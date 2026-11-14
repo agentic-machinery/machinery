@@ -109,10 +109,13 @@ is_current_delegator() {
 # (default_install_hook_types, default_stages, and every hook's stages).
 # The selector and the stage reader come from the machinery tree that holds
 # this installer (the installed release in a consumer checkout), never from the
-# consumer's checkout. The interpreter is the explicit LEARN_UKRAINIAN_PYTHON
-# boundary only; unset, the check refuses rather than guess one.
+# consumer's checkout. Roots and interpreter follow the hook boundary
+# (project_hook_context_resolve): a configured LEARN_UKRAINIAN_PRIMARY_REPO_ROOT
+# is required, and the interpreter is LEARN_UKRAINIAN_PYTHON when set, else that
+# validated primary's .venv/bin/python. The caller runs this in a subshell, so
+# the roots it exports do not leak into the rest of the installer.
 declared_stages() {
-    local config="$1" interpreter python
+    local config="$1" interpreter
     interpreter="$installer_dir/lib/project_interpreter.sh"
     if [[ ! -f "$interpreter" ]]; then
         echo "Git hook installer: project interpreter selector not found at $interpreter" >&2
@@ -120,12 +123,11 @@ declared_stages() {
     fi
     # shellcheck source=lu_machinery/lib/project_interpreter.sh
     source "$interpreter"
-    python="$(project_interpreter_configured)" || return 127
-    if [[ -z "$python" ]]; then
-        echo "Git hook installer: LEARN_UKRAINIAN_PYTHON is unset; set it to the absolute project interpreter to check declared hook stages" >&2
+    if ! project_hook_context_resolve "$repo_root"; then
+        echo "Git hook installer: hook context unavailable (step=${PROJECT_HOOK_BOOTSTRAP_STEP:-unknown}); configure LEARN_UKRAINIAN_PRIMARY_REPO_ROOT and the project interpreter" >&2
         return 127
     fi
-    project_python_run "$python" -m "$PROJECT_PACKAGE.pre_commit.declared_hook_stages" "$config"
+    project_python_run "$LEARN_UKRAINIAN_PYTHON" -m "$PROJECT_PACKAGE.pre_commit.declared_hook_stages" "$config"
 }
 
 run_check() {
