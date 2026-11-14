@@ -1156,9 +1156,28 @@ def _stop_task_services(record: dict) -> None:
 
 
 def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> None:
-    """Settle the task's services, worktree, then its /var/tmp scratch; never changes the task's execution status."""
+    """Settle services and the worktree, close out merged delivery, then remove scratch.
+
+    A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
+    """
     _stop_task_services(record)
+    request = (record.get("write_boundary") or {}).get("closeout_request")
+    if not request and record.get("mode") == "workspace-write" and "closeout" not in record:
+        # Attribution needs the checkout's origin, so take it before removal. Closeout itself runs afterward.
+        if merged := git.merged_delivery(record):
+            record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
+            record["delivery_merge_sha"] = merged["merge_sha"]
+            try:
+                root, _repository = git.resolve_repo(record.get("repo"))
+                request = {"pr": merged["number"], "repo": merged["repo"], "repo_root": str(root)}
+            except (OSError, ValueError) as exc:
+                record["closeout"] = {"pr": merged["number"], "returncode": None, "reason": type(exc).__name__}
     _reap_worktree(record, patience=patience, salvage=salvage)
+    if request and "closeout" not in record:
+        record["closeout"] = write_boundary.run_closeout(request)
+    if "closeout" in record and record["closeout"].get("returncode") != 0:
+        record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
+                                             f"{record['closeout'].get('returncode')}")
     _settle_task_scratch(record)
 
 
@@ -1909,13 +1928,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
                     _reap_settled(record, patience=SETTLE_PATIENCE)
-                if request := (record.get("write_boundary") or {}).get("closeout_request"):
-                    # A write worker asked its broker to close out its merged PR (#423). It runs now that the
-                    # worktree is settled, and a closeout that does not succeed fails the run.
-                    record["closeout"] = write_boundary.run_closeout(request)
-                    if record["closeout"].get("returncode") != 0:
-                        record.update(status="failed", error=f"closeout_failed: PR {request.get('pr')} exit "
-                                                             f"{record['closeout'].get('returncode')}")
                 try:
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
