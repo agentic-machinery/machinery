@@ -18,6 +18,7 @@ import pytest
 
 from lu_machinery.agent_runtime import acpx_pilot
 from lu_machinery.agent_runtime.adapters.acpx import validate_node_dependencies
+from lu_machinery.common.repo_root import machinery_path
 from tests.wait_helpers import wait_for_line
 from lu_machinery.agent_runtime.errors import AgentUnavailableError
 from lu_machinery.agent_runtime.result import Result
@@ -360,7 +361,7 @@ def test_cli_exit_disposition_follows_native_not_failed_shadow(monkeypatch, caps
 
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SERVER = _ROOT / "lu_machinery" / "agent_runtime" / "acp_text_agent.mjs"
+_SERVER = machinery_path("agent_runtime/acp_text_agent.mjs")
 _READY_LINE = "acp-text-agent ready"
 # Startup includes importing the ACP SDK under a loaded runner. The budget is
 # bounded so a hung child still fails, and it starts only after spawn.
