@@ -2357,7 +2357,7 @@
           "hooks": [
             {
               "additionalContextLimit": 1200,
-              "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/session-setup.sh\"",
+              "command": "(bash \"${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:?configured primary required}/.codex/hooks/session-setup.sh\") || exit 2",
               "statusMessage": "Checking learn-ukrainian session state",
               "timeout": 15,
               "type": "command"
@@ -2375,7 +2375,7 @@
           "hooks": [
             {
               "additionalContextLimit": 800,
-              "command": "CODEX_COMPACT_SESSION_START=1 bash \"$(git rev-parse --show-toplevel)/.codex/hooks/post-compact.sh\"",
+              "command": "(CODEX_COMPACT_SESSION_START=1 bash \"${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:?configured primary required}/.codex/hooks/post-compact.sh\") || exit 2",
               "statusMessage": "Hydrating bound fleet-driver context",
               "timeout": 15,
               "type": "command"
@@ -2390,7 +2390,7 @@
           "group": {},
           "hooks": [
             {
-              "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/goal-driver-stop.sh\"",
+              "command": "(bash \"${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:?configured primary required}/.codex/hooks/goal-driver-stop.sh\") || exit 2",
               "statusMessage": "Checking goal-driver state",
               "timeout": 5,
               "type": "command"
@@ -2405,7 +2405,7 @@
           "group": {},
           "hooks": [
             {
-              "command": "bash \"$(git rev-parse --show-toplevel)/.codex/hooks/release-thread-lease.sh\"",
+              "command": "(bash \"${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:?configured primary required}/.codex/hooks/release-thread-lease.sh\") || exit 2",
               "statusMessage": "Releasing learn-ukrainian session state",
               "timeout": 5,
               "type": "command"

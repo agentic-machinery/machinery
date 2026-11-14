@@ -409,8 +409,14 @@ def build(tree: Tree) -> Plan:
         outputs[full] = out
     for provider in providers:
         target = TARGETS[provider]
+        # A declared replacement permits an overlay; it must not erase shared
+        # defaults when that consumer supplies no replacement source (#552).
+        replacements = [prefix for prefix in inventory["provider_replacements"].get(provider, [])
+                        if any(name == prefix or name.startswith(prefix + "/")
+                               for name in groups.get(provider, {}))]
         for path, out in groups["shared"].items():
-            if out.owner == "product" and replaces(provider, path):
+            if out.owner == "product" and any(path == prefix or path.startswith(prefix + "/")
+                                              for prefix in replacements):
                 continue
             if out.owner == "fleet":
                 destinations = inventory["files"][path]["targets"].get(provider, [])
