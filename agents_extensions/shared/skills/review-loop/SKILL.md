@@ -70,7 +70,7 @@ interpreter does not select the primary checkout's Python modules.
    govern them; `code` for any other code change. A change that spans both is `infra`.
    A change to learner-facing Ukrainian is `ukrainian`: seat it from
    [ukrainian](references/ukrainian.md), not the resolver.
-   `infra` walks a different ladder and excludes code-only seats (Gemini Flash and Muse are
+   `infra` walks a different ladder and excludes code-only seats (Gemini Flash is
    `review_profiles: [code]` in `lu_machinery/config/model_catalog.yaml`), so the same value goes to
    the resolver (`--review-profile` and `--domain`) and to the dispatch below.
 
@@ -169,13 +169,6 @@ interpreter does not select the primary checkout's Python modules.
   approval. A moved head voids the verdict.
 - The `local-code-review` Step 6 breakers apply in every round.
 - A decline needs file:line or test evidence and never clears a blocking verdict.
-
-## Muse second reader (advisory)
-
-On a PR with catalog risk `critical`, the driver may add Muse Wonder Full as a second,
-read-only reader. Its findings enter the same ledger and are triaged like any other finding.
-It is advisory: it is not a gate, it never replaces or outvotes the reviewer of record, and its
-silence or approval proves nothing. Making it mandatory needs the operator's approval.
 
 ## Optional DeepSeek author pre-check (DS-PRECHECK-1101)
 
