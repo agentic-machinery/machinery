@@ -228,6 +228,18 @@ From the `main` commit identified above, with `$V` the version in
    the positive control. Remove the markers and confirm the prefix still
    validates.
 
+   Run the five-route write-boundary canary
+   ([runbook](runbooks/write-worker-boundary.md#five-route-canary)) when the
+   release contains a change that affects worker-sandbox behavior and no
+   recorded table matches. It is required: all five routes (`claude`, `codex`,
+   `cursor`, `agy`, `opencode`) must pass every check through the installed
+   wheel. Evidence recorded earlier on the same source SHA and wheel SHA-256
+   as this release candidate may be reused instead of re-running; any other
+   evidence is void. A route that cannot run is incomplete evidence: wait for
+   capacity or record an explicit exception, never substitute another route.
+   Put the table, with the wheel SHA-256 and installed-package provenance, in
+   the release's Acceptance section.
+
    Then check that every packaged resource resolves from the installed wheel
    and exercise lazy runtime paths. Running the agent deployer's plan and apply
    against a scratch consumer is one such path. Import alone is not
