@@ -46,7 +46,8 @@ only for a registered repository with a public role (decision A6; so does the re
 Read-only providers may use only ``github-read``; the owning worker records the review verdict after settlement.
 Sources goes through the read-only AGY boundary's ``SourcesRelay``. Its proxy and socket sit at fixed paths
 inside, so ``sources_command`` is the MCP stdio command providers name; a Codex run gets a task-local
-``CODEX_HOME`` holding only that server and a link to the selected account's login.
+``CODEX_HOME`` holding only that server and a link to the selected account's login, and an AGY, Cursor or OpenCode
+write worker one read-only MCP file naming only that server, where its CLI reads it (``sources_mcp_config``).
 
 The canary runs first and checks each boundary property; the provider starts only after the launcher
 has checked every outcome. Any setup or canary failure refuses the run (exit ``REFUSED``) and nothing
@@ -180,6 +181,16 @@ _SOURCES_INSIDE = "/run/lu-write-boundary/sources.sock"
 _SOURCES_STDIO_INSIDE = "/run/lu-write-boundary/sources-stdio.py"
 # The task-local CODEX_HOME the launcher projects into the run's private scratch, beside its TMPDIR.
 _CODEX_HOME = "codex-home"
+# A write worker on these routes gets one task-local MCP file naming only the Sources relay (``sources_mcp_config``),
+# written in the read-only boundary directory. AGY reads only HOME's ``.gemini/config/mcp_config.json`` (the file
+# ``agy mcp add`` writes; ``adapters/agy.py``) and Cursor HOME's ``.cursor/mcp.json``, so the file is bound read-only
+# there; OpenCode reads the file ``OPENCODE_CONFIG`` names, which is the file's fixed path inside.
+_SOURCES_MCP = "sources-mcp.json"
+_SOURCES_MCP_INSIDE = "/run/lu-write-boundary/sources-mcp.json"
+_SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor/mcp.json", "opencode": None}
+# Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
+# product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
+_CURSOR_SOURCES_SERVER = "sources-relay"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
                     "closeout-request": 900, "publish": 300, "pr-merge": 900}
 
@@ -210,6 +221,25 @@ def codex_home_config() -> str:
         "args = [" + ", ".join(json.dumps(arg) for arg in args) + "]",
         "",
     ])
+
+
+def sources_mcp_config(agent: str) -> str:
+    """The task-local MCP file of an AGY, Cursor or OpenCode write worker: one stdio server, the Sources relay.
+
+    Each is in the shape that provider reads (AGY and Cursor ``mcpServers`` with ``command`` and ``args``; OpenCode
+    ``mcp`` with a ``local`` server whose ``command`` is the whole argv). HOME is empty inside, so no other MCP
+    server, credential or host configuration is a layer of the run.
+    """
+    command, *args = sources_command()
+    if agent == "agy":
+        config: dict = {"mcpServers": {"sources": {"command": command, "args": args}}}
+    elif agent == "cursor":
+        config = {"mcpServers": {_CURSOR_SOURCES_SERVER: {"type": "stdio", "command": command, "args": args}}}
+    elif agent == "opencode":
+        config = {"mcp": {"sources": {"type": "local", "command": [command, *args]}}}
+    else:
+        raise ValueError(f"write boundary: no Sources MCP projection for {agent!r}")
+    return json.dumps(config, indent=2) + "\n"
 
 
 def _interpreter_root() -> Path:
@@ -324,6 +354,8 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         # The selected account's login: the only thing the task-local CODEX_HOME takes from the real one.
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
+    if spec.agent in _SOURCES_MCP_HOME and spec.mode == "workspace-write":
+        argv += ["--sources-mcp", spec.agent]
     if spec.agent == "codex" and spec.mode == "read-only":
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
@@ -1335,6 +1367,9 @@ class _Boundary:
             restores.append(Path(self.args.runtime))
         if self.args.codex_auth is not None:
             restores.append(self.base / _CODEX_HOME)
+        sources_mcp = self._sources_mcp(boundary, home)
+        if sources_mcp is not None:
+            restores.append(sources_mcp)
         login, login_reads = self._claude_login(home, repository)
         restores += [*([login[1]] if login else []), *login_reads]
         masks = [*base_masks, *private]
@@ -1397,6 +1432,9 @@ class _Boundary:
             # Codex writes its state there, but the trusted Sources definition stays read-only (as review F1).
             argv += ["--bind", str(codex_home), str(codex_home),
                      "--ro-bind", str(codex_home / "config.toml"), str(codex_home / "config.toml")]
+        if sources_mcp is not None and sources_mcp != boundary / _SOURCES_MCP:
+            # The provider reads it from HOME; it stays read-only there, as Codex's Sources definition.
+            argv += ["--ro-bind", str(boundary / _SOURCES_MCP), str(sources_mcp)]
         # No GitHub credential is readable inside (PUBLISH-CRED-1113): the host login's known stores are empty.
         for path in _github_credential_paths(home):
             if not _hidden(path, masks, restores):
@@ -1454,6 +1492,8 @@ class _Boundary:
         env.update(git_push_settings(env, interpreter, str(machinery_path("dispatcher/write_boundary.py").parents[2])))
         if codex_home is not None:
             env["CODEX_HOME"] = str(codex_home)
+        if self.args.sources_mcp == "opencode":
+            env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
         if (store := _pre_commit_store(home)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
@@ -1589,6 +1629,24 @@ class _Boundary:
                                       "auth_writable": auth in credentials}
         return home
 
+    def _sources_mcp(self, boundary: Path, home: Path) -> Path | None:
+        """Write the provider's task-local Sources MCP file (``--sources-mcp``) and return where it reads it.
+
+        The file is in the boundary directory, read-only inside; AGY and Cursor read it at its bind below HOME,
+        OpenCode at its fixed path inside (``OPENCODE_CONFIG``).
+        """
+        agent = self.args.sources_mcp
+        if agent is None:
+            return None
+        if self.args.mode != "workspace-write":
+            raise Refused("--sources-mcp projects a write worker's MCP file only")
+        config = sources_mcp_config(agent).encode()
+        _write_private(boundary / _SOURCES_MCP, config, 0o600)
+        relative = _SOURCES_MCP_HOME[agent]
+        target = home / relative if relative is not None else boundary / _SOURCES_MCP
+        self.receipt["sources_mcp"] = {"provider": agent, "config_sha256": hashlib.sha256(config).hexdigest()}
+        return target
+
     def _probes(self, repository: Path, common: Path, sockets: list[Path], outputs: list[Path], tmp: Path,
                 nonce: str) -> list[dict]:
         probes: list[dict] = []
@@ -1701,6 +1759,11 @@ class _Boundary:
         if self.args.codex_auth is not None:
             # The task-local Codex configuration holds the trusted Sources definition: it refuses a write.
             probes.append({"op": "write_open", "path": str(self.base / _CODEX_HOME / "config.toml"),
+                           "expect_any": ["EROFS"]})
+        if (agent := self.args.sources_mcp) is not None:
+            # The task-local Sources MCP file the provider reads refuses a write too.
+            relative = _SOURCES_MCP_HOME[agent]
+            probes.append({"op": "write_open", "path": str(home / relative) if relative else _SOURCES_MCP_INSIDE,
                            "expect_any": ["EROFS"]})
         return probes
 
@@ -1988,6 +2051,9 @@ def main(argv: list[str]) -> int:
                         "projected as private copies")
     parser.add_argument("--codex-auth", help="The selected Codex account's auth.json, linked into a task-local "
                         "CODEX_HOME that holds only the Sources server")
+    parser.add_argument("--sources-mcp", choices=tuple(_SOURCES_MCP_HOME),
+                        help="The write worker's provider, whose task-local MCP file names only the Sources relay "
+                        "(default: none)")
     parser.add_argument("--host-env", action="append", default=[],
                         help="NAME=VALUE of the dispatcher's host configuration, for the launcher only (default: none)")
     parser.add_argument("command", nargs=argparse.REMAINDER)
