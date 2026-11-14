@@ -345,6 +345,19 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
                       ' && grep -qF \'"/run/lu-write-boundary/sources-stdio.py", "/run/lu-write-boundary/sources.sock"]\''
                       ' "$CODEX_HOME/config.toml"')
         refreshed = '"$CODEX_HOME/auth.json"'  # a refresh through the link lands in the selected login
+    # An AGY, Cursor or OpenCode write worker reads one task-local MCP file naming only the Sources relay, never the
+    # host's own (planted here with a foreign server), and cannot rewrite it.
+    sources_mcp = {"agy": "$HOME/.gemini/config/mcp_config.json", "cursor": "$HOME/.cursor/mcp.json",
+                   "opencode": '"$OPENCODE_CONFIG"'}.get(route) if mode == "workspace-write" else None
+    if sources_mcp is not None:
+        for planted in (".gemini/config/mcp_config.json", ".cursor/mcp.json", ".config/opencode/opencode.json"):
+            (home / planted).parent.mkdir(parents=True, exist_ok=True)
+            (home / planted).write_text('{"mcpServers": {"foreign": {"url": "http://127.0.0.1:8766/mcp"}}}\n')
+        extra += ["--sources-mcp", route]
+        home_check = ((' && test "$OPENCODE_CONFIG" = /run/lu-write-boundary/sources-mcp.json' if route == "opencode"
+                       else ' && test -z "$OPENCODE_CONFIG"')
+                      + f" && grep -qF '\"/run/lu-write-boundary/sources.sock\"' {sources_mcp}"
+                      + f" && ! grep -q foreign {sources_mcp} && ! (echo planted >> {sources_mcp}) 2>/dev/null")
     probe, report = tmp_path / "probe.py", tmp_path / "cells.json"
     probe.write_text(_CREDENTIAL_PROBE)
     code = write_boundary.main([
@@ -375,6 +388,19 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
     if route == "codex":
         assert result["codex_home"] == {"config_sha256": hashlib.sha256(write_boundary.codex_home_config().encode())
                                         .hexdigest(), "auth": "linked", "auth_writable": True}
+    if sources_mcp is not None:
+        config = write_boundary.sources_mcp_config(route)
+        assert result["sources_mcp"] == {"provider": route, "config_sha256": hashlib.sha256(config.encode()).hexdigest()}
+        assert [probe["outcome"] for probe in result["canary"]["probes"] if probe["op"] == "write_open"
+                and probe["path"].endswith(("/mcp_config.json", "/.cursor/mcp.json", "/sources-mcp.json"))] == ["EROFS"]
+        # Exactly one server, the Sources relay, in the shape the provider reads.
+        servers = json.loads(config)["mcp" if route == "opencode" else "mcpServers"]
+        assert len(servers) == 1, servers
+        (server,) = servers.values()
+        command = write_boundary.sources_command()
+        assert ([*server["command"]] if route == "opencode" else [server["command"], *server["args"]]) == command
+    else:
+        assert "sources_mcp" not in result
 
 
 class _Launch:

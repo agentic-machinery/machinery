@@ -60,6 +60,14 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
             for name in ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT",
                          "LEARN_UKRAINIAN_STATE_ROOT"):
                 assert f"{name}={child[name]}" not in argv
+            # An AGY, Cursor or OpenCode write worker gets its task-local Sources MCP file (Claude and Codex
+            # name the relay themselves).
+            write_argv = write_boundary.launcher(replace(spec, mode=mode), Invocation(["/bin/sh"], None, child, None),
+                                                 tmp_path / "task.json")
+            launch = write_argv[:write_argv.index("--")]
+            projected = launch[launch.index("--sources-mcp") + 1] if "--sources-mcp" in launch else None
+            assert projected == (agent if agent in ("agy", "cursor", "opencode") else None)
+            assert "--sources-mcp" not in argv[:argv.index("--")]  # a read-only launch projects none
 
     # A missing anchor stays missing; worker Git metadata must never fill it in.
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
