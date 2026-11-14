@@ -1162,9 +1162,13 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     """
     _stop_task_services(record)
     request = (record.get("write_boundary") or {}).get("closeout_request")
+    # Attribution needs the checkout's origin, so take it before removal. Closeout itself runs afterward.
+    merged = None
     if not request and record.get("mode") == "workspace-write" and "closeout" not in record:
-        # Attribution needs the checkout's origin, so take it before removal. Closeout itself runs afterward.
-        if merged := git.merged_delivery(record):
+        merged = git.merged_delivery(record)
+    _reap_worktree(record, patience=patience, salvage=salvage)
+    if record.get("worktree_disposition") == "removed":
+        if merged:
             record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
             record["delivery_merge_sha"] = merged["merge_sha"]
             try:
@@ -1172,12 +1176,11 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
                 request = {"pr": merged["number"], "repo": merged["repo"], "repo_root": str(root)}
             except (OSError, ValueError) as exc:
                 record["closeout"] = {"pr": merged["number"], "returncode": None, "reason": type(exc).__name__}
-    _reap_worktree(record, patience=patience, salvage=salvage)
-    if request and "closeout" not in record:
-        record["closeout"] = write_boundary.run_closeout(request)
-    if "closeout" in record and record["closeout"].get("returncode") != 0:
-        record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
-                                             f"{record['closeout'].get('returncode')}")
+        if request and "closeout" not in record:
+            record["closeout"] = write_boundary.run_closeout(request)
+        if "closeout" in record and record["closeout"].get("returncode") != 0:
+            record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
+                                                 f"{record['closeout'].get('returncode')}")
     _settle_task_scratch(record)
 
 

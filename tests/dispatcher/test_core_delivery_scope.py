@@ -216,11 +216,13 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
     monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
     events = []
+    disposition = "retained"
 
     def reap(current, **_):
         assert "closeout" not in current
-        events.append("removed")
-        current.update(worktree_disposition="removed", worktree_disposition_reason="clean")
+        events.append(disposition)
+        current.update(worktree_disposition=disposition,
+                       worktree_disposition_reason="clean" if disposition == "removed" else "provider_processes_alive")
 
     def closeout(actual):
         assert record["worktree_disposition"] == "removed"
@@ -231,6 +233,14 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     monkeypatch.setattr(worker, "_reap_worktree", reap)
     runner = Mock(side_effect=closeout)
     monkeypatch.setattr(worker.write_boundary, "run_closeout", runner)
+    # A temporarily retained tree must not poison the receipt before the existing reap pass removes it.
+    worker._reap_settled(record)
+    assert events == ["retained"]
+    assert "closeout" not in record
+    assert (record["status"], record["error"]) == ("done", None)
+    runner.assert_not_called()
+    events.clear()
+    disposition = "removed"
     worker._reap_settled(record)
     if mode == "read-only" or pr_state != "MERGED":
         assert events == ["removed"]
