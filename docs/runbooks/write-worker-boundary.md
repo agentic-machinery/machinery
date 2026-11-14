@@ -376,26 +376,29 @@ env -u PYTHONPATH "$P" -I -c 'import importlib.metadata as m, lu_machinery; prin
 
 `$P` is the clean venv's interpreter; the consumer lock names the wheel built above by its hash. The printed
 path must lie inside that venv. Record the version, the path and `WHEEL_SHA256`. An editable install, a
-checkout on `PYTHONPATH` or a different version voids the run. The hook interpreter the canary commits use
-must be that same environment, so the commit hooks run the code under test.
+checkout on `PYTHONPATH` or a different version voids the run. The commit hooks run with the interpreter named
+by `LEARN_UKRAINIAN_PYTHON` (an absolute path to an executable), so export it for the dispatches below; it
+makes the hooks run the code under test rather than the primary checkout's own environment.
 
 ### Run one task per route
 
 Dispatch from the installed package, in write mode, with `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` naming the
-primary checkout that holds the task store:
+primary checkout that holds the task store and `LEARN_UKRAINIAN_PYTHON` naming `$P`:
 
 ```bash
+export LEARN_UKRAINIAN_PYTHON="$P"
 for route in claude codex cursor agy opencode; do
   "$P" -m lu_machinery.dispatcher.cli dispatch \
     --agent "$route" --model "<catalog model for $route>" --mode workspace-write \
     --task-id "canary-$ID-$route" --base "origin/$BRANCH" \
     --owned-path "tmp-boundary-canary/canary-$ID-$route.txt" \
-    --hard-timeout 900 --prompt-file "$PROMPTS/canary-$ID-$route.prompt"
+    --hard-timeout 900 --prompt-file "$PROMPTS/canary-$ID-$route.prompt"   # prints the task id and run nonce
 done
+"$P" -m lu_machinery.dispatcher.cli wait "canary-$ID-<route>" --run-nonce "<nonce>" --timeout 900   # per task
 ```
 
-Launch the five without waiting between them if capacity admits; wait for each with the dispatcher's
-`wait`, never by polling. Each prompt is the same bounded, mechanical task with the task id changed:
+Launch the five without waiting between them if capacity admits; wait for each with `wait`, never by
+polling. Verify the flags with `dispatch --help` of the installed version before the run. Each prompt is the same bounded, mechanical task with the task id changed:
 
 - Step A: call the Sources `verify_word` tool once with a common word and report whether it returned a
   result (quote the first line) or failed (quote the error). Do not retry.
@@ -403,10 +406,15 @@ Launch the five without waiting between them if capacity admits; wait for each w
   prints `READABLE` or `DENIED` with the errno, and never prints content. Run it on: the selected
   provider's own login, then the login of every other provider and every other account of the same
   provider, the host's other credential stores, and the private state directory. Name the host's list
-  in the prompt; this public document does not carry it (it lives in the private runbook for the host).
+  in the prompt, by role; this public document carries no host path or credential name, and the list is
+  host configuration kept with the host's private operating notes.
 - Step C: create the canary file, `git add` it, `git commit` with a message and an `X-Agent` trailer,
-  and `git push -u origin HEAD`. No other file is touched, and no PR is opened.
-- The reply carries each step's outcome and each Step C command's exit status and last line.
+  and `git push -u origin HEAD`. No PR is opened.
+- Step D, a negative control, before Step C's commit: print only whether the hook environment variables
+  are set (never their values) and the installed package's import path as the hook interpreter sees it.
+  Then `git add` a file outside the owned path and attempt a commit. It must be refused by the ownership
+  hook; `git reset` the index afterwards. Report the hook's output lines.
+- The reply carries each step's outcome and each command's exit status and last line.
 
 ### Checks and expected results
 
@@ -418,14 +426,18 @@ fill one table row per route:
 | Canary commit made | Task record: `commits_ahead` is 1 and `head_sha` equals `remote_head_sha`; the commit carries the `X-Agent` trailer | pass |
 | Boundary ran | The record has a `write_boundary` field; its `status` is `ran`, `canary_passed` is true and `import.status` is `imported`. A record with no such field ran outside the boundary (in an in-tree dispatcher) and proves nothing | pass |
 | Broker push | Receipt `broker` lists a `push` verb with `returncode` 0 and no `refused` | pass |
-| Hook bootstrap | The commit hooks ran from the artifact under test. A commit alone does not prove this. Check that the hook environment variables (`LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` and the hook interpreter) are present in the provider's shell and that the interpreter's package path is the clean venv. Then show a negative control on one route: a second commit of a path outside the owned paths is refused by the ownership hook | pass |
-| Owned-path check | The canary file, an owned path, commits; the negative control, an unowned path, is refused. `owned_path_grants_used` is empty | pass |
+| Hook bootstrap | The commit hooks ran from the artifact under test. A commit alone does not prove this. Step D reports that `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` and `LEARN_UKRAINIAN_PYTHON` are set in the provider's shell and that the package the hook interpreter imports lies in the clean venv. The negative control (an unowned path) is refused by a hook, which a commit that never ran hooks could not do | pass |
+| Owned-path check | The canary file, an owned path, commits; the Step D negative control, an unowned path, is refused. `owned_path_grants_used` is empty | pass |
 | pre-commit | The product hooks ran and passed in the commit, from the restored read-only hook store, with no network fetch (`egress` lists no hook-repository clone) | pass |
-| Commit-message scan | The commit-message OPSEC gate defers to the broker's host push scan only when `LU_WRITE_BOUNDARY_BROKER` names the broker socket and that path is a socket. The same message with the variable set but no socket is refused | pass |
+| Commit-message scan | The commit succeeds with its message and the broker's host push scan runs on it: the `push` verb returned 0. The gate defers to that scan only when `LU_WRITE_BOUNDARY_BROKER` names the broker socket, and the refusal without the socket is the product pre-push gate's own test, which the canary cannot reproduce inside, where the socket is always present | pass |
 | Sources through the relay | Step A returned a `verify_word` result, and the receipt `sources` block shows `completed` of at least 1 with `verify_word` among `tools`, and `failed` 0 | pass |
 | Own login only | Step B reports `READABLE` for the route's own login and nothing else | pass |
 | Every other credential and private state | Step B reports `DENIED` for every other provider and account login, every other credential store and the private state directory | pass |
 | Task status | The task ended `done`, the worktree is gone, and nothing else was changed | pass |
+
+Until a route's Sources projection ships, its Sources row fails and the canary blocks: that is the intended
+result of this check, not a reason to weaken the row. (The Known limits below say which routes name the
+Sources command today.)
 
 Any `READABLE` on a path that must be denied is a breach. A Sources result that came from a path other
 than the relay does not count: `sources.completed` of 0 with a worker claiming success fails the row.
@@ -440,10 +452,10 @@ The table is bound to the artifact and pasted into the PR (or the release accept
   digests), and the actual result of every check above, not a summary;
 - every exception, with the authority that recorded it.
 
-Changed code voids the evidence. Any later commit that touches behavior in the trigger list above needs
-a fresh run on its own head; a docs-only or unrelated delta does not, provided the wheel SHA-256 of the
-reviewed code is the same. Release acceptance accepts matching evidence (same source SHA and wheel
-SHA-256 as the release candidate) instead of re-running the five tasks, and runs them itself otherwise.
+Evidence is bound to the source SHA and the wheel SHA-256 together. Changed code voids it, and any later
+commit that affects behavior in the trigger list above needs a fresh run on its own head. Release
+acceptance reuses evidence only when both match the release candidate exactly, instead of re-running the
+five tasks, and runs them itself otherwise.
 
 ## Known limits
 
