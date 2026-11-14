@@ -82,7 +82,7 @@
 <header>
   <div class="title">
     <h1>Machinery</h1>
-    <span class="muted" id="machinery-version"></span>
+    <span class="muted" id="machinery-version" data-version="__MACHINERY_VERSION__"></span>
     <p class="purpose">Which subscription is near its limit, when it resets, and whether anything is signed out.</p>
   </div>
   <nav class="sites" aria-label="Sites"><a href="/">Learn Ukrainian</a><a href="http://localhost:8768/">KubeDojo</a></nav>
@@ -279,7 +279,7 @@ function planCell(plan) {
 }
 
 function bankedCell(banked) {
-  if (!banked || banked.status !== "ok" || typeof banked.count !== "number") return text("unknown", "muted");
+  if (!banked || banked.status !== "ok" || typeof banked.count !== "number") return text("not reported", "muted");
   const items = (Array.isArray(banked.items) ? banked.items : []).filter(item => !item.expired)
     .map(item => `${item.count}× ${item.kind || "reset"}${item.expires_on ? `, expires ${String(item.expires_on).slice(0, 10)}` : ""}`);
   return text(`${banked.count}${items.length ? ` (${items.join("; ")})` : ""}`, banked.count ? "ok" : "");
@@ -861,14 +861,16 @@ function renderVersion(version) {
   return `<a href="${CHANGELOG_URL}#v${encodeURIComponent(version)}" title="What changed in this release">lu-machinery ${escapeHtml(version)}</a>`;
 }
 
-async function loadVersion() {
-  let version = null;
-  try { version = (await fetchJson("/api/health")).data.machinery_version; } catch { /* shown as unknown */ }
-  document.getElementById("machinery-version").innerHTML = renderVersion(version);
+// The server writes the installed release into data-version when it serves this page, so the header
+// needs no request (the UI gateway does not admit /api/health). An unfilled or empty value reads as unknown.
+function loadVersion() {
+  const header = document.getElementById("machinery-version");
+  header.innerHTML = renderVersion(header.dataset?.version);
 }
 
 async function refreshAll() {
-  await Promise.all([...PANELS.map(loadPanel), loadVersion()]);
+  loadVersion();
+  await Promise.all(PANELS.map(loadPanel));
   document.getElementById("chips").innerHTML = renderChips(latest);
   showRefresh();
 }
