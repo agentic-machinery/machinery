@@ -294,18 +294,24 @@ def test_refresh_header_names_a_failure_and_claims_updated_only_after_success():
     assert health.status_code == 200
     version = health.json()["machinery_version"]
     assert version == importlib.metadata.version("lu-machinery")
+    served = TestClient(app).get("/machinery")
+    assert served.status_code == 200
+    assert f'id="machinery-version" data-version="{version}"' in served.text
+    assert "__MACHINERY_VERSION__" not in served.text
     page = machinery_path("api/dashboards/index.html").read_text()
     script = page.split("<script>", 1)[1].split("\nrefreshAll();", 1)[0]
     _node(
         _DOM
         + f"const HEALTH = {json.dumps(health.text)};\nconst VERSION = {json.dumps(version)};\n"
         + r"""
+document.getElementById('machinery-version').dataset = {version: VERSION};
 const realSetTimeout = setTimeout;
 setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 let failSubscriptions = true;
 globalThis.fetch = async (url) => {
   const refused = failSubscriptions && String(url).includes('/api/runtime/subscriptions');
-  const body = String(url) === '/api/health' ? HEALTH : '{}';
+  if (String(url) === '/api/health') throw new Error('the header must not request /api/health');
+  const body = '{}';
   return {ok: !refused, status: refused ? 503 : 200, text: async () => body, headers: {get: name => ({'X-Snapshot-Age-S': '2', 'X-Snapshot-Stale-After-S': '60', 'X-Snapshot-State': 'fresh'}[name] ?? null)}};
 };
 """

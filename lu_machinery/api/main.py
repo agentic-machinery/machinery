@@ -8,6 +8,7 @@ Architecture:
 
 import asyncio
 import functools
+import html
 import importlib.metadata
 import json
 import logging
@@ -29,7 +30,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from prometheus_client import CollectorRegistry, Counter, Histogram, make_asgi_app
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -1696,6 +1697,18 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 
 
 MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
+_VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
+
+
+def _machinery_home_response(index: Path) -> HTMLResponse:
+    """The machinery home page with the installed release filled in.
+
+    The page reads the version from the document, not from ``/api/health``, so a
+    viewer behind the UI gateway (which does not admit that route) still sees it.
+    With no distribution installed the value is empty and the header says unknown.
+    """
+    version = html.escape(_machinery_version() or "", quote=True)
+    return HTMLResponse(index.read_text(encoding="utf-8").replace(_VERSION_PLACEHOLDER, version))
 
 
 def _safe_join(base: Path, *parts: str | Path) -> Path | None:
@@ -1720,13 +1733,12 @@ async def serve_static(path: str, request: Request, ctx: MonitorContext = Depend
     if path in MACHINERY_HOME_PATHS:
         # The machinery home has its own address, so a product that owns ``/``
         # never hides it.
-        return FileResponse(dashboards_dir / "index.html")
+        return _machinery_home_response(dashboards_dir / "index.html")
     if not path or path in {"/", "index.html"}:
         product_index = product_file(product, "index.html")
         if product_index is not None:
             return FileResponse(product_index)
-        machinery_index = dashboards_dir / "index.html"
-        return FileResponse(machinery_index)
+        return _machinery_home_response(dashboards_dir / "index.html")
     file_path = _safe_join(dashboards_dir, path)
     if file_path is None:
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
