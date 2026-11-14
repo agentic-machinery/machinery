@@ -285,6 +285,11 @@ provider replacement suppresses shared product defaults only when that provider
 actually supplies a source in the replacement subtree. Without a Codex memory
 overlay, shared `memory/MEMORY.md` therefore remains deployed.
 
+Parity fixtures must include the product's
+`curriculum/l2-uk-en/curriculum.yaml` marker so they exercise curriculum prompt
+linting. The deployer honors each existing prompt rule's filename filter;
+research-only rules do not apply to ordinary content templates.
+
 `--check` is the named replacement for both legacy `deploy_prompts.sh --dry-run`
 and `check_rules_deployment.sh --tracked-mirrors-only`. It writes nothing and
 verifies every enabled target, including bytes, modes, ownership and retirement.
@@ -299,8 +304,8 @@ overlap planned outputs.
 The product workflow `rules-deployment-check.yml` and its tracked-mirror test in
 `tests/test_deploy_script_idempotency.py` must switch from the old option to
 apply followed by `--check` on an enrolled scratch consumer. The legacy deploy
-script's usage comment is the only other declaration of `--dry-run`; it has no
-executable product caller. Consumer migration owns those edits.
+script declares `--dry-run`, but no executable product caller uses that option.
+Consumer migration owns those edits.
 
 #### Mandatory hook settings
 

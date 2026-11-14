@@ -382,12 +382,14 @@ def build(tree: Tree) -> Plan:
             skill_names.add(name)
         # Product lint selection is code-side. Generic consumers never run curriculum checks.
         if tree.read("curriculum/l2-uk-en/curriculum.yaml") is not None:
-            from lu_machinery.lint.lint_prompts import RULES
+            from lu_machinery.lint.lint_prompts import RULES, rule_matches_path
             for path, (blob, _mode) in items.items():
                 if not path.endswith(".md") or not (path.startswith("skills/") or path.startswith("phases/")):
                     continue
-                for rule_id, severity, _description, _glob, pattern, exception in RULES:
-                    if severity == "error" and any(pattern.search(line) and not (exception and exception.search(line)) for line in blob.decode().splitlines()):
+                for rule_id, severity, _description, file_glob, pattern, exception in RULES:
+                    if severity != "error" or not rule_matches_path(path, file_glob):
+                        continue
+                    if any(pattern.search(line) and not (exception and exception.search(line)) for line in blob.decode().splitlines()):
                         raise Invalid("prompt lint: " + rule_id)
         destination = groups.setdefault(group, {})
         for path, (blob, mode) in items.items():
