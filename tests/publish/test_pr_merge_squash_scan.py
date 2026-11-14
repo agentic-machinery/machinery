@@ -9,6 +9,9 @@ import pytest
 from lu_machinery.publish import github as publisher
 from lu_machinery.ci.deploy_paths import DeployPathsError
 
+from tests.opsec_fixtures import TOKEN
+
+pub = publisher
 HEAD = "a" * 40
 _ABSENT = object()
 _UNVERIFIABLE_RECORDER = (
@@ -16,7 +19,8 @@ _UNVERIFIABLE_RECORDER = (
 )
 
 
-def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, head=HEAD, queued=False, outcome="queued"):
+def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, head=HEAD, queued=False, outcome="queued",
+                      queue=True, subject="Safe change", body="Safe change description"):
     """Stub GitHub reads, recording every write including legacy merge commands.
 
     ``outcome`` is what a successful enqueue leaves on GitHub: ``queued``, ``armed``
@@ -29,8 +33,8 @@ def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, hea
             "id": "PR_node", "number": 1, "isDraft": draft, "headRefOid": head,
             "mergeStateStatus": state, "isCrossRepository": False, "baseRefName": "main",
             "labels": [{"name": "merge-priority"}] if priority else [], **after,
-            "isMergeQueueEnabled": True, "viewerMergeHeadlineText": "Safe change",
-            "viewerMergeBodyText": "Safe change description",
+            "isMergeQueueEnabled": queue, "viewerMergeHeadlineText": subject,
+            "viewerMergeBodyText": body,
         }
         if args[:3] == ["gh", "pr", "view"]:
             value = pull
@@ -47,6 +51,9 @@ def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, hea
                 value = {"data": {"repository": {"pullRequest": pull}}}
         elif args[:4] == ["gh", "api", "--method", "GET"]:
             value = {"login": "fleet"} if args[4].startswith("user") else [[]]
+        elif args[:3] == ["gh", "pr", "merge"] and "--body-file" in args:
+            writes.append({"argv": args, "body": Path(args[args.index("--body-file") + 1]).read_text()})
+            value = {}
         else:
             writes.append({"argv": args})
             value = {}
@@ -200,3 +207,20 @@ def test_absent_string_or_null_verdict_recorder_is_refused_before_publication(
         )
     assert str(caught.value) == _UNVERIFIABLE_RECORDER
     assert calls == []
+
+
+transport = enqueue_transport
+
+
+@pytest.mark.usefixtures("queue_publisher")
+def test_direct_merge_sends_explicit_text_instead_of_defaults(synthetic_opsec):
+    calls = []
+    pub.publish(
+        "pr-merge",
+        repo="unit/public",
+        number=1,
+        subject="clean",
+        body="clean",
+        runner=transport(calls, body="* " + TOKEN, queue=False),
+    )
+    assert len(calls) == 1 and "--subject=clean" in calls[0]["argv"] and calls[0]["body"] == "clean"

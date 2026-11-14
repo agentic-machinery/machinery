@@ -288,6 +288,27 @@ jobs:
             --no-index --find-links wheelhouse --require-hashes --requirement consumer.lock
           "$RUNNER_TEMP/test-venv/bin/python" -I -m pip check --disable-pip-version-check
 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Provision and seal the release Node dependencies
+        run: |
+          set -euo pipefail
+          umask 022
+          cd "$RUNNER_TEMP"
+          runtime_python="$RUNNER_TEMP/test-venv/bin/python"
+          npm_cache="$RUNNER_TEMP/acp-npm-cache"
+          prefix="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import prepare_node_dependencies; print(prepare_node_dependencies() or "")')"
+          if [ -n "$prefix" ]; then
+            node_binary="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[0])')"
+            npm_cli="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[1])')"
+            PATH="$(dirname "$node_binary"):$PATH" "$node_binary" "$npm_cli" ci --ignore-scripts --no-audit --no-fund --prefix="$prefix" --cache="$npm_cache"
+            env -u PYTHONPATH "$runtime_python" -I -c 'from pathlib import Path; import sys; from lu_machinery.agent_runtime.adapters.acpx import seal_node_dependencies; print(seal_node_dependencies(cache=Path(sys.argv[1])))' "$npm_cache"
+          fi
+
       - name: Read the [run] files from the manifest
         run: |
           set -euo pipefail
@@ -1042,7 +1063,7 @@ jobs:
 
       - name: Remove test files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/pytest" "$RUNNER_TEMP/test-venv" "$RUNNER_TEMP/test-requirements.txt" "$RUNNER_TEMP/installed-wheel" "$RUNNER_TEMP/trufflehog" "$RUNNER_TEMP/semgrep-venv" "$RUNNER_TEMP/semgrep-requirements.txt" "$RUNNER_TEMP/semgrep-rules"
+        run: rm -rf "$RUNNER_TEMP/pytest" "$RUNNER_TEMP/test-venv" "$RUNNER_TEMP/test-requirements.txt" "$RUNNER_TEMP/installed-wheel" "$RUNNER_TEMP/trufflehog" "$RUNNER_TEMP/semgrep-venv" "$RUNNER_TEMP/semgrep-requirements.txt" "$RUNNER_TEMP/semgrep-rules" "$RUNNER_TEMP/acp-npm-cache"
 
   pytest-shards:
     name: pytest shards

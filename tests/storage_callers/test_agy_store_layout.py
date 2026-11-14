@@ -1,5 +1,6 @@
 """Exercise AGY's real launch boundary with fixture stores and no provider calls."""
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -9,6 +10,11 @@ import sys
 import pytest
 
 from lu_machinery.dispatcher import agy_sandbox
+from lu_machinery.lib.readonly_sqlite import open_readonly
+from lu_machinery.storage import generations
+from lu_machinery.storage.wal_permissions import hold_database
+from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.dispatcher.test_providers_b import _github_meta_path
 
 
 def _linked_worktree(tmp_path):
@@ -67,7 +73,7 @@ def _launch(tmp_path, worktree, task_id, command, **popen):
     app = tmp_path / "agy-home"
     app.mkdir(exist_ok=True)
     (app / "antigravity-oauth-token").write_text("token")
-    env = {**os.environ, "AGY_APP_DATA_DIR": str(app)}
+    env = {**os.environ, "AGY_APP_DATA_DIR": str(app), "PATH": _github_meta_path(tmp_path)}
     return argv, env
 
 
@@ -98,3 +104,59 @@ def test_disagreeing_primary_anchors_refuse_before_scratch_or_provider(tmp_path,
     else:
         assert receipt["reason"] == boundary
     assert not (tmp_path / "scratch-anchor").exists()
+
+
+@pytest.mark.parametrize("mode", ["legacy", "no_sidecars", "reader", "lifted_writer"])
+def test_real_launch_reads_only_the_selected_store_and_existing_sidecars(tmp_path, mode, monkeypatch, configured_roots):  # noqa: F811
+    worktree, _head = _linked_worktree(tmp_path)
+    primary = tmp_path / "repo"
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    (primary / "AGENTS.md").write_text("primary must remain hidden")
+    selector = primary / "data" / "sources.db"
+    selected = selector
+    hidden = None
+    with contextlib.ExitStack() as stack:
+        if mode != "legacy":
+            directory = primary / "data" / "sources-generations"
+            directory.mkdir()
+            selected = directory / "sources.20261031T010000Z-0123456789ab.db"
+            selector.rename(selected)
+            selector.symlink_to(selected.relative_to(selector.parent))
+            connection = sqlite3.connect(selected)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("INSERT INTO proof VALUES ('selected')")
+            connection.commit()
+            connection.close()
+            hidden = directory / "sources.20261031T000000Z-abcdef012345.db"
+            hidden.write_bytes(b"hidden history")
+            selected.with_name(selected.name + ".receipt.json").write_text("hidden receipt")
+            if mode == "reader":
+                reader = stack.enter_context(contextlib.closing(open_readonly(selected)))
+                assert reader.execute("SELECT value FROM proof").fetchall() == [("selected",)]
+            elif mode == "lifted_writer":
+                hold_database(selected)
+                stack.enter_context(generations.store_writer(selector))
+                writer = stack.enter_context(contextlib.closing(sqlite3.connect(selected)))
+                writer.execute("INSERT INTO proof VALUES ('host writer')")
+                writer.commit()
+        before = set(agy_sandbox._store_sidecars(selected))
+        argv, env = _launch(tmp_path, worktree, "store-layout", ["/bin/true"])
+        run = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120, cwd=worktree)
+        receipt = json.loads((tmp_path / "store-layout.sandbox.json").read_text())
+        assert (run.returncode, receipt["status"]) == (0, "ran"), (receipt.get("reason"), run.stderr)
+        assert receipt["canary"]["passed"] is True
+        probes = receipt["canary"]["probes"]
+        source_read = next(probe["outcome"] for probe in probes if probe["op"] == "store_read" and probe["store"] == "sources")
+        if mode == "no_sidecars":
+            assert source_read in [{"status": "read", "store": "sources", "reason": None},
+                                   {"status": "refused", "store": "sources", "reason": "wal_sidecars_unavailable"}]
+        else:
+            assert source_read == {"status": "read", "store": "sources", "reason": None}
+        outcomes = {(p["op"], p["path"]): p["outcome"] for p in probes}
+        assert outcomes[("stat", str(primary / "AGENTS.md"))] == "ENOENT"
+        if hidden is not None:
+            assert outcomes[("stat", str(hidden))] == "ENOENT"
+            assert outcomes[("stat", str(selected) + ".receipt.json")] == "ENOENT"
+        assert set(agy_sandbox._store_sidecars(selected)) == before
+        assert not (worktree / "data" / "sources.db").exists()
+        assert not (worktree / "data" / "vesum.db").exists()
