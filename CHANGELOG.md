@@ -10,6 +10,14 @@ notices them.
 
 ## [Unreleased]
 
+<a id="v0.1.19"></a>
+## [0.1.19] - 2026-11-14
+
+### Fixed
+
+- Write workers on the AGY, Cursor and OpenCode routes can call the read-only Sources dictionary tools inside the write boundary, as Claude and Codex workers already could. Read-only review dispatch is unchanged. ([#543](https://github.com/learn-ukrainian/machinery/pull/543))
+- Monitor UI: the machinery page header shows the installed release for every viewer, including viewers behind the UI gateway, without calling `/api/health`. The Subscriptions "Banked resets" column reads "not reported" instead of "unknown" when a pool does not report it. ([#542](https://github.com/learn-ukrainian/machinery/pull/542))
+
 <a id="v0.1.18"></a>
 ## [0.1.18] - 2026-11-14
 
@@ -460,7 +468,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.18...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.19...HEAD
+[0.1.19]: https://github.com/learn-ukrainian/machinery/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/learn-ukrainian/machinery/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/learn-ukrainian/machinery/compare/v0.1.16...v0.1.17
 [0.1.16]: https://github.com/learn-ukrainian/machinery/compare/v0.1.15...v0.1.16
