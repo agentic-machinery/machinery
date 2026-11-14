@@ -2,10 +2,12 @@
 
 import json
 from pathlib import Path
+from unittest.mock import Mock
 import pytest
 from lu_machinery.dispatcher import git, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.dispatcher.conftest import run_git
+from tests.dispatcher.conftest import MERGED
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 
@@ -26,6 +28,7 @@ def test_delivery_observes_actual_remote_and_dirty_worktree(sandbox, model, push
     assert record["push_state"] == push_state
     assert record["commits_ahead"] == ahead
     assert record["worktree_dirty_on_exit"] is dirty
+    assert "closeout" not in record  # An actual unmerged dispatch must never trigger merge cleanup.
     assert (record["worktree_disposition"] == "removed") is (push_state == "pushed" or dirty)
     if record["worktree_disposition"] == "removed":
         # Settlement removed the published or scratch-only worktree; re-attach it at its head for the probes below.
@@ -177,6 +180,78 @@ def test_scope_checks_each_own_commit(sandbox, delivery_settle, history, monkeyp
         worker._enforce_delivery(result)
     assert result["status"] == ("done" if history == "merged" else "no_deliverable")
     assert result["error"] == (None if history == "merged" else "outside_owned_paths: outside.txt")
+
+
+@pytest.mark.parametrize(
+    ("repo_key", "mode", "pr_state", "closeout_code", "explicit"),
+    [
+        pytest.param("public", "workspace-write", "MERGED", 0, False, id="merged-settlement-omits-closeout"),
+        pytest.param("machinery", "workspace-write", "MERGED", 0, False, id="wrong-repository-root"),
+        pytest.param("public", "workspace-write", "OPEN", 0, False, id="unmerged-triggers-closeout"),
+        pytest.param("public", "read-only", "MERGED", 0, False, id="read-only-triggers-closeout"),
+        pytest.param("public", "workspace-write", "MERGED", 1, False, id="nonzero-closeout-hidden"),
+        pytest.param("public", "workspace-write", "MERGED", 0, True, id="boundary-closeout-runs-twice"),
+    ],
+)
+def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
+    merged_delivery_world, monkeypatch, tmp_path, repo_key, mode, pr_state, closeout_code, explicit,
+):
+    """Defect classes: omitted, misrouted, premature, hidden-failure and duplicate settlement closeout.
+
+    New cases approved by claude-cto, message_f413e45fe3914a1fa0ae103efbb27d8b.
+    """
+    world = merged_delivery_world
+    slug = "learn-ukrainian/machinery" if repo_key == "machinery" else "learn-ukrainian/learn-ukrainian.github.io"
+    root = tmp_path / repo_key
+    root.mkdir()
+    record = world.record
+    record.update(repo=repo_key, mode=mode, commits_ahead=1, worktree_remote_url=f"https://github.com/{slug}.git")
+    world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": record["worktree_branch"]}]
+    world.prs[78] = {**MERGED, "state": pr_state, "headRefOid": record["head_sha"]}
+    world.files[78] = ["docs/owned.md"]
+    request = {"pr": 78, "repo": slug, "repo_root": str(root)}
+    if explicit:
+        record["write_boundary"] = {"closeout_request": request}
+    monkeypatch.setattr(git, "resolve_repo", lambda key: (root, {"github": slug}) if key == repo_key else None)
+    monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
+    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
+    events = []
+    disposition = "retained"
+
+    def reap(current, **_):
+        assert "closeout" not in current
+        events.append(disposition)
+        current.update(worktree_disposition=disposition,
+                       worktree_disposition_reason="clean" if disposition == "removed" else "provider_processes_alive")
+
+    def closeout(actual):
+        assert record["worktree_disposition"] == "removed"
+        assert actual == request
+        events.append("closeout")
+        return {"pr": 78, "returncode": closeout_code, "stdout": "closeout receipt", "stderr": ""}
+
+    monkeypatch.setattr(worker, "_reap_worktree", reap)
+    runner = Mock(side_effect=closeout)
+    monkeypatch.setattr(worker.write_boundary, "run_closeout", runner)
+    # A temporarily retained tree must not poison the receipt before the existing reap pass removes it.
+    worker._reap_settled(record)
+    assert events == ["retained"]
+    assert "closeout" not in record
+    assert (record["status"], record["error"]) == ("done", None)
+    runner.assert_not_called()
+    events.clear()
+    disposition = "removed"
+    worker._reap_settled(record)
+    if mode == "read-only" or pr_state != "MERGED":
+        assert events == ["removed"]
+        assert "closeout" not in record
+        runner.assert_not_called()
+    else:
+        assert events == ["removed", "closeout"]
+        runner.assert_called_once_with(request)
+        assert record["closeout"] == {"pr": 78, "returncode": closeout_code, "stdout": "closeout receipt", "stderr": ""}
+    assert record["status"] == ("failed" if closeout_code else "done")
+    assert record["error"] == ("closeout_failed: PR 78 exit 1" if closeout_code else None)
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
