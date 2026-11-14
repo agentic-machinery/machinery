@@ -22,6 +22,10 @@ def repo(tmp_path: Path) -> Path:
         ["git", "init", "-q"],
         ["git", "config", "user.name", "Migration test"],
         ["git", "config", "user.email", "migration@example.invalid"],
+        # git commit otherwise spawns a detached `git maintenance run --auto`
+        # that creates and removes .git/objects/maintenance.lock after the
+        # fixture returns, racing every byte-for-byte tree snapshot of repo.
+        ["git", "config", "maintenance.auto", "false"],
         ["git", "add", "agents_extensions"],
         ["git", "commit", "-qm", "source"],
     ):

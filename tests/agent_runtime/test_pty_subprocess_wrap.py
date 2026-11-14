@@ -118,24 +118,43 @@ def test_pty_master_read_returns_eof_or_eio_on_child_exit(clean_env, tmp_path):
 # in real time when PTY-wrapped.
 #
 # This is the core regression guard. With the legacy pipe spawn, a child
-# that writes "a", sleeps 0.5s, writes "b" — without ever calling
-# fflush(stdout) — would not surface "a" until the buffer filled or the
-# child exited. PTY makes the child line-buffer, so "a" appears
-# immediately.
+# that writes "a" and then blocks — without ever calling fflush(stdout) —
+# would not surface "a" until the buffer filled or the child exited. PTY
+# makes the child line-buffer, so "a" appears while the child is still
+# blocked. The child stays blocked until the test releases it, so the
+# proof does not depend on how fast the host starts the interpreter.
 # ----------------------------------------------------------------------
 
+# The child writes "a" without flushing, then blocks until the parent
+# creates the release file (bounded so a broken test cannot leave it
+# running), then writes "b". Kept as a real multi-line script so the
+# blocking loop is ordinary Python.
+_BLOCKING_CHILD = """\
+import os, sys, time
+sys.stdout.write('a\\n')
+end = time.monotonic() + 60
+while not os.path.exists(sys.argv[1]) and time.monotonic() < end:
+    time.sleep(0.01)
+sys.stdout.write('b\\n')
+"""
+
+
+def _wait_for_line(state, needle, timeout):
+    """Wait for the event itself; ``timeout`` only bounds a real failure."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(needle in ln for ln in state.stdout_lines):
+            return True
+        time.sleep(0.02)
+    return any(needle in ln for ln in state.stdout_lines)
+
+
 def test_pty_breaks_block_buffering_for_unflushed_child(clean_env, tmp_path):
+    release = tmp_path / "release"
     proc, stdout_fd, stderr_fd = _spawn_pty_subprocess(
-        [
-            _TEST_PYTHON,
-            "-c",
-            # No flush calls — relies entirely on line-buffering kicking in
-            # because the child detects stdout is a TTY (PTY).
-            "import sys, time; "
-            "sys.stdout.write('a\\n'); "
-            "time.sleep(0.5); "
-            "sys.stdout.write('b\\n')",
-        ],
+        # No flush calls — relies entirely on line-buffering kicking in
+        # because the child detects stdout is a TTY (PTY).
+        [_TEST_PYTHON, "-c", _BLOCKING_CHILD, str(release)],
         cwd=tmp_path,
         env=os.environ.copy(),
     )
@@ -148,26 +167,26 @@ def test_pty_breaks_block_buffering_for_unflushed_child(clean_env, tmp_path):
             stdout_master_fd=stdout_fd,
             stderr_master_fd=stderr_fd,
         )
-        # Within ~0.3s — before the 0.5s sleep — "a\n" must be visible.
-        # If we get this within 0.3s the PTY line-buffering is working.
-        # If it only shows up after the child exits (~0.5s+), the PTY
-        # change isn't actually taking effect.
-        deadline = time.monotonic() + 0.4
-        while time.monotonic() < deadline:
-            if state.stdout_lines and any("a" in ln for ln in state.stdout_lines):
-                break
-            time.sleep(0.02)
-        assert state.stdout_lines, (
-            "no stdout lines reached the streamer within 0.4s — "
-            "PTY is not actually line-buffering the child"
+        # The child cannot exit (and so cannot flush on exit) until it is
+        # released, so "a" arriving now proves real-time line buffering
+        # however slowly the host starts the interpreter.
+        assert _wait_for_line(state, "a", 30.0), (
+            "no 'a' line reached the streamer while the child was blocked — "
+            f"PTY is not actually line-buffering the child; got {state.stdout_lines!r}"
         )
-        assert any("a" in ln for ln in state.stdout_lines), (
-            f"first line missing 'a'; got lines: {state.stdout_lines!r}"
+        assert proc.poll() is None, (
+            "child exited before 'a' was observed, so its exit flush could "
+            "have delivered it; the line-buffering proof is void"
         )
-        # Both lines should be present after child exits.
-        proc.wait(timeout=5.0)
-        time.sleep(0.1)  # let streamer drain
+        release.touch()
+        # Both lines should be present after the child is released; wait
+        # for "b" itself before stop_watchdog closes the master fds.
+        assert _wait_for_line(state, "b", 30.0), (
+            f"'b' never reached the streamer after release; got {state.stdout_lines!r}"
+        )
+        proc.wait(timeout=30.0)
     finally:
+        release.touch()
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5.0)
