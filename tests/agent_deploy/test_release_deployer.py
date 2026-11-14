@@ -5,6 +5,8 @@ are literals, never constructed by the deployer's inventory or renderer.
 """
 from __future__ import annotations
 
+import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -678,3 +680,150 @@ def test_packaged_resource_edits_load_without_stale_pins_and_change_identity(tmp
     inventory["provider_replacements"]["codex"].append("scratch-metadata")
     inventory_path.write_bytes(plan.encoded(inventory))
     assert plan.release_inputs()[2] != identity
+
+
+# Defect class of every test below: installed-deploy output verification in reject_untracked_inputs
+# (machinery#22). A consumer deploys the real packaged release through the deploy CLI, and the pre-push
+# gate checks the result through a launcher, as a consumer's pre-push hook runs it.
+GATE_PRODUCT_HOOK = b"#!/usr/bin/env python3\nprint('product hook')\n"
+
+
+def load_gate(monkeypatch):
+    checkout = next(p for p in Path(__file__).resolve().parents if (p / ".githooks/pre_push_gate.py").is_file())
+    spec = importlib.util.spec_from_file_location("deploy_output_pre_push_gate", checkout / ".githooks/pre_push_gate.py")
+    gate = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, gate)
+    spec.loader.exec_module(gate)
+    return gate
+
+
+def git_environment():
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
+def commit_all(root, message):
+    for command in (["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=/dev/null",
+                                    "commit", "-q", "-m", message]):
+        subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True, env=git_environment())
+
+
+def deploy_cli(root):
+    result = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root)],
+                            capture_output=True, text=True, env=git_environment(), check=False)
+    assert result.returncode == 0, result.stderr
+
+
+def release_hook():
+    """One release-owned Python hook the Claude provider deploys, from the packaged inventory."""
+    inventory = plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
+    return next(target for name, record in sorted(inventory["files"].items()) if name.endswith(".py")
+                for target in record["targets"].get("claude", []))
+
+
+@pytest.fixture
+def deployed(tmp_path):
+    root = tmp_path / "gate-consumer"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True, env=git_environment())
+    inventory = plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
+    settings: dict = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        *parents, event = requirement["path"]
+        node = settings
+        for name in parents:
+            node = node.setdefault(name, {})
+        node.setdefault(event, []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    write(root, "agents_extensions/claude/settings.json", json.dumps(settings))
+    write(root, "agents_extensions/claude/hooks/product.py", GATE_PRODUCT_HOOK, 0o755)
+    write(root, plan.DESCRIPTOR, json.dumps({"providers": ["claude"], "preserve": [],
+                                             "sources": {"claude": {"path": "agents_extensions/claude", "required": True}}}))
+    write(root, ".gitignore", "/.claude/\n/.agents/\n/.deploy-state/\n")
+    commit_all(root, "consumer")
+    deploy_cli(root)
+    launcher = write(tmp_path, "launcher.sh", f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n', 0o755)
+    return root, str(launcher)
+
+
+def gate_verdict(gate, root, launcher):
+    try:
+        return gate.reject_untracked_inputs(root, launcher), None
+    except gate.GateOutcome as error:
+        return None, error
+
+
+def test_installed_deploy_outputs_verified_by_check_are_not_untracked_inputs(deployed, monkeypatch):
+    """The #22 refusal: release- and product-owned hook copies the session runs from block every push."""
+    root, launcher = deployed
+    gate = load_gate(monkeypatch)
+    listed = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--", "*.py"], capture_output=True,
+                            text=True, check=True, env=git_environment()).stdout.split()
+    assert {".claude/hooks/product.py", release_hook()} <= set(listed)
+    manifest, error = gate_verdict(gate, root, launcher)
+    assert error is None
+    assert manifest == hashlib.sha256((root / plan.STATE).read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("change", ["product-copy", "release-copy", "source-committed-after-deploy"])
+def test_deployed_output_edited_after_deploy_is_refused(deployed, monkeypatch, change):
+    """A stale or edited copy is not the deploy's current output, so it stays an overlay."""
+    root, launcher = deployed
+    gate = load_gate(monkeypatch)
+    assert gate_verdict(gate, root, launcher)[1] is None
+    if change == "source-committed-after-deploy":
+        write(root, "agents_extensions/claude/hooks/product.py", GATE_PRODUCT_HOOK + b"print('changed')\n", 0o755)
+        commit_all(root, "source change")
+        changed = ".claude/hooks/product.py"
+    else:
+        changed = ".claude/hooks/product.py" if change == "product-copy" else release_hook()
+        with (root / changed).open("ab") as handle:
+            handle.write(b"print('edited')\n")
+    _, error = gate_verdict(gate, root, launcher)
+    assert error is not None and error.reason == "untracked_inputs"
+    assert f"output drift: {changed}" in error.detail
+
+
+@pytest.mark.parametrize("extra", [".claude/hooks/extra.py", ".claude/extra.py", ".agents/extra.py"])
+def test_unplanned_file_in_provider_directory_is_refused(deployed, monkeypatch, extra):
+    """A file the plan does not own is refused, whether or not the deploy's check inventories its name."""
+    root, launcher = deployed
+    gate = load_gate(monkeypatch)
+    assert gate_verdict(gate, root, launcher)[1] is None
+    write(root, extra, "value = 1\n")
+    _, error = gate_verdict(gate, root, launcher)
+    assert error is not None and error.reason == "untracked_inputs"
+    assert extra in error.detail
+
+
+@pytest.mark.parametrize(("failure", "cause"), [
+    ("no-manifest", "no deploy ownership manifest"),
+    ("launcher-fails", "the deploy check exited 3"),
+    ("manifest-changes-during-check", "the deploy ownership manifest changed during the check"),
+    ("symlinked-copy", "the deploy check exited 2"),
+])
+def test_failed_deploy_check_keeps_provider_files_refused(deployed, monkeypatch, tmp_path, failure, cause):
+    """Without a passing check over an unchanged manifest, no provider file is exempt."""
+    root, launcher = deployed
+    gate = load_gate(monkeypatch)
+    assert gate_verdict(gate, root, launcher)[1] is None
+    if failure == "no-manifest":
+        (root / plan.STATE).unlink()
+    elif failure == "launcher-fails":
+        launcher = str(write(tmp_path, "failing-launcher.sh", "#!/usr/bin/env bash\nexit 3\n", 0o755))
+    elif failure == "manifest-changes-during-check":
+        launcher = str(write(tmp_path, "rewriting-launcher.sh", f'#!/usr/bin/env bash\n"{sys.executable}" "$@"\n'
+                             f'status=$?\nprintf " " >> "{root / plan.STATE}"\nexit $status\n', 0o755))
+    else:
+        copy = root / ".claude/hooks/product.py"
+        target = write(tmp_path, "product-copy.py", copy.read_bytes(), 0o755)
+        copy.unlink()
+        copy.symlink_to(target)
+    _, error = gate_verdict(gate, root, launcher)
+    assert error is not None and error.reason == "untracked_inputs"
+    assert cause in error.detail
+
+
+def test_gate_provider_directories_match_deploy_targets(monkeypatch):
+    """Layout drift: the gate must name every directory the deploy writes, and its ownership manifest."""
+    gate = load_gate(monkeypatch)
+    assert sorted(gate.DEPLOY_ROOTS) == sorted({*plan.TARGETS.values(), ".agents"})
+    assert gate.DEPLOY_STATE == plan.STATE

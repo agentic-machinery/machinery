@@ -19,6 +19,19 @@ The scanner reads remote ref names, annotated tag names and messages (nested tag
 
 The hook does not run `pre-commit`, `lint_opsec_leaks.py --commit-range` or `check-no-internal-ids`. This repository has no `.pre-commit-config.yaml`. The hook does not call `.githooks/pre_push_gate.py` `main()`. That entry still holds admission, the stage and run budgets, the concurrent scope, receipts, measurements and the Entire-ref refusal, and its product stage always raises `validation_incomplete` with the detail `this repository has no product push stage; the publication scanner is the push scan`. The same uncalled entry still reads `LU_PRE_PUSH_GATE_ADMISSION_WAIT_S`, `LU_PRE_PUSH_GATE_STAGE_BUDGET_S`, `LU_PRE_PUSH_GATE_RUN_BUDGET_S`, `LU_PRE_PUSH_GATE_MAX_CONCURRENT_RUNS` and `LU_PRE_PUSH_GATE_RUN_TOKEN`. None of them apply to a push.
 
+## Untracked inputs and deployed agent outputs
+
+`main()` refuses a push (`untracked_inputs`) when an untracked or ignored `*.py`, `*.pth`, `pytest.ini`, `tox.ini`, `setup.cfg` or `pyproject.toml` lies outside the outgoing commit (`reject_untracked_inputs`). Two derived sets are exempt. The first is dependency files under a `node_modules` directory whose sibling `package-lock.json` is tracked. The second is the current output of the installed agent deploy (machinery#22).
+
+The installed deploy (`python -I -m lu_machinery.agent_deploy --project-root <checkout>`) writes release-owned and product-owned files into the provider directories `.agent`, `.agents`, `.claude`, `.codex`, `.cursor` and `.gemini`, with its ownership manifest at `.deploy-state/agent-deploy.v1.json`. Agent sessions run their hooks from those copies, so a worker must not delete them to push. When a listed file lies in a provider directory, the gate runs the deploy's own `--check` through the project launcher. A file is exempt only if all of these hold:
+
+- the check exits 0;
+- the manifest reads the same before and after the check;
+- the file is a regular file, not a symlink;
+- its SHA-256 equals its manifest record.
+
+The digest of that manifest joins the receipt (`agent_deploy`). Everything else stays refused, and the refusal states why the deploy did not verify the files: an edited or stale copy, an extra file, a symlink, a missing manifest, or a check that fails or cannot run. To fix it, commit the agent extension sources, run the deploy again, then push. `.githooks/pre-push` in this repository does not call `main()`. A consumer whose pre-push hook does call it gets this behaviour.
+
 ## Bypass
 
 `git push --no-verify` tells Git to skip hooks. The agent git shim refuses that option, and any argument whose name is at least three characters and a prefix of `--no-verify`, before Git runs (`OPSEC: --no-verify would skip the push scan; push refused.`, exit 2). It also refuses a push when `GIT_CONFIG` is set, when `--shallow-file` is passed, or when the scanner hooks, `git_push.py` or the project interpreter cannot be used. Those refusals exit 2.
