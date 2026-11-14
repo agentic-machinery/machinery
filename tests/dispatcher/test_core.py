@@ -152,6 +152,7 @@ def test_private_muse_never_receives_contributor_on(spec, private_repos, mode, s
 
 
 def test_public_muse_contributor_on_is_preserved(spec, private_repos):
+    """Pins argv forwarding; product #12969's forced-off regression stays with its production port."""
     spec = dataclasses.replace(spec, options={"contributor_mode": "on"})
     checks.check_private_input(spec, "public")
     argv = muse.build(spec, {}).argv
