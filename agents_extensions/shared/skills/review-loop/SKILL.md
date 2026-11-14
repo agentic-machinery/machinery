@@ -51,6 +51,13 @@ interpreter does not select the primary checkout's Python modules.
    escalate a dispute or a scope breaker. A budgeted round is never spent on a defect the author
    already knows. If the change is being discarded for a new approach, skip repairs to the code
    being replaced; the code that stays and its replacement still get checks and exact-head review.
+   **Write-boundary changes need the five-route canary first.** When the change affects worker-sandbox
+   (write boundary) behavior (the boundary, its dependencies, credential or Sources projections, provider
+   adapters, hook configuration or the broker, even outside the named files), run the
+   [five-route canary](../../../../docs/runbooks/write-worker-boundary.md#five-route-canary) at the exact
+   code under review and attach its table to the PR before requesting the review of record. All five
+   routes are required; a route that cannot run needs capacity or a recorded exception. Changed code voids
+   the table. Independent review and the same-head CI requirements are unchanged.
 1. **Freeze the round-1 brief** ([brief](references/brief.md)): outcome, acceptance criteria,
    non-goals, the input contract (what executes, on which data, and who controls the input),
    dispositions. If an optional DeepSeek author pre-check
