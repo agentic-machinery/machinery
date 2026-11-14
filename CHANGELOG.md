@@ -13,10 +13,19 @@ notices them.
 <a id="v0.1.19"></a>
 ## [0.1.19] - 2026-11-14
 
+### Changed
+
+- Release acceptance requires a five-route write-boundary canary (claude, codex, cursor, agy, opencode) whenever the release contains a change to worker-sandbox behavior. The write-boundary runbook holds the recipe, the checks and the evidence record. ([#547](https://github.com/learn-ukrainian/machinery/pull/547))
+- Inside the write boundary, the commit-message scan defers to the broker's host push scan, which still scans every pushed commit. Outside the boundary the scan is unchanged. ([#546](https://github.com/learn-ukrainian/machinery/pull/546))
+
 ### Fixed
 
 - Write workers on the AGY, Cursor and OpenCode routes can call the read-only Sources dictionary tools inside the write boundary, as Claude and Codex workers already could. Read-only review dispatch is unchanged. ([#543](https://github.com/learn-ukrainian/machinery/pull/543))
 - Monitor UI: the machinery page header shows the installed release for every viewer, including viewers behind the UI gateway, without calling `/api/health`. The Subscriptions "Banked resets" column reads "not reported" instead of "unknown" when a pool does not report it. ([#542](https://github.com/learn-ukrainian/machinery/pull/542))
+
+### Removed
+
+- The review-loop skill and the model-assignment rules no longer mention Muse as a second reader. ([#546](https://github.com/learn-ukrainian/machinery/pull/546))
 
 <a id="v0.1.18"></a>
 ## [0.1.18] - 2026-11-14
