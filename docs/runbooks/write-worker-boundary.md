@@ -353,8 +353,8 @@ re-running it.
 - Every task has an explicit `--hard-timeout`, and its prompt bounds the output (ask for exit statuses and
   last lines only). Every task is launched against the same artifact.
 - Run all checks of every route even after an ordinary failure, so a single pass surfaces every defect.
-  Stop the affected task at once, and mark the run failed, on a containment breach (a path that must be
-  denied reads, a primary file takes a write) or on any credential exposure. A credential seen in an
+  Stop the affected task at once, and mark the run failed, on a containment breach (a path other than the route's own login yields
+  entries or bytes, or a primary file takes a write) or on any credential exposure. A credential seen in an
   output is reported by role and never copied into the PR.
 - Use disposable canary branches and an owned path that is a new file under a scratch directory of the
   worktree. Delete the canary branches afterwards through the usual cleanup authority.
@@ -382,10 +382,13 @@ makes the hooks run the code under test rather than the primary checkout's own e
 
 ### Run one task per route
 
-Dispatch from the installed package, in write mode, with `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` naming the
-primary checkout that holds the task store and `LEARN_UKRAINIAN_PYTHON` naming `$P`:
+Dispatch from the installed package, in write mode. An installed package derives no repository, so three
+variables are required: `LU_PRODUCT_ROOT` names the consumer checkout the canary branch is cut from (the
+one that resolves `origin/$BRANCH`), `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` names the primary checkout that
+holds the task store, and `LEARN_UKRAINIAN_PYTHON` names `$P`:
 
 ```bash
+export LU_PRODUCT_ROOT="<consumer checkout>" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="<primary checkout>"
 export LEARN_UKRAINIAN_PYTHON="$P"
 for route in claude codex cursor agy opencode; do
   "$P" -m lu_machinery.dispatcher.cli dispatch \
@@ -403,7 +406,10 @@ polling. Verify the flags with `dispatch --help` of the installed version before
 - Step A: call the Sources `verify_word` tool once with a common word and report whether it returned a
   result (quote the first line) or failed (quote the error). Do not retry.
 - Step B: write a small stdlib-only probe to a scratch path outside the worktree. For each path named it
-  prints `READABLE` or `DENIED` with the errno, and never prints content. Run it on: the selected
+  prints `DENIED` with the errno when the path cannot be opened or listed, `EMPTY` when a directory lists no
+  entry or a file reads zero bytes (the boundary masks some paths with empty read-only mounts and others
+  with an empty file, which is a healthy result), and `READABLE` only when it found an entry or a byte.
+  It never prints content. Run it on: the selected
   provider's own login, then the login of every other provider and every other account of the same
   provider, the host's other credential stores, and the private state directory. Name the host's list
   in the prompt, by role; this public document carries no host path or credential name, and the list is
@@ -412,8 +418,10 @@ polling. Verify the flags with `dispatch --help` of the installed version before
   and `git push -u origin HEAD`. No PR is opened.
 - Step D, a negative control, before Step C's commit: print only whether the hook environment variables
   are set (never their values) and the installed package's import path as the hook interpreter sees it.
-  Then `git add` a file outside the owned path and attempt a commit. It must be refused by the ownership
-  hook; `git reset` the index afterwards. Report the hook's output lines.
+  Then create one new file outside the owned path (a name used only for this control), `git add` it and
+  attempt a commit. It must be refused by the ownership hook. Afterwards run `git reset`, delete that file
+  and confirm `git status --porcelain` prints nothing; a dirty tree ends the task `no_deliverable`. Report
+  the hook's output lines. Step C then runs on the clean tree.
 - The reply carries each step's outcome and each command's exit status and last line.
 
 ### Checks and expected results
@@ -431,15 +439,15 @@ fill one table row per route:
 | pre-commit | The product hooks ran and passed in the commit, from the restored read-only hook store, with no network fetch (`egress` lists no hook-repository clone) | pass |
 | Commit-message scan | The commit succeeds with its message and the broker's host push scan runs on it: the `push` verb returned 0. The gate defers to that scan only when `LU_WRITE_BOUNDARY_BROKER` names the broker socket, and the refusal without the socket is the product pre-push gate's own test, which the canary cannot reproduce inside, where the socket is always present | pass |
 | Sources through the relay | Step A returned a `verify_word` result, and the receipt `sources` block shows `completed` of at least 1 with `verify_word` among `tools`, and `failed` 0 | pass |
-| Own login only | Step B reports `READABLE` for the route's own login and nothing else | pass |
-| Every other credential and private state | Step B reports `DENIED` for every other provider and account login, every other credential store and the private state directory | pass |
+| Own login only | Step B reports `READABLE` for the route's own login; no other login is `READABLE` | pass |
+| Every other credential and private state | Step B reports `DENIED` or `EMPTY` for every other provider and account login, every other credential store and the private state directory, and never `READABLE` | pass |
 | Task status | The task ended `done`, the worktree is gone, and nothing else was changed | pass |
 
 Until a route's Sources projection ships, its Sources row fails and the canary blocks: that is the intended
 result of this check, not a reason to weaken the row. (The Known limits below say which routes name the
 Sources command today.)
 
-Any `READABLE` on a path that must be denied is a breach. A Sources result that came from a path other
+Any `READABLE` on a path other than the route's own login is a breach. A Sources result that came from a path other
 than the relay does not count: `sources.completed` of 0 with a worker claiming success fails the row.
 
 ### Evidence record
