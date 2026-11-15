@@ -222,6 +222,17 @@ active environment; the merged-PR worktree reaper disposes of it safely.
 Workers implement inside `.worktrees/dispatch/<agent>/<task>/`. They do not
 become a second coordination plane.
 
+#### Task-card dependencies and owned-path overlap
+
+`--task-card '#N'` (also `owner/repo#N` or a staged card file) reads the card's
+`## Dependencies` section and refuses the dispatch, before anything is created,
+while a listed `#N`, `owner/repo#N` or exact same-repository issue title is open
+or its state cannot be read; `--allow-open-dependency '#N'` admits that one
+reference, and the task record's `task_card` field names it. Every write dispatch
+with owned paths prints the live write tasks whose owned paths equal, contain or
+lie inside its own and records them as `owned_path_overlap`;
+`--refuse-on-overlap` refuses it instead. Both run under `--dry-run` (#583).
+
 #### Sibling-repo dispatch
 
 `--worktree` and `--branch` default to the Learn Ukrainian primary checkout

@@ -76,6 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
         f"  .venv/bin/python {_DISPATCH} dispatch --agent muse --model muse-wonder-full-1.0 "
         "--prompt 'Explain X' --contributor-mode on --dry-run\n"
         f"  .venv/bin/python {_DISPATCH} dispatch --agent cursor --model grok-4.7-high --prompt 'Explain X'\n"
+        f"  .venv/bin/python {_DISPATCH} dispatch --agent claude --model claude-sonnet-5-5 --mode workspace-write "
+        "--prompt-file brief.md --owned-path docs/x.md --task-card '#583' --allow-open-dependency '#575' "
+        "--refuse-on-overlap --dry-run\n"
         "Outputs: task ID and nonce; task JSON, prompt, result, logs and dispatch worktree.\n"
         "  Muse supports read-only work only; other modes are refused with muse_worker_mode_refused.\n"
         "  Muse task JSON records the effective contributor_mode. --dry-run prints a plan and creates nothing.\n"
@@ -165,6 +168,22 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument(
         "--force-admission", metavar="REASON",
         help="Override host admission with a recorded non-empty reason; never overrides a full worktree disk (default: off)",
+    )
+    dispatch.add_argument(
+        "--task-card", metavar="CARD",
+        help="Task card, e.g. '#583', learn-ukrainian/machinery#583 or a card file: refuse while a #N, owner/repo#N "
+        "or exact same-repository title in its '## Dependencies' section is open or unreadable; the record names "
+        "the dependencies (default: no card, no check)",
+    )
+    dispatch.add_argument(
+        "--allow-open-dependency", action="append", default=[], metavar="REF",
+        help="Admit this open or unreadable --task-card dependency, e.g. '#575'; recorded in the task record "
+        "(repeatable; default: none)",
+    )
+    dispatch.add_argument(
+        "--refuse-on-overlap", action="store_true",
+        help="Refuse a write task whose owned paths equal, contain or lie inside a live write task's; the overlap "
+        "is always printed and recorded (default: off)",
     )
     dispatch.add_argument("--dry-run", action="store_true", help="Print plan; create nothing (default: off)")
     dispatch.add_argument("--print-advisory-binding", action="store_true",
@@ -431,6 +450,19 @@ def _dispatch(args) -> int:
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
     repo, info = git.resolve_repo(args.repo)
+    # Work that cannot land yet, or that collides with a live worker, is caught before anything is spent (#583).
+    if args.allow_open_dependency and not args.task_card:
+        raise ValueError("--allow-open-dependency requires --task-card")
+    gate_fields: dict[str, object] = {}
+    if args.task_card:
+        gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
+    if args.mode != "read-only" and args.owned_path:
+        overlap = checks.owned_path_overlap(args.owned_path, task_id)
+        if overlap:
+            print(f"dispatcher: owned paths overlap live write tasks: {', '.join(overlap)}", file=sys.stderr)
+            if args.refuse_on_overlap:
+                raise ValueError(f"owned_path_overlap_refused: owned paths overlap live write tasks {', '.join(overlap)}")
+        gate_fields["owned_path_overlap"] = overlap
     host_admission.precheck(args.mode, force_reason=args.force_admission)
     role_record = {**vars(args), **account_fields, "prompt_sha256": store.digest(prompt),
                    "repository_id": info.get("github")}
@@ -577,7 +609,7 @@ def _dispatch(args) -> int:
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
         invocation = runtime_context.build(spec, child_env(spec))
-        plan = dict(worktree=str(worktree), start_sha=sha, argv=invocation.argv, record_path=str(path))
+        plan = dict(worktree=str(worktree), start_sha=sha, argv=invocation.argv, record_path=str(path), **gate_fields)
         if binding:
             plan.update(review_attempt=binding, review_access=args.review_access or "isolated")
         print(json.dumps(plan, indent=2))
@@ -626,7 +658,7 @@ def _dispatch(args) -> int:
             record["worktree_remote_url"] = publish_remote
         if args.mode != "read-only" and args.owned_path and record["worktree_remote_url"] is None:
             raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
-        record.update(advisory_fields, **account_fields, **trial_fields)
+        record.update(advisory_fields, **account_fields, **trial_fields, **gate_fields)
         record["pool_shadow"] = pool_selector.shadow_decision(record)
         if agent == "muse":
             record["requested_contributor_mode"] = args.contributor_mode or "off"

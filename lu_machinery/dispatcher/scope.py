@@ -14,7 +14,7 @@ GENERATED_OUTPUTS = {
 }
 
 
-def _literal_root(raw: str) -> str | None:
+def literal_root(raw: str) -> str | None:
     """The owned path's literal part before any glob, or None when it has none."""
     path = PurePosixPath(raw.strip().replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts:
@@ -36,7 +36,7 @@ def with_generated_outputs(owned_paths) -> tuple[list[str], list[str]]:
     from lu_machinery.guardrails.delegate_ownership import path_is_owned
 
     owned = list(owned_paths)
-    roots = [root for root in map(_literal_root, owned) if root]
+    roots = [root for root in map(literal_root, owned) if root]
     added = [output for prefix, output in GENERATED_OUTPUTS.items()
              if not path_is_owned(output, owned)
              and any(root == prefix or root.startswith(prefix + "/") or prefix.startswith(root + "/") for root in roots)]
