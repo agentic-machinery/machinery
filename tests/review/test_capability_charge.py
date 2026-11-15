@@ -112,15 +112,28 @@ def test_clean_generated_hash_merge_gets_one_delta_outside_spent_budget(budget_m
     exemptions = recorder.budget_exempt_heads(comments[:3], sibling, "fleet", prove=next_proof,
                                              unrecorded=[candidate])
     assert set(exemptions) == {candidate}
+    # The generated-file exception requires the actual merged source's hash.
+    invalid = files(1, 1)
+    invalid["lu_machinery/lint/rename-map.json.sha256"] = "0" * 64 + "  rename-map.json\n"
+    assert prove(approved, commit(invalid, approved, base)) is None
 
 
-def test_merge_with_real_conflict_resolution_is_a_charged_round(budget_merge_repo):
-    """Defect class: resolving a real code conflict is admitted as a free base merge."""
+@pytest.mark.parametrize("conflict", ["text", "binary-ours", "modify-delete-keep"])
+def test_merge_with_real_conflict_resolution_is_a_charged_round(budget_merge_repo, conflict):
+    """Defect class: text, binary-ours or modify/delete conflicts get a free base merge."""
     repo, git, commit, files, root, _approved, _base, _candidate = budget_merge_repo
-    approved = commit(files(1, 0, "branch version\n"), root)
-    base = commit(files(0, 1, "base version\n"), root)
-    candidate = commit(files(1, 1, "resolved version\n"), approved, base)
-    assert "code.py" in git("show", "--remerge-diff", "--format=", "--name-only", candidate).splitlines()
+    branch_code = "\0branch version\n" if conflict == "binary-ours" else "branch version\n"
+    base_code = "\0base version\n" if conflict == "binary-ours" else "base version\n"
+    branch_files = files(1, 0, branch_code)
+    if conflict == "modify-delete-keep":
+        del branch_files["code.py"]
+    approved = commit(branch_files, root)
+    base = commit(files(0, 1, base_code), root)
+    resolved = {"text": "resolved version\n", "binary-ours": branch_code, "modify-delete-keep": base_code}
+    candidate = commit(files(1, 1, resolved[conflict]), approved, base)
+    names = git("show", "--remerge-diff", "--format=", "--name-only", candidate).splitlines()
+    assert ("code.py" in names) == (conflict == "text")
+    assert "remerge CONFLICT" in git("show", "--remerge-diff", "--format=", candidate)
     def prove(anchor, head):
         return recorder.clean_base_merge_descent(repo, approved=anchor, head=head, base_tip=base)
     assert prove(approved, candidate) is None
