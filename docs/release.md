@@ -127,20 +127,16 @@ From the `main` commit identified above, with `$V` the version in
    <requirements-machinery.lock at $SHA>
    ```
 
-3. Accept it in a disposable consumer environment outside any checkout. Use the
-   consumer's supported Python and pinned runtime requirements, then install the
-   candidate machinery lock last. This is the same interpreter recipe used by the
-   [five-route canary](runbooks/write-worker-boundary.md#build-and-install-the-artifact):
-   the launcher starts the consumer's Sources server with its own interpreter, so
-   a bare machinery-only venv omits required consumer packages such as `requests`.
-   Keep the live consumer environment untouched; these packages remain consumer
-   requirements, not new machinery dependencies. `$CANDIDATE_LOCK` is the consumer
-   lock assembled in step 2; `$P` is the disposable environment's absolute interpreter:
+3. Accept it in a clean, machinery-only virtual environment outside any checkout.
+   This proves the candidate lock installs and imports without consumer packages.
+   The [five-route canary](runbooks/write-worker-boundary.md#build-and-install-the-artifact)
+   separately uses the consumer runtime required by its Sources server.
+   `$CANDIDATE_LOCK` is the lock assembled in step 2; `$P` is the clean
+   environment's absolute interpreter:
 
    ```bash
-   "$CONSUMER_PYTHON" -m venv "$CONSUMER_VENV"
-   P="$CONSUMER_VENV/bin/python"
-   "$P" -m pip install --require-hashes -r "$CONSUMER_RUNTIME_LOCK"
+   "$CONSUMER_PYTHON" -m venv "$ACCEPTANCE_VENV"
+   P="$ACCEPTANCE_VENV/bin/python"
    "$P" -m pip install --force-reinstall --no-index --find-links "$WHEELHOUSE" --require-hashes -r "$CANDIDATE_LOCK"
    "$P" -m pip check
    env -u PYTHONPATH "$P" -I -c 'import importlib.metadata as m, lu_machinery; print(m.version("lu-machinery")); print(lu_machinery.__file__)'

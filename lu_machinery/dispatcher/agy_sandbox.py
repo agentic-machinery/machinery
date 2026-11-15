@@ -535,6 +535,10 @@ def _input_state(worktree: Path) -> dict:
     return {"head": head, "clean": status == ""}
 
 
+_SOURCES_START_FAILURE_LIMIT = 16
+_SOURCES_ERROR_LIMIT = 4096
+
+
 class SourcesRelay:
     """Parent-owned Sources MCP for one sandbox: read-only tools only, completed calls counted.
 
@@ -555,6 +559,7 @@ class SourcesRelay:
         self.tools: dict[str, int] = {}
         self.refused: dict[str, int] = {}  # by method, or by tool for a refused call
         self.start_failures: list[dict] = []
+        self.start_failure_overflow_count = 0
         self.lock = threading.Lock()
         self.stopped = False
         self.processes: list[subprocess.Popen] = []
@@ -573,7 +578,8 @@ class SourcesRelay:
     def evidence(self) -> dict:
         with self.lock:
             return {"completed": self.completed, "failed": self.failed, "tools": dict(sorted(self.tools.items())),
-                    "refused": dict(sorted(self.refused.items())), "start_failures": list(self.start_failures)}
+                    "refused": dict(sorted(self.refused.items())), "start_failures": list(self.start_failures),
+                    "start_failure_overflow_count": self.start_failure_overflow_count}
 
     def _accept(self) -> None:
         while not self.stopped:
@@ -597,17 +603,19 @@ class SourcesRelay:
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.processes.append(process)
         # Drain all stderr without retaining unbounded output or blocking the server on a full pipe.
-        first_error: list[str] = []
+        last_error: list[str] = []
+        client_closed = threading.Event()
 
         def drain_stderr() -> None:
             from lu_machinery.secret_redactor import redact_text
 
             with process.stderr:
-                line = process.stderr.readline(_MAX_LINE)
-                if line:
-                    first_error.append(redact_text(line.decode("utf-8", "replace").rstrip()))
-                while process.stderr.read(65536):
-                    pass
+                # Bounded reads drain even a server emitting an enormous unterminated line.
+                # Keep the final non-empty line: Python traceback headers carry no cause.
+                while line := process.stderr.readline(_SOURCES_ERROR_LIMIT):
+                    if line.strip():
+                        last_error[:] = [redact_text(line.decode("utf-8", "replace").rstrip())
+                                         [:_SOURCES_ERROR_LIMIT]]
 
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
@@ -636,6 +644,7 @@ class SourcesRelay:
             except (OSError, ValueError):
                 pass
             finally:
+                client_closed.set()
                 with contextlib.suppress(OSError, ValueError):
                     process.stdin.close()
 
@@ -663,9 +672,12 @@ class SourcesRelay:
             else:
                 stderr_thread.join(timeout=2)
                 with self.lock:
-                    if not served and not self.stopped:
-                        self.start_failures.append({"returncode": returncode,
-                                                    "first_error": first_error[0] if first_error else ""})
+                    if not served and not self.stopped and not client_closed.is_set():
+                        if len(self.start_failures) < _SOURCES_START_FAILURE_LIMIT:
+                            self.start_failures.append({"returncode": returncode,
+                                                        "first_error": last_error[0] if last_error else ""})
+                        else:
+                            self.start_failure_overflow_count += 1
             with contextlib.suppress(OSError):
                 connection.shutdown(socket.SHUT_RDWR)
             connection.close()

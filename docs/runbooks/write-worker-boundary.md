@@ -474,8 +474,9 @@ each with `wait`, never by polling. Verify the flags with `dispatch --help` of t
 - Step D, a negative control, before Step C's commit: print only whether the hook environment variables
   are set (never their values) and the installed package's import path as the hook interpreter sees it.
   Then create one new file outside the owned path (a name used only for this control), `git add` it and
-  attempt a commit. It must be refused by the ownership hook. Afterwards run `git reset`, delete that file
-  and confirm `git status --porcelain` prints nothing; a dirty tree ends the task `no_deliverable`. Report
+  attempt a commit. It must be refused by the ownership hook. Afterwards run `git reset`, then delete the negative-control directory with
+  `"$LEARN_UKRAINIAN_PYTHON" -I -c 'import shutil; shutil.rmtree("tmp-boundary-negative")'`
+  (create the control file under `tmp-boundary-negative/`). Confirm `git status --porcelain` prints nothing; a dirty tree ends the task `no_deliverable`. Report
   the hook's output lines. Step C then runs on the clean tree.
 - The reply carries each step's outcome and each command's exit status and last line.
 
