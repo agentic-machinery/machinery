@@ -73,6 +73,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -211,9 +212,11 @@ _CURSOR_SOURCES_SERVER = "sources-relay"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
                     "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300,
                     "budget-check": 300, "review-wait": 900}
-# The longest one review-wait blocks the broker, which serves one request at a time; a longer wait is repeated
-# by the client (``dispatch wait`` exits 124 while the review still runs, as on the host).
+# The longest one review-wait runs on the host; a longer wait is repeated by the client (``dispatch wait`` exits 124
+# while the review still runs, as on the host).
 REVIEW_WAIT_MAX = 840
+# Connections the broker serves at once; a further one waits in the listen backlog until one finishes.
+_BROKER_CONNECTIONS = 8
 _RUN_NONCE = re.compile(r"[0-9a-f]{32}")
 # A Fleet delivery id or artifact id as the authority service mints them; never a flag.
 _DELIVERY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -796,14 +799,20 @@ class _Broker:
 
     def __init__(self, boundary: _Boundary, path: Path):
         import socket
-        import threading
 
         self.boundary = boundary
         self.records: list[dict] = []
         self.seen: set[str] = set()
         self.closeout_request: dict | None = None
-        self.child: subprocess.Popen[bytes] | None = None
+        self.children: set[subprocess.Popen[bytes]] = set()
+        self.connections: set[threading.Thread] = set()
         self.closed = False
+        # Each connection is served on its own thread, so a long review-wait never holds the worker's other
+        # calls. Every other verb still runs one at a time under ``serial``, so the task's binding state (its
+        # bound PR, its one private pr-create, its published messages) is checked and set as before; ``state``
+        # guards the request ids, the records, the live host steps and the connection threads.
+        self.serial, self.state = threading.Lock(), threading.Lock()
+        self.slots = threading.BoundedSemaphore(_BROKER_CONNECTIONS)
         # The repository every GitHub verb acts on, and whether it is private, frozen now (#565): a later change
         # of the primary's origin or of the registry never moves this run's authority.
         self.launch_repository: tuple[str, bool] | _BrokerRefusal = self._resolve_repository()
@@ -826,12 +835,26 @@ class _Broker:
 
     def _serve(self) -> None:
         while not self.closed:
+            if not self.slots.acquire(timeout=1):
+                continue
             try:
                 connection, _ = self.server.accept()
             except OSError:
+                self.slots.release()
                 return
+            thread = threading.Thread(target=self._connection, args=(connection,), daemon=True)
+            with self.state:
+                self.connections.add(thread)
+            thread.start()
+
+    def _connection(self, connection) -> None:
+        try:
             with connection, contextlib.suppress(OSError, ValueError):
                 self._handle(connection)
+        finally:
+            with self.state:
+                self.connections.discard(threading.current_thread())
+            self.slots.release()
 
     def _peer_inside(self, connection) -> bool:
         """Whether the connecting process descends from this run's bubblewrap (PID namespaces nest under it)."""
@@ -882,16 +905,24 @@ class _Broker:
                 raise _BrokerRefusal("the verb is not admitted for a private repository")
             if not (isinstance(request_id, str) and _REQUEST_ID.fullmatch(request_id)) or not isinstance(payload, dict):
                 raise _BrokerRefusal("the request is malformed")
-            if request_id in self.seen:
-                raise _BrokerRefusal("the request id was already used: a request runs once")
-            self.seen.add(request_id)
-            reply = getattr(self, "_" + verb.replace("-", "_"))(payload)
+            with self.state:
+                if request_id in self.seen:
+                    raise _BrokerRefusal("the request id was already used: a request runs once")
+                self.seen.add(request_id)
+            step = getattr(self, "_" + verb.replace("-", "_"))
+            # review-wait reads the host's task store and changes no broker state, so it waits outside ``serial``.
+            if verb == "review-wait":
+                reply = step(payload)
+            else:
+                with self.serial:
+                    reply = step(payload)
         except _BrokerRefusal as exc:
             reply["stderr"] = f"write boundary broker refused: {exc}\n"
         except Exception as exc:  # a host step that fails is reported, never retried
             reply.update(returncode=1, stderr=f"write boundary broker failed: {type(exc).__name__}\n")
-        self.records.append({"verb": verb, "request_id": request_id, "returncode": reply["returncode"],
-                             "refused": reply["stderr"][:200] if reply["returncode"] == 2 else None})
+        with self.state:
+            self.records.append({"verb": verb, "request_id": request_id, "returncode": reply["returncode"],
+                                 "refused": reply["stderr"][:200] if reply["returncode"] == 2 else None})
         connection.settimeout(None)
         connection.sendall(json.dumps(reply).encode())
 
@@ -1048,16 +1079,23 @@ class _Broker:
     def _run(self, argv: list[str], timeout_key: str, *, stdin: bytes | None = None,
              env: dict[str, str] | None = None, cwd: Path | None = None) -> dict:
         env = {**_host_child_env(self.boundary.args.task_id), **(env or {})}
-        # A fixed argv built by this class from validated fields, never a shell.
-        self.child = subprocess.Popen(argv, cwd=cwd or self.boundary.repository, env=env, stdin=subprocess.PIPE,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with self.state:  # cleanup kills every live step, so none may start once it has begun
+            if self.closed:
+                raise _BrokerRefusal("the write boundary is closing")
+            # A fixed argv built by this class from validated fields, never a shell.
+            child = subprocess.Popen(argv, cwd=cwd or self.boundary.repository, env=env, stdin=subprocess.PIPE,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.children.add(child)
         try:
-            out, err = self.child.communicate(stdin, timeout=_BROKER_TIMEOUTS[timeout_key])
-            returncode = self.child.returncode
+            out, err = child.communicate(stdin, timeout=_BROKER_TIMEOUTS[timeout_key])
+            returncode = child.returncode
         except subprocess.TimeoutExpired:
-            self.child.kill()
-            out, err = self.child.communicate()
+            child.kill()
+            out, err = child.communicate()
             returncode, err = 124, err + b"\nwrite boundary broker: the host step timed out\n"
+        finally:
+            with self.state:
+                self.children.discard(child)
         return {"returncode": returncode, "stdout": out[:_MAX_REQUEST].decode("utf-8", "replace"),
                 "stderr": err[:_MAX_REQUEST].decode("utf-8", "replace")}
 
@@ -1155,8 +1193,8 @@ class _Broker:
             raise _BrokerRefusal("run_nonce is malformed")
         if type(timeout) is not int or not 0 <= timeout <= REVIEW_WAIT_MAX:
             raise _BrokerRefusal(f"timeout must be 0 to {REVIEW_WAIT_MAX} seconds")
-        # 0 (or none) is the host wait's unlimited sentinel; the broker serves one request at a time, so it waits
-        # the bounded maximum instead and the caller repeats the wait.
+        # 0 (or none) is the host wait's unlimited sentinel; the broker never holds a connection unbounded, so it
+        # waits the bounded maximum instead and the caller repeats the wait.
         timeout = timeout or REVIEW_WAIT_MAX
         reply = self._module("dispatcher.cli", ["wait", task, *(["--run-nonce", nonce] if nonce else []),
                                                 "--timeout", str(timeout)], "review-wait")
@@ -1393,7 +1431,7 @@ class _Broker:
             self.pr_create_spent = True
         reply = self._publish("pr-create", slug, [*fields, *(["--draft"] if draft else [])])
         if private and reply["returncode"] == 0:
-            # Bound before the broker (one request at a time) accepts the next request; a created PR whose
+            # Bound before the next serialized verb runs (``serial`` is held); a created PR whose
             # number the publisher did not print stays unbound, and the spent create still refuses another.
             created = {int(match.group(1)) for line in reply["stdout"].splitlines() if (match := re.fullmatch(
                 rf"https://github\.com/{re.escape(slug)}/pull/([1-9][0-9]{{0,7}})", line.strip(), re.IGNORECASE))}
@@ -1556,17 +1594,26 @@ class _Broker:
     def cleanup(self) -> None:
         import socket
 
-        self.closed = True
+        with self.state:
+            self.closed = True
+            children = list(self.children)
         # On Linux, close() does not wake a thread blocked in accept(); shutdown() does (accept fails with EINVAL),
         # so the serve thread exits now instead of every boundary waiting out the join's whole timeout.
         with contextlib.suppress(OSError):
             self.server.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             self.server.close()
-        if self.child is not None and self.child.poll() is None:
-            with contextlib.suppress(OSError):
-                self.child.kill()
+        for child in children:
+            if child.poll() is None:
+                with contextlib.suppress(OSError):
+                    child.kill()
+        # Within one 5 s budget, so the receipt keeps the record of every request whose step was just killed.
+        deadline = time.monotonic() + 5
         self.thread.join(timeout=5)
+        with self.state:
+            connections = list(self.connections)
+        for thread in connections:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
 
 class _Boundary:
