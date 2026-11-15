@@ -1990,11 +1990,6 @@
    "sha256": "579b2a8038e853a069c312e4a07f53302caba968d5c9229b60b5e9f2b7348c07"
   },
   {
-   "path": "lu_machinery/tools/coverage_report.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "71c8c97cf30c7b897c4223d556bb1f63c60e677aeefd309d60e512e7264c8fe8"
-  },
-  {
    "path": "lu_machinery/utils/claude_version.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "f81ef0425784486b1cf331632b2d9c44e61fe925768e9e213b7e0bf477865d3e"
