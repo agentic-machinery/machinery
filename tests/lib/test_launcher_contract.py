@@ -54,18 +54,10 @@ PUBLIC = (
     "start-codex.sh",
     "start-codex-driver.sh",
     "start-codex-cto.sh",
-    "start-cursor-driver.sh",
     "start-gemini.sh",
     "start-gemini-driver.sh",
     "start-muse-driver.sh",
-    "start-grok.sh",
-    "start-grok-driver.sh",
-    "start-glm.sh",
-    "start-glmcc.sh",
 )
-# Compat wrappers forward into the shared adapters; they are part of PUBLIC.
-COMPAT = ("start-glmcc.sh",)
-assert set(COMPAT).issubset(PUBLIC)
 
 
 def _install_claude_usage_fixture(root: Path) -> None:
@@ -233,9 +225,6 @@ def test_unknown_launcher_flag_exits_usage_error(name: str) -> None:
         ("start-claude.sh", "interactive launchers reject --epic"),
         ("start-codex.sh", "interactive launchers reject --epic"),
         ("start-gemini.sh", "interactive launchers reject --epic"),
-        ("start-grok.sh", "interactive launchers reject --epic"),
-        ("start-glm.sh", "is retired in the model catalog"),
-        ("start-glmcc.sh", "is retired in the model catalog"),
     ),
 )
 def test_interactive_launchers_reject_driver_epic(name: str, message: str) -> None:
@@ -251,9 +240,6 @@ def test_interactive_launchers_reject_driver_epic(name: str, message: str) -> No
         ("start-claude.sh", "interactive launchers reject --force"),
         ("start-codex.sh", "interactive launchers reject --force"),
         ("start-gemini.sh", "interactive launchers reject --force"),
-        ("start-grok.sh", "interactive launchers reject --force"),
-        ("start-glm.sh", "is retired in the model catalog"),
-        ("start-glmcc.sh", "is retired in the model catalog"),
     ),
 )
 def test_interactive_launchers_reject_force(name: str, message: str) -> None:
@@ -268,9 +254,7 @@ def test_interactive_launchers_reject_force(name: str, message: str) -> None:
     (
         "start-claude-driver.sh",
         "start-codex-driver.sh",
-        "start-cursor-driver.sh",
         "start-gemini-driver.sh",
-        "start-grok-driver.sh",
     ),
 )
 def test_driver_help_lists_force(name: str) -> None:
@@ -281,7 +265,7 @@ def test_driver_help_lists_force(name: str) -> None:
 
 
 def test_driver_dry_run_force_announces_release_then_claim() -> None:
-    result = run_launcher("start-grok-driver.sh", "--epic", "infra", "--force")
+    result = run_launcher("start-codex-driver.sh", "--epic", "infra", "--force")
     assert result.returncode == 0, result.stderr
     assert "would force-release any live holder on epic:" in result.stdout
     assert "then claim" in result.stdout
@@ -634,7 +618,6 @@ LC_MODE=driver LC_PROVIDER=codex LC_DRIVER_LEASE_CLAIMED=1
 LC_DRIVER_ORIGINAL_ARGS=()
 export SESSION_STREAM_ID=epic:9999 SESSION_STREAM_GENERATION=1
 launcher_driver_renew_loop() {{ :; }}
-launcher_cursor_observer_renew_loop() {{ :; }}
 launcher_driver_wait_hook() {{ export PATH={shlex.quote(os.defpath)}; }}
 session_supervisor_start_inbox_watch() {{
   LC_SUPERVISORY_DELIVERY=''
@@ -772,7 +755,6 @@ LC_MODE=driver LC_PROVIDER=codex LC_DRIVER_LEASE_CLAIMED=1
 LC_DRIVER_ORIGINAL_ARGS=()
 export SESSION_STREAM_ID=epic:9999 SESSION_STREAM_GENERATION=1
 launcher_driver_renew_loop() {{ :; }}
-launcher_cursor_observer_renew_loop() {{ :; }}
 launcher_close_driver_lease() {{
   printf 'close\\n' >> {shlex.quote(str(events))}
   LC_DRIVER_LEASE_CLOSED=1
@@ -1019,7 +1001,7 @@ def test_renew_loops_spawn_no_orphanable_sleeps() -> None:
     timeout. The subshells wait on anonymous FIFO slices instead.
     """
     body = (machinery_path('lib/launcher_core.sh')).read_text(encoding="utf-8")
-    for name in ("launcher_driver_renew_loop", "launcher_cursor_observer_renew_loop"):
+    for name in ("launcher_driver_renew_loop",):
         section = body.split(f"{name}() {{", 1)[1].split("\n}", 1)[0]
         subshell = section.split("(\n", 1)[1].rsplit(") &", 1)[0]
         assert not re.search(r"sleep[^\n|;]*&", subshell), f"{name} backgrounds a sleep"
@@ -1171,8 +1153,8 @@ launcher_adapter_exec() {{ launcher_exec_command {os.fspath(provider)!r}; }}
     store.open_session(
         stream_id=expired_stream,
         holder=LeaseHolder(
-            agent="grok",
-            harness="grok-tui",
+            agent="claude",
+            harness="claude-code",
             instance_id="expired-dead-holder",
             process_id=999_999_009,
         ),
@@ -1200,24 +1182,8 @@ launcher_adapter_exec() {{ launcher_exec_command {os.fspath(provider)!r}; }}
     assert supervisor.close_driver(role=LaunchRole.DRIVER, lease=rerouted) == "closed"
 
 
-def test_harness_contracts_and_redacted_glm_credentials(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    glm_secret = "glm-secret-must-not-appear"
-    glm = run_launcher(
-        "start-glmcc.sh",
-        env={"HOME": str(home), "ZAI_API_KEY": glm_secret},
-    )
-    assert glm.returncode == 2, glm.stderr
-    assert "is retired in the model catalog" in glm.stderr
-    assert glm_secret not in glm.stdout + glm.stderr
-
-    unsupported = run_launcher("start-glm.sh", "--harness", "native")
-    assert unsupported.returncode == 2
-    assert "is retired in the model catalog" in unsupported.stderr
-
-
 def test_linked_worktree_helper_calls_use_durable_helper_python(tmp_path: Path) -> None:
-    """A linked worktree has no own .venv; observer heartbeat and lease close must
+    """A linked worktree has no own .venv; lease close must
     run the durable helper root's interpreter (#F2, prompt audit r3)."""
     session_root = tmp_path / "worktree"
     session_root.mkdir()  # deliberately no session_root/.venv
@@ -1232,7 +1198,7 @@ def test_linked_worktree_helper_calls_use_durable_helper_python(tmp_path: Path) 
     stub.chmod(0o755)
     script = f"""
 set -euo pipefail
-LC_PROVIDER=cursor
+LC_PROVIDER=claude
 LC_MODE=driver
 LC_DRY_RUN=0
 LC_EPIC=devops
@@ -1240,13 +1206,11 @@ LC_ROOT={session_root}
 LC_SESSION_ROOT={session_root}
 LC_DURABLE_HELPER_ROOT={helper_root}
 source {machinery_path('lib/launcher_core.sh')}
-launcher_cursor_observer_presence
 launcher_close_driver_lease
 """
     result = subprocess.run(["bash", "-c", script], text=True, capture_output=True, check=False, timeout=30, env=launcher_environment())
     assert result.returncode == 0, result.stderr
     body = log.read_text(encoding="utf-8")
-    assert "-m\nlu_machinery.orchestration.observer_heartbeat\n" in body
     assert "-m\nlu_machinery.session_supervisor\nclose\n--role\ndriver\n" in body
 
 

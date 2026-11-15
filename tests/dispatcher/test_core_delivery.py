@@ -21,7 +21,10 @@ from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 def spec_at(tmp_path, provider):
     checkout = tmp_path / "checkout"
-    checkout.mkdir()
+    if provider == "muse":
+        subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True, timeout=30)
+        checkout = tmp_path / ".worktrees/dispatch/muse/delivery"
+    checkout.mkdir(parents=True)
     brief = tmp_path / "brief"
     brief.write_bytes(b"Original brief\r\n")
     return TaskSpec("delivery", provider, "stub", "high", "workspace-write", checkout, brief, tmp_path / "result")

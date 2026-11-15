@@ -120,11 +120,6 @@ def resolve_cursor_agent_binary() -> str:
     Searches PATH and the login install directories for that name only.
     A generic ``agent`` executable is never consulted.
 
-    The one shell-side exception is ``scripts/launchers/cursor.sh``. A shell
-    script cannot call this function, so that launcher looks up the name
-    ``cursor-agent`` itself and exits non-zero when the executable is missing.
-    It never accepts a generic ``agent``.
-
     Raises:
         CursorAgentMissingError: no executable named ``cursor-agent``.
     """

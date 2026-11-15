@@ -343,7 +343,7 @@ def test_claim_without_force_prints_monitor_expiry_hint(tmp_path: Path) -> None:
     script = f"""
 set -euo pipefail
 source "{project}/lu_machinery/lib/session_supervisor.sh"
-claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-grok-driver.sh" "infra"
+claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-codex-driver.sh" "infra"
 """
     result = subprocess.run(
         ["bash", "-c", script],
@@ -372,7 +372,7 @@ def test_claim_with_force_releases_then_opens(tmp_path: Path) -> None:
 set -euo pipefail
 source "{project}/lu_machinery/lib/session_supervisor.sh"
 LC_DRIVER_FORCE=1
-claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-grok-driver.sh" "infra"
+claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-codex-driver.sh" "infra"
 printf 'SESSION=%s\\n' "$SESSION_STREAM_SESSION_ID"
 """
     result = subprocess.run(
@@ -390,7 +390,7 @@ printf 'SESSION=%s\\n' "$SESSION_STREAM_SESSION_ID"
     assert log.count("CMD:open") == 2
     assert log.count("CMD:release") == 1
     assert "--reason" in log
-    assert "operator force takeover via start-grok-driver.sh (#8229)" in log
+    assert "operator force takeover via start-codex-driver.sh (#8229)" in log
     assert "--actor-agent" in log
     assert "test-agent" in log
 
@@ -412,7 +412,7 @@ source "{project}/lu_machinery/lib/session_supervisor.sh"
 LC_DRIVER_FORCE=1
 SESSION_SUPERVISOR_WAKE_DELIVERY=delivery-wake-1
 SESSION_SUPERVISOR_WAKE_STREAM=epic:9999
-claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-grok-driver.sh" "infra"
+claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "start-codex-driver.sh" "infra"
 """
     result = subprocess.run(
         ["bash", "-c", script],
@@ -434,7 +434,7 @@ def test_launcher_drops_force_from_successor_args() -> None:
     script = f"""
 set -euo pipefail
 source "{machinery_path('lib/launcher_core.sh')}"
-LC_DRIVER_ORIGINAL_ARGS=(--epic infra --force --model grok-4.7 -- --force)
+LC_DRIVER_ORIGINAL_ARGS=(--epic infra --force --model gpt-6.1-sol -- --force)
 launcher_drop_force_from_successor_args
 printf 'COUNT=%s\\n' "${{#LC_DRIVER_ORIGINAL_ARGS[@]}}"
 printf 'ARGS=%s\\n' "${{LC_DRIVER_ORIGINAL_ARGS[*]}}"
@@ -449,7 +449,7 @@ printf 'ARGS=%s\\n' "${{LC_DRIVER_ORIGINAL_ARGS[*]}}"
     )
     assert result.returncode == 0, result.stderr + result.stdout
     assert "COUNT=6" in result.stdout
-    assert "ARGS=--epic infra --model grok-4.7 -- --force" in result.stdout
+    assert "ARGS=--epic infra --model gpt-6.1-sol -- --force" in result.stdout
 
 
 def test_claim_fails_closed_on_missing_required_fields(tmp_path: Path) -> None:
@@ -608,7 +608,6 @@ export LEARN_UKRAINIAN_PYTHON="${{LEARN_UKRAINIAN_PYTHON:-{shlex.quote(sys.execu
 LC_DRIVER_ORIGINAL_ARGS=(--fixture 'two words')
 export SESSION_STREAM_ID=epic:9999 SESSION_STREAM_LEASE_ID=lease-test SESSION_STREAM_GENERATION=30
 launcher_driver_renew_loop() {{ :; }}
-launcher_cursor_observer_renew_loop() {{ :; }}
 if [ '{widen_wait_window}' = True ]; then
   launcher_driver_wait_hook() {{ touch {shlex.quote(str(wait_window))}; sleep 0.3 || true; }}
 fi

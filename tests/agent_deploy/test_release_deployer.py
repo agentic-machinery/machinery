@@ -31,8 +31,6 @@ EXPECTED = {
     ".agent/hooks/fleet.sh", ".agent/rules/core.md", ".agent/rules/fleet.md",
     ".agent/skills/fleet/SKILL.md", ".agent/skills/product/SKILL.md", ".agent/settings.json",
     ".agent/rules.json", ".agent/rules/core-part-01.md",
-    ".gemini/rules/core.md", ".gemini/rules/fleet.md",
-    ".gemini/skills/fleet/SKILL.md", ".gemini/skills/product/SKILL.md",
     ".codex/settings.json", ".codex/hooks.json",
     ".claude/memory/MEMORY.md", ".codex/memory/MEMORY.md", ".agent/memory/MEMORY.md",
 }
@@ -52,10 +50,9 @@ def write(root, relative, content, mode=0o644):
 
 
 def descriptor(root, **changes):
-    data = {"providers": ["claude", "codex", "agy", "gemini"], "sources": {
+    data = {"providers": ["claude", "codex", "agy"], "sources": {
         "shared": {"path": "agents_extensions/shared", "required": True},
         "codex": {"path": "agents_extensions/codex", "required": True},
-        "gemini": {"path": "gemini_extensions", "required": False},
     }, "preserve": [".agent/tmp", ".claude/settings.local.json"]}
     data.update(changes)
     write(root, plan.DESCRIPTOR, json.dumps(data))
@@ -74,14 +71,14 @@ def release(tmp_path, monkeypatch):
     # Input mappings are intentionally explicit, including omissions.
     inventory = {"version": 1, "provider_replacements": {"codex": ["config.toml", "hooks.json", "memory"]}, "claude_autoload_excludes": ["rules/core.md", "rules/non-negotiable-rules.md", "rules/core-curriculum.md"], "files": {
         "rules/core.md": {"mode": 420, "owner": "fleet", "targets": {
-            "codex": [".codex/rules/core.md"], "agy": [".agent/rules/core.md"], "gemini": [".gemini/rules/core.md"]}},
+            "codex": [".codex/rules/core.md"], "agy": [".agent/rules/core.md"]}},
         "rules/fleet.md": {"mode": 420, "owner": "fleet", "targets": {
-            "claude": [".claude/rules/fleet.md"], "codex": [".codex/rules/fleet.md"], "agy": [".agent/rules/fleet.md"], "gemini": [".gemini/rules/fleet.md"]}},
+            "claude": [".claude/rules/fleet.md"], "codex": [".codex/rules/fleet.md"], "agy": [".agent/rules/fleet.md"]}},
         "hooks/fleet.sh": {"mode": 493, "owner": "fleet", "targets": {
             "claude": [".claude/hooks/fleet.sh"], "codex": [".codex/hooks/fleet.sh"], "agy": [".agent/hooks/fleet.sh"]}},
         "skills/fleet/SKILL.md": {"mode": 420, "owner": "fleet", "targets": {
             "claude": [".claude/skills/fleet/SKILL.md"], "codex": [".agents/skills/fleet/SKILL.md"],
-            "agy": [".agent/skills/fleet/SKILL.md", ".agents/skills/fleet/SKILL.md"], "gemini": [".gemini/skills/fleet/SKILL.md"]}},
+            "agy": [".agent/skills/fleet/SKILL.md", ".agents/skills/fleet/SKILL.md"]}},
     }, "required_hooks": {"claude": {".claude/settings.json": [
         {"path": ["hooks", "SessionStart"], "group": {"matcher": "startup"}, "hooks": [
             {"type": "command", "command": ".claude/hooks/fleet.sh", "timeout": 10}]}]},
@@ -220,7 +217,7 @@ def test_unsafe_retirement_preserves_modified_unknown_and_runtime(consumer, monk
     assert (consumer / ".agent/tmp/scratch").read_text() == "keep"
 
 
-@pytest.mark.parametrize("root", [".claude", ".agent", ".agents", ".codex", ".gemini", ".cursor"])
+@pytest.mark.parametrize("root", [".claude", ".agent", ".agents", ".codex", ".cursor"])
 @pytest.mark.parametrize("kind", ["directory", "file", "symlink", "dangling", "fifo"])
 @pytest.mark.parametrize("name", ["sessions", "cache\\key", "session\u200bid"])
 def test_runtime_siblings_do_not_block_check_or_apply(consumer, tmp_path, monkeypatch, root, kind, name):
@@ -255,19 +252,17 @@ def test_runtime_siblings_do_not_block_check_or_apply(consumer, tmp_path, monkey
     ".claude/skills/old/SKILL.md", ".codex/agents/planted.toml",
     ".codex/config.toml", ".agents/plugins/planted/plugin.json",
     ".agents/rules/planted.md", ".agent/workflows/planted.md",
-    ".gemini/commands/planted.toml", ".claude/workflows/planted.js",
+    ".claude/workflows/planted.js",
     ".claude/agent-memory/reviewer/MEMORY.md", ".claude/agent-memory-local/reviewer/MEMORY.md",
-    ".claude/AGENTS.md", ".gemini/sandbox.Dockerfile",
+    ".claude/AGENTS.md",
     ".cursor/cli.json", ".cursor/environment.json", ".cursor/worktrees.json",
-    ".gemini/sandbox-macos-team.sb", ".claude/Skills/old/SKILL.md",
-    ".gemini/policies/allow-all.toml", ".gemini/sandbox.bashrc",
-    ".gemini/config.yaml", ".gemini/styleguide.md", ".cursor/BUGBOT.md",
+    ".claude/Skills/old/SKILL.md", ".cursor/BUGBOT.md",
     ".cursor/sandbox.json", ".cursor/permissions.json", ".cursor/config/bugbot.yaml",
 ]] + [
     # Every provider that discovers the shared .agents tree inventories it on its own,
     # from a fresh apply too (no earlier deployment state names .agents).
     # Claude alone never discovers it: the negative control.
-    (path, providers) for providers in (["codex"], ["agy"], ["gemini"], ["cursor"], ["gemini", "cursor"], ["claude"])
+    (path, providers) for providers in (["codex"], ["agy"], ["cursor"], ["claude"])
     for path in (".agents/skills/planted/SKILL.md", ".agents/rules/planted.md")
 ])
 @pytest.mark.parametrize("check", [False, True], ids=["apply", "check"])
@@ -320,7 +315,6 @@ def test_provider_discovery_content_cannot_hide_as_runtime(consumer, tmp_path, m
     (".codex", "agents prompts plugins skills rules hooks config.toml hooks.json"),
     (".agent", "agents plugins skills rules workflows hooks hooks.json mcp_config.json settings.json rules.json skills.json agents.json plugins.json AGENTS.md GEMINI.md"),
     (".agents", "agents plugins skills rules workflows hooks hooks.json mcp_config.json rules.json skills.json agents.json plugins.json AGENTS.md GEMINI.md"),
-    (".gemini", "agents commands extensions skills rules hooks settings.json config.json GEMINI.md AGENTS.md system.md .env sandbox.Dockerfile sandbox.bashrc policies config.yaml styleguide.md"),
     (".cursor", "agents commands skills rules hooks hooks.json mcp.json cli.json environment.json worktrees.json BUGBOT.md sandbox.json permissions.json config"),
 ])
 @pytest.mark.parametrize("kind", ["file", "symlink"])

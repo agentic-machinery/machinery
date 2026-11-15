@@ -3884,10 +3884,11 @@ def test_muse_installed_cli_preserves_explicit_permissions(tmp_path, monkeypatch
         tmp_path, monkeypatch, "Muse Code 1.4.12 (1.4.12-R6668.1)",
     )
     if mode == "workspace-write":
-        with pytest.raises(ValueError, match="^muse_write_mode_unconfined$"):
+        with pytest.raises(ValueError, match=r"^muse_worker_mode_refused$"):
             adapter.build_invocation(prompt="fixture", mode=mode, cwd=workspace,
                                      model="muse-wonder-full-1.0", task_id="muse-interface", session_id=None,
                                      effort="high", tool_config={"muse_worker": True, "muse_role": role})
+        assert probes == []
         return
     plan = adapter.build_invocation(
         prompt="fixture", mode=mode, cwd=workspace, model="muse-wonder-full-1.0",
@@ -3897,17 +3898,12 @@ def test_muse_installed_cli_preserves_explicit_permissions(tmp_path, monkeypatch
     )
     assert len(probes) == 1
     assert plan.metadata["cli_version"] == "Muse Code 1.4.12 (1.4.12-R6668.1)"
-    assert plan.cmd[plan.cmd.index("--permission-profile") + 1] == (
-        ":read-only" if mode == "read-only" else ":ask-me"
-    )
-    assert ("--disable-write" in plan.cmd) is (mode == "read-only")
+    assert plan.cmd[plan.cmd.index("--permission-profile") + 1] == ":read-only"
+    assert "--disable-write" in plan.cmd
     assert plan.cmd[plan.cmd.index("--workspace") + 1] == str(workspace)
     assert plan.cmd[plan.cmd.index("--worktree") + 1] == "off"
     assert plan.cmd[plan.cmd.index("--contributor-mode") + 1] == "off"
-    assert plan.cmd[plan.cmd.index("--config") + 1] == (
-        'run.toolset=["read_file"]' if mode == "read-only"
-        else 'run.toolset=["read_file", "write_file", "edit_file"]'
-    )
+    assert plan.cmd[plan.cmd.index("--config") + 1] == 'run.toolset=["read_file"]'
     assert {"--disable-shell", "--disable-web-tools", "--disable-reminders",
             "--disable-request-user-input", "--no-foreign-personal-context"} <= set(plan.cmd)
     assert plan.env_overrides == {"MUSE_NO_AUTO_UPDATE": "1"}

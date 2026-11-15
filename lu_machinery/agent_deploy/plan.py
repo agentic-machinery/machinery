@@ -29,18 +29,20 @@ from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_err
 DESCRIPTOR = "agents_extensions/deployment.v1.json"
 STATE = ".deploy-state/agent-deploy.v1.json"
 STAGING = ".deploy-state/agent-deploy.tmp"
-TARGETS = {"claude": ".claude", "codex": ".codex", "agy": ".agent", "gemini": ".gemini", "cursor": ".cursor"}
+TARGETS = {"claude": ".claude", "codex": ".codex", "agy": ".agent", "cursor": ".cursor"}
+# Output roots of retired targets. A descriptor can no longer enable them, but
+# deployment state from an earlier release may still own files there; those
+# roots stay owned so the next apply retires the files and no product source
+# may overlap them. The Gemini CLI target retired with product 747d981354e1.
+RETIRED_ROOTS = frozenset({".gemini"})
+OWNED_ROOTS = frozenset({*TARGETS.values(), *RETIRED_ROOTS})
 
 # Discovery/configuration names remain inventoried even without a planned output.
 # Runtime siblings are outside ownership; explicit descriptor preservation still applies.
 # Provider references: https://code.claude.com/docs/en/{claude-directory,settings,skills,sub-agents,output-styles,plugins,workflows}
 # https://learn.chatgpt.com/docs/{config-file/config-basic,build-skills,hooks}
 # https://antigravity.google/docs/{customization-discovery,rules,skills,ide-workflows}
-# https://geminicli.com/docs/reference/configuration/
 # https://cursor.com/docs/{context/rules,cli/reference/configuration,configuration/worktrees,cloud-agent}
-# Additional project configuration: https://geminicli.com/docs/reference/policy-engine/
-# (workspace policies are currently disabled), https://geminicli.com/docs/cli/sandbox/
-# https://docs.cloud.google.com/gemini/docs/code-review/customize-repo-review
 # https://cursor.com/docs/bugbot
 # https://cursor.com/docs/reference/{sandbox,permissions}
 DISCOVERY = {
@@ -48,16 +50,15 @@ DISCOVERY = {
     ".codex": {"agents", "prompts", "plugins", "skills", "rules", "hooks", "config.toml", "hooks.json"},
     ".agent": {"agents", "plugins", "skills", "rules", "workflows", "hooks", "hooks.json", "mcp_config.json", "settings.json", "rules.json", "skills.json", "agents.json", "plugins.json", "AGENTS.md", "GEMINI.md"},
     ".agents": {"agents", "plugins", "skills", "rules", "workflows", "hooks", "hooks.json", "mcp_config.json", "rules.json", "skills.json", "agents.json", "plugins.json", "AGENTS.md", "GEMINI.md"},
-    ".gemini": {"agents", "commands", "extensions", "skills", "rules", "hooks", "settings.json", "config.json", "GEMINI.md", "AGENTS.md", "system.md", ".env", "sandbox.Dockerfile", "sandbox.bashrc", "policies", "config.yaml", "styleguide.md"},
     ".cursor": {"agents", "commands", "skills", "rules", "hooks", "hooks.json", "mcp.json", "cli.json", "environment.json", "worktrees.json", "BUGBOT.md", "sandbox.json", "permissions.json", "config"},
 }
 
 
 # Providers that discover workspace content in the shared .agents tree, so its
-# discovery names stay inventoried whenever one is enabled: Codex and AGY (above),
-# Gemini CLI (.agents/skills alias, https://geminicli.com/docs/cli/skills) and
-# Cursor (.agents/skills, https://cursor.com/docs/context/skills).
-SHARED_DISCOVERY = frozenset({"codex", "agy", "gemini", "cursor"})
+# discovery names stay inventoried whenever one is enabled: Codex and AGY (above)
+# and Cursor (.agents/skills, https://cursor.com/docs/context/skills). The retired
+# Gemini CLI target (.gemini) is no longer deployed; Gemini runs through AGY.
+SHARED_DISCOVERY = frozenset({"codex", "agy", "cursor"})
 
 
 class Invalid(ValueError):
@@ -354,7 +355,7 @@ def build(tree: Tree) -> Plan:
         if not isinstance(spec, dict) or set(spec) != {"path", "required"} or type(spec["required"]) is not bool:
             raise Invalid("source requires path and boolean required")
         source = relative(spec["path"])
-        if source.split("/")[0] in {*TARGETS.values(), ".agents", ".deploy-state", ".git"}:
+        if source.split("/")[0] in {*OWNED_ROOTS, ".agents", ".deploy-state", ".git"}:
             raise Invalid("product source overlaps deployment output or Git state")
         if any(source == p or source.startswith(p + "/") or p.startswith(source + "/") for p in used_sources):
             raise Invalid("overlapping product sources")
@@ -426,8 +427,6 @@ def build(tree: Tree) -> Plan:
                 destinations = []
             elif provider == "codex" and path.startswith("skills/"):
                 destinations = [".agents/" + path]
-            elif provider == "gemini" and not path.startswith(("skills/", "rules/")):
-                destinations = []
             else:
                 destinations = [target + "/" + path]
                 if provider == "agy" and path.startswith("skills/"):
@@ -510,7 +509,7 @@ def old_state(tree: Tree) -> dict[str, Any]:
         raise Invalid("invalid ownership records")
     for path, record in data["files"].items():
         relative(path)
-        if path.split("/")[0] not in {*TARGETS.values(), ".agents"} or "/" not in path:
+        if path.split("/")[0] not in {*OWNED_ROOTS, ".agents"} or "/" not in path:
             raise Invalid("manifest output outside provider directories")
         if not isinstance(record, dict) or set(record) != {"type", "sha256", "mode", "owner", "source"}:
             raise Invalid("invalid file record")
@@ -547,9 +546,7 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     owned.update((root, name.casefold()) for root in roots for name in DISCOVERY.get(root, ()))
     def excluded(path: str) -> bool:
         root, name = path.split("/")[:2]
-        # Gemini also loads sandbox-macos-<profile>.sb (configuration reference above).
-        discovery_profile = root == ".gemini" and name.casefold().startswith("sandbox-macos-") and name.casefold().endswith(".sb")
-        return preserved(path, plan) or ((root, name.casefold()) not in owned and not discovery_profile)
+        return preserved(path, plan) or (root, name.casefold()) not in owned
     for root in sorted(roots):
         # Exclude runtime entries before stat/open/recursion. Non-preserved
         # links and special files still fail closed inside inventory().
