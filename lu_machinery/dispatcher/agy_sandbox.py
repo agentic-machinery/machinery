@@ -896,6 +896,24 @@ def public_repository(slug: str) -> bool:
     return slug.casefold() in names
 
 
+def private_repository(slug: str) -> bool:
+    """Whether ``slug`` is a registered fleet repository whose role is private (#565, designated approval C-5541).
+
+    Only the write boundary's broker uses this, and only to act on the task's own repository, branch and PR
+    frozen at launch. It never widens ``public_repository``: the read-only relays here stay public-only.
+    """
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+
+    if not (isinstance(slug, str) and _GH_REPO.fullmatch(slug)) or public_repository(slug):
+        return False
+    try:
+        repos = load_fleet_repos()
+    except (FleetRepoError, OSError, ValueError):
+        return False
+    return any(repo.role.startswith("private-") and repo.github.casefold() == slug.casefold()
+               for repo in repos.values())
+
+
 def origin_repository(checkout: Path) -> str | None:
     """The ``OWNER/REPO`` of ``checkout``'s ``origin`` on github.com, read on the host, or None."""
     try:

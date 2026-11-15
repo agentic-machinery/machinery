@@ -327,9 +327,31 @@ Texts arrive as JSON strings, and the host writes them to the run's private scra
   `commits`, `commit`, `comments`, `reviews`, `timeline`, `issue`, `checks`, `check-annotations`,
   `run`, `jobs`). It reads only the primary's own repository and never security alerts.
 
-Every GitHub verb acts only on a primary whose origin is a registered repository with a `public-` role
-(decision A6). A worker reaches the public internet, so the host login neither reads nor publishes for it
-in a private, unknown or unresolved repository; such a primary's verbs are refused.
+Every GitHub verb acts only on the primary's origin, which the broker resolves once when it starts and
+keeps for the run: a later change of the origin or the registry never moves the run's authority. That
+repository must be registered in `config/fleet_repos.yaml` (decision A6, amended for #565 by designated
+approval C-5541):
+
+- **Public role (`public-`).** Every verb above, unchanged.
+- **Private role (`private-`).** Only the verbs of the broker's explicit private allowlist
+  (`_PRIVATE_VERBS`), each bound to the task's own repository, branch and PR: the push of the
+  dispatched (or continued PR) branch, `fetch-base` of its default branch, `pr-create` from that branch,
+  the PR verbs, `review-dispatch` and `record-verdict` on the task's own PR, `closeout-request`, and the
+  Fleet verbs. A verb added to the broker later is refused for a private repository until it is listed.
+  `github-read` is narrowed to the authorized PR and its checks: `pull`, `pr-files`, `commits`,
+  `comments`, `reviews`, `timeline` and `issue` by that PR's number, `checks` and `commit` by the task's
+  branch tip or that PR's live head. The authorized PR is the one the task record names (`--pr`, a
+  review's PR), else the PR whose head is the dispatched branch, checked live. `run`, `jobs`,
+  `check-annotations` and any other PR or issue number are refused.
+- **Unknown or unresolved origin.** Every GitHub verb is refused.
+
+Why this keeps private content in: the worker already holds its private checkout and reaches the public
+internet, so what A6 must stop is the host login moving private content somewhere the task does not
+already reach. Bound verbs only send the worker's own commits and texts back to its own private
+repository, and read back only its own PR and checks. Nothing names another repository (a named `repo`
+that differs is refused), another branch or another PR. The push scan, the publisher's content scan, the
+credential isolation (no GitHub credential and no GitHub route inside) and the review and CI gates are the
+same for both roles. The read-only `gh` relay and the read-only AGY boundary stay public-only.
 
 Sources goes through the read-only AGY boundary's `SourcesRelay` (read-only tools only). The launcher
 binds its own directory read-only at `/run/lu-write-boundary`, so its byte proxy and the relay socket sit at
@@ -502,6 +524,43 @@ Sources command today.)
 Any `READABLE` on a path other than the route's own login is a breach. A Sources result that came from a path other
 than the relay does not count: `sources.completed` of 0 with a worker claiming success fails the row.
 
+### Private-repository rows
+
+A change that can alter the broker's private-repository rule (decision A6 as amended, C-5541) also runs one
+write task in one registered private repository (a `private-` role in `config/fleet_repos.yaml`), from the
+same artifact. The private verbs run on the host and do not depend on the provider, so one route carries
+them; use a route the five-route run passed. Before the run, record the private repository's branch list,
+open PRs and the newest workflow run on the host, so that the zero-mutation rows have a baseline.
+
+The task, dispatched with `--repo <private key>` and a fresh branch, runs these steps:
+
+- Step P1: commit one canary file and `git push origin HEAD`; open a draft PR with the publisher's
+  `pr-create` (no `--repo`); start its review with `write_boundary call review-dispatch` on that PR at the
+  pushed head; publish one Fleet message with `write_boundary call fleet-publish`.
+- Step P2, negative controls: `git push origin HEAD:refs/heads/<another branch>`; `pr-create` and `push`
+  naming another registered repository (`"repo": "<other OWNER/REPO>"`); `pr-comment` on an unrelated open
+  PR of the private repository; `github-read` of an unrelated PR, of an issue number and of a workflow run
+  id (`run`). Each must be refused (`returncode` 2).
+
+The review it dispatches runs read-only and, in Step P3, reads its PR with `github-read` (`pull`,
+`pr-files`, `reviews`), its checks (`checks` at the pinned head), and once an unrelated PR number, which
+must be refused.
+
+| Check | How it is proved | Expected |
+| --- | --- | --- |
+| Private push | Receipt `broker` lists `push` with `returncode` 0; the private repository's remote branch head equals the task's `head_sha` | pass |
+| Private PR create | Receipt `broker` lists `pr-create` with `returncode` 0; the PR's head is the task's branch, its base the default branch, in the same repository | pass |
+| Private review dispatch | Receipt `broker` lists `review-dispatch` with `returncode` 0; the review task's record names the PR, the pinned head and the task as `initiator` | pass |
+| Reviewer reads | The review's receipt lists the Step P3 `github-read` calls of its own PR and checks with `returncode` 0, and the unrelated-PR read with `returncode` 2 | pass |
+| Fleet publication | Receipt `broker` lists `fleet-publish` with `returncode` 0, and the message is on the plane with the task id as sender | pass |
+| Cross-repository refusal | The Step P2 requests naming another repository are refused; that repository's branches, PRs and comments are unchanged against its baseline | pass |
+| Wrong-branch refusal | The Step P2 push to another branch is refused; the private repository's branch list differs from the baseline only by the task's own branch | pass |
+| Unrelated-PR refusal | The Step P2 `pr-comment` and `github-read` of an unrelated PR, issue or run are refused; the unrelated PR has no new comment | pass |
+| Zero unauthorized mutations | Against the baseline, the only changes on GitHub are the task's branch, its PR and the review's verdict comment on it | pass |
+
+Close the canary PR unmerged and delete its branch afterwards, as for the five routes. The evidence record
+names the private repository by its registry key only.
+
 ### Evidence record
 
 The table is bound to the artifact and pasted into the PR (or the release acceptance notes):
@@ -539,8 +598,9 @@ five tasks, and runs them itself otherwise.
 - Decision A4 changes what a worker sees. It no longer reads the real provider configuration beyond the
   selected login's guard-bound state (no plugins, session history or other account), other tasks' records (stage a brief's inputs in
   `<task>.inputs`), private data roots such as `LU_SENSE_PROOF_DIR`, or driver files under `/var/tmp`.
-  A worker in a private repository can still work in its checkout, but every GitHub verb refuses it
-  (decision A6, with no per-task exception).
+  A worker in a registered private repository publishes only through the bound private verbs, and reads
+  only its own PR and checks (decision A6 as amended, C-5541). The read-only `gh` relay and read-only AGY
+  still refuse a private repository, so an AGY review there reads nothing from GitHub.
 - The emptied checkout state is a named list, not every ignored path: an ignored private file a
   checkout keeps outside those names stays readable. Read-only AGY keeps its own boundary
   (`agy_sandbox`), which still binds the whole task store.

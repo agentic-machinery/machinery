@@ -158,6 +158,16 @@ _BROKER_VERBS = ("review-dispatch", "record-verdict", "fleet-publish", "fleet-de
 # Named reads of the worker's own repository (the publisher's fixed GET templates); no security-alert reads.
 _GITHUB_READS = frozenset({"pull", "pr-files", "commits", "commit", "comments", "reviews", "timeline", "issue",
                            "checks", "check-annotations", "run", "jobs"})
+# A registered private repository (#565, designated approval C-5541): the explicit allowlist of verbs the broker
+# admits for it. Each is bound to the task's own repository, branch and PR identity frozen at launch; a verb added
+# to _BROKER_VERBS later is refused for a private repository until it is listed here.
+_PRIVATE_VERBS = frozenset({"review-dispatch", "record-verdict", "fleet-publish", "fleet-deliveries", "closeout-request",
+                            "push", "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge", "pr-ownership",
+                            "github-read"})
+# A private repository's github-read is the authorized PR (by its number) and its checks (by its head commit) only;
+# reads by any other id (another PR or issue, a workflow run, a check run) are refused.
+_PRIVATE_PR_READS = frozenset({"pull", "pr-files", "commits", "comments", "reviews", "timeline", "issue"})
+_PRIVATE_SHA_READS = frozenset({"checks", "commit"})
 _BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 # GitHub's write-capable hosts. The egress proxy refuses them inside the boundary, by name and by the address ranges
 # GitHub publishes for them, so no credential the worker could read anywhere is usable from inside; every
@@ -364,6 +374,9 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
     if spec.mode == "workspace-write" and spec.options.get("branch"):
         # The PR branch a continuation (``dispatch --branch``, recorded as ``publish_branch``) publishes to (#557).
         argv += ["--publish-branch", spec.options["branch"]]
+    if spec.options.get("pr"):
+        # The task record's PR, frozen here: a private repository's github-read is that PR and its checks (#565).
+        argv += ["--pr", str(spec.options["pr"])]
     if spec.agent == "codex" and spec.mode == "read-only":
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
@@ -750,6 +763,9 @@ class _Broker:
       directory and refuses while the worktree is registered.
     * ``push``, ``fetch-base``, ``pr-create``, ``pr-edit``, ``pr-comment``, ``pr-merge`` and ``github-read`` are
       the worker's only GitHub access (PUBLISH-CRED-1113); docs/runbooks/write-worker-boundary.md lists them.
+    * The repository they act on is frozen when the broker starts. For a registered private one (#565, C-5541)
+      only ``_PRIVATE_VERBS`` are admitted, each bound to the task's own repository, branch and PR, and
+      ``github-read`` reads only the authorized PR and its checks.
     """
 
     def __init__(self, boundary: _Boundary, path: Path):
@@ -762,6 +778,9 @@ class _Broker:
         self.closeout_request: dict | None = None
         self.child: subprocess.Popen[bytes] | None = None
         self.closed = False
+        # The repository every GitHub verb acts on, and whether it is private, frozen now (#565): a later change
+        # of the primary's origin or of the registry never moves this run's authority.
+        self.launch_repository: tuple[str, bool] | _BrokerRefusal = self._resolve_repository()
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:  # the descriptor path avoids the sockaddr_un length limit, as in agy_sandbox.SourcesRelay
@@ -826,6 +845,8 @@ class _Broker:
                 raise _BrokerRefusal("the verb is not one of " + ", ".join(_BROKER_VERBS))
             if self.boundary.args.mode == "read-only" and verb != "github-read":
                 raise _BrokerRefusal("read-only dispatches may only use github-read")
+            if self._private() and verb not in _PRIVATE_VERBS:
+                raise _BrokerRefusal("the verb is not admitted for a private repository")
             if not (isinstance(request_id, str) and _REQUEST_ID.fullmatch(request_id)) or not isinstance(payload, dict):
                 raise _BrokerRefusal("the request is malformed")
             if request_id in self.seen:
@@ -843,18 +864,38 @@ class _Broker:
 
     # -- launch-bound facts --------------------------------------------------------------------------------------
 
-    def _repository_slug(self) -> str:
-        """The primary's origin on github.com, the only repository every GitHub verb acts on.
+    def _resolve_repository(self) -> tuple[str, bool] | _BrokerRefusal:
+        """The primary's origin on github.com and whether it is private, or the refusal every GitHub verb gets.
 
-        It must be a registered repository with a public role (decision A6): the worker reaches the public
-        internet, so the host login reads or publishes nothing of a private, unknown or unresolved one.
+        It must be a registered repository (decision A6, as amended for #565 by designated approval C-5541):
+        with a public role, or with a private role, where every admitted verb is bound to this task's own
+        repository, branch and PR, so the host login never moves private content anywhere but back to its own
+        repository. An unknown or unresolved origin is refused.
         """
-        url = _git(self.boundary.repository, "config", "--get", "remote.origin.url", git_dir=self.boundary.common)
+        try:
+            url = _git(self.boundary.repository, "config", "--get", "remote.origin.url", git_dir=self.boundary.common)
+        except Refused:
+            return _BrokerRefusal("the primary's origin is not a github.com repository")
         if not (match := _GITHUB_REMOTE.fullmatch(url.strip())):
-            raise _BrokerRefusal("the primary's origin is not a github.com repository")
-        if not agy_sandbox.public_repository(match.group(1)):
-            raise _BrokerRefusal("the primary's origin is not a registered public repository")
-        return match.group(1)
+            return _BrokerRefusal("the primary's origin is not a github.com repository")
+        slug = match.group(1)
+        if agy_sandbox.public_repository(slug):
+            return slug, False
+        if agy_sandbox.private_repository(slug):
+            return slug, True
+        return _BrokerRefusal("the primary's origin is not a registered repository")
+
+    def _private(self) -> bool:
+        """Whether the launch's repository is a registered private one (its verbs and reads are then narrowed)."""
+        frozen = getattr(self, "launch_repository", None)
+        return isinstance(frozen, tuple) and frozen[1]
+
+    def _repository_slug(self) -> str:
+        """The launch's repository, the only one every GitHub verb acts on (frozen when the broker started)."""
+        frozen = self.launch_repository
+        if isinstance(frozen, _BrokerRefusal):
+            raise _BrokerRefusal(str(frozen))
+        return frozen[0]
 
     def _gh_json(self, argv: list[str]) -> Any:
         """One fresh read through the shared GitHub client (its budget and Retry-After admission apply)."""
@@ -1318,7 +1359,47 @@ class _Broker:
             if not (isinstance(sha, str) and _OBJECT_ID.fullmatch(sha)):
                 raise _BrokerRefusal("sha must be a full commit id")
             fields += ["--sha", sha]
-        return self._module("publish.github", ["read", name, "--repo", self._repository_slug(), *fields], "gh")
+        slug = self._repository_slug()
+        if self._private():
+            self._private_read_scope(name, number, sha)
+        return self._module("publish.github", ["read", name, "--repo", slug, *fields], "gh")
+
+    def _private_read_scope(self, name: str, number: int | None, sha: str | None) -> None:
+        """Refuse a private repository's read that is not the authorized PR or its checks (C-5541).
+
+        The authorized PR is the one the launch names (``--pr``, frozen from the task record: a review's PR),
+        else the PR whose head is this task's dispatched branch, checked live. Its checks are read by commit:
+        this task's branch tip, or the authorized PR's live head. Reads by another id (a workflow run, a check
+        run, another PR or issue) are refused, so no unrelated private content reaches a worker.
+        """
+        launch_pr = getattr(self.boundary.args, "pr", None)
+        if name in _PRIVATE_PR_READS and number is not None and sha is None:
+            if launch_pr is not None:
+                if number != launch_pr:
+                    raise _BrokerRefusal("a private repository's read names a PR other than this task's")
+                return
+            self._pull_request({"pr": number}, "OPEN", "MERGED", "CLOSED")
+            return
+        if name in _PRIVATE_SHA_READS and sha is not None and number is None:
+            if sha == self.boundary.current_tip():
+                return
+            if launch_pr is not None:
+                _number, _slug, facts = self._authorized_pull_request(launch_pr)
+                if sha == facts.get("headRefOid"):
+                    return
+            raise _BrokerRefusal("a private repository's read names a commit other than this task's PR head")
+        raise _BrokerRefusal("a private repository's github-read is only this task's PR (pull, pr-files, commits, "
+                             "comments, reviews, timeline, issue by its number) and its checks (checks, commit by "
+                             "its head)")
+
+    def _authorized_pull_request(self, number: int) -> tuple[int, str, dict]:
+        """The launch's own PR (``--pr``) read live: same repository, not from a fork."""
+        slug = self._repository_slug()
+        facts = self._gh_json(["pr", "view", str(number), "--repo", slug, "--json",
+                               "state,headRefName,headRefOid,isCrossRepository,baseRefName"])
+        if not isinstance(facts, dict) or facts.get("isCrossRepository") is not False:
+            raise _BrokerRefusal("the task's PR cannot be read on GitHub")
+        return number, slug, facts
 
     def cleanup(self) -> None:
         self.closed = True
@@ -2176,6 +2257,12 @@ def call_main(argv: list[str]) -> int:
     return code if type(code) is int and 0 <= code < 256 else 1
 
 
+def _pr_number(text: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]{0,7}", text):
+        raise argparse.ArgumentTypeError("--pr must be a PR number")
+    return int(text)
+
+
 def main(argv: list[str]) -> int:
     if argv[:1] == ["call"]:
         return call_main(argv[1:])
@@ -2197,6 +2284,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--runtime", help="The read-only Codex task's existing private scratch lease")
     parser.add_argument("--publish-branch", help="The PR branch a continuation dispatch publishes to (its "
                         "publish_branch); the broker pushes and owns that PR only")
+    parser.add_argument("--pr", type=_pr_number, help="The PR the task record names (a review's PR); in a private "
+                        "repository github-read reads only this PR and its checks (default: the PR of the "
+                        "dispatched branch)")
     parser.add_argument("--author-model", help="The dispatched model, the review family check's author "
                         "(default: none; the broker then dispatches no review)")
     parser.add_argument("--output", action="append", help="A declared output file the provider writes")
