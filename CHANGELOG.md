@@ -19,6 +19,7 @@ notices them.
 
 ### Fixed
 
+- Failed pushes from write workers now record a redacted git error line in the task receipt instead of only the failing git step. ([#572](https://github.com/learn-ukrainian/machinery/pull/572))
 - Write workers inside the boundary can run governed tests, continue their assigned PR and receive and acknowledge their Fleet inbox deliveries. ([#560](https://github.com/learn-ukrainian/machinery/pull/560))
 - Dispatcher settlement runs merged-PR closeout after removing the worker's worktree and reports closeout failures. ([#548](https://github.com/learn-ukrainian/machinery/pull/548))
 - Agent deployment preserves shared Codex memory when a product overlay is absent, accepts the approved configured-primary hook commands and applies prompt lint rules only to their intended files. ([#556](https://github.com/learn-ukrainian/machinery/pull/556))
