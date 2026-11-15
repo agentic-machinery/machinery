@@ -55,7 +55,8 @@ BLOCKING = frozenset({"P0", "P1"})
 P0_P2 = frozenset({"P0", "P1", "P2"})
 # A whole line outside any code fence, so prose, a quote or a fenced example that mentions a trailer never lands a task.
 _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
-_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
+# CommonMark: a backtick fence's info string has no backtick, so "```X-Agent``` ..." is inline code, not a fence.
+_FENCE_OPEN = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
 _FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
 
 router = APIRouter()
@@ -75,8 +76,8 @@ def trailer_task_ids(message: str) -> set[str]:
             if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
                 fence = None
             continue
-        if opened := _FENCE_OPEN.match(line):
-            fence = opened.group(1)
+        if opened := _FENCE_OPEN.fullmatch(line):
+            fence = opened.group(1) or opened.group(2)
         elif trailer := _TRAILER.fullmatch(line):
             found.add(trailer.group(1))
     return found

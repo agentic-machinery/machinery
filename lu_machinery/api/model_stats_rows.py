@@ -325,7 +325,8 @@ def _locked(batch_state_dir: Path, wait_s: float | None = None) -> Iterator[Path
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
                         raise TimeoutError("the model-stats rows lock is busy") from None
-                    time.sleep(0.05)
+                    # flock has no timeout; this poll interval bounds a settlement's wait to wait_s.
+                    time.sleep(0.05)  # nosemgrep: python.lang.best-practice.arbitrary-sleep
         yield directory / ROWS_FILE
     finally:
         os.close(fd)

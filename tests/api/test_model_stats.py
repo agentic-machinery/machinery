@@ -143,6 +143,7 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
         "fix: suffixed\n\nX-Agent: claude/t-suffix (retry of t-real)\n",
         "docs: example\n\n```text\nX-Agent: codex/t-fence\n```\n",
         "docs: unclosed example\n\n~~~\nX-Agent: claude/t-tilde\n",
+        "docs: inline code is no fence\n\n```X-Agent``` names the task.\n\nX-Agent: codex/t-inline\n",
     ]
     for message in messages:
         _git(repo, "commit", "-q", "--allow-empty", "-m", message)
@@ -153,14 +154,15 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
 
     landing = stats.scan_landing(tmp_path, datetime.now(UTC) - timedelta(days=1))
 
-    assert landing.task_ids == {"t-real"}
-    assert landing.repositories == {"read": 1} and landing.by_repository == {"fixture": 1}
+    assert landing.task_ids == {"t-real", "t-inline"}
+    assert landing.repositories == {"read": 1} and landing.by_repository == {"fixture": 2}
     batch_state, tasks = _state(tmp_path)
-    for task_id in ("t-real", "t-real-2", "t-prose", "t-quote", "t-suffix", "t-fence", "t-tilde", "t-branch"):
+    for task_id in ("t-real", "t-real-2", "t-prose", "t-quote", "t-suffix", "t-fence", "t-tilde", "t-inline",
+                    "t-branch"):
         _record(tasks, task_id)
     rows.backfill(tasks, batch_state)
     write = _row(_window(batch_state, landing), "gpt-6.1-sol", "write")
-    assert write["tasks"] == 8 and write["landed"] == 1
+    assert write["tasks"] == 9 and write["landed"] == 2
 
 
 def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, monkeypatch):
