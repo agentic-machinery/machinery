@@ -1,11 +1,11 @@
-"""Live canary evidence for the review output contract at each release cut (#12399).
+"""Live canary evidence a change to the review output contract needs before it merges (#12399).
 
 On 2026-11-01 PR #12372 changed the code-review output contract, passed review and CI,
 and then no Codex, Claude or Grok review could settle (#12380, #12394, #12390). Its
-tests used fixtures and its own review ran on the old dispatcher. Release acceptance
-therefore runs one live read-only review per required reviewer route on the release
-candidate's exact head, under the candidate's own dispatcher. Every route must settle
-``done`` with a canonical receipt before the release may proceed.
+tests used fixtures and its own review ran on the old dispatcher. A change to the paths
+below therefore enters the merge queue only when, on its exact head, one live read-only
+review per required reviewer route has settled ``done`` with a canonical receipt while
+the candidate's own dispatcher supervised it.
 
 The evidence is canary evidence, never a review of record. A canary task is pinned to a
 head with no review branch and no PR, so ``record_cf_verdict`` refuses it ("review was
@@ -42,7 +42,7 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 # whatever it is called; the schema is packaged.
 CONTRACT_PATHS: tuple[str, ...] = (
     "schemas/code-review-findings.v1.schema.json",
-    f"{_MACHINERY}/review/contract_canary.py",  # the canary itself is proven on live routes too
+    f"{_MACHINERY}/review/contract_canary.py",  # this gate: a change to it is proven on live routes too
     f"{_MACHINERY}/schemas/code-review-findings.v1.schema.json",
     f"{_MACHINERY}/review/review_contract.py",
     f"{_MACHINERY}/review/verdict_parser.py",
@@ -302,8 +302,8 @@ def _load_task(task_id: str) -> tuple[dict, str]:
 def record(task_id: str, root: Path | None = None) -> Path:
     """Write the receipt for one settled canary task at the head it reviewed.
 
-    Release acceptance checks receipts only at the release candidate's exact head,
-    so a receipt for any other head cannot satisfy that cut.
+    The keeper and ``pr-merge`` read receipts only at the PR's live head, so a receipt
+    for any other head never admits anything.
     """
     task, result = _load_task(task_id)
     receipt = build_receipt(task, result, head=str(task.get("head_sha")))
@@ -456,7 +456,7 @@ def run(args: argparse.Namespace) -> int:
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
     )
     # Force a full score even if this head's changed files do not touch the contract.
-    # Isolated host imports select the installed receipt checker, not the candidate.
+    # Isolated host imports select the installed gate used by the keeper, not the candidate.
     check = [str(interpreter), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
@@ -550,7 +550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     target.add_argument("--pr", type=int, help="PR whose head to resolve once, e.g. 585 (default: use --head)")
     runner.add_argument("--hard-timeout", type=int, default=1200, help="Positive per-route deadline in seconds (default: 1200)")
     runner.add_argument("--dry-run", action="store_true", help="Print argv plan without creating files or dispatching (default: off)")
-    runner.add_argument("paths", nargs="*", help="Changed repository-relative files for check (default: the canary itself)")
+    runner.add_argument("paths", nargs="*", help="Changed repository-relative files for check (default: the contract gate itself)")
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
