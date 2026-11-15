@@ -290,7 +290,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
 
 
 @pytest.mark.parametrize("failure", [
-    None, "route", "check", "mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "client-interrupt",
+    None, "route", "check", "mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "client-interrupt", "submit-interrupt",
 ])
 def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     runner_roots, monkeypatch, capsys, failure,
@@ -339,6 +339,14 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     monkeypatch.setenv("PYTHONPATH", "/must/not/shadow/candidate")
     monkeypatch.setattr(canary, "_invoke", invoke)
     monkeypatch.setattr(canary.os.path, "ismount", lambda path: mounted)
+    if failure == "submit-interrupt":
+        real_submit = canary.ThreadPoolExecutor.submit
+
+        def interrupted_submit(self, *args, **kwargs):
+            real_submit(self, *args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(canary.ThreadPoolExecutor, "submit", interrupted_submit)
     if failure == "client-interrupt":
         real_result = canary.Future.result
 
@@ -358,14 +366,14 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
         assert sum(cmd[0] == "systemd-run" for cmd in commands) == 4
         assert "squashfs sha256:" in output.out
         assert "claude: FAIL" in output.out if failure == "route" else "claude: PASS" in output.out
-    if failure in {"unmount", "unmount-noop", "interrupt", "unit-lost"}:
+    if failure in {"unmount", "unmount-noop", "interrupt", "unit-lost", "submit-interrupt"}:
         assert mounted
         assert "retained" in output.err
         assert len(list(runner_roots.iterdir())) == 1
     else:
         assert not mounted
         assert list(runner_roots.iterdir()) == []
-    if failure not in {"mount", "unmount", "unmount-noop", "interrupt", "unit-lost"}:
+    if failure not in {"mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "submit-interrupt"}:
         assert sum("-u" in cmd for cmd in commands) == 1
 
 

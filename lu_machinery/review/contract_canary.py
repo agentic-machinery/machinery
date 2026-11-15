@@ -469,6 +469,7 @@ def run(args: argparse.Namespace) -> int:
         return 0
     mount_attempted = False
     pending: dict[str, Future[subprocess.CompletedProcess[str]]] = {}
+    submitting_route: str | None = None
     try:
         (work / "mount").mkdir()
         for command in setup:
@@ -483,7 +484,9 @@ def run(args: argparse.Namespace) -> int:
         # units before collecting results; the context joins every unit even on interrupt.
         with ThreadPoolExecutor(max_workers=len(route_commands)) as executor:
             for route, command in route_commands:
+                submitting_route = route
                 pending[route] = executor.submit(_invoke, command, cwd=work, env=env, check=False)
+                submitting_route = None
             for route, future in pending.items():
                 result = future.result()
                 if "CANARY-ROUTE-SETTLED" not in result.stdout.splitlines():
@@ -505,6 +508,9 @@ def run(args: argparse.Namespace) -> int:
             if not future.done() or future.exception() is not None
             or "CANARY-ROUTE-SETTLED" not in future.result().stdout.splitlines()
         ]
+        # submit can queue work and then be interrupted before returning its future.
+        if submitting_route is not None and submitting_route not in pending:
+            unknown.append(submitting_route)
         if unknown:
             # No candidate code may disappear while any detached task might still use it.
             raise CanaryError(f"{','.join(unknown)}: route completion unknown; retained mount and environment at {work}; "
