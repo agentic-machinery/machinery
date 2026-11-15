@@ -508,108 +508,45 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             "allowed_open_dependencies": [d["ref"] for d in dependencies if d["state"] != "closed"]}
 
 
-# One character of an owned-path pattern: (negated, ((first, last) code point ranges)); ``?`` is (True, ()).
-# ``None`` is ``*``, which fnmatch lets match any text, ``/`` included.
-_STAR = None
+_GLOB = frozenset("*?[")
 
 
-def _pattern_atoms(pattern: str) -> list:
-    """``pattern`` as fnmatch reads it (``fnmatch.translate``): characters, ``?``, ``[...]`` sets and ``*``."""
-    atoms: list = []
-    i = 0
-    while i < len(pattern):
-        char, i = pattern[i], i + 1
-        if char == "*":
-            if not atoms or atoms[-1] is not _STAR:
-                atoms.append(_STAR)
-        elif char == "?":
-            atoms.append((True, ()))
-        elif char == "[" and (end := pattern.find("]", i + (pattern[i:i + 1] == "!") + 1)) != -1:
-            body, i = pattern[i:end], end + 1
-            negated, body = body.startswith("!"), body.removeprefix("!")
-            ranges, k = [], 0
-            while k < len(body):
-                if k + 2 < len(body) and body[k + 1] == "-":
-                    ranges.append((ord(body[k]), ord(body[k + 2])))
-                    k += 3
-                else:
-                    ranges.append((ord(body[k]), ord(body[k])))
-                    k += 1
-            atoms.append((negated, tuple((lo, hi) for lo, hi in ranges if lo <= hi)))
-        else:
-            atoms.append((False, ((ord(char), ord(char)),)))
-    return atoms
+def _literal_norm(path: str) -> str | None:
+    """A literal owned path as the ownership predicate compares it (no ``./`` or trailing ``/``); None if it owns nothing."""
+    from lu_machinery.guardrails.delegate_ownership import ClaimKind, normalize_claim
+
+    claim = normalize_claim(path)
+    return claim.norm if claim.kind is not ClaimKind.UNKNOWN else None
 
 
-def _claim_patterns(raw: str) -> list[list]:
-    """The patterns whose union is what ``owned_path_matcher(raw)`` owns; none for a claim that owns nothing."""
-    from lu_machinery.guardrails.delegate_ownership import (
-        ClaimKind,
-        _bracket_literal,
-        normalize_claim,
-        owned_path_matcher,
-    )
-
-    def subtree(norm: str) -> list[list]:
-        literal = [(False, ((ord(char), ord(char)),)) for char in norm]
-        return [literal, [*literal, (False, ((ord("/"), ord("/")),)), _STAR]]
-
-    if owned_path_matcher(raw) is None:
-        return []
-    claim = normalize_claim(raw)
-    if claim.kind is not ClaimKind.UNKNOWN:
-        return subtree(claim.norm)
-    pattern = claim.norm
-    while pattern.startswith("./"):
-        pattern = pattern[2:]
-    literal = _bracket_literal(raw)
-    return [_pattern_atoms(pattern), *(subtree(literal.norm) if literal is not None else [])]
+def _paths_overlap(a: str, b: str) -> bool:
+    """Equal, or one is a directory prefix of the other."""
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
-def _characters_meet(a: tuple, b: tuple) -> bool:
-    """Whether two pattern characters admit a common character."""
-    if a[0] and b[0]:
-        return True
-    positive, other = (b, a) if a[0] else (a, b)
-    # The first common character is the range's start, a start of the other's ranges or just after one.
-    for lo, hi in positive[1]:
-        for char in (lo, *(edge for first, last in other[1] for edge in (first, last + 1))):
-            inside = any(first <= char <= last for first, last in other[1])
-            if lo <= char <= hi and inside != other[0]:
-                return True
-    return False
+def owned_path_overlap(owned_paths, task_id: str, repo_key: str) -> tuple[list[str], list[str]]:
+    """Live write tasks of repository ``repo_key`` sharing a literal owned path with ``owned_paths`` (#583).
 
-
-def _patterns_meet(p: list, q: list) -> bool:
-    """Whether some path matches both patterns (a search over pairs of positions)."""
-    seen, todo = set(), [(0, 0)]
-    while todo:
-        i, j = todo.pop()
-        if (i, j) in seen:
-            continue
-        seen.add((i, j))
-        if i == len(p) and j == len(q):
-            return True
-        a = p[i] if i < len(p) else ()
-        b = q[j] if j < len(q) else ()
-        if a is _STAR:
-            todo += [(i + 1, j)] + ([(i, j + 1)] if j < len(q) else [])
-        if b is _STAR:
-            todo += [(i, j + 1)] + ([(i + 1, j)] if i < len(p) else [])
-        if a and b and _characters_meet(a, b):
-            todo.append((i + 1, j + 1))
-    return False
-
-
-def _claims_overlap(mine: str, theirs: str) -> bool:
-    """Whether two owned-path claims own a common path, as the shared ownership predicate reads each claim."""
-    return any(_patterns_meet(p, q) for p in _claim_patterns(mine) for q in _claim_patterns(theirs))
-
-
-def owned_path_overlap(owned_paths, task_id: str, repo_key: str) -> list[str]:
-    """Live write tasks of repository ``repo_key`` with an owned path overlapping one of ``owned_paths`` (#583)."""
+    Two owned paths overlap when they are equal or one is a directory prefix of the other. A path holding a glob
+    character (``*``, ``?``, ``[``), on either side, is not compared: it is returned as ``task_id: path`` in the
+    second list and never counts as an overlap (the ownership hook refuses such write claims).
+    """
     from lu_machinery.dispatcher import ownership
 
+    not_checked: list[str] = []
+
+    def literal_paths(task: str, paths) -> list[str]:
+        literal = []
+        for path in paths:
+            if not isinstance(path, str):
+                continue
+            if _GLOB.intersection(path):
+                not_checked.append(f"{task}: {path}")
+            elif (norm := _literal_norm(path)) is not None:
+                literal.append(norm)
+        return literal
+
+    mine = literal_paths(task_id, owned_paths)
     found = []
     for record in store.list_tasks():
         if (record.get("status") not in store.ACTIVE or record.get("mode") == "read-only"
@@ -619,9 +556,10 @@ def owned_path_overlap(owned_paths, task_id: str, repo_key: str) -> list[str]:
             theirs = ownership.effective_scope(record)
         except ValueError:
             theirs = record.get("owned_paths") or []
-        if any(_claims_overlap(a, b) for a in owned_paths for b in theirs if isinstance(b, str)):
+        theirs = literal_paths(record["task_id"], theirs)
+        if any(_paths_overlap(a, b) for a in mine for b in theirs):
             found.append(record["task_id"])
-    return sorted(found)
+    return sorted(found), not_checked
 
 
 def check_review_budget(args, repository: dict, head_sha: str) -> None:

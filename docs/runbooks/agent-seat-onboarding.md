@@ -230,10 +230,12 @@ become a second coordination plane.
 or PR is open, its state cannot be read, or a line is anything else;
 `--allow-open-dependency '#N'` (or the exact line) admits that one entry, and the
 task record's `task_card` field names it. Every write dispatch with owned paths
-prints the live write tasks of the same repository whose owned paths share a
-path with its own (the same path, a directory above or below it, or a pattern
-owning a common path) and records them as `owned_path_overlap`;
-`--refuse-on-overlap` refuses it instead. Both run under `--dry-run` (#583).
+prints the live write tasks of the same repository whose owned paths overlap
+its own (the same path, or a directory above or below it, compared literally)
+and records them as `owned_path_overlap`; `--refuse-on-overlap` refuses it
+instead. An owned path holding `*`, `?` or `[`, on either side, is not compared:
+it is printed and recorded as `owned_path_overlap_not_checked` (`task: path`)
+and never refuses. Both run under `--dry-run` (#583).
 
 #### Sibling-repo dispatch
 

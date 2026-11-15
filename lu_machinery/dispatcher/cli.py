@@ -182,9 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--refuse-on-overlap", action="store_true",
-        help="Refuse a write task whose owned paths share a path with a live write task's in the same repository "
-        "(the same path, a directory above or below, or a pattern owning a common path); the overlap is always "
-        "printed and recorded (default: off)",
+        help="Refuse a write task whose owned paths overlap a live write task's in the same repository (the same "
+        "path, or a directory above or below it, compared literally); the overlap is always printed and recorded. "
+        "A path with *, ? or [ on either side is listed as not checked (pattern) and never refuses (default: off)",
     )
     dispatch.add_argument("--dry-run", action="store_true", help="Print plan; create nothing (default: off)")
     dispatch.add_argument("--print-advisory-binding", action="store_true",
@@ -460,12 +460,14 @@ def _dispatch(args) -> int:
     if args.task_card:
         gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
     if args.mode != "read-only" and args.owned_path:
-        overlap = checks.owned_path_overlap(args.owned_path, task_id, info["key"])
+        overlap, not_checked = checks.owned_path_overlap(args.owned_path, task_id, info["key"])
+        if not_checked:
+            print(f"dispatcher: owned-path overlap not checked (pattern): {'; '.join(not_checked)}", file=sys.stderr)
         if overlap:
             print(f"dispatcher: owned paths overlap live write tasks: {', '.join(overlap)}", file=sys.stderr)
             if args.refuse_on_overlap:
                 raise ValueError(f"owned_path_overlap_refused: owned paths overlap live write tasks {', '.join(overlap)}")
-        gate_fields["owned_path_overlap"] = overlap
+        gate_fields.update(owned_path_overlap=overlap, owned_path_overlap_not_checked=not_checked)
     host_admission.precheck(args.mode, force_reason=args.force_admission)
     role_record = {**vars(args), **account_fields, "prompt_sha256": store.digest(prompt),
                    "repository_id": info.get("github")}
