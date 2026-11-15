@@ -152,8 +152,8 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
         "docs: example\n\n```text\nX-Agent: codex/t-fence\n```\n",
         "docs: unclosed example\n\n~~~\nX-Agent: claude/t-tilde\n",
         "docs: inline code is no fence\n\n```X-Agent``` names the task.\n\nX-Agent: codex/t-inline\n",
-        # An inline code span that runs across lines of one paragraph is an example, not a landing.
-        "docs: inline example\n\nThe trailer reads `\nX-Agent: claude/t-span\n` in a commit.\n",
+        # An inline code span that runs across lines of one paragraph, after an escaped backtick, is an example.
+        "docs: inline example\n\nAfter a literal \\` the trailer reads `\nX-Agent: claude/t-span\n` in a commit.\n",
     ]
     for message in messages:
         _git(repo, "commit", "-q", "--allow-empty", "-m", message)

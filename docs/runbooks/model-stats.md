@@ -53,8 +53,9 @@ a row a settlement failed to write.
   totals, split again by task class, so `code` at `high` and `code` at `low` compare directly.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
-- **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer, outside any code
-  fence or inline code span (a fenced, inline-code or quoted example never counts), on a registered
+- **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer that the commit
+  message, parsed as CommonMark, renders as one plain-text line of a top-level paragraph or heading (a fenced,
+  indented, inline-code, quoted, list or HTML example never counts), on a registered
   repository's local `origin/main` since the first row, or that recorded its own merged delivery into `main`
   (`delivery_merge_sha`, proven against GitHub at settlement). `landed_by` reports how many landed by trailer,
   by recorded merge, or both. The Monitor never fetches; trailer landing is as fresh as the last fetch of each

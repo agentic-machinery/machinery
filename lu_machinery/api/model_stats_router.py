@@ -30,6 +30,8 @@ from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from prometheus_client.core import GaugeMetricFamily
 
 from lu_machinery.common.git_context import sanitized_git_env
@@ -53,73 +55,42 @@ ALL_EFFORTS = "all"
 # reference script counted P0-P2, so both are reported.
 BLOCKING = frozenset({"P0", "P1"})
 P0_P2 = frozenset({"P0", "P1", "P2"})
-# A whole line outside any code fence, so prose, a quote or a fenced example that mentions a trailer never lands a task.
+# One whole line, so prose or a suffixed value that mentions a trailer never lands a task.
 _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
-# CommonMark: a backtick fence's info string has no backtick, so "```X-Agent``` ..." is inline code, not a fence.
-_FENCE_OPEN = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
-_FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
-_BACKTICKS = re.compile(r"`+")
+_LINE_ENDINGS = re.compile(r"\r\n|\r|\n")  # CommonMark's three, as markdown-it normalizes them
+_COMMONMARK = MarkdownIt("commonmark")
 
 router = APIRouter()
-
-
-def _code_spans(text: str) -> list[tuple[int, int]]:
-    """CommonMark inline code spans of one paragraph as offsets: a backtick run closed by the next run of the same
-    length; a run with no such closer is literal text."""
-    runs = [(match.start(), match.end()) for match in _BACKTICKS.finditer(text)]
-    spans: list[tuple[int, int]] = []
-    index = 0
-    while index < len(runs):
-        start, end = runs[index]
-        closer = next((k for k in range(index + 1, len(runs)) if runs[k][1] - runs[k][0] == end - start), None)
-        if closer is None:
-            index += 1
-            continue
-        spans.append((start, runs[closer][1]))
-        index = closer + 1
-    return spans
-
-
-def _paragraph_trailers(lines: list[str]) -> set[str]:
-    """Trailer task ids of one paragraph's lines, skipping a line an inline code span covers."""
-    text = "\n".join(lines)
-    spans = _code_spans(text)
-    found: set[str] = set()
-    offset = 0
-    for line in lines:
-        end = offset + len(line)
-        trailer = _TRAILER.fullmatch(line)
-        if trailer and not any(start < offset and end < stop for start, stop in spans):
-            found.add(trailer.group(1))
-        offset = end + 1
-    return found
 
 
 def trailer_task_ids(message: str) -> set[str]:
     """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
 
-    Lines inside a backtick or tilde code fence (CommonMark: closed by a run of the same character at least as long,
-    else open to the end), or inside an inline code span that runs across lines of one paragraph, are examples,
-    never attribution.
+    The message is parsed as CommonMark (markdown-it, the parser ``review.verdict_parser`` uses). A trailer counts
+    only where it renders as one whole line of plain text in a top-level paragraph or heading and the same trailer
+    is a whole source line of that block: a code fence or code block, an inline code span (across lines too, honoring backslash escapes),
+    a quote, a list item or HTML is an example, never attribution.
     """
+    if "X-Agent:" not in message:
+        return set()
+    lines = _LINE_ENDINGS.split(message)
     found: set[str] = set()
-    fence: str | None = None
-    paragraph: list[str] = []
-    for line in message.splitlines():
-        if fence is not None:
-            close = _FENCE_CLOSE.fullmatch(line)
-            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
-                fence = None
+    block: Token | None = None
+    for token in _COMMONMARK.parse(message):
+        if token.nesting == 1:
+            block = token
+        if token.type != "inline" or block is None or block.level != 0 or block.map is None:
             continue
-        opened = _FENCE_OPEN.fullmatch(line)
-        if opened or not line.strip():
-            found |= _paragraph_trailers(paragraph)
-            paragraph = []
-            if opened:
-                fence = opened.group(1) or opened.group(2)
-            continue
-        paragraph.append(line)
-    return found | _paragraph_trailers(paragraph)
+        source = {match.group(1) for line in lines[block.map[0]:block.map[1]] if (match := _TRAILER.fullmatch(line))}
+        rendered: list[str] = []
+        for child in [*(token.children or []), None]:
+            if child is not None and child.type not in ("softbreak", "hardbreak"):
+                rendered.append(child.content if child.type in ("text", "text_special") else "\0")
+                continue
+            if (match := _TRAILER.fullmatch("".join(rendered))) and match.group(1) in source:
+                found.add(match.group(1))
+            rendered = []
+    return found
 
 
 @dataclass
