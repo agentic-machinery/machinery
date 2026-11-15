@@ -614,25 +614,10 @@
     "start-codex.sh": [
       "harness"
     ],
-    "start-cursor-driver.sh": [
-      "harness"
-    ],
     "start-gemini-driver.sh": [
       "harness"
     ],
     "start-gemini.sh": [
-      "harness"
-    ],
-    "start-glm.sh": [
-      "harness"
-    ],
-    "start-glmcc.sh": [
-      "harness"
-    ],
-    "start-grok-driver.sh": [
-      "harness"
-    ],
-    "start-grok.sh": [
       "harness"
     ],
     "tests/build/test_build_landing_pages.py": [
@@ -832,12 +817,6 @@
     },
     {
       "path": "eval/",
-      "components": [
-        "shared-core"
-      ]
-    },
-    {
-      "path": "gemini_extensions/",
       "components": [
         "shared-core"
       ]

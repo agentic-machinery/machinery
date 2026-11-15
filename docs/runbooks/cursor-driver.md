@@ -8,7 +8,7 @@ Cursor is a first-class worker and orchestrator seat in the fleet roster. Promot
 
 ## Driver vs GUI Supervision
 
-- **Canonical Driver = TUI Launcher:** The canonical Cursor driver runs as a launched TUI driver session (`start-cursor-driver.sh`, child #6956) sharing `lu_machinery/lib/launcher_core.sh` with other driver seats. It claims the stream lease, respects lease lifecycles, and executes the standard `drive-epic` loop. On claim it heartbeats `POST /api/observer/presence` (`agent=cursor`) over the Monitor loopback tunnel and renews that row while the provider child is alive so occupancy can show the seat under `cloud-observer` without a RAM lease (#7075). A GUI Cursor driver session that is actually driving uses the same helper:
+- **Driver session:** A Cursor driver session claims the stream lease, respects lease lifecycles, and executes the standard `drive-epic` loop. On claim it heartbeats `POST /api/observer/presence` (`agent=cursor`) over the Monitor loopback tunnel and renews that row while the provider child is alive so occupancy can show the seat under `cloud-observer` without a RAM lease (#7075). A GUI Cursor driver session that is actually driving uses the same helper:
 
 ```bash
 .venv/bin/python -m lu_machinery.orchestration.observer_heartbeat \

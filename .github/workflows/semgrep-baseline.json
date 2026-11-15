@@ -425,11 +425,6 @@
    "sha256": "09dd06b5a5e1a474e979e7963c848a1bd03cb19565b94e62fd3da9f54a86c875"
   },
   {
-   "path": "lu_machinery/ci/cursor_cloud_pytest_verify.py",
-   "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
-   "sha256": "82ec8d41fcd42e1bf3d6a9938fd36325e3e3da31230aef82a02a1ba7813e2570"
-  },
-  {
    "path": "lu_machinery/ci/dependency_advisory_issue.py",
    "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
    "sha256": "0c46f6c4f1ac627ff357b9a093e8deee9183d234ffa95d40220c16460ece1ddf"
@@ -823,16 +818,6 @@
    "path": "lu_machinery/api/runtime_router.py",
    "rule": "python.lang.maintainability.is-function-without-parentheses",
    "sha256": "c49af43d3fc0744e170c7b9aace4cf43be9a4c553dc4fc3ae62dab6a8c27b734"
-  },
-  {
-   "path": "lu_machinery/ci/cursor_cloud_pytest_verify.py",
-   "rule": "python.lang.maintainability.is-function-without-parentheses",
-   "sha256": "70aa65f9ff5b9a5b46ac3c9f2fd816ac5ea7b59967b764145a095c9ba95deb16"
-  },
-  {
-   "path": "lu_machinery/ci/cursor_cloud_pytest_verify.py",
-   "rule": "python.lang.maintainability.is-function-without-parentheses",
-   "sha256": "f22185abb919c2119b8a0e0fdb70b9e5c84b905d77fc6749affd811aa806efaf"
   },
   {
    "path": "lu_machinery/dispatcher/host_admission.py",
@@ -2465,11 +2450,6 @@
    "sha256": "925185a804f421190a7a0276a73594730bf5ea098b8fd7fb781ad42e365b8cc9"
   },
   {
-   "path": "lu_machinery/ci/cursor_cloud_pytest_verify.py",
-   "rule": "python.lang.security.use-defused-xml",
-   "sha256": "9799cab3616968caa8d9d3d85ccab16eaed8932f6f73becd296362ce72207517"
-  },
-  {
    "path": "lu_machinery/ci/data_tier.py",
    "rule": "python.lang.security.use-defused-xml",
    "sha256": "925185a804f421190a7a0276a73594730bf5ea098b8fd7fb781ad42e365b8cc9"
@@ -2513,11 +2493,6 @@
    "path": "lu_machinery/ci/component_shadow.py",
    "rule": "python.lang.security.use-defused-xml-parse",
    "sha256": "0034bfe60c671b20333ef3bb87b34ae796a14bd6dce706054acabd219ec3366f"
-  },
-  {
-   "path": "lu_machinery/ci/cursor_cloud_pytest_verify.py",
-   "rule": "python.lang.security.use-defused-xml-parse",
-   "sha256": "3a9f26f77b4e2eef73e96ef92e150ebd79aa6f096ff6bdf121d17460dfd8331e"
   },
   {
    "path": "lu_machinery/ci/data_tier.py",
