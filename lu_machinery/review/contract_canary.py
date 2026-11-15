@@ -27,7 +27,7 @@ import sys
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from lu_machinery.common import github_client
 
@@ -356,9 +356,12 @@ finally:
 """
 
 
-def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bool = True) -> subprocess.CompletedProcess:
+def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bool = True) -> subprocess.CompletedProcess[str]:
     """Use the shared GitHub client seam, including its non-GitHub argv transport."""
-    result = github_client.run(list(argv), cwd=cwd, env=dict(env), text=True, capture_output=True, check=False)
+    result = cast(
+        subprocess.CompletedProcess[str],
+        github_client.run(list(argv), cwd=cwd, env=dict(env), text=True, capture_output=True, check=False),
+    )
     if check and result.returncode:
         raise CanaryError(f"command failed ({result.returncode}): {shlex.join(argv)}\n{result.stderr.strip()}")
     return result
