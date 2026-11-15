@@ -665,6 +665,7 @@ tests/dispatcher/test_codex_accounts.py
 tests/dispatcher/test_codex_read_only_scratch.py
 tests/dispatcher/test_core.py
 tests/dispatcher/test_core_admission.py
+tests/dispatcher/test_dispatch_card_gate.py
 tests/dispatcher/test_core_branch_start.py
 tests/dispatcher/test_core_delivery.py
 tests/dispatcher/test_core_delivery_scope.py
