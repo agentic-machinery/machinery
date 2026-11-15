@@ -292,16 +292,15 @@ class CommitInputs:
 
     def lookup(self, path: str) -> tuple[bytes, str] | None:
         """``(mode, ID)`` of the entry at ``path`` in the commit's tree; ``None`` when there is none."""
-        entry: tuple[bytes, str] | None = (self.TREE_MODE, self.root)
-        walked = []
+        mode, oid, walked = self.TREE_MODE, self.root, ""
         for part in relative(path).split("/"):
-            if entry[0] != self.TREE_MODE:
+            if mode != self.TREE_MODE:
                 return None
-            entry = self.listings([entry[1]], ["/".join(walked) or "."])[0].get(part)
+            entry = self.listings([oid], [walked or "."])[0].get(part)
             if entry is None:
                 return None
-            walked.append(part)
-        return entry
+            (mode, oid), walked = entry, (walked + "/" + part).lstrip("/")
+        return mode, oid
 
     @staticmethod
     def regular(mode: bytes, path: str) -> int:

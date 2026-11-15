@@ -187,9 +187,11 @@ def worktree_records(*args: str, root: Path) -> list[str] | None:
     """``git_records`` for a listing of the checkout at ``root`` itself (machinery#22).
 
     ``--work-tree`` outranks ``core.worktree``, so a setting written while the gate runs cannot point the
-    listing at another directory than the one validated.
+    listing at another directory than the one validated; the untracked cache and file-system monitor are
+    off, so no cached or reported state the checkout's configuration supplies can stand in for the scan.
     """
-    return git_records(f"--work-tree={root}", *args, cwd=root)
+    pins = ("-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false", f"--work-tree={root}")
+    return git_records(*pins, *args, cwd=root)
 
 
 def parse_updates(text: str) -> list[Update]:
