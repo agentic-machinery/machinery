@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import shutil
+import subprocess
 import time
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+
+from prometheus_client import CollectorRegistry, generate_latest
 
 from lu_machinery.agent_runtime import model_pause
+from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
 from lu_machinery.dispatcher import store, worker
 
@@ -36,6 +43,14 @@ def _state(tmp_path: Path) -> tuple[Path, Path]:
     tasks = tmp_path / "batch_state" / "tasks"
     tasks.mkdir(parents=True)
     return tmp_path / "batch_state", tasks
+
+
+def _window(batch_state: Path, landing: stats.Landing, name: str = "7d") -> dict:
+    return stats.collect(batch_state, batch_state.parent, NOW, landing=landing)["windows"][name]
+
+
+def _row(payload: dict, model: str, role: str) -> dict:
+    return next(r for r in payload["models"] if r["model"] == model and r["role"] == role)
 
 
 def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, monkeypatch):
@@ -78,11 +93,116 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
 
     first = rows.backfill(tasks, batch_state)
     again = rows.backfill(tasks, batch_state)
+    shutil.rmtree(tasks)  # retention removes every task record; the rows remain
+    payload = _window(batch_state, stats.Landing(task_ids={"w1", "r2-review"}))
 
     assert (first["added"], first["refreshed"], first["already_present"]) == (4, 1, 2)
     assert first["invalid_task_id"] == 1 and "/srv/private/model" not in rows.rows_path(batch_state).read_text()
     assert (again["added"], again["refreshed"]) == (0, 0)
     assert rows.read_rows(batch_state)[1]["malformed_lines"] == 1
+    write = _row(payload, "gpt-6.1-sol", "write")
+    assert write["tasks"] == 3 and write["low_sample"] is True
+    assert write["status"]["done"] == 2 and write["status"]["no_deliverable"] == 1
+    assert write["landed"] == 1 and write["landed_rate"] == {"value": 0.333, "n": 3, "low_sample": True}
+    assert write["wall_seconds"] == {"median": 1200.0, "p90": 1800.0, "total_hours": 1.0, "n": 3}
+    assert write["wall_hours_per_landed"]["value"] == 1.0
+    assert write["tokens"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
+    assert write["output_tokens_per_landed"]["value"] == 300
+    assert [(c["class"], c["tasks"], c["landed"]) for c in write["by_class"]] == [("code", 2, 1), ("unclassified", 1, 0)]
+
+    review = _row(payload, "claude-opus-5-5", "review")
+    assert review["tasks"] == 3 and "landed" not in review
+    assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 1}
+    assert review["blocking_per_review"]["value"] == 1.0 and review["p0_p2_per_review"]["value"] == 1.5
+    assert review["by_class"][0]["class"] == "code/medium"
+
+    (author,) = payload["authors"]
+    assert author["model"] == "gpt-6.1-sol" and author["prs"] == 1
+    assert author["rounds_per_pr"]["value"] == 2.0
+    assert author["approved_eventually"]["value"] == 1.0
+    assert author["first_round_approved"]["value"] == 0.0
+    assert author["blocking_per_pr"]["value"] == 2.0 and author["p0_p2_per_pr"]["value"] == 3.0
+    assert payload["records"] == 6
+    assert _window(batch_state, stats.Landing(), "all")["records"] == 7
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+
+
+def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
+    """Defect class: false landing attribution from prose, quotes, code fences, suffixed values or another branch."""
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "fixture")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "fixture@example.invalid")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "--template=")
+    messages = [
+        # A squash merge appends its own paragraph after the trailer: the line still counts.
+        "feat: real (#1)\n\nRefs #9\n\nX-Agent: codex/t-real\n\nCo-authored-by: A <a@example.invalid>\n",
+        "docs: prose\n\nThe earlier run carried X-Agent: claude/t-prose and failed.\n",
+        "docs: quoted\n\n> X-Agent: claude/t-quote\n",
+        "fix: suffixed\n\nX-Agent: claude/t-suffix (retry of t-real)\n",
+        "docs: example\n\n```text\nX-Agent: codex/t-fence\n```\n",
+        "docs: unclosed example\n\n~~~\nX-Agent: claude/t-tilde\n",
+        "docs: inline code is no fence\n\n```X-Agent``` names the task.\n\nX-Agent: codex/t-inline\n",
+    ]
+    for message in messages:
+        _git(repo, "commit", "-q", "--allow-empty", "-m", message)
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "unmerged\n\nX-Agent: codex/t-branch\n")
+    monkeypatch.setattr(stats, "load_fleet_repos", lambda: {"fixture": SimpleNamespace(key="fixture")})
+    monkeypatch.setattr(stats, "resolve_fleet_repo", lambda key, **_: (None, repo))
+
+    landing = stats.scan_landing(tmp_path, datetime.now(UTC) - timedelta(days=1))
+
+    assert landing.task_ids == {"t-real", "t-inline"}
+    assert landing.repositories == {"read": 1} and landing.by_repository == {"fixture": 2}
+    batch_state, tasks = _state(tmp_path)
+    for task_id in ("t-real", "t-real-2", "t-prose", "t-quote", "t-suffix", "t-fence", "t-tilde", "t-inline",
+                    "t-branch"):
+        _record(tasks, task_id)
+    rows.backfill(tasks, batch_state)
+    write = _row(_window(batch_state, landing), "gpt-6.1-sol", "write")
+    assert write["tasks"] == 9 and write["landed"] == 2
+
+
+def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, monkeypatch):
+    """Defect class: data leak of prompts, result bodies, host paths, errors, task ids or account identities."""
+    batch_state, tasks = _state(tmp_path)
+    secrets = ["PROMPT-TEXT-x1", "/home/leaky/worktree", "kk", "ERROR-DETAIL-x2", "EXPLANATION-x3",
+               "finding body 0", "/srv/private/model", "../escape", "acct-identity@example.invalid"]
+    _record(tasks, "leaky", prompt="PROMPT-TEXT-x1", prompt_file="/home/leaky/worktree/prompt.md",
+            worktree_path="/home/leaky/worktree", claude_account="kk", error="ERROR-DETAIL-x2",
+            research_task_family="../escape", allowance={"pool": "claude:kk", "start": {"remaining_pct": 50},
+                                                        "finish": {"remaining_pct": 40}})
+    _record(tasks, "odd-model", model="/srv/private/model", codex_account="acct-identity@example.invalid")
+    _review(tasks, "leaky-review", "correct", ["P1"], pr=3, review_author_model="gpt-6.1-sol",
+            worktree_path="/home/leaky/worktree")
+    result = tasks / "leaky-review.result"
+    payload = json.loads(result.read_text())
+    payload["overall"]["explanation"] = "EXPLANATION-x3"
+    result.write_text(json.dumps(payload))
+    rows.backfill(tasks, batch_state)
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    ctx = SimpleNamespace(roots=SimpleNamespace(batch_state_dir=batch_state, live_repo_root=tmp_path))
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    registry = CollectorRegistry()
+    registry.register(stats.ModelStatsCollector(ctx))
+
+    stored = rows.rows_path(batch_state).read_text()
+    text = json.dumps(snapshot)
+    metrics = generate_latest(registry).decode()
+
+    assert [s for s in secrets if s in stored + text + metrics] == []
+    assert [t for t in ("leaky", "odd-model") if t in metrics] == []
+    assert '"model": "unknown"' in text and '{effort="high",model="unknown",role="write",window="7d"} 1.0' in metrics
+    assert snapshot["windows"]["7d"]["allowance"] == []  # an API-key label is no admitted pool
 
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
@@ -127,6 +247,11 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
     rows.backfill(tasks, batch_state)
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
     assert stored["half"]["allowance"]["start"] == "unknown"
+    window = _window(batch_state, stats.Landing(task_ids={"both", "half"}))
+    assert window["allowance"] == [{"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1,
+                                    "landed": 1, "reset_crossed": 0, "low_sample": True, "pct_points_spent": 5.5,
+                                    "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}}]
+    assert _row(window, "gpt-6.1-sol", "write")["allowance_pct_points_per_landed"]["value"] == 5.5
 
 
 def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
@@ -150,6 +275,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     rows.backfill(tasks, batch_state)
 
     stored = {row["task_id"]: (row["model"], row["effort"]) for row in rows.read_rows(batch_state)[0]}
+    window = _window(batch_state, stats.Landing())
 
     assert stored == {
         "grok": ("grok-4.7", "high"),
@@ -162,3 +288,14 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "unknown-version": ("claude-opus-5-6", "high"),
         "free-effort": ("gpt-6.1-sol", "request-0"),
     }
+    flash = _row(window, "gemini-3.8-flash-high", "write")
+    assert flash["effort"] == "all" and [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [
+        ("medium", 1), ("unset", 1)]
+    assert {(r["model"], e["effort"]) for r in window["models"] for e in r["by_effort"]} == set(stored.values())
+    sol = _row(window, "gpt-6.1-sol", "write")
+    assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("request-0", ["docs"])]
+    # /metrics keeps finite label sets: values outside the catalog's known set export as "other".
+    metrics = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())["metrics"]["windows"]["all"]
+    exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
+    assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
+    assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
