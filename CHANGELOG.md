@@ -37,6 +37,7 @@ notices them.
 - The unused sealed review snapshot engine is removed. AGY plain asks run the same as before, and AGY reviews stay refused. ([#582](https://github.com/learn-ukrainian/machinery/pull/582))
 - Seven unused one-shot tools are removed: the budget screen, delivery baseline, coverage report, agent pitfall census, goal-driver size cap, HTML migration tool and GUI session lease. ([#580](https://github.com/learn-ukrainian/machinery/pull/580))
 - The Grok session canary runbook and protocol no longer describe a production rollover step. ([#596](https://github.com/learn-ukrainian/machinery/pull/596))
+- The unused liveness probe, which nothing called, is removed. ([#605](https://github.com/learn-ukrainian/machinery/pull/605))
 
 <a id="v0.1.20"></a>
 ## [0.1.20] - 2026-11-15
