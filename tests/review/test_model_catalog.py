@@ -1147,7 +1147,7 @@ def assert_frozen_surfaces(actual, *, surfaces):
             # #586: Hydrogen is an AGY work model with no review or advisory role, so it joins
             # no seat, review route, ladder or ranking; its row is pinned and every other field stays frozen.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
-            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "eb70beb66fa2b597573462c10d494df5248cee46c267d1b86bac3b4da27a9ac7"
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "d65beae8f847d7d054ff7fba403215567fd7da70817ae873d9c3fd637612e3d4"
         assert value == expected, f"current surface differs: {surface}"
 
 

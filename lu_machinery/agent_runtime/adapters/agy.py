@@ -771,15 +771,18 @@ _AGY_HYDROGEN_SLUGS: tuple[str, ...] = (
     "gemini-4-hydrogen-medium",
     "gemini-4-hydrogen-low",
 )
+_AGY_GEMINI4_SLUGS: tuple[str, ...] = (
+    *_AGY_CARBON_SLUGS,
+    *_AGY_HYDROGEN_SLUGS,
+    *_AGY_ARGON_SLUGS,
+)
 _AGY_GENERAL_MODEL_SLUGS: tuple[str, ...] = (
     "gemini-3.8-flash-high",
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
     "gemini-3.1-pro-high",
     "gemini-3.1-pro-low",
-    *_AGY_CARBON_SLUGS,
-    *_AGY_HYDROGEN_SLUGS,
-    *_AGY_ARGON_SLUGS,
+    *_AGY_GEMINI4_SLUGS,
 )
 _AGY_MODEL_SLUGS: tuple[str, ...] = (
     *_AGY_GENERAL_MODEL_SLUGS,
@@ -923,7 +926,9 @@ def agy_model_state(
                 bound = False
             family = next((
                 spec["family"] for key, spec in load_model_catalog()["models"].items()
-                if key == observed_slug or spec.get("routing_wire_ids", {}).get("agy") == observed_slug
+                if key == observed_slug
+                or spec.get("routing_wire_ids", {}).get("agy") == observed_slug
+                or observed_slug in spec.get("runtime_model_ids", ())
             ), None) if observed_slug else None
             # Custody and binding do not establish consistency of a sealed mapping.
             # A genuine mismatch stays known; a contradictory receipt stays untrusted.
@@ -2331,8 +2336,8 @@ def _stream_result(
     # invocations still pass resolve_model_slug's admission check.
     expected = _AGY_MODEL_BY_NORMALIZED.get(_normalize_model(expected_model)) if expected_model is not None else None
     claude_identity = expected in _AGY_CLAUDE_SLUGS
-    argon_identity = expected in _AGY_ARGON_SLUGS
-    check_identity = claude_identity or argon_identity
+    gemini4_identity = expected in _AGY_GEMINI4_SLUGS
+    check_identity = claude_identity or gemini4_identity
     identity_seen = False
     init_seen = False
     activity_seen = False
@@ -2391,10 +2396,7 @@ def _stream_result(
                 resolved = []
                 for value in reported:
                     try:
-                        if argon_identity:
-                            slug = _AGY_MODEL_BY_NORMALIZED.get(_normalize_model(value)) if isinstance(value, str) and value.strip() else None
-                        else:
-                            slug = AgyAdapter.resolve_model_slug(value) if isinstance(value, str) and value.strip() else None
+                        slug = AgyAdapter.resolve_model_slug(value) if isinstance(value, str) and value.strip() else None
                     except ValueError:
                         slug = None
                     resolved.append(slug)

@@ -86,7 +86,16 @@ def test_agy_read_only_without_attempt_boundary_is_refused_not_run_unguarded(
     assert lane_probe._mode_for_probe(agy.AgyAdapter()) == "workspace-write"
 
 
-@pytest.mark.parametrize("slug,label", zip(SLUGS, LABELS, strict=True))
+@pytest.mark.parametrize("slug,label", [
+    *zip(SLUGS, LABELS, strict=True),
+    ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+    ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+    ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+    ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+    ("gemini-4-carbon-low", "Gemini 4 Carbon (Low)"),
+    ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
+    ("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+])
 def test_exact_slug_and_display_label_resolve(slug, label):
     adapter = agy.AgyAdapter()
     assert adapter._resolve_model_flag(slug) == slug
@@ -208,7 +217,7 @@ def test_anthropic_agy_fixture_candidate_cannot_review_anthropic_author(author):
 
 
 @pytest.mark.parametrize("shape", ["nested", "top-level"])
-@pytest.mark.parametrize("slug", SLUGS)
+@pytest.mark.parametrize("slug", (*SLUGS, *agy._AGY_HYDROGEN_SLUGS, *agy._AGY_CARBON_SLUGS, "gemini-4-argon-high"))
 @pytest.mark.parametrize("observed", ["matching", "mismatching", "absent", "no-init", "tool-only"])
 def test_provider_init_identity_on_existing_parse_result(tmp_path, monkeypatch, slug, observed, shape):
     plan = InvocationPlan(
@@ -263,6 +272,8 @@ def test_provider_init_identity_on_existing_parse_result(tmp_path, monkeypatch, 
         assert result.substitution is None
     if observed not in {"matching", "mismatching"}:
         assert identity is None
+        assert result.stderr_excerpt == "agy_model_identity_missing"
+        assert result.failure_code == "provider_policy_refusal"
         return
     assert identity is not None
     assert identity["actual_model"] == (
@@ -543,7 +554,13 @@ def test_provider_session_must_bind_to_this_stream(tmp_path, identifiers):
     assert result.model_identity is None or result.model_identity["substituted"] is True
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5-high", "claude-sonnet-5-5-high"])
+@pytest.mark.parametrize("model", [
+    "claude-opus-5-5-high",
+    "claude-sonnet-5-5-high",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-carbon-medium",
+])
 def test_identity_survives_provider_failure_without_claiming_success(tmp_path, model):
     plan, terminal = _identity_stream_plan(tmp_path, model)
     terminal["result"].update(status="ERROR", error="synthetic provider failure")
@@ -560,6 +577,9 @@ def test_identity_survives_provider_failure_without_claiming_success(tmp_path, m
 @pytest.mark.parametrize("pin,other", [
     ("claude-sonnet-5-5-high", "claude-opus-5-5-high"),
     ("claude-opus-5-5-high", "claude-sonnet-5-5-high"),
+    ("gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"),
+    ("gemini-4-hydrogen-xhigh", "gemini-3.8-flash-high"),
+    ("gemini-4-carbon-high", "gemini-4-carbon-medium"),
 ])
 def test_adapter_substitution_uses_invocation_pin_instead_of_metadata(tmp_path, pin, other):
     plan, terminal = _identity_stream_plan(tmp_path, pin)
@@ -754,13 +774,21 @@ def consistency_stream(slug, case):
     return "\n".join(lines) + "\n"
 
 
+@pytest.mark.parametrize("selector", [
+    "gemini-4-argon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+])
 @pytest.mark.parametrize("nested,top,observed", [
     ("other-nested", "other-top", "other-nested"),
-    ("other-nested", "gemini-4-argon-high", "other-nested"),
-    ("gemini-4-argon-high", "other-top", "other-top"),
+    ("other-nested", "MODEL", "other-nested"),
+    ("MODEL", "other-top", "other-top"),
 ])
-def test_argon_preserves_nested_first_mismatch_observation(tmp_path, nested, top, observed):
-    plan, terminal = _identity_stream_plan(tmp_path, "gemini-4-argon-high")
+def test_argon_preserves_nested_first_mismatch_observation(tmp_path, selector, nested, top, observed):
+    nested = selector if nested == "MODEL" else nested
+    top = selector if top == "MODEL" else top
+    plan, terminal = _identity_stream_plan(tmp_path, selector)
     identity = {}
     result, problem = agy._stream_result(
         "\n".join(map(json.dumps, [{"event": "init", "init": {"model": nested}, "model": top}, terminal])),
