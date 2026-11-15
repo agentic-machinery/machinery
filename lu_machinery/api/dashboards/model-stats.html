@@ -28,7 +28,7 @@
   th { font-size: 12px; color: var(--muted); font-weight: 600; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   tr.cls td { color: var(--muted); font-size: 13px; }
-  tr.cls td:first-child { padding-left: 16px; }
+  tr.cls td:first-child { padding-left: 32px; }
   tr.eff td:first-child { padding-left: 16px; font-style: italic; }
   .low { color: var(--warn); font-size: 11px; margin-left: 3px; }
   .muted { color: var(--muted); } .error { color: var(--bad); }
@@ -50,7 +50,7 @@
 </header>
 <main id="main">
   <section><h2>Value: landed tasks per wall hour against first-round approval <span class="meta" id="chart-meta"></span></h2>
-    <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), plain sub-rows by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
+    <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), and the plain rows under each effort split that effort by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
     <div id="chart">Loading…</div></section>
   <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2><div id="write">Loading…</div></section>
   <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2><div id="review">Loading…</div></section>
@@ -94,8 +94,8 @@ function reviewRow(r, kind) {
 
 function withClasses(models, role, render) {
   return models.filter((m) => m.role === role).flatMap((m) =>
-    [render(m, ""), ...m.by_effort.map((e) => render(e, "eff")),
-     ...(m.by_class.length > 1 ? m.by_class.map((c) => render(c, "cls")) : [])]);
+    [render(m, ""), ...m.by_effort.flatMap((e) => [render(e, "eff"),
+      ...(m.by_class.length > 1 ? e.by_class.map((c) => render(c, "cls")) : [])])]);
 }
 
 function chart(data, label) {

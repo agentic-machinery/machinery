@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import sys
+import time
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -35,6 +36,7 @@ from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCO
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
+from lu_machinery.review.review_contract import ContractError, parse_reviewer_json
 
 ROW_SCHEMA = "model-stats-row.v1"
 ROWS_DIR = "model-stats"
@@ -45,6 +47,8 @@ ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 UNSET = "unset"
+# Harness aliases that name a family but no version; stored as recorded, never given one.
+NATIVE_ALIASES = ("opus", "sonnet", "haiku")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _EFFORT_SUFFIX = re.compile(rf"-({VARIANT_SUFFIX.pattern})\Z")
@@ -90,9 +94,9 @@ def tokens(usage: object) -> tuple[int, int, int]:
     if "cache_read_input_tokens" in u:  # Claude
         return (n(u, "input_tokens") + n(u, "cache_creation_input_tokens"), n(u, "cache_read_input_tokens"),
                 n(u, "output_tokens"))
-    if "cached_input_tokens" in u:  # Codex: input_tokens includes cached
+    if "cached_input_tokens" in u:  # Codex: input_tokens includes cached, output_tokens includes reasoning
         return (max(0, n(u, "input_tokens") - n(u, "cached_input_tokens")), n(u, "cached_input_tokens"),
-                n(u, "output_tokens") + n(u, "reasoning_output_tokens"))
+                n(u, "output_tokens"))
     if "inputTokens" in u:  # Cursor
         return (n(u, "inputTokens") + n(u, "cacheWriteTokens"), n(u, "cacheReadTokens"),
                 n(u, "outputTokens") + n(u, "reasoningTokens"))
@@ -185,19 +189,29 @@ def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
         os.close(fd)
     if len(raw) > MAX_RESULT_BYTES:
         return None
+    return review_summary(raw)
+
+
+def review_summary(raw: bytes) -> dict[str, Any]:
+    """Verdict and finding priorities of a reviewer reply, read with the review contract's own parser.
+
+    Bare JSON, one fenced JSON object and the ``VERDICT:``/``SCORE:`` envelope are read; anything else, including a
+    findings container that is not a list, is ``unparsed`` with no priorities and never raises.
+    """
+    unparsed: dict[str, Any] = {"verdict": "unparsed", "priorities": {}}
     try:
-        payload = json.loads(raw)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(payload, dict):
-        return None
+        payload = parse_reviewer_json(raw.decode("utf-8"))
+    except (ContractError, UnicodeDecodeError, ValueError, RecursionError, TypeError, KeyError):
+        return unparsed
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
-    priorities: Counter[str] = Counter()
-    for finding in payload.get("findings") or []:
-        if isinstance(finding, dict) and finding.get("priority") in PRIORITIES:
-            priorities[finding["priority"]] += 1
-    return {"verdict": verdict if verdict in VERDICTS[:3] else "unparsed", "priorities": dict(sorted(priorities.items()))}
+    findings = payload.get("findings", [])
+    if verdict not in VERDICTS[:3] or not isinstance(findings, list):
+        return unparsed
+    priorities: Counter[str] = Counter(
+        finding["priority"] for finding in findings
+        if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
+    return {"verdict": verdict, "priorities": dict(sorted(priorities.items()))}
 
 
 def _reading(value: object) -> dict[str, float] | str:
@@ -231,8 +245,12 @@ def _iso(value: object) -> str | None:
     return moment.isoformat() if moment else None
 
 
-def summary_row(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The summary row of a settled task record, or None for an active or foreign record."""
+def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None) -> dict[str, Any] | None:
+    """The summary row of a settled task record, or None for an active or foreign record.
+
+    ``source_mtime_ns`` is the record file's modification time when it was read: of two rows for one task id, the
+    one from the later record version is the current one.
+    """
     task_id = record.get("task_id")
     status = record.get("status")
     if not isinstance(task_id, str) or not task_id or not isinstance(status, str) or status in ACTIVE:
@@ -269,6 +287,7 @@ def summary_row(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
         "author_model": model_id(author) if author else None,
         "landing": _landing(record),
+        "source_mtime_ns": source_mtime_ns,
     }
 
 
@@ -276,36 +295,91 @@ def rows_path(batch_state_dir: Path) -> Path:
     return batch_state_dir / ROWS_DIR / ROWS_FILE
 
 
+# A settlement never waits longer than this for the rows lock; the backfill repairs a row it skipped.
+SETTLEMENT_LOCK_WAIT_S = 5.0
+_NOFOLLOW = os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open(path: Path, flags: int) -> int:
+    """Open without following a symlink, so a planted link never redirects a write or a read."""
+    return os.open(path, flags | _NOFOLLOW, 0o600)
+
+
 @contextmanager
-def _locked(batch_state_dir: Path) -> Iterator[Path]:
+def _locked(batch_state_dir: Path, wait_s: float | None = None) -> Iterator[Path]:
+    """Hold ``rows.lock``; ``wait_s`` bounds the wait (TimeoutError), None waits as long as it takes."""
     directory = batch_state_dir / ROWS_DIR
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(directory / LOCK_FILE, "a", opener=lambda p, f: os.open(p, f, 0o600)) as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    if not stat.S_ISDIR(os.lstat(directory).st_mode):
+        raise NotADirectoryError("the model-stats directory is not a directory")
+    fd = _open(directory / LOCK_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+    try:
+        if wait_s is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline = time.monotonic() + wait_s
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("the model-stats rows lock is busy") from None
+                    time.sleep(0.05)
         yield directory / ROWS_FILE
+    finally:
+        os.close(fd)
 
 
 def _line(row: Mapping[str, Any]) -> bytes:
     return (json.dumps(row, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
 
-def append_row(batch_state_dir: Path, row: Mapping[str, Any]) -> None:
-    with _locked(batch_state_dir) as path:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def append_row(batch_state_dir: Path, row: Mapping[str, Any], wait_s: float | None = None) -> None:
+    """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
+    with _locked(batch_state_dir, wait_s) as path:
+        fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
         try:
-            os.write(fd, _line(row))
+            size = os.fstat(fd).st_size
+            open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
+            _write_all(fd, (b"\n" if open_fragment else b"") + _line(row))
         finally:
             os.close(fd)
 
 
-def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path) -> None:
-    """Append the row of a just-written settled record. Never raises: the record's status stays as written."""
+def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path, source_mtime_ns: int) -> None:
+    """Append the row of a just-written settled record. Never raises: the record's status stays as written.
+
+    ``source_mtime_ns`` is the modification time of the file the writer renamed into place (its content's version).
+    """
     try:
-        row = summary_row(path, record)
+        row = summary_row(path, record, source_mtime_ns)
         if row is not None:
-            append_row(batch_state_dir, row)
+            append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
+
+
+_LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")
+
+
+def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
+    """A row as read, with every label revalidated, so a damaged file never puts free text in a label."""
+    for name in _LABEL_FIELDS:
+        value = row.get(name)
+        if name == "class" and isinstance(value, str) and value.count("/") == 1:
+            row[name] = "/".join(label(part) for part in value.split("/"))
+        else:
+            row[name] = label(value)
+    author = row.get("author_model")
+    row["author_model"] = label(author) if author is not None else None
+    return row
 
 
 def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]]:
@@ -313,11 +387,11 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
     counts: Counter[str] = Counter()
     latest: dict[str, dict[str, Any]] = {}
     try:
-        stream = rows_path(batch_state_dir).open("rb")
+        fd = _open(rows_path(batch_state_dir), os.O_RDONLY)
     except FileNotFoundError:
         counts["missing"] += 1
         return [], counts
-    with stream:
+    with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
                 row = json.loads(line)
@@ -328,17 +402,19 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
                 counts["malformed_lines"] += 1
                 continue
             counts["lines"] += 1
-            latest[row["task_id"]] = row
+            latest[row["task_id"]] = _sanitised(row)
     counts["rows"] = len(latest)
     return list(latest.values()), counts
 
 
-def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Path, dict[str, Any]]]:
+def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Path, dict[str, Any], int]]:
     seen: set[str] = set()
     for path in iter_task_records(tasks_dir, include_archive=True):
         if path.name.endswith(".write-boundary.json") or ".sandbox." in path.name:
             continue
         try:
+            # Stat first: a write after the stat is newer than this read, so its own row outranks this one.
+            mtime_ns = os.stat(path).st_mtime_ns
             record = read_task_record(path)
         except (OSError, ValueError, TypeError, RecursionError):
             counts["unreadable"] += 1
@@ -349,44 +425,66 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
             counts["duplicate_task_ids"] += 1
             continue
         seen.add(record["task_id"])
-        yield path, record
+        yield path, record, mtime_ns
+
+
+def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> bool:
+    """Whether ``candidate`` should supersede the stored row: none stored, or one from an older record version."""
+    if present is None:
+        return True
+    stored = present.get("source_mtime_ns")
+    return not isinstance(stored, int) or stored < candidate["source_mtime_ns"]
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
-    """Add a row for every settled record without one; idempotent. Records are read outside the lock."""
+    """Add a row for every settled record without a current one; idempotent. Records are read outside the lock.
+
+    A stored row from an older version of the record (a settlement row whose later rewrite failed to append its
+    own) is superseded by a new last line, never edited; a row from the same or a newer version is kept.
+    """
     counts: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
-    for path, record in _settled_records(tasks_dir, counts):
-        row = summary_row(path, record)
+    for path, record, mtime_ns in _settled_records(tasks_dir, counts):
+        row = summary_row(path, record, mtime_ns)
         if row is None:
             counts["active_or_foreign"] += 1
             continue
         candidates.append(row)
     counts["settled_records"] = len(candidates)
     if dry_run:
-        present = {row["task_id"] for row in read_rows(batch_state_dir)[0]}
+        present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
         counts["would_add"] = sum(row["task_id"] not in present for row in candidates)
+        counts["would_refresh"] = sum(row["task_id"] in present and _stale(present[row["task_id"]], row)
+                                      for row in candidates)
         return dict(sorted(counts.items()))
     with _locked(batch_state_dir) as path:
-        present = {row["task_id"] for row in read_rows(batch_state_dir)[0]}
-        added = [row for row in candidates if row["task_id"] not in present]
-        counts["added"] = len(added)
-        counts["already_present"] = len(candidates) - len(added)
-        if added:
-            # Backfilled rows go first, so a settlement row appended for the same task id still wins.
-            temporary = path.with_name(f".{ROWS_FILE}.{os.getpid()}.tmp")
-            with open(temporary, "wb", opener=lambda p, f: os.open(p, f, 0o600)) as stream:
-                for row in added:
-                    stream.write(_line(row))
-                try:
-                    with path.open("rb") as existing:
-                        while chunk := existing.read(1 << 20):
-                            stream.write(chunk)
-                except FileNotFoundError:
-                    pass
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
+        present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
+        written = [row for row in candidates if _stale(present.get(row["task_id"]), row)]
+        counts["added"] = sum(row["task_id"] not in present for row in written)
+        counts["refreshed"] = len(written) - counts["added"]
+        counts["already_present"] = len(candidates) - len(written)
+        if written:
+            # The existing lines, then the new ones last, so a new line supersedes an older row of its task id.
+            temporary = path.with_name(f".{ROWS_FILE}.{os.getpid()}.{time.time_ns()}.tmp")
+            try:
+                with os.fdopen(_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL), "wb") as stream:
+                    try:
+                        with os.fdopen(_open(path, os.O_RDONLY), "rb") as existing:
+                            tail = b"\n"
+                            while chunk := existing.read(1 << 20):
+                                stream.write(chunk)
+                                tail = chunk[-1:]
+                            if tail != b"\n":
+                                stream.write(b"\n")
+                    except FileNotFoundError:
+                        pass
+                    for row in written:
+                        stream.write(_line(row))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
     return dict(sorted(counts.items()))
 
 
@@ -405,8 +503,9 @@ def _parser() -> argparse.ArgumentParser:
             "  .venv/bin/python -m lu_machinery.api.model_stats_rows backfill\n"
             "  .venv/bin/python -m lu_machinery.api.model_stats_rows backfill --batch-state-dir batch_state\n\n"
             "Outputs: appends missing rows to <batch-state-dir>/model-stats/rows.jsonl (atomic replace under\n"
-            "rows.lock) and prints one JSON object of counts (settled_records, added, already_present, unreadable,\n"
-            "duplicate_task_ids, active_or_foreign; would_add with --dry-run). Task records are never changed.\n\n"
+            "rows.lock) and prints one JSON object of counts (settled_records, added, refreshed, already_present,\n"
+            "unreadable, duplicate_task_ids, active_or_foreign; would_add and would_refresh with --dry-run).\n"
+            "A refreshed row replaces one taken from an older version of its record. Task records are never changed.\n\n"
             "Exit codes: 0 rows written or nothing to add; 1 the task store or the rows file could not be used.\n\n"
             "Related: lu_machinery/api/model_stats_router.py, docs/runbooks/model-stats.md, issue #581."
         ),
@@ -423,7 +522,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--dry-run", action="store_true",
-        help="Count the rows that would be added and write nothing (default: write).",
+        help="Count the rows that would be added or refreshed and write nothing (default: write).",
     )
     return parser
 

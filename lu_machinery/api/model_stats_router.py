@@ -21,9 +21,10 @@ import math
 import re
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -33,8 +34,9 @@ from prometheus_client.core import GaugeMetricFamily
 
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 
-from .model_stats_rows import POOLS, VERDICTS, read_rows, timestamp
+from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
 from .state_helpers import cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
@@ -51,15 +53,33 @@ ALL_EFFORTS = "all"
 # reference script counted P0-P2, so both are reported.
 BLOCKING = frozenset({"P0", "P1"})
 P0_P2 = frozenset({"P0", "P1", "P2"})
-# A whole line, so prose or a quoted example that mentions a trailer never lands a task.
-_TRAILER = re.compile(r"^X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
+# A whole line outside any code fence, so prose, a quote or a fenced example that mentions a trailer never lands a task.
+_TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
+_FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
 
 router = APIRouter()
 
 
 def trailer_task_ids(message: str) -> set[str]:
-    """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message."""
-    return set(_TRAILER.findall(message))
+    """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
+
+    Lines inside a backtick or tilde code fence (CommonMark: closed by a run of the same character at least as long,
+    else open to the end) are examples, never attribution.
+    """
+    found: set[str] = set()
+    fence: str | None = None
+    for line in message.splitlines():
+        if fence is not None:
+            close = _FENCE_CLOSE.fullmatch(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = None
+            continue
+        if opened := _FENCE_OPEN.match(line):
+            fence = opened.group(1)
+        elif trailer := _TRAILER.fullmatch(line):
+            found.add(trailer.group(1))
+    return found
 
 
 @dataclass
@@ -261,24 +281,32 @@ def _ordered(groups: Mapping[Any, _Group]) -> list[tuple[Any, _Group]]:
 
 
 def _models(rows: list[_Row]) -> list[dict[str, Any]]:
-    """Per (model, role): the totals over every effort, then the same figures per effort and per class."""
+    """Per (model, role): the totals over every effort and their class split, then per effort with its own classes."""
     totals: dict[tuple[str, str], _Group] = defaultdict(_Group)
-    efforts: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     classes: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
+    efforts: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
+    effort_classes: dict[tuple[str, str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     for row in rows:
         key = (row.model, row.role)
         totals[key].add(row)
-        efforts[key][row.effort].add(row)
         classes[key][row.task_class].add(row)
+        efforts[key][row.effort].add(row)
+        effort_classes[(*key, row.effort)][row.task_class].add(row)
+
+    def by_class(groups: Mapping[str, _Group], role: str) -> list[dict[str, Any]]:
+        return [{"class": name, **group.to_dict(role)} for name, group in _ordered(groups)]
+
     return [
         {"model": model, "role": role, "effort": ALL_EFFORTS, **group.to_dict(role),
-         "by_effort": [{"effort": name, **cls.to_dict(role)} for name, cls in _ordered(efforts[(model, role)])],
-         "by_class": [{"class": name, **cls.to_dict(role)} for name, cls in _ordered(classes[(model, role)])]}
+         "by_effort": [{"effort": effort, **cls.to_dict(role),
+                        "by_class": by_class(effort_classes[(model, role, effort)], role)}
+                       for effort, cls in _ordered(efforts[(model, role)])],
+         "by_class": by_class(classes[(model, role)], role)}
         for (model, role), group in _ordered(totals)
     ]
 
 
-def _authors(rows: list[_Row]) -> list[dict[str, Any]]:
+def _authors(rows: list[_Row], name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Author-side review outcomes: rounds are distinct pinned heads per PR, ordered by first review start."""
     prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": {}})
     for row in rows:
@@ -286,7 +314,7 @@ def _authors(rows: list[_Row]) -> list[dict[str, Any]]:
         if row.role != "review" or not author or not pr:
             continue
         entry = prs[(str(row.raw.get("repo") or "public"), str(pr))]
-        entry["authors"].add(author)
+        entry["authors"].add(name(str(author)))
         head = row.raw.get("pinned_head") or row.task_id
         started = row.started or datetime.max.replace(tzinfo=UTC)
         previous = entry["heads"].get(head)
@@ -347,6 +375,30 @@ def summarize(rows: Iterable[_Row]) -> dict[str, Any]:
     }
 
 
+OTHER = "other"
+_KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
+
+
+@lru_cache(maxsize=1)
+def _known_models() -> frozenset[str]:
+    catalog = load_model_catalog()
+    return frozenset({*(catalog.get("models") or {}), *NATIVE_ALIASES, "unknown"})
+
+
+def metric_model(model: str) -> str:
+    """A catalog model id (or a bare native alias) as itself; any other spelling is ``other``."""
+    try:
+        known = _known_models()
+    except Exception:  # no catalog: no value is known
+        return OTHER
+    return model if model in known else OTHER
+
+
+def metric_effort(effort: str) -> str:
+    """A catalog effort word, ``unset`` or a legacy telemetry value as itself; anything else is ``other``."""
+    return effort if effort in _KNOWN_EFFORTS or VARIANT_SUFFIX.fullmatch(effort) else OTHER
+
+
 def week_of(moment: datetime) -> str:
     year, week, _ = moment.isocalendar()
     return f"{year}-W{week:02d}"
@@ -374,7 +426,9 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     if landing is None:
         landing = scan_landing(primary_root, first)
     rows = [row for row in _rows(raw_rows, landing) if row.moment < until]
-    windows = {}
+    # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
+    bounded = [replace(row, model=metric_model(row.model), effort=metric_effort(row.effort)) for row in rows]
+    windows, metric_windows = {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         windows[name] = {
@@ -382,6 +436,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                        "cohort": "finished_at, else started_at, in [since, until)"},
             **summarize(row for row in rows if since <= row.moment),
         }
+        selected = [row for row in bounded if since <= row.moment]
+        metric_windows[name] = {"models": _models(selected), "authors": _authors(selected, metric_model)}
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
@@ -389,6 +445,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
         "weeks": _weeks(rows),
+        "metrics": {"windows": metric_windows, "weeks": _weeks(bounded)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict()},
     }
 
@@ -419,7 +476,7 @@ async def model_stats(
                             headers={**snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True),
                                      "Retry-After": "5"})
     snapshot, age = stored
-    body = {key: value for key, value in snapshot.items() if key != "windows"}
+    body = {key: value for key, value in snapshot.items() if key not in ("windows", "metrics")}
     return JSONResponse({**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)},
                         headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
 
@@ -453,8 +510,8 @@ class ModelStatsCollector:
         age_gauge = GaugeMetricFamily("lu_model_stats_snapshot_age_seconds", "Age of the model-stats snapshot.")
         age_gauge.add_metric([], round(age, 3))
         yield age_gauge
-        yield from self._windows(snapshot["windows"])
-        yield from self._weeks(snapshot["weeks"])
+        yield from self._windows(snapshot["metrics"]["windows"])
+        yield from self._weeks(snapshot["metrics"]["weeks"])
 
     @staticmethod
     def _windows(windows: Mapping[str, Mapping[str, Any]]) -> Iterator[GaugeMetricFamily]:
