@@ -287,18 +287,11 @@ _LIB_SITES = {
     ),
     "launcher_git_identity": f"{_LAUNCHER}LC_PROVIDER=claude LC_MODEL=claude-opus-5-5 && launcher_export_git_identity",
     "launcher_model_catalog": f"{_LAUNCHER}LC_PROVIDER=claude LC_MODEL=claude-opus-5-5 && launcher_normalize_model",
-    "launcher_cursor_pin": (
-        f"{_LAUNCHER}LC_PROVIDER=cursor LC_MODE=driver LC_MODEL=grok-4.7-high LC_CURSOR_SEAT_PIN=grok-4.7-high && "
-        "(launcher_validate_cursor_pin)"
-    ),
     "launcher_driver_state": (
         f"{_LAUNCHER}LC_MODE=driver LC_DRY_RUN=0 LC_EPIC=infra LU_DRIVER_STATE_PYTHON={_PY} "
         'LU_DRIVER_STATE_FILE="$1/.claude/infra-epic/DRIVER-STATE.md" && launcher_seed_driver_state'
     ),
     "launcher_rollover_bundle": f"{_LAUNCHER}LC_EPIC=infra && launcher_import_rollover_bundle",
-    "launcher_observer_heartbeat": (
-        f"{_LAUNCHER}LC_PROVIDER=cursor LC_MODE=driver LC_DRY_RUN=0 LC_EPIC=infra && launcher_cursor_observer_presence"
-    ),
     "launcher_close_lease": f"{_LAUNCHER}LC_DRIVER_CLOSE_RETRY_SECONDS=0 && launcher_close_driver_lease",
     "launcher_driver_agent": f"{_LAUNCHER}LC_PROVIDER=claude LC_EPIC=infra && launcher_inject_driver_agent",
 }
