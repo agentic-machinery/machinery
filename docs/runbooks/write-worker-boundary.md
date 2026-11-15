@@ -242,8 +242,9 @@ launch, never from the request:
   model as `--review-author-model` and `--review-mode cross_family`. A request field for the author is
   refused.
 - **Review result.** `review-wait` waits on the host for a review this task dispatched (named
-  `<task>-review-<suffix>`, with this task as its `initiator`) for at most 840 seconds per request,
-  because the broker serves one request at a time. The wait inside forwards a `wait` of any task whose
+  `<task>-review-<suffix>`, with this task as its `initiator`) for at most 840 seconds per request.
+  The broker serves each connection on its own thread and runs `review-wait` outside the lock that
+  serializes every other verb, so a pending wait never holds the worker's other calls. The wait inside forwards a `wait` of any task whose
   record is not in the task's own view; a longer or unlimited `--timeout` exits 124 while the review
   still runs, as the host's wait does, and the caller runs the same wait again. Once the review is done
   the printed record carries the reviewer's sealed reply as `result` (its digest checked), so the
