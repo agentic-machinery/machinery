@@ -11,6 +11,7 @@ from lu_machinery.fleet_comms.authority import AuthorityRecipientRefused, Author
 from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 
 SESSION = "claude-cto-27b21508"
+MISSING = object()
 LEGACY = "claude-cto-d465aa4b"
 
 
@@ -31,6 +32,8 @@ def tasks(tmp_path, monkeypatch):
 
     def write(task_id, status):
         record = {"schema_version": 2, "task_id": task_id, "run_nonce": "n", "status": status}
+        if status is MISSING:
+            del record["status"]
         (root / f"{task_id}.json").write_text(json.dumps(record))
         return task_id
 
@@ -181,6 +184,7 @@ def test_settled_task_delivery_left_queued_expires_on_the_next_claim_and_hygiene
     dry = run(capsys, "deliveries", "expire-stale", "--root", str(plane))
     assert dry["unreadable"] == {
         "deliveries": 3, "recipient_not_registered": 2, "recipient_settled": 1, "subscriptions": 0,
+        "roster_complete": True,
     }
     assert dry["unreadable_expired"] is None
     assert sorted(tuple(row) for row in backlog(plane)) == [
@@ -197,6 +201,7 @@ def test_settled_task_delivery_left_queued_expires_on_the_next_claim_and_hygiene
     applied = run(capsys, "deliveries", "expire-stale", "--root", str(plane), "--apply")
     assert applied["unreadable_expired"] == {
         "deliveries": 2, "recipient_not_registered": 2, "recipient_settled": 0, "subscriptions": 0,
+        "roster_complete": True,
     }
     with AuthorityService(root=plane) as service:
         assert dead_letter_reasons(service) == [
@@ -217,3 +222,84 @@ def test_dead_subscription_still_receiving_broadcasts_ends_when_its_task_settles
         after = service.publish_message(sender="alertmanager", body="disk 95%", channel="alerts")
         assert delivery_recipients(service, after) == ["claude-cto"]
         assert service.get_channel("alerts").subscribers == ("claude-cto",)
+
+
+def open_state(service, name):
+    """The delivery states and subscriptions a recipient still holds."""
+    states = [row["state"] for row in service.store.connection.execute(
+        "SELECT state FROM authority_deliveries WHERE recipient = ? ORDER BY created_at", (name,)
+    ).fetchall()]
+    return states, name in service.get_channel("alerts").subscribers
+
+
+@pytest.mark.parametrize(("status", "settled"), [
+    (MISSING, False), (None, False), ("", False), ("paused", False), (["done"], False), ({"s": "done"}, False),
+    ("spawning", False), ("running", False),
+    *((terminal, True) for terminal in (
+        "done", "failed", "timeout", "rate_limited", "cancelled", "crashed", "no_deliverable",
+    )),
+])
+def test_damaged_task_status_never_expires_mail_or_ends_a_subscription(plane, tasks, status, settled):
+    """Defect class: a missing, null or unrecognized task status classifies as settled and destroys mail (#594)."""
+    worker = tasks("cto-5-i5-worker", "running")
+    with AuthorityService(root=plane) as service:
+        service.create_channel("alerts", subscribers=("claude-cto",))
+        service.subscribe("alerts", (worker,))
+        service.publish_message(sender="claude-cto", body="apply option B", recipients=(worker,))
+    tasks(worker, status)
+    with AuthorityService(root=plane) as service:
+        service.claim_next_delivery("claude-cto", "seat-1")
+        service.expire_unreadable()
+        broadcast = service.publish_message(sender="alertmanager", body="disk 95%", channel="alerts")
+        if settled:
+            assert open_state(service, worker) == (["expired"], False)
+            assert delivery_recipients(service, broadcast) == ["claude-cto"]
+        else:
+            # Standing unknown or live: mail and subscription stay; a direct publish is admitted.
+            service.publish_message(sender="claude-cto", body="again", recipients=(worker,))
+            assert open_state(service, worker) == (["queued", "queued", "queued"], True)
+            assert dead_letter_reasons(service) == []
+
+
+@pytest.mark.parametrize("unavailable", ["slots", "lanes"])
+def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
+    plane, tasks, monkeypatch, tmp_path, unavailable,
+):
+    """Defect class: with one roster source unreadable, registered or unproven names lose mail and subscriptions (#594)."""
+    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery.fleet_comms import authority
+    from lu_machinery.ops import driver_lanes
+
+    slots = set(_channels._load_registry_slots(_channels.ASSIGNMENTS_PATH))
+    lane = next(item.sender for item in driver_lanes.load_registry().lanes if item.sender not in slots)
+    worker = tasks("cto-6-i6-worker", "running")
+    with AuthorityService(root=plane) as service:
+        service.create_channel("alerts", subscribers=("claude-cto", lane))
+        service.subscribe("alerts", (worker,))
+        service.publish_message(sender="claude-cto", body="b", recipients=(lane, worker))
+        with service._write_transaction():
+            service._publish_message_tx(
+                sender="sre-timers", body="old report", channel=None, targets=None, kind="message",
+                imported_recipients=("codex",), imported_source="test-legacy", idempotency_key="legacy-codex",
+            )
+    tasks(worker, "done")
+    target = (_channels, "ASSIGNMENTS_PATH") if unavailable == "slots" else (driver_lanes, "DATA_FILE")
+    monkeypatch.setattr(*target, tmp_path / "unavailable")
+    assert authority._roster_complete() is False
+
+    with AuthorityService(root=plane) as service:
+        service.claim_next_delivery("claude-cto", "seat-1")
+        assert service.count_unreadable() == {
+            "deliveries": 0, "recipient_not_registered": 0, "recipient_settled": 0, "subscriptions": 0,
+            "roster_complete": False,
+        }
+        assert service.expire_unreadable()["roster_complete"] is False
+        broadcast = service.publish_message(sender="alertmanager", body="disk 95%", channel="alerts")
+        assert sorted(delivery_recipients(service, broadcast)) == sorted(["claude-cto", lane, worker])
+        service.publish_message(sender="sre-timers", body="b", recipients=("codex",))  # admitted, not dropped
+        assert dead_letter_reasons(service) == []
+        assert sorted(service.get_channel("alerts").subscribers) == sorted(["claude-cto", lane, worker])
+    assert sorted(tuple(row) for row in backlog(plane) if row["recipient"] != "claude-cto") == sorted([
+        ("codex", "queued"), ("codex", "queued"), (lane, "queued"), (lane, "queued"),
+        (worker, "queued"), (worker, "queued"),
+    ])

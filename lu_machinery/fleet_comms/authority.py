@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
@@ -209,17 +210,24 @@ _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # The supervisory wake watcher's inbox (``ai_agent_bridge._inbox_watch.supervisory_recipient``).
 _SUPERVISORY_RECIPIENT_RE = re.compile(r"supervisor:epic:[1-9][0-9]*")
 RecipientStanding = Literal["registered", "live_task", "settled_task", "not_registered", "unknown"]
-_ROSTER_CACHE: dict[tuple[object, ...], frozenset[str]] = {}
+_ROSTER_CACHE: dict[tuple[object, ...], tuple[frozenset[str], bool]] = {}
+# Dispatch v2 terminal statuses; only these prove a task has settled. Any other
+# value, or none, leaves its standing unknown (#594).
+_TASK_TERMINAL_STATUSES = frozenset({
+    "done", "failed", "timeout", "rate_limited", "cancelled", "crashed", "no_deliverable",
+})
+_LOG = logging.getLogger(__name__)
 
 
-def _registered_recipients() -> frozenset[str]:
-    """Recipients a drain reads besides live tasks: the durable CTO, registered slots and driver lanes.
+def _load_roster() -> tuple[frozenset[str], bool]:
+    """The durable CTO, registered slots and driver lanes, and whether both sources loaded.
 
     Slots come from ``config/area_assignments.yaml`` (the roster every slot
     reader uses) and lane senders from ``config/driver_lanes.json`` (the lanes
-    the context guard hands off). An unreadable roster yields only the durable
-    CTO; callers then refuse or keep, never expire (fail closed). The result
-    is cached per file identity (path, mtime, size), so every claim does not
+    the context guard hands off). The roster is complete only when the slot
+    roster names at least one slot and the lane file loads with at least one
+    lane; an incomplete roster proves no name unregistered. The result is
+    cached per file identity (path, mtime, size), so every claim does not
     reparse both files.
     """
     from lu_machinery.ai_agent_bridge import _channels
@@ -236,21 +244,38 @@ def _registered_recipients() -> frozenset[str]:
     cached = _ROSTER_CACHE.get(tuple(key))
     if cached is not None:
         return cached
-    names = {DURABLE_CTO_RECIPIENT, *_channels._load_registry_slots(paths[0])}
-    if len(names) > 1:
-        # A broken lane file leaves the roster's slots.
-        with contextlib.suppress(Exception):
-            names.update(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
-    roster = frozenset(names)
+    slots = _channels._load_registry_slots(paths[0])
+    lanes: tuple[str, ...] = ()
+    with contextlib.suppress(Exception):
+        lanes = tuple(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
+    complete = bool(slots) and bool(lanes)
+    if not complete:
+        _LOG.warning(
+            "fleet_comms recipient roster incomplete (slots=%d, lanes=%d): "
+            "unregistered names are admitted and no subscription or delivery is ended",
+            len(slots), len(lanes),
+        )
+    roster = (frozenset({DURABLE_CTO_RECIPIENT, *slots, *lanes}), complete)
     _ROSTER_CACHE.clear()
     _ROSTER_CACHE[tuple(key)] = roster
     return roster
 
 
-def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
-    """A dispatch task's standing by its record: live while spawning or running, else settled.
+def _registered_recipients() -> frozenset[str]:
+    """Recipients a drain reads besides live tasks: the durable CTO, registered slots and driver lanes."""
+    return _load_roster()[0]
 
-    ``None`` when no task record has this id; ``unknown`` when the record cannot be read.
+
+def _roster_complete() -> bool:
+    """True only when both the slot roster and the driver-lane file loaded (#594)."""
+    return _load_roster()[1]
+
+
+def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
+    """A dispatch task's standing by its record: live while spawning or running, settled at a terminal status.
+
+    ``None`` when no task record has this id; ``unknown`` when the record cannot
+    be read or its status is missing, not a string or not a known status.
     """
     if not _TASK_ID_RE.fullmatch(name) or ".." in name:
         return None
@@ -262,11 +287,22 @@ def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
         return "unknown"
     if record is None:
         return None
-    return "live" if record.get("status") in store.ACTIVE else "settled"
+    status = record.get("status") if isinstance(record, Mapping) else None
+    if not isinstance(status, str):
+        return "unknown"
+    if status in store.ACTIVE:
+        return "live"
+    if status in _TASK_TERMINAL_STATUSES:
+        return "settled"
+    return "unknown"
 
 
-def _recipient_standing(name: str, registered: frozenset[str]) -> RecipientStanding:
-    """Whether a drain will read ``name``; a stored session-CTO name stays readable by its session."""
+def _recipient_standing(name: str, registered: frozenset[str], complete: bool) -> RecipientStanding:
+    """Whether a drain will read ``name``: the one classifier every admission and removal path uses.
+
+    A stored session-CTO name stays readable by its session. ``not_registered``
+    needs a complete roster; ``settled_task`` needs a known terminal status.
+    """
     if name in registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
         return "registered"
     task = _task_standing(name)
@@ -274,17 +310,24 @@ def _recipient_standing(name: str, registered: frozenset[str]) -> RecipientStand
         return "live_task"
     if task == "settled":
         return "settled_task"
-    if task == "unknown" or len(registered) == 1:
+    if task == "unknown" or not complete:
         return "unknown"
     return "not_registered"
 
 
 def _require_readable_recipients(names: Iterable[str]) -> None:
-    """Refuse, before any write, a recipient no drain reads (#594)."""
-    registered = _registered_recipients()
+    """Refuse, before any write, a recipient proven unreadable (#594).
+
+    A recipient whose standing is unknown (damaged task record, incomplete
+    roster) is admitted and logged: doubt never drops mail.
+    """
+    registered, complete = _registered_recipients(), _roster_complete()
     for name in names:
-        standing = _recipient_standing(name, registered)
+        standing = _recipient_standing(name, registered, complete)
         if standing in {"registered", "live_task"}:
+            continue
+        if standing == "unknown":
+            _LOG.warning("fleet_comms recipient %s admitted with unverified standing", name)
             continue
         raise AuthorityRecipientRefused(name, standing)
 
@@ -335,7 +378,6 @@ class AuthorityRecipientRefused(AuthorityServiceError):
     _CAUSES: ClassVar[dict[str, tuple[str, str]]] = {
         "not_registered": (RECIPIENT_NOT_REGISTERED_REASON, "is neither a registered slot nor a live task id"),
         "settled_task": (RECIPIENT_SETTLED_REASON, "is a task that has settled"),
-        "unknown": ("recipient_unverifiable", "could not be checked against the slot roster or its task record"),
     }
 
     def __init__(self, recipient: str, standing: str) -> None:
@@ -1771,7 +1813,8 @@ class AuthorityService:
         """Open deliveries and subscriptions whose recipient no drain reads, by cause. Reads only (#594).
 
         Bare provider names and the retired Kimi seats count as not registered.
-        Nothing is counted while the slot roster is unreadable.
+        Nothing is counted while the roster is incomplete (``roster_complete``
+        is then false), and no name of unknown standing is counted.
         """
         counts = {RECIPIENT_NOT_REGISTERED_REASON: 0, RECIPIENT_SETTLED_REASON: 0}
         for _row, reason in self._unreadable_deliveries_tx(settled_only=False):
@@ -1780,6 +1823,7 @@ class AuthorityService:
             "deliveries": sum(counts.values()),
             **counts,
             "subscriptions": len(self._unreadable_subscriptions_tx(settled_only=False)),
+            "roster_complete": _roster_complete(),
         }
 
     def expire_unreadable(self, *, now: str | None = None) -> dict[str, int]:
@@ -1791,7 +1835,8 @@ class AuthorityService:
         sends one summary notice to the CTO. This is the one writer that expires
         a stored Kimi delivery: Kimi is retired, so its queued rows are retired
         too, as a state change only (CTO decision on #594). No per-row notice is
-        sent, so no write admits a Kimi recipient.
+        sent, so no write admits a Kimi recipient. With an incomplete roster
+        nothing is expired or ended, and ``roster_complete`` reports false.
         """
         now_value = self._now_string(now)
         with self._write_transaction():
@@ -1818,12 +1863,18 @@ class AuthorityService:
                 if ids:
                     self._notify_cleanup_expiry_summary_tx(ids, reason_code=reason)
         counts = {reason: len(ids) for reason, ids in expired.items()}
-        return {"deliveries": sum(counts.values()), **counts, "subscriptions": ended}
+        return {
+            "deliveries": sum(counts.values()), **counts, "subscriptions": ended,
+            "roster_complete": _roster_complete(),
+        }
 
     def _unreadable_deliveries_tx(self, *, settled_only: bool) -> list[tuple[sqlite3.Row, str]]:
-        """Queued or running deliveries whose recipient is a settled task (or, unless ``settled_only``, unregistered)."""
+        """Queued or running deliveries whose recipient is a settled task (or, unless ``settled_only``, unregistered).
+
+        Empty while the roster is incomplete: no removal on doubt (#594).
+        """
         registered = _registered_recipients()
-        if len(registered) == 1:
+        if not _roster_complete():
             return []
         rows: list[tuple[sqlite3.Row, str]] = []
         recipients = self._conn.execute(
@@ -1847,7 +1898,7 @@ class AuthorityService:
 
     def _unreadable_subscriptions_tx(self, *, settled_only: bool) -> list[str]:
         registered = _registered_recipients()
-        if len(registered) == 1:
+        if not _roster_complete():
             return []
         names = self._conn.execute(
             "SELECT DISTINCT recipient FROM authority_channel_subscribers ORDER BY recipient"
@@ -1866,7 +1917,7 @@ class AuthorityService:
 
     @staticmethod
     def _unreadable_reason(name: str, registered: frozenset[str], *, settled_only: bool) -> str | None:
-        standing = _recipient_standing(name, registered)
+        standing = _recipient_standing(name, registered, _roster_complete())
         if standing == "settled_task":
             return RECIPIENT_SETTLED_REASON
         if standing == "not_registered" and not settled_only:
@@ -2426,12 +2477,15 @@ class AuthorityService:
         """Fan-out targets a drain reads; end the subscription of a settled task or unregistered name.
 
         A subscriber whose standing cannot be checked keeps its subscription and
-        its delivery (fail closed: nothing is ended on doubt).
+        its delivery, and while the roster is incomplete no subscription is
+        ended at all (fail closed: nothing is ended on doubt).
         """
+        if not _roster_complete():
+            return tuple(names)
         registered = _registered_recipients()
         kept: list[str] = []
         for name in names:
-            standing = _recipient_standing(name, registered)
+            standing = _recipient_standing(name, registered, _roster_complete())
             if standing in {"settled_task", "not_registered"}:
                 self._end_subscriptions_tx(name, channel_id=str(channel_row["channel_id"]))
                 continue
@@ -2843,7 +2897,7 @@ class AuthorityService:
         if session_via_durable_cto and is_session_cto_recipient(recipient):
             parties: tuple[str, ...] = (DURABLE_CTO_RECIPIENT,)
         elif is_session_cto_recipient(recipient) or _recipient_standing(
-            recipient, _registered_recipients()
+            recipient, _registered_recipients(), _roster_complete()
         ) in {"registered", "live_task"}:
             parties = (recipient, DURABLE_CTO_RECIPIENT)
         else:

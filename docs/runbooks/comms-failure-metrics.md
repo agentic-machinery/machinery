@@ -70,6 +70,15 @@ deliveries as `recipient_settled` dead letters, which keeps the rows, notifies
 channel broadcast also skips a subscriber that no drain reads and ends that
 subscription.
 
+Doubt never removes mail. A task counts as settled only at a terminal status
+(`done`, `failed`, `timeout`, `rate_limited`, `cancelled`, `crashed`,
+`no_deliverable`); a record with a missing, empty, non-string or unrecognized
+status leaves its standing unknown. The roster is complete only when both
+`config/area_assignments.yaml` (at least one slot) and `config/driver_lanes.json`
+(at least one lane) load. A recipient of unknown standing, or any name while the
+roster is incomplete, is admitted with a logged warning instead of refused, and
+no expiry, hygiene or broadcast path ends its deliveries or subscriptions.
+
 ## One-time hygiene of unread mail
 
 Count first; this writes nothing:
@@ -79,7 +88,9 @@ Count first; this writes nothing:
 ```
 
 `unreadable` gives the open deliveries whose recipient no drain reads, by cause,
-and the number of such subscriptions. `--apply` expires those rows as
+and the number of such subscriptions; `roster_complete: false` means nothing
+was counted and `--apply` will remove nothing until both roster files load.
+`--apply` expires those rows as
 `recipient_not_registered` or `recipient_settled` dead letters (rows and
 messages stay, nothing is deleted), ends those subscriptions and sends one
 summary notice per cause to `claude-cto`. It then applies the usual 7-day
