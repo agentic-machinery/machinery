@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 import pytest
 import yaml
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import machinery_path, product_root
 from tests.review.test_model_catalog import AGY_AUTHORING_ROWS as AGY_AUTHORING_ROWS, AGY_REVIEW_ROWS as AGY_REVIEW_ROWS, APPROVED_BASELINE as APPROVED_BASELINE, APPROVED_INPUTS as APPROVED_INPUTS, FIXTURE as FIXTURE, HOOK_FAILURE_ROWS as HOOK_FAILURE_ROWS, INPUTS as INPUTS, ModelCatalogError as ModelCatalogError, PRE_RETIREMENT_BASELINE as PRE_RETIREMENT_BASELINE, PRE_RETIREMENT_INPUTS as PRE_RETIREMENT_INPUTS, PRE_REVIEW_USAGE_BASELINE as PRE_REVIEW_USAGE_BASELINE, ULIF_LOCAL_TOOLS as ULIF_LOCAL_TOOLS, WORD_CARD_TOOL_ROWS as WORD_CARD_TOOL_ROWS, _require_routable_model as _require_routable_model, approved_agy_mode_baseline as approved_agy_mode_baseline, approved_hook_failure_baseline as approved_hook_failure_baseline, approved_retirement_11327_baseline as approved_retirement_11327_baseline, approved_review_usage_11449_baseline as approved_review_usage_11449_baseline, approved_sources_tool_baseline as approved_sources_tool_baseline, deepcopy as deepcopy, guard_policy as guard_policy, gzip as gzip, json as json, load_model_catalog as load_model_catalog, require_execution_model as require_execution_model, settings_index as settings_index
 import base64
 import shutil
@@ -264,7 +264,7 @@ def test_hook_failure_overlay_changes_only_worker_guard_settings(configuration):
     assert [i for i, row in enumerate(before["adapters"]) if "--settings" in row.get("value", {}).get("cmd", [])] == (
         HOOK_FAILURE_ROWS
     )
-    source = json.loads((Path(__file__).resolve().parents[2] / "agents_extensions/shared/settings.json").read_bytes())
+    source = json.loads((product_root() / "agents_extensions/shared/settings.json").read_bytes())
     tracked = {name: (timeout, on_failure) for _, name, timeout, on_failure in guard_policy(source)}
     for index in changed:
         old, new = before["adapters"][index], after["adapters"][index]
