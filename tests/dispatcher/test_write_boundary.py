@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -613,6 +614,7 @@ def broker(primary, tmp_path, monkeypatch):
     instance.boundary = _Launch(repo, scratch, _git(worktree, "rev-parse", "HEAD"))
     instance.steps = []
     instance.bound_pr, instance.published, instance.pr_create_spent = None, set(), False
+    instance.serial, instance.state, instance.children, instance.closed = threading.Lock(), threading.Lock(), set(), False
     instance.pulls = {7: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "main"},
                       9: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
@@ -715,6 +717,48 @@ def test_failed_broker_push_receipt_retains_redacted_git_error(broker, monkeypat
         assert broker.records[-1]["refused"] == expected
         assert secret not in json.dumps(broker.records) + connection.reply.decode()
         assert sum(step in argv for argv in calls) == 1  # a failure is never retried
+
+
+def test_a_pending_review_wait_does_not_hold_the_workers_other_broker_calls(broker, tmp_path, monkeypatch):
+    """Defect class: the broker serves one connection at a time, so while a worker's review-wait blocks (up to
+    840 s) its every other broker call (checks, verdict, enqueue, publish) waits too and the worker looks stalled."""
+    waiting, release = threading.Event(), threading.Event()
+
+    def module(self, module, argv, key, stdin=None, cwd=None):
+        if argv[0] == "wait":  # the host's wait of a review still running
+            waiting.set()
+            release.wait(60)
+        return {"returncode": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(write_boundary._Broker, "_module", module)
+    monkeypatch.setattr(write_boundary._Broker, "_peer_inside", lambda self, connection: True)
+    sockets = tmp_path / "sockets"
+    sockets.mkdir()
+    instance = write_boundary._Broker(broker.boundary, sockets / "broker.sock")
+    instance.pulls = broker.pulls
+    directory = os.open(sockets, os.O_RDONLY | os.O_DIRECTORY)  # the path stays under the sockaddr_un limit
+    monkeypatch.setenv(write_boundary.BROKER_ENV, f"/proc/self/fd/{directory}/broker.sock")
+    replies: dict[str, dict] = {}
+
+    def call(name, verb, payload):
+        replies[name] = write_boundary.broker_call(verb, payload)
+
+    waiter = threading.Thread(target=call, args=("wait", "review-wait", {"task_id": "wb-test-review-r1"}))
+    try:
+        waiter.start()
+        assert waiting.wait(10)
+        other = threading.Thread(target=call, args=("check", "budget-check", {"pr": 7}), daemon=True)
+        other.start()
+        other.join(10)
+        assert replies.get("check", {}).get("returncode") == 0, replies
+        assert "wait" not in replies  # answered while the wait still blocks
+    finally:
+        release.set()
+        waiter.join(10)
+        instance.cleanup()
+        os.close(directory)
+    assert replies["wait"]["returncode"] == 0
+    assert [(row["verb"], row["returncode"]) for row in instance.records] == [("budget-check", 0), ("review-wait", 0)]
 
 
 def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, primary, tmp_path, monkeypatch):
