@@ -342,6 +342,8 @@ def _dispatch_through_broker(args) -> int:
     if args.mode != "read-only" or args.dry_run:
         raise ValueError("write_boundary_refused: inside a write boundary only a read-only review is dispatched, "
                          "through the launcher's broker")
+    if args.task_card or args.allow_open_dependency or args.refuse_on_overlap:
+        raise ValueError("write_boundary_refused: the broker's review dispatch takes no task card or overlap flags")
     if (args.prompt is None) == (args.prompt_file is None):
         raise ValueError("provide exactly one of --prompt or --prompt-file")
     source = args.prompt if args.prompt is not None else args.prompt_file
