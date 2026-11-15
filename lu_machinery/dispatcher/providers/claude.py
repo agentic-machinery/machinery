@@ -119,12 +119,17 @@ def managed_policy(env: Mapping[str, str]) -> str | None:
 
 
 def _sources_mcp_config(mode: str) -> str:
+    """The strict MCP map: one Sources server, or none when the product declares none (the run goes on)."""
     if mode == "read-only":
         command, *args = sources_command()
         server = {"type": "stdio", "command": command, "args": args}
     else:
-        server = json.loads((product_root() / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"][_SOURCES_SERVER]
-    return json.dumps({"mcpServers": {_SOURCES_SERVER: server}}, separators=(",", ":"))
+        try:
+            servers = json.loads((product_root() / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+        except FileNotFoundError:
+            servers = {}
+        server = servers.get(_SOURCES_SERVER)
+    return json.dumps({"mcpServers": {_SOURCES_SERVER: server} if server else {}}, separators=(",", ":"))
 
 
 def model_id(model: str) -> str | None:
