@@ -456,6 +456,11 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
             raise Refused(str(exc)) from None
         args = (*credentials, *command)
     git = "git"
+    options = ["--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
+               "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
+               "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
+               *(["-c", "protocol.https.allow=always"] if network else []),
+               *([f"--git-dir={git_dir}"] if git_dir else []), "-C", str(cwd)]
     if command[:1] == ["push"]:
         # Broker and settlement share this exact-update scan. No worker hook is trusted, including
         # reference-transaction hooks, so the transport below always has hooks disabled.
@@ -468,37 +473,35 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
                 or not expected_separator or target != branch or (remote and not _OBJECT_ID.fullmatch(remote))
                 or (not head and not remote)):
             raise Refused("host push requires one exact update and lease")
-        common = git_dir or Path(_git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir").strip())
         update = (f"{branch if head else '(delete)'} {head or '0' * len(remote)} "
                   f"{branch} {remote or '0' * len(head)}\n").encode()
         code = ("import sys; sys.path.insert(0, sys.argv[1]); "
                 f"from {_PACKAGE}.opsec.git_push import main; "
-                "raise SystemExit(main(sys.argv[2:4], stdin=sys.stdin.buffer.read(), chain=lambda *_: 0))")
+                "raise SystemExit(main(sys.argv[2:4], stdin=sys.stdin.buffer.read(), chain=lambda *_: 0, "
+                "transport=sys.argv[4]))")
         package_parent = str(machinery_path("dispatcher/write_boundary.py").parents[2])
-        # The scan and the transport run one absolute Git binary. The scanner exempts a private destination only
-        # when trusted_route proves that this Git reaches it over verified HTTPS or default SSH, and it proves
-        # nothing about a binary named by a bare "git" (the shim pins LU_OPSEC_REAL_GIT for the same reason).
-        # Without the pin every private push here was scanned as public (#565); a public one is scanned either way.
+        # The scan describes the transport below and nothing else. It runs every Git query, the private route
+        # proof included, with the transport's absolute Git, its environment and its leading options (the fixed
+        # settings above, then the request's credentials or own settings), so it reads exactly the configuration
+        # the push reads: no global, system or command-scope host setting can mask an unverified route (#565).
+        # It receives the URL as Git's hook would for a URL push (as the remote name too) and treats one that a
+        # rewrite would redirect as untrusted. The scanner keeps its own process environment for its lookups only.
         git = shutil.which("git", path=env["PATH"]) or ""
         if not os.path.isabs(git):
             raise Refused("host push requires an absolute host Git")
+        transport = json.dumps({"git": git, "environment": env, "options": [*options, *args[:len(args) - len(command)]]})
         # Fixed isolated interpreter and scanner code; input is the validated update above, never a shell command.
+        # Its last argument is data the scanner parses as JSON (Transport.from_json), never a command or option.
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         scanned = subprocess.run(
-            [sys.executable, "-I", "-c", code, package_parent, "origin", command[5]],
-            cwd=cwd, input=update, env={**os.environ, "GIT_DIR": str(common), "LU_OPSEC_REAL_GIT": git},
-            capture_output=True, timeout=_BROKER_TIMEOUTS["publish"], check=False,
+            [sys.executable, "-I", "-c", code, package_parent, command[5], command[5], transport],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            cwd=cwd, input=update, capture_output=True, timeout=_BROKER_TIMEOUTS["publish"], check=False,
         )
         if scanned.returncode:
             raise Refused(scanned.stderr.decode("utf-8", "replace") or "host push scan refused")
     # Fixed argv: "git", or for a push the absolute Git the scan verified, resolved from the fixed env PATH above.
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        [git,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
-         "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
-         "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
-         "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
-         *(["-c", "protocol.https.allow=always"] if network else []),
-         *([f"--git-dir={git_dir}"] if git_dir else []), "-C", str(cwd), *args],
+        [git, *options, *args],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
         capture_output=True, text=True, timeout=_GIT_TIMEOUT, check=False, env=env, stdin=subprocess.DEVNULL,
     )
     if result.returncode:

@@ -309,10 +309,14 @@ Texts arrive as JSON strings, and the host writes them to the run's private scra
 - **Push.** Only the dispatched branch, only at the worker's current tip, and only as a
   fast-forward of the remote branch. The host copies the commits from the private Git layer
   (`index-pack` hashes every object) and runs the push scan (`opsec.git_push`) on the exact update.
-  The scan and the push use the same absolute host Git binary, which the scan receives as
-  `LU_OPSEC_REAL_GIT`. For a registered private repository the scan therefore leaves the update
-  unscanned only when its trusted-route check proves that binary reaches the destination over
-  verified HTTPS. Any other route or destination, public ones included, is scanned as public.
+  The scan runs every Git query with the push's own transport (`git_push.Transport`): the same
+  absolute host Git binary, the same environment and the same leading options, so it reads exactly
+  the configuration the push reads, and no global, system or command-scope host setting reaches
+  either. For a registered private repository the scan therefore leaves the update unscanned only
+  when its trusted-route check proves that this transport reaches the destination over verified
+  HTTPS and that no URL rewrite (`url.<base>.insteadOf` or `pushInsteadOf`) or remote section of
+  that URL would send it elsewhere. Any other route or destination, public ones included, is
+  scanned as public.
   It then pushes with `--force-with-lease` on the remote value it read. Host Git runs with no
   global or system configuration and no hooks; its only credential is the registry-scoped helper
   of `git_credentials`. It works at any time while the worker runs, so review can follow.

@@ -739,16 +739,33 @@ def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, p
     assert "default branch" in _refused(lambda: broker._push({"head": broker.boundary.tip}))
 
 
-@pytest.mark.parametrize(("url", "scanned"), [
-    ("https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git", False),
-    ("https://github.com/example-owner/unregistered.git", True),
-], ids=["private-exempt", "public-scanned"])
-def test_host_push_scan_exempts_only_a_registered_private_destination(primary, monkeypatch, url, scanned):
+_PRIVATE_URL = "https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git"
+
+
+@pytest.mark.parametrize(("url", "host", "scanned"), [
+    (_PRIVATE_URL, None, False),
+    ("https://github.com/example-owner/unregistered.git", None, True),
+    (_PRIVATE_URL, "tls-off-masked", True),
+    (_PRIVATE_URL, "rewritten", True),
+], ids=["private-exempt", "public-scanned", "private-tls-off-masked-by-host-config-scanned",
+        "private-rewritten-destination-scanned"])
+def test_host_push_scan_exempts_only_a_registered_private_destination(primary, monkeypatch, url, host, scanned):
     """Defect classes: the broker's host push scan treats a registered private destination as public (it cannot
-    prove the transport's route and refuses every private push), or exempts a public destination from the scan."""
+    prove the transport's route and refuses every private push), or exempts a public destination from the scan,
+    or proves the route with configuration the transport does not use: host global or command-scope settings that
+    mask the repository's http.sslVerify=false, or a URL that a rewrite sends to another destination (#565)."""
     _, worktree, _ = primary
     tip = _git(worktree, "rev-parse", "HEAD")
     monkeypatch.delenv("LU_OPSEC_REAL_GIT", raising=False)  # the broker's host environment carries no pin
+    if host == "tls-off-masked":  # only the repository's own configuration reaches the transport
+        _git(worktree, "config", "http.sslVerify", "false")
+        (Path(os.environ["HOME"]) / "global.gitconfig").write_text(f'[http "{url}"]\n\tsslVerify = true\n')
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(Path(os.environ["HOME"]) / "global.gitconfig"))
+        for name, value in {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.sslVerify",
+                            "GIT_CONFIG_VALUE_0": "true"}.items():
+            monkeypatch.setenv(name, value)
+    elif host == "rewritten":
+        _git(worktree, "config", "url.https://example.invalid/public.git.insteadOf", url)
     real_run, seen = subprocess.run, {}
 
     def run(argv, **kwargs):
