@@ -227,11 +227,28 @@ or baseline excludes output.
 Every guarded removal honors canonical `keep_worktree` even when Git is clean.
 The gate discovers the bound hot/archive task record itself; caller-supplied
 records cannot hide intent. A kept tree may acquire a passing retrieval receipt
-but remains retained. No command releases retention intent any more: the
-post-task reaper's `--release-retention` command was deleted with it
-(FR-01b). Every guarded remover, `worktree_claims remove` included, still
-refuses a kept tree. The owner retrieves the output; releasing the tree itself
-has no supported command and is an Infra-owned residual.
+but remains retained. The post-task reaper's `--release-retention` command
+was deleted with it (FR-01b), and every automatic guarded remover,
+`worktree_claims remove` included, still refuses a kept tree. Once the work
+is published, the owner releases a dispatch v2 tree with
+`lu_machinery/dispatch.py release-worktree TASK` (#577). Under the task lock it
+requires a finished record whose `worktree_disposition` is `retained` and whose
+tree is on disk, and proves the provider's process tree gone. It then lifts the
+hold for exactly one settlement call (`git.settle_worktree`), which proves no
+tracked change, a published HEAD (the canonical remote recorded at dispatch, or
+a merged pull request carrying the task's delivery) and no live borrower, and
+removes the tree through the `worktree_claims` chokepoint, preserving ignored
+and untracked output as usual. The record then says
+`worktree_disposition: released`, with the settlement reason and a
+`worktree_release` proof (`head`, `start_sha`, `canonical_remote`,
+`prior_reason`, `checks`, `removal`); the task's scratch goes with the tree.
+Every unsafe case refuses with a typed reason (`dirty`, `unpublished`,
+`remote_mismatch`, `borrowed_by_live_task`, `provider_processes_alive`,
+`provider_liveness_unknown`, `removal_refused`, `not_retained`, `task_active`,
+`task_not_found` and similar), exits 1 and restores the record as it was. The
+command never pushes, salvages or forces, runs only when an owner calls it, and
+does not remove trees that no task record names; those stay reported by
+`dispatch.py worktrees`.
 
 Continuation rounds keep the checkout's creator as its owner (#10008). Even
 without retention intent, attribution requires exactly one creator and settled
@@ -326,7 +343,8 @@ stops. An owner sets or clears a hold with
 is set, settlement, salvage and this run leave the worktree untouched
 (`retention_hold`). A later write of the task record does not drop the hold,
 and the old-tree report does not inspect a held checkout. Clearing the hold
-does not push or remove the tree; the next settlement decides. The run's private receipt lists every
+does not push or remove the tree; the next settlement decides. To remove a
+held tree whose work is published, use `release-worktree TASK` (above). The run's private receipt lists every
 finished task's tree still on disk with its reason; the summary carries
 `retained_count`, `retained_safety_stops` and `retained_complete`.
 

@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         f"  .venv/bin/python {_DISPATCH} grant-paths TASK --run-nonce NONCE --owned-path tests/fix.py "
         "--reason 'Approved fixture change' --approval-ref message-id\n"
         f"  .venv/bin/python {_DISPATCH} retain-worktree TASK --set\n"
+        f"  .venv/bin/python {_DISPATCH} release-worktree TASK\n"
         "Outputs: task JSON, prompt, result and logs; new branch/worktree on dispatch.\n"
         "Exit codes: 0 success, 1 terminal failure, 2 invalid/refused request,\n"
         "  3 host admission refused (retryable), 4 worktree disk full, 124 client timeout.\n"
@@ -275,6 +276,29 @@ def build_parser() -> argparse.ArgumentParser:
     mode = retain.add_mutually_exclusive_group(required=True)
     mode.add_argument("--set", action="store_true", help="Set the hold (required unless --clear)")
     mode.add_argument("--clear", action="store_true", help="Clear the hold; does not push or remove (required unless --set)")
+    release = subs.add_parser(
+        "release-worktree",
+        help="Remove one finished task's retained worktree once its work is published",
+        description="Remove one finished task's retained worktree and record worktree_disposition: released.\n"
+        "Use after the owner no longer needs a kept tree (retention hold or another retained reason) and its "
+        "work is published. Removal runs only through the worktree_claims chokepoint, after these proofs: "
+        "the provider's process tree is gone, no tracked change, HEAD is on the canonical remote recorded at "
+        "dispatch or in a merged pull request carrying the task's delivery, and no live task borrows the tree. "
+        "Do not use it to publish, salvage or force removal, or for a tree with no task record.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+        f"  .venv/bin/python {_DISPATCH} release-worktree TASK\n"
+        "Outputs: JSON with task_id and released. Released: worktree_disposition, worktree_disposition_reason "
+        "and the worktree_release proof\n  (head, start_sha, canonical_remote, prior_reason, checks, removal). "
+        "Refused: a typed reason (for example dirty,\n  unpublished, remote_mismatch, borrowed_by_live_task, "
+        "provider_processes_alive, provider_liveness_unknown,\n  not_retained, task_active, task_not_found) "
+        "and an optional detail.\n"
+        "Side effects: on release, removes the worktree, its task branch when published, and the task's "
+        "scratch,\n  and rewrites the task record; on refusal, the record and the tree are left as they were.\n"
+        "Exit codes: 0 released, 1 refused, 2 invalid request.\n"
+        "Related: docs/runbooks/worktree-cleanup.md.",
+    )
+    release.add_argument("task_id", help="Task ID whose retained worktree to release, e.g. worker-42")
     return parser
 
 
@@ -776,6 +800,10 @@ def main(argv=None) -> int:
         if args.command == "retain-worktree":
             print(json.dumps(_retain_worktree(args.task_id, hold=args.set), indent=2))
             return 0
+        if args.command == "release-worktree":
+            released = worker.release_worktree(args.task_id)
+            print(json.dumps(released, indent=2))
+            return 0 if released["released"] else 1
         if args.command == "grant-paths":
             try:
                 result = store.grant_paths(args.task_id, args.run_nonce, args.owned_path, args.reason, args.approval_ref)

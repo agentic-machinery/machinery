@@ -287,3 +287,64 @@ def test_a_home_relative_hooks_path_keeps_its_guards(sandbox, monkeypatch, tmp_p
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+def _held_tree(sandbox, model="unpushed", publish=True):
+    """A finished write task whose worktree an owner held, optionally with its HEAD published afterwards."""
+    task = sandbox.dispatch(model, "--mode", "workspace-write")
+    # A write task whose tree settlement keeps (unpublished or dirty) ends failed (exit 1).
+    sandbox.settle(task, expected=1)
+    path = sandbox.tasks / f"{task[0]}.json"
+    record = json.loads(path.read_text())
+    tree = Path(record["worktree_path"])
+    assert record["worktree_disposition"] == "retained" and tree.is_dir()
+    sandbox.cli("retain-worktree", task[0], "--set")
+    if publish:
+        branch = record.get("publish_branch") or record["worktree_branch"]
+        run_git(tree, "push", str(sandbox.remote), f"HEAD:refs/heads/{branch}")
+    return task[0], tree, path
+
+
+def test_release_worktree_removes_a_published_held_tree_and_records_released(sandbox):
+    """Defect class: stranded retained tree. A held tree whose work later lands had no supported release (#577)."""
+    task_id, tree, path = _held_tree(sandbox)
+    head = run_git(tree, "rev-parse", "HEAD")
+    out = json.loads(sandbox.cli("release-worktree", task_id).stdout)
+    assert (out["released"], out["worktree_disposition"], out["worktree_disposition_reason"]) == (True, "released", "clean")
+    record = json.loads(path.read_text())
+    assert (record["worktree_disposition"], record["worktree_disposition_reason"]) == ("released", "clean")
+    assert "worktree_retention_hold" not in record
+    proof = record["worktree_release"]
+    assert (proof["head"], proof["prior_reason"], proof["removal"]) == (head, "retention_hold", "clean")
+    assert proof["checks"] == ["provider_gone", "no_tracked_change", "head_published", "no_live_borrower"]
+    assert proof["canonical_remote"] == record["worktree_remote_url"]
+    assert not tree.exists()
+    assert record["task_scratch_disposition"] in {"removed", "absent"}
+    # A released record is no longer retained: a second release refuses and changes nothing.
+    again = json.loads(sandbox.cli("release-worktree", task_id, expected=1).stdout)
+    assert (again["released"], again["reason"]) == (False, "not_retained")
+
+
+@pytest.mark.parametrize("case", ["tracked_change", "unpublished", "live_borrower", "live_provider"])
+def test_release_worktree_refuses_an_unsafe_tree_with_a_typed_reason_and_changes_nothing(sandbox, case):
+    """Defect class: unsafe release. A tree that could still lose work or that a process may use is removed."""
+    import os
+
+    task_id, tree, path = _held_tree(sandbox, model="pushed-dirty" if case == "tracked_change" else "unpushed",
+                                     publish=case in {"live_borrower", "live_provider"})
+    if case == "live_borrower":
+        borrower = dict(schema_version=2, task_id="borrower", run_nonce="n", status="running", worktree_path=str(tree))
+        (sandbox.tasks / "borrower.json").write_text(json.dumps(borrower))
+    if case == "live_provider":
+        record = json.loads(path.read_text())
+        record.update(launch_mode="popen-fallback", provider_pgid=os.getpgrp())
+        path.write_text(json.dumps(record))
+    before = json.loads(path.read_text())
+    head = run_git(tree, "rev-parse", "HEAD")
+    out = json.loads(sandbox.cli("release-worktree", task_id, expected=1).stdout)
+    assert out["released"] is False
+    assert out["reason"] == {"tracked_change": "dirty", "unpublished": "unpublished",
+                             "live_borrower": "borrowed_by_live_task", "live_provider": "provider_processes_alive"}[case]
+    assert json.loads(path.read_text()) == before
+    assert before["worktree_retention_hold"] is True
+    assert tree.is_dir() and run_git(tree, "rev-parse", "HEAD") == head

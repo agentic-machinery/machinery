@@ -1354,6 +1354,107 @@ def settle_left_worktrees(salvage: bool = False) -> None:
                 store.replace(current, path)
 
 
+def release_worktree(task_id: str) -> dict:
+    """Remove one finished task's retained worktree once nothing in it can be lost; record ``released``.
+
+    The owner's explicit release of a kept tree (#577). Under the task lock: the record must be a
+    finished dispatch v2 task whose worktree is retained and still on disk, and its provider's process
+    tree must be proven gone. The retention hold is then lifted for exactly one ``git.settle_worktree``
+    call, which proves no tracked change, a published HEAD (the canonical remote recorded at dispatch,
+    or a merged pull request carrying the task's delivery), no live borrower (asked again under the
+    worktree lock together with provider liveness), and removes the tree through the
+    ``worktree_claims`` chokepoint. Any refusal restores the record as it was and leaves the tree
+    untouched. Never pushes, salvages or forces.
+    """
+    path = store.record_path(task_id)
+
+    def refused(reason: str, detail: str | None = None) -> dict:
+        result = {"task_id": task_id, "released": False, "reason": reason}
+        if detail:
+            result["detail"] = detail
+        return result
+
+    with store.task_state_lock(path):
+        # The hot record only, read as stored: an archived or missing record names no tree this releases.
+        try:
+            record = json.loads(path.read_text())
+        except FileNotFoundError:
+            return refused("task_not_found")
+        except (OSError, ValueError, RecursionError) as exc:
+            return refused("task_record_damaged", type(exc).__name__)
+        if not isinstance(record, dict) or record.get("task_id") != task_id:
+            return refused("task_record_damaged")
+        if record.get("schema_version") != 2:
+            return refused("not_dispatch_v2")
+        if record.get("status") in store.ACTIVE:
+            return refused("task_active", str(record.get("status")))
+        if record.get("worktree_disposition") != "retained":
+            return refused("not_retained", str(record.get("worktree_disposition")))
+        tree = record.get("worktree_path")
+        if not isinstance(tree, str) or not Path(tree).is_dir():
+            return refused("worktree_missing")
+        if hold_error := store.retention_hold_error(record):
+            return refused("retention_hold_invalid", hold_error)
+        alive = _provider_alive(record)
+        if alive is not False:
+            return refused("provider_processes_alive" if alive else "provider_liveness_unknown")
+        original = json.loads(path.read_text())
+        try:
+            head = git._git(Path(tree), "rev-parse", "HEAD", isolate=True)
+        except (OSError, subprocess.SubprocessError):
+            head = None
+        provider_seen: list[bool] = []
+
+        def borrowed() -> bool:
+            if _provider_alive(record) is not False:
+                provider_seen.append(True)
+                return True
+            return _borrowed(record)
+
+        candidate = {**record, "worktree_retention_hold": False}
+        outcome: dict = {"worktree_disposition": "error", "worktree_disposition_reason": "settlement_failed"}
+        try:
+            # settle_worktree reads the hold from disk, so the clear is written; the task lock is held throughout.
+            store.replace(candidate, path)
+            outcome = git.settle_worktree(candidate, borrowed=borrowed)
+        except Exception as exc:  # restored below, never raised: the record must not lose its hold
+            outcome = {**outcome, "worktree_disposition_detail": type(exc).__name__}
+        finally:
+            if outcome.get("worktree_disposition") != "removed":
+                store.replace(original, path)
+        if outcome.get("worktree_disposition") != "removed":
+            reason = outcome.get("worktree_disposition_reason", "settlement_failed")
+            if reason == "borrowed_by_live_task" and provider_seen:
+                reason = "provider_processes_alive"
+            return refused(reason, outcome.get("worktree_disposition_detail"))
+        start = record.get("worktree_start_sha", record.get("worktree_base_sha"))
+        proof = {
+            "released_at": store.now(),
+            "head": head,
+            "start_sha": start,
+            "canonical_remote": record.get("worktree_remote_url"),
+            "prior_reason": record.get("worktree_disposition_reason"),
+            "checks": ["provider_gone", "no_tracked_change", "head_published" if head != start else "no_commits",
+                       "no_live_borrower"],
+            "removal": outcome.get("worktree_disposition_reason"),
+        }
+        record.pop("worktree_disposition_detail", None)
+        record.update(worktree_disposition="released", worktree_disposition_reason=outcome["worktree_disposition_reason"],
+                      worktree_retention_hold=False, worktree_release=proof)
+        for key in ("worktree_disposition_detail", "worktree_registry"):
+            if key in outcome:
+                record[key] = outcome[key]
+        try:
+            disposition, why, size = _remove_task_scratch(task_id)
+        except Exception as exc:  # recorded, never raised: the release must still be published
+            disposition, why, size = "failed", f"{type(exc).__name__}: {exc}"[:300], None
+        record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=why,
+                      task_scratch_bytes=size)
+        store.replace(record, path)
+    return {"task_id": task_id, "released": True, "worktree_disposition": "released",
+            "worktree_disposition_reason": record["worktree_disposition_reason"], "worktree_release": proof}
+
+
 def _end_lingering(child: subprocess.Popen, spec: TaskSpec) -> None:
     """End a provider that outlived its terminal result, keeping what its launcher still has to write.
 
