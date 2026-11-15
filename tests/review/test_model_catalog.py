@@ -1144,6 +1144,10 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
+            # #586: Hydrogen is an AGY work model with no review or advisory role, so it joins
+            # no seat, review route, ladder or ranking; its row is pinned and every other field stays frozen.
+            hydrogen = value["models"].pop("gemini-4-hydrogen")
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "eb70beb66fa2b597573462c10d494df5248cee46c267d1b86bac3b4da27a9ac7"
         assert value == expected, f"current surface differs: {surface}"
 
 
@@ -1158,6 +1162,7 @@ def refresh_current_baseline():
 
     capture = deepcopy(_V2_BASELINE)
     capture["baseline"]["catalog"] = approved_dispatcher_spelling(without_advisory_roles(plain(expanded_legacy_view())))
+    capture["baseline"]["catalog"]["models"].pop("gemini-4-hydrogen")  # pinned in assert_frozen_surfaces (#586)
     usage_dir = _V2_BASELINE_PATH.parent / ".recapture-no-live-usage"
     assert not usage_dir.exists()
     receipts = []
