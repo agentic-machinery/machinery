@@ -1985,11 +1985,6 @@
     {
       "path": "lu_machinery/api/state_router.py",
       "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
       "message": "Cannot determine type of \"value\""
     },
     {
@@ -2381,11 +2376,6 @@
       "path": "lu_machinery/api/subscription_usage.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"dict[str, Any]\", target has type \"None\")"
-    },
-    {
-      "path": "lu_machinery/api/subscription_usage.py",
-      "code": "attr-defined",
-      "message": "\"object\" has no attribute \"get\""
     },
     {
       "path": "lu_machinery/api/subscription_usage.py",

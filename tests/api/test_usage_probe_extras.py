@@ -13,7 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import claude_account_usage, state_router
+from lu_machinery.api import claude_account_usage, state_helpers, state_router
 from lu_machinery.api import subscription_usage as probes
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.fleet import capacity_pick, usage
@@ -23,6 +23,33 @@ FIXTURES = Path(__file__).parent / "fixtures" / "usage_9270"
 NOW = datetime(2026, 9, 30, 8, 0, tzinfo=UTC)
 SENTINEL = "SYNTHETIC_SECRET_SENTINEL"
 IDENTIFIER = "SYNTHETIC_IDENTIFIER_SENTINEL"
+
+
+def test_missing_balance_key_does_not_expire_successful_usage(monkeypatch):
+    """A missing balance key must not make 51-second-old successful usage stale."""
+    account = {
+        "probe_state": "ok", "balance_probe_state": "NEED_KEY",
+        "fetched_at": NOW.isoformat(), "usage_weekly_usd": 12.5,
+    }
+    monkeypatch.setattr(probes, "_api_account_last_failure", {})
+    monkeypatch.setattr(probes, "_api_account_last_good", {"openrouter": (1000, account)})
+    monkeypatch.setattr(probes, "cache_get_with_age", lambda *a, **kw: (account, 51))
+    monkeypatch.setattr(probes.time, "monotonic", lambda: 1051)
+    result = probes._api_account_snapshot("openrouter")
+    assert result == {**account, "freshness": "fresh", "stale": False, "age_s": 51}
+
+
+def test_expired_successful_api_reading_still_uses_stale_last_good(monkeypatch):
+    """Removing the partial-reading cutoff must preserve real age expiry."""
+    account = {"probe_state": "ok", "balance_probe_state": "NEED_KEY", "fetched_at": NOW.isoformat()}
+    monkeypatch.setattr(probes, "_api_account_last_failure", {})
+    monkeypatch.setattr(probes, "_api_account_last_good", {"openrouter": (1000, account)})
+    monkeypatch.setattr(probes, "_api_account_cache_ttl_s", lambda: 600)
+    monkeypatch.setattr(probes.time, "monotonic", lambda: 1601)
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1601)
+    monkeypatch.setattr(state_helpers, "_ttl_cache", {"api_account:openrouter": (1000, account)})
+    result = probes._api_account_snapshot("openrouter")
+    assert result == {**account, "freshness": "stale_last_good", "stale": True, "age_s": 601}
 
 
 @pytest.fixture

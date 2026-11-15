@@ -370,7 +370,7 @@ function apiRows(budget) {
     let values = "unknown";
     let valueClass = "muted";
     if (state === "fresh") {
-      values = figures.join("; ") || null;
+      values = [...figures, probe].filter(Boolean).join("; ") || null;
       valueClass = "";
     } else if (state === "last_good") {
       const marked = figures.length ? `${figures.join("; ")} (last good)` : null;
