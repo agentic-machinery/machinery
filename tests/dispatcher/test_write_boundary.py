@@ -642,6 +642,30 @@ def _refused(call) -> str:
     return str(refusal.value)
 
 
+def test_budget_check_relays_own_pr_and_preserves_host_admission(broker, monkeypatch):
+    """Defect class: a boundary worker's own-PR budget check cannot reach the host, or loses its refusal (#575)."""
+    calls = []
+    response = {"returncode": 0, "stdout": '{"admitted": true, "budget": 3}\n', "stderr": ""}
+
+    def host(self, module, argv, key):
+        calls.append((module, argv, key))
+        return response
+
+    monkeypatch.setattr(write_boundary._Broker, "_module", host)
+    assert broker._budget_check({"pr": 7, "repo": "owner/repo"}) == response
+    response = {"returncode": 1, "stdout": '{"admitted": false, "refusal": "REVIEW_BUDGET_EXHAUSTED"}\n',
+                "stderr": "host diagnostic\n"}
+    assert broker._budget_check({"pr": 7, "repo": "owner/repo"}) == response
+    assert calls == [("review.record_cf_verdict", ["budget-check", "--repository", "owner/repo", "--pr", "7"],
+                      "budget-check")] * 2
+
+
+def test_budget_check_refuses_another_pr_before_host_admission(broker):
+    """Defect class: the boundary worker checks another branch's PR through the host's login (#575)."""
+    assert "not this task's dispatched branch" in _refused(lambda: broker._budget_check({"pr": 8}))
+    assert broker.steps == []
+
+
 def test_failed_broker_push_receipt_retains_redacted_git_error(broker, monkeypatch):
     """Defect class: broker push failures hide Git's cause or expose credentials in replies and receipts."""
     secret = "ghp_" + "A" * 36

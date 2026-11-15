@@ -97,8 +97,12 @@ interpreter does not select the primary checkout's Python modules.
    and `requires_silence_timeout`. Exit 1 is fail-closed: no eligible reviewer means escalate
    to the CTO, or use the red-team exception (`workflow.md` § Merge policy) exactly as written
    there. Never review your own work.
-3. **Dispatch the reviewer read-only at the exact pushed head**, passing the same
+3. **Check the round budget, then dispatch the reviewer read-only at the exact pushed head**, passing the same
    `$REVIEW_PROFILE`. The dispatcher removes the review worktree when the task settles.
+   Before every round, including round 1, run the recorder's `budget-check` command in step 6.
+   Inside a write boundary it automatically relays through the host broker's `budget-check` verb,
+   bound to the task's own open PR. Use the same command; no direct GitHub access is needed.
+   Read its JSON and exit status: admission permits dispatch, and a refusal stops the round.
 
    For bound Contract 1 plan or Contract 2 lesson attempts using `--review-id`, `--attempt-id`
    and `--review-attempt`, follow [Running a bound attempt](../../../../docs/runbooks/formal-review-attempt-isolation.md#running-a-bound-attempt)
@@ -144,6 +148,10 @@ interpreter does not select the primary checkout's Python modules.
    ```bash
    "$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py" budget-check --repository "$REPOSITORY" --pr "$PR"
    ```
+
+   Inside a write boundary, the command forwards to the host's `budget-check` broker verb and
+   returns the host admission JSON (including any repair receipt) or its real refusal. A request
+   for another task's PR or repository is refused before the recorder runs.
 
    Exit 0 admits the round; carry any `repair_round` receipt (its approved and candidate heads,
    class, failed runs or conflicted paths, and `delta_sha256`) into the delta brief, and ask the
