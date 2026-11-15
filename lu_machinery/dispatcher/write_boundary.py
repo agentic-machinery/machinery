@@ -1650,12 +1650,16 @@ class _Boundary:
             reason = exc.reason if isinstance(exc, test_slots.SlotError) else type(exc).__name__
             self.receipt["test_slots"] = {"bound": False, "reason": reason}
             return None
-        inside = test_slots._default_pool()
-        if _overlaps(pool, self.worktree) or _overlaps(pool, self.repository) or _under(inside, _MASKED_ROOTS):
+        # Bound where it resolves, as every restore is, so its mount point already exists whatever covers its
+        # parents inside; a sandboxed run finds the pool only at the default location, so only that one is bound.
+        if pool != test_slots._default_pool():
+            self.receipt["test_slots"] = {"bound": False, "reason": "pool_not_at_default_location"}
+            return None
+        if _overlaps(pool, self.worktree) or _overlaps(pool, self.repository) or _under(pool, _MASKED_ROOTS):
             self.receipt["test_slots"] = {"bound": False, "reason": "pool_overlaps_the_view"}
             return None
         self.receipt["test_slots"] = {"bound": True}
-        return pool, inside
+        return pool, pool
 
     def _claude_login(self, home: Path, repository: Path) -> tuple[tuple[Path, Path] | None, list[Path]]:
         """The selected Claude login's projection, wherever it lives: a private directory bound at its resolved

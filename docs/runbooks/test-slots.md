@@ -114,7 +114,8 @@ Every dispatched write worker runs inside the write boundary
 ([write-worker-boundary](write-worker-boundary.md)), which also maps only the current user, empties
 `/var/tmp` and sets `LU_SCRATCH_ROOT` to the run's private scratch (#557). Its launcher therefore
 prepares the host's pool on the host, with the full ownership walk, and binds that directory writable
-at the default location, `/var/tmp/lu/test-slots-<uid>`. Inside:
+where it resolves, when that is the default location, `/var/tmp/lu/test-slots-<uid>` (a host whose
+pool lives elsewhere, through `LU_SCRATCH_ROOT` or `LU_TEST_SLOTS_DIR`, gets no bind). Inside:
 
 - A sandboxed process uses that pool only when `/proc/self/mountinfo` shows a writable mount exactly at
   the default location. The worker cannot create or move a mount, so a directory it made itself is never
@@ -126,8 +127,8 @@ at the default location, `/var/tmp/lu/test-slots-<uid>`. Inside:
   Its xdist workers join its hold: a non-`review` hold counts in a sandbox only when it was taken in the
   same user namespace, recorded as `userns` in its ticket. A hold issued outside, such as a launcher's,
   still serves a sandbox only as a `review` turn.
-- The boundary receipt's `test_slots` shows `bound`, or why nothing was bound (`disabled`, or the
-  refusal reason when the host pool cannot be prepared). Without a bind the run still starts, and its
+- The boundary receipt's `test_slots` shows `bound`, or why nothing was bound (`disabled`,
+  `pool_not_at_default_location`, or the refusal reason when the host pool cannot be prepared). Without a bind the run still starts, and its
   governed tests are refused with a typed reason.
 
 The worker holds the same authority over the pool as any host process of this user: it can lock and
