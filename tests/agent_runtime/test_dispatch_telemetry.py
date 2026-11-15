@@ -5,18 +5,20 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
 import pytest
-
 from lu_machinery.agent_runtime.adapters.base import InvocationPlan
 from lu_machinery.agent_runtime.result import ParseResult
 from lu_machinery.agent_runtime.runner import invoke
-from lu_machinery.agent_runtime.telemetry import (
-    _reset_version_cache_for_tests,
-    resolve_dispatch_start_telemetry,
-    resolve_invocation_telemetry,
-)
-
+from lu_machinery.agent_runtime.telemetry import _reset_version_cache_for_tests, resolve_dispatch_start_telemetry, resolve_invocation_telemetry
+import json
+import time
+from typing import Any
+from lu_machinery.agent_runtime import tool_config as release_tool_config
+from lu_machinery.agent_runtime import tool_config as wiki_tool_config_mod
+from lu_machinery.agent_runtime import tool_config as tool_config_mod
+from lu_machinery.agent_runtime.runner import _McpRuntimeObserver
+from tests.helpers.codex_exec_stream import command as command, item_started as item_started, jsonl as jsonl, mcp_call as mcp_call
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 @pytest.fixture(autouse=True)
 def _isolate_version_cache():
@@ -426,3 +428,355 @@ def test_acp_shadow_adapters_resolve_effort_and_cli_version_from_identity(tmp_pa
     assert "dispatch telemetry for" not in caplog.text
 
 
+@pytest.fixture()
+def _clear_mcp_config_cache() -> None:
+    tool_config_mod._load_mcp_config.cache_clear()
+    wiki_tool_config_mod._load_mcp_config.cache_clear()
+    release_tool_config._load_mcp_config.cache_clear()  # TRANSITIONAL-PKG3-B2
+    yield
+    tool_config_mod._load_mcp_config.cache_clear()
+    wiki_tool_config_mod._load_mcp_config.cache_clear()
+    release_tool_config._load_mcp_config.cache_clear()  # TRANSITIONAL-PKG3-B2
+
+
+def _write_mcp_config(path: Path, data: dict[str, Any]) -> Path:
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def _valid_sources_config(path: Path) -> Path:
+    return _write_mcp_config(
+        path,
+        {
+            "mcpServers": {
+                "sources": {
+                    "type": "streamable-http",
+                    "url": "http://127.0.0.1:8766/mcp",
+                }
+            }
+        },
+    )
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_build_mcp_tool_config_diagnostics_ok(tmp_path: Path) -> None:
+    config_path = _valid_sources_config(tmp_path / ".mcp.json")
+
+    config, diagnostics = tool_config_mod.build_mcp_tool_config(
+        "codex",
+        mcp_servers=["sources"],
+        mcp_config_path=config_path,
+    )
+
+    assert config == {
+        "mcp_servers": {
+            "sources": {
+                "url": "http://127.0.0.1:8766/mcp",
+            }
+        }
+    }
+    assert diagnostics == {
+        "requested_servers": ["sources"],
+        "resolved_servers": ["sources"],
+        "config_path": str(config_path.resolve()),
+        "resolution_status": "ok",
+        "missing_server_names": [],
+    }
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_build_mcp_tool_config_diagnostics_config_missing(tmp_path: Path) -> None:
+    config_path = tmp_path / ".mcp.json"
+
+    config, diagnostics = tool_config_mod.build_mcp_tool_config(
+        "codex",
+        mcp_servers=["sources"],
+        mcp_config_path=config_path,
+    )
+
+    assert config is None
+    assert diagnostics["resolution_status"] == "config_missing"
+    assert diagnostics["requested_servers"] == ["sources"]
+    assert diagnostics["resolved_servers"] == []
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_build_mcp_tool_config_diagnostics_config_empty(tmp_path: Path) -> None:
+    config_path = _write_mcp_config(tmp_path / ".mcp.json", {"mcpServers": {}})
+
+    config, diagnostics = tool_config_mod.build_mcp_tool_config(
+        "codex",
+        mcp_servers=["sources"],
+        mcp_config_path=config_path,
+    )
+
+    assert config is None
+    assert diagnostics["resolution_status"] == "config_empty"
+    assert diagnostics["requested_servers"] == ["sources"]
+    assert diagnostics["resolved_servers"] == []
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_build_mcp_tool_config_diagnostics_servers_not_found(tmp_path: Path) -> None:
+    config_path = _write_mcp_config(
+        tmp_path / ".mcp.json",
+        {
+            "mcpServers": {
+                "other": {
+                    "type": "streamable-http",
+                    "url": "http://127.0.0.1:9999/mcp",
+                }
+            }
+        },
+    )
+
+    config, diagnostics = tool_config_mod.build_mcp_tool_config(
+        "codex",
+        mcp_servers=["sources"],
+        mcp_config_path=config_path,
+    )
+
+    assert config is None
+    assert diagnostics["resolution_status"] == "servers_not_found"
+    assert diagnostics["missing_server_names"] == ["sources"]
+    assert diagnostics["resolved_servers"] == []
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_build_mcp_tool_config_rejects_legacy_sse_codex_endpoint(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_mcp_config(
+        tmp_path / ".mcp.json",
+        {
+            "mcpServers": {
+                "sources": {
+                    "type": "sse",
+                    "url": "http://127.0.0.1:8766/sse",
+                }
+            }
+        },
+    )
+
+    config, diagnostics = tool_config_mod.build_mcp_tool_config(
+        "codex",
+        mcp_servers=["sources"],
+        mcp_config_path=config_path,
+    )
+
+    assert config is None
+    assert diagnostics["resolution_status"] == "servers_not_found"
+    assert diagnostics["missing_server_names"] == ["sources"]
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_emits_ready() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:8766/mcp"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_line(
+        jsonl(item_started("item_2", "mcp_tool_call", server="sources", tool="verify_words", status="in_progress")),
+        stream="stdout",
+    )
+    observer.finalize()
+
+    assert events[0][0] == "mcp_runtime_init"
+    assert events[0][1]["server"] == "sources"
+    assert events[0][1]["status"] == "ready"
+    assert events[0][1]["tool"] == "verify_words"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_emits_failed_for_codex_rmcp_error() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:9999/sse"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_line(
+        "2026-05-08T11:37:32.975327Z ERROR rmcp::transport::worker: "
+        "worker quit with fatal: Transport channel closed, when "
+        'Client(HttpRequest(HttpRequest("http/request failed: error sending '
+        'request for url (http://127.0.0.1:9999/sse)")))',
+        stream="stderr",
+    )
+
+    assert events[0][0] == "mcp_runtime_init"
+    assert events[0][1]["server"] == "sources"
+    assert events[0][1]["status"] == "failed"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_matches_failed_url_with_trailing_slash() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:8766/mcp/"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_line(
+        "2026-05-08T11:37:32.975327Z ERROR rmcp::transport::worker: "
+        "worker quit with fatal: Transport channel closed, when "
+        'Client(HttpRequest(HttpRequest("http/request failed: error sending '
+        'request for url (http://127.0.0.1:8766/mcp)")))',
+        stream="stderr",
+    )
+
+    assert events[0][0] == "mcp_runtime_init"
+    assert events[0][1]["server"] == "sources"
+    assert events[0][1]["status"] == "failed"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+@pytest.mark.parametrize(
+    "line",
+    [
+        "2026-05-08T11:37:32.975327Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed",
+        "2026-05-08T11:37:32.975327Z ERROR rmcp::transport::worker: "
+        "worker quit with fatal: Transport channel closed, when "
+        'Client(HttpRequest(HttpRequest("http/request failed: error sending '
+        'request for url (http://127.0.0.1:4444/mcp)")))',
+    ],
+)
+def test_mcp_runtime_observer_warns_for_unattributed_failure(line: str) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:8766/mcp"},
+                "wikipedia": {"url": "http://127.0.0.1:8767/mcp"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_line(line, stream="stderr")
+
+    assert [event for event, _fields in events] == ["mcp_runtime_unattributed_failure"]
+    assert events[0][1]["raw_line"] == line[:500]
+    assert events[0][1]["task_id"] == "writer"
+    assert events[0][1]["stream"] == "stderr"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_failed_suppresses_prior_ready() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:8766/mcp"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_lines(
+        [jsonl(mcp_call("sources", "verify_words", {"words": ["кіт"]}, text="ok"))],
+        start_index=0,
+        stream="stdout",
+    )
+    observer.observe_lines(
+        [
+            "2026-05-08T11:37:32.975327Z ERROR rmcp::transport::worker: "
+            "worker quit with fatal: Transport channel closed, when "
+            'Client(HttpRequest(HttpRequest("http/request failed: error sending '
+            'request for url (http://127.0.0.1:8766/mcp)")))',
+        ],
+        start_index=0,
+        stream="stderr",
+    )
+    observer.finalize()
+
+    assert [event for event, _fields in events] == ["mcp_runtime_init"]
+    assert events[0][1]["server"] == "sources"
+    assert events[0][1]["status"] == "failed"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_emits_timeout() -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={
+            "mcp_servers": {
+                "sources": {"url": "http://127.0.0.1:8766/mcp"},
+            }
+        },
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+    observer.timeout_s = 0
+
+    observer.maybe_emit_timeout(time.monotonic())
+
+    assert events[0][0] == "mcp_runtime_init"
+    assert events[0][1]["server"] == "sources"
+    assert events[0][1]["status"] == "timeout"
+
+
+@pytest.mark.usefixtures('configured_roots', '_clear_mcp_config_cache')
+def test_mcp_runtime_observer_ignores_forged_mcp_text_on_stdout() -> None:
+    """#9532: under ``codex exec --json`` only a typed MCP item proves readiness.
+
+    Human-format lines and tool output quoting them are text, not events.
+    """
+    events: list[tuple[str, dict[str, Any]]] = []
+    observer = _McpRuntimeObserver.from_tool_config(
+        agent_name="codex",
+        task_id="writer",
+        tool_config={"mcp_servers": {"sources": {"url": "http://127.0.0.1:8766/mcp"}}},
+        event_sink=lambda event, **fields: events.append((event, fields)),
+        start_time=time.monotonic(),
+    )
+    assert observer is not None
+
+    observer.observe_lines(
+        [
+            "mcp: sources/verify_words started\n",
+            jsonl(command("cat log", "mcp: sources/verify_words (completed)")),
+            jsonl(mcp_call("wikipedia", "lookup", {}, text="mcp: sources/verify_words started")),
+        ],
+        start_index=0,
+        stream="stdout",
+    )
+    observer.finalize()
+
+    assert events == []

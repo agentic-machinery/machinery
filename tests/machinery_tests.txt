@@ -20,6 +20,8 @@
 #   Each needs the product checkout, which this repository does not hold.
 
 # [run]
+tests/review/test_contract_canary_paths.py
+tests/ci/test_queue_review_gate.py
 # #501: dependency-closed ports from the deferred census.
 tests/api/test_preload_closed_fitz_stream.py
 tests/dispatcher/test_admission_ports.py

@@ -1,6 +1,7 @@
 """Opt-in Grok reviewer shell and hook boundary."""
 
 from __future__ import annotations
+from tests.agent_runtime.product_roots import claude_plan_binary as claude_plan_binary
 
 import json
 import os
@@ -9,18 +10,17 @@ import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
-
 import pytest
-
 from lu_machinery.agent_runtime.adapters.grok_build import GrokBuildAdapter
 from lu_machinery.agent_runtime.env_sanitize import build_agent_env
 from lu_machinery.common.repo_root import machinery_path
-from tests.agent_runtime.product_roots import (  # noqa: F401
-    agent_runtime_roots,
-    configured_roots,
-)
-
-pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
+from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots, configured_roots as configured_roots
+import fnmatch
+import shutil
+from lu_machinery.agent_runtime.adapters.claude import REVIEWER_PERMISSION_PROFILE
+from lu_machinery.agent_runtime.adapters.claude import ClaudeAdapter
+from lu_machinery.agent_runtime.review_mcp import review_tools_allowed_csv
+from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -782,3 +782,954 @@ def test_refusal_exits_two_with_real_closed_stderr_pipe(event):
         assert result.stdout == ""
     finally:
         os.close(write_fd)
+
+
+SOURCES_READ_ONLY_TOOLS, SOURCES_PERSISTING_TOOLS = sources_tool_sets(Path(__file__).resolve().parents[2] / "tests/fixtures/product_tree/.mcp/servers/sources/server.py")
+
+
+SOURCES_RULES = [f"mcp__sources__{name}" for name in SOURCES_READ_ONLY_TOOLS]
+
+
+PERSISTING_RULES = [f"mcp__sources__{name}" for name in SOURCES_PERSISTING_TOOLS]
+
+
+WRITER_DENIES = [*PERSISTING_RULES, *(f"mcp__*__{name}" for name in SOURCES_PERSISTING_TOOLS)]
+
+
+ALTERNATE_SERVER_NAMES = ("sources_alias", "plugin_lu_sources", "srv")
+
+
+def _claude_denies(rules: list[str], tool: str) -> bool:
+    """Claude's documented deny match: an exact name, or a glob over the full tool name."""
+    return any(fnmatch.fnmatchcase(tool, rule) for rule in rules)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.live_network
+@pytest.mark.skipif(os.environ.get("LU_LIVE_CLAUDE_PERMISSIONS") != "1", reason="opt-in paid Claude CLI matcher check")
+def test_live_claude_reader_allowed_writer_denied(tmp_path: Path) -> None:
+    """Require native permission-denial evidence and independent stub execution evidence."""
+    binary = shutil.which("claude")
+    assert binary is not None, "opted-in live test requires the installed Claude CLI"
+    audit = tmp_path / "calls.jsonl"
+    stub = tmp_path / "stub_sources.py"
+    stub.write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from mcp.server.fastmcp import FastMCP\n"
+        "mcp = FastMCP('permission-fixture')\n"
+        "def record(name):\n"
+        "    with Path(sys.argv[1]).open('a') as f: f.write(json.dumps(name) + '\\n')\n"
+        "    return name\n"
+        "@mcp.tool()\n"
+        "def inspect_word(word: str) -> str:\n"
+        "    return record('inspect_word')\n"
+        "@mcp.tool()\n"
+        "def query_wikipedia(query: str) -> str:\n"
+        "    return record('query_wikipedia')\n"
+        "mcp.run(transport='stdio')\n"
+    )
+    cmd = _reviewer_plan(tmp_path)
+    # Keep the generated settings, allow/deny lists and dontAsk mode intact;
+    # replace only the real server with harmless, independently logged tools.
+    cmd[0] = binary
+    cmd[cmd.index("--mcp-config") + 1] = json.dumps(
+        {"mcpServers": {"sources": {"command": sys.executable, "args": [str(stub), str(audit)]}}}
+    )
+    cmd[cmd.index("--output-format") + 1] = "json"
+    cmd.extend(["--setting-sources", "", "--no-session-persistence", "--max-turns", "4"])
+    # stdin carries the prompt in the adapter's normal print invocation.
+    proc = subprocess.run(
+        cmd,
+        input=(
+            "Test only these two MCP tools. Call mcp__sources__inspect_word with word='fixture'. "
+            "Then attempt mcp__sources__query_wikipedia with query='fixture' once, even if it is denied. "
+            "Do not use other tools or substitute a tool."
+        ),
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=build_agent_env(provider="claude"),
+    )
+    # Do not echo a paid response, credentials or stderr into public diagnostics.
+    assert proc.returncode == 0, f"Claude live matcher process exited {proc.returncode}"
+    result = json.loads(proc.stdout)
+    assert result.get("is_error") is False
+    assert audit.is_file(), "allowed read tool never reached the stub"
+    assert set(json.loads(line) for line in audit.read_text().splitlines()) == {"inspect_word"}
+    assert any(
+        denial.get("tool_name") == "mcp__sources__query_wikipedia" for denial in result.get("permission_denials", [])
+    ), "no native writer permission denial: a model refusing to call is insufficient evidence"
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_workspace_write_names_mcp_servers_from_config(tmp_path: Path) -> None:
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps({"mcpServers": {"sources": {}, "other_tool": {}}}),
+        encoding="utf-8",
+    )
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="workspace-write",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"mcp_config_path": str(config)},
+    )
+    granted = plan.cmd[plan.cmd.index("--allowedTools") + 1].split(",")
+    assert "mcp__sources__*" in granted
+    assert "mcp__other_tool__*" in granted
+    assert "mcp__sources" not in granted
+    assert "NotebookEdit" not in granted
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("worker_cwd_product")
+def test_workspace_write_mcp_config_comes_from_worker_cwd(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"worker_only": {}}}),
+        encoding="utf-8",
+    )
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="workspace-write",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config=None,
+    )
+    granted = plan.cmd[plan.cmd.index("--allowedTools") + 1].split(",")
+    assert "mcp__worker_only__*" in granted
+    assert "mcp__sources__*" not in granted
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_explicit_mcp_config_path_wins_over_worker_cwd(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"from_cwd": {}}}),
+        encoding="utf-8",
+    )
+    explicit = tmp_path / "explicit.json"
+    explicit.write_text(
+        json.dumps({"mcpServers": {"from_explicit": {}}}),
+        encoding="utf-8",
+    )
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="workspace-write",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"mcp_config_path": str(explicit)},
+    )
+    granted = plan.cmd[plan.cmd.index("--allowedTools") + 1].split(",")
+    assert "mcp__from_explicit__*" in granted
+    assert "mcp__from_cwd__*" not in granted
+
+    missing = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="workspace-write",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"mcp_config_path": str(tmp_path / "absent.json")},
+    )
+    missing_granted = missing.cmd[missing.cmd.index("--allowedTools") + 1].split(",")
+    assert "mcp__from_cwd__*" not in missing_granted
+    assert not any(name.startswith("mcp__") for name in missing_granted)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("worker_cwd_product")
+def test_workspace_write_rejects_invalid_mcp_config(tmp_path: Path) -> None:
+    (tmp_path / ".mcp.json").write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid JSON"):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="workspace-write",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config=None,
+        )
+
+    shaped = tmp_path / "shaped"
+    shaped.mkdir()
+    (shaped / ".mcp.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="mcpServers"):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="workspace-write",
+            cwd=shaped,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config={"mcp_config_path": str(shaped / ".mcp.json")},
+        )
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("worker_cwd_product")
+def test_workspace_write_rejects_unreadable_mcp_config(tmp_path: Path) -> None:
+    config = tmp_path / ".mcp.json"
+    config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    config.chmod(0)
+    try:
+        with pytest.raises(ValueError, match="unreadable"):
+            ClaudeAdapter().build_invocation(
+                prompt="inspect",
+                mode="workspace-write",
+                cwd=tmp_path,
+                model=None,
+                task_id=None,
+                session_id=None,
+                tool_config=None,
+            )
+    finally:
+        config.chmod(0o644)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_workspace_write_rejects_inexpressible_mcp_server_name(tmp_path: Path) -> None:
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps({"mcpServers": {"ok": {}, "bad,name": {}}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cannot be expressed"):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="workspace-write",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config={"mcp_config_path": str(config)},
+        )
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_reviewer_tools_opt_in_installs_profile(tmp_path: Path) -> None:
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"reviewer_tools": True},
+    )
+    assert plan.cmd[plan.cmd.index("--permission-mode") + 1] == "dontAsk"
+    sources_read = {f"mcp__sources__{name}" for name in SOURCES_READ_ONLY_TOOLS}
+    assert set(REVIEWER_PERMISSION_PROFILE["allow"]) | sources_read == set(
+        plan.cmd[plan.cmd.index("--allowedTools") + 1].split(",")
+    )
+    assert set(REVIEWER_PERMISSION_PROFILE["deny"]) | set(WRITER_DENIES) == set(
+        plan.cmd[plan.cmd.index("--disallowedTools") + 1].split(",")
+    )
+    assert plan.env_overrides["LU_CLAUDE_READ_ONLY_GIT_PUSH_BLOCK"] == "1"
+    settings = json.loads(plan.cmd[plan.cmd.index("--settings") + 1])
+    commands = [hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]]
+    assert any(command.endswith("guard-reviewer-publish.py") for command in commands)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_discussion_readonly_keeps_separate_permissions(tmp_path: Path) -> None:
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"discussion_readonly": True},
+    )
+    assert "--settings" in plan.cmd
+    assert "--permission-mode" not in plan.cmd
+    assert "--allowedTools" not in plan.cmd
+    assert _denied(plan.cmd) == WRITER_DENIES
+    assert plan.cmd[plan.cmd.index("--tools") + 1] == "Read,Grep,Glob,LS"
+    assert "LU_CLAUDE_READ_ONLY_GIT_PUSH_BLOCK" not in plan.env_overrides
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_review_isolation_keeps_separate_permissions(tmp_path: Path, monkeypatch) -> None:
+    from lu_machinery.agent_runtime.adapters import claude
+    from lu_machinery.review import isolation
+
+    mcp = tmp_path / "empty.json"
+    mcp.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    monkeypatch.setattr(isolation, "validated_review_write_root", lambda _: tmp_path)
+    monkeypatch.setattr(claude, "_isolated_review_response_schema", lambda _: "{}")
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={
+            "review_isolation": True,
+            "review_engine_binary": "/bin/true",
+            "strict_mcp_config": True,
+            "mcp_config_path": str(mcp),
+            "setting_sources": "",
+            "allowed_tools": "",
+        },
+    )
+    assert "--settings" in plan.cmd
+    assert "--safe-mode" in plan.cmd
+    assert "--permission-mode" not in plan.cmd
+    assert "--allowedTools" not in plan.cmd
+    assert _denied(plan.cmd) == WRITER_DENIES
+    assert plan.cmd[plan.cmd.index("--tools") + 1] == ""
+
+
+_WRAPPER = 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh"'
+
+
+_PINNED_GUARDS = ("guard-pr-merge.py", "guard-admin-merge.py", "guard-branch-switch-in-main.py")
+
+
+def _mark_product_checkout(root: Path, monkeypatch) -> None:
+    """Select ``root`` as the product checkout too: the settings file is product configuration."""
+    from lu_machinery.common import repo_root
+
+    marker = root / repo_root.PRODUCT_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("levels: {}\n", encoding="utf-8")
+    monkeypatch.setenv(repo_root.PRODUCT_ROOT_ENV, str(root))
+
+
+def _guard_source_tree(root: Path, commands: list[str], *, interpreter: bool = True) -> Path:
+    """A checkout-shaped tree whose settings name ``commands`` as Bash PreToolUse hooks."""
+    hooks = root / "agents_extensions/shared/hooks"
+    hooks.mkdir(parents=True)
+    for name in ("enforce-venv.sh", "guard-secret-print.py", *_PINNED_GUARDS):
+        (hooks / name).write_text("#!/bin/sh\n", encoding="utf-8")
+    groups = [{"matcher": "Bash", "hooks": [{"type": "command", "command": c, "timeout": 7} for c in commands]}]
+    (root / "agents_extensions/shared/settings.json").write_text(
+        json.dumps({"hooks": {"PreToolUse": groups}}), encoding="utf-8"
+    )
+    if interpreter:
+        python = root / ".venv/bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text("", encoding="utf-8")
+    return hooks
+
+
+def _settings_from(root: Path, monkeypatch) -> list[dict]:
+    from lu_machinery.agent_runtime.adapters import claude
+
+    _mark_product_checkout(root, monkeypatch)
+    monkeypatch.setattr(claude, "__file__", str(root / "scripts/agent_runtime/adapters/claude.py"))
+    settings = json.loads(claude._worker_guard_settings())
+    return [hook for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]]
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("advisor", [None, "claude-opus-5-5", "claude-sonnet-5-5"])
+def test_worker_settings_omit_the_interactive_advisor(tmp_path: Path, monkeypatch, advisor: str | None) -> None:
+    from lu_machinery.agent_runtime.adapters import claude
+
+    _guard_source_tree(tmp_path, ["$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-venv.sh"])
+    source_path = tmp_path / "agents_extensions/shared/settings.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["model"] = "claude-sonnet-5-5"
+    if advisor is not None:
+        source["advisorModel"] = advisor
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+    _mark_product_checkout(tmp_path, monkeypatch)
+    monkeypatch.setattr(claude, "__file__", str(tmp_path / "scripts/agent_runtime/adapters/claude.py"))
+
+    settings = json.loads(claude._headless_worker_settings(publish_guard=False))
+    assert "advisorModel" not in json.loads(claude._worker_guard_settings())
+    assert "advisorModel" not in settings
+    assert "model" not in settings
+    assert settings["hooks"]["PreToolUse"]
+    assert settings["permissions"]["deny"] == list(claude.HEADLESS_BACKGROUND_TOOL_DENIES)
+
+
+_SPLIT_WRAPPER = 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-"hook.sh'
+
+
+_ESCAPED_WRAPPER = r"bash $CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python\-hook.sh"
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Unknown guard, extra or missing arguments in the canonical spelling.
+        f"{_WRAPPER} guard-secret-print.py",
+        f"{_WRAPPER} guard-pr-merge.py --extra",
+        f"{_WRAPPER} ../hooks/guard-pr-merge.py",
+        f"{_WRAPPER}",
+        # The same defects behind split quoting and backslash spellings.
+        f"{_SPLIT_WRAPPER} guard-pr-merge.py --extra",
+        f"{_SPLIT_WRAPPER}",
+        f"{_SPLIT_WRAPPER} guard-secret-print.py",
+        f"{_ESCAPED_WRAPPER} guard-pr-merge.py extra",
+        f"{_ESCAPED_WRAPPER}",
+        f"{_WRAPPER} 'guard-pr-'merge.py --extra",
+        # Another launcher, wrapper path or nesting.
+        'sh "$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh" guard-pr-merge.py',
+        '"$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh" guard-pr-merge.py',
+        'bash "/elsewhere/run-project-python-hook.sh" guard-pr-merge.py',
+        "sh -c 'bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh\" guard-pr-merge.py'",
+        "$CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh",
+        # A parser guard or the hooks directory outside both supported forms.
+        "/usr/bin/python3 'guard-pr-'merge.py",
+        "$CLAUDE_PROJECT_DIR/.claude/hooks/guard-pr-merge.py --extra",
+        "bash $CLAUDE_PROJECT_DIR/.claude/hooks/enforce-venv.sh",
+        "$CLAUDE_PROJECT_DIR/.claude/hooks/../hooks/guard-pr-merge.py",
+        "$CLAUDE_PROJECT_DIR/.claude/hooks/",
+    ],
+)
+def test_worker_guards_refuse_other_fleet_guard_forms(tmp_path: Path, monkeypatch, command: str) -> None:
+    _guard_source_tree(tmp_path, [command])
+    with pytest.raises(RuntimeError, match="Claude worker guard has an unsupported form"):
+        _settings_from(tmp_path, monkeypatch)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "command",
+    [f"{_WRAPPER} 'guard-pr-merge.py", "sh -c 'optional-telemetry pre-task"],
+)
+def test_worker_guards_refuse_an_unreadable_hook_command(tmp_path: Path, monkeypatch, command: str) -> None:
+    _guard_source_tree(tmp_path, [command])
+    with pytest.raises(RuntimeError, match="unreadable"):
+        _settings_from(tmp_path, monkeypatch)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_readonly_transport_rejects_every_push_wrapper(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, timeout=30)
+    subprocess.run(["git", "init", str(work)], check=True, capture_output=True, timeout=30)
+    (work / "sample.txt").write_text("sample\n", encoding="utf-8")
+    for args in (
+        ["config", "user.name", "Test"],
+        ["config", "user.email", "test@example.invalid"],
+        ["add", "sample.txt"],
+        ["commit", "-m", "fixture"],
+        ["remote", "add", "origin", str(remote)],
+        ["config", "remote.origin.push", "HEAD:refs/heads/probe"],
+    ):
+        subprocess.run(["git", "-C", str(work), *args], check=True, capture_output=True, timeout=30)
+
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=work,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={"reviewer_tools": True},
+    )
+    env = build_agent_env(provider="claude", overrides=plan.env_overrides)
+    assert (
+        subprocess.run(
+            ["git", "-C", str(work), "status", "--porcelain"], env=env, capture_output=True, timeout=30
+        ).returncode
+        == 0
+    )
+    assert (
+        subprocess.run(
+            ["git", "-C", str(work), "ls-remote", "origin"], env=env, capture_output=True, timeout=30
+        ).returncode
+        == 0
+    )
+    for command, cwd in (
+        (["git", "push"], work),
+        (["git", "-C", str(work), "push"], tmp_path),
+        (["bash", "-c", "git push"], work),
+        (
+            [sys.executable, "-c", "import subprocess; raise SystemExit(subprocess.run(['git','push']).returncode)"],
+            work,
+        ),
+    ):
+        result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0, (command, result.stdout, result.stderr)
+        refs = subprocess.run(
+            ["git", "--git-dir", str(remote), "for-each-ref", "--format=%(refname)"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        assert refs.stdout == ""
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    ("command", "blocked"),
+    [
+        ("git push", True),
+        ("git -C /tmp/example push --dry-run", True),
+        ("git -c core.quotePath=false push", True),
+        ("env X=1 git push", True),
+        ("bash -c 'git push'", True),
+        ("sh -c 'gh api -f body=probe repos/o/r/issues/1/comments'", True),
+        ("eval 'gh pr merge 1'", True),
+        ("gh issue reopen 1", True),
+        ("gh pr create --help", True),
+        ("gh api --method PATCH repos/o/r", True),
+        ("gh api -X POST repos/o/r", True),
+        ("gh api --raw-field body=x repos/o/r", True),
+        ("gh release create v1", True),
+        ("gh workflow run ci.yml", True),
+        # #10633: the shared parser keeps $'...' undecoded, so ANSI-C spellings
+        # are refused (Bash expands $'\547it' to git).
+        ("$'git' push", True),
+        ("$'\\547it' push", True),
+        ("bash -c \"\\$'git' push\"", True),
+        # Only the eval string re-read after quote removal holds the marker.
+        (r"eval \$\'git\' push", True),
+        ("gh pr view 1 --json number", False),
+        ("gh api -X GET repos/o/r", False),
+        ("git status --short", False),
+        ('grep -c "end$" notes.txt', False),
+    ],
+)
+def test_reviewer_publish_hook(command: str, blocked: bool) -> None:
+    hook = Path(__file__).resolve().parents[2] / "agents_extensions/shared/hooks/guard-reviewer-publish.py"
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+    result = subprocess.run([sys.executable, str(hook)], input=payload, capture_output=True, text=True, timeout=30)
+    assert (result.returncode == 2) is blocked, (command, result.stderr)
+
+
+def _reviewer_plan(cwd: Path, **extra) -> list[str]:
+    return (
+        ClaudeAdapter()
+        .build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=cwd,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config={"reviewer_tools": True, **extra},
+        )
+        .cmd
+    )
+
+
+def _granted(cmd: list[str]) -> list[str]:
+    assert cmd.count("--allowedTools") == 1
+    return cmd[cmd.index("--allowedTools") + 1].split(",")
+
+
+def _denied(cmd: list[str]) -> list[str]:
+    assert cmd.count("--disallowedTools") == 1
+    return cmd[cmd.index("--disallowedTools") + 1].split(",")
+
+
+def _mcp_config(cmd: list[str]) -> dict:
+    """The one MCP config the argv loads; it must be strict so nothing else is merged in."""
+    assert cmd.count("--mcp-config") == 1
+    assert cmd.count("--strict-mcp-config") == 1
+    index = cmd.index("--mcp-config")
+    assert cmd[index - 1] == "--strict-mcp-config"
+    return json.loads(cmd[index + 1])
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_reviewer_loads_only_the_trusted_sources_server(tmp_path: Path) -> None:
+    from lu_machinery.agent_runtime.review_mcp import isolated_sources_mcp_config
+    from lu_machinery.agent_runtime.review_mcp import review_server_checkout
+    from lu_machinery.agent_runtime.review_mcp import sources_server_launch
+    from lu_machinery.common.repo_root import project_interpreter
+
+    cmd = _reviewer_plan(tmp_path)
+    config = _mcp_config(cmd)
+    assert config == isolated_sources_mcp_config(*sources_server_launch())
+    server = config["mcpServers"]["sources"]
+    assert list(config["mcpServers"]) == ["sources"]
+    # tests/agent_runtime/test_review_mcp.py launches this under a hostile session environment.
+    assert server == {
+        "command": "/usr/bin/env",
+        "args": [
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "LC_ALL=C.UTF-8",
+            str(project_interpreter()),
+            "-I",
+            str(review_server_checkout() / ".mcp" / "servers" / "sources" / "server.py"),
+        ],
+    }
+    granted = _granted(cmd)
+    assert granted == [*REVIEWER_PERMISSION_PROFILE["allow"], *SOURCES_RULES]
+    assert "mcp__sources__*" not in granted
+    assert not set(PERSISTING_RULES) & set(granted)
+    # Deny outranks any allow rule a reviewed checkout's settings file could add.
+    assert _denied(cmd) == [*REVIEWER_PERMISSION_PROFILE["deny"], *WRITER_DENIES]
+    assert "mcp__sources__query_wikipedia" in _denied(cmd)
+    assert not {"Edit", "Write", "NotebookEdit", "MultiEdit"} & set(granted)
+    assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+    settings = json.loads(cmd[cmd.index("--settings") + 1])
+    commands = [hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]]
+    assert any(command.endswith("guard-reviewer-publish.py") for command in commands)
+    assert any(command.endswith("guard-primary-checkout-write.py") for command in commands)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "worktree_config",
+    [
+        {"mcpServers": {"sources": {"type": "streamable-http", "url": "http://127.0.0.1:9/mcp"}}},
+        {"mcpServers": {"sources": {"command": "/bin/sh", "args": ["-c", "write-anything"]}}},
+        {"mcpServers": {"sources": {"command": "python", "args": ["evil_server.py"]}, "other_tool": {}}},
+        {"mcpServers": {"other_tool": {"command": "python", "args": ["other.py"]}}},
+        "{not json",
+    ],
+    ids=["sources-url", "sources-command", "sources-plus-other", "other-only", "invalid"],
+)
+def test_worktree_mcp_json_gains_the_reviewer_nothing(tmp_path: Path, worktree_config) -> None:
+    """A reviewed branch's .mcp.json never reaches the reviewer argv, whatever it names `sources` (#9551)."""
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    reviewed = tmp_path / "reviewed"
+    reviewed.mkdir()
+    text = worktree_config if isinstance(worktree_config, str) else json.dumps(worktree_config)
+    (reviewed / ".mcp.json").write_text(text, encoding="utf-8")
+    cmd = _reviewer_plan(reviewed)
+    assert cmd == _reviewer_plan(clean)
+    joined = "\n".join(cmd)
+    for planted in ("127.0.0.1:9", "/bin/sh", "evil_server.py", "other_tool", "other.py"):
+        assert planted not in joined
+    assert not any(name.startswith("mcp__other_tool") for name in _granted(cmd))
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_reviewer_refuses_a_caller_mcp_config_outside_formal_full_access(tmp_path: Path) -> None:
+    config = tmp_path / "sources.json"
+    config.write_text(json.dumps({"mcpServers": {"sources": {"command": "/bin/sh"}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="formal full-access"):
+        _reviewer_plan(tmp_path, mcp_config_path=str(config))
+    with pytest.raises(ValueError, match="formal full-access"):
+        _reviewer_plan(tmp_path, mcp_config_path=str(config), review_access="isolated")
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_full_review_access_keeps_review_tool_set(tmp_path: Path) -> None:
+    from lu_machinery.agent_runtime.review_mcp import review_tools_allowed_csv
+
+    (tmp_path / ".mcp.json").write_text("{", encoding="utf-8")  # never read for formal attempts
+    attempt = tmp_path / "attempt.json"
+    cmd = _reviewer_plan(tmp_path, mcp_config_path=str(attempt), strict_mcp_config=True, review_access="full")
+    assert _granted(cmd) == [
+        *REVIEWER_PERMISSION_PROFILE["allow"],
+        *review_tools_allowed_csv("claude", "full").split(","),
+    ]
+    # Deny wins over the formal allow list: a writer added to it stays denied.
+    assert _denied(cmd) == [*REVIEWER_PERMISSION_PROFILE["deny"], *WRITER_DENIES]
+    # The formal attempt's own harness-written config is the only one loaded.
+    assert cmd.count("--mcp-config") == 1
+    assert cmd[cmd.index("--mcp-config") + 1] == str(attempt)
+    assert cmd[cmd.index("--mcp-config") - 1] == "--strict-mcp-config"
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("allowed_tools", ["mcp__sources__*", "Read,Bash(git push *)", ""])
+@pytest.mark.parametrize("strict_mcp_config", [False, True])
+def test_explicit_allowed_tools_are_not_widened_or_narrowed(
+    tmp_path: Path,
+    allowed_tools: str,
+    strict_mcp_config: bool,
+) -> None:
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config={
+            "reviewer_tools": True,
+            "allowed_tools": allowed_tools,
+            "mcp_config_path": str(tmp_path / "sources.json"),
+            "strict_mcp_config": strict_mcp_config,
+        },
+    )
+    assert plan.cmd.count("--allowedTools") == 1
+    assert plan.cmd[plan.cmd.index("--allowedTools") + 1] == allowed_tools
+    assert "--permission-mode" not in plan.cmd
+    # Only the sources writers are added; the reviewer deny list is not.
+    assert _denied(plan.cmd) == WRITER_DENIES
+    assert "LU_CLAUDE_READ_ONLY_GIT_PUSH_BLOCK" not in plan.env_overrides
+    settings = json.loads(plan.cmd[plan.cmd.index("--settings") + 1])
+    commands = [hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]]
+    assert not any(command.endswith("guard-reviewer-publish.py") for command in commands)
+
+
+def _isolated_review_config(tmp_path: Path, monkeypatch) -> dict:
+    from lu_machinery.agent_runtime.adapters import claude
+    from lu_machinery.review import isolation
+
+    mcp = tmp_path / "empty.json"
+    mcp.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    monkeypatch.setattr(isolation, "validated_review_write_root", lambda _: tmp_path)
+    monkeypatch.setattr(claude, "_isolated_review_response_schema", lambda _: "{}")
+    return {
+        "review_isolation": True,
+        "review_engine_binary": "/bin/true",
+        "strict_mcp_config": True,
+        "mcp_config_path": str(mcp),
+        "setting_sources": "",
+        "allowed_tools": "Read,Grep,Glob",
+    }
+
+
+READ_ONLY_PATHS = {
+    "ordinary-reviewer": lambda tmp, _mp: {"reviewer_tools": True},
+    "formal-full-review": lambda tmp, _mp: {
+        "reviewer_tools": True,
+        "mcp_config_path": str(tmp / "attempt.json"),
+        "strict_mcp_config": True,
+        "review_access": "full",
+    },
+    "formal-isolated-review": lambda tmp, _mp: {
+        "allowed_tools": review_tools_allowed_csv("claude"),
+        "mcp_config_path": str(tmp / "attempt.json"),
+        "strict_mcp_config": True,
+        "review_access": "isolated",
+    },
+    "explicit-sources-glob": lambda tmp, _mp: {"allowed_tools": "mcp__sources__*"},
+    "explicit-writer-grant": lambda tmp, _mp: {"allowed_tools": ",".join(["Read", *PERSISTING_RULES])},
+    "explicit-with-reviewer-tools": lambda tmp, _mp: {
+        "reviewer_tools": True,
+        "allowed_tools": "mcp__sources__*",
+        "mcp_config_path": str(tmp / "sources.json"),
+        "strict_mcp_config": True,
+    },
+    "ad-hoc-none": lambda tmp, _mp: None,
+    "ad-hoc-empty": lambda tmp, _mp: {},
+    "ad-hoc-mcp-config": lambda tmp, _mp: {"mcp_config_path": str(tmp / "sources.json")},
+    "discussion-readonly": lambda tmp, _mp: {"discussion_readonly": True},
+    "discussion-with-reviewer-tools": lambda tmp, _mp: {"discussion_readonly": True, "reviewer_tools": True},
+    "review-isolation": _isolated_review_config,
+}
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("session_id", [None, "00000000-0000-4000-8000-000000000000"])
+@pytest.mark.parametrize("path", sorted(READ_ONLY_PATHS))
+def test_every_read_only_path_denies_every_sources_writer(
+    tmp_path: Path, monkeypatch, path: str, session_id: str | None
+) -> None:
+    """AC-01 (#9560): deny is a single list on every read-only argv; Claude applies deny before allow."""
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=session_id,
+        tool_config=READ_ONLY_PATHS[path](tmp_path, monkeypatch),
+    )
+    denied = _denied(plan.cmd)
+    assert set(PERSISTING_RULES) <= set(denied)
+    # Readers are never denied: ordinary lookups keep working.
+    assert not set(SOURCES_RULES) & set(denied)
+    # The same holds whatever name the server is registered under.
+    for server in ALTERNATE_SERVER_NAMES:
+        assert all(_claude_denies(denied, f"mcp__{server}__{name}") for name in SOURCES_PERSISTING_TOOLS)
+        assert not any(_claude_denies(denied, f"mcp__{server}__{name}") for name in SOURCES_READ_ONLY_TOOLS)
+    if "--allowedTools" in plan.cmd and path != "explicit-writer-grant":
+        # The adapter itself never grants a writer; only a caller's own list can name one.
+        assert not set(PERSISTING_RULES) & set(_granted(plan.cmd))
+
+
+def _alias_sources_config(path: Path, server: str) -> Path:
+    """An MCP config that registers the real sources launcher under ``server``."""
+    from lu_machinery.agent_runtime.review_mcp import isolated_sources_mcp_config
+    from lu_machinery.agent_runtime.review_mcp import sources_server_launch
+
+    launch = isolated_sources_mcp_config(*sources_server_launch())["mcpServers"]["sources"]
+    path.write_text(json.dumps({"mcpServers": {server: launch}}), encoding="utf-8")
+    return path
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("strict_mcp_config", [False, True])
+@pytest.mark.parametrize("server", ALTERNATE_SERVER_NAMES)
+@pytest.mark.parametrize("session", ["fresh", "resumed"])
+def test_explicit_config_alternate_server_name_cannot_expose_a_writer(
+    tmp_path: Path, server: str, session: str, strict_mcp_config: bool
+) -> None:
+    """Review blocker (#9560): an explicit config naming sources otherwise escapes ``mcp__sources__<writer>``."""
+    config = _alias_sources_config(tmp_path / "alias.json", server)
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id="00000000-0000-4000-8000-000000000000",
+        tool_config={
+            "is_new_session": session == "fresh",
+            "mcp_config_path": str(config),
+            "strict_mcp_config": strict_mcp_config,
+            "allowed_tools": f"mcp__{server}__*",
+        },
+    )
+    assert ("--session-id" if session == "fresh" else "--resume") in plan.cmd
+    assert plan.cmd[plan.cmd.index("--mcp-config") + 1] == str(config)
+    denied = _denied(plan.cmd)
+    for name in SOURCES_PERSISTING_TOOLS:
+        assert _claude_denies(denied, f"mcp__{server}__{name}"), name
+    # Readers under the alias stay allowed by the caller's glob and are not denied.
+    assert _granted(plan.cmd) == [f"mcp__{server}__*"]
+    for name in SOURCES_READ_ONLY_TOOLS:
+        assert not _claude_denies(denied, f"mcp__{server}__{name}"), name
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("tool_config", [None, {"allowed_tools": "mcp__sources_alias__*"}, {"reviewer_tools": True}])
+def test_settings_provided_alternate_server_name_cannot_expose_a_writer(tmp_path: Path, tool_config) -> None:
+    """A checkout's ``.mcp.json`` and settings can register and allow sources under another name.
+
+    The adapter never reads those files for a read-only run; the deny covers every server name instead.
+    """
+    _alias_sources_config(tmp_path / ".mcp.json", "sources_alias")
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {
+                "enabledMcpjsonServers": ["sources_alias"],
+                "permissions": {"allow": ["mcp__sources_alias__*"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config=tool_config,
+    )
+    denied = _denied(plan.cmd)
+    for name in SOURCES_PERSISTING_TOOLS:
+        assert _claude_denies(denied, f"mcp__sources_alias__{name}"), name
+    for name in SOURCES_READ_ONLY_TOOLS:
+        assert not _claude_denies(denied, f"mcp__sources_alias__{name}"), name
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+def test_ad_hoc_discuss_env_denies_every_sources_writer(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AB_DISCUSS_READONLY", "1")
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config=None,
+    )
+    assert _denied(plan.cmd) == WRITER_DENIES
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "tool_config",
+    [
+        None,
+        {"reviewer_tools": True},
+        {"allowed_tools": "mcp__sources__*"},
+        {"allowed_tools": ",".join(PERSISTING_RULES)},
+    ],
+    ids=["none", "reviewer-tools", "explicit-glob", "explicit-writers"],
+)
+@pytest.mark.parametrize("mode", ["workspace-write", "danger"])
+def test_write_and_danger_modes_never_deny_sources_writers(tmp_path: Path, mode: str, tool_config) -> None:
+    """AC-02 (#9560): builds and writers keep their cache access."""
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode=mode,
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config=tool_config,
+    )
+    assert "--disallowedTools" not in plan.cmd
+    if tool_config and "allowed_tools" in tool_config:
+        assert _granted(plan.cmd) == tool_config["allowed_tools"].split(",")
+    elif mode == "danger":
+        assert "--allowedTools" not in plan.cmd
+    else:
+        assert "Bash" in _granted(plan.cmd)
+
+
+@pytest.mark.usefixtures("claude_plan_binary")
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("tool_config", [None, {"reviewer_tools": True}, {"allowed_tools": "mcp__sources__*"}])
+def test_unreadable_server_declarations_refuse_read_only_launch(tmp_path: Path, monkeypatch, tool_config) -> None:
+    from lu_machinery.agent_runtime.adapters import claude
+
+    monkeypatch.setattr(claude, "sources_tool_sets", lambda: sources_tool_sets(tmp_path / "missing.py"))
+    with pytest.raises(FileNotFoundError):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config=tool_config,
+        )
+    # Write mode never reads the declarations, so it is unaffected.
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="workspace-write",
+        cwd=tmp_path,
+        model=None,
+        task_id=None,
+        session_id=None,
+        tool_config=None,
+    )
+    assert "--disallowedTools" not in plan.cmd
+
+
+@pytest.fixture
+def worker_cwd_product(configured_roots, agent_runtime_roots, tmp_path, monkeypatch):
+    relative = "agents_extensions/shared/settings.json"
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes((configured_roots.product / relative).read_bytes())
+    _mark_product_checkout(tmp_path, monkeypatch)
+
+pytestmark = [pytest.mark.usefixtures('agent_runtime_roots')]

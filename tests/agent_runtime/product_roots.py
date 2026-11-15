@@ -20,6 +20,7 @@ nothing. A module opts in with::
 """
 
 from __future__ import annotations
+import os
 
 import shutil
 import sys
@@ -62,3 +63,16 @@ def agent_runtime_roots(
         for name in _product_modules():
             del sys.modules[name]
         sys.modules.update(before)
+
+
+@pytest.fixture
+def claude_plan_binary(tmp_path, monkeypatch):
+    from lu_machinery.review.isolation import CLAUDE_MIN_SUPPORTED_CLI_VERSION
+
+    directory = tmp_path / "plan-bin"
+    directory.mkdir()
+    binary = directory / "claude"
+    version = ".".join(str(value) for value in CLAUDE_MIN_SUPPORTED_CLI_VERSION)
+    binary.write_text("#!/bin/sh\nprintf '%s\\n' '" + version + " (Claude Code)'\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(directory) + os.pathsep + os.environ.get("PATH", ""))
