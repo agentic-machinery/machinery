@@ -302,8 +302,8 @@ def _load_task(task_id: str) -> tuple[dict, str]:
 def record(task_id: str, root: Path | None = None) -> Path:
     """Write the receipt for one settled canary task at the head it reviewed.
 
-    The keeper and ``pr-merge`` read receipts only at the PR's live head, so a receipt
-    for any other head never admits anything.
+    Release acceptance checks receipts only at the release candidate's exact head,
+    so a receipt for any other head cannot satisfy that cut.
     """
     task, result = _load_task(task_id)
     receipt = build_receipt(task, result, head=str(task.get("head_sha")))
@@ -550,7 +550,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     target.add_argument("--pr", type=int, help="PR whose head to resolve once, e.g. 585 (default: use --head)")
     runner.add_argument("--hard-timeout", type=int, default=1200, help="Positive per-route deadline in seconds (default: 1200)")
     runner.add_argument("--dry-run", action="store_true", help="Print argv plan without creating files or dispatching (default: off)")
-    runner.add_argument("paths", nargs="*", help="Changed repository-relative files for check (default: the contract gate itself)")
+    runner.add_argument("paths", nargs="*", help="Changed repository-relative files for check (default: the canary itself)")
     args = parser.parse_args(argv)
     try:
         if args.command == "run":
