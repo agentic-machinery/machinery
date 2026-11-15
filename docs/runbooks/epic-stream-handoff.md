@@ -171,7 +171,7 @@ for operator review and are never swept automatically.
    session. Live drivers must not pass `--force` or `handoff-claim`.
 
    ```bash
-   ./start-grok-driver.sh --epic infra --force
+   ./start-codex-driver.sh --epic infra --force
    # equivalent supervisor CLI:
    .venv/bin/python -m lu_machinery.session_supervisor release --role driver --force \
      --stream epic:6943 --actor-agent operator --actor-host-id "$LU_MONITOR_HOST_ID" \

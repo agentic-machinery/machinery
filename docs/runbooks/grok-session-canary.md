@@ -155,7 +155,7 @@ Artifacts live under gitignored `.claude/<epic>-epic/canary/`.
 ## Lifecycle
 
 ```
-START  → start-grok-driver.sh --epic <name> claims stream lease via common supervisor
+START  → the driver launcher claims the stream lease via the common supervisor
          → load diary + stream; mint only within thread-rollover
 DRIVE  → stamp diary after each batch
          within thread-rollover, at ~60–70% context OR after auto-compact → score from memory
@@ -180,4 +180,3 @@ The launcher owns lease open/close for Grok. The agent never opens, claims, rene
 - `docs/runbooks/epic-stream-handoff.md` — continuity evidence; current launcher-owned lease rules bind
 - `lu_machinery/context_canary.py` — shared mint/score engine
 - `docs/best-practices/codex-thread-handoff.md` — strict rollover canary
-- `start-grok-driver.sh --epic <name>` — core injects the lane protocol pointer

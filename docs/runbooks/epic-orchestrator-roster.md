@@ -19,8 +19,7 @@ and cold-starts the driver, which runs the `drive-epic` skill to orchestrate its
 Gemini may drive epics (2026-10-08 approval): `./start-gemini-driver.sh --epic <lane>`
 defaults to `gemini-3.1-pro-high` and also accepts `--model gemini-3.8-flash-high`; every
 other Gemini model id is refused. Use standalone `start-gemini.sh` for non-driver work.
-The routing table below lists the recommended seat per epic; `grok-4.7` remains the
-listed driver fallback.
+The routing table below lists the recommended seat per epic.
 
 ## Routing reminder — pick the seat, pass the epic
 
@@ -28,22 +27,15 @@ listed driver fallback.
 | --- | --- | --- |
 | **harness / infra** | Codex / gpt-6.1-sol @ high | `./start-codex-driver.sh --epic infra` |
 | **devops** | Codex / gpt-6.1-sol @ high | `./start-codex-driver.sh --epic devops` |
-| **ops-api** (Operator API + UI; stream key `monitor`) | Cursor | `./start-cursor-driver.sh --epic ops-api` (alias: `--epic monitor`) |
-| **ops-api** (named alternate) | Opus 5.5 @ high (default Anthropic) | `./start-claude-driver.sh --epic ops-api` |
+| **ops-api** (Operator API + UI; stream key `monitor`) | Opus 5.5 @ high (default Anthropic) | `./start-claude-driver.sh --epic ops-api` |
 | **corpus** (acquisition & ingestion) | Opus 5.5 @ high (default Anthropic) | `./start-claude-driver.sh --epic corpus` |
-| **atlas** (Word Atlas + Practice Hub product) | Grok 4.7 | `./start-grok-driver.sh --epic atlas` |
-| **hramatka** (teacher lesson service) | Grok 4.7 | `./start-grok-driver.sh --epic hramatka` |
-| **curriculum-upgrade** (#7994 machinery) | Grok driver; writers AGY/Codex; CF cross-family | `./start-grok-driver.sh --epic curriculum-upgrade` (slot `grok-core`; file handoff `.claude/curriculum-upgrade-epic/`) |
 | **a1-upgrade** (#7995 closed 2026-09-24) | Retired selector; no driver launch | — |
 | **eval-harness** (#4913 closed 2026-09-24) | Retired selector; route new infra work through `infra` | — |
-| **folk** (curriculum track) | Grok 4.7 † | `./start-grok-driver.sh --epic folk` |
-| **bio** (curriculum track) | Grok 4.7 | `./start-grok-driver.sh --epic bio` |
 | **any epic** — incident · architecture cutover · contested review | Opus 5.5 @ high (default Anthropic) | `./start-claude-driver.sh --epic <epic>` |
 | **any epic** — routine Anthropic alternate | Sonnet 5.5 | `./start-claude-driver.sh --epic <epic> --model claude-sonnet-5-5` |
-| **any epic** — Cursor TUI driver (pinned `grok-4.7-high`, never Auto; attested after run) | Cursor `grok-4.7` | `./start-cursor-driver.sh --epic <epic>` |
 
-**Driver launcher convention:** `./start-<provider>-driver.sh --epic <epic>` where `<provider>` ∈
-`codex · grok · claude · cursor`. The core owns all launcher flags; provider
+**Driver launcher convention:** `./start-codex-driver.sh --epic <epic>` or
+`./start-claude-driver.sh --epic <epic>`. The core owns all launcher flags; provider
 CLI flags follow `--`. Each driver validates the lane, claims the lease, runs
 the provider canary, and injects the `drive-epic` binding before the provider
 process starts. Codex additionally performs its transport-health probe during
@@ -114,8 +106,7 @@ Forwarded model, settings and fallback-model selectors are refused: choose the
 startup model through the launcher `--model` or `LAUNCHER_MODEL`. Attached `-m`
 values are also refused because they can replace the admitted startup model.
 
-† **folk carve-out:** the *driver* may be Grok, but folk content **review** uses
-the review-loop ukrainian seats, with no Claude seat (no DeepSeek, and Grok is never a judge seat).
+Folk content **review** uses the review-loop ukrainian seats, with no Claude seat (no DeepSeek, and Grok is never a judge seat).
 
 **Recommended against as a driver seat (least-bite — the live `model_catalog.orchestrator_seats` policy is authoritative):**
 - **Fable 5.1** — parked: not routed by default, explicit pin only (`--model claude-fable-5-1`); reintroduction or a successor model is an operator decision. **Opus 5.5 is the orchestrator and complex-coding/deep-review dispatch seat**
@@ -253,8 +244,7 @@ Everything else the driver runs to completion and reports past-tense — no "sho
 ## Rollout (sequencing)
 
 1. **This PR:** the `drive-epic` skill, this runbook, and the provider driver launchers
-   (`start-grok-driver.sh` / `start-claude-driver.sh` /
-   `start-codex-driver.sh` / `start-cursor-driver.sh`). Cross-family reviewed;
+   (`start-claude-driver.sh` / `start-codex-driver.sh`). Cross-family reviewed;
    advisor-looped on the skill contract.
 2. **Follow-up PR:** rewire the eligible driver
    cold-prompt `case` blocks to invoke `$drive-epic` (replacing the hand-written per-epic
