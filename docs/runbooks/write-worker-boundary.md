@@ -132,6 +132,10 @@ launcher compares every outcome before it lets the provider start.
 
 The receipt `<task>.write-boundary.json` beside the task record holds the bwrap path, the argv digest,
 every canary outcome, the egress destinations, the provider's exit status and the import result.
+For a failed broker `push`, `broker[].refused` retains the failed Git step and its first stderr
+line, with secrets redacted before the receipt's 200-character limit is applied. This includes
+object import and remote lookup failures before the final push. Empty stderr leaves the step name
+alone; a failure is never automatically retried.
 `write_boundary.verify` fails the run unless the receipt shows `ran`, a passed canary and an import
 status of `unchanged` or `imported`.
 
