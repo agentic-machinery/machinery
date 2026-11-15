@@ -154,7 +154,7 @@ def _scan(
         "--rules-source",
         rules_source,
     ]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=SCAN_TIMEOUT, check=False)
+    result = _run_gate(command)
     summary_path = out / "summary.json"
     assert summary_path.is_file(), result.stdout + result.stderr
     return result, json.loads(summary_path.read_text(encoding="utf-8"))
@@ -164,7 +164,25 @@ def _verify(repo: Path, clearance: Path, refs: list[str]) -> subprocess.Complete
     command = ["bash", str(GATE), "verify", "--repo", str(repo), "--clearance", str(clearance)]
     for ref in refs:
         command += ["--ref", ref]
-    return subprocess.run(command, capture_output=True, text=True, timeout=SCAN_TIMEOUT, check=False)
+    return _run_gate(command)
+
+
+def _run_gate(command: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run the gate on one CPU, the share of one pytest-xdist worker.
+
+    Semgrep and TruffleHog start one job per CPU, so an unconfined scan in a
+    parallel pytest run takes every core of the runner from the other workers.
+    That stretched wall-clock-bounded launcher tests in the same CI shard past
+    their timeouts. The gate and every scanner it starts inherit this thread's
+    affinity (its ``env -i`` resets the environment, not the affinity). The
+    scan results do not depend on the core count; only its speed does.
+    """
+    allowed = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, {min(allowed)})
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=SCAN_TIMEOUT, check=False)
+    finally:
+        os.sched_setaffinity(0, allowed)
 
 
 def _jsonl_count(path: Path) -> int:
