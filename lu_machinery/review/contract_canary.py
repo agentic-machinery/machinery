@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
@@ -467,7 +468,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"remove temporary directory {work} after successful unmount")
         return 0
     mount_attempted = False
-    active_route: str | None = None
+    pending: dict[str, Future[subprocess.CompletedProcess[str]]] = {}
+    submitting_route: str | None = None
     try:
         (work / "mount").mkdir()
         for command in setup:
@@ -478,28 +480,40 @@ def run(args: argparse.Namespace) -> int:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
         print(f"head {head}; squashfs sha256:{digest}", flush=True)
         failures = 0
-        for route, command in route_commands:
-            active_route = route
-            result = _invoke(command, cwd=work, env=env, check=False)
-            if "CANARY-ROUTE-SETTLED" not in result.stdout.splitlines():
-                print(result.stdout, end="")
-                print(result.stderr, end="", file=sys.stderr)
-                raise CanaryError(f"{route}: user unit returned without terminal-task confirmation")
-            active_route = None
-            failures += bool(result.returncode)
-            print(f"{route}: {'FAIL' if result.returncode else 'PASS'} (exit {result.returncode})", flush=True)
-            if result.returncode:
-                print(result.stdout, end="")
-                print(result.stderr, end="", file=sys.stderr)
+        # Each existing unit still dispatches, waits and records its route. Submit all
+        # units before collecting results; the context joins every unit even on interrupt.
+        with ThreadPoolExecutor(max_workers=len(route_commands)) as executor:
+            for route, command in route_commands:
+                submitting_route = route
+                pending[route] = executor.submit(_invoke, command, cwd=work, env=env, check=False)
+                submitting_route = None
+            for route, future in pending.items():
+                result = future.result()
+                if "CANARY-ROUTE-SETTLED" not in result.stdout.splitlines():
+                    print(result.stdout, end="")
+                    print(result.stderr, end="", file=sys.stderr)
+                    raise CanaryError(f"{route}: user unit returned without terminal-task confirmation")
+                failures += bool(result.returncode)
+                print(f"{route}: {'FAIL' if result.returncode else 'PASS'} (exit {result.returncode})", flush=True)
+                if result.returncode:
+                    print(result.stdout, end="")
+                    print(result.stderr, end="", file=sys.stderr)
         result = _invoke(check, cwd=work, env=env, check=False)
         print(result.stdout, end="")
         print(result.stderr, end="", file=sys.stderr)
         return 1 if failures or result.returncode else 0
     finally:
-        if active_route:
-            # The user unit and detached supervisor may still be running after a client interruption.
-            # Their candidate code must stay mounted until the host settles those tasks.
-            raise CanaryError(f"{active_route}: route completion unknown; retained mount and environment at {work}; "
+        unknown = [
+            route for route, future in pending.items()
+            if not future.done() or future.exception() is not None
+            or "CANARY-ROUTE-SETTLED" not in future.result().stdout.splitlines()
+        ]
+        # submit can queue work and then be interrupted before returning its future.
+        if submitting_route is not None and submitting_route not in pending:
+            unknown.append(submitting_route)
+        if unknown:
+            # No candidate code may disappear while any detached task might still use it.
+            raise CanaryError(f"{','.join(unknown)}: route completion unknown; retained mount and environment at {work}; "
                               "settle its tasks before unmounting")
         # Never traverse/remove a still-mounted checkout when unmount fails.
         if mount_attempted and os.path.ismount(work / "mount"):

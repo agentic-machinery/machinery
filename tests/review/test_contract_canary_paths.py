@@ -290,7 +290,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
 
 
 @pytest.mark.parametrize("failure", [
-    None, "route", "check", "mount", "unmount", "unmount-noop", "interrupt", "unit-lost",
+    None, "route", "check", "mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "client-interrupt", "submit-interrupt",
 ])
 def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     runner_roots, monkeypatch, capsys, failure,
@@ -339,20 +339,76 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     monkeypatch.setenv("PYTHONPATH", "/must/not/shadow/candidate")
     monkeypatch.setattr(canary, "_invoke", invoke)
     monkeypatch.setattr(canary.os.path, "ismount", lambda path: mounted)
+    if failure == "submit-interrupt":
+        real_submit = canary.ThreadPoolExecutor.submit
+
+        def interrupted_submit(self, *args, **kwargs):
+            real_submit(self, *args, **kwargs)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(canary.ThreadPoolExecutor, "submit", interrupted_submit)
+    if failure == "client-interrupt":
+        real_result = canary.Future.result
+
+        def interrupted_result(self, *args, **kwargs):
+            monkeypatch.setattr(canary.Future, "result", real_result)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(canary.Future, "result", interrupted_result)
     expected = 0 if failure is None else 1 if failure in {"route", "check"} else 2
-    assert canary.main(["run", "--head", "b" * 40]) == expected
+    if failure == "client-interrupt":
+        with pytest.raises(KeyboardInterrupt):
+            canary.main(["run", "--head", "b" * 40])
+    else:
+        assert canary.main(["run", "--head", "b" * 40]) == expected
     output = capsys.readouterr()
     if failure in {None, "route", "check"}:
         assert sum(cmd[0] == "systemd-run" for cmd in commands) == 4
         assert "squashfs sha256:" in output.out
         assert "claude: FAIL" in output.out if failure == "route" else "claude: PASS" in output.out
-    if failure in {"unmount", "unmount-noop", "interrupt", "unit-lost"}:
+    if failure in {"unmount", "unmount-noop", "interrupt", "unit-lost", "submit-interrupt"}:
         assert mounted
         assert "retained" in output.err
         assert len(list(runner_roots.iterdir())) == 1
     else:
         assert not mounted
         assert list(runner_roots.iterdir()) == []
+    if failure not in {"mount", "unmount", "unmount-noop", "interrupt", "unit-lost", "submit-interrupt"}:
+        assert sum("-u" in cmd for cmd in commands) == 1
+
+
+def test_runner_starts_all_routes_before_waiting_for_settlement(runner_roots, monkeypatch):
+    """Serial route waits deadlock this barrier; cleanup must follow every settlement."""
+    from threading import Barrier
+
+    routes = canary.required_routes()
+    started = []
+    settled = []
+    barrier = Barrier(len(routes), timeout=5)
+    cleanup = []
+
+    def invoke(argv, *, cwd, env, check=True):
+        output = ""
+        if argv[0] == "mksquashfs":
+            Path(argv[2]).write_bytes(b"candidate image")
+        if argv[0] == "systemd-run":
+            route = argv[argv.index("--agent") + 1]
+            started.append(route)
+            barrier.wait()
+            assert set(started) == set(routes)
+            settled.append(route)
+            output = "CANARY-ROUTE-SETTLED\n"
+        if "check" in argv or "-u" in argv:
+            assert set(settled) == set(routes)
+        if "-u" in argv:
+            cleanup.append(argv)
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(canary, "_invoke", invoke)
+    monkeypatch.setattr(canary.os.path, "ismount", lambda path: not cleanup)
+    assert canary.main(["run", "--head", "b" * 40]) == 0
+    assert len(cleanup) == 1
+    assert list(runner_roots.iterdir()) == []
 
 
 @pytest.mark.parametrize("bad_args", [
