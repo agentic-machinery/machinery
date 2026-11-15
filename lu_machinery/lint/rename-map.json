@@ -3246,6 +3246,7 @@
  "tests/dispatcher/test_core_scope_verification.py": "machinery",
  "tests/dispatcher/test_core_worktree_entry.py": "product",
  "tests/dispatcher/test_core_worktree_settlement.py": "product",
+ "tests/dispatcher/test_dispatch_card_gate.py": "machinery",
  "tests/dispatcher/test_environment.py": "machinery",
  "tests/dispatcher/test_grant_paths.py": "product",
  "tests/dispatcher/test_opencode_provider.py": "machinery",
