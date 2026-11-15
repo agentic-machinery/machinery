@@ -60,6 +60,9 @@ def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> 
     deny = [_shell_rule(rule) for rule in _READ_DENIES.split(",") if rule.startswith("Bash(")]
     config = {
         "version": 1,
+        # Cursor's schema requires ``editor``; without it Cursor rewrites the file to repair it, and since the file is
+        # read-only it then falls back to its defaults, which allow only ``Shell(ls)`` (cursor-agent 2026.11.13).
+        "editor": {"vimMode": False},
         "approvalMode": "allowlist",
         "autoAcceptWebSearch": True,
         "sandbox": {"mode": "disabled"},

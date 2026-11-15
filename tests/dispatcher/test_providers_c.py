@@ -454,7 +454,9 @@ def _cursor_read_only_profile(tmp_path):
     prompt.write_text("review\n", encoding="utf-8")
     spec = TaskSpec("cursor-ro", "cursor", "grok-4.7-high", None, "read-only", tmp_path, prompt, tmp_path / "final")
     argv = cursor.build(spec, {}).argv
-    permissions = json.loads(cursor.read_only_cli_config(("verify_word",), ("cache_entry",)))["permissions"]
+    config = json.loads(cursor.read_only_cli_config(("verify_word",), ("cache_entry",)))
+    assert config["editor"] == {"vimMode": False}  # else Cursor repairs the read-only file and drops these rules
+    permissions = config["permissions"]
     shell = {kind: [rule for rule in permissions[kind] if rule.startswith("Shell(")] for kind in ("allow", "deny")}
     return argv, permissions, shell
 
