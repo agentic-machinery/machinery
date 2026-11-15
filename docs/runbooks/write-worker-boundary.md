@@ -24,14 +24,17 @@ Read-only AGY retains its existing filesystem boundary and uses
 the same GitHub domain and address refusal rules, without nesting two boundaries.
 
 Both paths withhold the host's GitHub login and refuse direct GitHub egress. The existing read-only
-`gh` relay admits `pr view`, `pr diff`, `pr checks`, `pr list`, `issue view`, `run view` and `run list`;
-arbitrary `gh api` requests, including repository permission queries, and search queries (`--search`/`-S`,
-whose `repo:` qualifiers would widen a listing) are refused. Named reads also use `github-read`.
+`gh` relay admits `pr view`, `pr diff`, `pr checks`, `pr list`, `issue view` and `run view`, each with its
+own listed flags read at that form's arity (a flag that is a boolean in one form and takes a value in another
+cannot hide a later `-R`); any other flag, arbitrary `gh api` requests, including repository permission
+queries, and search queries (`--search`/`-S`, whose `repo:` qualifiers would widen a listing) are refused.
+Named reads also use `github-read`.
 Write dispatches get the same relay: its `gh` is first on the worker's `PATH`, so a write worker reads
-its PR, its checks and its CI runs with the usual `gh` commands.
+its PR, its checks and its PR's CI runs with the usual `gh` commands.
 The host login reads only a registered repository with a `public-` role in `config/fleet_repos.yaml`
-(decision A6): the relay resolves the repository on the host (`--repo`/`-R`, else the worktree's
-`origin`) and refuses a private, unknown or unresolved one before `gh` runs; the argv it runs names that
+(decision A6): the relay resolves the repository on the host (`--repo`/`-R` in any form and the shell's
+`GH_REPO`, which must all agree, else the worktree's `origin`; a `GH_HOST` other than github.com, `-R` inside
+a flag cluster and URL operands are refused) and refuses a private, unknown or unresolved one before `gh` runs; the argv it runs names that
 repository first, so `gh` never chooses one itself. A bare `--` is refused.
 The broker binds authority to the launch's mode and refuses every other verb for a read-only seat,
 including `push`, `pr-create`, `pr-edit`, `pr-comment`, `pr-merge` and `record-verdict`.
@@ -302,7 +305,7 @@ stdin.
 | `pr-ownership` | `command` (`accept` or `queue-exit`), `pr`, optional `repo`, `custody`, `from` | Runs `pr_ownership` as the task for its own open PR |
 | `github-read` | `name`, optional `number` or `sha`, `repo`, `paginate` | One named read of the repository |
 | `budget-check` | `pr`, optional `repo` | The recorder's round admission for the worker's own open PR |
-| `review-wait` | `task_id`, optional `run_nonce`, `timeout` (0 to 840 seconds) | Waits for the worker's own review; its record and, once done, its reply |
+| `review-wait` | `task_id`, optional `run_nonce`, `timeout` (1 to 840 seconds; 0 or none waits 840) | Waits for the worker's own review; its record and, once done, its reply |
 
 What every publication verb takes from the launch, never from the request: the repository (the
 primary's registered GitHub origin), the branch, the base (the repository's default branch on

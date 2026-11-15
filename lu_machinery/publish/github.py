@@ -2144,8 +2144,11 @@ def _read_through_broker(operation, repo, fields, *, paginate, slurp, cwd, env, 
             f"without --slurp: {', '.join(names)}; nothing was sent."
         )
     payload = {"name": operation, **fields, **({"paginate": True} if paginate else {})}
-    if repo or (env or {}).get("GH_REPO"):
-        host, _, slug = repository(cwd, _validated_environment(env), repo).partition("/")
+    # env=None inherits os.environ: an inherited GH_REPO is claimed like an explicit one, so the broker refuses a
+    # foreign repository instead of reading the launch's.
+    environment = _validated_environment(env)
+    if repo or environment.get("GH_REPO"):
+        host, _, slug = repository(cwd, environment, repo).partition("/")
         if host != "github.com" or not slug:
             raise gate.PublishBlocked("OPSEC: read repository unresolved.")
         payload["repo"] = slug

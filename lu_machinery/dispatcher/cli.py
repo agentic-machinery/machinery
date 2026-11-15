@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -369,9 +370,10 @@ def _wait_through_broker(args) -> int:
     """
     from lu_machinery.dispatcher import write_boundary
 
-    if args.timeout < 0:
+    if not 0 <= args.timeout < float("inf"):  # NaN fails too
         raise ValueError("timeout must be nonnegative and poll interval positive")
-    timeout = min(int(args.timeout), write_boundary.REVIEW_WAIT_MAX) if args.timeout else write_boundary.REVIEW_WAIT_MAX
+    # Whole seconds, rounded up: a fractional wait must never become 0, the host wait's unlimited sentinel.
+    timeout = min(math.ceil(args.timeout), write_boundary.REVIEW_WAIT_MAX) if args.timeout else write_boundary.REVIEW_WAIT_MAX
     payload = {"task_id": args.task_id, "timeout": timeout, **({"run_nonce": args.run_nonce} if args.run_nonce else {})}
     reply = write_boundary.broker_call("review-wait", payload)
     sys.stdout.write(reply.get("stdout", ""))

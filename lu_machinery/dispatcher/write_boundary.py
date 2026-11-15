@@ -1155,6 +1155,9 @@ class _Broker:
             raise _BrokerRefusal("run_nonce is malformed")
         if type(timeout) is not int or not 0 <= timeout <= REVIEW_WAIT_MAX:
             raise _BrokerRefusal(f"timeout must be 0 to {REVIEW_WAIT_MAX} seconds")
+        # 0 (or none) is the host wait's unlimited sentinel; the broker serves one request at a time, so it waits
+        # the bounded maximum instead and the caller repeats the wait.
+        timeout = timeout or REVIEW_WAIT_MAX
         reply = self._module("dispatcher.cli", ["wait", task, *(["--run-nonce", nonce] if nonce else []),
                                                 "--timeout", str(timeout)], "review-wait")
         try:

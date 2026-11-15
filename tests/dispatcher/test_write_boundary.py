@@ -1071,15 +1071,20 @@ _FORWARDED = {
     # The reads of the chain (#575, #557, #591): a named read, the review budget check and the wait on its own review.
     "github-read": ("{py} -m lu_machinery.publish read pull --number 7",
                     "{py} -m lu_machinery.publish read pull --number 7 --repo owner/other"),
+    # An inherited GH_REPO is the read's repository claim (env=None inherits), never dropped for the launch's own.
+    "github-read-env": ("GH_REPO={slug} {py} -m lu_machinery.publish read pull --number 7",
+                        "GH_REPO=owner/other {py} -m lu_machinery.publish read pull --number 7"),
     "budget-check": ("{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 7",
                      "{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 8"),
     "review-wait": ("{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
-                    "wait wb-test-review-r1 --timeout 5",
+                    "wait wb-test-review-r1 --timeout 0.5",
                     "{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
                     "wait other-review-r1 --timeout 5"),
 }
 # The host step's first argument, where it is not the verb itself.
-_HOST_STEP = {"github-read": "read", "review-wait": "wait"}
+_HOST_STEP = {"github-read": "read", "github-read-env": "read", "review-wait": "wait"}
+# The broker verb, where the case name is not the verb itself.
+_VERB = {"github-read-env": "github-read"}
 
 
 @pytest.mark.parametrize("target", ["own", "foreign", "private", "private-foreign"])
@@ -1142,16 +1147,18 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     requests = [(row["verb"], row["returncode"]) for row in result["broker"]]
     remote_refs = _git(tmp_path, "--git-dir", str(remote), "for-each-ref", "--format=%(objectname) %(refname)")
     if not target.endswith("foreign"):
-        assert exit_code == 0 and requests == [(operation, 0)], output
+        assert exit_code == 0 and requests == [(_VERB.get(operation, operation), 0)], output
         if operation == "push":
             assert remote_refs == f"{tip} refs/heads/task" and steps == []
         else:
             assert steps and steps[-1][0] == _HOST_STEP.get(operation, operation)
-            if operation != "review-wait":
+            if operation == "review-wait":  # a fractional wait stays bounded, never 0 (the host's unlimited wait)
+                assert steps[-1][-2:] == ["--timeout", "1"], steps
+            else:
                 flag = "--repository" if operation == "budget-check" else "--repo"
                 assert steps[-1][steps[-1].index(flag) + 1] == slug
     else:
-        assert exit_code != 0 and requests == [(operation, 2)] and "refused" in output, output
+        assert exit_code != 0 and requests == [(_VERB.get(operation, operation), 2)] and "refused" in output, output
         assert steps == [] and remote_refs == ""
 
 
