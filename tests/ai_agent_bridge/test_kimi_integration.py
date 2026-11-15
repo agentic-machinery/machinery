@@ -45,6 +45,9 @@ STORED_ROW_TABLES = frozenset(
 )
 
 SKIP, ADMITTED, KEYED, NO_TARGET, HELPER = "skip", "admitted", "keyed", "no-target", "helper"
+# Deliberately terminalizes stored Kimi rows (state change only, no admission): the one-time
+# unread-mail hygiene of #594, decided by claude-cto because Kimi is retired.
+RETIRE = "retire"
 
 _SKIP_MARKERS = (
     "kimi_row(",
@@ -97,6 +100,9 @@ WRITERS: dict[str, Writer] = {
     f"{_AUTH}::AuthorityService._reclaim_expired_jobs_tx": Writer(SKIP, "deadline expiry and stale-lease requeue"),
     f"{_AUTH}::AuthorityService.claim_next_delivery": Writer(SKIP, "admitted recipient; Kimi-model request passed over"),
     f"{_AUTH}::AuthorityService._reclaim_expired_deliveries_tx": Writer(SKIP, "delivery expiry and requeue"),
+    f"{_AUTH}::AuthorityService.expire_unreadable": Writer(
+        RETIRE, "#594 hygiene: expires unread rows to unregistered names, retired Kimi rows included"
+    ),
     f"{_AUTH}::AuthorityService.expire_undelivered": Writer(
         SKIP, "backfill a null deadline on old undelivered rows; stored Kimi deliveries are left"
     ),
@@ -140,6 +146,7 @@ WRITERS: dict[str, Writer] = {
         {
             f"{_AUTH}::AuthorityService.finish_delivery": KEYED,
             f"{_AUTH}::AuthorityService._reclaim_expired_deliveries_tx": SKIP,
+            f"{_AUTH}::AuthorityService.expire_unreadable": RETIRE,
         },
     ),
     f"{_AUTH}::AuthorityService._record_wake_receipt_tx": Writer(

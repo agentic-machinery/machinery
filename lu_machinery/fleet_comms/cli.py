@@ -879,15 +879,20 @@ def cmd_deliveries(args: argparse.Namespace) -> int:
                 ))
             elif args.deliveries_command == "expire-stale":
                 matched = service.count_undelivered(older_than_days=args.older_than_days)
-                expired = (
-                    service.expire_undelivered(older_than_days=args.older_than_days)
-                    if args.apply else 0
-                )
+                unreadable = service.count_unreadable()
+                expired = 0
+                unreadable_expired = None
+                if args.apply:
+                    # Unread mail for nobody first, by cause; then the age cutoff on what is left (#594).
+                    unreadable_expired = service.expire_unreadable()
+                    expired = service.expire_undelivered(older_than_days=args.older_than_days)
                 payload = {
                     "matched": matched,
                     "expired": expired,
                     "applied": bool(args.apply),
                     "older_than_days": args.older_than_days,
+                    "unreadable": unreadable,
+                    "unreadable_expired": unreadable_expired,
                 }
             else:
                 payload = asdict(service.get_delivery(args.delivery_id))
@@ -927,10 +932,14 @@ def _add_deliveries_parser(sub: Any) -> None:
         "  inspect the external outcome before repeating an action. Ack records its verified outcome;\n"
         "  supervisory requests require consumption for the current fence. Status reads metadata.\n"
         "  Unreadable or dead-lettered coordinator replies emit a typed delivery-error to both parties.\n"
-        "  expire-stale counts queued or running deliveries older than 7 days. Without --apply it\n"
-        "  writes nothing. With --apply it expires them. Rows stay, and an unread body stays\n"
-        "  ineligible for retention deletion. Expiry sends one summary notification. Their dead\n"
-        "  letters carry reason expired_by_cleanup, which recent-failure windows do not count.\n"
+        "  expire-stale counts queued or running deliveries older than 7 days, and (as unreadable)\n"
+        "  open deliveries and channel subscriptions whose recipient no drain reads: neither a\n"
+        "  registered slot nor a live task id (retired seats included), or a task that has settled.\n"
+        "  Without --apply it writes nothing. With --apply it first expires the unreadable rows, as\n"
+        "  recipient_not_registered or recipient_settled dead letters, and ends those subscriptions,\n"
+        "  then expires the old rows left as expired_by_cleanup, which recent-failure windows do not\n"
+        "  count. Rows stay, and an unread body stays ineligible for retention deletion. Each batch\n"
+        "  sends one summary notification. Claims also expire deliveries to a settled task.\n"
         "  These commands open the authority store, initializing/migrating it if necessary.\n"
         "  Inside a write boundary only receive and ack run, through the launcher's broker, for the\n"
         "  task's own deliveries (recipient and worker id are the task id).\n"
@@ -980,8 +989,8 @@ def _add_deliveries_parser(sub: Any) -> None:
         operation.set_defaults(func=cmd_deliveries)
     expire = operations.add_parser(
         "expire-stale",
-        help="Count undelivered deliveries older than 7 days; expire them only with --apply",
-        description="Count undelivered deliveries older than 7 days.\n" + description,
+        help="Count old or unreadable undelivered deliveries; expire them only with --apply",
+        description="Count undelivered deliveries older than 7 days or addressed to no reader.\n" + description,
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -989,7 +998,7 @@ def _add_deliveries_parser(sub: Any) -> None:
     expire.add_argument("--older-than-days", type=int, default=7, help="Age cutoff in days (default: 7)")
     expire.add_argument(
         "--apply", action="store_true",
-        help="Expire matched rows as expired_by_cleanup dead letters (default: count only)",
+        help="Expire matched rows as cause-named dead letters and end unreadable subscriptions (default: count only)",
     )
     expire.set_defaults(func=cmd_deliveries)
 

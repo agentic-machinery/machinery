@@ -14,6 +14,7 @@ import pytest
 from lu_machinery.fleet_comms.cli import EXIT_OK
 from lu_machinery.fleet_comms.cli import main as cli_main
 from lu_machinery.fleet_comms.efficiency_metrics import (
+    DEAD_LETTER_CAUSES,
     collect_dead_letters,
     collect_dead_letters_authority,
     collect_delivery_backlog,
@@ -105,6 +106,24 @@ def _seed_authority_plane(root: Path) -> Path:
           updated_at TEXT NOT NULL,
           completed_at TEXT
         );
+        -- Every pg store has comms_messages (pg migration v2) before the
+        -- authority tables (v3); the pg metrics reader fails closed without it.
+        CREATE TABLE comms_messages (
+          message_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          in_reply_to TEXT,
+          kind TEXT NOT NULL,
+          sender TEXT NOT NULL,
+          recipient TEXT,
+          body_inline TEXT,
+          body_artifact_id TEXT,
+          content_sha256 TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO comms_messages VALUES
+          ('auth-m1','conv1',NULL,'request','codex','claude',NULL,NULL,NULL,'{}',
+           '2026-08-01T12:00:00Z');
         INSERT INTO authority_deliveries VALUES
           ('auth-d1','auth-m1','claude','queued',NULL,NULL,NULL,0,0,NULL,NULL,
            '2026-08-01T12:00:00Z','2026-08-01T12:00:00Z',NULL),
@@ -351,8 +370,8 @@ def test_authority_metrics_engine_parity(authority_db):
         "failure_lifetime": {"dead_letters": 1, "failed_deliveries": 0, "failed_jobs": 0},
         "failure_windows": {
             label: {
-                metric: {"total": 0, "by_recipient": {}}
-                for metric in ("dead_letters", "failed_deliveries", "failed_jobs")
+                "dead_letters": {"total": 0, "by_recipient": {}, "by_cause": dict.fromkeys(DEAD_LETTER_CAUSES, 0)},
+                **{metric: {"total": 0, "by_recipient": {}} for metric in ("failed_deliveries", "failed_jobs")},
             } for label in ("24h", "7d")
         },
     }
@@ -558,7 +577,10 @@ def test_recent_failures_exclude_old_events_and_group_recipients(tmp_path: Path,
         conn.execute("UPDATE authority_jobs SET state='failed', completed_at='2026-11-12T12:00:00Z'")
     metrics = collect_efficiency_metrics_authority(db, now=datetime(2026, 11, 13, 12, tzinfo=UTC))
     assert metrics['failure_windows']['24h'] == {
-        'dead_letters': {'total': 1, 'by_recipient': {'claude': 1}},
+        'dead_letters': {
+            'total': 1, 'by_recipient': {'claude': 1},
+            'by_cause': {**dict.fromkeys(DEAD_LETTER_CAUSES, 0), 'other': 1},
+        },
         'failed_deliveries': {'total': 1, 'by_recipient': {'claude': 1}},
         'failed_jobs': {'total': 1, 'by_recipient': {'claude': 1}},
     }
