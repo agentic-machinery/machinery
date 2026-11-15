@@ -1275,17 +1275,20 @@ def test_an_alert_delivery_is_claimed_and_acked_by_an_agent_seat(
         payload: dict = json.loads(capsys.readouterr().out)
         return payload
 
-    def claim_and_ack(recipient: str, key: str, expected: int) -> dict:
+    def claim_and_ack(recipient: str, expected: int) -> tuple[str, dict]:
         lease = deliveries("claim", "--recipient", recipient, "--worker-id", recipient, expected=EXIT_OK)
-        assert lease["message_id"] == sent[key]
         fence = ["--worker-id", recipient, "--fence-token", str(lease["fence_token"])]
-        return deliveries("ack", lease["delivery_id"], *fence, expected=expected)
+        return lease["message_id"], deliveries("ack", lease["delivery_id"], *fence, expected=expected)
 
-    assert claim_and_ack("claude-cto", "relaunch-held-infra-1", EXIT_OK)["state"] == "acknowledged"
-    assert claim_and_ack("claude-cto", "handoff-alert-infra-1", EXIT_OK)["state"] == "acknowledged"
-    assert claim_and_ack("claude-infra", "claude-handoff-infra-1", EXIT_ERROR)["error"] == (
-        "supervisory_consumption_required"
-    )
+    # Both CTO alerts share a creation second, so their claim order is not fixed.
+    cto_claims = [claim_and_ack("claude-cto", EXIT_OK) for _ in range(2)]
+    assert {message_id for message_id, _ack in cto_claims} == {
+        sent["relaunch-held-infra-1"], sent["handoff-alert-infra-1"],
+    }
+    assert all(ack["state"] == "acknowledged" for _message_id, ack in cto_claims)
+    handoff_id, refused = claim_and_ack("claude-infra", EXIT_ERROR)
+    assert handoff_id == sent["claude-handoff-infra-1"]
+    assert refused["error"] == "supervisory_consumption_required"
 
 
 def test_stuck_handoff_alerts_the_cto_once_without_killing(tmp_path: Path) -> None:
