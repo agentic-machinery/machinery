@@ -468,7 +468,8 @@ def test_read_only_mode_denies_edits_on_every_provider(sandbox, tmp_path, monkey
     elif agent == "codex":
         assert "--dangerously-bypass-approvals-and-sandbox" in argv  # supervisor's read-only OS mounts hold the policy
     elif agent == "cursor":
-        assert argv[argv.index("--mode") + 1] == "ask"
+        # The read-only permission profile the write boundary projects holds the policy, never a bypass flag.
+        assert "--disable-project-configs" in argv and not {"--mode", "--force", "--yolo", "--sandbox"} & set(argv)
     elif agent == "muse":
         assert {"--disable-write", "--disable-shell"} <= set(argv)
     elif agent == "claude":

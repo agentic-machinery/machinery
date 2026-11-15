@@ -74,7 +74,10 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
             launch = write_argv[:write_argv.index("--")]
             projected = launch[launch.index("--sources-mcp") + 1] if "--sources-mcp" in launch else None
             assert projected == (agent if agent in ("agy", "cursor", "opencode") else None)
-            assert "--sources-mcp" not in argv[:argv.index("--")]  # a read-only launch projects none
+            # A read-only launch projects none, but for Cursor, whose permission profile rides with it.
+            read_only = argv[:argv.index("--")]
+            assert (read_only[read_only.index("--sources-mcp") + 1] if "--sources-mcp" in read_only else None) == (
+                "cursor" if agent == "cursor" else None)
 
     # A missing anchor stays missing; worker Git metadata must never fill it in.
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
