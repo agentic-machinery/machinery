@@ -1315,7 +1315,7 @@ def test_management_balance_failure_is_not_a_good_prepaid_sample(monkeypatch):
     assert not subscription_usage_mod._api_account_is_cacheable(result)
 
 
-def test_management_key_missing_uses_short_cache_ttl(monkeypatch):
+def test_management_key_missing_keeps_successful_usage_fresh(monkeypatch):
     mod = subscription_usage_mod
     monkeypatch.setattr(mod, "_api_account_last_failure", {})
     monkeypatch.setattr(mod, "_api_account_last_good", {})
@@ -1327,8 +1327,9 @@ def test_management_key_missing_uses_short_cache_ttl(monkeypatch):
     monkeypatch.setattr(mod, "cache_get_with_age", lambda *a, **kw: (account, 31))
     mod._api_account_last_good["openrouter"] = (time.monotonic() - 31, account)
     result = mod.get_api_account_data("openrouter")
-    assert result["freshness"] == "stale_last_good"
-    assert called == [True]
+    assert result["freshness"] == "fresh"
+    assert result["balance_probe_state"] == "NEED_KEY"
+    assert called == []
 
 
 # --- CodexBar UsagePace port (usage-pace-secrets-v2) -----------------------

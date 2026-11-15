@@ -657,11 +657,7 @@ def _api_account_snapshot(provider: str) -> dict[str, Any]:
     cached = cache_get_with_age(_api_account_cache_key(provider), ttl=_api_account_cache_ttl_s())
     if cached is not None and _api_account_is_cacheable(cached[0]) and not failure:
         val, age = cached
-        partial_expired = (
-            val.get("balance_probe_state") in {"NEED_KEY", "NEED_PROBE"} and age >= API_ACCOUNT_FAILURE_TTL_S
-        )
-        if not partial_expired:
-            return _with_api_account_observation_metadata(val, freshness="fresh", age_s=age)
+        return _with_api_account_observation_metadata(val, freshness="fresh", age_s=age)
     good = _api_account_last_good.get(provider)
     if good:
         observed, val = good
@@ -688,7 +684,7 @@ def _api_account_snapshot(provider: str) -> dict[str, Any]:
 
 
 def get_api_account_data(provider: str) -> dict[str, Any]:
-    """Cache-only read with short retries for failed or missing-key probes."""
+    """Cache-only read with short retries for failed probes."""
     result = _api_account_snapshot(provider)
     failure = _api_account_last_failure.get(provider)
     retry_due = not failure or time.monotonic() - failure[0] >= API_ACCOUNT_FAILURE_TTL_S
