@@ -106,7 +106,7 @@ def anchor_sendbacks(h: Harness) -> list[str]:
 
 
 def alerts(h: Harness) -> list[str]:
-    return [body for recipient, body in h.sent if recipient == "epics"]
+    return [body for recipient, body in h.sent if recipient == "claude-cto"]
 
 
 def respawns(h: Harness) -> list[list[str]]:
@@ -468,7 +468,7 @@ class FleetPlane:
             self.log.append(f"send {recipient} failed {type(exc).__name__}: {exc}")
 
     def send(self, recipient: str, body: str, key: str, kind: str) -> None:
-        expected = cg.ALERT if recipient in {"claude-cto", "epics"} else cg.HANDOFF_REQUEST
+        expected = cg.ALERT if recipient == "claude-cto" else cg.HANDOFF_REQUEST
         assert kind == expected, (recipient, kind, key)
         payload = hashlib.sha256(body.encode("utf-8")).hexdigest()
         stored = self.payloads.get(key)

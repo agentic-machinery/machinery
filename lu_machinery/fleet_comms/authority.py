@@ -198,6 +198,96 @@ def _admitted_subscribers(names: Iterable[str]) -> list[AdmittedTarget]:
     return admitted
 
 
+RECIPIENT_NOT_REGISTERED_REASON = "recipient_not_registered"
+"""Refusal and dead-letter reason for a recipient that is neither a registered slot nor a task (#594)."""
+
+RECIPIENT_SETTLED_REASON = "recipient_settled"
+"""Refusal and dead-letter reason for a task recipient whose task has settled (#594)."""
+
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+# The supervisory wake watcher's inbox (``ai_agent_bridge._inbox_watch.supervisory_recipient``).
+_SUPERVISORY_RECIPIENT_RE = re.compile(r"supervisor:epic:[1-9][0-9]*")
+RecipientStanding = Literal["registered", "live_task", "settled_task", "not_registered", "unknown"]
+_ROSTER_CACHE: dict[tuple[object, ...], frozenset[str]] = {}
+
+
+def _registered_recipients() -> frozenset[str]:
+    """Recipients a drain reads besides live tasks: the durable CTO, registered slots and driver lanes.
+
+    Slots come from ``config/area_assignments.yaml`` (the roster every slot
+    reader uses) and lane senders from ``config/driver_lanes.json`` (the lanes
+    the context guard hands off). An unreadable roster yields only the durable
+    CTO; callers then refuse or keep, never expire (fail closed). The result
+    is cached per file identity (path, mtime, size), so every claim does not
+    reparse both files.
+    """
+    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery.ops import driver_lanes
+
+    paths = (Path(_channels.ASSIGNMENTS_PATH), Path(driver_lanes.DATA_FILE))
+    key: list[object] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            key.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            key.append((str(path), None, None))
+    cached = _ROSTER_CACHE.get(tuple(key))
+    if cached is not None:
+        return cached
+    names = {DURABLE_CTO_RECIPIENT, *_channels._load_registry_slots(paths[0])}
+    if len(names) > 1:
+        try:
+            names.update(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
+        except Exception:  # noqa: BLE001 - a broken lane file leaves the roster's slots
+            pass
+    roster = frozenset(names)
+    _ROSTER_CACHE.clear()
+    _ROSTER_CACHE[tuple(key)] = roster
+    return roster
+
+
+def _task_standing(name: str) -> Literal["live", "settled", "unknown"] | None:
+    """A dispatch task's standing by its record: live while spawning or running, else settled.
+
+    ``None`` when no task record has this id; ``unknown`` when the record cannot be read.
+    """
+    if not _TASK_ID_RE.fullmatch(name) or ".." in name:
+        return None
+    from lu_machinery.dispatcher import store
+
+    try:
+        record = store.read(name, missing_ok=True)
+    except (OSError, ValueError):
+        return "unknown"
+    if record is None:
+        return None
+    return "live" if record.get("status") in store.ACTIVE else "settled"
+
+
+def _recipient_standing(name: str, registered: frozenset[str]) -> RecipientStanding:
+    """Whether a drain will read ``name``; a stored session-CTO name stays readable by its session."""
+    if name in registered or is_session_cto_recipient(name) or _SUPERVISORY_RECIPIENT_RE.fullmatch(name):
+        return "registered"
+    task = _task_standing(name)
+    if task == "live":
+        return "live_task"
+    if task == "settled":
+        return "settled_task"
+    if task == "unknown" or len(registered) == 1:
+        return "unknown"
+    return "not_registered"
+
+
+def _require_readable_recipients(names: Iterable[str]) -> None:
+    """Refuse, before any write, a recipient no drain reads (#594)."""
+    registered = _registered_recipients()
+    for name in names:
+        standing = _recipient_standing(name, registered)
+        if standing in {"registered", "live_task"}:
+            continue
+        raise AuthorityRecipientRefused(name, standing)
+
 
 def _safe_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
     if value is None:
@@ -237,6 +327,21 @@ class AuthorityServiceError(RuntimeError):
 
 class AuthorityStaleLeaseError(AuthorityServiceError):
     """A worker attempted to complete a superseded lease."""
+
+
+class AuthorityRecipientRefused(AuthorityServiceError):
+    """A publish or subscription named a recipient no drain reads; ``cause`` names why."""
+
+    _CAUSES = {
+        "not_registered": (RECIPIENT_NOT_REGISTERED_REASON, "is neither a registered slot nor a live task id"),
+        "settled_task": (RECIPIENT_SETTLED_REASON, "is a task that has settled"),
+        "unknown": ("recipient_unverifiable", "could not be checked against the slot roster or its task record"),
+    }
+
+    def __init__(self, recipient: str, standing: str) -> None:
+        self.recipient = recipient
+        self.cause, detail = self._CAUSES[standing]
+        super().__init__(f"{self.cause}: {recipient} {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,11 +514,13 @@ class AuthorityService:
         A Kimi subscriber is kept as given (the legacy import replays history
         through here) but never receives a delivery: ``publish_message`` skips
         it. New Kimi subscriptions are refused by ``subscribe`` and the CLI.
+        Outside the legacy import a subscriber no drain reads is refused (#594).
         """
         channel_name = _nonempty(name, field="channel")
         normalized_subscribers = _normalize_recipients(subscribers)
         if not legacy_import:
             _refuse_session_cto_recipients(normalized_subscribers)
+            _require_readable_recipients(normalized_subscribers)
         meta = _safe_json_mapping(metadata)
         with self._write_transaction():
             row = self._conn.execute(
@@ -452,11 +559,14 @@ class AuthorityService:
         """Add durable future fan-out subscribers without rewriting history.
 
         A Kimi subscriber is refused before any write: Kimi is not a bridge recipient.
+        So is one no drain reads: neither a registered slot nor a live task (#594).
         """
         targets = _admit_recipients(recipients, mode=BRIDGE_MODE)
         channel_name = _nonempty(channel, field="channel")
-        if not _normalize_recipients(target.recipient for target in targets):
+        names = _normalize_recipients(target.recipient for target in targets)
+        if not names:
             raise AuthorityServiceError("subscriber_required")
+        _require_readable_recipients(names)
         subscriber_metadata = _safe_json_mapping(metadata)
         with self._write_transaction():
             channel_row = self._require_channel_tx(channel_name)
@@ -639,6 +749,11 @@ class AuthorityService:
 
         An explicit Kimi recipient is refused before any write, and a Kimi
         subscriber gets no delivery: Kimi is not a bridge recipient.
+
+        Only a reader gets a delivery (#594): an explicit recipient that is
+        neither a registered slot nor a live task id is refused with
+        ``AuthorityRecipientRefused`` before any write. A channel subscriber
+        that no drain reads gets no delivery, and its subscription ends.
         """
         targets = _admit_recipients(recipients, mode=BRIDGE_MODE) if recipients is not None else None
         message_key = idempotency_key or new_id("authority-message-key")
@@ -748,6 +863,9 @@ class AuthorityService:
 
         A Kimi recipient (or a Kimi ``requested_model``) is refused before any
         write: Kimi seats take web, UI and backend coding only.
+
+        The job is the queue: its message names the recipient but creates no
+        delivery, because no drain reads a provider seat's deliveries (#594).
         """
         (target,) = _admit_recipients((recipient,), mode=ACP_MODE, attachments=(metadata,))
         key = idempotency_key or new_id("authority-request-key")
@@ -781,6 +899,7 @@ class AuthorityService:
                 provenance=provenance,
                 deadline_at=deadline_at,
                 idempotency_key=f"request-message:{key}",
+                deliver=False,
             )
             return self._enqueue_job_tx(
                 job_kind="request",
@@ -899,6 +1018,7 @@ class AuthorityService:
                 provenance=provenance,
                 deadline_at=deadline,
                 idempotency_key=f"discussion-message:{key}",
+                deliver=False,
             )
             return self._enqueue_job_tx(
                 job_kind="discussion",
@@ -1647,6 +1767,112 @@ class AuthorityService:
         ).fetchall()
         return [row for row in rows if not self._stored_kimi_delivery(row)]
 
+    def count_unreadable(self) -> dict[str, int]:
+        """Open deliveries and subscriptions whose recipient no drain reads, by cause. Reads only (#594).
+
+        Bare provider names and the retired Kimi seats count as not registered.
+        Nothing is counted while the slot roster is unreadable.
+        """
+        counts = {RECIPIENT_NOT_REGISTERED_REASON: 0, RECIPIENT_SETTLED_REASON: 0}
+        for _row, reason in self._unreadable_deliveries_tx(settled_only=False):
+            counts[reason] += 1
+        return {
+            "deliveries": sum(counts.values()),
+            **counts,
+            "subscriptions": len(self._unreadable_subscriptions_tx(settled_only=False)),
+        }
+
+    def expire_unreadable(self, *, now: str | None = None) -> dict[str, int]:
+        """Expire open deliveries no drain will read and end those recipients' subscriptions.
+
+        The one-time hygiene of #594, run by ``deliveries expire-stale --apply``.
+        Rows and messages stay; each expired row dead-letters with its cause
+        (``recipient_not_registered`` or ``recipient_settled``) and each cause
+        sends one summary notice to the CTO. This is the one writer that expires
+        a stored Kimi delivery: Kimi is retired, so its queued rows are retired
+        too, as a state change only (CTO decision on #594). No per-row notice is
+        sent, so no write admits a Kimi recipient.
+        """
+        now_value = self._now_string(now)
+        with self._write_transaction():
+            ended = len(self._unreadable_subscriptions_tx(settled_only=False))
+            expired: dict[str, list[str]] = {RECIPIENT_NOT_REGISTERED_REASON: [], RECIPIENT_SETTLED_REASON: []}
+            for row, reason in self._unreadable_deliveries_tx(settled_only=False):
+                delivery_id = str(row["delivery_id"])
+                self._conn.execute(
+                    """UPDATE authority_deliveries
+                       SET state = 'expired', lease_owner = NULL, lease_expires_at = NULL,
+                           updated_at = ?, completed_at = ? WHERE delivery_id = ?""",
+                    (now_value, now_value, delivery_id),
+                )
+                self._conn.execute(
+                    """UPDATE authority_delivery_attempts
+                       SET state = 'expired', finished_at = ?
+                       WHERE delivery_id = ? AND fence_token = ? AND finished_at IS NULL""",
+                    (now_value, delivery_id, int(row["fence_token"])),
+                )
+                self._dead_letter_delivery_tx(delivery_id, reason_code=reason, notify=False)
+                expired[reason].append(delivery_id)
+            self._end_unreadable_subscriptions_tx(settled_only=False)
+            for reason, ids in expired.items():
+                if ids:
+                    self._notify_cleanup_expiry_summary_tx(ids, reason_code=reason)
+        counts = {reason: len(ids) for reason, ids in expired.items()}
+        return {"deliveries": sum(counts.values()), **counts, "subscriptions": ended}
+
+    def _unreadable_deliveries_tx(self, *, settled_only: bool) -> list[tuple[sqlite3.Row, str]]:
+        """Queued or running deliveries whose recipient is a settled task (or, unless ``settled_only``, unregistered)."""
+        registered = _registered_recipients()
+        if len(registered) == 1:
+            return []
+        rows: list[tuple[sqlite3.Row, str]] = []
+        recipients = self._conn.execute(
+            """SELECT DISTINCT recipient FROM authority_deliveries
+               WHERE state IN ('queued', 'running') ORDER BY recipient"""
+        ).fetchall()
+        for item in recipients:
+            reason = self._unreadable_reason(str(item["recipient"]), registered, settled_only=settled_only)
+            if reason is None:
+                continue
+            rows.extend(
+                (row, reason)
+                for row in self._conn.execute(
+                    """SELECT delivery_id, fence_token, recipient, message_id FROM authority_deliveries
+                       WHERE recipient = ? AND state IN ('queued', 'running')
+                       ORDER BY created_at ASC, delivery_id ASC""",
+                    (str(item["recipient"]),),
+                ).fetchall()
+            )
+        return rows
+
+    def _unreadable_subscriptions_tx(self, *, settled_only: bool) -> list[str]:
+        registered = _registered_recipients()
+        if len(registered) == 1:
+            return []
+        names = self._conn.execute(
+            "SELECT DISTINCT recipient FROM authority_channel_subscribers ORDER BY recipient"
+        ).fetchall()
+        return [
+            str(item["recipient"])
+            for item in names
+            if self._unreadable_reason(str(item["recipient"]), registered, settled_only=settled_only) is not None
+        ]
+
+    def _end_unreadable_subscriptions_tx(self, *, settled_only: bool) -> int:
+        return sum(
+            self._end_subscriptions_tx(name)
+            for name in self._unreadable_subscriptions_tx(settled_only=settled_only)
+        )
+
+    @staticmethod
+    def _unreadable_reason(name: str, registered: frozenset[str], *, settled_only: bool) -> str | None:
+        standing = _recipient_standing(name, registered)
+        if standing == "settled_task":
+            return RECIPIENT_SETTLED_REASON
+        if standing == "not_registered" and not settled_only:
+            return RECIPIENT_NOT_REGISTERED_REASON
+        return None
+
     def record_wake_receipt(
         self,
         delivery_id: str,
@@ -2000,7 +2226,15 @@ class AuthorityService:
         imported_source: str | None = None,
         emit_wakes: bool = True,
         imported_delivery_state: str | None = None,
+        deliver: bool = True,
     ) -> AuthorityMessage:
+        """Write one immutable message and its deliveries.
+
+        ``deliver=False`` records the message for a job, which is its own queue:
+        no delivery is created. Explicit recipients of a delivered live message
+        must be readable (``_require_readable_recipients``); stored channel
+        subscribers no drain reads are skipped and their subscriptions end.
+        """
         if not isinstance(body, str):
             raise AuthorityServiceError("message_body_must_be_text")
         if re.fullmatch(
@@ -2026,9 +2260,13 @@ class AuthorityService:
             recipients_norm = _normalize_recipients(
                 target.recipient for target in _admitted_subscribers(name for name in durable if name)
             )
+            if deliver:
+                recipients_norm = self._readable_subscribers_tx(channel_row, recipients_norm)
         else:
             recipients_norm = _normalize_recipients(require_admitted(target).recipient for target in targets or ())
             _refuse_session_cto_recipients(recipients_norm)
+            if deliver and imported_source is None and imported_delivery_state is None:
+                _require_readable_recipients(recipients_norm)
         revisions = self._normalize_context_revisions(context_revisions, channel_row)
         provenance_data = _safe_json_mapping(provenance)
         deadline = self._normalize_deadline(deadline_at)
@@ -2138,7 +2376,7 @@ class AuthorityService:
             ),
         )
         delivery_ids: list[str] = []
-        for recipient in recipients_norm:
+        for recipient in recipients_norm if deliver else ():
             delivery_id = new_id("authority-delivery")
             delivery_state = imported_delivery_state or "queued"
             terminal_sha = _sha256_bytes(b"") if delivery_state == "acknowledged" else None
@@ -2183,6 +2421,35 @@ class AuthorityService:
             created_at=creation,
             delivery_ids=tuple(delivery_ids),
         )
+
+    def _readable_subscribers_tx(self, channel_row: sqlite3.Row, names: Sequence[str]) -> tuple[str, ...]:
+        """Fan-out targets a drain reads; end the subscription of a settled task or unregistered name.
+
+        A subscriber whose standing cannot be checked keeps its subscription and
+        its delivery (fail closed: nothing is ended on doubt).
+        """
+        registered = _registered_recipients()
+        kept: list[str] = []
+        for name in names:
+            standing = _recipient_standing(name, registered)
+            if standing in {"settled_task", "not_registered"}:
+                self._end_subscriptions_tx(name, channel_id=str(channel_row["channel_id"]))
+                continue
+            kept.append(name)
+        return tuple(kept)
+
+    def _end_subscriptions_tx(self, recipient: str, *, channel_id: str | None = None) -> int:
+        """Remove future fan-out to ``recipient``; past messages and deliveries are kept."""
+        if channel_id is None:
+            cursor = self._conn.execute(
+                "DELETE FROM authority_channel_subscribers WHERE recipient = ?", (recipient,)
+            )
+        else:
+            cursor = self._conn.execute(
+                "DELETE FROM authority_channel_subscribers WHERE channel_id = ? AND recipient = ?",
+                (channel_id, recipient),
+            )
+        return int(cursor.rowcount or 0)
 
     def _enqueue_job_tx(
         self,
@@ -2318,6 +2585,11 @@ class AuthorityService:
         with its per-row notice; inside a cleanup batch a stored session-CTO
         recipient is notified through the durable CTO, so its refusal cannot
         roll back the batch.
+
+        Every pass also expires the open deliveries to a task that has settled,
+        which no drain will read (#594), as ``recipient_settled`` with a per-row
+        notice, and ends that task's subscriptions. A stored Kimi delivery is
+        left as it is here too.
         """
         reclaimed = 0
         cleanup_expired: list[str] = []
@@ -2356,6 +2628,29 @@ class AuthorityService:
             reclaimed += 1
         if cleanup_expired:
             self._notify_cleanup_expiry_summary_tx(cleanup_expired)
+        if cleanup_ids is None:
+            for row, reason in self._unreadable_deliveries_tx(settled_only=True):
+                if self._stored_kimi_delivery(row):
+                    continue
+                delivery_id = str(row["delivery_id"])
+                self._conn.execute(
+                    """UPDATE authority_deliveries
+                       SET state = 'expired', lease_owner = NULL, lease_expires_at = NULL,
+                           updated_at = ?, completed_at = ? WHERE delivery_id = ?""",
+                    (now, now, delivery_id),
+                )
+                self._conn.execute(
+                    """UPDATE authority_delivery_attempts
+                       SET state = 'expired', finished_at = ?
+                       WHERE delivery_id = ? AND fence_token = ? AND finished_at IS NULL""",
+                    (now, delivery_id, int(row["fence_token"])),
+                )
+                self._dead_letter_delivery_tx(delivery_id, reason_code=reason, notify=False)
+                self._notify_coordinator_reply_failure_tx(
+                    delivery_id, reason_code=reason, session_via_durable_cto=True,
+                )
+                reclaimed += 1
+            self._end_unreadable_subscriptions_tx(settled_only=True)
         stale = self._conn.execute(
             """SELECT delivery_id, fence_token, attempt_count, recipient, message_id FROM authority_deliveries
                WHERE state = 'running' AND lease_expires_at IS NOT NULL
@@ -2478,7 +2773,9 @@ class AuthorityService:
         if notify:
             self._notify_coordinator_reply_failure_tx(delivery_id, reason_code=reason_code)
 
-    def _notify_cleanup_expiry_summary_tx(self, delivery_ids: list[str]) -> bool:
+    def _notify_cleanup_expiry_summary_tx(
+        self, delivery_ids: list[str], *, reason_code: str = CLEANUP_EXPIRY_REASON,
+    ) -> bool:
         """One delivery-error for a batch of cleanup expiries, addressed only to the durable CTO.
 
         Per-row notices would flood the coordinator and a legacy session recipient
@@ -2506,11 +2803,14 @@ class AuthorityService:
             sender="fleet-comms", channel=None, kind="delivery-error",
             body=_canonical_json({
                 "error": "coordinator_reply_delivery_failed",
-                "reason_code": CLEANUP_EXPIRY_REASON,
+                "reason_code": reason_code,
                 "expired_count": len(ids),
             }),
             targets=_admit_recipients((DURABLE_CTO_RECIPIENT,), mode=BRIDGE_MODE),
-            idempotency_key=f"coordinator-reply-error:summary:{digest}",
+            idempotency_key=(
+                f"coordinator-reply-error:summary:{digest}" if reason_code == CLEANUP_EXPIRY_REASON
+                else f"coordinator-reply-error:summary:{reason_code}:{digest}"
+            ),
         )
         return True
 
@@ -2538,6 +2838,16 @@ class AuthorityService:
         ).fetchone():
             return True
         # Notifications have a different sender, so their own expiry cannot recurse.
+        # The original recipient is told only if a drain still reads it (#594).
+        recipient = str(row["recipient"])
+        if session_via_durable_cto and is_session_cto_recipient(recipient):
+            parties: tuple[str, ...] = (DURABLE_CTO_RECIPIENT,)
+        elif is_session_cto_recipient(recipient) or _recipient_standing(
+            recipient, _registered_recipients()
+        ) in {"registered", "live_task"}:
+            parties = (recipient, DURABLE_CTO_RECIPIENT)
+        else:
+            parties = (DURABLE_CTO_RECIPIENT,)
         self._publish_message_tx(
             sender="fleet-comms", channel=None, kind="delivery-error",
             body=_canonical_json({
@@ -2547,12 +2857,7 @@ class AuthorityService:
                 "message_id": str(row["message_id"]),
                 "recipient": str(row["recipient"]),
             }),
-            targets=_admit_recipients(
-                (DURABLE_CTO_RECIPIENT,)
-                if session_via_durable_cto and is_session_cto_recipient(row["recipient"])
-                else (str(row["recipient"]), DURABLE_CTO_RECIPIENT),
-                mode=BRIDGE_MODE,
-            ),
+            targets=_admit_recipients(parties, mode=BRIDGE_MODE),
             in_reply_to=str(row["message_id"]),
             idempotency_key=key,
         )

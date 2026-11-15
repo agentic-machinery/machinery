@@ -18,6 +18,13 @@ genuine `deadline_expired` row, even in the same cleanup batch, still counts.
 Only state `failed` counts in the two failure measures; expired/dead-lettered
 rows remain represented by the separate dead-letter measure.
 
+Each `dead_letters` window also carries `by_cause`, one count per cause:
+`recipient_not_registered`, `recipient_settled`, `attempts_exhausted`,
+`expired_unread` (reason `deadline_expired`), `worker_failed`, `job_expired` (a
+job's deadline) and `other`. The causes sum to `total`. The CLI shows them now;
+`/api/comms/v1/metrics` drops the key until its public filter passes it through
+(the Fleet page work in #592).
+
 A request job inherits its message's recipient only when there is exactly one.
 Other jobs use `authority-job`, so fan-out never multiplies the event count.
 Older PostgreSQL job schemas without subject metadata also use `authority-job`;
@@ -44,6 +51,41 @@ Suggested initial alert: `lu_fleet_comms_dead_letters_recent{window="24h"} > 0`
 for 5 minutes. Alert separately on collection success 0 or absent scrape data.
 The private infrastructure repository owns alert rules and routing to the CTO;
 this change supplies measurements and does not install those rules.
+
+## Only readers get mail
+
+The authority creates a delivery only for a recipient a drain reads: `claude-cto`,
+a slot in `config/area_assignments.yaml`, a lane sender in
+`config/driver_lanes.json`, a supervisory watcher (`supervisor:epic:<n>`) or a
+live task id (task record status `spawning` or `running`). Publishing or
+subscribing to anything else fails before any write with a typed error that
+names the recipient: `recipient_not_registered: <name> ...` (bare provider
+names, retired seats and ad-hoc worker names) or `recipient_settled: <task> ...`.
+Request and discussion jobs are their own queue, so their messages create no
+delivery.
+
+When a task settles, the next delivery claim or reclaim expires its open
+deliveries as `recipient_settled` dead letters, which keeps the rows, notifies
+`claude-cto` of its unread messages and ends the task's channel subscriptions. A
+channel broadcast also skips a subscriber that no drain reads and ends that
+subscription.
+
+## One-time hygiene of unread mail
+
+Count first; this writes nothing:
+
+```bash
+.venv/bin/python -m lu_machinery.fleet_comms deliveries expire-stale
+```
+
+`unreadable` gives the open deliveries whose recipient no drain reads, by cause,
+and the number of such subscriptions. `--apply` expires those rows as
+`recipient_not_registered` or `recipient_settled` dead letters (rows and
+messages stay, nothing is deleted), ends those subscriptions and sends one
+summary notice per cause to `claude-cto`. It then applies the usual 7-day
+cutoff to the rest. Queued rows to the retired Kimi seats are expired too, as
+`recipient_not_registered` (a state change only; it is the one writer that does
+this). These expiries count in the recent windows under their cause.
 
 ## Remove a stale subscription
 

@@ -26,7 +26,7 @@ ECHO = (
     "Finish the current step only, write the top of .claude/infra-epic/DRIVER-STATE.md "
     "(in-flight workers with task ids, waits with nonces, PRs, holds, orders and their status, next actions), "
     "stop every background task you started (background Bash tasks and Monitor streams), "
-    "post 'HANDOFF-DONE infra .claude/infra-epic/DRIVER-STATE.md' to Fleet Comms recipient epics, then stop. "
+    "post 'HANDOFF-DONE infra .claude/infra-epic/DRIVER-STATE.md' to Fleet Comms recipient claude-cto, then stop. "
     "The guard exits and relaunches your seat; running workers keep running and the fresh session adopts them."
 )
 
@@ -880,6 +880,11 @@ def refuse(h: Harness, rc: int = 3, tail: str = "refused: a CTO process is still
     pane.text = launcher_output(h.state["cto"]["relaunch_id"], rc, tail)
 
 
+def launcher_exit_alerts(h: Harness) -> list[str]:
+    """The CTO alerts for a failed relaunch; other CTO alerts (lead missing, relaunch held) are not these."""
+    return [body for recipient, body in h.sent if recipient == "claude-cto" and " launcher exited rc=" in body]
+
+
 def test_single_instance_refusal_is_retried_exactly_once_on_the_next_tick(tmp_path: Path) -> None:
     """AC-02: one retry, a tick later; the second refusal alerts and stays down."""
     h = relaunched(tmp_path)
@@ -887,19 +892,19 @@ def test_single_instance_refusal_is_retried_exactly_once_on_the_next_tick(tmp_pa
     h.advance(5)
     h.tick("cto")  # the refusal is seen; the retry waits for the next tick
     assert len(respawns(h)) == 1
-    assert [body for recipient, body in h.sent if recipient == "epics"] == []
+    assert launcher_exit_alerts(h) == []
     h.advance(5)
     h.tick("cto")
     assert len(respawns(h)) == 2 and h.state["cto"]["relaunch_retried"] is True
     refuse(h)
     h.advance(5)
     h.tick("cto")
-    alerts = [body for recipient, body in h.sent if recipient == "epics"]
+    alerts = launcher_exit_alerts(h)
     assert len(alerts) == 1 and "rc=3" in alerts[0] and "still running" in alerts[0]
     for _ in range(3):
         h.advance(5)
         h.tick("cto")
-    assert len(respawns(h)) == 2 and len([1 for r, _b in h.sent if r == "epics"]) == 1
+    assert len(respawns(h)) == 2 and len(launcher_exit_alerts(h)) == 1
 
 
 def test_a_successful_retry_clears_the_retry_marker(tmp_path: Path) -> None:
@@ -931,7 +936,7 @@ def test_any_other_launcher_failure_stays_terminal(tmp_path: Path, rc: int, tail
         h.advance(5)
         h.tick("cto")
     assert len(respawns(h)) == 1
-    assert len([1 for r, _b in h.sent if r == "epics"]) == 1
+    assert len(launcher_exit_alerts(h)) == 1
 
 
 def test_refusal_with_the_predecessor_scope_still_active_is_terminal(tmp_path: Path) -> None:
@@ -942,7 +947,7 @@ def test_refusal_with_the_predecessor_scope_still_active_is_terminal(tmp_path: P
         h.advance(5)
         h.tick("cto")
     assert len(respawns(h)) == 1
-    assert len([1 for r, _b in h.sent if r == "epics"]) == 1
+    assert len(launcher_exit_alerts(h)) == 1
     assert any("the predecessor may remain" in line for line in h.logs)
 
 
@@ -1190,17 +1195,17 @@ def test_fleet_sender_uses_the_data_file_identity_and_never_raises(monkeypatch: 
     send = cg.fleet_sender(load_registry().guard_sender, logs.append)
     send("claude-infra", "body", "key-1", cg.HANDOFF_REQUEST)
     send("down", "body", "key-2", cg.HANDOFF_REQUEST)
-    send("epics", "body", "key-3", cg.ALERT)
+    send("claude-cto", "body", "key-3", cg.ALERT)
     send("down", "body", "key-4", cg.ALERT)
-    send("epics", "body", "key-5", "status")
+    send("claude-cto", "body", "key-5", "status")
     assert all(call["sender"] == load_registry().guard_sender for call in calls)
     assert [call["idempotency_key"] for call in calls] == ["key-1", "key-2", "key-3", "key-4"]
     assert logs == [
         "send claude-infra ok m-1",
         "send down failed RuntimeError: store unavailable",
-        "send epics ok m-2",
+        "send claude-cto ok m-2",
         "send down failed RuntimeError: store unavailable",
-        "send epics failed ValueError: unknown guard message kind 'status'",
+        "send claude-cto failed ValueError: unknown guard message kind 'status'",
     ]
 
 
@@ -1214,14 +1219,15 @@ def temp_plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def guard_sends(root: Path) -> dict[str, str]:
-    """Send one handoff and the two alert recipients through fleet_sender; recipient -> message id."""
+    """Send one handoff and two CTO alerts through fleet_sender; idempotency key -> message id."""
     logs: list[str] = []
     send = cg.fleet_sender(load_registry().guard_sender, logs.append)
-    send("claude-infra", "HANDOFF NOW body", "claude-handoff-infra-1", cg.HANDOFF_REQUEST)
-    send("claude-cto", "CTO-ALERT relaunch held", "relaunch-held-infra-1", cg.ALERT)
-    send("epics", "CTO-ALERT handoff incomplete", "handoff-alert-infra-1", cg.ALERT)
+    keys = ("claude-handoff-infra-1", "relaunch-held-infra-1", "handoff-alert-infra-1")
+    send("claude-infra", "HANDOFF NOW body", keys[0], cg.HANDOFF_REQUEST)
+    send("claude-cto", "CTO-ALERT relaunch held", keys[1], cg.ALERT)
+    send("claude-cto", "CTO-ALERT handoff incomplete", keys[2], cg.ALERT)
     assert all(" ok message_" in line for line in logs), logs
-    return {line.split()[1]: line.split()[3] for line in logs}
+    return {key: line.split()[3] for key, line in zip(keys, logs, strict=True)}
 
 
 def test_fleet_sender_stores_the_handoff_as_supervisory_and_alerts_as_ordinary_messages(temp_plane: Path) -> None:
@@ -1229,30 +1235,30 @@ def test_fleet_sender_stores_the_handoff_as_supervisory_and_alerts_as_ordinary_m
     from lu_machinery.fleet_comms.authority import AuthorityService
 
     sent = guard_sends(temp_plane)
-    keys = {
-        "claude-infra": "claude-handoff-infra-1",
-        "claude-cto": "relaunch-held-infra-1",
-        "epics": "handoff-alert-infra-1",
+    recipients = {
+        "claude-handoff-infra-1": "claude-infra",
+        "relaunch-held-infra-1": "claude-cto",
+        "handoff-alert-infra-1": "claude-cto",
     }
     with AuthorityService(root=temp_plane) as service:
-        stored = {recipient: service.get_message(message_id) for recipient, message_id in sent.items()}
+        stored = {key: service.get_message(message_id) for key, message_id in sent.items()}
         keyed = dict(
             service.store.connection.execute(
                 "SELECT idempotency_key, subject_id FROM authority_idempotency WHERE namespace = 'message'"
             ).fetchall()
         )
-    assert {recipient: message.kind for recipient, message in stored.items()} == {
-        "claude-infra": "supervisory-request",
-        "claude-cto": "request",
-        "epics": "request",
+    assert {key: message.kind for key, message in stored.items()} == {
+        "claude-handoff-infra-1": "supervisory-request",
+        "relaunch-held-infra-1": "request",
+        "handoff-alert-infra-1": "request",
     }
-    for recipient, message in stored.items():
+    for key, message in stored.items():
         assert (message.sender, message.recipient, message.correlation_id) == (
             load_registry().guard_sender,
-            recipient,
-            keys[recipient],
+            recipients[key],
+            key,
         )
-        assert keyed[keys[recipient]] == message.message_id
+        assert keyed[key] == message.message_id
 
 
 def test_an_alert_delivery_is_claimed_and_acked_by_an_agent_seat(
@@ -1269,24 +1275,26 @@ def test_an_alert_delivery_is_claimed_and_acked_by_an_agent_seat(
         payload: dict = json.loads(capsys.readouterr().out)
         return payload
 
-    def claim_and_ack(recipient: str, expected: int) -> dict:
+    def claim_and_ack(recipient: str, key: str, expected: int) -> dict:
         lease = deliveries("claim", "--recipient", recipient, "--worker-id", recipient, expected=EXIT_OK)
-        assert lease["message_id"] == sent[recipient]
+        assert lease["message_id"] == sent[key]
         fence = ["--worker-id", recipient, "--fence-token", str(lease["fence_token"])]
         return deliveries("ack", lease["delivery_id"], *fence, expected=expected)
 
-    assert claim_and_ack("claude-cto", EXIT_OK)["state"] == "acknowledged"
-    assert claim_and_ack("epics", EXIT_OK)["state"] == "acknowledged"
-    assert claim_and_ack("claude-infra", EXIT_ERROR)["error"] == "supervisory_consumption_required"
+    assert claim_and_ack("claude-cto", "relaunch-held-infra-1", EXIT_OK)["state"] == "acknowledged"
+    assert claim_and_ack("claude-cto", "handoff-alert-infra-1", EXIT_OK)["state"] == "acknowledged"
+    assert claim_and_ack("claude-infra", "claude-handoff-infra-1", EXIT_ERROR)["error"] == (
+        "supervisory_consumption_required"
+    )
 
 
-def test_stuck_handoff_alerts_epics_once_without_killing(tmp_path: Path) -> None:
+def test_stuck_handoff_alerts_the_cto_once_without_killing(tmp_path: Path) -> None:
     h = Harness(tmp_path, **{"infra-muse": claude_pane(70, busy=True)})
     h.tick("infra-muse")
     for _ in range(7):  # 35 minutes, busy and never done
         h.advance(5)
         h.tick("infra-muse")
-    alerts = [body for recipient, body in h.sent if recipient == "epics"]
+    alerts = [body for recipient, body in h.sent if recipient == "claude-cto" and "handoff still incomplete" in body]
     assert len(alerts) == 1 and alerts[0].startswith("CTO-ALERT") and "no forced kill" in alerts[0]
     assert "/exit" not in h.fake.typed("infra-muse")
 

@@ -14,6 +14,8 @@ import pytest
 from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 
+pytestmark = pytest.mark.usefixtures("placeholder_seats_registered")
+
 
 @pytest.fixture
 def plane(tmp_path, monkeypatch):

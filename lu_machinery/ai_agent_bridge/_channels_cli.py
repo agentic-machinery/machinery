@@ -1840,8 +1840,9 @@ def _handle_discuss(args) -> int:
 
     # ── post the root question ────────────────────────────────────
     # NOTE: do NOT pass to_agents here — discuss handles fanout itself
-    # via runtime_invoke. Passing to_agents would create pending delivery
-    # rows that the inbox worker would process redundantly.
+    # via runtime_invoke. The root names no recipient (an empty tuple, not
+    # None, so channel subscribers get no fan-out either): a participant is a
+    # provider seat no drain reads, so a delivery to it is never read (#594).
     from lu_machinery.fleet_comms.authority import AuthorityService
 
     authority = AuthorityService()
@@ -1851,7 +1852,7 @@ def _handle_discuss(args) -> int:
             sender=discussion_source,
             body=body,
             channel=args.channel,
-            recipients=with_agents,
+            recipients=(),
             kind="discussion-root",
             provenance={
                 "Source": discussion_source,

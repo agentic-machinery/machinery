@@ -33,6 +33,8 @@ from lu_machinery.fleet_comms.routing_reservations import (
     RoutingSelection,
 )
 
+pytestmark = pytest.mark.usefixtures("placeholder_seats_registered")
+
 
 class _UnusedExecutor:
     """Enough of the executor contract for mode-only tests."""

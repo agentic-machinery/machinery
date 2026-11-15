@@ -504,10 +504,16 @@ def collect_efficiency_metrics_authority(plane_db: Path, *, now: datetime | None
     return metrics
 
 
+_REQUEST_MESSAGE_RECIPIENT = (
+    "(SELECT m.recipient FROM comms_messages m WHERE m.message_id = j.subject_id AND j.job_kind = 'request')"
+)
+
+
 def _authority_failure_windows(conn: Any, *, now: datetime | None = None) -> dict[str, Any]:
     """Count terminal events, not creation cohorts; never read message bodies.
 
-    Jobs with exactly one message recipient inherit it. Other jobs use the
+    Jobs with exactly one message recipient inherit it (a request message names
+    it and has no delivery since #594; older ones also had one). Other jobs use the
     explicit authority-job bucket, keeping each event in exactly one group.
     Dead letters with reason ``expired_by_cleanup`` (``authority.CLEANUP_EXPIRY_REASON``)
     record a deliberate operator cleanup, not a failure, and are not counted.
@@ -518,15 +524,20 @@ def _authority_failure_windows(conn: Any, *, now: datetime | None = None) -> dic
     deliveries = _table_exists(conn, "authority_deliveries")
     jobs = _table_exists(conn, "authority_jobs")
     job_columns = _column_names(conn, "authority_jobs") if jobs else set()
+    # A request message names its recipient; since #594 it has no delivery to name it.
+    message_recipient = (
+        _REQUEST_MESSAGE_RECIPIENT if _table_exists(conn, "comms_messages") else "NULL"
+    )
     sources = {}
     if deliveries:
         sources["failed_deliveries"] = """SELECT recipient, COALESCE(completed_at, updated_at) AS event_time
             FROM authority_deliveries WHERE state = 'failed'"""
     if jobs:
         sources["failed_jobs"] = (
-            """SELECT (SELECT CASE WHEN COUNT(DISTINCT recipient) = 1
+            f"""SELECT COALESCE({message_recipient},
+                (SELECT CASE WHEN COUNT(DISTINCT recipient) = 1
                 THEN MIN(recipient) ELSE 'authority-job' END FROM authority_deliveries
-                WHERE message_id = j.subject_id AND j.job_kind = 'request') AS recipient,
+                WHERE message_id = j.subject_id AND j.job_kind = 'request')) AS recipient,
                 COALESCE(j.completed_at, j.updated_at) AS event_time
                 FROM authority_jobs j WHERE j.state = 'failed'"""
             if deliveries and {"subject_id", "job_kind", "completed_at"} <= job_columns else
@@ -538,31 +549,34 @@ def _authority_failure_windows(conn: Any, *, now: datetime | None = None) -> dic
         )
     if _table_exists(conn, "authority_dead_letters"):
         sources["dead_letters"] = (
-            """SELECT COALESCE(d.recipient,
+            f"""SELECT COALESCE(d.recipient, {message_recipient},
                 (SELECT CASE WHEN COUNT(DISTINCT recipient) = 1 THEN MIN(recipient)
                     ELSE 'authority-job' END FROM authority_deliveries
                     WHERE message_id = j.subject_id AND j.job_kind = 'request')) AS recipient,
-                l.created_at AS event_time
+                l.created_at AS event_time, l.reason_code AS reason_code, l.job_id AS job_id
                 FROM authority_dead_letters l
                 LEFT JOIN authority_deliveries d ON d.delivery_id = l.delivery_id
                 LEFT JOIN authority_jobs j ON j.job_id = l.job_id
                 WHERE l.reason_code <> 'expired_by_cleanup'"""
             if deliveries and {"subject_id", "job_kind"} <= job_columns else
-            """SELECT COALESCE(d.recipient, 'authority-job') AS recipient, l.created_at AS event_time
+            """SELECT COALESCE(d.recipient, 'authority-job') AS recipient, l.created_at AS event_time,
+                l.reason_code AS reason_code, l.job_id AS job_id
                 FROM authority_dead_letters l
                 LEFT JOIN authority_deliveries d ON d.delivery_id = l.delivery_id
                 WHERE l.reason_code <> 'expired_by_cleanup'"""
             if deliveries else
-            """SELECT 'authority-job' AS recipient, created_at AS event_time FROM authority_dead_letters
-                WHERE reason_code <> 'expired_by_cleanup'"""
+            """SELECT 'authority-job' AS recipient, created_at AS event_time, reason_code, job_id
+                FROM authority_dead_letters WHERE reason_code <> 'expired_by_cleanup'"""
         )
     # The same UTC parser handles SQLite text and PostgreSQL lifecycle text.
-    # All queries are literals; no identifiers or values are interpolated.
+    # Queries are literals plus the constant fragment above; no identifiers or values are interpolated.
     cutoffs = {"24h": now - timedelta(days=1), "7d": now - timedelta(days=7)}
     for metric, query in sources.items():
         lifetime[metric] = 0
         for label in cutoffs:
             windows[label][metric] = {"total": 0, "by_recipient": {}}
+            if metric == "dead_letters":
+                windows[label][metric]["by_cause"] = dict.fromkeys(DEAD_LETTER_CAUSES, 0)
         for row in conn.execute(query):
             lifetime[metric] += 1
             event_time = _parse_timestamp(row["event_time"])
@@ -575,7 +589,32 @@ def _authority_failure_windows(conn: Any, *, now: datetime | None = None) -> dic
                     recipient = str(row["recipient"])
                     grouped = bucket["by_recipient"]
                     grouped[recipient] = grouped.get(recipient, 0) + 1
+                    if "by_cause" in bucket:
+                        cause = dead_letter_cause(row["reason_code"], is_job=row["job_id"] is not None)
+                        bucket["by_cause"][cause] += 1
     return {"failure_windows": windows, "failure_lifetime": lifetime}
+
+
+DEAD_LETTER_CAUSES = (
+    "recipient_not_registered", "recipient_settled", "attempts_exhausted", "expired_unread",
+    "worker_failed", "job_expired", "other",
+)
+"""Failure causes of a dead letter, in display order (#594); ``other`` keeps every row counted once."""
+
+_DELIVERY_DEAD_LETTER_CAUSES = {
+    "recipient_not_registered": "recipient_not_registered",
+    "recipient_settled": "recipient_settled",
+    "attempts_exhausted": "attempts_exhausted",
+    "deadline_expired": "expired_unread",
+    "worker_failed": "worker_failed",
+}
+
+
+def dead_letter_cause(reason_code: object, *, is_job: bool) -> str:
+    """Map a stored dead-letter ``reason_code`` to its display cause; a job's deadline is ``job_expired``."""
+    if is_job:
+        return "job_expired" if reason_code == "deadline_expired" else "other"
+    return _DELIVERY_DEAD_LETTER_CAUSES.get(str(reason_code), "other")
 
 
 def _parse_timestamp(value: object) -> datetime | None:

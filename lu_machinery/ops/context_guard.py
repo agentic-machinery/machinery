@@ -25,7 +25,7 @@ handoff
     "Exit and stop tasks", with the same human and snapshot guards; the next
     tick's dialog check remains the fallback. A failing anchor check sends the
     lane back with the missing sections and counts instead of exiting; the check
-    is bounded and alerts ``epics`` once per distinct failure. A check error or a missing handoff fails
+    is bounded and alerts ``claude-cto`` once per distinct failure. A check error or a missing handoff fails
     open, with one alert, so the anchor check can never wedge a lane. Once
     HANDOFF-DONE has been seen and the agent and its launcher have exited, the
     pane is respawned with the lane's launcher
@@ -43,7 +43,7 @@ handoff
     A scope that was never recorded, or whose state cannot be read, holds the relaunch and
     alerts ``claude-cto`` after ``UNKNOWN_SCOPE_ALERT_SECONDS``; it never relaunches blind. A completed relaunch alerts
     ``claude-cto`` once with a redacted pane tail. Other stalled handoffs alert
-    ``epics`` once after ``handoff_alert_seconds``. After a respawn it
+    ``claude-cto`` once after ``handoff_alert_seconds``. After a respawn it
     watches the launcher; a non-zero launcher exit alerts once with the pane's
     stderr tail and is not relaunched in a loop. The one exception is the
     launcher's single-instance refusal (rc 3 with its "process is still running"
@@ -150,8 +150,8 @@ SINGLE_INSTANCE_REFUSAL_RE = re.compile(r"refused: .*process is still running")
 RELAUNCH_TAIL_LINES = 6
 ALERT_DETAIL_CHARS = 600
 # Fleet Comms message kinds, one per send. Only the launcher watcher consumes a supervisory
-# request, so it carries only the handoff request to a driver seat. An alert to claude-cto or
-# epics is an ordinary request that the CTO seat claims and acknowledges (#12837).
+# request, so it carries only the handoff request to a driver seat. An alert to claude-cto
+# is an ordinary request that the CTO seat claims and acknowledges (#12837).
 HANDOFF_REQUEST = "supervisory-request"
 ALERT = "request"
 # A lead lane (the CTO) whose session is missing alerts claude-cto after this long, then hourly.
@@ -505,7 +505,7 @@ class Guard:
             f"HANDOFF NOW ({again}CTO automated, {iso(self.now())}): {reason} Finish the current step only, "
             f"write the top of {lane.goal} (in-flight workers with task ids, waits with nonces, PRs, holds, "
             f"orders and their status, next actions), {stop_tasks}post 'HANDOFF-DONE {lane.name} {lane.goal}' to Fleet "
-            "Comms recipient epics, then stop. The guard exits and relaunches your seat; running workers keep "
+            "Comms recipient claude-cto, then stop. The guard exits and relaunches your seat; running workers keep "
             "running and the fresh session adopts them."
         )
 
@@ -632,7 +632,7 @@ class Guard:
         phase start (``since``) so a later phase is a new occurrence.
         """
         phase = s.get("since") or iso(self.now())
-        self.send("epics", body, f"{key}-{phase}", ALERT)
+        self.send("claude-cto", body, f"{key}-{phase}", ALERT)
         alerts = s.setdefault("anchor_alerts", [])
         if key not in alerts:
             alerts.append(key)
@@ -895,7 +895,7 @@ class Guard:
         s["relaunch_hold"] = rc
         self.log(f"{lane.name} watch: relaunched launcher exited rc={rc}; alerting once, no relaunch loop")
         self.send(
-            "epics",
+            "claude-cto",
             f"CTO-ALERT {iso(self.now())}: {lane.name} launcher exited rc={rc} after relaunch; "
             f"pane left as is (no relaunch loop). stderr tail: {tail or '(none captured)'}",
             # Keyed on the relaunch occurrence: a fixed key makes the Fleet plane
@@ -1063,7 +1063,7 @@ class Guard:
     def _stall_alert(self, lane: Lane, s: dict[str, Any], waited: int) -> None:
         if waited > self.setting("handoff_alert_seconds") and not s.get("alerted"):
             self.send(
-                "epics",
+                "claude-cto",
                 f"CTO-ALERT {iso(self.now())}: {lane.name} handoff still incomplete {waited}s after HANDOFF NOW; "
                 f"no forced kill. Check tmux session {lane.session}",
                 f"handoff-alert-{lane.name}-{iso(self.now())}",

@@ -38,3 +38,22 @@ def isolate_fleet_comms_pg(request: pytest.FixtureRequest, monkeypatch: pytest.M
     """Route marked PG cases, including direct psycopg connections, to the database."""
     if request.node.get_closest_marker("postgres") and os.environ.get(_PG_DSN_ENV, "").strip():
         monkeypatch.setenv(_PG_DSN_ENV, request.getfixturevalue("fleet_comms_pg_dsn"))
+
+
+# Placeholder seats the delivery-mechanics suites address; none is a registered slot or a task.
+PLACEHOLDER_SEATS = frozenset({
+    "agy", "claude", "codex", "cursor", "driver", "glm", "grok", "other", "worker", "worker-task",
+})
+
+
+@pytest.fixture
+def placeholder_seats_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat PLACEHOLDER_SEATS as registered readers on top of the real slot roster (#594).
+
+    For suites that test leases, fences and fan-out rather than recipient
+    admission; the admission suites use the real roster.
+    """
+    from lu_machinery.fleet_comms import authority
+
+    real = authority._registered_recipients
+    monkeypatch.setattr(authority, "_registered_recipients", lambda: real() | PLACEHOLDER_SEATS)
