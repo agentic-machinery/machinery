@@ -356,34 +356,15 @@ def regular_file(path: Path) -> tuple[bytes, int] | None:
         return None
 
 
-def blob_id(data: bytes, object_format: str) -> str:
-    """Git's object id for a blob holding ``data``, in the repository's object format."""
-    return hashlib.new(object_format, b"blob %d\0" % len(data) + data).hexdigest()
-
-
-def committed_blobs(paths: list[str], *, root: Path) -> tuple[str, dict[str, str]] | None:
-    """``(object format, {path: blob id})`` for the regular-file entries HEAD holds at ``paths``."""
-    object_format = (git_ok("rev-parse", "--show-object-format", cwd=root) or "").strip()
-    records = git_records("--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", *paths, cwd=root) if paths else []
-    if object_format not in ("sha1", "sha256") or records is None:
-        return None
-    blobs: dict[str, str] = {}
-    for record in records:
-        meta, _, name = record.partition("\t")
-        fields = meta.split(" ")
-        if len(fields) == 3 and fields[1] == "blob" and fields[0] in ("100644", "100755"):
-            blobs[name] = fields[2]
-    return object_format, blobs
-
-
-def checked_deploy_manifest(root: Path) -> tuple[bytes | None, str]:
-    """``(manifest, why not)``: the ownership manifest the installed deploy's ``--check`` recomposed.
+def checked_deploy_manifest(root: Path, head: str) -> tuple[bytes | None, str]:
+    """``(manifest, why not)``: the ownership manifest the installed deploy's check composed from ``head``.
 
     The check runs in this interpreter (the project interpreter that runs the gate), isolated (``-I``:
-    no checkout directory, ``PYTHONPATH`` or user site on its import path). It recomposes the plan from
-    the installed release and the checkout's sources, verifies every planned output and the checkout's
-    manifest, writes nothing, and prints the manifest it recomposed. The checkout's own manifest file is
-    never read here, so a worker who swaps it while the check runs gains nothing.
+    no checkout directory, ``PYTHONPATH`` or user site on its import path). ``--inputs-commit`` makes it
+    read the descriptor and product sources from the outgoing commit's objects, which no write to the
+    checkout can change while it runs; with the installed release that fixes the plan. It verifies every
+    planned output and the checkout's manifest against that plan, writes nothing, and prints the plan's
+    manifest. The gate never reads the checkout's manifest file itself.
     """
     command = [
         sys.executable,
@@ -394,6 +375,8 @@ def checked_deploy_manifest(root: Path) -> tuple[bytes | None, str]:
         str(root),
         "--check",
         "--print-manifest",
+        "--inputs-commit",
+        head,
     ]
     try:
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
@@ -435,52 +418,38 @@ def manifest_records(manifest: bytes) -> dict[str, dict[str, object]] | None:
     return files
 
 
-def verified_deploy_outputs(paths: list[str], *, root: Path) -> tuple[set[str], str | None, str]:
+def verified_deploy_outputs(paths: list[str], *, root: Path, head: str) -> tuple[set[str], str | None, str]:
     """``(proven, manifest digest, why not)``: the ``paths`` the installed deploy verifies as its outputs.
 
-    A path is proven only when the check passes and the path is a regular file (no final symlink) whose
-    SHA-256 and mode equal the record in the manifest the check recomposed. A product-owned record must
-    also name a source whose blob in the outgoing commit holds those bytes, so a source edited for the
-    length of the check and restored proves nothing; release-owned bytes come from the installed release.
-    A check that fails or cannot run, or a manifest without valid records, proves nothing, and the
-    reason says which.
+    A path is proven only when the check of the plan composed from ``head`` passes and the path is a
+    regular file (no final symlink) whose SHA-256 and mode equal its record in the manifest the check
+    printed. A check that fails or cannot run, or a manifest without valid records, proves nothing, and
+    the reason says which.
     """
     if not any(is_deploy_output(path) for path in paths):
         return set(), None, ""
-    manifest, unverified = checked_deploy_manifest(root)
+    manifest, unverified = checked_deploy_manifest(root, head)
     if manifest is None:
         return set(), None, unverified
     records = manifest_records(manifest)
     if records is None:
         return set(), None, "the deploy check printed no valid ownership manifest"
-    candidates = {}
+    proven = set()
     for path in paths:
         record = records.get(path) if is_deploy_output(path) else None
         found = regular_file(root / path) if record is not None else None
         if found is not None and (hashlib.sha256(found[0]).hexdigest(), found[1]) == (record["sha256"], record["mode"]):
-            candidates[path] = (found[0], record)
-    sources = sorted({str(record["source"]) for _, record in candidates.values() if record["owner"] == "product"})
-    committed = committed_blobs(sources, root=root)
-    if committed is None:
-        return set(), None, "cannot read the outgoing commit's agent extension sources"
-    object_format, blobs = committed
-    proven = {
-        path
-        for path, (data, record) in candidates.items()
-        if record["owner"] == "fleet" or blobs.get(str(record["source"])) == blob_id(data, object_format)
-    }
-    unverified = (
-        "a product-owned copy differs from its source in the outgoing commit" if proven != set(candidates) else ""
-    )
-    return proven, hashlib.sha256(manifest).hexdigest(), unverified
+            proven.add(path)
+    return proven, hashlib.sha256(manifest).hexdigest(), ""
 
 
-def reject_untracked_inputs(root: Path) -> str | None:
+def reject_untracked_inputs(root: Path, head: str | None = None) -> str | None:
     """Refuse when untracked or ignored Python/config files could change the run but not the receipt.
 
     Two derived sets are not overlays: dependency directories proven by their lockfile, and current
-    outputs of the installed agent deploy that its own check verifies (machinery#22). Returns the
-    digest of the verified deploy manifest when that set was used, for the receipt, else ``None``.
+    outputs of the installed agent deploy that its own check verifies against the plan of the outgoing
+    commit ``head`` (default: ``HEAD``; machinery#22). Returns the digest of the verified deploy
+    manifest when that set was used, for the receipt, else ``None``.
     """
     # Names stay byte for byte (``git_records``): a text-mode read turns CR and CRLF into LF, so a
     # deployed output would be looked up under, and hashed from, another name than the one Git listed.
@@ -495,7 +464,9 @@ def reject_untracked_inputs(root: Path) -> str | None:
             raise GateOutcome("state_unavailable", "cannot list tracked dependency inputs", incomplete=True)
         tracked = set(tracked_listing)
     overlays = [path for path in candidates if not is_regenerable_dependency_input(path, root=root, tracked=tracked)]
-    outputs, manifest, unverified = verified_deploy_outputs(overlays, root=root)
+    if head is None and any(is_deploy_output(path) for path in overlays):
+        head = (git_ok("rev-parse", "--verify", "HEAD^{commit}", cwd=root) or "").strip()
+    outputs, manifest, unverified = verified_deploy_outputs(overlays, root=root, head=head or "")
     overlays = sorted(path for path in overlays if path not in outputs)
     if overlays:
         shown = ", ".join(overlays[:10]) + (f" (+{len(overlays) - 10} more)" if len(overlays) > 10 else "")
@@ -526,7 +497,7 @@ def build_plan(update: Update, root: Path, launcher: str, config: str) -> Plan |
     dirty = git_records("status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", cwd=root)
     if dirty is None or dirty:
         raise GateOutcome("dirty_tree", "tracked files differ from the outgoing commit; commit or restore them first")
-    deploy_manifest = reject_untracked_inputs(root)
+    deploy_manifest = reject_untracked_inputs(root, head)
     base, base_fallback = outgoing_base(update, root)
     if base == head and base_fallback is None:  # only a remote tip equal to the head is nothing outgoing
         return None

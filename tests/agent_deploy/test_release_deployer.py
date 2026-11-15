@@ -787,10 +787,9 @@ def test_deployed_output_edited_after_deploy_is_refused(deployed, monkeypatch, c
     elif change == "mode-changed-after-deploy":
         (deployed / changed).chmod(0o644)
     elif change == "source-edited-during-check":
-        # The source holds other bytes only while the check reads it: the copy matches the plan, not the commit.
+        # The source holds other bytes while the check runs: the copy matches that edit, not the commit.
         source.write_bytes(GATE_PRODUCT_HOOK + b"print('uncommitted')\n")
         deploy_cli(deployed)
-        cause = "a product-owned copy differs from its source in the outgoing commit"
     else:
         changed = changed if change == "product-copy" else release_hook()
         cause = f"output drift: {changed}"
@@ -817,6 +816,7 @@ def test_unplanned_file_in_provider_directory_is_refused(deployed, monkeypatch, 
     ("check-cannot-run", "the deploy check exited 3"),
     ("forged-manifest-on-disk", "the deploy check exited 1"),
     ("manifest-swapped-back-during-check", ".claude/extra.py"),
+    ("descriptor-redirected-during-check", ".claude/extra.py"),
     ("symlinked-copy", "the deploy check exited 2"),
 ])
 def test_failed_deploy_check_keeps_provider_files_refused(deployed, monkeypatch, tmp_path, failure, cause):
@@ -840,6 +840,17 @@ def test_failed_deploy_check_keeps_provider_files_refused(deployed, monkeypatch,
             swap = (f'#!/bin/sh\ncp "{genuine}" "{state}"\n"{sys.executable}" "$@"\nstatus=$?\n'
                     f'cp "{forged}" "{state}"\nexit $status\n')
             monkeypatch.setattr(gate.sys, "executable", str(write(tmp_path, "swapping.sh", swap, 0o755)))
+    elif failure == "descriptor-redirected-during-check":
+        # A committed directory the outgoing descriptor never deploys; the descriptor names it only while
+        # the check runs, and the outputs and manifest are the ones that redirected descriptor plans.
+        write(deployed, "tools/settings.json", (deployed / "agents_extensions/claude/settings.json").read_bytes())
+        write(deployed, "tools/extra.py", "value = 1\n")
+        commit_all(deployed, "an undeployed committed directory")
+        descriptor_path = deployed / plan.DESCRIPTOR
+        committed = descriptor_path.read_bytes()
+        descriptor_path.write_bytes(committed.replace(b'"agents_extensions/claude"', b'"tools"'))
+        deploy_cli(deployed)
+        assert (deployed / ".claude/extra.py").is_file()
     else:
         copy = deployed / ".claude/hooks/product.py"
         target = write(tmp_path, "product-copy.py", copy.read_bytes(), 0o755)
@@ -869,3 +880,23 @@ def test_print_manifest_is_the_recomposed_plan_not_the_checkout_copy(deployed):
     (deployed / plan.STATE).write_bytes(genuine)
     printed = deploy_cli(deployed, "--check", "--print-manifest")
     assert ".claude/extra.py" not in json.loads(printed)["files"]
+
+
+def test_inputs_commit_plans_from_the_commit_not_the_checkout(deployed):
+    """The plan printed with --inputs-commit must come from the commit, never from checkout inputs."""
+    head = subprocess.run(["git", "-C", str(deployed), "rev-parse", "HEAD"], capture_output=True, text=True,
+                          check=True, env=git_environment()).stdout.strip()
+    committed = deploy_cli(deployed, "--check", "--print-manifest", "--inputs-commit", head)
+    assert committed.encode() == (deployed / plan.STATE).read_bytes()
+    descriptor_path = deployed / plan.DESCRIPTOR
+    descriptor_path.write_bytes(descriptor_path.read_bytes().replace(b'"required": true', b'"required": false'))
+    (deployed / "agents_extensions/claude/hooks/product.py").write_bytes(GATE_PRODUCT_HOOK + b"print('edit')\n")
+    write(deployed, "agents_extensions/claude/hooks/added.py", GATE_PRODUCT_HOOK, 0o755)
+    assert deploy_cli(deployed, "--check", "--print-manifest", "--inputs-commit", head) == committed
+    tree = subprocess.run(["git", "-C", str(deployed), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
+                          check=True, env=git_environment()).stdout.strip()
+    for oid in (tree, head[:12]):
+        refused = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root",
+                                  str(deployed), "--check", "--inputs-commit", oid], capture_output=True, text=True,
+                                 env=git_environment(), check=False)
+        assert refused.returncode == 2 and "invalid deployment" in refused.stderr, refused.stderr

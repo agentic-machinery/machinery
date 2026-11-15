@@ -14,6 +14,7 @@ import hashlib
 import importlib.resources as resources  # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -146,6 +147,13 @@ class Tree:
         except UnsafeEntryError as exc:
             raise Invalid("non-regular deployment output or parent: " + path) from exc
 
+    def has_directory(self, path: str) -> bool:
+        try:
+            with self.directory(path):
+                return True
+        except FileNotFoundError:
+            return False
+
     def inventory(self, path: str, *, exclude: Callable[[str], bool] | None = None) -> dict[str, tuple[bytes, int]]:
         found: dict[str, tuple[bytes, int]] = {}
         def visit(fd: int, prefix: str) -> None:
@@ -207,6 +215,90 @@ class Tree:
         except OSError as exc:
             if exc.errno != errno.ENOTEMPTY:
                 raise
+
+
+class CommitInputs:
+    """Deployment inputs read from one commit's Git objects (``--inputs-commit``), never the checkout.
+
+    Objects are immutable, so nothing written to the checkout while a check runs changes the plan
+    (machinery#22). Only regular-file entries count: a symlink, submodule or other entry is refused,
+    as the checkout inventory refuses one. Outputs, provider control files and the ownership manifest
+    are still read from the checkout ``Tree``.
+    """
+
+    def __init__(self, tree: Tree, commit: str):
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+            raise Invalid("--inputs-commit must be a full object name")
+        self.fd = tree.fd
+        if self.git("rev-parse", "--verify", "--end-of-options", commit + "^{commit}").decode().strip() != commit:
+            raise Invalid("--inputs-commit must name a commit")
+        self.commit = commit
+
+    def git(self, *args: str, stdin: bytes | None = None) -> bytes:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        result = subprocess.run(  # fixed git argv on the held checkout fd, no shell; object reads only
+            ["git", "-C", f"/proc/self/fd/{self.fd}", "--literal-pathspecs", *args],
+            pass_fds=(self.fd,), input=stdin, capture_output=True, check=False,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        )
+        if result.returncode:
+            raise Invalid("cannot read deployment inputs from the commit")
+        return result.stdout
+
+    def entries(self, path: str, *, recursive: bool) -> list[tuple[str, str, str, str]]:
+        listing = self.git("ls-tree", "-z", *(["-r"] if recursive else []), self.commit, "--", relative(path))
+        found = []
+        for record in listing.decode("utf-8", "surrogateescape").split("\0")[:-1]:
+            meta, _, name = record.partition("\t")
+            mode, kind, oid = meta.split(" ")
+            found.append((mode, kind, oid, name))
+        return found
+
+    def blobs(self, oids: list[str]) -> list[bytes]:
+        output = self.git("cat-file", "--batch", stdin="".join(oid + "\n" for oid in oids).encode()) if oids else b""
+        result, offset = [], 0
+        for oid in oids:
+            header_end = output.index(b"\n", offset)
+            header = output[offset:header_end].split(b" ")
+            if len(header) != 3 or header[0].decode() != oid or header[1] != b"blob":
+                raise Invalid("cannot read deployment inputs from the commit")
+            size = int(header[2])
+            result.append(output[header_end + 1:header_end + 1 + size])
+            offset = header_end + 1 + size + 1
+        return result
+
+    @staticmethod
+    def regular(mode: str, kind: str, path: str) -> int:
+        if kind != "blob" or mode not in {"100644", "100755"}:
+            raise Invalid("symlink or special file in deployment input: " + path)
+        return 0o755 if mode == "100755" else 0o644
+
+    def read(self, path: str) -> tuple[bytes, int] | None:
+        found = [entry for entry in self.entries(path, recursive=False) if entry[3] == path]
+        if not found:
+            return None
+        mode, kind, oid, _ = found[0]
+        permissions = self.regular(mode, kind, path)
+        return self.blobs([oid])[0], permissions
+
+    def has_directory(self, path: str) -> bool:
+        found = [entry for entry in self.entries(path, recursive=False) if entry[3] == path]
+        if found and found[0][1] != "tree":
+            raise Invalid("non-directory deployment path: " + path)
+        return bool(found)
+
+    def inventory(self, path: str) -> dict[str, tuple[bytes, int]]:
+        prefix = relative(path) + "/"
+        items = []
+        for mode, kind, oid, name in self.entries(path, recursive=True):
+            if not name.startswith(prefix):
+                raise Invalid("deployment input outside its source: " + name)
+            key = name[len(prefix):]
+            for part in key.split("/"):
+                relative(part)
+            items.append((key, oid, self.regular(mode, kind, name)))
+        contents = self.blobs([oid for _, oid, _ in items])
+        return {key: (blob, mode) for (key, _, mode), blob in zip(items, contents, strict=True)}
 
 
 @contextlib.contextmanager
@@ -315,8 +407,10 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
-def build(tree: Tree) -> Plan:
-    entry = tree.read(DESCRIPTOR)
+def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
+    """The plan for ``tree``, composed from ``inputs`` (the descriptor and product sources); default: ``tree``."""
+    inputs = tree if inputs is None else inputs
+    entry = inputs.read(DESCRIPTOR)
     if entry is None:
         raise Invalid("missing " + DESCRIPTOR)
     descriptor = decode(entry[0])
@@ -360,14 +454,11 @@ def build(tree: Tree) -> Plan:
         if any(source == p or source.startswith(p + "/") or p.startswith(source + "/") for p in used_sources):
             raise Invalid("overlapping product sources")
         used_sources.append(source)
-        try:
-            with tree.directory(source):
-                pass
-        except FileNotFoundError:
+        if not inputs.has_directory(source):
             if spec["required"]:
-                raise Invalid("missing required source: " + source) from None
+                raise Invalid("missing required source: " + source)
             continue
-        items = tree.inventory(source)
+        items = inputs.inventory(source)
         skills = {p.split("/")[1] for p in items if p.startswith("skills/") and len(p.split("/")) > 2}
         for name in skills:
             skill = items.get(f"skills/{name}/SKILL.md")
@@ -382,7 +473,7 @@ def build(tree: Tree) -> Plan:
                 raise Invalid("skill lint: " + "; ".join(errors))
             skill_names.add(name)
         # Product lint selection is code-side. Generic consumers never run curriculum checks.
-        if tree.read("curriculum/l2-uk-en/curriculum.yaml") is not None:
+        if inputs.read("curriculum/l2-uk-en/curriculum.yaml") is not None:
             from lu_machinery.lint.lint_prompts import RULES
             for path, (blob, _mode) in items.items():
                 if not path.endswith(".md") or not (path.startswith("skills/") or path.startswith("phases/")):
@@ -582,8 +673,8 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     return problems
 
 
-def deploy(tree: Tree, *, check: bool, print_manifest: bool = False) -> int:
-    plan = build(tree)
+def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None) -> int:
+    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:
