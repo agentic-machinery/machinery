@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from lu_machinery.api.fleet_workers_collect import UNATTRIBUTED_HOST_ID, reset_workers_payload_cache
@@ -19,11 +21,22 @@ from lu_machinery.api.occupancy_local import write_marker
 from lu_machinery.api.project_state_router import reset_local_document_cache
 from lu_machinery.api.project_state_store import reset_project_state_store
 
+@contextmanager
 def _snapshot_client(ctx=None):
     snapshot_app = FastAPI()
     snapshot_app.state.ctx = ctx or app.state.ctx
     snapshot_app.include_router(fleet_workers_router.router, prefix="/api/fleet")
-    return TestClient(snapshot_app)
+    with TestClient(snapshot_app) as running:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fleet_workers_router.workers_snapshot(snapshot_app.state.ctx).read()
+                break
+            except HTTPException as exc:
+                assert exc.status_code == 503
+                assert time.monotonic() < deadline, "initial snapshot did not become ready"
+                time.sleep(0.01)
+        yield running
 
 
 def _workers_get(path):

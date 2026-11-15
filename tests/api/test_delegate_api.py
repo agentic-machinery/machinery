@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI
+import pytest
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import lu_machinery.api.delegate_router as delegate_router
@@ -15,11 +18,24 @@ from lu_machinery.api.main import app
 client = TestClient(app, raise_server_exceptions=False)
 
 
+@contextmanager
 def _snapshot_client(ctx=None):
     snapshot_app = FastAPI()
     snapshot_app.state.ctx = ctx or app.state.ctx
     snapshot_app.include_router(delegate_router.router, prefix="/api/delegate")
-    return TestClient(snapshot_app)
+    with TestClient(snapshot_app) as running:
+        deadline = time.monotonic() + 5
+        for snapshot in (delegate_router.active_snapshot(snapshot_app.state.ctx),
+                         delegate_router.recent_snapshot(snapshot_app.state.ctx)):
+            while True:
+                try:
+                    snapshot.read()
+                    break
+                except HTTPException as exc:
+                    assert exc.status_code == 503
+                    assert time.monotonic() < deadline, "initial snapshot did not become ready"
+                    time.sleep(0.01)
+        yield running
 
 
 def _active_get():
@@ -777,6 +793,39 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
                 await closing
 
     asyncio.run(failing_collection_still_closes())
+
+    # A blocked first collection must leave unrelated routes available after
+    # the startup budget, with the existing retry response for its own panel.
+    from fastapi import FastAPI, HTTPException
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_initial():
+        entered.set()
+        assert release.wait(5), "initial collector was never released"
+        return {"ready": True}
+
+    cold = state_helpers.PeriodicSnapshot(slow_initial, 60)
+    cold_app = FastAPI(lifespan=lambda _: cold.lifespan())
+
+    @cold_app.get("/unrelated")
+    async def unrelated():
+        return {"responsive": True}
+
+    try:
+        with TestClient(cold_app) as running:
+            assert entered.wait(5)
+            assert not release.is_set()
+            with pytest.raises(HTTPException) as pending:
+                cold.read()
+            assert pending.value.status_code == 503
+            assert pending.value.headers["Retry-After"] == "2"
+            assert running.get("/unrelated").json() == {"responsive": True}
+            release.set()
+    finally:
+        release.set()
+    assert cold.read()[0] == {"ready": True}
 
 
 def test_snapshot_age_includes_collection_and_failed_refresh(tmp_path, monkeypatch):
