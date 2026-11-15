@@ -2310,35 +2310,74 @@ def _trusted_verdict_shas(comments: Sequence[Mapping[str, Any]], login: str) -> 
     return {marker["sha"] for _, marker in _trusted_markers(comments, login)}
 
 
-# A post-approval base update is one merge, or a few; a longer first-parent walk is not one.
-MAX_EXEMPT_BASE_MERGES = 10
+# Only these generated receipts may differ from Git's remerge result. Keep this
+# explicit: an arbitrary .sha256 file is not proof of generated content.
+CLEAN_MERGE_GENERATED_FILES = frozenset({"lu_machinery/lint/rename-map.json.sha256"})
 
 
 def clean_base_merge_descent(repo_root: Path, *, approved: str, head: str, base_tip: str) -> list[str] | None:
     """The base commits ``head`` merges after ``approved``, when that is all it adds; else None.
 
-    Every commit on the first-parent path from ``head`` back to ``approved``
-    must be a Git-proven conflict-free merge of the base branch
-    (:func:`_clean_merge_source`): its second parent is on ``base_tip`` and its
-    tree is exactly Git's merge of its parents. A missing object, a conflict, a
-    manual edit in a merge, any other commit, a path longer than
-    ``MAX_EXEMPT_BASE_MERGES`` or a proof error proves nothing.
+    The head must be one two-parent merge directly after ``approved``, with
+    its second parent on ``base_tip``. Git's merge conflicts and remerge diff
+    may name only explicitly listed, verified generated receipts. This
+    budget-only proof does not change the stricter merge proof used for author
+    attribution. Missing objects, real conflict resolutions and proof errors
+    grant no exemption.
     """
-    merged: list[str] = []
-    current = head
     deadline = time.monotonic() + BRANCH_FACTS_TIMEOUT_S
     try:
-        while current != approved:
-            if len(merged) >= MAX_EXEMPT_BASE_MERGES:
+        entry = _read_commit_entries(repo_root, [head], deadline=deadline)[0]
+        parents = [parent["sha"] for parent in entry["parents"]]
+        if len(parents) != 2 or parents[0] != approved:
+            return None
+        with isolated_object_store(repo_root) as env:
+            ancestry = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", parents[1], base_tip],
+                env=env, capture_output=True, check=False, timeout=30,
+            )
+            if ancestry.returncode != 0:
                 return None
-            entry = _read_commit_entries(repo_root, [current], deadline=deadline)[0]
-            if _clean_merge_source(entry, base_tip, checkout=repo_root) != CLEAN_BASE_MERGE:
+            # Binary-ours and modify/delete conflicts can have no remerge-diff
+            # names when Git's conflicted tree already matches the commit.
+            merge = subprocess.run(
+                ["git", "merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", *parents],
+                env=env, capture_output=True, check=False, timeout=30,
+            )
+            if merge.returncode not in (0, 1):
                 return None
-            merged.append(entry["parents"][1]["sha"])
-            current = entry["parents"][0]["sha"]
-    except RecordError:
+            fields = merge.stdout.decode("utf-8").split("\0")
+            if len(fields) < 2 or fields[-1] != "" or not SHA.fullmatch(fields[0]):
+                return None
+            conflicted = set(fields[1:-1])
+            if bool(conflicted) != (merge.returncode == 1):
+                return None
+            if not conflicted <= CLEAN_MERGE_GENERATED_FILES:
+                return None
+            diff = subprocess.run(
+                ["git", "show", "--remerge-diff", "--format=", "--name-only", "-z",
+                 "--no-renames", "--no-ext-diff", "--no-textconv", head, "--"],
+                env=env, capture_output=True, check=True, timeout=30,
+            )
+            changed = set(diff.stdout.decode("utf-8").split("\0")) - {""}
+            if not changed <= CLEAN_MERGE_GENERATED_FILES:
+                return None
+            for receipt in changed | conflicted:
+                source = receipt.removesuffix(".sha256")
+                content = subprocess.run(
+                    ["git", "cat-file", "blob", f"{head}:{source}"],
+                    env=env, capture_output=True, check=True, timeout=30,
+                ).stdout
+                recorded = subprocess.run(
+                    ["git", "cat-file", "blob", f"{head}:{receipt}"],
+                    env=env, capture_output=True, check=True, timeout=30,
+                ).stdout
+                expected = f"{hashlib.sha256(content).hexdigest()}  {Path(source).name}\n".encode("ascii")
+                if recorded != expected:
+                    return None
+    except (RecordError, OSError, subprocess.SubprocessError, UnicodeError):
         return None
-    return merged or None
+    return [parents[1]]
 
 
 def _clean_merge_descent_prover(
@@ -2415,12 +2454,14 @@ def budget_exempt_heads(
     """The reviewed heads, and ``sha``, that consume no review round, each with its receipt.
 
     A head is exempt when it descends from the last fully approved head before
-    its first verdict only through clean merges of the base branch (``prove``,
+    its first verdict through one clean merge of the base branch (``prove``,
     :func:`clean_base_merge_descent`). A head dispatched for review with no
     recorded verdict (``unrecorded``) is weighed like ``sha``, against the last
     fully approved head on record. The exemption changes accounting only:
     every head still needs its own exact-head verdict, no approval carries
-    forward, a recorded rejection stands, and no verdict is dropped. Exemptions
+    forward, a recorded rejection stands, and no verdict is dropped. Each
+    approved anchor grants at most one exempt head. A further merge needs a
+    new exact-head approval first; unreviewed merges cannot chain. Exemptions
     are re-proven from Git on every call, so a head whose proof is lost counts.
     """
     markers = _trusted_markers(comments, login)
@@ -2430,6 +2471,7 @@ def budget_exempt_heads(
     order = sorted(first.items(), key=lambda item: item[1])
     order.extend((head, len(comments)) for head in dict.fromkeys([*sorted(unrecorded), sha]) if head not in first)
     exempt: dict[str, dict[str, Any]] = {}
+    used_anchors: set[str] = set()
     for head, start in order:
         prefix = comments[:start]
         latest: dict[str, int] = {}
@@ -2446,11 +2488,12 @@ def budget_exempt_heads(
             if _fully_approved(prefix, candidate, login, **context):
                 anchor = candidate
                 break
-        if anchor is None:
+        if anchor is None or anchor in used_anchors:
             continue
         merges = prove(anchor, head)
         if merges:
             exempt[head] = {"approved_head": anchor, "base_merges": merges}
+            used_anchors.add(anchor)
     return exempt
 
 

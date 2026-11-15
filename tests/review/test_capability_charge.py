@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 
 import pytest
 
@@ -25,6 +27,124 @@ from tests.review.record_support import (
 H1, H2, H3, NEXT = "1" * 40, "2" * 40, "3" * 40, "4" * 40
 R3_STARTED = "2026-09-23T10:00:00.000001+00:00"
 STAMP = "2026-09-23T10:30:00Z"
+
+
+@pytest.fixture
+def budget_merge_repo(tmp_path):
+    """Real Git objects, including a hash conflict over an otherwise clean merge."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+               GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
+               GIT_COMMITTER_NAME="Test", GIT_COMMITTER_EMAIL="test@example.invalid")
+
+    def git(*args, input=None):
+        return subprocess.run(
+            ["git", "-C", str(tmp_path), *args], input=input, env=env,
+            check=True, capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+
+    git("init", "-q")
+
+    def commit(files, *parents):
+        git("read-tree", "--empty")
+        for path, content in files.items():
+            blob = git("hash-object", "-w", "--stdin", input=content)
+            git("update-index", "--add", "--cacheinfo", f"100644,{blob},{path}")
+        tree = git("write-tree")
+        return git("commit-tree", tree, *(arg for parent in parents for arg in ("-p", parent)), input="fixture\n")
+
+    source = "lu_machinery/lint/rename-map.json"
+    digest = source + ".sha256"
+
+    def files(left, right, code="original\n"):
+        content = json.dumps({"left": left, "padding": [1, 2, 3, 4, 5], "right": right}, indent=2) + "\n"
+        return {source: content, digest: hashlib.sha256(content.encode()).hexdigest() + "  rename-map.json\n",
+                "code.py": code}
+
+    root = commit(files(0, 0))
+    approved = commit(files(1, 0), root)
+    base = commit(files(0, 1), root)
+    candidate = commit(files(1, 1), approved, base)
+    return tmp_path, git, commit, files, root, approved, base, candidate
+
+
+def test_clean_generated_hash_merge_gets_one_delta_outside_spent_budget(budget_merge_repo):
+    """Defect class: generated-hash regeneration consumes a round, or unreviewed merges chain."""
+    repo, git, commit, files, _root, approved, base, candidate = budget_merge_repo
+    assert git("show", "--remerge-diff", "--format=", "--name-only", candidate) == (
+        "lu_machinery/lint/rename-map.json.sha256"
+    )
+    comments = [recorded_verdict(H1, "CHANGES_REQUESTED", task_id="r1"),
+                recorded_verdict(H2, "CHANGES_REQUESTED", task_id="r2"),
+                recorded_verdict(approved, "APPROVED", task_id="r3")]
+    def prove(anchor, head):
+        return recorder.clean_base_merge_descent(repo, approved=anchor, head=head, base_tip=base)
+    receipt = recorder.require_review_round_within_budget(
+        comments, candidate, "fleet", budget=3, pr=42, prove_merge_only=prove,
+        repair_heads=frozenset({"f" * 40}),
+    )
+    assert receipt == {"budget_exemption": {"reason": recorder.CLEAN_BASE_MERGE,
+                                           "approved_head": approved, "base_merges": [base]}}
+    assert not recorder._fully_approved(comments, candidate, "fleet")
+    # An intervening commit, even with the same tree, is not a direct base merge.
+    extra = commit(files(1, 0), approved)
+    indirect = commit(files(1, 1), extra, base)
+    assert prove(approved, indirect) is None
+    # Another merge cannot chain before the delta receives its own approval.
+    newer_base = commit(files(0, 1, "base update\n"), base)
+    chained = commit(files(1, 1, "base update\n"), candidate, newer_base)
+    def next_proof(anchor, head):
+        return recorder.clean_base_merge_descent(repo, approved=anchor, head=head, base_tip=newer_base)
+    assert next_proof(candidate, chained) == [newer_base]
+    with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+        recorder.require_review_round_within_budget(
+            comments, chained, "fleet", budget=3, pr=42, prove_merge_only=next_proof,
+            repair_heads=frozenset({"f" * 40}),
+        )
+    # A new exact-head approval can anchor its own single delta (as on PR #587).
+    comments.append(recorded_verdict(candidate, "APPROVED", task_id="delta"))
+    assert recorder.require_review_round_within_budget(
+        comments, chained, "fleet", budget=3, pr=42, prove_merge_only=next_proof,
+        repair_heads=frozenset({"f" * 40}),
+    )["budget_exemption"]["approved_head"] == candidate
+    # A second sibling cannot reuse the original approval either.
+    sibling = commit(files(1, 1, "base update\n"), approved, newer_base)
+    exemptions = recorder.budget_exempt_heads(comments[:3], sibling, "fleet", prove=next_proof,
+                                             unrecorded=[candidate])
+    assert set(exemptions) == {candidate}
+    # The generated-file exception requires the actual merged source's hash.
+    invalid = files(1, 1)
+    invalid["lu_machinery/lint/rename-map.json.sha256"] = "0" * 64 + "  rename-map.json\n"
+    assert prove(approved, commit(invalid, approved, base)) is None
+
+
+@pytest.mark.parametrize("conflict", ["text", "binary-ours", "modify-delete-keep"])
+def test_merge_with_real_conflict_resolution_is_a_charged_round(budget_merge_repo, conflict):
+    """Defect class: text, binary-ours or modify/delete conflicts get a free base merge."""
+    repo, git, commit, files, root, _approved, _base, _candidate = budget_merge_repo
+    branch_code = "\0branch version\n" if conflict == "binary-ours" else "branch version\n"
+    base_code = "\0base version\n" if conflict == "binary-ours" else "base version\n"
+    branch_files = files(1, 0, branch_code)
+    if conflict == "modify-delete-keep":
+        del branch_files["code.py"]
+    approved = commit(branch_files, root)
+    base = commit(files(0, 1, base_code), root)
+    resolved = {"text": "resolved version\n", "binary-ours": branch_code, "modify-delete-keep": base_code}
+    candidate = commit(files(1, 1, resolved[conflict]), approved, base)
+    names = git("show", "--remerge-diff", "--format=", "--name-only", candidate).splitlines()
+    assert ("code.py" in names) == (conflict == "text")
+    assert "remerge CONFLICT" in git("show", "--remerge-diff", "--format=", candidate)
+    def prove(anchor, head):
+        return recorder.clean_base_merge_descent(repo, approved=anchor, head=head, base_tip=base)
+    assert prove(approved, candidate) is None
+    comments = [recorded_verdict(H1, "CHANGES_REQUESTED", task_id="r1"),
+                recorded_verdict(H2, "CHANGES_REQUESTED", task_id="r2"),
+                recorded_verdict(approved, "APPROVED", task_id="r3")]
+    with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+        recorder.require_review_round_within_budget(
+            comments, candidate, "fleet", budget=3, pr=42, prove_merge_only=prove,
+            repair_heads=frozenset({"f" * 40}),
+        )
 
 
 def blocked_reply(*, missing=("ci-logs",), explanation="CI run 41768361838 succeeded; its logs could not be read.",
