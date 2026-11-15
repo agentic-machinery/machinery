@@ -30,6 +30,12 @@ DESCRIPTOR = "agents_extensions/deployment.v1.json"
 STATE = ".deploy-state/agent-deploy.v1.json"
 STAGING = ".deploy-state/agent-deploy.tmp"
 TARGETS = {"claude": ".claude", "codex": ".codex", "agy": ".agent", "cursor": ".cursor"}
+# Output roots of retired targets. A descriptor can no longer enable them, but
+# deployment state from an earlier release may still own files there; those
+# roots stay owned so the next apply retires the files and no product source
+# may overlap them. The Gemini CLI target retired with product 747d981354e1.
+RETIRED_ROOTS = frozenset({".gemini"})
+OWNED_ROOTS = frozenset({*TARGETS.values(), *RETIRED_ROOTS})
 
 # Discovery/configuration names remain inventoried even without a planned output.
 # Runtime siblings are outside ownership; explicit descriptor preservation still applies.
@@ -349,7 +355,7 @@ def build(tree: Tree) -> Plan:
         if not isinstance(spec, dict) or set(spec) != {"path", "required"} or type(spec["required"]) is not bool:
             raise Invalid("source requires path and boolean required")
         source = relative(spec["path"])
-        if source.split("/")[0] in {*TARGETS.values(), ".agents", ".deploy-state", ".git"}:
+        if source.split("/")[0] in {*OWNED_ROOTS, ".agents", ".deploy-state", ".git"}:
             raise Invalid("product source overlaps deployment output or Git state")
         if any(source == p or source.startswith(p + "/") or p.startswith(source + "/") for p in used_sources):
             raise Invalid("overlapping product sources")
@@ -495,7 +501,7 @@ def old_state(tree: Tree) -> dict[str, Any]:
         raise Invalid("invalid ownership records")
     for path, record in data["files"].items():
         relative(path)
-        if path.split("/")[0] not in {*TARGETS.values(), ".agents"} or "/" not in path:
+        if path.split("/")[0] not in {*OWNED_ROOTS, ".agents"} or "/" not in path:
             raise Invalid("manifest output outside provider directories")
         if not isinstance(record, dict) or set(record) != {"type", "sha256", "mode", "owner", "source"}:
             raise Invalid("invalid file record")
