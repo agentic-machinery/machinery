@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -322,3 +323,52 @@ def test_no_usage_returns_zero(tmp_path: Path, content: str) -> None:
     transcript = tmp_path / "usage.jsonl"
     transcript.write_text(content)
     assert latest_tokens(transcript) == 0
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ({"used": 410_000, "age": 10}, "410000\tstatus line (harness live usage)"),
+        ({"used": 410_000, "age": 290}, "410000\tstatus line (harness live usage)"),
+        ({"used": 410_000, "age": 301}, "250000\tlatest assistant input/cache usage"),
+        ({"used": 410_000, "age": -120}, "250000\tlatest assistant input/cache usage"),
+        ({"used": 0, "age": 10}, "250000\tlatest assistant input/cache usage"),
+        ({"used": 410_000, "age": 10, "session_id": "other"}, "250000\tlatest assistant input/cache usage"),
+        ({"used": "410000", "age": 10}, "250000\tlatest assistant input/cache usage"),
+        (None, "250000\tlatest assistant input/cache usage"),
+    ],
+    ids=["fresh", "just-inside-300s", "stale", "future-stamp", "zero", "foreign-session", "non-numeric", "no-record"],
+)
+def test_live_usage_prefers_fresh_status_line_then_transcript_never_an_estimate(
+    tmp_path: Path, record: dict | None, expected: str
+) -> None:
+    """A stale, foreign or malformed status-line figure must fall to the transcript, never be trusted."""
+    transcript = tmp_path / "usage.jsonl"
+    write_usage(transcript, {"input_tokens": 250_000})
+    record_file = tmp_path / "record.json"
+    if record is not None:
+        record_file.write_text(
+            json.dumps(
+                {
+                    "session_id": record.get("session_id", "sid"),
+                    "observed_context_used_tokens": record["used"],
+                    "observed_context_used_at_epoch": int(time.time()) - record["age"],
+                }
+            )
+        )
+
+    def live(transcript_path: Path) -> str:
+        return subprocess.run(
+            ["bash", "-c", 'source "$1"; context_live_usage "$2" sid "$3"', "test", str(LIB), str(record_file), str(transcript_path)],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        ).stdout.rstrip("\n")
+
+    # Unedited transcript shape, plus an oversized one with no usage: size is never a figure.
+    assert live(transcript) == expected
+    unmeasured = tmp_path / "unmeasured.jsonl"
+    unmeasured.write_text(json.dumps({"type": "user", "message": {"content": "x" * 2_000_000}}) + "\n")
+    fallback = "410000\tstatus line (harness live usage)" if expected.startswith("410000") else "0\tunknown"
+    assert live(unmeasured) == fallback

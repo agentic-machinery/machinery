@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -431,3 +432,26 @@ def test_replaced_lock_name_refused(state_module, tmp_path, monkeypatch):
             state_module.lock_session(directory, lock.name)
     finally:
         os.close(directory)
+
+
+def test_unknown_usage_never_sets_a_tier_or_demands_a_handoff(hook_case, tmp_path):
+    """A transcript without model usage must not be sized into a tier or a hand-off demand (bytes/7 estimate removed)."""
+    project, _, payload = hook_case
+    transcript = Path(json.loads(payload)["transcript_path"])
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "x" * 6_000_000}}) + "\n")
+    state = project / f"batch_state/context_monitor/{SESSION}.tier"
+    unknown = json.loads(run_hook(hook_case))["hookSpecificOutput"]["additionalContext"]
+    assert unknown.startswith("Context usage is unknown right now")
+    assert not state.exists()
+    state.parent.mkdir(parents=True)
+    state.write_text("3 760000\n")
+    assert run_hook(hook_case, "context-rollover-guard.sh") == ""
+    assert state.read_text() == "3 760000\n"
+
+    # A fresh status-line figure is live usage even though the transcript has none.
+    record = tmp_path / "record.json"
+    data = json.loads(record.read_text())
+    data.update(observed_context_used_tokens=770_000, observed_context_used_at_epoch=int(time.time()))
+    record.write_text(json.dumps(data))
+    guard = json.loads(run_hook(hook_case, "context-rollover-guard.sh"))["hookSpecificOutput"]["additionalContext"]
+    assert "(~770k tokens)" in guard

@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,17 @@ def test_observed_statusline_window_wins_and_records_mismatch(tmp_path: Path) ->
     assert record["actual_context_window_provenance"].startswith("statusline.")
     assert record["window_mismatch"]
     assert not record["model_mismatch"]
+    assert "observed_context_used_tokens" not in record
+
+    # A status-line usage of 0 is a real observation that replaces the older figure.
+    for used in (410_000, 0):
+        before = int(time.time())
+        record = update_session("native-session", observed_context_used=used, provenance="statusline", state_root=tmp_path)
+        assert record["observed_context_used_tokens"] == used
+        assert before <= record["observed_context_used_at_epoch"] <= int(time.time())
+    for bad in (-1, True, 1.5):
+        with pytest.raises(SessionRecordError, match="non-negative integer"):
+            update_session("native-session", observed_context_used=bad, state_root=tmp_path)  # type: ignore[arg-type]
 
 
 def test_missing_or_mismatched_route_fails_closed(tmp_path: Path) -> None:
