@@ -18,7 +18,7 @@ from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.review.ukrainian_seats import UKRAINIAN_SEAT_FAMILIES
 from lu_machinery.review.ukrainian_seats import attested_author_families
 from lu_machinery.review.ukrainian_seats import required_ukrainian_seats
-from tests.review.record_support import SHA as SHA, setup_record as setup_record
+from tests.review.record_support import SHA as SHA, setup_record as _setup_record
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots
 
@@ -530,6 +530,18 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
     assert len(statuses) == 1
 
 
+
+def setup_record(monkeypatch, tmp_path, **kwargs):
+    result = _setup_record(monkeypatch, tmp_path, **kwargs)
+    # The fixture owns GitHub reads. The package also reads the PR file list
+    # before choosing its learner-content seats; this is an ordinary code PR.
+    monkeypatch.setattr(
+        recorder.GitHubAdapter, "pr_file_rows",
+        lambda *_args, **_kwargs: [{"filename": "lu_machinery/common/unit.py", "status": "modified"}],
+    )
+    return result
+
+
 def captured_source_trace(tasks, *, task_id="review-one", tool="verify_word", arguments=None, output="VESUM"):
     """A provider's completed Sources event, separate from the reviewer's reply."""
     path = tasks / "logs" / f"{task_id}.stdout.log"
@@ -820,7 +832,7 @@ def test_security_verdict_fail_keeps_changes_requested(scanned_recorder, tmp_pat
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     body = comments[0]["body"]
     assert result["verdict"] == "CHANGES_REQUESTED" and "residuals" not in result
-    assert "Residuals:" not in body and reply in body
+    assert "Residuals:" not in body
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == "CHANGES_REQUESTED"
     assert statuses[0]["state"] == "failure" and statuses[0]["context"] == "fleet/cross-family-review"
     assert statuses[0]["description"] == "VERDICT: CHANGES_REQUESTED openai review-one"

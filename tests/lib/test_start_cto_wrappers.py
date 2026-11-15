@@ -583,16 +583,16 @@ session_supervisor_exec_successor
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-_HANDOFF_IDENTITY = _REPO_ROOT / "lu_machinery" / "lib" / "handoff_identity.sh"
+_HANDOFF_IDENTITY = machinery_path("lib/handoff_identity.sh")
 
 
-_ISSUE_STREAMS = _REPO_ROOT / "lu_machinery" / "config" / "issue_streams.yaml"
+_ISSUE_STREAMS = machinery_path("config/issue_streams.yaml")
 
 
 _LAUNCH_PATH_MINTS = (
     _HANDOFF_IDENTITY,
-    _REPO_ROOT / "lu_machinery" / "lib" / "launcher_core.sh",
-    _REPO_ROOT / "lu_machinery" / "session_canary" / "grok_lane.py",
+    machinery_path("lib/launcher_core.sh"),
+    machinery_path("session_canary/grok_lane.py"),
 )
 
 

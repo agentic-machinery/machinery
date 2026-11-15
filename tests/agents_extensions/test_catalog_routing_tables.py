@@ -240,8 +240,7 @@ def test_sources_tool_overlay_adds_only_approved_read_only_grants(configuration)
 @pytest.mark.usefixtures("configured_roots")
 def test_grok_ukrainian_role_confers_no_ukrainian_review_route():
     """C-5307 restores Grok coding and Cursor review without admitting Ukrainian review."""
-    source = Path(__file__).resolve().parents[2]
-    catalog = yaml.safe_load((source / "lu_machinery/config/model_catalog.yaml").read_text(encoding="utf-8"))
+    catalog = yaml.safe_load((machinery_path("config/model_catalog.yaml")).read_text(encoding="utf-8"))
     assert "ukrainian_review" not in catalog["models"]["grok-4.7"]["roles"]
     assert catalog["models"]["grok-4.7"]["lifecycle"] == "active"
     assert catalog["models"]["grok-4.7"]["roles"] == ["coding", "standard_review"]

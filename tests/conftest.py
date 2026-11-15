@@ -2982,6 +2982,7 @@ def pytest_configure_node(node: Any) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "reads_content: test reads a controlled content or policy fixture")
     config.pluginmanager.register(
         _TelemetryIsolation(
             tuple(

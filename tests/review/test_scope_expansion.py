@@ -1,6 +1,7 @@
 """The expansion breaker counts author changes across base-branch merges."""
 
 from __future__ import annotations
+from lu_machinery.common.repo_root import machinery_path
 
 import json
 import subprocess
@@ -310,7 +311,7 @@ def test_hooks_existing_module_dependency_error_is_not_translated(product_checko
 
 
 @pytest.mark.usefixtures('configured_roots')
-def test_configured_callers_are_counted_once_and_implementation_separately():
+def test_configured_callers_are_counted_once_and_implementation_separately(tmp_path):
     """The dependency scan must expose both callers without double counting R's old wrapper."""
     from pathlib import Path
 
@@ -320,10 +321,15 @@ def test_configured_callers_are_counted_once_and_implementation_separately():
     from lu_machinery.lint.boundary_ratchet import _dynamic_count
     from lu_machinery.lint.boundary_ratchet import load_config
 
-    root = Path(__file__).resolve().parents[2]
     paths = ["lu_machinery/research/registry.py", "lu_machinery/review/product_hooks.py", "lu_machinery/ops/product_entry.py"]
-    graph = scan_imports({path: (root / path).read_bytes() for path in paths})
+    graph = scan_imports({path: machinery_path(path.removeprefix("lu_machinery/")).read_bytes() for path in paths})
     assert [row["path"] for row in graph["configured_loads"]] == paths[:2]
-    config = load_config(root / "lu_machinery" / CONFIG_PATH)
+    # This repository lint policy is intentionally not wheel package data.
+    policy = tmp_path / CONFIG_PATH.name
+    policy.write_bytes(subprocess.check_output(
+        ["git", "show", "HEAD:lu_machinery/" + CONFIG_PATH.as_posix()],
+        cwd=Path(__file__).resolve().parents[2],
+    ))
+    config = load_config(policy)
     assert _dynamic_count(graph, config, "machinery") == 2
     assert _configured_line(graph) == "configured-entry-point implementation=1 callers=2"

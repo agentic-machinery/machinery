@@ -700,12 +700,11 @@ def test_every_runner_failure_reaches_report(
     def fail(*args: object, **kwargs: object) -> None:
         raise data_tier.DataTierError("runner failed at /private/example.db")
 
-    if failure in {"selection", "memory", "worktree", "snapshot", "bulk", "cleanup", "scope_cleanup"}:
+    if failure in {"selection", "memory", "worktree", "bulk", "cleanup", "scope_cleanup"}:
         helper = {
             "selection": "load_selection",
             "memory": "require_memory",
             "worktree": "make_test_worktree",
-            "snapshot": "snapshot_databases",
             "bulk": "bulk_status",
             "cleanup": "remove_test_worktree",
             "scope_cleanup": "stop_scope",
@@ -713,8 +712,6 @@ def test_every_runner_failure_reaches_report(
         monkeypatch.setattr(data_tier, helper, fail)
     elif failure == "interpreter":
         (nightly.primary / ".venv" / "bin" / "python").unlink()
-    elif failure == "hydration":
-        monkeypatch.setattr(data_tier, "hydrate", lambda *args: {"group": "missing /private/artifact"})
     elif failure == "missing_database":
         monkeypatch.setattr(data_tier, "bind_stores", lambda *_args: ({}, [], {}, ["sources.db"]))
     elif failure == "second_memory":

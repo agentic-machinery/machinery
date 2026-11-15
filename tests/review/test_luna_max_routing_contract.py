@@ -6,12 +6,12 @@ formal reviewer. Large structural assertions stay in ``test_model_catalog.py``.
 """
 
 from __future__ import annotations
+from lu_machinery.common.repo_root import machinery_path
 
 from lu_machinery.review.model_catalog import load_model_catalog
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 import pytest
 import yaml
 from lu_machinery.fleet import credit_lane
@@ -300,9 +300,8 @@ def test_agy_author_alias_keeps_every_same_family_seat_out_of_formal_review(
 
 @pytest.mark.usefixtures('configured_roots')
 def test_fleet_endpoint_eligibility_is_a_projection_of_model_catalog() -> None:
-    root = Path(__file__).resolve().parents[2]
-    catalog = yaml.safe_load((root / "lu_machinery/config/model_catalog.yaml").read_text(encoding="utf-8"))
-    fleet = yaml.safe_load((root / "lu_machinery/config/fleet_communications.yaml").read_text(encoding="utf-8"))
+    catalog = yaml.safe_load((machinery_path("config/model_catalog.yaml")).read_text(encoding="utf-8"))
+    fleet = yaml.safe_load((machinery_path("config/fleet_communications.yaml")).read_text(encoding="utf-8"))
     assert fleet["formal_review_eligibility_source"].endswith("#review_scheduler.endpoints")
     policy = catalog["review_scheduler"]["endpoints"]
     aliases = {"glm-local": "glm", "kimi": "kimicc"}

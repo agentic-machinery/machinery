@@ -8,6 +8,7 @@ bound to this dispatch's arguments. Gemini 3.8 Flash High does not (#12291).
 from __future__ import annotations
 
 import pytest
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.agent_runtime import bounded_advisory
 import json
 import os
@@ -165,10 +166,10 @@ def test_standalone_catalog_resolves_haiku_without_runtime_package(tmp_path, ent
     review = tmp_path / "lu_machinery/review"
     review.mkdir(parents=True)
     for name in ("model_catalog.py", "role_resolution.py", "family_exclusions.py", "ukrainian_seats.py", "__init__.py"):
-        shutil.copyfile(ROOT / "lu_machinery/review" / name, review / name)
+        shutil.copyfile(machinery_path("review") / name, review / name)
     config = tmp_path / "lu_machinery/config"
     config.mkdir()
-    shutil.copyfile(ROOT / "lu_machinery/config/model_catalog.yaml", config / "model_catalog.yaml")
+    shutil.copyfile(machinery_path("config/model_catalog.yaml"), config / "model_catalog.yaml")
     command = [str(review / "model_catalog.py")] if entrypoint == "file" else ["-m", "lu_machinery.review.model_catalog"]
     result = subprocess.run(
         [sys.executable, *command, "--resolve-role", "mechanical_classification"],
