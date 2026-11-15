@@ -910,11 +910,15 @@ class _Broker:
                     raise _BrokerRefusal("the request id was already used: a request runs once")
                 self.seen.add(request_id)
             step = getattr(self, "_" + verb.replace("-", "_"))
-            # review-wait reads the host's task store and changes no broker state, so it waits outside ``serial``.
+            # review-wait reads the host's task store and changes no broker state, so it waits outside ``serial``;
+            # its one host step goes through ``_run``, which refuses once cleanup has begun.
             if verb == "review-wait":
                 reply = step(payload)
             else:
                 with self.serial:
+                    # A verb queued behind another starts no Git or GitHub step once cleanup has begun.
+                    if self.closed:
+                        raise _BrokerRefusal("the write boundary is closing")
                     reply = step(payload)
         except _BrokerRefusal as exc:
             reply["stderr"] = f"write boundary broker refused: {exc}\n"
