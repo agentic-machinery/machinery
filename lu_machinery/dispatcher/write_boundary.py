@@ -491,7 +491,8 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
         )
         if scanned.returncode:
             raise Refused(scanned.stderr.decode("utf-8", "replace") or "host push scan refused")
-    result = subprocess.run(
+    # Fixed argv: "git", or for a push the absolute Git the scan verified, resolved from the fixed env PATH above.
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
         [git, "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
          "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
          "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
