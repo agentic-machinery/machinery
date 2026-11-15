@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import re
 import subprocess
+import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -58,6 +59,7 @@ P0_P2 = frozenset({"P0", "P1", "P2"})
 # One whole line, so prose or a suffixed value that mentions a trailer never lands a task.
 _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
 _LINE_ENDINGS = re.compile(r"\r\n|\r|\n")  # CommonMark's three, as markdown-it normalizes them
+_ALNUM = re.compile(r"[A-Za-z0-9]+")
 _COMMONMARK = MarkdownIt("commonmark")
 
 router = APIRouter()
@@ -66,29 +68,36 @@ router = APIRouter()
 def trailer_task_ids(message: str) -> set[str]:
     """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
 
-    The message is parsed as CommonMark (markdown-it, the parser ``review.verdict_parser`` uses). A trailer counts
-    only where it renders as one whole line of plain text in a top-level paragraph or heading and the same trailer
-    is a whole source line of that block: a code fence or code block, an inline code span (across lines too, honoring backslash escapes),
-    a quote, a list item or HTML is an example, never attribution.
+    The message is parsed as CommonMark (markdown-it, the parser ``review.verdict_parser`` uses). A whole source
+    line that is a trailer counts only where that same line renders as one line of plain text in a top-level
+    paragraph or heading: a code fence or code block, an inline code span (across lines too, honoring backslash
+    escapes), a quote, a list item or HTML is an example, never attribution. Each candidate line's task id is
+    first replaced by a unique marker whose letters and digits differ but whose punctuation is the same, which
+    leaves the parse unchanged, so a rendered line is attributed to its own source line and never to a copy.
     """
     if "X-Agent:" not in message:
         return set()
     lines = _LINE_ENDINGS.split(message)
+    markers: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        if match := _TRAILER.fullmatch(line):
+            marked = _ALNUM.sub(lambda _run: uuid.uuid4().hex, match.group(1))
+            lines[index] = line[:match.start(1)] + marked
+            markers[lines[index]] = match.group(1)
     found: set[str] = set()
     block: Token | None = None
-    for token in _COMMONMARK.parse(message):
+    for token in _COMMONMARK.parse("\n".join(lines)) if markers else ():
         if token.nesting == 1:
             block = token
-        if token.type != "inline" or block is None or block.level != 0 or block.map is None:
+        if token.type != "inline" or block is None or block.level != 0:
             continue
-        source = {match.group(1) for line in lines[block.map[0]:block.map[1]] if (match := _TRAILER.fullmatch(line))}
         rendered: list[str] = []
         for child in [*(token.children or []), None]:
             if child is not None and child.type not in ("softbreak", "hardbreak"):
                 rendered.append(child.content if child.type in ("text", "text_special") else "\0")
                 continue
-            if (match := _TRAILER.fullmatch("".join(rendered))) and match.group(1) in source:
-                found.add(match.group(1))
+            if (task := markers.get("".join(rendered))) is not None:
+                found.add(task)
             rendered = []
     return found
 
