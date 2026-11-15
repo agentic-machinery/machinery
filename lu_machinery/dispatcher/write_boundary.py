@@ -1554,7 +1554,13 @@ class _Broker:
         return number, slug, facts
 
     def cleanup(self) -> None:
+        import socket
+
         self.closed = True
+        # On Linux, close() does not wake a thread blocked in accept(); shutdown() does (accept fails with EINVAL),
+        # so the serve thread exits now instead of every boundary waiting out the join's whole timeout.
+        with contextlib.suppress(OSError):
+            self.server.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             self.server.close()
         if self.child is not None and self.child.poll() is None:
