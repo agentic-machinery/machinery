@@ -14,13 +14,13 @@ The six required elements, in their original order, are:
 
 1. Durable handoff, native quit, and attributed fenced exit (steps 1–2).
 2. Keep the existing shell pane for the successor launcher (step 4).
-3. Verify both native dry runs and their quoted output (step 3).
+3. Verify the successor launcher's dry run (step 3).
 4. Reconcile open orders and their exact authority recipients (step 5).
 5. Use the quoted Grok model-table key as syntax only (step 6).
 6. Stop on failed or unknown prerequisites (step 7).
 
 This is the requirements checklist. Execute the steps below in numerical order:
-both dry runs must pass before typing any real launcher command.
+the successor dry run must pass before typing any real launcher command.
 
 ## 1. Save the predecessor's durable handoff
 
@@ -82,71 +82,33 @@ release or expiry needs the existing authorized supervisor flow. Follow the
 [current lease boundary](../../agents_extensions/shared/rules/core.md#unconditional-invariants)
 and the corrected [Grok canary protocol](grok-session-canary.md#lifecycle).
 
-## 3. Verify both native dry runs before a real launch
+## 3. Verify the successor dry run before a real launch
 
-From the repository checkout in an existing shell pane, run both commands.
-Do not replace the shell with a launcher and do not invoke a real launcher yet.
-These examples check two routes; they do not authorize moving between streams.
+From the repository checkout in an existing shell pane, dry-run the
+already-authorized successor launcher. Do not replace the shell with a launcher
+and do not invoke a real launcher yet. A dry run does not authorize moving
+between streams.
 
-```bash
-LAUNCHER_DRY_RUN=1 ./start-grok-driver.sh --epic infra
-LAUNCHER_DRY_RUN=1 ./start-cursor-driver.sh --epic devops
-```
-
-Require exit status 0 from each command. Verify its selected stream, native
-harness, registered slot, and would-execute arguments against the intended
-route. Rerun the intended route's dry run if the lane or arguments differ.
-Stop if either dry run fails or selects the wrong route. Inspect current source
-before using dry-run after a launcher change.
-
-The following public-safe lines are verbatim excerpts captured on 2026-10-19.
-Full output stays in private task evidence because arguments can contain local
-paths and session details. These are observations, not permanent stream pins.
-
-Grok, `--epic infra`, exit status 0:
-
-```text
-launcher: would claim lease stream=epic:6943 agent=grok harness=grok-tui
-launcher: session epic=infra slot=grok-infra handoff=.claude/infra-epic/CLAUDE-DRIVER-HANDOFF.md
-launcher: would bind drive-epic after lease; provider canary: not run
-```
-
-Cursor, `--epic devops`, exit status 0:
-
-```text
-launcher: would claim lease stream=epic:5703 agent=cursor harness=cursor-agent
-launcher: session epic=devops slot=cursor-devops handoff=.claude/devops-epic/CLAUDE-DRIVER-HANDOFF.md
-launcher: would bind drive-epic after lease; provider canary: not run
-```
+Set `LAUNCHER_DRY_RUN=1` for that launcher and require exit status 0. Verify
+its selected stream, native harness, registered slot, and would-execute
+arguments against the intended route. Rerun the dry run if the lane or
+arguments differ. Stop if the dry run fails or selects the wrong route.
+Inspect current source before using dry-run after a launcher change.
 
 The shared dry-run path skips scope entry, deployment, and rollover import.
 Its lease branch prints and returns before calling the supervisor. Sources:
 [scripts/lib/launcher_core.sh:1581](../../scripts/lib/launcher_core.sh#L1581),
 [scripts/lib/launcher_core.sh:965](../../scripts/lib/launcher_core.sh#L965).
-The native adapters print arguments and return before provider execution:
-[scripts/launchers/grok.sh:44](../../scripts/launchers/grok.sh#L44),
-[scripts/launchers/cursor.sh:47](../../scripts/launchers/cursor.sh#L47).
 
 A successful dry run proves local argument construction, not authentication,
 provider health, quota, model runtime compatibility, or a lease claim. Unknown
-health remains unknown and current routing gates still apply. The Grok adapter's
-"would run provider canary" line is a dry-run message. Cursor has no launcher
-semantic canary. Source: [scripts/launchers/cursor.sh:19](../../scripts/launchers/cursor.sh#L19).
-These commands cover native Grok and Cursor only. Do not generalize this safety
-proof to Hermes or probe Hermes as part of this procedure.
+health remains unknown and current routing gates still apply.
 
 ## 4. Type the real launcher into the existing shell pane
 
-Only after the durable handoff, attributed fenced exit, and both successful dry
-runs, type the already-authorized launcher command at the existing shell prompt.
+Only after the durable handoff, attributed fenced exit, and a successful dry
+run, type the already-authorized launcher command at the existing shell prompt.
 Use the exact lane and arguments that passed the intended route's dry run.
-For the two checked examples, choose only the authorized stream's command:
-
-```bash
-./start-grok-driver.sh --epic infra
-# Or, for the separate DevOps stream:
-./start-cursor-driver.sh --epic devops
-```
 
 Run the command as a foreground shell command. Never use `exec`,
 `tmux respawn-pane`, or a launcher as the pane's initial command. Keep the
@@ -294,14 +256,13 @@ model key, while bare `model.grok-4.7` creates nested `grok-4` and `7` keys.
 This is syntax evidence only; runtime acceptance by the installed Grok CLI is
 unverified. Do not edit live configuration or authentication to follow this
 guide. Stop if the intended route needs an unapproved configuration change or
-unproven runtime behavior. Grok preserves its last model selection unless the
-caller supplies a model or effort; verify the intended model against current
-routing before proceeding. Source: [scripts/launchers/grok.sh:31](../../scripts/launchers/grok.sh#L31).
+unproven runtime behavior. Verify the intended model against current routing
+before proceeding.
 
 ## 7. Stop conditions
 
 Stop before a real launch if the handoff or health protocol failed, the
-predecessor's fenced exit is missing or unattributed, either dry run failed,
+predecessor's fenced exit is missing or unattributed, the dry run failed,
 the intended route differs, or authority, lease expiry, or health is unknown.
 Keep the shell pane and durable continuity evidence intact. The launcher owns
 fenced lease close; an agent never claims, renews, releases, or recovers it.

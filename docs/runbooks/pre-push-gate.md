@@ -1,6 +1,6 @@
 # Pre-push gate
 
-`.githooks/pre-push` is the tracked hook a push runs. `lu_machinery/install_git_hooks.sh` installs a delegator that execs the copy in the current worktree. The agent git shim (`lu_machinery/agent_runtime/shims/git`) pins `core.hooksPath` to `lu_machinery/opsec/push_hooks` for `git push`, so Git runs that directory's `pre-push`. That hook execs `lu_machinery.opsec.git_push`. After a clean scan, `lu_machinery/opsec/push_hooks/chain` runs the caller's own pre-push hook with the same arguments and input.
+`.githooks/pre-push` is the tracked hook a push runs. `lu_machinery/install_git_hooks.sh` installs a delegator that execs the copy in the current worktree. A consumer checkout runs the installer from the installed release, with its working directory in that checkout. Its `--check` reads the declared stages with the release's own interpreter selector and stage reader, resolved through the hook boundary (`project_hook_context_resolve`): `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` must be set, and the interpreter is `LEARN_UKRAINIAN_PYTHON` when set, else that primary's `.venv/bin/python`. The agent git shim (`lu_machinery/agent_runtime/shims/git`) pins `core.hooksPath` to `lu_machinery/opsec/push_hooks` for `git push`, so Git runs that directory's `pre-push`. That hook execs `lu_machinery.opsec.git_push`. After a clean scan, `lu_machinery/opsec/push_hooks/chain` runs the caller's own pre-push hook with the same arguments and input.
 
 ## What the hook runs
 
