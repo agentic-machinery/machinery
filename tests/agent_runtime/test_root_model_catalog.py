@@ -1182,7 +1182,8 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
 
 @pytest.mark.parametrize(
     ("agent", "model"),
-    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium")],
+    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium"),
+     ("agy", "gemini-4-hydrogen-medium"), ("agy", "gemini-4-hydrogen-xhigh")],
 )
 def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent, model):
     """Defect class: a model with no catalog review role admitted to a review-typed dispatch.
@@ -1279,7 +1280,9 @@ def test_driver_brief_population_follows_catalog_capabilities():
     assert driver_brief_models(catalog) == {"gpt-6-luna"}
 
 
-@pytest.mark.parametrize("model", ["gemini-4-argon-xhigh", "gemini-4-carbon-max", "claude-opus-5-5-low"])
+@pytest.mark.parametrize(
+    "model", ["gemini-4-argon-xhigh", "gemini-4-carbon-max", "gemini-4-hydrogen-max", "claude-opus-5-5-low"],
+)
 def test_agy_admission_refuses_unattestable_catalog_variants(model):
     """Defect class: generic catalog variants launch on AGY without an attestable selector."""
     assert canonical_model_id(model) is not None
