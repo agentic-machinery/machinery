@@ -10,7 +10,7 @@ the candidate's own dispatcher supervised it.
 The evidence is canary evidence, never a review of record. A canary task is pinned to a
 head with no review branch and no PR, so ``record_cf_verdict`` refuses it ("review was
 not branch-pinned"), and its receipt lives here, outside the PR comments the verdict
-lookup reads. Runbook: ``docs/runbooks/review-contract-canary.md``.
+lookup reads. Runbook: ``docs/runbooks/write-worker-boundary.md#review-contract-canary``.
 """
 
 from __future__ import annotations
@@ -20,10 +20,16 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from lu_machinery.common import github_client
 
 # The machinery package's directory name, which a change lists its files under, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
@@ -231,7 +237,10 @@ def build_receipt(record: Mapping[str, Any], result: str, *, head: str) -> dict:
     Recording also checks the reply is a canonical receipt with the recorder's copy of the
     contract, which is the candidate's when ``record`` runs from the candidate worktree.
     """
-    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
+    from lu_machinery.review.review_contract import (
+        ContractError,
+        canonical_receipt_payload,
+    )
 
     receipt = _settled_receipt(record, result, head=head)
     try:
@@ -304,17 +313,248 @@ def record(task_id: str, root: Path | None = None) -> Path:
     return path
 
 
+_RUN_MODELS = {
+    "codex": ("gpt-6.1-sol", "--codex-account", "b-sub"),
+    "claude": ("claude-sonnet-5-5", "--claude-account", "b"),
+    "cursor": ("grok-4.7-high",),
+    "agy": ("gemini-3.8-flash-high",),
+}
+
+# Run inside the candidate interpreter, with the existing dispatcher and recorder.
+# Keep dispatch and wait in one user unit; receipts are never reviews of record.
+_RUN_ROUTE = """\
+import contextlib, io, signal, sys
+from lu_machinery.dispatcher.cli import main
+from lu_machinery.review.contract_canary import record
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
+signal.signal(signal.SIGTERM, interrupted)
+identity = None
+settled = False
+try:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = main(sys.argv[1:])
+    if code:
+        # Dispatch may have started a supervisor before reporting an error.
+        # Without a task identity and terminal wait, settlement is unknown.
+        print(output.getvalue())
+        raise SystemExit(code)
+    task_id, nonce = output.getvalue().strip().splitlines()[-2:]
+    identity = [task_id, '--run-nonce', nonce]
+    code = main(['wait', *identity])
+    settled = code in (0, 1)
+    if code:
+        raise SystemExit(code)
+    print(record(task_id))
+finally:
+    if identity and not settled:
+        main(['cancel', *identity])
+        settled = main(['wait', *identity]) in (0, 1)
+    if settled:
+        print('CANARY-ROUTE-SETTLED')
+"""
+
+
+def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Use the shared GitHub client seam, including its non-GitHub argv transport."""
+    result = cast(
+        subprocess.CompletedProcess[str],
+        github_client.run(list(argv), cwd=cwd, env=dict(env), text=True, capture_output=True, check=False),
+    )
+    if check and result.returncode:
+        raise CanaryError(f"command failed ({result.returncode}): {shlex.join(argv)}\n{result.stderr.strip()}")
+    return result
+
+
+def _run_steps(
+    work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
+    hard_timeout: int, env: Mapping[str, str],
+) -> tuple[list[list[str]], list[tuple[str, list[str]]], list[str]]:
+    """Build the exact argv plan without creating files, units, mounts or tasks."""
+    clone, mount = work / "source", work / "mount"
+    python = str(work / "consumer/bin/python")
+    setup = [
+        ["git", "clone", "--no-hardlinks", "--no-checkout", str(source), str(clone)],
+        ["git", "-C", str(clone), "fetch", "--no-tags", f"https://github.com/{repo}.git", head],
+        ["git", "-C", str(clone), "-c", "core.hooksPath=/dev/null", "checkout", "--detach", head],
+        # Dispatch creates its review worktrees in the registered primary; give it this exact object too.
+        ["git", "-C", str(source), "fetch", "--no-tags", str(clone), head],
+        ["mksquashfs", str(clone), str(work / "candidate.squashfs"), "-noappend", "-processors", "1"],
+        ["snapfuse", str(work / "candidate.squashfs"), str(mount), "-o", "ro"],
+        [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
+        [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+         "--require-hashes", "--only-binary=:all:", "-r", str(mount / "requirements-machinery.lock")],
+        [python, "-I", "-c", "import pathlib, sys, sysconfig; pathlib.Path(sysconfig.get_path('purelib'), 'contract-canary.pth').write_text(sys.argv[1] + '\\n')",
+         str(mount)],
+        [python, "-I", "-B", "-c", "from lu_machinery.dispatcher.worker import _dispatcher_code; import sys; c = _dispatcher_code(); assert c['head'] == sys.argv[1] and c['clean'] and c['read_only'], c", head],
+    ]
+    prompt = (
+        f"Read-only review-contract canary at {head}. Inspect lu_machinery/review/contract_canary.py "
+        "and report any concrete correctness defect you can verify. Do not change files or dispatch tasks. "
+        "Return exactly the canonical code-review-findings.v1 JSON object required by your output contract: "
+        "schema_version, overall (correctness, explanation, confidence), findings. "
+        "An empty findings list is permitted if no defect is verified. This is canary evidence, "
+        "never a review of record."
+    )
+    commands = []
+    # Passing named context explicitly is necessary: the user manager does not inherit this shell's env.
+    context = ["PATH", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_STATE_ROOT",
+               "LEARN_UKRAINIAN_PYTHON"]
+    for route in routes:
+        model, *account = _RUN_MODELS[route]
+        unit = f"{work.name.lstrip('.')}-{route}"
+        argv = ["systemd-run", "--user", "--wait", "--pipe", "--collect", "--service-type=exec",
+                f"--unit={unit}", f"--working-directory={work}"]
+        argv += [f"--setenv={key}={env[key]}" for key in context if key in env]
+        argv += [python, "-I", "-B", "-c", _RUN_ROUTE, "dispatch", "--repo", repo_key,
+                 "--agent", route, "--model", model, *account, "--effort", "high", "--mode", "read-only",
+                 "--worktree", "--task-id", f"{unit}", "--pinned-head", head, "--base", head,
+                 "--review-profile", "code", "--require-review-verdict", "--hard-timeout", str(hard_timeout),
+                 "--prompt", prompt]
+        commands.append((route, argv))
+    unmount = [shutil.which("fusermount3") or "fusermount", "-u", str(mount)]
+    return setup, commands, unmount
+
+
+def run(args: argparse.Namespace) -> int:
+    """Host-only orchestration of the established sealed-checkout canary procedure."""
+    from lu_machinery.common.git_context import sanitized_git_env
+    from lu_machinery.common.repo_root import (
+        primary_root,
+        product_root,
+        project_interpreter,
+    )
+    from lu_machinery.dispatcher.git import resolve_repo
+
+    if not args.dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
+        raise CanaryError("run must execute on the host, outside a dispatched worker; use --dry-run here")
+    source, repository = resolve_repo(args.repo)
+    env = sanitized_git_env(strip_config_injection=True)
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    env.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary_root()), LU_PRODUCT_ROOT=str(product_root()))
+    head = args.head
+    if args.pr is not None:
+        result = github_client.run(
+            ["gh", "pr", "view", str(args.pr), "--repo", repository["github"], "--json", "headRefOid"],
+            cwd=source, env=env, text=True, capture_output=True, check=True,
+        )
+        head = json.loads(result.stdout)["headRefOid"]
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        raise CanaryError("--head must be a full lowercase 40-character commit SHA")
+    if args.hard_timeout <= 0:
+        raise CanaryError("--hard-timeout must be positive")
+    routes = required_routes()
+    if set(routes) != set(_RUN_MODELS):
+        raise CanaryError("required routes changed; update the supported canary model map before running")
+    interpreter = project_interpreter()
+    work = Path.home() / ".lu-contract-canary-DRY-RUN"
+    if not args.dry_run:
+        work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
+    setup, route_commands, unmount = _run_steps(
+        work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
+    )
+    # Force a full score even if this head's changed files do not touch the contract.
+    # Isolated host imports select the installed gate used by the keeper, not the candidate.
+    check = [str(interpreter), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
+             "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
+    if args.dry_run:
+        print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
+        print(f"mkdir {work / 'mount'} (temporary directory under home; fusermount refuses /var/tmp)")
+        for command in [*setup, *(argv for _, argv in route_commands), check, unmount]:
+            print(shlex.join(command))
+        print(f"remove temporary directory {work} after successful unmount")
+        return 0
+    mount_attempted = False
+    active_route: str | None = None
+    try:
+        (work / "mount").mkdir()
+        for command in setup:
+            if command[0] == "snapfuse":
+                mount_attempted = True
+            _invoke(command, cwd=work, env=env)
+        with (work / "candidate.squashfs").open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        print(f"head {head}; squashfs sha256:{digest}", flush=True)
+        failures = 0
+        for route, command in route_commands:
+            active_route = route
+            result = _invoke(command, cwd=work, env=env, check=False)
+            if "CANARY-ROUTE-SETTLED" not in result.stdout.splitlines():
+                print(result.stdout, end="")
+                print(result.stderr, end="", file=sys.stderr)
+                raise CanaryError(f"{route}: user unit returned without terminal-task confirmation")
+            active_route = None
+            failures += bool(result.returncode)
+            print(f"{route}: {'FAIL' if result.returncode else 'PASS'} (exit {result.returncode})", flush=True)
+            if result.returncode:
+                print(result.stdout, end="")
+                print(result.stderr, end="", file=sys.stderr)
+        result = _invoke(check, cwd=work, env=env, check=False)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        return 1 if failures or result.returncode else 0
+    finally:
+        if active_route:
+            # The user unit and detached supervisor may still be running after a client interruption.
+            # Their candidate code must stay mounted until the host settles those tasks.
+            raise CanaryError(f"{active_route}: route completion unknown; retained mount and environment at {work}; "
+                              "settle its tasks before unmounting")
+        # Never traverse/remove a still-mounted checkout when unmount fails.
+        if mount_attempted and os.path.ismount(work / "mount"):
+            try:
+                _invoke(unmount, cwd=work, env=env)
+                if os.path.ismount(work / "mount"):
+                    raise CanaryError("unmount returned success but the candidate is still mounted")
+            except BaseException:
+                print(f"cleanup failed; retained {work}; unmount with {shlex.join(unmount)}", file=sys.stderr)
+                raise
+        shutil.rmtree(work)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(
+        description=__doc__.splitlines()[0] + "\nUse run on the host; canaries are not reviews of record.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+        "  .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585 --dry-run\n"
+        "  .venv/bin/python -m lu_machinery.review.contract_canary check --head <40-hex-sha> lu_machinery/dispatcher/worker.py\n"
+        "Outputs: run builds a sealed checkout, dispatches live tasks, records receipts and removes its mount.\n"
+        "Exit codes: 0 pass (or dry-run only), 1 canary failure, 2 invalid input/setup/cleanup failure.\n"
+        "Related: docs/runbooks/write-worker-boundary.md#review-contract-canary; machinery #585.",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("routes", help="Print the required reviewer routes")
     rec = sub.add_parser("record", help="Record one settled canary task as canary evidence")
-    rec.add_argument("--task-id", required=True)
+    rec.add_argument("--task-id", required=True, help="Settled task ID, e.g. contract-canary-codex")
     chk = sub.add_parser("check", help="Print the refusal for a PR head, if any")
-    chk.add_argument("--head", required=True)
-    chk.add_argument("paths", nargs="+")
+    chk.add_argument("--head", required=True, help="Exact reviewed commit, 40 lowercase hex characters")
+    chk.add_argument("paths", nargs="+", help="Changed repository-relative files, e.g. lu_machinery/dispatcher/worker.py")
+    runner = sub.add_parser(
+        "run", help="Build, run, record and score the sealed-checkout canary on the host",
+        description="Orchestrate the four-route review-contract canary at an exact head.\n"
+        "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+        "  .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"
+        "  .venv/bin/python -m lu_machinery.review.contract_canary run --head <40-hex-sha> --dry-run\n"
+        "Outputs: temporary SquashFS/venv under home; live read-only tasks and shared canary receipts.\n"
+        "The mount and temporary directory are removed; failed unmount retains the directory for recovery.\n"
+        "Exit codes: 0 all routes and check pass, or dry-run plan; 1 route/check failure; 2 setup/cleanup failure.\n"
+        "Related: docs/runbooks/write-worker-boundary.md#review-contract-canary.",
+    )
+    runner.add_argument("--repo", default="machinery", help="Fleet registry key holding the candidate code (default: machinery)")
+    target = runner.add_mutually_exclusive_group(required=True)
+    target.add_argument("--head", help="Exact candidate commit, 40 lowercase hex characters (default: from --pr)")
+    target.add_argument("--pr", type=int, help="PR whose head to resolve once, e.g. 585 (default: use --head)")
+    runner.add_argument("--hard-timeout", type=int, default=1200, help="Positive per-route deadline in seconds (default: 1200)")
+    runner.add_argument("--dry-run", action="store_true", help="Print argv plan without creating files or dispatching (default: off)")
+    runner.add_argument("paths", nargs="*", help="Changed repository-relative files for check (default: the contract gate itself)")
     args = parser.parse_args(argv)
     try:
+        if args.command == "run":
+            return run(args)
         if args.command == "routes":
             print("\n".join(required_routes()))
         elif args.command == "record":
@@ -323,7 +563,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             detail = refusal(args.paths, args.head)
             print(f"{REASON}: {detail}" if detail else "ok")
             return 1 if detail else 0
-    except (CanaryError, ValueError, OSError) as exc:
+    except (CanaryError, ValueError, OSError, subprocess.SubprocessError) as exc:
         print(f"{REASON}: {exc}", file=sys.stderr)
         return 2
     return 0

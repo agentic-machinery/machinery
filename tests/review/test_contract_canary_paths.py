@@ -246,3 +246,197 @@ def test_a_change_outside_the_contract_needs_no_canary(repo) -> None:
     root, _ = repo
     # No git read at all: an unknown head does not matter outside the contract.
     assert canary.refusal(["scripts/example.py", "docs/review-protocol.md"], "not-a-sha", root) is None
+
+
+@pytest.fixture
+def runner_roots(tmp_path, configured_roots, monkeypatch):
+    """A host context with all external orchestration replaced by an argv fake."""
+    import sys
+    from lu_machinery.dispatcher import git as dispatch_git
+
+    source = tmp_path / "registered-source"
+    source.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(dispatch_git, "resolve_repo", lambda key: (
+        source, {"github": "example/machinery", "key": key},
+    ))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
+    return home
+
+
+def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypatch, capsys):
+    """A worker can inspect the complete plan without escaping its write boundary."""
+    import sys
+
+    monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-585")
+    monkeypatch.setattr(canary, "_invoke", lambda *a, **kw: pytest.fail("dry-run executed a command"))
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "no live proof" in output
+    assert "mksquashfs" in output and "snapfuse" in output and "fusermount" in output
+    assert "--codex-account b-sub" in output and "--claude-account b" in output
+    assert "--codex-account a" not in output
+    assert "--require-hashes" in output and "contract-canary.pth" in output
+    assert "--pinned-head " + "a" * 40 in output
+    assert "check --head " + "a" * 40 in output
+    assert f"{sys.executable} -I -B -m lu_machinery.review.contract_canary check" in output
+    assert output.count("systemd-run --user") == 4
+    assert list(runner_roots.iterdir()) == []
+    assert canary.main(["run", "--head", "a" * 40]) == 2
+    assert "outside a dispatched worker" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure", [
+    None, "route", "check", "mount", "unmount", "unmount-noop", "interrupt", "unit-lost",
+])
+def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
+    runner_roots, monkeypatch, capsys, failure,
+):
+    """Route/check failure fails closed; setup and cleanup errors preserve a mounted tree."""
+    import sys
+
+    commands = []
+    mounted = False
+
+    def invoke(argv, *, cwd, env, check=True):
+        nonlocal mounted
+        commands.append(argv)
+        assert "PYTHONPATH" not in env
+        code, output = 0, ""
+        if argv[0] == "mksquashfs":
+            Path(argv[2]).write_bytes(b"candidate image")
+        if argv[0] == "snapfuse":
+            mounted = True
+            if failure == "mount":
+                raise canary.CanaryError("mount failed after becoming visible")
+        if argv[0] == "systemd-run":
+            assert mounted
+            route = argv[argv.index("--agent") + 1]
+            assert argv[argv.index("--mode") + 1] == "read-only"
+            assert "--pr" not in argv and "--branch" not in argv
+            assert argv[argv.index("--task-id") + 1][0].isalnum()
+            assert any(a.startswith("--setenv=PATH=") for a in argv)
+            assert any(a.startswith("--setenv=LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=") for a in argv)
+            assert any(a.startswith("--setenv=LU_PRODUCT_ROOT=") for a in argv)
+            if failure == "interrupt":
+                raise KeyboardInterrupt
+            code = 1 if failure == "route" and route == "claude" else 0
+            output = "" if failure == "unit-lost" else "CANARY-ROUTE-SETTLED\n"
+        if "check" in argv:
+            assert argv[:5] == [sys.executable, "-I", "-B", "-m", "lu_machinery.review.contract_canary"]
+            assert "consumer" not in argv[0]
+            code = 1 if failure == "check" else 0
+            output = "needs-contract-canary: missing: codex\n" if code else "ok\n"
+        if "-u" in argv:
+            if failure == "unmount":
+                raise canary.CanaryError("unmount busy")
+            mounted = failure == "unmount-noop"
+        return subprocess.CompletedProcess(argv, code, output, "")
+
+    monkeypatch.setenv("PYTHONPATH", "/must/not/shadow/candidate")
+    monkeypatch.setattr(canary, "_invoke", invoke)
+    monkeypatch.setattr(canary.os.path, "ismount", lambda path: mounted)
+    expected = 0 if failure is None else 1 if failure in {"route", "check"} else 2
+    assert canary.main(["run", "--head", "b" * 40]) == expected
+    output = capsys.readouterr()
+    if failure in {None, "route", "check"}:
+        assert sum(cmd[0] == "systemd-run" for cmd in commands) == 4
+        assert "squashfs sha256:" in output.out
+        assert "claude: FAIL" in output.out if failure == "route" else "claude: PASS" in output.out
+    if failure in {"unmount", "unmount-noop", "interrupt", "unit-lost"}:
+        assert mounted
+        assert "retained" in output.err
+        assert len(list(runner_roots.iterdir())) == 1
+    else:
+        assert not mounted
+        assert list(runner_roots.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad_args", [
+    ["--head", "main"], ["--head", "c" * 40, "--hard-timeout", "0"],
+])
+def test_runner_rejects_unpinned_or_unbounded_runs(runner_roots, monkeypatch, bad_args):
+    """No task or image may be created for a ref or an unlimited provider run."""
+    monkeypatch.setattr(canary, "_invoke", lambda *a, **kw: pytest.fail("invalid run executed"))
+    assert canary.main(["run", *bad_args]) == 2
+    assert list(runner_roots.iterdir()) == []
+
+
+def test_runner_resolves_pr_head_once_before_planning(runner_roots, monkeypatch, capsys):
+    """A moving PR never mixes the dispatch and score commits."""
+    from lu_machinery.common import github_client
+
+    reads = []
+
+    def read(argv, **kwargs):
+        reads.append(argv)
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"headRefOid": "d" * 40}), "")
+
+    monkeypatch.setattr(github_client, "run", read)
+    assert canary.main(["run", "--repo", "machinery", "--pr", "42", "--dry-run"]) == 0
+    assert len(reads) == 1
+    assert "--repo" in reads[0] and "example/machinery" in reads[0]
+    assert "--pinned-head " + "d" * 40 in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("outcome", [
+    "done", "failed", "interrupted", "dispatch-error", "unknown-wait", "timeout-wait", "recovered-wait",
+])
+def test_route_bootstrap_records_only_terminal_success_and_cancels_interruption(monkeypatch, capsys, outcome):
+    """Unknown dispatch/wait status never signals settlement or records a receipt."""
+    import signal
+    import sys
+    from lu_machinery.dispatcher import cli
+
+    calls = []
+    receipts = []
+
+    def main(argv):
+        calls.append(argv[0])
+        if argv[0] == "dispatch":
+            print("canary-task\nnonce-42")
+            return 2 if outcome == "dispatch-error" else 0
+        assert argv[1:] == ["canary-task", "--run-nonce", "nonce-42"]
+        if argv[0] == "wait" and calls.count("wait") == 1:
+            if outcome == "interrupted":
+                raise KeyboardInterrupt
+            if outcome in {"unknown-wait", "recovered-wait"}:
+                return 2
+            if outcome == "timeout-wait":
+                return 124
+            return 1 if outcome == "failed" else 0
+        if argv[0] == "wait" and outcome in {"unknown-wait", "timeout-wait"}:
+            return 2
+        return 0
+
+    monkeypatch.setattr(cli, "main", main)
+    monkeypatch.setattr(canary, "record", lambda task_id: receipts.append(task_id))
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+    monkeypatch.setattr(sys, "argv", ["bootstrap", "dispatch"])
+    if outcome == "done":
+        exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
+        assert calls == ["dispatch", "wait"]
+        assert receipts == ["canary-task"]
+    elif outcome == "failed":
+        with pytest.raises(SystemExit) as exc:
+            exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
+        assert exc.value.code == 1
+        assert calls == ["dispatch", "wait"]
+        assert receipts == []
+    elif outcome == "interrupted":
+        with pytest.raises(KeyboardInterrupt):
+            exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
+        assert calls == ["dispatch", "wait", "cancel", "wait"]
+        assert receipts == []
+    else:
+        with pytest.raises(SystemExit) as exc:
+            exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
+        assert exc.value.code == (124 if outcome == "timeout-wait" else 2)
+        assert calls == (["dispatch"] if outcome == "dispatch-error" else ["dispatch", "wait", "cancel", "wait"])
+        assert receipts == []
+    assert ("CANARY-ROUTE-SETTLED" in capsys.readouterr().out.splitlines()) == (
+        outcome in {"done", "failed", "interrupted", "recovered-wait"}
+    )
