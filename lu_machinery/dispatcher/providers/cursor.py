@@ -47,8 +47,9 @@ def _shell_rule(claude_rule: str) -> str:
 def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> str:
     """The ``cli-config.json`` a read-only run reads: the permission profile of a read-only Claude run.
 
-    ``--mode ask`` refused every shell call, ``git diff`` and ``sha256sum`` included (2026-11-15 bench). Cursor takes per-command rules only from
-    this file, so the write boundary binds it read-only at HOME's ``.cursor/cli-config.json``. Every shell command
+    ``--mode ask`` refused every shell call, ``git diff`` and ``sha256sum`` included (2026-11-15 bench). Cursor
+    takes per-command rules only from this file and rewrites it at every start, so the write boundary puts a private
+    copy at HOME's ``.cursor/cli-config.json``, discarded with the run's scratch. Every shell command
     runs except the Git and GitHub writes Claude's profile denies; file writes and the Sources tools that persist
     entries are denied too, and deny wins over allow. ``allowlist`` approval with no ``--force`` refuses any other
     call that needs approval. Cursor's own sandbox stays off, as Claude's per-shell prefix is stripped: a nested
@@ -60,8 +61,8 @@ def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> 
     deny = [_shell_rule(rule) for rule in _READ_DENIES.split(",") if rule.startswith("Bash(")]
     config = {
         "version": 1,
-        # Cursor's schema requires ``editor``; without it Cursor rewrites the file to repair it, and since the file is
-        # read-only it then falls back to its defaults, which allow only ``Shell(ls)`` (cursor-agent 2026.11.13).
+        # Cursor's schema requires ``editor``; a profile without it is a repair case, and a failed repair falls back
+        # to Cursor's defaults, which allow only ``Shell(ls)`` (cursor-agent 2026.11.13).
         "editor": {"vimMode": False},
         "approvalMode": "allowlist",
         "autoAcceptWebSearch": True,

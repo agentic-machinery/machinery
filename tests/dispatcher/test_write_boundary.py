@@ -358,9 +358,10 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
                        else ' && test -z "$OPENCODE_CONFIG"')
                       + f" && grep -qF '\"/run/lu-write-boundary/sources.sock\"' {sources_mcp}"
                       + f" && ! grep -q foreign {sources_mcp} && ! (echo planted >> {sources_mcp}) 2>/dev/null")
-        if mode == "read-only":  # with its permission profile, read-only too
-            home_check += (" && grep -qF 'Shell(git:push*)' $HOME/.cursor/cli-config.json"
-                           " && ! (echo planted >> $HOME/.cursor/cli-config.json) 2>/dev/null")
+        if mode == "read-only":  # with its permission profile, which Cursor rewrites through a file beside it
+            profile = "$HOME/.cursor/cli-config.json"
+            home_check += (f" && grep -qF 'Shell(git:push*)' {profile}"
+                           f" && cp {profile} {profile}.1.tmp && mv {profile}.1.tmp {profile}")
     probe, report = tmp_path / "probe.py", tmp_path / "cells.json"
     probe.write_text(_CREDENTIAL_PROBE)
     code = write_boundary.main([

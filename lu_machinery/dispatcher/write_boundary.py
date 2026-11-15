@@ -209,8 +209,8 @@ _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
 _CURSOR_SOURCES_SERVER = "sources-relay"
 # A read-only Cursor run's permission profile (``providers.cursor.read_only_cli_config``): Cursor reads per-command
-# rules only from this file, so it is written in the boundary directory and bound read-only at its path below HOME.
-_CURSOR_CLI_CONFIG = "cursor-cli-config.json"
+# rules only from this file and rewrites it at every start through a temporary file beside it, so it is a private
+# copy in HOME's lower layer, as the Claude login's copies are: Cursor's rewrite lands in the discarded upper layer.
 _CURSOR_CLI_CONFIG_HOME = ".cursor/cli-config.json"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
                     "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300,
@@ -1719,9 +1719,9 @@ class _Boundary:
         sources_mcp = self._sources_mcp(boundary, home)
         if sources_mcp is not None:
             restores.append(sources_mcp)
-        cursor_config = self._cursor_permissions(boundary, home)
+        cursor_config = self._cursor_permissions()
         if cursor_config is not None:
-            restores.append(cursor_config)
+            restores.append(home / _CURSOR_CLI_CONFIG_HOME)
         login, login_reads = self._claude_login(home, repository)
         restores += [*([login[1]] if login else []), *login_reads]
         masks = [*base_masks, *private]
@@ -1749,6 +1749,9 @@ class _Boundary:
 
         lower = self.base / "home-lower"
         lower.mkdir(mode=0o700)
+        if cursor_config is not None:
+            (lower / _CURSOR_CLI_CONFIG_HOME).parent.mkdir(mode=0o700, parents=True)
+            _write_private(lower / _CURSOR_CLI_CONFIG_HOME, cursor_config, 0o600)
         argv = [
             str(bwrap), "--unshare-all", "--unshare-user", "--disable-userns", "--die-with-parent", "--new-session",
             "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
@@ -1799,8 +1802,6 @@ class _Boundary:
         if sources_mcp is not None and sources_mcp != boundary / _SOURCES_MCP:
             # The provider reads it from HOME; it stays read-only there, as Codex's Sources definition.
             argv += ["--ro-bind", str(boundary / _SOURCES_MCP), str(sources_mcp)]
-        if cursor_config is not None:
-            argv += ["--ro-bind", str(boundary / _CURSOR_CLI_CONFIG), str(cursor_config)]
         # No GitHub credential is readable inside (PUBLISH-CRED-1113): the host login's known stores are empty.
         for path in _github_credential_paths(home):
             if not _hidden(path, masks, restores):
@@ -2047,8 +2048,8 @@ class _Boundary:
         self.receipt["sources_mcp"] = {"provider": agent, "config_sha256": hashlib.sha256(config).hexdigest()}
         return target
 
-    def _cursor_permissions(self, boundary: Path, home: Path) -> Path | None:
-        """Write a read-only Cursor run's permission profile and return where Cursor reads it, else None.
+    def _cursor_permissions(self) -> bytes | None:
+        """A read-only Cursor run's permission profile, else None.
 
         Without the Sources partition no Sources tool is allowed, and Cursor refuses an MCP call no rule allows.
         """
@@ -2062,9 +2063,8 @@ class _Boundary:
         except Exception:  # Sources is optional; the shell rules are not
             readers, writers = (), ()
         config = read_only_cli_config(readers, writers).encode()
-        _write_private(boundary / _CURSOR_CLI_CONFIG, config, 0o600)
         self.receipt["cursor_permissions"] = {"config_sha256": hashlib.sha256(config).hexdigest()}
-        return home / _CURSOR_CLI_CONFIG_HOME
+        return config
 
     def _probes(self, repository: Path, common: Path, sockets: list[Path], outputs: list[Path], tmp: Path,
                 nonce: str) -> list[dict]:
@@ -2185,8 +2185,8 @@ class _Boundary:
             probes.append({"op": "write_open", "path": str(home / relative) if relative else _SOURCES_MCP_INSIDE,
                            "expect_any": ["EROFS"]})
         if self.args.mode == "read-only" and self.args.sources_mcp == "cursor":
-            # So does a read-only Cursor run's permission profile.
-            probes.append({"op": "write_open", "path": str(home / _CURSOR_CLI_CONFIG_HOME), "expect_any": ["EROFS"]})
+            # A read-only Cursor run's permission profile is present where Cursor reads it.
+            probes.append({"op": "stat", "path": str(home / _CURSOR_CLI_CONFIG_HOME), "expect_any": ["OK"]})
         return probes
 
     def _report(self, descriptor: int) -> list | None:
