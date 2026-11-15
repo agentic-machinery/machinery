@@ -24,8 +24,11 @@ Read-only AGY retains its existing filesystem boundary and uses
 the same GitHub domain and address refusal rules, without nesting two boundaries.
 
 Both paths withhold the host's GitHub login and refuse direct GitHub egress. The existing read-only
-`gh` relay admits `pr view`, `pr diff`, `pr checks`, `issue view` and `run view`; arbitrary `gh api`
-requests, including repository permission queries, are refused. Named reads also use `github-read`.
+`gh` relay admits `pr view`, `pr diff`, `pr checks`, `pr list`, `issue view`, `run view` and `run list`;
+arbitrary `gh api` requests, including repository permission queries, and search queries (`--search`/`-S`,
+whose `repo:` qualifiers would widen a listing) are refused. Named reads also use `github-read`.
+Write dispatches get the same relay: its `gh` is first on the worker's `PATH`, so a write worker reads
+its PR, its checks and its CI runs with the usual `gh` commands.
 The host login reads only a registered repository with a `public-` role in `config/fleet_repos.yaml`
 (decision A6): the relay resolves the repository on the host (`--repo`/`-R`, else the worktree's
 `origin`) and refuses a private, unknown or unresolved one before `gh` runs; the argv it runs names that
@@ -205,7 +208,10 @@ forward to it on their own when that variable is set, so a worker runs the usual
 | Command inside | Verb | What the host does |
 | --- | --- | --- |
 | `dispatch.py dispatch --mode read-only ...` | `review-dispatch` | Starts the review in its own normal sandbox |
+| `dispatch.py wait <task>-review-<suffix> [--run-nonce N] [--timeout S]` | `review-wait` | Waits for the review and returns its record and reply |
+| `record_cf_verdict.py budget-check --repository R --pr N` | `budget-check` | Runs the recorder's round admission for the task's own open PR |
 | `record_cf_verdict.py --task-id T --pr N` | `record-verdict` | Records the verdict under the host's PR lock |
+| publisher `read <name> --number N\|--sha S [--paginate]` | `github-read` | One named read of the task's repository |
 | `fleet_comms channel publish ...` | `fleet-publish` | Appends the message with the task id as sender |
 | `fleet_comms deliveries receive\|ack ...` | `fleet-deliveries` | Receives or acknowledges a delivery addressed to the task |
 | `write_boundary call pr-ownership` | `pr-ownership` | Runs `pr_ownership accept` or `queue-exit` as the task, for its own PR |
@@ -232,6 +238,17 @@ launch, never from the request:
   (`index-pack` hashes every object) and dispatches with `--mode read-only --worktree`, the launch's
   model as `--review-author-model` and `--review-mode cross_family`. A request field for the author is
   refused.
+- **Review result.** `review-wait` waits on the host for a review this task dispatched (named
+  `<task>-review-<suffix>`, with this task as its `initiator`) for at most 840 seconds per request,
+  because the broker serves one request at a time. The wait inside forwards a `wait` of any task whose
+  record is not in the task's own view; a longer or unlimited `--timeout` exits 124 while the review
+  still runs, as the host's wait does, and the caller runs the same wait again. Once the review is done
+  the printed record carries the reviewer's sealed reply as `result` (its digest checked), so the
+  author reads every finding, including those the recorder withholds from the PR (#591). The reply
+  reaches only this task.
+- **Budget check.** `budget-check` runs `record_cf_verdict budget-check` on the host for the task's own
+  open PR and returns its JSON and exit status (#575). The review dispatch still runs the same admission
+  itself, so the check only tells the worker before it spends a dispatch.
 - **Replay.** Each request id is accepted once per run. The dispatcher refuses an existing task id.
 - **Paths.** No request names a host path. The prompt arrives as text and the host writes it to the
   run's private scratch.
@@ -283,7 +300,9 @@ stdin.
 | `pr-comment` | `pr`, `body`, optional `repo` | Comments on the worker's own open or merged PR |
 | `pr-merge` | `pr`, `head`, optional `repo` | Enqueues the worker's own PR at `head` |
 | `pr-ownership` | `command` (`accept` or `queue-exit`), `pr`, optional `repo`, `custody`, `from` | Runs `pr_ownership` as the task for its own open PR |
-| `github-read` | `name`, optional `number` or `sha` | One named read of the repository |
+| `github-read` | `name`, optional `number` or `sha`, `repo`, `paginate` | One named read of the repository |
+| `budget-check` | `pr`, optional `repo` | The recorder's round admission for the worker's own open PR |
+| `review-wait` | `task_id`, optional `run_nonce`, `timeout` (0 to 840 seconds) | Waits for the worker's own review; its record and, once done, its reply |
 
 What every publication verb takes from the launch, never from the request: the repository (the
 primary's registered GitHub origin), the branch, the base (the repository's default branch on
@@ -332,7 +351,12 @@ Texts arrive as JSON strings, and the host writes them to the run's private scra
   needs a new approval.
 - **Reads.** `github-read` names one of the publisher's fixed GET templates (`pull`, `pr-files`,
   `commits`, `commit`, `comments`, `reviews`, `timeline`, `issue`, `checks`, `check-annotations`,
-  `run`, `jobs`). It reads only the primary's own repository and never security alerts.
+  `run`, `jobs`). It reads only the primary's own repository and never security alerts. The
+  publisher's `read` forwards these names inside the boundary (with `--number` or `--sha`, and
+  `--paginate`); any other read is refused there with `WRITE_BOUNDARY`, before anything is sent, instead
+  of failing at the egress proxy. A `repo` must be the launch's own.
+- **Fetch.** `git fetch` keeps its github.com URL and fails at the egress proxy; `fetch-base` is the
+  fetch of the default branch (`write_boundary call fetch-base`).
 
 Every GitHub verb acts only on the primary's origin, which the broker resolves once when it starts and
 keeps for the run: a later change of the origin or the registry never moves the run's authority. That
@@ -343,14 +367,15 @@ approval C-5541):
 - **Private role (`private-`).** Only the verbs of the broker's explicit private allowlist
   (`_PRIVATE_VERBS`), each bound to the task's own repository, branch and PR: the push of the
   dispatched (or continued PR) branch, `fetch-base` of its default branch, `pr-create` from that branch,
-  the PR verbs, `review-dispatch` and `record-verdict` on the task's own PR, `closeout-request`, and the
-  Fleet verbs. A verb added to the broker later is refused for a private repository until it is listed.
+  the PR verbs, `review-dispatch`, `budget-check` and `record-verdict` on the task's own PR, `review-wait`
+  of the task's own review, `closeout-request`, and the Fleet verbs. A verb added to the broker later is refused for a private repository until it is listed.
   `github-read` is narrowed to the authorized PR and its checks: `pull`, `pr-files`, `commits`,
   `comments`, `reviews`, `timeline` and `issue` by that PR's number, `checks` and `commit` by the task's
   branch tip or that PR's live head. `run`, `jobs`, `check-annotations` and any other PR or issue
   number are refused.
 - **One authorized PR (private role).** Every private PR operation (`github-read`, `pr-edit`,
-  `pr-comment`, `pr-merge`, `pr-ownership`, `review-dispatch`, `record-verdict`, `closeout-request`)
+  `pr-comment`, `pr-merge`, `pr-ownership`, `review-dispatch`, `budget-check`, `record-verdict`,
+  `closeout-request`)
   acts on one PR. With the task record's `--pr` (a review's PR, frozen into the launch), every operation
   must name that number. Without it, the task's first PR operation binds its own PR, checked live: open,
   in the task's repository (not a fork), its head the dispatched (or continued PR) branch and its base the

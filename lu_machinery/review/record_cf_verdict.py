@@ -3611,6 +3611,15 @@ def budget_check_main(argv: list[str]) -> int:
     parser.add_argument("--repository", required=True, help="GitHub owner/name of the PR")
     parser.add_argument("--pr", type=int, required=True, help="Open PR number")
     args = parser.parse_args(argv)
+    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
+        # Inside a write boundary the task store and GitHub are the host's: the launcher's broker runs this same
+        # check for the worker's own open PR (#575) and returns its JSON and exit status.
+        from lu_machinery.dispatcher import write_boundary
+
+        reply = write_boundary.broker_call("budget-check", {"pr": args.pr, "repo": args.repository})
+        sys.stdout.write(reply.get("stdout", ""))
+        sys.stderr.write(reply.get("stderr", ""))
+        return 0 if reply.get("returncode") == 0 else 1
     try:
         result = budget_check(args.repository, args.pr)
     except (RecordError, SweepError, ValueError) as exc:

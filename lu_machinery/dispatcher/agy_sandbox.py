@@ -100,11 +100,18 @@ INPUT_MOUNT = "/agy-inputs"
 MAX_INPUTS = 8
 MAX_INPUT_BYTES = 8 << 20
 # The read-only gh forms the AGY boundary relays; nothing else reaches the host's gh.
-_GH_READS = frozenset({("pr", "view"), ("pr", "diff"), ("pr", "checks"), ("issue", "view"), ("run", "view")})
+_GH_READS = frozenset({("pr", "view"), ("pr", "diff"), ("pr", "checks"), ("pr", "list"), ("issue", "view"),
+                       ("run", "view"), ("run", "list")})
 _GH_TIMEOUT = 300
-# Flags of those forms that take a separate value; every other argument is a flag or an operand.
+# Flags of those forms that take a separate value; every other argument is a flag or an operand. A short flag is
+# listed only when it takes a value in every form that has it: treating a boolean flag as valued would skip the
+# check of the word after it (a ``-R`` there). An unlisted value flag only makes its value checked as an operand.
 _GH_VALUE_FLAGS = frozenset({"--json", "-q", "--jq", "-t", "--template", "--job", "-j", "--attempt", "-a",
-                             "--color", "--interval", "-i"})
+                             "--color", "--interval", "-i", "--head", "--base", "--state", "--limit", "--label",
+                             "--author", "--assignee", "--branch", "--workflow", "--event", "--status", "--user",
+                             "--commit", "--created"})
+# A search query can name other repositories (``repo:`` qualifiers widen the listing), so it is refused.
+_GH_SEARCH_FLAGS = frozenset({"--search", "-S"})
 # A number, #number or branch name: never a host, URL or OWNER/REPO#N selector.
 _GH_OPERAND = re.compile(r"#?[A-Za-z0-9._/-]+")
 # The one value --repo/-R accepts: OWNER/REPO on github.com. HOST/OWNER/REPO and URLs name another host.
@@ -1005,7 +1012,8 @@ def _gh_parse(argv) -> tuple[str | None, list[str]]:
             and all(isinstance(arg, str) and "\0" not in arg and len(arg) <= 4096 for arg in argv)):
         return "the gh request is malformed", []
     if (argv[0], argv[1]) not in _GH_READS:
-        return "only gh pr view, gh pr diff, gh pr checks, gh issue view and gh run view are relayed", []
+        return ("only gh pr view, gh pr diff, gh pr checks, gh pr list, gh issue view, gh run view and gh run list "
+                "are relayed", [])
     # gh runs on the host's network with the host's login, so nothing may choose another host: the
     # repository is the worktree's own remote or an OWNER/REPO on github.com given as ``--repo X``,
     # ``--repo=X`` or ``-R X``. A URL operand or any other repository form names another host;
@@ -1032,14 +1040,14 @@ def _gh_parse(argv) -> tuple[str | None, list[str]]:
                 if equals:
                     named.append(value)
                 expect_repo = not equals
-            elif name.startswith(("--web", "--repo")):
+            elif name.startswith(("--web", "--repo")) or name in _GH_SEARCH_FLAGS:
                 return f"gh {name} is refused", []
             else:
                 expect_value = not equals and name in _GH_VALUE_FLAGS
         elif arg.startswith("-") and len(arg) > 1:
             if arg == "-R":
                 expect_repo = True
-            elif "w" in arg or "R" in arg:
+            elif "w" in arg or "R" in arg or "S" in arg:
                 return f"gh {arg} is refused", []
             else:
                 expect_value = len(arg) == 2 and arg in _GH_VALUE_FLAGS

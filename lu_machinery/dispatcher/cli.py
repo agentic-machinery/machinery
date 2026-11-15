@@ -360,6 +360,26 @@ def _dispatch_through_broker(args) -> int:
     return int(reply.get("returncode", 1))
 
 
+def _wait_through_broker(args) -> int:
+    """Inside a write boundary a review this worker dispatched is waited on by the host's broker (#557, #591).
+
+    The wait is bounded per request (``write_boundary.REVIEW_WAIT_MAX``): a longer ``--timeout`` exits 124 while the
+    review still runs, as the host's wait does, and the caller runs the same wait again. The printed record carries
+    the reviewer's sealed reply as ``result`` once the review is done.
+    """
+    from lu_machinery.dispatcher import write_boundary
+
+    if args.timeout < 0:
+        raise ValueError("timeout must be nonnegative and poll interval positive")
+    timeout = min(int(args.timeout), write_boundary.REVIEW_WAIT_MAX) if args.timeout else write_boundary.REVIEW_WAIT_MAX
+    payload = {"task_id": args.task_id, "timeout": timeout, **({"run_nonce": args.run_nonce} if args.run_nonce else {})}
+    reply = write_boundary.broker_call("review-wait", payload)
+    sys.stdout.write(reply.get("stdout", ""))
+    sys.stderr.write(reply.get("stderr", ""))
+    code = reply.get("returncode")
+    return code if type(code) is int and 0 <= code < 256 else 1
+
+
 def _dispatch(args) -> int:
     if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
         return _dispatch_through_broker(args)
@@ -821,6 +841,10 @@ def main(argv=None) -> int:
                 return 1
             print(json.dumps(result, indent=2))
             return 0
+        if (args.command == "wait" and os.environ.get("LU_WRITE_BOUNDARY_BROKER")
+                and not store.record_path(args.task_id).exists()):
+            # Only this task's own records are visible inside; another task (its review) is the host's to read.
+            return _wait_through_broker(args)
         code = 0
         if args.command == "worktrees":
             result = _worktrees(args.repo, args.all)

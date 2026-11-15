@@ -153,17 +153,18 @@ _HOST_CONTEXT = frozenset({
 # typed verbs. Each verb has a fixed schema, and every identity it acts under comes from the launch, never the
 # request.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
-_BROKER_VERBS = ("review-dispatch", "record-verdict", "fleet-publish", "fleet-deliveries", "closeout-request", "push",
-                 "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge", "pr-ownership", "github-read")
+_BROKER_VERBS = ("review-dispatch", "review-wait", "budget-check", "record-verdict", "fleet-publish", "fleet-deliveries",
+                 "closeout-request", "push", "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge",
+                 "pr-ownership", "github-read")
 # Named reads of the worker's own repository (the publisher's fixed GET templates); no security-alert reads.
-_GITHUB_READS = frozenset({"pull", "pr-files", "commits", "commit", "comments", "reviews", "timeline", "issue",
-                           "checks", "check-annotations", "run", "jobs"})
+GITHUB_READS = frozenset({"pull", "pr-files", "commits", "commit", "comments", "reviews", "timeline", "issue",
+                          "checks", "check-annotations", "run", "jobs"})
 # A registered private repository (#565, designated approval C-5541): the explicit allowlist of verbs the broker
 # admits for it. Each is bound to the task's own repository, branch and PR identity frozen at launch; a verb added
 # to _BROKER_VERBS later is refused for a private repository until it is listed here.
-_PRIVATE_VERBS = frozenset({"review-dispatch", "record-verdict", "fleet-publish", "fleet-deliveries", "closeout-request",
-                            "push", "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge", "pr-ownership",
-                            "github-read"})
+_PRIVATE_VERBS = frozenset({"review-dispatch", "review-wait", "budget-check", "record-verdict", "fleet-publish",
+                            "fleet-deliveries", "closeout-request", "push", "fetch-base", "pr-create", "pr-edit",
+                            "pr-comment", "pr-merge", "pr-ownership", "github-read"})
 # A private repository's github-read is the authorized PR (by its number) and its checks (by its head commit) only;
 # reads by any other id (another PR or issue, a workflow run, a check run) are refused.
 _PRIVATE_PR_READS = frozenset({"pull", "pr-files", "commits", "comments", "reviews", "timeline", "issue"})
@@ -208,7 +209,12 @@ _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
 _CURSOR_SOURCES_SERVER = "sources-relay"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
-                    "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300}
+                    "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300,
+                    "budget-check": 300, "review-wait": 900}
+# The longest one review-wait blocks the broker, which serves one request at a time; a longer wait is repeated
+# by the client (``dispatch wait`` exits 124 while the review still runs, as on the host).
+REVIEW_WAIT_MAX = 840
+_RUN_NONCE = re.compile(r"[0-9a-f]{32}")
 # A Fleet delivery id or artifact id as the authority service mints them; never a flag.
 _DELIVERY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
@@ -770,6 +776,9 @@ class _Broker:
       and the review task id is ``<task>-review-<suffix>``. The host fetches that commit from the worker's
       private Git layer (index-pack hashes every object), then runs the dispatcher, whose review then runs
       in its own normal sandbox. The author model is the launch's model, so the family check is not forgeable.
+    * ``review-wait`` waits (bounded) for a review task of this worker on the host and returns its record, with the
+      reviewer's sealed reply once it is done, so the author reads every finding, withheld from the PR or not.
+    * ``budget-check`` runs the recorder's read-only round admission for the worker's own open PR on the host.
     * ``record-verdict`` runs the recorder for a review task of this worker, on the worker's PR; the recorder
       takes the host's PR lock and writes its receipts in the task store, which is read-only inside.
     * ``fleet-publish`` appends one Fleet Comms message whose sender is the task id and whose idempotency key
@@ -1122,6 +1131,51 @@ class _Broker:
         number, _slug, _facts = self._pull_request(payload, "OPEN")
         return self._module("review.record_cf_verdict", ["--task-id", task, "--pr", str(number)], "record-verdict")
 
+    def _budget_check(self, payload: dict) -> dict:
+        """The recorder's round admission for this task's own open PR (#575); it reads only and writes nothing."""
+        if not {"pr"} <= set(payload) <= {"pr", "repo"}:
+            raise _BrokerRefusal("budget-check takes pr and optionally repo")
+        number, slug, _facts = self._pull_request(payload, "OPEN")
+        return self._module("review.record_cf_verdict", ["budget-check", "--repository", slug, "--pr", str(number)],
+                            "budget-check")
+
+    def _review_wait(self, payload: dict) -> dict:
+        """Wait on the host for a review this task dispatched and return its record and, once done, its reply.
+
+        The task store is read-only and empty inside, so ``dispatch wait`` of the review cannot run there (#557).
+        The review must be named ``<task>-review-<suffix>`` and record this task as its initiator. The reply is the
+        reviewer's sealed result (its digest checked), so the author reads the findings the recorder withholds
+        from the PR (#591); it reaches only this task.
+        """
+        if not {"task_id"} <= set(payload) <= {"task_id", "run_nonce", "timeout"}:
+            raise _BrokerRefusal("review-wait takes task_id, and optionally run_nonce and timeout")
+        task = self._review_task(payload)
+        nonce, timeout = payload.get("run_nonce"), payload.get("timeout", 0)
+        if nonce is not None and not (isinstance(nonce, str) and _RUN_NONCE.fullmatch(nonce)):
+            raise _BrokerRefusal("run_nonce is malformed")
+        if type(timeout) is not int or not 0 <= timeout <= REVIEW_WAIT_MAX:
+            raise _BrokerRefusal(f"timeout must be 0 to {REVIEW_WAIT_MAX} seconds")
+        reply = self._module("dispatcher.cli", ["wait", task, *(["--run-nonce", nonce] if nonce else []),
+                                                "--timeout", str(timeout)], "review-wait")
+        try:
+            record = json.loads(reply["stdout"])
+        except ValueError:
+            record = None
+        if not isinstance(record, dict):
+            return reply
+        if record.get("initiator") != self.boundary.args.task_id:
+            raise _BrokerRefusal("the review task was not dispatched by this task")
+        if record.get("status") == "done":
+            from lu_machinery.common.task_store_paths import tasks_dir
+            from lu_machinery.review import record_cf_verdict as recorder
+
+            try:
+                record["result"] = recorder._task(task, tasks_dir())[1]
+            except (recorder.RecordError, ValueError, OSError) as exc:
+                record["result_unavailable"] = str(exc)[:200]
+        reply["stdout"] = json.dumps(record, indent=2) + "\n"
+        return reply
+
     def _fleet_publish(self, payload: dict) -> dict:
         allowed = {"channel", "body", "recipients", "idempotency_key", "in_reply_to"}
         if not set(payload) <= allowed or not {"channel", "body", "idempotency_key"} <= set(payload):
@@ -1435,11 +1489,13 @@ class _Broker:
 
     def _github_read(self, payload: dict) -> dict:
         """A named read of this repository through the publisher's fixed GET templates (no write is possible)."""
-        if not set(payload) <= {"name", "number", "sha"} or "name" not in payload:
-            raise _BrokerRefusal("github-read takes name, number and sha")
-        name = payload["name"]
-        if name not in _GITHUB_READS:
-            raise _BrokerRefusal("name must be one of " + ", ".join(sorted(_GITHUB_READS)))
+        if not set(payload) <= {"name", "number", "sha", "repo", "paginate"} or "name" not in payload:
+            raise _BrokerRefusal("github-read takes name, number, sha, repo and paginate")
+        name, paginate = payload["name"], payload.get("paginate", False)
+        if type(paginate) is not bool:
+            raise _BrokerRefusal("paginate must be true or false")
+        if name not in GITHUB_READS:
+            raise _BrokerRefusal("name must be one of " + ", ".join(sorted(GITHUB_READS)))
         fields = []
         if (number := payload.get("number")) is not None:
             if type(number) is not int or not 0 < number < 10**12:
@@ -1450,9 +1506,11 @@ class _Broker:
                 raise _BrokerRefusal("sha must be a full commit id")
             fields += ["--sha", sha]
         slug = self._repository_slug()
+        self._claimed({"repo": payload.get("repo")}, slug)
         if self._private():
             self._private_read_scope(name, number, sha)
-        return self._module("publish.github", ["read", name, "--repo", slug, *fields], "gh")
+        return self._module("publish.github", ["read", name, "--repo", slug, *fields,
+                                               *(["--paginate"] if paginate else [])], "gh")
 
     def _private_read_scope(self, name: str, number: int | None, sha: str | None) -> None:
         """Refuse a private repository's read that is not the authorized PR or its checks (C-5541).
@@ -1740,10 +1798,11 @@ class _Boundary:
         emptied = [path for path in (*data, *private) if path.is_dir() and path != home and path not in restores]
         argv += [arg for path in emptied for arg in ("--remount-ro", str(path))]
         _home_lower(lower, home, argv)
-        if read_only:
-            (boundary / "bin").mkdir(mode=0o700)
-            _write_private(boundary / "bin" / "gh", agy_sandbox._GH_SHIM.format(interpreter=interpreter).encode(), 0o500)
-            self.gh = agy_sandbox._GhBroker(boundary / "gh.sock", self.worktree)
+        # Every dispatch, write or read-only, reads GitHub through the host's read-only gh relay: the worker holds
+        # no GitHub login and the egress proxy refuses GitHub, so without it ``gh pr view``/``pr checks`` fail.
+        (boundary / "bin").mkdir(mode=0o700)
+        _write_private(boundary / "bin" / "gh", agy_sandbox._GH_SHIM.format(interpreter=interpreter).encode(), 0o500)
+        self.gh = agy_sandbox._GhBroker(boundary / "gh.sock", self.worktree)
         try:
             # Sources goes through the read-only AGY boundary's relay: read-only tools only, one server per
             # connection, started by the launcher from the product checkout. Providers reach it through
@@ -1777,8 +1836,7 @@ class _Boundary:
         # still creates it on demand, and it goes with the boundary's private scratch.
         env.update(TMPDIR=str(runtime), LU_SCRATCH_ROOT=str(runtime / "scratch"), XDG_RUNTIME_DIR=str(runtime / "run"),
                    LU_TASK_SCRATCH=str(runtime / "task"), GIT_TERMINAL_PROMPT="0", NODE_USE_ENV_PROXY="1", **{BROKER_ENV: _BROKER_INSIDE})
-        if read_only:
-            env["PATH"] = str(boundary / "bin") + os.pathsep + env.get("PATH", os.defpath)
+        env["PATH"] = str(boundary / "bin") + os.pathsep + env.get("PATH", os.defpath)
         env.update(git_push_settings(env, interpreter, str(machinery_path("dispatcher/write_boundary.py").parents[2])))
         if codex_home is not None:
             env["CODEX_HOME"] = str(codex_home)
