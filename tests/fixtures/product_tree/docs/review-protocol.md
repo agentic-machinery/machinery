@@ -370,12 +370,13 @@ Multi-finding validation order is deterministic: sort by
 
 ## Changing this contract
 
-A change to the review output contract (the paths in
-`scripts/review/contract_canary.py` `CONTRACT_PATHS`) cannot be queued until a live
-read-only canary review on every required reviewer route settles `done` with a canonical
-receipt on its exact head, under the candidate's dispatcher. The keeper and `pr-merge`
-refuse it with `needs-contract-canary` until then. Canary evidence is never a review of
-record. Recipe: [`docs/runbooks/review-contract-canary.md`](runbooks/review-contract-canary.md).
+The review-contract canary runs once per release cut on the release candidate's
+exact head, under the candidate's dispatcher. Every required reviewer route must
+settle `done` with a canonical receipt; a failing route blocks the release. The
+release's Acceptance section records the per-route table. Contract-path PRs do
+not require per-PR canary receipts; independent review and CI remain required.
+Canary evidence is never a review of record. Recipe:
+[`docs/runbooks/review-contract-canary.md`](runbooks/review-contract-canary.md).
 
 ## Reviewer selection trace
 
