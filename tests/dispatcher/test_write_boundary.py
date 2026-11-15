@@ -607,7 +607,7 @@ def broker(primary, tmp_path, monkeypatch):
     instance = write_boundary._Broker.__new__(write_boundary._Broker)
     instance.boundary = _Launch(repo, scratch, _git(worktree, "rev-parse", "HEAD"))
     instance.steps = []
-    instance.bound_pr, instance.published = None, set()
+    instance.bound_pr, instance.published, instance.pr_create_spent = None, set(), False
     instance.pulls = {7: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "main"},
                       9: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
@@ -889,14 +889,25 @@ def test_private_repository_reads_only_the_authorized_pr_and_its_checks(broker):
     assert [argv[1] for _module, argv in broker.steps] == ["reviews", "checks"]
 
 
-@pytest.mark.parametrize("foreign", [9, 10, 11], ids=["different-base", "closed-same-branch", "merged-same-branch"])
-@pytest.mark.parametrize("operation", ["read", "comment", "edit"])
-def test_private_repository_acts_only_on_its_one_bound_pr(broker, operation, foreign):
+@pytest.mark.parametrize(("operation", "foreign"), [
+    *((operation, foreign) for operation in ("read", "comment", "edit") for foreign in (9, 10, 11)),
+    ("create", "launch-pr"), ("create", "bound-pr-merged"), ("create", "second-create")],
+    ids=[*(f"{operation}-{name}" for operation in ("read", "comment", "edit")
+           for name in ("different-base", "closed-same-branch", "merged-same-branch")),
+         "create-after-launch-pr", "create-after-bound-pr-merged", "create-after-own-create"])
+def test_private_repository_acts_only_on_its_one_bound_pr(broker, monkeypatch, operation, foreign):
     """Defect class: private PR identity leak. In a private repository a PR other than the task's own is read,
     commented on or edited because its head branch has the dispatched branch's name (a closed or merged PR of a
     reused branch, or an open PR against another base), or because the launch's --pr is not compared with the
-    named PR, so private content of another PR reaches the worker or another PR is changed (#565 round 1, F1)."""
+    named PR, so private content of another PR reaches the worker or another PR is changed (#565 round 1, F1).
+
+    Defect class: private second-PR creation. A private task's pr-create is admitted although it already has its
+    one authorized PR (the launch's --pr, or a bound PR since merged), or a second pr-create is admitted after its
+    first created PR, so the host login opens a PR outside the one-PR boundary (#565 round 2, F1)."""
     broker.launch_repository = ("owner/repo", True)
+    if operation == "create":
+        _private_second_pr_creation(broker, monkeypatch, foreign)
+        return
     call = {"read": lambda pr: broker._github_read({"name": "pull", "number": pr}),
             "comment": lambda pr: broker._pr_comment({"pr": pr, "body": "x"}),
             "edit": lambda pr: broker._pr_edit({"pr": pr, "title": "t"})}[operation]
@@ -914,7 +925,47 @@ def test_private_repository_acts_only_on_its_one_bound_pr(broker, operation, for
     assert call(7)["returncode"] == 0 and len(broker.steps) == 1
 
 
-_HANDOFF = {"channel": "cto", "body": "hand-off", "idempotency_key": "k1", "recipients": ["claude-cto"]}
+def _private_second_pr_creation(broker, monkeypatch, case: str) -> None:
+    """One private second-PR creation case of the test above: refused, and a first create still admitted and bound."""
+
+    def module(self, name, argv, key, stdin=None, cwd=None):
+        self.steps.append((name, argv))
+        created = "https://github.com/owner/repo/pull/12\n" if argv[0] == "pr-create" else ""
+        return {"returncode": 0, "stdout": created, "stderr": ""}
+
+    def creates() -> list[list[str]]:
+        return [argv for _name, argv in broker.steps if argv[0] == "pr-create"]
+
+    monkeypatch.setattr(write_boundary._Broker, "_module", module)
+    request = {"title": "Title", "body": "Body"}
+    # A continuation continues its branch's existing PR and never opens another.
+    broker.boundary.target = "refs/heads/assigned"
+    assert "continuation" in _refused(lambda: broker._pr_create(request))
+    broker.boundary.target = broker.boundary.branch
+    if case == "launch-pr":
+        broker.boundary.args.pr = 7
+        assert "own PR (7)" in _refused(lambda: broker._pr_create(request))
+        broker.boundary.args.pr = None
+    elif case == "bound-pr-merged":
+        # The reviewer's probe: PR 7 bound, then merged, then the branch moves on; another PR is never opened.
+        assert broker._pr_edit({"pr": 7, "title": "t"})["returncode"] == 0 and broker.bound_pr == 7
+        broker.pulls[7] = {**broker.pulls[7], "state": "MERGED"}
+        broker.boundary.tip = "6" * 40
+        assert "own PR (7)" in _refused(lambda: broker._pr_create(request))
+        assert broker.bound_pr == 7
+        broker.bound_pr = None
+    assert creates() == []
+    # With no authorized PR the first create is admitted, and the PR it returns is bound before the next request.
+    assert broker._pr_create(request)["returncode"] == 0 and broker.bound_pr == 12
+    assert "own PR (12)" in _refused(lambda: broker._pr_create(request))
+    if case == "second-create":
+        # Even when the first create's PR number was never printed (so nothing was bound), the create is spent.
+        broker.bound_pr = None
+        assert "at most one PR" in _refused(lambda: broker._pr_create(request))
+    assert len(creates()) == 1
+
+
+_HANDOFF ={"channel": "cto", "body": "hand-off", "idempotency_key": "k1", "recipients": ["claude-cto"]}
 
 
 @pytest.mark.parametrize("leak", [{"channel": "shared"}, {"recipients": ["claude-cto", "codex"]},

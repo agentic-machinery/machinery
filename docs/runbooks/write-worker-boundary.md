@@ -349,7 +349,12 @@ approval C-5541):
   in the task's repository (not a fork), its head the dispatched (or continued PR) branch and its base the
   repository's default branch. The binding never moves for the rest of the run. A head branch name alone
   never authorizes a PR: a closed or merged PR of a reused branch name, and a PR of the same branch
-  against another base, are refused.
+  against another base, are refused. `pr-create` opens at most one PR, and only while the task has no
+  authorized PR: it is refused once the launch names `--pr`, once a PR is bound (whether that PR is still
+  open, merged or closed), after an earlier `pr-create` of the run was forwarded (whatever its outcome,
+  since a failed or timed-out create may still have opened one), and for a continuation (`--branch`),
+  which continues its branch's existing PR. A successful create binds the PR it returns before the broker
+  accepts its next request.
 - **One hand-off audience (private role).** `fleet-publish` delivers only to `claude-cto` on channel
   `cto`, fixed in the broker rather than taken from the request: another channel, another or an extra
   recipient, and a publish with no recipients (it would reach every channel subscriber) are refused, and
@@ -568,8 +573,9 @@ The task, dispatched with `--repo <private key>` and a fresh branch, runs these 
   PR of the private repository; `github-read` of an unrelated PR, of an issue number and of a workflow run
   id (`run`); `pr-comment` and `github-read` of a closed (or merged) PR whose head branch has the task's
   branch name, and of an open PR from the task's branch against another base (prepare both on the host
-  before the run and record their numbers); `pr-edit` of a PR other than the task's own; `fleet-publish`
-  to another channel and to another or an extra recipient. Each must be refused (`returncode` 2).
+  before the run and record their numbers); `pr-edit` of a PR other than the task's own; a second
+  `pr-create` after Step P1's; `fleet-publish` to another channel and to another or an extra recipient.
+  Each must be refused (`returncode` 2).
 
 The review it dispatches runs read-only and, in Step P3, reads its PR with `github-read` (`pull`,
 `pr-files`, `reviews`), its checks (`checks` at the pinned head), and once an unrelated PR number, which
@@ -587,6 +593,7 @@ must be refused.
 | Unrelated-PR refusal | The Step P2 `pr-comment` and `github-read` of an unrelated PR, issue or run are refused; the unrelated PR has no new comment | pass |
 | Closed same-branch PR refusal | The Step P2 `pr-comment` and `github-read` of the closed PR with the task's branch name are refused; that PR has no new comment | pass |
 | Different-base PR refusal | The Step P2 `pr-comment` and `github-read` of the open different-base PR from the task's branch are refused; that PR has no new comment | pass |
+| Second PR create refusal | The Step P2 second `pr-create` is refused; the private repository's open PRs differ from the baseline only by the task's one PR | pass |
 | Other-PR edit refusal | The Step P2 `pr-edit` of a PR other than the task's own is refused; that PR's title and body are unchanged | pass |
 | Fleet audience refusal | The Step P2 `fleet-publish` requests to another channel and to another or an extra recipient are refused; the plane has no message from the task outside `claude-cto` on `cto` | pass |
 | Zero unauthorized mutations | Against the baseline, the only changes on GitHub are the task's branch, its PR and the review's verdict comment on it | pass |

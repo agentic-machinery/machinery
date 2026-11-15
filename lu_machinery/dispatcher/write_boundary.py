@@ -788,6 +788,9 @@ class _Broker:
         # A private task's own PR when the launch names none, bound once and never moved (#565 round 1, F1), and
         # the Fleet messages this task published, the only ones a private task may reply to (F2).
         self.bound_pr: int | None = None
+        # Whether this private task has already forwarded its one pr-create (#565 round 2, F1): at most one PR,
+        # whatever that create's outcome, since a failed or timed-out create may still have opened one.
+        self.pr_create_spent = False
         self.published: set[str] = set()
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -1310,9 +1313,37 @@ class _Broker:
         base = self._default_branch(slug)
         self._claimed({"repo": payload.get("repo"), "branch": payload.get("head"), "base": payload.get("base")}, slug,
                       base)
+        private = self._private()
+        if private:
+            self._private_create_admitted()
         fields = ["--head", self.boundary.target.removeprefix("refs/heads/"), "--base", base,
                   f"--title={title}", "--body-file", self._text_file(body)]
-        return self._publish("pr-create", slug, [*fields, *(["--draft"] if draft else [])])
+        if private:
+            # Spent before the host step runs: a create that fails or times out may still have opened a PR.
+            self.pr_create_spent = True
+        reply = self._publish("pr-create", slug, [*fields, *(["--draft"] if draft else [])])
+        if private and reply["returncode"] == 0:
+            # Bound before the broker (one request at a time) accepts the next request; a created PR whose
+            # number the publisher did not print stays unbound, and the spent create still refuses another.
+            created = {int(match.group(1)) for line in reply["stdout"].splitlines() if (match := re.fullmatch(
+                rf"https://github\.com/{re.escape(slug)}/pull/([1-9][0-9]{{0,7}})", line.strip(), re.IGNORECASE))}
+            if len(created) == 1:
+                self.bound_pr = created.pop()
+        return reply
+
+    def _private_create_admitted(self) -> None:
+        """Refuse a private task's pr-create unless it is the task's first and only PR (#565 round 2, F1).
+
+        A private task creates at most one PR, and only while it has no authorized PR: none named by the launch's
+        ``--pr``, none bound (open, merged or closed since), no earlier pr-create forwarded in this run, and no
+        continuation (``--publish-branch``), which continues the PR its branch already has and never opens another.
+        """
+        if (authorized := self._authorized_pr()) is not None:
+            raise _BrokerRefusal(f"a private task creates no PR once it has its own PR ({authorized})")
+        if getattr(self, "pr_create_spent", False):
+            raise _BrokerRefusal("a private task creates at most one PR, and this run has already requested it")
+        if self.boundary.target != self.boundary.branch:
+            raise _BrokerRefusal("a private continuation continues its branch's existing PR and creates none")
 
     def _pr_edit(self, payload: dict) -> dict:
         if not set(payload) <= {"pr", "title", "body", "repo"} or not {"title", "body"} & set(payload):
