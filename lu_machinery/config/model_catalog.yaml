@@ -756,6 +756,52 @@ models:
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/
       - https://aistudio.google.com/docs/changelog
       - https://aistudio.google.com/docs/thinking
+  gemini-4-hydrogen:
+    routing_wire_ids:
+      agy: gemini-4-hydrogen-medium
+    family: google
+    tier: frontier_practical
+    lifecycle: active
+    # Same selector shape as gemini-4-carbon, plus the fourth thinking level.
+    # -medium is the routing wire id; -low, -high and -xhigh are runtime ids for
+    # explicit selection and identity attestation, not aliases.
+    runtime_model_ids: [gemini-4-hydrogen-low, gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh]
+    # Work roles only, as Carbon. No review, Ukrainian review or advisory role
+    # until a held-out evaluation reports.
+    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
+    transports: [agy]
+    strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels, lower_price_than_carbon]
+    weaknesses:
+      - provider_listing_is_not_qualification
+      - no_published_code_review_benchmark
+      - no_published_ukrainian_quality_result
+      - occasional_slowness_or_timeouts
+      - more_tokens_at_higher_thinking_levels
+      - agy_selector_thinking_level_mapping_unverified
+    notes: >-
+      Gemini work and comparative-evaluation route over AGY (#586), measured
+      against Gemini 4 Carbon; Carbon stays the preferred Gemini work route until
+      that comparison reports. AGY selectors gemini-4-hydrogen-low, -medium,
+      -high and -xhigh (#586 task card); a 2026-11-12 evaluation ran -medium and
+      -high through AGY. Dispatch: `python -m lu_machinery.dispatch dispatch
+      --agent agy --model gemini-4-hydrogen-medium`; -low, -high and -xhigh are
+      explicit selections only. Hydrogen holds no review role, so it is refused
+      for any review of record; review ladders, the Ukrainian review route and
+      the certified Gemini driver seat are unchanged. Model card (2026-11-12):
+      adapted from Gemini 4 Carbon, one 1M-token window shared by input and
+      output (64K synchronous output by default), knowledge cutoff March 2026,
+      four thinking levels, occasional slowness or timeouts and higher token use
+      at higher thinking levels; Terminal-Bench 4.1 (cheating-adjusted) 57.0% in
+      Google's table. Gemini API docs: API id gemini-4-hydrogen, thinking levels
+      low, medium, high and xhigh (default high); standard paid tier USD 1.50
+      input and 7.50 output (thinking included) per 1M tokens. Google publishes
+      no code-review benchmark and no Ukrainian result, and does not state how
+      the AGY selectors map to API thinking levels.
+    sources:
+      - https://deepmind.google/models/model-cards/gemini-4-hydrogen/
+      - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-hydrogen/
+      - https://aistudio.google.com/docs/pricing
+      - https://aistudio.google.com/docs/thinking
   gemini-4-argon:
     routing_wire_ids:
       agy: gemini-4-argon-medium
