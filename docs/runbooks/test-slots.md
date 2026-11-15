@@ -88,7 +88,8 @@ outside the sandbox, with the full ownership walk:
    only read the marked ticket and the slot files and check their locks, so they need no write access to
    the pool. A sandboxed process, one whose user namespace maps only part of the id range, cannot choose
    the pool: `LU_TEST_SLOTS_DIR` or `LU_SCRATCH_ROOT` there is refused with
-   `test_slots_pool_override_refused`, and it may join only a `review` hold.
+   `test_slots_pool_override_refused`, and it may join only a `review` hold (a write-boundary worker's
+   own hold is the exception; see below).
 3. The review's governed test runs take turns on the hold's session lock, a `.session` file beside its
    ticket. Concurrent runs of one review therefore never add up past its 2 slots. The run that holds the
    turn passes `LU_TEST_SLOTS_SESSION` to its own descendants, such as a pytest a test starts or the
@@ -105,7 +106,33 @@ outside the sandbox, with the full ownership walk:
 
 The slots stay reserved while the reviewer reads. The dispatch hard timeout bounds that time. Other
 routes are unchanged: a Claude read-only seat has no OS sandbox and takes its own slots, and a write
-worker takes slots for each test run.
+worker takes slots for each test run (see "Write-boundary workers" below).
+
+## Write-boundary workers
+
+Every dispatched write worker runs inside the write boundary
+([write-worker-boundary](write-worker-boundary.md)), which also maps only the current user, empties
+`/var/tmp` and sets `LU_SCRATCH_ROOT` to the run's private scratch (#557). Its launcher therefore
+prepares the host's pool on the host, with the full ownership walk, and binds that directory writable
+at the default location, `/var/tmp/lu/test-slots-<uid>`. Inside:
+
+- A sandboxed process uses that pool only when `/proc/self/mountinfo` shows a writable mount exactly at
+  the default location. The worker cannot create or move a mount, so a directory it made itself is never
+  one. Then `LU_SCRATCH_ROOT` does not select the pool. Without that mount, `LU_SCRATCH_ROOT` and
+  `LU_TEST_SLOTS_DIR` are still refused with `test_slots_pool_override_refused`.
+- Only the pool directory itself is checked there (a private directory of this user), because the
+  launcher verified its path on the host where owners are real, and the bind pins the directory.
+- A governed run queues in the host-wide FIFO with every host run, so the governor stays active.
+  Its xdist workers join its hold: a non-`review` hold counts in a sandbox only when it was taken in the
+  same user namespace, recorded as `userns` in its ticket. A hold issued outside, such as a launcher's,
+  still serves a sandbox only as a `review` turn.
+- The boundary receipt's `test_slots` shows `bound`, or why nothing was bound (`disabled`, or the
+  refusal reason when the host pool cannot be prepared). Without a bind the run still starts, and its
+  governed tests are refused with a typed reason.
+
+The worker holds the same authority over the pool as any host process of this user: it can lock and
+remove pool files. The governor is a shared courtesy among this user's runs, not a security boundary.
+Read-only dispatches get no bind.
 
 Every hold keeps its slot files locked shared once issued. xdist starts a governed run's workers with
 their inherited descriptors closed, so each worker joins the hold itself and keeps its slots locked until

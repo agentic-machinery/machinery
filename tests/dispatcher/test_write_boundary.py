@@ -221,7 +221,7 @@ def test_broker_refuses_forged_or_replayed_requests(primary, monkeypatch, tmp_pa
                         lambda self, payload, state: (payload["pr"], "owner/repo", {"headRefOid": tip}))
     monkeypatch.setattr(write_boundary._Broker, "_repo_key", lambda self, slug: "fixture")
     host_steps = []
-    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None: host_steps.append(
+    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None, cwd=None: host_steps.append(
         (module, argv)) or {"returncode": 0, "stdout": "", "stderr": ""})
     client = tmp_path / "client.py"
     client.write_text(_BROKER_CLIENT)
@@ -410,6 +410,7 @@ class _Launch:
         self.args = type("Args", (), {"task_id": "wb-test", "author_model": "claude-opus-5-5",
                                      "mode": "workspace-write"})()
         self.branch, self.repository, self.common, self.base, self.tip = "refs/heads/task", repo, repo / ".git", scratch, tip
+        self.target = self.branch  # the publication branch: a continuation's PR branch, else the dispatched one
         self.fetched: list[str] = []
 
     def current_tip(self) -> str:
@@ -427,7 +428,7 @@ def test_read_only_broker_refuses_publication_and_preserves_checkout(primary, mo
     before = _digest(worktree / "a.txt", repo / ".git/config", repo / ".git/refs/heads/task")
     steps = []
     monkeypatch.setattr(write_boundary._Broker, "_repository_slug", lambda self: "owner/repo")
-    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None: steps.append(
+    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None, cwd=None: steps.append(
         (module, argv)) or {"returncode": 0, "stdout": "read-ok", "stderr": ""})
     probe = tmp_path / "review-probe.py"
     probe.write_text(_BROKER_CLIENT[:_BROKER_CLIENT.index("good =")] + '''
@@ -619,7 +620,7 @@ def broker(primary, tmp_path, monkeypatch):
         return self.pulls.get(int(argv[2]))
 
     monkeypatch.setattr(write_boundary._Broker, "_gh_json", gh_json)
-    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None: self.steps.append(
+    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None, cwd=None: self.steps.append(
         (module, argv)) or {"returncode": 0, "stdout": "", "stderr": ""})
     return instance
 
@@ -668,6 +669,17 @@ def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, p
     broker.boundary.tip = _git(worktree, "rev-parse", "HEAD")
     assert "fast-forward" in _refused(lambda: broker._push({"head": broker.boundary.tip}))
     assert _git(tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/task") == tip
+    # A continuation (#557) publishes to the assigned PR's branch only, fast-forward, never its own or the default.
+    _git(repo, "push", "-q", str(remote), f"{broker.boundary.tip}:refs/heads/assigned")
+    broker.boundary.target = "refs/heads/assigned"
+    assert "dispatched branch" in _refused(lambda: broker._push({"head": broker.boundary.tip, "branch": "task"}))
+    _git(worktree, "commit", "-q", "--allow-empty", "-m", "continued")
+    broker.boundary.tip = _git(worktree, "rev-parse", "HEAD")
+    assert broker._push({"head": broker.boundary.tip, "branch": "assigned"})["returncode"] == 0
+    assert _git(tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/assigned") == broker.boundary.tip
+    assert _git(tmp_path, "--git-dir", str(remote), "rev-parse", "refs/heads/task") == tip
+    broker.boundary.target = "refs/heads/main"
+    assert "default branch" in _refused(lambda: broker._push({"head": broker.boundary.tip}))
 
 
 def test_fetch_base_updates_only_the_default_branch_tracking_ref(broker, primary, tmp_path, monkeypatch):
@@ -820,9 +832,9 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     monkeypatch.setattr(write_boundary._Broker, "_gh_json", gh_json)
     monkeypatch.setattr(write_boundary._Broker, "_remote", lambda self, slug: (str(remote), []))
     monkeypatch.setattr(write_boundary._Broker, "_approval", lambda self, head: "wb-test-review-r1")
-    monkeypatch.setattr(write_boundary._Broker, "_run", lambda self, argv, key, stdin=None, env=None: {
+    monkeypatch.setattr(write_boundary._Broker, "_run", lambda self, argv, key, stdin=None, env=None, cwd=None: {
         "returncode": 0, "stdout": "", "stderr": ""})
-    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None: steps.append(
+    monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None, cwd=None: steps.append(
         argv) or {"returncode": 0, "stdout": "published\n", "stderr": ""})
     body = tmp_path / "body.md"
     body.write_text("Body\n")
