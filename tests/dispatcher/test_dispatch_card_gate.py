@@ -59,23 +59,26 @@ def test_github_read_failure_refuses_unless_that_reference_is_allowed(admission_
 
 
 def test_overlap_with_a_live_writer_by_directory_prefix_is_listed_and_refusable(admission_dispatch, monkeypatch, capsys):  # noqa: F811
-    """Defect class: a live write task owning a directory is missed when the new task owns a file inside it."""
+    """Defect class: a live write task owning a common path is missed (a directory above, or a pattern sharing a descendant)."""
     def writer(task_id, owned, repo="public", status="running", mode="workspace-write"):
         return {"task_id": task_id, "status": status, "mode": mode, "repo": repo, "owned_paths": owned}
 
     live = [
-        writer("live-writer", ["docs/runbooks/"]),
+        writer("dir-writer", ["docs/runbooks/"]),
+        writer("descendant-writer", ["docs/*/sub/x.md"]),
+        writer("pattern-writer", ["docs/runbooks/*b.py"]),
         writer("live-reader", ["docs/runbooks"], mode="read-only"),
         writer("done-writer", ["docs/runbooks"], status="done"),
         writer("sibling-writer", ["docs/runbooks-old"]),
-        writer("glob-writer", ["docs/runbooks/*.py"]),
+        writer("disjoint-pattern-writer", ["docs/runbooks/c*.txt"]),
         writer("other-repo-writer", ["docs/runbooks"], repo="private"),
     ]
     monkeypatch.setattr(store, "list_tasks", lambda *_a, **_k: live)
-    owned = ("--owned-path", "docs/runbooks/dispatch.md")
+    owned = ("--owned-path", "docs/runbooks/sub", "--owned-path", "docs/runbooks/a*.py")
+    overlap = "descendant-writer, dir-writer, pattern-writer"
     assert admission_dispatch.dispatch(*owned, "--refuse-on-overlap", "--dry-run") == 2
-    assert "owned_path_overlap_refused: owned paths overlap live write tasks live-writer" in capsys.readouterr().err
+    assert f"owned_path_overlap_refused: owned paths overlap live write tasks {overlap}" in capsys.readouterr().err
     assert admission_dispatch.dispatch(*owned, "--dry-run") == 0
     out = capsys.readouterr()
-    assert json.loads(out.out)["owned_path_overlap"] == ["live-writer"]
-    assert "overlap live write tasks: live-writer" in out.err
+    assert json.loads(out.out)["owned_path_overlap"] == overlap.split(", ")
+    assert f"overlap live write tasks: {overlap}" in out.err

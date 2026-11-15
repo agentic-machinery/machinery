@@ -182,8 +182,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--refuse-on-overlap", action="store_true",
-        help="Refuse a write task whose owned paths overlap a live write task's in the same repository (same path, "
-        "directory above or below, or matching pattern); the overlap is always printed and recorded (default: off)",
+        help="Refuse a write task whose owned paths share a path with a live write task's in the same repository "
+        "(the same path, a directory above or below, or a pattern owning a common path); the overlap is always "
+        "printed and recorded (default: off)",
     )
     dispatch.add_argument("--dry-run", action="store_true", help="Print plan; create nothing (default: off)")
     dispatch.add_argument("--print-advisory-binding", action="store_true",
