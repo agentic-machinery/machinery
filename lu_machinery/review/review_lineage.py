@@ -216,8 +216,10 @@ def lineage_runs(
 ) -> list[ReviewRun]:
     """Every hot and archived review run of this PR; an archived run is kept beside a hot one.
 
-    A run belongs to the PR by its recorded ``pr`` or its review branch; a caller that knows
-    only one of them passes None for the other. ``records`` is the caller's own
+    A run belongs to this PR when its recorded ``pr`` equals ``number``, or when it has
+    no recorded ``pr`` and ``branch`` is one of its review branches. A run recorded for
+    another PR does not belong here even on the same branch. A caller that knows only
+    one of them passes None for the other. ``records`` is the caller's own
     :func:`review_records` read, when it has one.
     """
     if records is None:
@@ -225,7 +227,8 @@ def lineage_runs(
     return [
         _read_run(path, record)
         for path, record in records
-        if (number is not None and record.get("pr") == number) or branch in _review_branches(record)
+        if (number is not None and record.get("pr") == number)
+        or (record.get("pr") is None and branch in _review_branches(record))
     ]
 
 
