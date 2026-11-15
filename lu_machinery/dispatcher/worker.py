@@ -5,21 +5,25 @@ import ctypes
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import psutil
 
-from lu_machinery.agent_runtime import bounded_advisory
+from lu_machinery.agent_runtime import bounded_advisory, model_pause
+from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, resolve_codex_account_label
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
 from lu_machinery.common import task_scratch
 from lu_machinery.common.repo_root import in_tree_source, machinery_path, primary_root, state_root
@@ -45,6 +49,7 @@ from lu_machinery.dispatcher.watchdog import (
     deadlines,
     liveness_paths,
 )
+from lu_machinery.fleet import claude_account_lane
 from lu_machinery.review.model_catalog import advisory_role_policy
 from lu_machinery.review.product_hooks import attempt_hooks
 
@@ -1504,6 +1509,76 @@ def _provider_env(spec: TaskSpec) -> dict[str, str]:
     return env
 
 
+# Weekly plan meters the Monitor routing-budget publishes per pool (model_pause.routing_budget_used_pct, #581).
+_CODEX_ALLOWANCE_POOLS = {"sub": "codex:a", "b-sub": "codex:b"}
+ALLOWANCE_CONNECT_TIMEOUT_S = 0.5
+
+
+def _allowance_pool(record: dict) -> tuple[str, str, claude_account_lane.ClaudeAccount | None] | None:
+    """(pool, meter lane, Claude account) for the task's seat, or None when no plan meter funds it.
+
+    An API-key Claude account and an API Codex account are billed per token: they have no allowance.
+    """
+    agent = record.get("agent")
+    if agent == "claude":
+        account = claude_account_lane.account_from_record(record, agent="claude")
+        if account.refusal is not None or account.label is None or account.api_key:
+            return None
+        return f"claude:{account.label}", "claude", account
+    if agent == "codex":
+        try:
+            lane = _CODEX_ALLOWANCE_POOLS.get(resolve_codex_account_label(record.get("codex_account")))
+        except CodexAccountRefused:
+            return None
+        return (lane, lane, None) if lane else None
+    if agent == "agy":
+        model = record.get("model")
+        lane = model_pause.AGY_CLAUDE_WINDOW_LANE if isinstance(model, str) and model.startswith("claude-") else "gemini"
+        return lane, lane, None
+    if agent == "cursor":
+        return "cursor", "cursor", None
+    return None
+
+
+def _monitor_listening() -> bool:
+    """One short connect to the Monitor, so a best-effort reading never spends the admission's readiness wait."""
+    url = urllib.parse.urlsplit(model_pause._monitor_base())
+    port = url.port or (443 if url.scheme == "https" else 80)
+    try:
+        socket.create_connection((url.hostname or "localhost", port), timeout=ALLOWANCE_CONNECT_TIMEOUT_S).close()
+    except OSError:
+        return False
+    return True
+
+
+def _allowance_reading(pool: tuple[str, str, claude_account_lane.ClaudeAccount | None] | None) -> dict | str:
+    """The pool's remaining weekly allowance now, or ``"unknown"``; a missing reading is never 0. Never raises."""
+    if pool is None:
+        return "unknown"
+    try:
+        if not _monitor_listening():
+            return "unknown"
+        used = model_pause.routing_budget_used_pct(pool[1], account=pool[2])
+    except Exception:  # the Monitor or its snapshot is unavailable: no reading
+        return "unknown"
+    if used is None or not math.isfinite(used):
+        return "unknown"
+    return {"remaining_pct": round(100.0 - min(100.0, max(0.0, used)), 2), "at": store.now()}
+
+
+def _allowance(record: dict, side: str) -> dict:
+    """The record's allowance block with ``side`` ("start" or "finish") read now."""
+    previous: dict = record["allowance"] if isinstance(record.get("allowance"), dict) else {}
+    try:
+        pool = _allowance_pool(record)
+    except Exception:  # an unreadable account binding funds no known pool
+        pool = None
+    block = {"pool": pool[0] if pool else None, "meter": "weekly_remaining_pct",
+             "start": previous.get("start", "unknown"), "finish": previous.get("finish", "unknown")}
+    block[side] = _allowance_reading(pool)
+    return block
+
+
 def supervise(path: Path, options: dict | None = None, hard_timeout: float | None = None) -> None:
     os.umask(0o077)
     record = json.loads(path.read_text())
@@ -1513,6 +1588,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         record["dispatcher_code_start"] = _dispatcher_code()
     spec = _spec(record, options or {})
     options = spec.options
+    record["allowance"] = _allowance(record, "start")
     hard_timeout, silence_timeout, initial_response_timeout = deadlines({
         **options, **{key: record[key] for key in ("hard_timeout", "silence_timeout", "initial_response_timeout")
                      if key in record},
@@ -1885,6 +1961,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 spec.final_file.chmod(0o600)
                 if record.get("advisory_role") is not None:
                     _seal_advisory_result(record, spec.final_file)
+            record["allowance"] = _allowance(record, "finish")
             record.update(
                 status=status,
                 returncode=returncode,
