@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -223,6 +224,39 @@ def test_restored_mtime_does_not_label_stale_in_flight_counts_with_fresh_generat
     assert row["observed_model"] is None
     assert row["cli_version"] is None
     assert read_calls == [str(task), str(task), str(task), str(task)]
+
+
+def test_read_oserror_on_one_file_leaves_generation_unobserved(tmp_path, monkeypatch):
+    """Defect class: one unreadable task still publishes a complete in-flight generation."""
+    monkeypatch.setattr(delegate_router, "_TASK_STATE_CACHE", {})
+    monkeypatch.setattr(delegate_router, "_LAST_TASKS_DIR_STR", "")
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    readable = tasks_dir / "readable.json"
+    unreadable = tasks_dir / "unreadable.json"
+    readable.write_text(json.dumps({"task_id": "readable", "agent": "codex", "status": "spawning"}))
+    unreadable.write_text(json.dumps({"task_id": "unreadable", "agent": "codex", "status": "spawning"}))
+    real_read = delegate_router._read_task_state
+
+    def flaky_read(path, *args, **kwargs):
+        if str(path) == str(unreadable):
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(delegate_router, "_read_task_state", flaky_read)
+    generation: list[str] = []
+    counts = state_router._in_flight_by_agent(tasks_dir, task_generation=generation)
+    assert generation == []
+    assert counts is not None
+    assert counts["codex"] == 1
+    assert str(unreadable) not in delegate_router._DIRECTORY_TASK_STATE_CACHE.get(str(tasks_dir), {})
+
+    monkeypatch.setattr(delegate_router, "_read_task_state", real_read)
+    recovered: list[str] = []
+    recovered_counts = state_router._in_flight_by_agent(tasks_dir, task_generation=recovered)
+    assert recovered == [state_router._tasks_content_token(tasks_dir)]
+    assert recovered_counts is not None
+    assert recovered_counts["codex"] == 2
 
 
 def test_db_skipping_scan_does_not_suppress_persistence_or_vanished_row_deletion(tmp_path, monkeypatch):
