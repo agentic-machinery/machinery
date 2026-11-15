@@ -68,6 +68,7 @@ const rate = (r, d = 2) => r && r.value !== null ? num(r.value, d) : "—";
 const n = (r) => r ? `${r.n}${r.low_sample ? LOW : ""}` : "—";
 const mins = (v) => v === null || v === undefined ? "—" : num(v / 60, 0);
 const cell = (v) => `<td class="num">${v}</td>`;
+const timedOf = (r) => r.wall_seconds.n === r.tasks ? "" : ` <span class="low" title="tasks with a recorded duration">of ${r.wall_seconds.n}</span>`;
 
 function table(head, rows) {
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
@@ -80,7 +81,7 @@ function rowName(r, kind) {
 function writeRow(r, kind) {
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(r.status.done)}`
     + `${cell(pct(r.no_deliverable))}${cell(pct(r.not_done))}${cell(r.landed)}${cell(pct(r.landed_rate))}`
-    + `${cell(rate(r.wall_hours_per_landed, 1))}${cell(mins(r.wall_seconds.median))}${cell(mins(r.wall_seconds.p90))}`
+    + `${cell(rate(r.wall_hours_per_landed, 1))}${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}`
     + `${cell(r.output_tokens_per_landed.value === null ? "—" : num(r.output_tokens_per_landed.value / 1000) + "k")}</tr>`;
 }
 
@@ -89,20 +90,21 @@ function reviewRow(r, kind) {
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
     + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain} / ${v.unparsed}`)}${cell(pct(r.approve_rate))}`
     + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}${cell(n(r.approve_rate))}`
-    + `${cell(mins(r.wall_seconds.median))}${cell(mins(r.wall_seconds.p90))}</tr>`;
+    + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
 }
 
 function withClasses(models, role, render) {
   return models.filter((m) => m.role === role).flatMap((m) =>
     [render(m, ""), ...m.by_effort.flatMap((e) => [render(e, "eff"),
-      ...(m.by_class.length > 1 ? e.by_class.map((c) => render(c, "cls")) : [])])]);
+      ...e.by_class.map((c) => render(c, "cls"))])]);
 }
 
 function chart(data, label) {
   const authors = new Map(data.authors.map((a) => [a.model, a]));
-  const points = data.models.filter((m) => m.role === "write" && m.landed > 0 && authors.has(m.model)).map((m) => {
+  const timed = (m) => m.wall_seconds.n === m.tasks && m.wall_seconds.total_seconds > 0;
+  const points = data.models.filter((m) => m.role === "write" && m.landed > 0 && timed(m) && authors.has(m.model)).map((m) => {
     const a = authors.get(m.model);
-    return {model: m.model, x: m.landed / Math.max(m.wall_seconds.total_hours, 1e-9), y: a.first_round_approved.value,
+    return {model: m.model, x: m.landed / (m.wall_seconds.total_seconds / 3600), y: a.first_round_approved.value,
             low: m.landed < 10 || a.prs < 10, landed: m.landed, hours: m.wall_seconds.total_hours, prs: a.prs};
   }).filter((p) => p.y !== null);
   if (!points.length) return '<p class="muted">No model has both landed tasks and reviewed PRs in this window.</p>';

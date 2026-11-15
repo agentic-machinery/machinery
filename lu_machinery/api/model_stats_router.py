@@ -58,29 +58,68 @@ _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
 # CommonMark: a backtick fence's info string has no backtick, so "```X-Agent``` ..." is inline code, not a fence.
 _FENCE_OPEN = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
 _FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+_BACKTICKS = re.compile(r"`+")
 
 router = APIRouter()
+
+
+def _code_spans(text: str) -> list[tuple[int, int]]:
+    """CommonMark inline code spans of one paragraph as offsets: a backtick run closed by the next run of the same
+    length; a run with no such closer is literal text."""
+    runs = [(match.start(), match.end()) for match in _BACKTICKS.finditer(text)]
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(runs):
+        start, end = runs[index]
+        closer = next((k for k in range(index + 1, len(runs)) if runs[k][1] - runs[k][0] == end - start), None)
+        if closer is None:
+            index += 1
+            continue
+        spans.append((start, runs[closer][1]))
+        index = closer + 1
+    return spans
+
+
+def _paragraph_trailers(lines: list[str]) -> set[str]:
+    """Trailer task ids of one paragraph's lines, skipping a line an inline code span covers."""
+    text = "\n".join(lines)
+    spans = _code_spans(text)
+    found: set[str] = set()
+    offset = 0
+    for line in lines:
+        end = offset + len(line)
+        trailer = _TRAILER.fullmatch(line)
+        if trailer and not any(start < offset and end < stop for start, stop in spans):
+            found.add(trailer.group(1))
+        offset = end + 1
+    return found
 
 
 def trailer_task_ids(message: str) -> set[str]:
     """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
 
     Lines inside a backtick or tilde code fence (CommonMark: closed by a run of the same character at least as long,
-    else open to the end) are examples, never attribution.
+    else open to the end), or inside an inline code span that runs across lines of one paragraph, are examples,
+    never attribution.
     """
     found: set[str] = set()
     fence: str | None = None
+    paragraph: list[str] = []
     for line in message.splitlines():
         if fence is not None:
             close = _FENCE_CLOSE.fullmatch(line)
             if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
                 fence = None
             continue
-        if opened := _FENCE_OPEN.fullmatch(line):
-            fence = opened.group(1) or opened.group(2)
-        elif trailer := _TRAILER.fullmatch(line):
-            found.add(trailer.group(1))
-    return found
+        opened = _FENCE_OPEN.fullmatch(line)
+        if opened or not line.strip():
+            found |= _paragraph_trailers(paragraph)
+            paragraph = []
+            if opened:
+                fence = opened.group(1) or opened.group(2)
+            continue
+        paragraph.append(line)
+    return found | _paragraph_trailers(paragraph)
 
 
 @dataclass
@@ -248,20 +287,24 @@ class _Group:
 
     def to_dict(self, role: str) -> dict[str, Any]:
         tasks = sum(self.status.values())
-        hours = sum(self.durations) / 3600
+        seconds = sum(self.durations)
+        hours = seconds / 3600
+        # A task with no recorded duration makes the total, and so the cost per landed task, unknown, never zero.
+        timed = len(self.durations) == tasks
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
             "status": {name: self.status[name] for name in (*STATUSES, "other")},
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
             "wall_seconds": {"median": _median(self.durations), "p90": _p90(self.durations),
-                             "total_hours": round(hours, 2), "n": len(self.durations)},
+                             "total_hours": round(hours, 2), "total_seconds": round(seconds, 1),
+                             "n": len(self.durations)},
             "tokens": dict(zip(("fresh_input", "cached_input", "output"), self.tokens, strict=True)),
         }
         if role == "write":
             out.update(
                 landed=self.landed, landed_rate=_rate(self.landed, tasks),
-                wall_hours_per_landed=_rate(hours, self.landed, 2),
+                wall_hours_per_landed={**_rate(hours, self.landed, 2), **({} if timed else {"value": None})},
                 output_tokens_per_landed=_rate(self.tokens[2], self.landed, 0),
                 fresh_input_tokens_per_landed=_rate(self.tokens[0], self.landed, 0),
                 allowance_pct_points_per_landed=_rate(self.points, self.allowance["landed"], 2),
@@ -315,7 +358,7 @@ def _authors(rows: list[_Row], name: Callable[[str], str] = str) -> list[dict[st
         if row.role != "review" or not author or not pr:
             continue
         entry = prs[(str(row.raw.get("repo") or "public"), str(pr))]
-        entry["authors"].add(name(str(author)))
+        entry["authors"].add(str(author))
         head = row.raw.get("pinned_head") or row.task_id
         started = row.started or datetime.max.replace(tzinfo=UTC)
         previous = entry["heads"].get(head)
@@ -330,7 +373,7 @@ def _authors(rows: list[_Row], name: Callable[[str], str] = str) -> list[dict[st
     for entry in prs.values():
         heads = sorted(entry["heads"].values(), key=lambda head: head[0])
         verdicts = [head[1][0] if head[1] else None for head in heads]
-        counts = by_author["+".join(sorted(entry["authors"]))]
+        counts = by_author[name("+".join(sorted(entry["authors"])))]
         counts["prs"] += 1
         counts["rounds"] += len(heads)
         counts["approved"] += "correct" in verdicts

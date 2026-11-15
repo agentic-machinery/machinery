@@ -104,7 +104,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert write["tasks"] == 3 and write["low_sample"] is True
     assert write["status"]["done"] == 2 and write["status"]["no_deliverable"] == 1
     assert write["landed"] == 1 and write["landed_rate"] == {"value": 0.333, "n": 3, "low_sample": True}
-    assert write["wall_seconds"] == {"median": 1200.0, "p90": 1800.0, "total_hours": 1.0, "n": 3}
+    assert write["wall_seconds"] == {"median": 1200.0, "p90": 1800.0, "total_hours": 1.0, "total_seconds": 3600.0, "n": 3}
     assert write["wall_hours_per_landed"]["value"] == 1.0
     assert write["tokens"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
     assert write["output_tokens_per_landed"]["value"] == 300
