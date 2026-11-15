@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from lu_machinery.review import record_cf_verdict as recorder
-from lu_machinery.review.review_lineage import LineageRefused, ReviewRun, check_lineage, superseded_runs
+from lu_machinery.review.review_lineage import (
+    LineageRefused,
+    ReviewRun,
+    check_lineage,
+    lineage_runs,
+    superseded_runs,
+)
 
 EARLY = "1" * 40
 APPROVED = "2" * 40
@@ -315,3 +321,38 @@ def test_a_missing_reply_without_proof_the_provider_never_ran_is_still_refused(s
     missing = _crashed("missing-reply", provider_pgid=provider_pgid, result_sha256=result_sha256, status=status)
     with pytest.raises(LineageRefused, match=rf"review task missing-reply \({status}\) has no reply on record"):
         lineage(approve, (missing, None))
+
+
+def test_a_run_recorded_for_another_pr_on_the_same_branch_is_not_this_prs_lineage(tmp_path):
+    """Defect class: #626 — another PR's review runs on a shared branch spend this PR's budget.
+
+    Two PRs opened from one dispatch branch each keep their own recorded runs. A run with
+    no recorded PR on that branch still belongs to the PR being counted.
+    """
+    branch = "claude/shared-dispatch"
+    repository = "learn-ukrainian/machinery"
+
+    def recorded(task_id, pr):
+        body = {
+            "task_id": task_id,
+            "repository": repository,
+            "schema_version": 2,
+            "review_branch": branch,
+            "review_mode": "cross_family",
+            "worktree_base_sha": "a" * 40,
+            "status": "done",
+        }
+        if pr is not None:
+            body["pr"] = pr
+        return tmp_path / f"{task_id}.json", body
+
+    records = [recorded("pr-a", 13075), recorded("pr-b", 13076), recorded("unattributed", None)]
+
+    def counted(number):
+        runs = lineage_runs(
+            tmp_path, repository=repository, number=number, branch=branch, records=records,
+        )
+        return [run.task_id for run in runs]
+
+    assert counted(13076) == ["pr-b", "unattributed"]
+    assert counted(13075) == ["pr-a", "unattributed"]
