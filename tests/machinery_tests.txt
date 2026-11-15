@@ -278,6 +278,7 @@ tests/api/test_launchd_supervisor.py
 tests/api/test_legacy_bridge_telemetry.py
 tests/api/test_legacy_comms_telemetry.py
 tests/api/test_load_samples.py
+tests/api/test_model_stats.py
 tests/api/test_monitor_api_telemetry.py
 tests/api/test_monitor_client_failover.py
 tests/api/test_monitor_ctx_store_isolation.py

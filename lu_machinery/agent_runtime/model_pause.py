@@ -396,11 +396,13 @@ def _window_used_pct(block: object) -> float | None:
     return 100.0 - remaining
 
 
-def _agy_claude_windows_used_pct(view: Mapping[str, Any]) -> float | None:
-    """The stricter fresh AGY Claude window, or None when the reading is unusable.
+def _agy_claude_windows_used_pct(
+    view: Mapping[str, Any], keys: tuple[str, ...] = _AGY_CLAUDE_WINDOW_KEYS
+) -> float | None:
+    """The stricter fresh AGY Claude window of ``keys``, or None when the reading is unusable.
 
-    Both the five-hour window and the weekly window must be fresh numbers.
-    The headroom stop then compares that used percent with its cap.
+    Every window read must be a fresh number. Admission reads both the five-hour
+    and the weekly window; the headroom stop then compares that used percent with its cap.
     """
     from lu_machinery.fleet import claude_account_lane
 
@@ -413,7 +415,7 @@ def _agy_claude_windows_used_pct(view: Mapping[str, Any]) -> float | None:
         windows = probe.get("claude_gpt_windows") if isinstance(probe, Mapping) else None
     if not isinstance(windows, Mapping):
         return None
-    readings = [_window_used_pct(windows.get(key)) for key in _AGY_CLAUDE_WINDOW_KEYS]
+    readings = [_window_used_pct(windows.get(key)) for key in keys]
     if any(reading is None for reading in readings):
         return None
     return max(readings)
@@ -453,7 +455,13 @@ def _window_reset_passed(block: object, now: datetime) -> bool:
     return reset is not None and reset < now
 
 
-def _reading_window_passed(view: Mapping[str, Any], lane: str, account: ClaudeAccount | None, now: datetime) -> bool:
+def _reading_window_passed(
+    view: Mapping[str, Any],
+    lane: str,
+    account: ClaudeAccount | None,
+    now: datetime,
+    agy_keys: tuple[str, ...] = _AGY_CLAUDE_WINDOW_KEYS,
+) -> bool:
     """True when a window that ``routing_budget_used_pct`` would read has reset before ``now``."""
     from lu_machinery.fleet import claude_account_lane
 
@@ -465,7 +473,7 @@ def _reading_window_passed(view: Mapping[str, Any], lane: str, account: ClaudeAc
             windows = probe.get("claude_gpt_windows") if isinstance(probe, Mapping) else None
         if not isinstance(windows, Mapping):
             return False
-        return any(_window_reset_passed(windows.get(key), now) for key in _AGY_CLAUDE_WINDOW_KEYS)
+        return any(_window_reset_passed(windows.get(key), now) for key in agy_keys)
     if lane == "claude" and account is not None:
         from lu_machinery.agent_runtime.attempt_boundary import DEFAULT_CLAUDE_ACCOUNT
 
@@ -497,6 +505,7 @@ _MONITOR_READ_TIMEOUT_S = 5.0
 _MONITOR_READY_WAIT_S = 75.0
 _MONITOR_RETRY_PAUSE_S = 1.0
 _MONITOR_DOWN_MEMO_S = 30.0  # after one spent wait, later reads in this process do one 3 s attempt, not another wait
+TELEMETRY_READ_TIMEOUT_S = 2.0  # a telemetry read is one attempt: it never waits for readiness
 _monitor_wait_spent_at: float | None = None
 
 
@@ -504,11 +513,13 @@ class MonitorUnavailable(Exception):
     """The Monitor routing-budget did not answer: a transport failure, not a missing usage reading."""
 
 
-def _bound_routing_view(account: ClaudeAccount | None) -> Mapping[str, Any] | None:
+def _bound_routing_view(account: ClaudeAccount | None, *, ready_wait: bool = True) -> Mapping[str, Any] | None:
     """The routing-budget bound to ``account``; None when the answer has no readable snapshot.
 
     Raises :class:`MonitorUnavailable` when the Monitor is unreachable, times
-    out, fails the request or truncates its answer.
+    out, fails the request or truncates its answer. ``ready_wait=False`` is a
+    telemetry read: one attempt bounded by ``TELEMETRY_READ_TIMEOUT_S``, and
+    the admission down memo is neither read nor written.
     """
     from lu_machinery.fleet import claude_account_lane
 
@@ -520,17 +531,18 @@ def _bound_routing_view(account: ClaudeAccount | None) -> Mapping[str, Any] | No
     global _monitor_wait_spent_at
     spent = _monitor_wait_spent_at
     waited_recently = spent is not None and time.monotonic() - spent < _MONITOR_DOWN_MEMO_S
-    deadline = time.monotonic() + (0.0 if waited_recently else _MONITOR_READY_WAIT_S)
-    timeout = 3.0 if waited_recently else _MONITOR_READ_TIMEOUT_S
+    deadline = time.monotonic() + (0.0 if waited_recently or not ready_wait else _MONITOR_READY_WAIT_S)
+    timeout = TELEMETRY_READ_TIMEOUT_S if not ready_wait else 3.0 if waited_recently else _MONITOR_READ_TIMEOUT_S
     while True:
         try:
             with urllib.request.urlopen(f"{base}/api/state/routing-budget", timeout=timeout) as resp:
                 data = json.load(resp)
-            _monitor_wait_spent_at = None
+            if ready_wait:
+                _monitor_wait_spent_at = None
             break
         except (OSError, http.client.HTTPException):
             if time.monotonic() + _MONITOR_RETRY_PAUSE_S >= deadline:
-                if not waited_recently:
+                if ready_wait and not waited_recently:
                     _monitor_wait_spent_at = time.monotonic()
                 raise MonitorUnavailable from None
             time.sleep(_MONITOR_RETRY_PAUSE_S)
@@ -565,12 +577,28 @@ def routing_budget_used_pct(
     view = _bound_routing_view(account)
     if view is None:
         return None
-    if _reading_window_passed(view, lane, account, now or datetime.now(UTC)):
+    return _used_pct_from_view(view, lane, account, now or datetime.now(UTC))
+
+
+def _used_pct_from_view(
+    view: Mapping[str, Any],
+    lane: str,
+    account: ClaudeAccount | None,
+    now: datetime,
+    agy_keys: tuple[str, ...] = _AGY_CLAUDE_WINDOW_KEYS,
+) -> float | None:
+    """``lane``'s used percent from a routing-budget view already bound to ``account``, or None.
+
+    ``agy_keys`` names the AGY Claude windows read; the stricter of them counts.
+    """
+    from lu_machinery.fleet import claude_account_lane
+
+    if _reading_window_passed(view, lane, account, now, agy_keys):
         return None
     if lane == "claude" and account is not None:
         return claude_account_lane.account_weekly_used_pct(view, account=account)
     if lane == AGY_CLAUDE_WINDOW_LANE:
-        return _agy_claude_windows_used_pct(view)
+        return _agy_claude_windows_used_pct(view, agy_keys)
     if lane in {"codex:a", "codex:b"}:
         accounts = view.get("codex_accounts")
         info = accounts.get(lane, {}) if isinstance(accounts, Mapping) else {}
@@ -583,6 +611,28 @@ def routing_budget_used_pct(
     if isinstance(value, int | float) and not isinstance(value, bool):
         return float(value)
     return None
+
+
+def weekly_used_pct_reading(lane: str, *, account: ClaudeAccount | None) -> float | None:
+    """Telemetry, never admission: ``lane``'s weekly plan usage from one Monitor read, or None.
+
+    One request bounded by ``TELEMETRY_READ_TIMEOUT_S``, with no readiness wait, no retry and no write to the
+    admission reader's down memo, so a reading never delays the work it describes. ``agy_claude`` reads only
+    its weekly window. Every failure, including an unreachable Monitor, is None.
+    """
+    from lu_machinery.fleet import claude_account_lane
+
+    if account is not None:
+        claude_account_lane.require_account(account)
+    elif lane == "claude":
+        return None
+    try:
+        view = _bound_routing_view(account, ready_wait=False)
+    except MonitorUnavailable:
+        return None
+    if view is None:
+        return None
+    return _used_pct_from_view(view, lane, account, datetime.now(UTC), agy_keys=("weekly",))
 
 
 def account_used_pct(account: ClaudeAccount | None) -> Callable[[str], float | None]:
