@@ -432,6 +432,7 @@ def test_dismissal_keeps_raw_patch_worker_broker_and_reviewer_relays_closed(monk
     """A new interactive verb must not grant a worker broker or reviewer a dismissal transport."""
     import importlib.util
     import json
+    import threading
     from pathlib import Path
     from lu_machinery.dispatcher import agy_sandbox, write_boundary
 
@@ -463,7 +464,8 @@ def test_dismissal_keeps_raw_patch_worker_broker_and_reviewer_relays_closed(monk
             self.reply = json.loads(value)
 
     broker = write_boundary._Broker.__new__(write_boundary._Broker)
-    broker.records = []
+    # Hand-built without its socket: set what __init__ gives every connection thread (the records and their lock).
+    broker.records, broker.state = [], threading.Lock()
     monkeypatch.setattr(broker, "_peer_inside", lambda connection: True)
     connection = Connection()
     broker._handle(connection)

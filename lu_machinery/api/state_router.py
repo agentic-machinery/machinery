@@ -2173,7 +2173,6 @@ def _aged_routing_budget(
     payload: object,
     age_s: float,
     *,
-    stale: bool = True,
     claude_fields: dict[str, Any] | None = None,
 ) -> object:
     """Publish the real age of a stored routing snapshot without adding keys.
@@ -2197,7 +2196,7 @@ def _aged_routing_budget(
         extra = float(prior) if isinstance(prior, (int, float)) else 0.0
         reported_age = extra + age_s
         diagnostics["data_age_s"] = round(reported_age, 1)
-        diagnostics["stale"] = bool(diagnostics.get("stale")) or stale or reported_age > threshold
+        diagnostics["stale"] = bool(diagnostics.get("stale")) or reported_age > threshold
         served["diagnostics"] = diagnostics
     if reported_age <= threshold:
         return served
@@ -2512,7 +2511,6 @@ async def routing_budget(
         payload = _public_routing_budget(_aged_routing_budget(
             value,
             state_helpers._ttl_clock() - observed.started_at,
-            stale=age_s >= ROUTING_BUDGET_TTL_S or observed.invalidated.is_set(),
             claude_fields=claude_fields,
         ))
         return _routing_budget_response(payload)
@@ -2521,7 +2519,6 @@ async def routing_budget(
     payload = _public_routing_budget(_aged_routing_budget(
         value,
         state_helpers._ttl_clock() - observed.started_at,
-        stale=observed.invalidated.is_set(),
         claude_fields=claude_fields,
     ))
     return _routing_budget_response(payload)
@@ -2531,9 +2528,6 @@ def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
     diagnostics = payload.get("diagnostics", {})
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
         diagnostics.get("data_age_s"), diagnostics.get("stale_threshold_s", ROUTING_BUDGET_MAX_AGE_S),
-        # diagnostics.stale also describes a 15 s routing-cache refresh. The
-        # display header describes the source-age bound; admission still reads
-        # the unchanged diagnostics and per-account freshness fields.
     ))
 
 

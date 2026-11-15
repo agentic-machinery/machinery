@@ -339,6 +339,20 @@ def test_routing_budget_shape_lock(monkeypatch, tmp_path):
     assert all(isinstance(count, int) for count in data["in_flight"].values())
 
 
+def test_refresh_due_snapshot_within_source_age_threshold_stays_fresh():
+    """The refresh TTL must not mark a 127-second-old routing source stale."""
+    snapshot = {
+        "diagnostics": {"data_age_s": 100, "stale": False, "stale_threshold_s": 900},
+        "recommendation": {"primary_agent_for_code": "codex", "warnings": []},
+        "agents": {"codex": {"eligible": True, "status": "cool"}},
+    }
+    served = state_router._aged_routing_budget(snapshot, 27, claude_fields={})
+    assert served["diagnostics"] == {"data_age_s": 127.0, "stale": False, "stale_threshold_s": 900}
+    assert served["recommendation"] == snapshot["recommendation"]
+    assert served["agents"] == snapshot["agents"]
+    assert snapshot["diagnostics"]["data_age_s"] == 100
+
+
 def test_token_matched_warm_hit_withdraws_when_cumulative_age_exceeds_bound(monkeypatch, tmp_path):
     """A within-TTL cache hit must not authorize a source older than 900 seconds."""
     _configure(monkeypatch, tmp_path, [])
@@ -425,7 +439,7 @@ def test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked(monkeypatc
                 assert again.json()["in_flight"] == {"codex": 1}
                 assert again.json()["diagnostics"] == {
                     "data_age_s": 12.0,
-                    "stale": True,
+                    "stale": False,
                     "stale_threshold_s": 900,
                 }
                 assert len(calls) == 2
@@ -438,8 +452,8 @@ def test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked(monkeypatc
     asyncio.run(scenario())
 
 
-def test_task_directory_aba_during_compute_never_marks_in_compute_counts_fresh(monkeypatch, tmp_path):
-    """An added then removed newest task must not leave its counts marked fresh."""
+def test_task_directory_aba_during_compute_refreshes_without_marking_source_stale(monkeypatch, tmp_path):
+    """Task invalidation schedules refresh without conflating it with source age."""
     _configure(monkeypatch, tmp_path, [])
     ctx = fixture_context(tmp_path)
     tasks = ctx.roots.batch_state_dir / "tasks"
@@ -489,9 +503,9 @@ def test_task_directory_aba_during_compute_never_marks_in_compute_counts_fresh(m
                     assert response.status_code == 200
                     body = response.json()
                     assert body["in_flight"]["codex"] == 1
-                    assert body["diagnostics"]["stale"] is True
+                    assert body["diagnostics"]["stale"] is False
                     await settle_refresh()
-                assert cold.json()["diagnostics"]["stale"] is True
+                assert cold.json()["diagnostics"]["stale"] is False
             finally:
                 await settle_refresh()
 

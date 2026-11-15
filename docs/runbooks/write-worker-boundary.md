@@ -242,8 +242,9 @@ launch, never from the request:
   model as `--review-author-model` and `--review-mode cross_family`. A request field for the author is
   refused.
 - **Review result.** `review-wait` waits on the host for a review this task dispatched (named
-  `<task>-review-<suffix>`, with this task as its `initiator`) for at most 840 seconds per request,
-  because the broker serves one request at a time. The wait inside forwards a `wait` of any task whose
+  `<task>-review-<suffix>`, with this task as its `initiator`) for at most 840 seconds per request.
+  The broker serves each connection on its own thread and runs `review-wait` outside the lock that
+  serializes every other verb, so a pending wait never holds the worker's other calls. The wait inside forwards a `wait` of any task whose
   record is not in the task's own view; a longer or unlimited `--timeout` exits 124 while the review
   still runs, as the host's wait does, and the caller runs the same wait again. Once the review is done
   the printed record carries the reviewer's sealed reply as `result` (its digest checked), so the
@@ -252,6 +253,13 @@ launch, never from the request:
 - **Budget check.** `budget-check` runs `record_cf_verdict budget-check` on the host for the task's own
   open PR and returns its JSON and exit status (#575). The review dispatch still runs the same admission
   itself, so the check only tells the worker before it spends a dispatch.
+  Before each review round, including the first, run the usual command inside the boundary:
+  `python -m lu_machinery.review.record_cf_verdict budget-check --repository owner/name --pr N`
+  (using the project interpreter). The recorder forwards it automatically; exit 0 admits the round,
+  while a host refusal retains its JSON reason and prevents dispatch. A request naming another PR's
+  branch or repository is refused before the host recorder runs. In the boundary receipt, the
+  corresponding entry includes `{"verb": "budget-check", "returncode": 0, "refused": null}` for admission;
+  inspect the command's JSON as well as this transport receipt.
 - **Replay.** Each request id is accepted once per run. The dispatcher refuses an existing task id.
 - **Paths.** No request names a host path. The prompt arrives as text and the host writes it to the
   run's private scratch.

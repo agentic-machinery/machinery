@@ -34,11 +34,54 @@ def model_observer(stdout_path):
     return _observe(stdout_path, _reported)
 
 
+def _shell_rule(claude_rule: str) -> str:
+    """Cursor's form of one Claude ``Bash(cmd sub *)`` deny: ``Shell(cmd:sub*)``, the base command and an args glob.
+
+    Cursor's ``*`` matches any text and a rule matches each command of a compound one
+    (https://cursor.com/docs/cli/reference/permissions), so ``git:push*`` refuses ``git push`` with any arguments.
+    """
+    command, _, arguments = claude_rule.removeprefix("Bash(").removesuffix(")").removesuffix(" *").partition(" ")
+    return f"Shell({command}:{arguments}*)"
+
+
+def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> str:
+    """The ``cli-config.json`` a read-only run reads: the permission profile of a read-only Claude run.
+
+    ``--mode ask`` refused every shell call, ``git diff`` and ``sha256sum`` included (2026-11-15 bench). Cursor
+    takes per-command rules only from this file and rewrites it at every start, so the write boundary puts a private
+    copy at HOME's ``.cursor/cli-config.json``, discarded with the run's scratch. Every shell command
+    runs except the Git and GitHub writes Claude's profile denies; file writes and the Sources tools that persist
+    entries are denied too, and deny wins over allow. ``allowlist`` approval with no ``--force`` refuses any other
+    call that needs approval. Cursor's own sandbox stays off, as Claude's per-shell prefix is stripped: a nested
+    bubblewrap cannot start, and the read-only whole-process boundary is the launcher's.
+    """
+    from lu_machinery.dispatcher.providers.claude import _READ_DENIES
+    from lu_machinery.dispatcher.write_boundary import _CURSOR_SOURCES_SERVER as server
+
+    deny = [_shell_rule(rule) for rule in _READ_DENIES.split(",") if rule.startswith("Bash(")]
+    config = {
+        "version": 1,
+        # Cursor's schema requires ``editor``; a profile without it is a repair case, and a failed repair falls back
+        # to Cursor's defaults, which allow only ``Shell(ls)`` (cursor-agent 2026.11.13).
+        "editor": {"vimMode": False},
+        "approvalMode": "allowlist",
+        "autoAcceptWebSearch": True,
+        "sandbox": {"mode": "disabled"},
+        "permissions": {
+            "allow": ["Shell(*)", "Read(*)", *(f"Mcp({server}:{name})" for name in readers)],
+            "deny": ["Write(*)", *deny, *(f"Mcp({server}:{name})" for name in writers)],
+        },
+    }
+    return json.dumps(config, indent=2) + "\n"
+
+
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     argv = ["cursor-agent", "-p", "--model", spec.model, "--output-format", "stream-json", "--trust"]
     argv += ["--workspace", str(spec.worktree)]
     if spec.mode == "read-only":
-        argv += ["--mode", "ask"]
+        # The rules are read_only_cli_config's, never a workspace's own .cursor/cli.json. --approve-mcps loads the
+        # projected Sources relay; only the tools that file allows run.
+        argv += ["--disable-project-configs", "--approve-mcps"]
     elif spec.mode == "workspace-write":
         argv += ["--approve-mcps", "--sandbox", "disabled", "--force"]
     else:
