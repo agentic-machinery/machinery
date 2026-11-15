@@ -2196,7 +2196,7 @@ def _aged_routing_budget(
         extra = float(prior) if isinstance(prior, (int, float)) else 0.0
         reported_age = extra + age_s
         diagnostics["data_age_s"] = round(reported_age, 1)
-        diagnostics["stale"] = reported_age > threshold
+        diagnostics["stale"] = bool(diagnostics.get("stale")) or reported_age > threshold
         served["diagnostics"] = diagnostics
     if reported_age <= threshold:
         return served
