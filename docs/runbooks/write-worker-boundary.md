@@ -428,20 +428,31 @@ re-running it.
 ### Build and install the artifact
 
 Build the wheel from the exact head under test the way a release does ([release](../release.md#cut-a-release)
-steps 1 to 3: `git archive` of the head, the wheelhouse and the hash-checked install into a clean venv outside
-any checkout), and dispatch through that installation, so the boundary that runs is the one under test:
+steps 1 to 3: `git archive` of the head, the wheelhouse and the hash-checked install into a disposable
+consumer environment outside any checkout), and dispatch through that installation, so the boundary that runs is the one under test:
 
 ```bash
 HEAD_SHA="$(git rev-parse HEAD)"                       # the head under test, already pushed
 git archive --format=tar "$HEAD_SHA" | tar -x -C "$WORK/src"
 "$BUILD_VENV/bin/python" -I -m build --wheel --no-isolation --outdir "$WORK/dist" "$WORK/src"
+# Create CONSUMER_VENV using the consumer's supported Python and runtime requirements.
+# CONSUMER_RUNTIME_LOCK is the consumer's pinned runtime requirements, including Sources packages.
+"$CONSUMER_PYTHON" -m venv "$CONSUMER_VENV"
+P="$CONSUMER_VENV/bin/python"
+"$P" -m pip install --require-hashes -r "$CONSUMER_RUNTIME_LOCK"
 WHEEL_SHA256="$(sha256sum "$WORK"/dist/lu_machinery-*.whl | cut -d' ' -f1)"
-"$P" -m pip install --no-index --find-links "$WHEELHOUSE" --require-hashes -r requirements-machinery.lock
+"$P" -m pip install --force-reinstall --no-index --find-links "$WHEELHOUSE" --require-hashes -r "$CANDIDATE_LOCK"
+"$P" -m pip check
 env -u PYTHONPATH "$P" -I -c 'import importlib.metadata as m, lu_machinery; print(m.version("lu-machinery")); print(lu_machinery.__file__)'
 ```
 
-`$P` is the clean venv's interpreter; the consumer lock names the wheel built above by its hash. The printed
-path must lie inside that venv. Record the version, the path and `WHEEL_SHA256`. An editable install, a
+`$P` is the disposable consumer environment's interpreter, used for dispatch and its host-side Sources
+server. `$CANDIDATE_LOCK` names the wheel built above by its hash plus `requirements-machinery.lock`
+from that head; `$WHEELHOUSE` contains those artifacts. Install the consumer runtime first and the
+candidate machinery lock last. A bare machinery-only venv is insufficient: Sources imports consumer
+runtime packages (for example `requests`) that are not machinery dependencies. Do not modify the live
+consumer environment or add its runtime packages to machinery's dependencies. The printed path must
+lie inside the disposable environment. Record the version, the path and `WHEEL_SHA256`. An editable install, a
 checkout on `PYTHONPATH` or a different version voids the run. The commit hooks run with the interpreter named
 by `LEARN_UKRAINIAN_PYTHON` (an absolute path to an executable), so export it for the dispatches below; it
 makes the hooks run the code under test rather than the primary checkout's own environment.
@@ -502,8 +513,9 @@ each with `wait`, never by polling. Verify the flags with `dispatch --help` of t
 - Step D, a negative control, before Step C's commit: print only whether the hook environment variables
   are set (never their values) and the installed package's import path as the hook interpreter sees it.
   Then create one new file outside the owned path (a name used only for this control), `git add` it and
-  attempt a commit. It must be refused by the ownership hook. Afterwards run `git reset`, delete that file
-  and confirm `git status --porcelain` prints nothing; a dirty tree ends the task `no_deliverable`. Report
+  attempt a commit. It must be refused by the ownership hook. Afterwards run `git reset`, then delete the negative-control directory with
+  `"$LEARN_UKRAINIAN_PYTHON" -I -c 'import shutil; shutil.rmtree("tmp-boundary-negative")'`
+  (create the control file under `tmp-boundary-negative/`). Confirm `git status --porcelain` prints nothing; a dirty tree ends the task `no_deliverable`. Report
   the hook's output lines. Step C then runs on the clean tree.
 - The reply carries each step's outcome and each command's exit status and last line.
 
@@ -517,7 +529,7 @@ fill one table row per route:
 | Canary commit made | Task record: `commits_ahead` is 1 and `head_sha` equals `remote_head_sha`; the commit carries the `X-Agent` trailer | pass |
 | Boundary ran | The record has a `write_boundary` field; its `status` is `ran`, `canary_passed` is true and `import.status` is `imported`. A record with no such field ran outside the boundary (in an in-tree dispatcher) and proves nothing | pass |
 | Broker push | Receipt `broker` lists a `push` verb with `returncode` 0 and no `refused` | pass |
-| Hook bootstrap | The commit hooks ran from the artifact under test. A commit alone does not prove this. Step D reports that `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` and `LEARN_UKRAINIAN_PYTHON` are set in the provider's shell and that the package the hook interpreter imports lies in the clean venv. The negative control (an unowned path) is refused by a hook, which a commit that never ran hooks could not do | pass |
+| Hook bootstrap | The commit hooks ran from the artifact under test. A commit alone does not prove this. Step D reports that `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` and `LEARN_UKRAINIAN_PYTHON` are set in the provider's shell and that the package the hook interpreter imports lies in the disposable consumer environment. The negative control (an unowned path) is refused by a hook, which a commit that never ran hooks could not do | pass |
 | Owned-path check | The canary file, an owned path, commits; the Step D negative control, an unowned path, is refused. `owned_path_grants_used` is empty | pass |
 | pre-commit | The product hooks ran and passed in the commit, from the restored read-only hook store, with no network fetch (`egress` lists no hook-repository clone) | pass |
 | Commit-message scan | The commit succeeds with its message and the broker's host push scan runs on it: the `push` verb returned 0. The gate defers to that scan only when `LU_WRITE_BOUNDARY_BROKER` names the broker socket, and the refusal without the socket is the product pre-push gate's own test, which the canary cannot reproduce inside, where the socket is always present | pass |

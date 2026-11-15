@@ -8,23 +8,15 @@ import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
-
 import pytest
 import yaml
-
 from lu_machinery.review import model_catalog
 from lu_machinery.review.family_exclusions import family_exclusion
-from lu_machinery.review.model_catalog import (
-    CATALOG_PATH,
-    ModelCatalogError,
-    bounded_execution_policy,
-    cursor_pinned_models,
-    load_model_catalog,
-    validate_catalog,
-)
+from lu_machinery.review.model_catalog import CATALOG_PATH, ModelCatalogError, bounded_execution_policy, cursor_pinned_models, load_model_catalog, validate_catalog
 from lu_machinery.review.role_resolution import expand_routing_references, resolve_routing_reference
-from tests.helpers import machinery_package
-
+from tests.helpers import machinery_package as machinery_package
+from lu_machinery import model_families
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 def raw_catalog():
     return yaml.safe_load(CATALOG_PATH.read_text())
@@ -274,3 +266,224 @@ def test_legacy_adapter_expands_raw_authored_references():
     from tests.review.test_model_catalog import assert_frozen_surfaces
 
     assert_frozen_surfaces({"catalog": expanded_legacy_view(raw_catalog())}, surfaces=("catalog",))
+
+
+_UNKNOWN_TOKENS = (
+    "composer",
+    "cursor-fast",
+    "mystery-model",
+    "composer-2.4",
+    "mystery-reviewer",
+    "gravity",
+    "anti",
+)
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_canonical_normalize_family_unknown_is_first_class() -> None:
+    from lu_machinery.review.record_cf_verdict import BranchFactsError
+    from lu_machinery.review.record_cf_verdict import incoming_writer_family
+    from lu_machinery.review.reviewer_resolver import resolve_author_family
+    from lu_machinery.review.reviewer_resolver import resolve_family
+
+    for token in _UNKNOWN_TOKENS:
+        assert model_families.normalize_family(token) is model_families.Family.UNKNOWN, token
+    assert model_families.normalize_family("") is model_families.Family.UNKNOWN
+    assert model_families.normalize_family(None) is model_families.Family.UNKNOWN
+    for token in ("muse", "muse-spark-1.3", "muse-wonder-full", "muse-wonder-full-2.0", "muse:mystery-model"):
+        assert model_families.normalize_family(token) is model_families.Family.UNKNOWN, token
+        assert resolve_family(token) == "unknown", token
+        assert resolve_author_family(token) == "unknown", token
+        with pytest.raises(BranchFactsError, match="incoming writer family unknown"):
+            incoming_writer_family("muse", token)
+    with pytest.raises(BranchFactsError, match="incoming writer family unknown"):
+        incoming_writer_family("muse", None)
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_canonical_word_boundary_prevents_false_matches() -> None:
+    # "gemmate" must NOT be read as gemma; "openrouter" has no openai marker;
+    # "gravity" and "anti" alone stay unknown.
+    assert model_families.normalize_family("gemmate-thing") is model_families.Family.UNKNOWN
+    assert model_families.normalize_family("openrouter") is model_families.Family.UNKNOWN
+    assert model_families.normalize_family("gravity") is model_families.Family.UNKNOWN
+    assert model_families.normalize_family("anti") is model_families.Family.UNKNOWN
+    for token in (
+        "xmeta",
+        "metaphor",
+        "metax",
+        "xmuse-wonder-full-1.0",
+        "muse-wonder-full-1.0x",
+        "muse-wonder-full-1.01",
+    ):
+        assert model_families.normalize_family(token) is model_families.Family.UNKNOWN, token
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_canonical_lineage_prefers_pin_over_cursor_seat() -> None:
+    # cursor seat + pinned model -> the pin's family.
+    assert model_families.normalize_lineage_family({"family": "cursor", "pin": "grok-4"}) is model_families.Family.XAI
+    assert (
+        model_families.normalize_lineage_family({"family": "cursor", "pin": "claude-opus-4-6"})
+        is model_families.Family.ANTHROPIC
+    )
+    assert (
+        model_families.normalize_lineage_family({"family": "cursor", "pin": "composer-2.5"})
+        is model_families.Family.MOONSHOT
+    )
+    # Cursor Auto has its own family without a concrete pin.
+    assert model_families.normalize_lineage_family({"family": "cursor"}) is model_families.Family.CURSOR
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_canonical_lineage_ambiguous_concrete_signals_fail_closed() -> None:
+    from lu_machinery.review.reviewer_resolver import resolve_author_family
+
+    assert (
+        model_families.normalize_lineage_family({"family": "google", "pin": "openrouter/deepseek/deepseek-v4-pro"})
+        is model_families.Family.UNKNOWN
+    )
+    assert model_families.normalize_lineage_family({"family": "meta", "pin": "muse-wonder-full-1.0"}) is (
+        model_families.Family.META
+    )
+    assert model_families.normalize_lineage_family({"family": "google", "pin": "muse-wonder-full-1.0"}) is (
+        model_families.Family.UNKNOWN
+    )
+    assert resolve_author_family("muse-wonder-full-1.0", "meta") == "meta"
+    assert resolve_author_family("muse-wonder-full-1.0", "google") == "conflict"
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("display", ["Composer 2.5", "composer 2.5", "COMPOSER 2.5", "  Composer   2.5  "])
+def test_cursor_display_name_resolves_to_the_concrete_composer_slug(display: str) -> None:
+    assert model_families.canonical_cursor_model(display) == "composer-2.5"
+    assert model_families.normalize_family(display) is model_families.Family.MOONSHOT
+    assert model_families.normalize_lineage_family({"family": "cursor", "resolved_model": display}) is (
+        model_families.Family.MOONSHOT
+    )
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "value",
+    [
+        "unknown",
+        "",
+        "   ",
+        "Composer",
+        "Composer 2",
+        "Composer 2.4",
+        "Composer 2.50",
+        "Composer 2.5 Fast",
+        "Composer 3",
+    ],
+)
+def test_cursor_display_name_normaliser_rejects_everything_else(value: str) -> None:
+    assert model_families.canonical_cursor_model(value) == value
+    assert model_families.normalize_family(value) is model_families.Family.UNKNOWN
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "selector",
+    [
+        "auto",
+        "AUTO",
+        "Auto",
+        " auto ",
+        "default",
+        "DEFAULT",
+        "Default",
+        " default ",
+        "cursor:auto",
+        "CURSOR:AUTO",
+        "Cursor:Auto",
+        " cursor:auto ",
+        "cursor/auto",
+        "CURSOR/AUTO",
+        "Cursor/Auto",
+        " cursor/auto ",
+        "cursor:default",
+        "CURSOR:DEFAULT",
+        "Cursor:Default",
+        " cursor:default ",
+        "cursor/default",
+        "CURSOR/DEFAULT",
+        "Cursor/Default",
+        " cursor/default ",
+    ],
+)
+def test_cursor_auto_selectors_share_canonical_family(selector):
+    from lu_machinery.review.model_catalog import is_cursor_auto_selector
+
+    assert is_cursor_auto_selector(selector)
+    assert model_families.normalize_family(selector) is model_families.Family.CURSOR
+    assert (
+        model_families.normalize_lineage_family({"family": "cursor", "model": selector}) is model_families.Family.CURSOR
+    )
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("field", ["pin", "pin_slug", "model", "model_id", "writer_model_id"])
+@pytest.mark.parametrize("selector", ["auto", "DEFAULT", "cursor:auto", "cursor/default"])
+@pytest.mark.parametrize("reported", ["Grok 4.7 256K High", "claude-opus-5-5", None])
+def test_explicit_auto_selector_keeps_cursor_despite_runtime_telemetry(field, selector, reported):
+    metadata = {"family": "cursor", field: selector, "resolved_model": reported}
+    assert model_families.normalize_lineage_family(metadata) is model_families.Family.CURSOR
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "token,expected",
+    [
+        ("agy", "google"),
+        ("ANTIGRAVITY", "google"),
+        ("agy:mystery-model", "google"),
+        ("antigravity:gemini-3.1-pro-high", "google"),
+        ("gemma-agy", "google"),
+        ("agy:deepseek-v4.1-flash", "deepseek"),
+        ("agy:grok-4.7", "xai"),
+        ("agy:composer-2.5", "moonshot"),
+        ("agy:glm-5.3", "zhipu"),
+        ("agy:laguna-s-2.1", "poolside"),
+        ("agy:qwen", "qwen"),
+        ("cursor:agy:gpt-6.1-sol", "unknown"),
+        ("cursor:auto", "cursor"),
+        ("fixture", "fixture"),
+        ("adversarial-fixture", "fixture"),
+        ("agyx:mystery", "unknown"),
+        ("xantigravity:mystery", "unknown"),
+        ("mystery:antigravityx", "unknown"),
+    ],
+)
+def test_agy_route_fallback_and_other_family_controls(token, expected):
+    assert model_families.normalize_family(token).value == expected
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "mixed,expected",
+    [
+        ("claude-opus-5-5:gpt-6.1-sol", "openai"),
+        ("gpt-6.1-sol:claude-opus-5-5", "openai"),
+        ("claude-opus-5-5:gemini-3.1-pro-high", "google"),
+        ("gemini-3.1-pro-high:gpt-6.1-sol", "google"),
+        ("deepseek-v4.1-flash:gemini-3.1-pro-high", "deepseek"),
+        ("grok-4.7:claude-opus-5-5", "anthropic"),
+    ],
+)
+def test_agy_does_not_change_existing_mixed_concrete_token_precedence(mixed, expected):
+    for selector in (mixed, f"agy:{mixed}", f"{mixed}-antigravity"):
+        assert model_families.normalize_family(selector).value == expected
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("model,family", [("claude-opus-5-5", "anthropic"), ("gpt-6.1-sol", "openai")])
+def test_agy_decoration_does_not_override_conflicting_lineage_or_author_family(model, family):
+    from lu_machinery.review.reviewer_resolver import resolve_author_family
+
+    decorated = f"agy:{model}"
+    assert model_families.normalize_lineage_family({"family": "google", "pin": decorated}).value == "unknown"
+    assert model_families.normalize_lineage_family({"family": family, "pin": decorated}).value == family
+    assert resolve_author_family(decorated, "google") == "conflict"
+    assert resolve_author_family(decorated, family) == family

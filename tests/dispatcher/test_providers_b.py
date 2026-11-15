@@ -992,8 +992,80 @@ def test_agy_sources_relay_forwards_only_read_only_tools_and_counts_matched_resu
         ("tools/call", "slow"), ("ping", None), ("tools/call", "contentless"),
     ]
     assert relay.evidence() == {"completed": 2, "failed": 3, "tools": {"reader": 2},
+                                "start_failures": [], "start_failure_overflow_count": 0,
                                 "refused": {"ping": 1, "resources/list": 1, "tools/call:reader": 1,
                                             "tools/call:writer": 1}}
+
+
+def test_agy_sources_relay_import_failure_records_startup_exit(tmp_path):
+    """An import-time server exit must not leave an empty Sources failure receipt (#569)."""
+    import socket
+
+    from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
+
+    server = tmp_path / "server.py"
+    server.write_text("import missing_sources_runtime_package\n")
+    relay = SourcesRelay(tmp_path / "sources.sock", frozenset(), dict(os.environ))
+    relay.server = [sys.executable, "-I", str(server)]
+    try:
+        directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(5)
+            try:
+                connection.connect(f"/proc/self/fd/{directory}/sources.sock")
+            finally:
+                os.close(directory)
+            assert connection.recv(1) == b""
+        assert relay.evidence() == {
+            "completed": 0, "failed": 0, "tools": {}, "refused": {},
+            "start_failures": [{"returncode": 1, "first_error":
+                                "ModuleNotFoundError: No module named 'missing_sources_runtime_package'"}],
+            "start_failure_overflow_count": 0,
+        }
+    finally:
+        relay.cleanup()
+
+    # A healthy stdio server exits when its client closes stdin; that is not startup failure.
+    server.write_text("import sys\nsys.stderr.write('INFO server ready\\n')\nsys.stdin.read()\n")
+    relay = SourcesRelay(tmp_path / "healthy.sock", frozenset(), dict(os.environ))
+    relay.server = [sys.executable, "-I", str(server)]
+    try:
+        directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(5)
+                connection.connect(f"/proc/self/fd/{directory}/healthy.sock")
+                connection.shutdown(socket.SHUT_WR)
+                assert connection.recv(1) == b""
+        finally:
+            os.close(directory)
+        assert relay.evidence()["start_failures"] == []
+    finally:
+        relay.cleanup()
+
+    # Exercise the receipt cap and redaction using real exception tracebacks.
+    from lu_machinery.dispatcher.agy_sandbox import _SOURCES_START_FAILURE_LIMIT
+
+    server.write_text("raise RuntimeError('token=example-secret')\n")
+    relay = SourcesRelay(tmp_path / "bounded.sock", frozenset(), dict(os.environ))
+    relay.server = [sys.executable, "-I", str(server)]
+    try:
+        directory = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(_SOURCES_START_FAILURE_LIMIT + 1):
+                with socket.socket(socket.AF_UNIX) as connection:
+                    connection.settimeout(5)
+                    connection.connect(f"/proc/self/fd/{directory}/bounded.sock")
+                    assert connection.recv(1) == b""
+        finally:
+            os.close(directory)
+        evidence = relay.evidence()
+        assert len(evidence["start_failures"]) == _SOURCES_START_FAILURE_LIMIT
+        assert evidence["start_failure_overflow_count"] == 1
+        assert all(failure == {"returncode": 1, "first_error": "RuntimeError: token=[REDACTED_SECRET]"}
+                   for failure in evidence["start_failures"])
+    finally:
+        relay.cleanup()
 
 
 def test_agy_scratch_removal_never_follows_a_link_the_sandbox_planted(tmp_path):

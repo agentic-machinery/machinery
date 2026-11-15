@@ -535,6 +535,10 @@ def _input_state(worktree: Path) -> dict:
     return {"head": head, "clean": status == ""}
 
 
+_SOURCES_START_FAILURE_LIMIT = 16
+_SOURCES_ERROR_LIMIT = 4096
+
+
 class SourcesRelay:
     """Parent-owned Sources MCP for one sandbox: read-only tools only, completed calls counted.
 
@@ -554,6 +558,8 @@ class SourcesRelay:
         self.completed = self.failed = 0
         self.tools: dict[str, int] = {}
         self.refused: dict[str, int] = {}  # by method, or by tool for a refused call
+        self.start_failures: list[dict] = []
+        self.start_failure_overflow_count = 0
         self.lock = threading.Lock()
         self.stopped = False
         self.processes: list[subprocess.Popen] = []
@@ -572,7 +578,8 @@ class SourcesRelay:
     def evidence(self) -> dict:
         with self.lock:
             return {"completed": self.completed, "failed": self.failed, "tools": dict(sorted(self.tools.items())),
-                    "refused": dict(sorted(self.refused.items()))}
+                    "refused": dict(sorted(self.refused.items())), "start_failures": list(self.start_failures),
+                    "start_failure_overflow_count": self.start_failure_overflow_count}
 
     def _accept(self) -> None:
         while not self.stopped:
@@ -593,8 +600,29 @@ class SourcesRelay:
                 return
             # Same process group as the launcher, so a killed task takes its servers with it.
             process = subprocess.Popen(self.server, cwd=product_root(), env=self.env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.processes.append(process)
+        # Drain all stderr without retaining unbounded output or blocking the server on a full pipe.
+        last_error: list[str] = []
+        client_closed = threading.Event()
+
+        def drain_stderr() -> None:
+            from lu_machinery.secret_redactor import redact_text
+
+            stderr = process.stderr
+            assert stderr is not None  # Popen above always creates stderr=PIPE.
+            with stderr:
+                # Bounded reads drain even a server emitting an enormous unterminated line.
+                # Keep the final non-empty line: Python traceback headers carry no cause.
+                while line := stderr.readline(_SOURCES_ERROR_LIMIT):
+                    if line.strip():
+                        error = redact_text(line.decode("utf-8", "replace").rstrip())
+                        assert error is not None  # redact_text preserves non-None input.
+                        last_error[:] = [error[:_SOURCES_ERROR_LIMIT]]
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+        served = False
         pending: dict[str, tuple[str, str | None]] = {}
         pending_lock, send_lock = threading.Lock(), threading.Lock()
 
@@ -619,6 +647,7 @@ class SourcesRelay:
             except (OSError, ValueError):
                 pass
             finally:
+                client_closed.set()
                 with contextlib.suppress(OSError, ValueError):
                     process.stdin.close()
 
@@ -630,16 +659,31 @@ class SourcesRelay:
                 except ValueError:
                     continue
                 if isinstance(message, dict) and (message := self._settle(message, pending, pending_lock)) is not None:
+                    served = True
                     reply(message)
         except OSError:
             pass
         finally:
+            # EOF can precede process exit by a scheduler tick. Distinguish a natural startup
+            # exit from our own shutdown, and publish diagnostics before the client sees EOF.
+            try:
+                returncode = process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    process.kill()
+                process.wait()
+            else:
+                stderr_thread.join(timeout=2)
+                with self.lock:
+                    if not served and not self.stopped and not client_closed.is_set():
+                        if len(self.start_failures) < _SOURCES_START_FAILURE_LIMIT:
+                            self.start_failures.append({"returncode": returncode,
+                                                        "first_error": last_error[0] if last_error else ""})
+                        else:
+                            self.start_failure_overflow_count += 1
             with contextlib.suppress(OSError):
                 connection.shutdown(socket.SHUT_RDWR)
             connection.close()
-            with contextlib.suppress(OSError):
-                process.kill()
-            process.wait()
 
     def _admit(self, message: dict, pending: dict, pending_lock: threading.Lock, reply) -> bool:
         method = message.get("method")
