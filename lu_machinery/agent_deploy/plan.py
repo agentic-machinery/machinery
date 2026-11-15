@@ -220,8 +220,8 @@ class Tree:
 class CommitInputs:
     """Deployment inputs read from one commit's Git objects (``--inputs-commit``), never the checkout.
 
-    Objects are immutable, so nothing written to the checkout while a check runs changes the plan
-    (machinery#22). Only regular-file entries count: a symlink, submodule or other entry is refused,
+    Objects are immutable and replace refs are ignored, so nothing written to the checkout while a check
+    runs changes the plan (machinery#22). Only regular-file entries count: a symlink, submodule or other entry is refused,
     as the checkout inventory refuses one. Outputs, provider control files and the ownership manifest
     are still read from the checkout ``Tree``.
     """
@@ -237,7 +237,9 @@ class CommitInputs:
     def git(self, *args: str, stdin: bytes | None = None) -> bytes:
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         result = subprocess.run(  # fixed git argv on the held checkout fd, no shell; object reads only
-            ["git", "-C", f"/proc/self/fd/{self.fd}", "--literal-pathspecs", *args],
+            # Replace refs (refs/replace/*) would let checkout-local refs substitute other objects for the
+            # commit's: never honour them.
+            ["git", "-C", f"/proc/self/fd/{self.fd}", "--no-replace-objects", "--literal-pathspecs", *args],
             pass_fds=(self.fd,), input=stdin, capture_output=True, check=False,
             env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
         )
