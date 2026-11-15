@@ -6,16 +6,18 @@ install and no machinery checkout on `PYTHONPATH`.
 
 ## Release train
 
-Owner decision C-5345 (ONE-REVIEW-FAST-RELEASE-1112, 2026-11-12). One machinery
-release per day, at 06:00 UTC. The person cutting the release runs this
-runbook by hand. Cut from `main` only when `main` has moved since the last
-tag and that commit's CI Gate is green. An urgent bug gets an immediate
+Owner decisions C-5345 (ONE-REVIEW-FAST-RELEASE-1112, 2026-11-12) and
+RELEASE-8H-CANARY-AT-CUT-1115 (2026-11-15, revised to 12 hours). Cut a
+machinery release every 12 hours, at 06:00 and 18:00 UTC. The person cutting
+the release runs this runbook by hand. Cut from `main` only when `main` has moved since the last
+tag and that commit's CI Gate is green. Skip a window when nothing has merged
+since the last tag. An urgent bug gets an immediate
 hotfix release: the same commands, as soon as the fix is on a green `main`,
-without waiting for 06:00. Any other bug is fixed in a follow-up PR and rides
-the next train that meets the conditions. Do not rebuild or replace a version
+without waiting for the next window. Any other bug is fixed in a follow-up PR
+and rides the next train that meets the conditions. Do not rebuild or replace a version
 that was already published, and do not move a tag.
 
-There is no 06:00 job. Build, wheelhouse, acceptance, tag and
+There is no scheduled release job. Build, wheelhouse, acceptance, tag and
 `release-create` are separate commands, not one script. A scheduler would
 need one command that refuses to publish unless `main` differs from the last
 tag and the CI Gate on that commit is green, then runs the cut below.
@@ -239,6 +241,32 @@ From `$SHA`, the commit identified under Changelog, with `$V` the version in
    `NODE_OPTIONS` loading `b4a` must execute the `react-native-b4a` marker as
    the positive control. Remove the markers and confirm the prefix still
    validates.
+
+   Run the review-contract canary once per release cut on `$SHA`, the release
+   candidate head, regardless of which paths changed. This replaces the per-PR
+   canary gate; independent PR review and CI remain required. Run on the host
+   with its provider credentials and user bus, outside a dispatched worker.
+   `$PRIMARY` is the primary product checkout and `$HOST_PYTHON` is its
+   `.venv/bin/python`:
+
+   ```bash
+   LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+     "$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"
+   ```
+
+   If the installed version lacks `run`, use the exact candidate checkout
+   (`$CANDIDATE_CHECKOUT`, checked out at `$SHA`) for this host command:
+
+   ```bash
+   LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+     PYTHONPATH="$CANDIDATE_CHECKOUT" \
+     "$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"
+   ```
+
+   Record the command's per-route PASS/FAIL table and candidate head in the
+   release's Acceptance section. Every required route must pass and the final
+   receipt check must succeed. A failing route or an incomplete run blocks the
+   release; PR merge does not require these receipts.
 
    Then check that every packaged resource resolves from the installed wheel
    and exercise lazy runtime paths. Running the agent deployer's plan and apply

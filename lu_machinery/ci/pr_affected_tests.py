@@ -418,7 +418,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         else None
     )
     run = set(guards) if reason else set(selected)
-    if reason == BUDGET_REASON:
+    if reason and not infrastructure:
         # Over the safe budget: changed tests fill what the guards leave, cheapest
         # first, so the same rule bounds the mandatory selection and the importers.
         used = guard_estimate
@@ -435,15 +435,18 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         for p in git("diff", "--no-renames", "--diff-filter=D", "--name-only", "-z", base, candidate, "--").split(b"\0")
         if p
     } & sources
+    # A deferred changed test does not consume the importers' room. Only an
+    # infrastructure change or guards that already exhaust the budget stop the scan.
+    scan_dependencies = importers and sources and not infrastructure and guard_estimate <= SAFE_SECONDS
     direct, shared = (
         tuple([p for p in tier if p not in run] for tier in importing_tests(sources, deleted, base, selectable))
-        if importers and sources and not reason
+        if scan_dependencies
         else ([], [])
     )
     imported = direct + shared
     readers = (
         [p for p in text_reading_tests(sources, selectable) if p not in run and p not in imported]
-        if importers and sources and not reason
+        if scan_dependencies
         else []
     )
     unknown += [p for p in imported + readers if p not in durations]
@@ -451,8 +454,8 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         value = durations.get(p, default)
         if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
             raise ValueError("invalid recorded duration")
-    budget = estimate
-    fill_limit = min(estimate + (CAP_SECONDS - estimate) * FILL_SHARE, SAFE_SECONDS)
+    budget = 60 + sum(cost(p, run) for p in run)
+    fill_limit = min(budget + (CAP_SECONDS - budget) * FILL_SHARE, SAFE_SECONDS)
     # Tests that import the code themselves fill first. Tests that only share a conftest
     # with it are cheaper to name than to trust, so they never displace a direct importer.
     for tier in (direct, shared):
@@ -466,7 +469,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
             run.add(p)
             budget += durations.get(p, default)
     timeout = min(CAP_SECONDS, max(TIMEOUT_SECONDS, math.ceil(budget * VARIANCE_RATIO))) if budget > used else TIMEOUT_SECONDS
-    if (set(imported) | set(readers)) - run:
+    if not reason and (set(imported) | set(readers)) - run:
         reason = BUDGET_REASON if fill_limit == SAFE_SECONDS else "recorded estimate exceeds 600 second cap"
     # A whole file already covers its pinned ids.
     run = sorted(p for p in run if "::" not in p or guard_file(p) not in run)
