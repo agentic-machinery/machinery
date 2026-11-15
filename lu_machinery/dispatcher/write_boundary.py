@@ -455,6 +455,7 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
         except _BrokerRefusal as exc:
             raise Refused(str(exc)) from None
         args = (*credentials, *command)
+    git = "git"
     if command[:1] == ["push"]:
         # Broker and settlement share this exact-update scan. No worker hook is trusted, including
         # reference-transaction hooks, so the transport below always has hooks disabled.
@@ -474,17 +475,24 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
                 f"from {_PACKAGE}.opsec.git_push import main; "
                 "raise SystemExit(main(sys.argv[2:4], stdin=sys.stdin.buffer.read(), chain=lambda *_: 0))")
         package_parent = str(machinery_path("dispatcher/write_boundary.py").parents[2])
+        # The scan and the transport run one absolute Git binary. The scanner exempts a private destination only
+        # when trusted_route proves that this Git reaches it over verified HTTPS or default SSH, and it proves
+        # nothing about a binary named by a bare "git" (the shim pins LU_OPSEC_REAL_GIT for the same reason).
+        # Without the pin every private push here was scanned as public (#565); a public one is scanned either way.
+        git = shutil.which("git", path=env["PATH"]) or ""
+        if not os.path.isabs(git):
+            raise Refused("host push requires an absolute host Git")
         # Fixed isolated interpreter and scanner code; input is the validated update above, never a shell command.
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         scanned = subprocess.run(
             [sys.executable, "-I", "-c", code, package_parent, "origin", command[5]],
-            cwd=cwd, input=update, env={**os.environ, "GIT_DIR": str(common)},
+            cwd=cwd, input=update, env={**os.environ, "GIT_DIR": str(common), "LU_OPSEC_REAL_GIT": git},
             capture_output=True, timeout=_BROKER_TIMEOUTS["publish"], check=False,
         )
         if scanned.returncode:
             raise Refused(scanned.stderr.decode("utf-8", "replace") or "host push scan refused")
     result = subprocess.run(
-        ["git", "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
+        [git, "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
          "-c", "push.followTags=false", "-c", "push.recurseSubmodules=no",
          "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
          *(["-c", "protocol.https.allow=always"] if network else []),

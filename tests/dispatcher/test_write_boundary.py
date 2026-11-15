@@ -739,6 +739,38 @@ def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, p
     assert "default branch" in _refused(lambda: broker._push({"head": broker.boundary.tip}))
 
 
+@pytest.mark.parametrize(("url", "scanned"), [
+    ("https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git", False),
+    ("https://github.com/example-owner/unregistered.git", True),
+], ids=["private-exempt", "public-scanned"])
+def test_host_push_scan_exempts_only_a_registered_private_destination(primary, monkeypatch, url, scanned):
+    """Defect classes: the broker's host push scan treats a registered private destination as public (it cannot
+    prove the transport's route and refuses every private push), or exempts a public destination from the scan."""
+    _, worktree, _ = primary
+    tip = _git(worktree, "rev-parse", "HEAD")
+    monkeypatch.delenv("LU_OPSEC_REAL_GIT", raising=False)  # the broker's host environment carries no pin
+    real_run, seen = subprocess.run, {}
+
+    def run(argv, **kwargs):
+        if "-I" in argv:  # the real host push scan, in its own interpreter
+            seen["scan"] = real_run(argv, **kwargs)
+            return seen["scan"]
+        if "push" not in argv:
+            return real_run(argv, **kwargs)
+        seen["push"] = argv  # the transport is not run: nothing leaves the test
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    try:
+        write_boundary._git(worktree, "push", "--quiet", "--no-verify", "--porcelain",
+                            "--force-with-lease=refs/heads/task:", url, f"{tip}:refs/heads/task")
+    except write_boundary.Refused:
+        assert scanned  # a public scan may refuse (synthetic history or no matcher); a private push never is
+    assert (b"commit(s) scanned" in seen["scan"].stderr) is scanned, seen["scan"].stderr
+    if not scanned:
+        assert seen["scan"].returncode == 0 and os.path.isabs(seen["push"][0])
+
+
 def test_fetch_base_updates_only_the_default_branch_tracking_ref(broker, primary, tmp_path, monkeypatch):
     """Defect class: the fetch verb takes a request-chosen ref or refspec, or rewrites a tracking ref, so a worker
     fetches arbitrary remote state into the shared primary."""
