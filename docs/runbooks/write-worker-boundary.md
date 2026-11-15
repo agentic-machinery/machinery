@@ -99,7 +99,9 @@ One bubblewrap invocation per launch, built in full by the launcher:
 - Writable: the task worktree, a private `TMPDIR` (also `LU_SCRATCH_ROOT` and `XDG_RUNTIME_DIR`),
   the declared outputs (the final-message file and AGY's write log) and, for a write dispatch, the host's
   test-slot pool at its default location (#557; [test slots](test-slots.md#write-boundary-workers)), so
-  governed tests queue with the host's own runs. The receipt's `test_slots` records whether it was bound.
+  governed tests queue with the host's own runs. The pool and its `queue` and `holders` directories are
+  mount points, so no directory a host run resolves can be replaced; the canary checks that each
+  refuses a rename (`EBUSY`). The receipt's `test_slots` records whether it was bound.
 - Network: only the CONNECT-only egress proxy of the formal review attempts (`attempt_network`),
   reached through the in-namespace forwarder. Any public host on port 443 except GitHub: its names
   (`github.com`, every name below it, and `ghcr.io`) and every name that resolves into the address

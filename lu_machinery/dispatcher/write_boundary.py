@@ -143,6 +143,9 @@ _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
     "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "GH_CONFIG_DIR",
     "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
+    # The host's test-slot governor settings: the launcher selects and sizes the pool it binds as the dispatcher's
+    # own runs do (#557). The pool directory is never passed inside; the size, wait and switch are (``_slot_env``).
+    "LU_TEST_SLOTS", "LU_TEST_SLOTS_DIR", "LU_TEST_SLOTS_COUNT", "LU_TEST_SLOTS_WAIT_S",
 })
 
 # The host broker (decision CONTAIN-BROKER-1113). Inside the boundary the task store, the Fleet plane and the
@@ -1328,6 +1331,7 @@ class _Boundary:
         self.gh: Any = None
         self.created = False
         self.created_outputs: list[Path] = []
+        self.slot_env: dict[str, str] = {}  # the bound test-slot pool's settings for the worker (#557)
 
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
@@ -1479,6 +1483,9 @@ class _Boundary:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
         if slot_pool is not None:
             probes.append({"op": "stat", "path": str(slot_pool[1]), "expect_any": ["OK"]})
+            probes.append({"op": "rename", "path": str(slot_pool[1]), "expect_any": ["EBUSY", "EROFS"]})
+            for name in ("queue", "holders"):
+                probes.append({"op": "rename", "path": str(slot_pool[1] / name), "expect_any": ["EBUSY"]})
         self.receipt["canary"] = {"probes_planned": len(probes), "passed": False}
         self.receipt["view"] = {"data_roots": len(data), "toolchain": len(toolchain), "checkouts": len(checkouts),
                                 "private_masks": len(private), "own_records": len(own)}
@@ -1511,8 +1518,11 @@ class _Boundary:
         argv += ["--bind", str(tmp), str(tmp), "--ro-bind", str(boundary), str(boundary)]
         if slot_pool is not None:
             # The host's test-slot pool, writable where a sandboxed run finds it, so governed tests queue with the
-            # host's own runs (#557); ``test_slots.launcher_bound`` accepts only this mount inside.
-            argv += ["--bind", str(slot_pool[0]), str(slot_pool[1])]
+            # host's own runs (#557); ``test_slots.launcher_bound`` accepts only this mount inside. Its queue and
+            # holder directories are mount points too: host runs resolve them by name, so a worker that could rename
+            # one and put a link in its place would steer host unlinks and creates outside the pool (review F1).
+            for name in ("", "queue", "holders"):
+                argv += ["--bind", str(slot_pool[0] / name), str(slot_pool[1] / name)]
         runtime = tmp
         if self.args.runtime is not None:
             from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
@@ -1591,6 +1601,7 @@ class _Boundary:
             env["CODEX_HOME"] = str(codex_home)
         if self.args.sources_mcp == "opencode":
             env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
+        env.update(self.slot_env)
         if (store := _pre_commit_store(home)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
@@ -1645,6 +1656,8 @@ class _Boundary:
             if not test_slots.enabled():
                 self.receipt["test_slots"] = {"bound": False, "reason": "disabled"}
                 return None
+            settings = {test_slots.ENABLE_ENV: "on", test_slots.COUNT_ENV: str(test_slots.pool_size(os.environ)),
+                        test_slots.WAIT_ENV: f"{test_slots.wait_timeout(os.environ):g}"}
             pool = test_slots._open_pool(os.environ).resolve(strict=True)
         except (test_slots.SlotError, OSError) as exc:
             reason = exc.reason if isinstance(exc, test_slots.SlotError) else type(exc).__name__
@@ -1658,7 +1671,9 @@ class _Boundary:
         if _overlaps(pool, self.worktree) or _overlaps(pool, self.repository) or _under(pool, _MASKED_ROOTS):
             self.receipt["test_slots"] = {"bound": False, "reason": "pool_overlaps_the_view"}
             return None
-        self.receipt["test_slots"] = {"bound": True}
+        # The worker's runs size and wait as the host's do; the pool itself is found by its mount (review F2).
+        self.slot_env = settings
+        self.receipt["test_slots"] = {"bound": True, "pool_size": int(settings[test_slots.COUNT_ENV])}
         return pool, pool
 
     def _claude_login(self, home: Path, repository: Path) -> tuple[tuple[Path, Path] | None, list[Path]]:

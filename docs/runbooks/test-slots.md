@@ -131,9 +131,18 @@ pool lives elsewhere, through `LU_SCRATCH_ROOT` or `LU_TEST_SLOTS_DIR`, gets no 
   `pool_not_at_default_location`, or the refusal reason when the host pool cannot be prepared). Without a bind the run still starts, and its
   governed tests are refused with a typed reason.
 
-The worker holds the same authority over the pool as any host process of this user: it can lock and
-remove pool files. The governor is a shared courtesy among this user's runs, not a security boundary.
-Read-only dispatches get no bind.
+- The worker's runs use the host's pool size, wait limit and switch: the launcher reads
+  `LU_TEST_SLOTS`, `LU_TEST_SLOTS_DIR`, `LU_TEST_SLOTS_COUNT` and `LU_TEST_SLOTS_WAIT_S` from the
+  dispatcher's environment, selects the pool with them, and passes the size, wait and `on` to the
+  worker (never the directory). A selection away from the default location is not bound.
+
+Host runs resolve the pool's `queue` and `holders` directories by name. Inside, the pool and both of
+those directories are mount points, so a worker cannot rename or replace any directory a host run
+passes through (`EBUSY`), and the boundary canary checks this before the provider starts. Every file
+the governor opens in them is opened without following a link. A worker can still lock, create and
+remove pool files, as any host process of this user can, so it can deny or stall other runs' tests
+(for example by holding slots or filling the queue); the governor is a shared courtesy among this
+user's runs, not a security boundary. Read-only dispatches get no bind.
 
 Every hold keeps its slot files locked shared once issued. xdist starts a governed run's workers with
 their inherited descriptors closed, so each worker joins the hold itself and keeps its slots locked until
