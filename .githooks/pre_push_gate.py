@@ -52,7 +52,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-GATE_VERSION = 12  # 12: no test stage; a receipt binds only what the remaining stages read (#11276)
+GATE_VERSION = 13  # 13: a receipt binds the verified agent deploy manifest (machinery#22); 12: no test stage (#11276)
 MAX_CONCURRENT_RUNS_ENV = "LU_PRE_PUSH_GATE_MAX_CONCURRENT_RUNS"
 MEASUREMENT_SCHEMA = "pre-push-measurement.v3"  # v3: no test-stage fields (#11276)
 SCOPE_MEMORY_MAX = 6 * 1024**3
@@ -66,9 +66,19 @@ _MACHINERY = _SCANNER_PACKAGE.partition(".")[0]
 # is never green.
 STAGE_BUDGET_S = 600.0
 RUN_BUDGET_S = 2 * STAGE_BUDGET_S
-# A receipt binds these tool fingerprints. The retained ``pytest`` fingerprint reads installed
+# A receipt binds these tool fingerprints; ``agent_deploy`` is the verified deploy manifest's digest, or
+# ``None`` when no deployed output was exempted (``build_plan``). The retained ``pytest`` fingerprint reads installed
 # package metadata only; it neither imports pytest nor executes tests during a push.
-TOOL_NAMES = ("gate_source", "launcher", "interpreter_resolver", "pre_commit_config", "python", "pytest", "pre_commit")
+TOOL_NAMES = (
+    "gate_source",
+    "launcher",
+    "interpreter_resolver",
+    "pre_commit_config",
+    "python",
+    "pytest",
+    "pre_commit",
+    "agent_deploy",
+)
 CLEANUP_BUDGET_S = 10.0  # after a kill: reaping and the sweep for leftover descendants
 # One predecessor's admission allowance. Gate version 11 held admission through its run budget, a host
 # test-slot wait of one stage allowance, its selector's bound and two cleanups. Checkouts that still run it
@@ -95,19 +105,13 @@ OVERLAY_PATHSPECS = (
     ":(glob)**/setup.cfg",
     ":(glob)**/pyproject.toml",
 )
-# Where scripts/deploy_prompts.sh writes its ignored copies, and the committed trees it copies them from
-# (#12387). A copy byte-identical to the outgoing commit's blob at one of its source paths is fixed by
-# the commit the receipt binds, so it is not an overlay. Keep in parity with the deploy's rsync targets.
-DEPLOYED_COPY_SOURCES = (
-    (".claude/", ("agents_extensions/shared/",)),
-    (".agent/", ("agents_extensions/shared/",)),
-    (".codex/", ("agents_extensions/shared/", "agents_extensions/codex/")),
-    (".agents/", ("agents_extensions/agy/",)),
-    (".agents/skills/", ("agents_extensions/shared/skills/",)),
-    (".gemini/", ("gemini_extensions/",)),
-    (".gemini/skills/", ("agents_extensions/shared/skills/",)),
-    (".gemini/rules/", ("agents_extensions/shared/rules/",)),
-)
+# The provider directories the installed agent deploy (``lu_machinery.agent_deploy``) writes into a
+# consumer checkout (machinery#22). Keep in parity with ``plan.TARGETS`` and the
+# shared ``.agents`` tree. A file there is not an overlay only when the deploy's own
+# ``--check`` verifies it as a current planned output: the release and the committed sources fix its bytes
+# (``verified_deploy_outputs``).
+DEPLOY_ROOTS = (".agent", ".agents", ".claude", ".codex", ".cursor")
+DEPLOY_CHECK_TIMEOUT_S = 120.0
 
 
 class GateOutcome(Exception):
@@ -177,6 +181,17 @@ def git_records(*args: str, cwd: Path) -> list[str] | None:
     if result.returncode != 0 or (output and not output.endswith("\0")):
         return None
     return output.split("\0")[:-1]
+
+
+def worktree_records(*args: str, root: Path) -> list[str] | None:
+    """``git_records`` for a listing of the checkout at ``root`` itself (machinery#22).
+
+    ``--work-tree`` outranks ``core.worktree``, so a setting written while the gate runs cannot point the
+    listing at another directory than the one validated; the untracked cache and file-system monitor are
+    off, so no cached or reported state the checkout's configuration supplies can stand in for the scan.
+    """
+    pins = ("-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false", f"--work-tree={root}")
+    return git_records(*pins, *args, cwd=root)
 
 
 def parse_updates(text: str) -> list[Update]:
@@ -334,81 +349,143 @@ def is_regenerable_dependency_input(path: str, *, root: Path, tracked: set[str])
     return False
 
 
-def deployed_copy_sources(path: str) -> list[str]:
-    """The committed paths ``DEPLOYED_COPY_SOURCES`` says the deploy may have copied ``path`` from."""
-    return [
-        source + path.removeprefix(target)
-        for target, sources in DEPLOYED_COPY_SOURCES
-        if path.startswith(target)
-        for source in sources
-    ]
+def is_deploy_output(path: str) -> bool:
+    return path.split("/", 1)[0] in DEPLOY_ROOTS
 
 
-def blob_id(data: bytes, object_format: str) -> str:
-    """Git's object id for a blob holding ``data``, in the repository's object format."""
-    return hashlib.new(object_format, b"blob %d\0" % len(data) + data).hexdigest()
-
-
-def committed_deployed_copies(paths: list[str], *, root: Path) -> set[str]:
-    """The ``paths`` that are regular files byte-identical to HEAD's blob at a deploy source path.
-
-    Anything Git cannot answer, a symlink or other non-regular leaf, or a mismatch stays an overlay.
-    """
-    sources = {path: deployed_copy_sources(path) for path in paths}
-    wanted = sorted({source for listed in sources.values() for source in listed})
-    if not wanted:
-        return set()
-    object_format = (git_ok("rev-parse", "--show-object-format", cwd=root) or "").strip()
-    records = git_records("--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", *wanted, cwd=root)
-    if object_format not in ("sha1", "sha256") or records is None:
-        return set()
-    blobs: dict[str, str] = {}
-    for record in records:
-        meta, _, name = record.partition("\t")
-        fields = meta.split(" ")
-        if len(fields) == 3 and fields[1] == "blob" and fields[0] in ("100644", "100755"):
-            blobs[name] = fields[2]
-    proven = set()
-    for path, listed in sources.items():
-        try:
-            descriptor = os.open(root / path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
-            continue
+def regular_file(path: Path) -> tuple[bytes, int] | None:
+    """``(bytes, permission bits)`` of a regular file; ``None`` for a final symlink, special file or error."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
         with os.fdopen(descriptor, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                continue
-            digest = blob_id(handle.read(), object_format)
-        if any(blobs.get(source) == digest for source in listed):
+            status = os.fstat(handle.fileno())
+            return (handle.read(), stat.S_IMODE(status.st_mode)) if stat.S_ISREG(status.st_mode) else None
+    except OSError:
+        return None
+
+
+def checked_deploy_manifest(root: Path, head: str) -> tuple[bytes | None, str]:
+    """``(manifest, why not)``: the ownership manifest the installed deploy's check composed from ``head``.
+
+    The check runs in this interpreter (the project interpreter that runs the gate), isolated (``-I``:
+    no checkout directory, ``PYTHONPATH`` or user site on its import path). ``--inputs-commit`` makes it
+    read the descriptor and product sources from the outgoing commit's objects, which no write to the
+    checkout can change while it runs; with the installed release that fixes the plan. It verifies every
+    planned output and the checkout's manifest against that plan, writes nothing, and prints the plan's
+    manifest. The gate never reads the checkout's manifest file itself.
+    """
+    command = [
+        sys.executable,
+        "-I",
+        "-m",
+        f"{_MACHINERY}.agent_deploy",
+        "--project-root",
+        str(root),
+        "--check",
+        "--print-manifest",
+        "--inputs-commit",
+        head,
+    ]
+    try:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        result = subprocess.run(  # fixed argv, no shell: this interpreter and the installed deploy's check
+            command, capture_output=True, check=False, cwd=root, env=clean_environment(), timeout=DEPLOY_CHECK_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, f"the deploy check could not run ({type(error).__name__})"
+    if result.returncode != 0:
+        text = result.stderr.decode("utf-8", "replace").strip() or result.stdout.decode("utf-8", "replace").strip()
+        last = text.splitlines()[-1:] or [""]
+        return None, f"the deploy check exited {result.returncode}: {last[0][:300]}"
+    return result.stdout, ""
+
+
+def manifest_records(manifest: bytes) -> dict[str, dict[str, object]] | None:
+    """The file records of a manifest, each with a text ``sha256``, an integer ``mode`` and an owner."""
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate JSON member")
+        return dict(pairs)
+
+    try:
+        files = json.loads(manifest, object_pairs_hook=unique).get("files")
+    except (ValueError, UnicodeError, AttributeError):
+        return None
+    if not isinstance(files, dict):
+        return None
+    for record in files.values():
+        if not (
+            isinstance(record, dict)
+            and isinstance(record.get("sha256"), str)
+            and type(record.get("mode")) is int
+            and record.get("owner") in ("fleet", "product")
+            and isinstance(record.get("source"), str)
+        ):
+            return None
+    return files
+
+
+def verified_deploy_outputs(paths: list[str], *, root: Path, head: str) -> tuple[set[str], str | None, str]:
+    """``(proven, manifest digest, why not)``: the ``paths`` the installed deploy verifies as its outputs.
+
+    A path is proven only when the check of the plan composed from ``head`` passes and the path is a
+    regular file (no final symlink) whose SHA-256 and mode equal its record in the manifest the check
+    printed. A check that fails or cannot run, or a manifest without valid records, proves nothing, and
+    the reason says which.
+    """
+    if not any(is_deploy_output(path) for path in paths):
+        return set(), None, ""
+    manifest, unverified = checked_deploy_manifest(root, head)
+    if manifest is None:
+        return set(), None, unverified
+    records = manifest_records(manifest)
+    if records is None:
+        return set(), None, "the deploy check printed no valid ownership manifest"
+    proven = set()
+    for path in paths:
+        record = records.get(path) if is_deploy_output(path) else None
+        found = regular_file(root / path) if record is not None else None
+        if found is not None and (hashlib.sha256(found[0]).hexdigest(), found[1]) == (record["sha256"], record["mode"]):
             proven.add(path)
-    return proven
+    return proven, hashlib.sha256(manifest).hexdigest(), ""
 
 
-def reject_untracked_inputs(root: Path) -> None:
+def reject_untracked_inputs(root: Path, head: str | None = None) -> str | None:
     """Refuse when untracked or ignored Python/config files could change the run but not the receipt.
 
-    Two derived sets are not overlays: dependency directories proven by their lockfile, and copies the
-    deploy wrote that are byte-identical to the outgoing commit's sources (#12387).
+    Two derived sets are not overlays: dependency directories proven by their lockfile, and current
+    outputs of the installed agent deploy that its own check verifies against the plan of the outgoing
+    commit ``head`` (default: ``HEAD``; machinery#22). Returns the digest of the verified deploy
+    manifest when that set was used, for the receipt, else ``None``.
     """
-    # Names stay byte for byte (``git_records``): a text-mode read turns CR and CRLF into LF, so the
-    # deployed-copy proof would hash a different, committed-identical file than the one Git listed.
-    listing = git_records("ls-files", "-z", "--others", "--", *OVERLAY_PATHSPECS, cwd=root)
+    # Names stay byte for byte (``git_records``): a text-mode read turns CR and CRLF into LF, so a
+    # deployed output would be looked up under, and hashed from, another name than the one Git listed.
+    listing = worktree_records("ls-files", "-z", "--others", "--", *OVERLAY_PATHSPECS, root=root)
     if listing is None:
         raise GateOutcome("state_unavailable", "cannot list untracked validation inputs", incomplete=True)
     candidates = [path for path in listing if path]
     tracked: set[str] = set()
     if any("node_modules" in Path(path).parts for path in candidates):
-        tracked_listing = git_records("ls-files", "-z", "--cached", cwd=root)
+        tracked_listing = worktree_records("ls-files", "-z", "--cached", root=root)
         if tracked_listing is None:
             raise GateOutcome("state_unavailable", "cannot list tracked dependency inputs", incomplete=True)
         tracked = set(tracked_listing)
     overlays = [path for path in candidates if not is_regenerable_dependency_input(path, root=root, tracked=tracked)]
-    copies = committed_deployed_copies(overlays, root=root)
-    overlays = sorted(path for path in overlays if path not in copies)
+    if head is None and any(is_deploy_output(path) for path in overlays):
+        head = (git_ok("rev-parse", "--verify", "HEAD^{commit}", cwd=root) or "").strip()
+    outputs, manifest, unverified = verified_deploy_outputs(overlays, root=root, head=head or "")
+    overlays = sorted(path for path in overlays if path not in outputs)
     if overlays:
         shown = ", ".join(overlays[:10]) + (f" (+{len(overlays) - 10} more)" if len(overlays) > 10 else "")
         stale = (
-            "Deployed agent copies must match the commit: rerun `npm run agents:deploy` after committing. "
-            if any(deployed_copy_sources(path) for path in overlays)
+            "Files under the agent provider directories must be current outputs the installed agent deploy "
+            f"verifies{f' ({unverified})' if unverified else ''}: commit the agent extension sources, rerun "
+            f"`{_MACHINERY}.agent_deploy`, then push. "
+            if any(is_deploy_output(path) for path in overlays)
             else ""
         )
         raise GateOutcome(
@@ -417,6 +494,7 @@ def reject_untracked_inputs(root: Path) -> None:
             f"commit them or remove them first. {stale}"
             "For agent task artifacts, use the preserved task evidence directory ($LU_TASK_EVIDENCE_DIR).",
         )
+    return manifest if outputs else None
 
 
 def build_plan(update: Update, root: Path, launcher: str, config: str) -> Plan | None:
@@ -427,15 +505,19 @@ def build_plan(update: Update, root: Path, launcher: str, config: str) -> Plan |
             f"{update.local_ref} ({update.local_sha[:12]}) is not the checked-out HEAD ({head[:12] or 'unknown'}); "
             "push from the worktree that has the commit checked out so the exact commit is the one validated",
         )
-    dirty = git_records("status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", cwd=root)
+    dirty = worktree_records(
+        "status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", root=root
+    )
     if dirty is None or dirty:
         raise GateOutcome("dirty_tree", "tracked files differ from the outgoing commit; commit or restore them first")
-    reject_untracked_inputs(root)
+    deploy_manifest = reject_untracked_inputs(root, head)
     base, base_fallback = outgoing_base(update, root)
     if base == head and base_fallback is None:  # only a remote tip equal to the head is nothing outgoing
         return None
     tree = (git_ok("rev-parse", f"{head}^{{tree}}", cwd=root) or "").strip()
-    return Plan(head, tree, base, base_fallback=base_fallback, tools=tool_versions(launcher, config))
+    # The verified deploy manifest binds the release-owned outputs the commit alone does not fix.
+    tools = {**tool_versions(launcher, config), "agent_deploy": deploy_manifest}
+    return Plan(head, tree, base, base_fallback=base_fallback, tools=tools)
 
 
 def tool_versions(launcher: str, config: str) -> dict[str, str | None]:
