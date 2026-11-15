@@ -428,11 +428,6 @@
       "message": "Need type annotation for \"supported\""
     },
     {
-      "path": "lu_machinery/agent_runtime/livenessprobe.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bool\""
-    },
-    {
       "path": "lu_machinery/agent_runtime/model_pause.py",
       "code": "arg-type",
       "message": "Argument 1 to \"get\" of \"dict\" has incompatible type \"Any | None\"; expected \"str\""

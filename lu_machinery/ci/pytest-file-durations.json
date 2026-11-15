@@ -80,7 +80,6 @@
   "tests/agent_runtime/test_jsonl_lines.py": 0.896,
   "tests/agent_runtime/test_lane_probe.py": 3.282,
   "tests/agent_runtime/test_lane_runtime_usage.py": 0.626,
-  "tests/agent_runtime/test_livenessprobe.py": 0.821,
   "tests/agent_runtime/test_model_pause.py": 1.805,
   "tests/agent_runtime/test_primary_tree_watch.py": 3.027,
   "tests/agent_runtime/test_provider_diagnostic_regressions.py": 23.271,
