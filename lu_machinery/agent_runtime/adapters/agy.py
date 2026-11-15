@@ -759,12 +759,26 @@ _AGY_ARGON_SLUGS: tuple[str, ...] = (
     "gemini-4-argon-medium",
     "gemini-4-argon-low",
 )
+# The catalog's Gemini 4 work routes (#586): wire id plus runtime ids, one per AGY selector.
+_AGY_CARBON_SLUGS: tuple[str, ...] = (
+    "gemini-4-carbon-high",
+    "gemini-4-carbon-medium",
+    "gemini-4-carbon-low",
+)
+_AGY_HYDROGEN_SLUGS: tuple[str, ...] = (
+    "gemini-4-hydrogen-xhigh",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-low",
+)
 _AGY_GENERAL_MODEL_SLUGS: tuple[str, ...] = (
     "gemini-3.8-flash-high",
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-low",
     "gemini-3.1-pro-high",
     "gemini-3.1-pro-low",
+    *_AGY_CARBON_SLUGS,
+    *_AGY_HYDROGEN_SLUGS,
     *_AGY_ARGON_SLUGS,
 )
 _AGY_MODEL_SLUGS: tuple[str, ...] = (

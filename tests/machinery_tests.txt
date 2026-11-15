@@ -43,7 +43,6 @@ tests/repo_contracts/test_git_identity.py
 tests/repo_contracts/test_guard_admin_merge.py
 tests/repo_contracts/test_guard_branch_switch_in_main.py
 tests/repo_contracts/test_launcher_sandbox_closure.py
-tests/repo_contracts/test_migrate_to_html.py
 tests/repo_contracts/test_red_ci_registry_file.py
 tests/repo_contracts/test_secret_redactor_urls.py
 tests/repo_contracts/test_shell_shlex.py
@@ -160,7 +159,6 @@ tests/agents_extensions/test_gemini_lane_canary.py
 tests/agents_extensions/test_github_client_lint.py
 tests/agents_extensions/test_guard_benign_corpus.py
 tests/agents_extensions/test_guard_secret_print.py
-tests/agents_extensions/test_gui_session_lease.py
 tests/agents_extensions/test_hook_tool_names.py
 tests/agents_extensions/test_hooks_executable.py
 tests/agents_extensions/test_operator_contract_wiring.py
@@ -388,7 +386,6 @@ tests/curriculum/test_claude_account_route_key.py
 tests/curriculum/test_delegate_check_budget.py
 tests/dispatcher/test_snapshot_hidden_changes.py
 tests/driver_blockers/test_driver_blockers.py
-tests/evidence/test_agent_pitfall_census.py
 tests/fleet/test_capacity_pick.py
 tests/fleet/test_capacity_pick_resource_policy.py
 tests/fleet/test_capacity_pick_root.py

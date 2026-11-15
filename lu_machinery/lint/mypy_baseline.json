@@ -3213,26 +3213,6 @@
       "message": "Need type annotation for \"reasons\""
     },
     {
-      "path": "lu_machinery/ci/delivery_baseline.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"append\" of \"list\" has incompatible type \"None\"; expected \"float\""
-    },
-    {
-      "path": "lu_machinery/ci/delivery_baseline.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"get\" of \"dict\" has incompatible type \"tuple[Any | None, Any | None]\"; expected \"tuple[str, str]\""
-    },
-    {
-      "path": "lu_machinery/ci/delivery_baseline.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"str\")"
-    },
-    {
-      "path": "lu_machinery/ci/delivery_baseline.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"durations\" (hint: \"durations: list[<type>] = ...\")"
-    },
-    {
       "path": "lu_machinery/ci/flake_ledger.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
@@ -6756,26 +6736,6 @@
       "path": "lu_machinery/lint/lint_test_assertions.py",
       "code": "union-attr",
       "message": "Item \"With\" of \"AsyncFor | AsyncWith | For | If | While | With\" has no attribute \"orelse\""
-    },
-    {
-      "path": "lu_machinery/ops/budget_screen.py",
-      "code": "misc",
-      "message": "Generator has incompatible item type \"tuple[str, str, None]\"; expected \"tuple[str, str, Pool]\""
-    },
-    {
-      "path": "lu_machinery/ops/budget_screen.py",
-      "code": "operator",
-      "message": "Unsupported operand types for / (\"None\" and \"float\")"
-    },
-    {
-      "path": "lu_machinery/ops/budget_screen.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"counts\""
-    },
-    {
-      "path": "lu_machinery/ops/budget_screen.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"samples\" (hint: \"samples: dict[<type>, <type>] = ...\")"
     },
     {
       "path": "lu_machinery/ops/context_cost_report.py",
