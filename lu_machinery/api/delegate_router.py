@@ -144,8 +144,9 @@ def _task_state_path(task_id: str, ctx: MonitorContext | None = None, *, archive
 
 def _read_task_state(
     path: str, ctx: MonitorContext | None = None, *, tasks_dir: Path | None = None,
+    raise_read_errors: bool = False,
 ) -> dict[str, Any] | None:
-    """Read task JSON only after a local containment check (CodeQL sink guard)."""
+    """Read contained task JSON; scans can distinguish retryable I/O from invalid content."""
     root = os.path.realpath(tasks_dir) if tasks_dir is not None else _tasks_root(ctx)
     fullpath = os.path.realpath(path)
     if not fullpath.startswith(root + os.sep):
@@ -154,8 +155,10 @@ def _read_task_state(
         try:
             with open(fullpath, encoding="utf-8") as handle:
                 data = parse_task_record(Path(path), handle.read().encode("utf-8"), display_unknown_schema=True)
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
             if attempt + 1 == TASK_READ_RETRIES:
+                if raise_read_errors and isinstance(exc, OSError):
+                    raise
                 return None
             time.sleep(TASK_READ_RETRY_SECONDS)
             continue
@@ -655,13 +658,19 @@ def _delegate_task_rows_locked(
                 if not alive:
                     derived_status = "zombie"
         else:
-            task = (
-                _read_task_state(path_str, resolved)
-                if persist_cache else _read_task_state(path_str, resolved, tasks_dir=tasks_dir)
-            )
+            try:
+                task = _read_task_state(
+                    path_str, resolved, tasks_dir=None if persist_cache else tasks_dir, raise_read_errors=True,
+                )
+            except OSError:
+                # An I/O failure can recover without changing file metadata.
+                # Do not turn it into an indefinitely cached absence.
+                continue
             if task is None:
-                if not persist_cache:
-                    task_cache[path_str] = (fingerprint, None, "", False, None, None)
+                # Foreign or damaged records are misses too. Otherwise every
+                # projection repeats their reads, parsing and retry sleeps while
+                # holding the shared scan lock. A changed fingerprint retries.
+                task_cache[path_str] = (fingerprint, None, "", False, None, None)
                 continue
             derived_status, alive = _derived_task_status(task)
             claimed_repo = _authoritative_task_repository(task)

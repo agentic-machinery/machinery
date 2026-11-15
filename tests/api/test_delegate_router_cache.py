@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from builtins import open as builtin_open
 
 import pytest
 from fastapi import FastAPI
@@ -12,6 +13,83 @@ from fastapi.testclient import TestClient
 
 from lu_machinery.api import delegate_router, state_router
 from lu_machinery.api.monitor_context import fixture_context
+
+
+def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path, monkeypatch):
+    """Defect class: malformed records repeat retry sleeps on every projection."""
+    monkeypatch.setattr(delegate_router, "_TASK_STATE_CACHE", {})
+    monkeypatch.setattr(delegate_router, "_LAST_TASKS_DIR_STR", "")
+    ctx = fixture_context(tmp_path)
+    tasks = ctx.roots.batch_state_dir / "tasks"
+    tasks.mkdir(parents=True)
+    valid = tasks / "valid.json"
+    broken = tasks / "broken.json"
+    valid.write_text(json.dumps({"schema_version": 2, "task_id": "valid", "status": "done"}))
+    broken.write_text("{")
+    reads = []
+    original = delegate_router._read_task_state
+
+    def read(*args, **kwargs):
+        reads.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(delegate_router, "_read_task_state", read)
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
+    assert set(reads) == {str(valid), str(broken)}
+    reads.clear()
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
+    assert delegate_router.active_delegate_tasks(ctx=ctx)["total"] == 0
+    assert reads == []
+
+    before = broken.stat()
+    broken.write_text(json.dumps({"schema_version": 2, "task_id": "broken", "status": "spawning"}))
+    os.utime(broken, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert delegate_router.active_delegate_tasks(ctx=ctx)["total"] == 1
+    assert reads == [str(broken)]
+
+    # Transient I/O errors can recover without a metadata change; they must
+    # remain retryable rather than becoming cached absent records.
+    delegate_router._TASK_STATE_CACHE.pop(str(valid))
+    failures = []
+
+    def flaky_open(path, *args, **kwargs):
+        if path == str(valid) and len(failures) < delegate_router.TASK_READ_RETRIES:
+            failures.append(path)
+            raise OSError("temporary read failure")
+        return builtin_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(delegate_router, "open", flaky_open, raising=False)
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
+    assert str(valid) not in delegate_router._TASK_STATE_CACHE
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 2
+    valid.unlink()
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
+    assert str(valid) not in delegate_router._TASK_STATE_CACHE
+
+
+def test_unchanged_foreign_files_are_not_reparsed_or_rewarned(tmp_path, monkeypatch, caplog):
+    """Defect class: repeated foreign-file reads keep scans and warning floods hot."""
+    from lu_machinery.orchestration import task_record_store
+
+    monkeypatch.setattr(delegate_router, "_TASK_STATE_CACHE", {})
+    monkeypatch.setattr(delegate_router, "_LAST_TASKS_DIR_STR", "")
+    # Force warning dedup eviction between scans: the scan cache must avoid
+    # reading foreign files independently of the logger's bounded set.
+    monkeypatch.setattr(task_record_store, "_REPORTED_FOREIGN", set())
+    ctx = fixture_context(tmp_path)
+    tasks = ctx.roots.batch_state_dir / "tasks"
+    tasks.mkdir(parents=True)
+    foreign = tasks / "receipt.json"
+    foreign.write_text('{"schema": "receipt.v1"}')
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 0
+    assert len([r for r in caplog.records if "NON_RECORD_FILE" in r.message]) == 1
+    task_record_store._REPORTED_FOREIGN.clear()
+    caplog.clear()
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 0
+    assert not [r for r in caplog.records if "NON_RECORD_FILE" in r.message]
+    foreign.write_text('{"schema": "receipt.v2", "changed": true}')
+    assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 0
+    assert len([r for r in caplog.records if "NON_RECORD_FILE" in r.message]) == 1
 
 
 @pytest.mark.parametrize("pid", ["unknown", "²", 2**64, -1, True, {}])

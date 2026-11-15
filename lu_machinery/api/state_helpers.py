@@ -83,21 +83,26 @@ class PeriodicSnapshot[T]:
 
     @asynccontextmanager
     async def lifespan(self):
-        try:
-            await self._refresh()
-        except Exception:
-            _cache_log.warning("initial snapshot refresh failed", exc_info=True)
+        ready = asyncio.Event()
 
         async def repeat() -> None:
             while True:
-                await asyncio.sleep(self.interval)
                 try:
                     await self._refresh()
                 except Exception:
-                    _cache_log.warning("periodic snapshot refresh failed", exc_info=True)
+                    _cache_log.warning("snapshot refresh failed", exc_info=True)
+                finally:
+                    ready.set()
+                await asyncio.sleep(self.interval)
 
         task = asyncio.create_task(repeat(), name="monitor-snapshot-refresh")
         try:
+            # Usually fixtures/small stores are ready immediately. A cold task
+            # scan must not hold ASGI startup (and every unrelated panel) hostage.
+            # Keep the same single writer running; read() supplies the existing
+            # typed 503 + Retry-After until its first observation is available.
+            with suppress(TimeoutError):
+                await asyncio.wait_for(ready.wait(), timeout=0.1)
             yield
         finally:
             task.cancel()
