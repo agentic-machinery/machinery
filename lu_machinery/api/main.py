@@ -76,6 +76,8 @@ from .git_hygiene_router import warm_pull_requests
 from .issues_router import router as issues_router
 from .knowledge_router import router as knowledge_router
 from .milestones_router import router as milestones_router
+from .model_stats_router import ModelStatsCollector
+from .model_stats_router import router as model_stats_router
 from .monitor_context import MonitorContext, get_ctx, production_context, resolve_context
 from .observer_presence import router as observer_presence_router
 from .occupancy import router as occupancy_router
@@ -1823,6 +1825,8 @@ class PrometheusMetricsMiddleware:
         registry = CollectorRegistry()
         if context is not None:
             registry.register(CommsCollector(context))
+            # Per-model value gauges from the model-stats snapshot (#581); Grafana's contract is its runbook.
+            registry.register(ModelStatsCollector(context))
         self.app = app
         self._requests = Counter(
             "monitor_http_requests_total",
@@ -1941,6 +1945,7 @@ def create_app(
     factory_app.include_router(fleet_router, prefix="/api/fleet", tags=["fleet"])
     factory_app.include_router(project_state_router, prefix="/api/fleet", tags=["fleet"])
     factory_app.include_router(fleet_workers_router, prefix="/api/fleet", tags=["fleet"])
+    factory_app.include_router(model_stats_router, prefix="/api/fleet/model-stats", tags=["fleet"])
     factory_app.include_router(session_streams_router, prefix="/api/session-streams", tags=["session-streams"])
     factory_app.include_router(coordination_router, prefix="/api/coordination")
     factory_app.include_router(cluster_router, prefix="/api/cluster", tags=["cluster"])
