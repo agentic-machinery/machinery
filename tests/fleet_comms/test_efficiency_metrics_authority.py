@@ -106,6 +106,24 @@ def _seed_authority_plane(root: Path) -> Path:
           updated_at TEXT NOT NULL,
           completed_at TEXT
         );
+        -- Every pg store has comms_messages (pg migration v2) before the
+        -- authority tables (v3); the pg metrics reader fails closed without it.
+        CREATE TABLE comms_messages (
+          message_id TEXT PRIMARY KEY,
+          conversation_id TEXT NOT NULL,
+          in_reply_to TEXT,
+          kind TEXT NOT NULL,
+          sender TEXT NOT NULL,
+          recipient TEXT,
+          body_inline TEXT,
+          body_artifact_id TEXT,
+          content_sha256 TEXT,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL
+        );
+        INSERT INTO comms_messages VALUES
+          ('auth-m1','conv1',NULL,'request','codex','claude',NULL,NULL,NULL,'{}',
+           '2026-08-01T12:00:00Z');
         INSERT INTO authority_deliveries VALUES
           ('auth-d1','auth-m1','claude','queued',NULL,NULL,NULL,0,0,NULL,NULL,
            '2026-08-01T12:00:00Z','2026-08-01T12:00:00Z',NULL),
