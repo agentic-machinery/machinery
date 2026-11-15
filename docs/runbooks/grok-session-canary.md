@@ -51,8 +51,6 @@ After every compact (including when canary still PASSes):
 3. Open the active phase receipt named there
 4. If open task is missing from dual-write → **STOP inventing** — stamp or hand off
 
-Thread rollover confirmation uses the exact replacement binding and lease. Read the durable handoff and follow `thread-rollover/references/resume.md`; no snapshot quiz is required.
-
 ## Handoff = DIARY (required)
 
 The dual-write board under `.claude/<epic>-epic/*-DRIVER-HANDOFF.md` is a **diary**, not a one-shot close note.
@@ -179,4 +177,3 @@ The launcher owns lease open/close for Grok. The agent never opens, claims, rene
 - `lu_machinery/session_canary/diary.py` — stamp / handback / hydrate capsule helpers
 - `docs/runbooks/epic-stream-handoff.md` — continuity evidence; current launcher-owned lease rules bind
 - `lu_machinery/context_canary.py` — shared mint/score engine
-- `docs/best-practices/codex-thread-handoff.md` — strict rollover canary
