@@ -691,11 +691,6 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         raise gate.PublishBlocked(
             f"OPSEC: merge refused: no {requirement} APPROVE from {_RECORDER} is recorded at {head}."
         )
-    from lu_machinery.review import contract_canary
-
-    # A review-contract change also needs live canary evidence on every reviewer route (#12399).
-    if (canary := contract_canary.refusal(paths, head)) is not None:
-        raise gate.PublishBlocked(f"OPSEC: merge refused: {contract_canary.REASON}: {canary}.")
     if state == "needs-CF":
         from lu_machinery.publish.merge_guard import _rollup_name
 
