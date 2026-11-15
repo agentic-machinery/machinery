@@ -208,6 +208,10 @@ _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor
 # Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
 _CURSOR_SOURCES_SERVER = "sources-relay"
+# A read-only Cursor run's permission profile (``providers.cursor.read_only_cli_config``): Cursor reads per-command
+# rules only from this file, so it is written in the boundary directory and bound read-only at its path below HOME.
+_CURSOR_CLI_CONFIG = "cursor-cli-config.json"
+_CURSOR_CLI_CONFIG_HOME = ".cursor/cli-config.json"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
                     "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300,
                     "budget-check": 300, "review-wait": 900}
@@ -378,7 +382,7 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         # The selected account's login: the only thing the task-local CODEX_HOME takes from the real one.
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
-    if spec.agent in _SOURCES_MCP_HOME and spec.mode == "workspace-write":
+    if spec.agent in _SOURCES_MCP_HOME and (spec.mode == "workspace-write" or spec.agent == "cursor"):
         argv += ["--sources-mcp", spec.agent]
     if spec.mode == "workspace-write" and spec.options.get("branch"):
         # The PR branch a continuation (``dispatch --branch``, recorded as ``publish_branch``) publishes to (#557).
@@ -1715,6 +1719,9 @@ class _Boundary:
         sources_mcp = self._sources_mcp(boundary, home)
         if sources_mcp is not None:
             restores.append(sources_mcp)
+        cursor_config = self._cursor_permissions(boundary, home)
+        if cursor_config is not None:
+            restores.append(cursor_config)
         login, login_reads = self._claude_login(home, repository)
         restores += [*([login[1]] if login else []), *login_reads]
         masks = [*base_masks, *private]
@@ -1792,6 +1799,8 @@ class _Boundary:
         if sources_mcp is not None and sources_mcp != boundary / _SOURCES_MCP:
             # The provider reads it from HOME; it stays read-only there, as Codex's Sources definition.
             argv += ["--ro-bind", str(boundary / _SOURCES_MCP), str(sources_mcp)]
+        if cursor_config is not None:
+            argv += ["--ro-bind", str(boundary / _CURSOR_CLI_CONFIG), str(cursor_config)]
         # No GitHub credential is readable inside (PUBLISH-CRED-1113): the host login's known stores are empty.
         for path in _github_credential_paths(home):
             if not _hidden(path, masks, restores):
@@ -2029,14 +2038,33 @@ class _Boundary:
         agent = self.args.sources_mcp
         if agent is None:
             return None
-        if self.args.mode != "workspace-write":
-            raise Refused("--sources-mcp projects a write worker's MCP file only")
+        if self.args.mode != "workspace-write" and agent != "cursor":
+            raise Refused("--sources-mcp projects a write worker's MCP file only, or a read-only Cursor run's")
         config = sources_mcp_config(agent).encode()
         _write_private(boundary / _SOURCES_MCP, config, 0o600)
         relative = _SOURCES_MCP_HOME[agent]
         target = home / relative if relative is not None else boundary / _SOURCES_MCP
         self.receipt["sources_mcp"] = {"provider": agent, "config_sha256": hashlib.sha256(config).hexdigest()}
         return target
+
+    def _cursor_permissions(self, boundary: Path, home: Path) -> Path | None:
+        """Write a read-only Cursor run's permission profile and return where Cursor reads it, else None.
+
+        Without the Sources partition no Sources tool is allowed, and Cursor refuses an MCP call no rule allows.
+        """
+        if self.args.mode != "read-only" or self.args.sources_mcp != "cursor":
+            return None
+        from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+        from lu_machinery.dispatcher.providers.cursor import read_only_cli_config
+
+        try:
+            readers, writers = sources_tool_sets()
+        except Exception:  # Sources is optional; the shell rules are not
+            readers, writers = (), ()
+        config = read_only_cli_config(readers, writers).encode()
+        _write_private(boundary / _CURSOR_CLI_CONFIG, config, 0o600)
+        self.receipt["cursor_permissions"] = {"config_sha256": hashlib.sha256(config).hexdigest()}
+        return home / _CURSOR_CLI_CONFIG_HOME
 
     def _probes(self, repository: Path, common: Path, sockets: list[Path], outputs: list[Path], tmp: Path,
                 nonce: str) -> list[dict]:
@@ -2156,6 +2184,9 @@ class _Boundary:
             relative = _SOURCES_MCP_HOME[agent]
             probes.append({"op": "write_open", "path": str(home / relative) if relative else _SOURCES_MCP_INSIDE,
                            "expect_any": ["EROFS"]})
+        if self.args.mode == "read-only" and self.args.sources_mcp == "cursor":
+            # So does a read-only Cursor run's permission profile.
+            probes.append({"op": "write_open", "path": str(home / _CURSOR_CLI_CONFIG_HOME), "expect_any": ["EROFS"]})
         return probes
 
     def _report(self, descriptor: int) -> list | None:

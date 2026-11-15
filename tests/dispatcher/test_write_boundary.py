@@ -345,10 +345,10 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
                       ' && grep -qF \'"/run/lu-write-boundary/sources-stdio.py", "/run/lu-write-boundary/sources.sock"]\''
                       ' "$CODEX_HOME/config.toml"')
         refreshed = '"$CODEX_HOME/auth.json"'  # a refresh through the link lands in the selected login
-    # An AGY, Cursor or OpenCode write worker reads one task-local MCP file naming only the Sources relay, never the
-    # host's own (planted here with a foreign server), and cannot rewrite it.
+    # An AGY, Cursor or OpenCode write worker, and a read-only Cursor run, reads one task-local MCP file naming only
+    # the Sources relay, never the host's own (planted here with a foreign server), and cannot rewrite it.
     sources_mcp = {"agy": "$HOME/.gemini/config/mcp_config.json", "cursor": "$HOME/.cursor/mcp.json",
-                   "opencode": '"$OPENCODE_CONFIG"'}.get(route) if mode == "workspace-write" else None
+                   "opencode": '"$OPENCODE_CONFIG"'}.get(route) if mode == "workspace-write" or route == "cursor" else None
     if sources_mcp is not None:
         for planted in (".gemini/config/mcp_config.json", ".cursor/mcp.json", ".config/opencode/opencode.json"):
             (home / planted).parent.mkdir(parents=True, exist_ok=True)
@@ -358,6 +358,9 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
                        else ' && test -z "$OPENCODE_CONFIG"')
                       + f" && grep -qF '\"/run/lu-write-boundary/sources.sock\"' {sources_mcp}"
                       + f" && ! grep -q foreign {sources_mcp} && ! (echo planted >> {sources_mcp}) 2>/dev/null")
+        if mode == "read-only":  # with its permission profile, read-only too
+            home_check += (" && grep -qF 'Shell(git:push*)' $HOME/.cursor/cli-config.json"
+                           " && ! (echo planted >> $HOME/.cursor/cli-config.json) 2>/dev/null")
     probe, report = tmp_path / "probe.py", tmp_path / "cells.json"
     probe.write_text(_CREDENTIAL_PROBE)
     code = write_boundary.main([
@@ -399,6 +402,7 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
         (server,) = servers.values()
         command = write_boundary.sources_command()
         assert ([*server["command"]] if route == "opencode" else [server["command"], *server["args"]]) == command
+        assert ("cursor_permissions" in result) == (mode == "read-only")
     else:
         assert "sources_mcp" not in result
 

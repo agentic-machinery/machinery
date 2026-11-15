@@ -318,7 +318,8 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
             )
         expected += ["--disallowedTools", denies]
     elif provider == "cursor":
-        expected += ["--mode", "ask"] if mode == "read-only" else ["--approve-mcps", "--sandbox", "disabled", "--force"]
+        expected += (["--disable-project-configs", "--approve-mcps"] if mode == "read-only"
+                     else ["--approve-mcps", "--sandbox", "disabled", "--force"])
     else:
         expected += ["--dangerously-skip-permissions"]
         expected += ["--print-timeout", "7260s", "--add-dir", str(worktree),

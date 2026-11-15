@@ -431,3 +431,54 @@ def test_muse_provider_cannot_bypass_file_sandbox(tmp_path, monkeypatch):
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+def _cursor_shell_rule_matches(rule, command):
+    """Cursor's own Shell(...) matcher (cursor-agent 2026.11.13 ``matchesShell``): ``*`` is any text, anchored."""
+    import re
+
+    def glob(pattern, text):
+        return re.fullmatch(re.escape(pattern.strip()).replace(r"\*", ".*"), text) is not None
+
+    inner = rule.removeprefix("Shell(").removesuffix(")").strip()
+    base, _, rest = command.strip().partition(" ")
+    if ":" in inner:
+        executable, _, arguments = inner.partition(":")
+        if (glob(executable, base) or glob(executable, command)) and glob(arguments, rest.strip()):
+            return True
+    return glob(inner, command) or command.startswith(f"{inner} ") or glob(inner, base) or base == inner
+
+
+def _cursor_read_only_profile(tmp_path):
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("review\n", encoding="utf-8")
+    spec = TaskSpec("cursor-ro", "cursor", "grok-4.7-high", None, "read-only", tmp_path, prompt, tmp_path / "final")
+    argv = cursor.build(spec, {}).argv
+    permissions = json.loads(cursor.read_only_cli_config(("verify_word",), ("cache_entry",)))["permissions"]
+    shell = {kind: [rule for rule in permissions[kind] if rule.startswith("Shell(")] for kind in ("allow", "deny")}
+    return argv, permissions, shell
+
+
+@pytest.mark.parametrize("command", [
+    "git diff --stat origin/main...HEAD", "git show HEAD:README.md", "sha256sum README.md", "date -u",
+    "gh pr checks 612", "gh pr view 612 --json headRefOid",
+])
+def test_cursor_read_only_runs_the_read_only_shell_commands_ask_mode_refused(tmp_path, command):
+    """Defect class: read-only Cursor refuses every shell command, so a Grok review cannot read the diff."""
+    argv, permissions, shell = _cursor_read_only_profile(tmp_path)
+    assert "--mode" not in argv and "--disable-project-configs" in argv
+    assert any(_cursor_shell_rule_matches(rule, command) for rule in shell["allow"])
+    assert not any(_cursor_shell_rule_matches(rule, command) for rule in shell["deny"])
+    assert "Mcp(sources-relay:verify_word)" in permissions["allow"]
+
+
+@pytest.mark.parametrize("command", [
+    "git push origin HEAD:main", "git commit -m x", "git branch -D main", "gh pr merge 612 --squash",
+    "gh pr comment 612 --body x", "gh api -X POST repos/o/r/issues", "gh workflow run ci.yml",
+])
+def test_cursor_read_only_still_refuses_writes_and_publishing(tmp_path, command):
+    """Defect class: opening the shell to a read-only Cursor run also lets it push, publish or write files."""
+    argv, permissions, shell = _cursor_read_only_profile(tmp_path)
+    assert "--force" not in argv and "--yolo" not in argv and "--sandbox" not in argv
+    assert any(_cursor_shell_rule_matches(rule, command) for rule in shell["deny"])
+    assert "Write(*)" in permissions["deny"] and "Mcp(sources-relay:cache_entry)" in permissions["deny"]
