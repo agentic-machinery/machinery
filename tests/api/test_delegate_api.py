@@ -815,7 +815,7 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
 
     try:
         with TestClient(cold_app) as running:
-            assert entered.is_set()
+            assert entered.wait(5)
             assert not release.is_set()
             with pytest.raises(HTTPException) as pending:
                 cold.read()
