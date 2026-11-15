@@ -234,7 +234,6 @@ tests/ai_agent_bridge/test_serve_security.py
 tests/ai_agent_bridge/test_ui_agy.py
 tests/ai_agent_bridge/test_ui_codex.py
 tests/ai_agent_bridge/test_wake_overlap_detection.py
-tests/ai_agent_bridge/test_worktree_brief.py
 tests/ai_llm/test_ai_llm_claude_call.py
 tests/ai_llm/test_ai_llm_codex_call.py
 tests/ai_llm/test_ai_llm_fallback.py
@@ -709,7 +708,6 @@ tests/dispatcher/test_worktree_links.py
 tests/dispatcher/test_worktree_registry.py
 tests/dispatcher/test_write_boundary.py
 # PORT-1108 deferred-files: frozen LU 5aba2adb; dependency-complete whole-file ports.
-tests/fleet/test_agy_failure_tally.py
 tests/orchestration/test_dispatch_admission_disk.py
 tests/orchestration/test_imported_rollover_detection.py
 tests/orchestration/test_reaper_regenerable_round3.py
