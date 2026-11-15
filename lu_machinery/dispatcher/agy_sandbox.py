@@ -554,6 +554,7 @@ class SourcesRelay:
         self.completed = self.failed = 0
         self.tools: dict[str, int] = {}
         self.refused: dict[str, int] = {}  # by method, or by tool for a refused call
+        self.start_failures: list[dict] = []
         self.lock = threading.Lock()
         self.stopped = False
         self.processes: list[subprocess.Popen] = []
@@ -572,7 +573,7 @@ class SourcesRelay:
     def evidence(self) -> dict:
         with self.lock:
             return {"completed": self.completed, "failed": self.failed, "tools": dict(sorted(self.tools.items())),
-                    "refused": dict(sorted(self.refused.items()))}
+                    "refused": dict(sorted(self.refused.items())), "start_failures": list(self.start_failures)}
 
     def _accept(self) -> None:
         while not self.stopped:
@@ -593,8 +594,24 @@ class SourcesRelay:
                 return
             # Same process group as the launcher, so a killed task takes its servers with it.
             process = subprocess.Popen(self.server, cwd=product_root(), env=self.env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.processes.append(process)
+        # Drain all stderr without retaining unbounded output or blocking the server on a full pipe.
+        first_error: list[str] = []
+
+        def drain_stderr() -> None:
+            from lu_machinery.secret_redactor import redact_text
+
+            with process.stderr:
+                line = process.stderr.readline(_MAX_LINE)
+                if line:
+                    first_error.append(redact_text(line.decode("utf-8", "replace").rstrip()))
+                while process.stderr.read(65536):
+                    pass
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+        served = False
         pending: dict[str, tuple[str, str | None]] = {}
         pending_lock, send_lock = threading.Lock(), threading.Lock()
 
@@ -630,16 +647,28 @@ class SourcesRelay:
                 except ValueError:
                     continue
                 if isinstance(message, dict) and (message := self._settle(message, pending, pending_lock)) is not None:
+                    served = True
                     reply(message)
         except OSError:
             pass
         finally:
+            # EOF can precede process exit by a scheduler tick. Distinguish a natural startup
+            # exit from our own shutdown, and publish diagnostics before the client sees EOF.
+            try:
+                returncode = process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    process.kill()
+                process.wait()
+            else:
+                stderr_thread.join(timeout=2)
+                with self.lock:
+                    if not served and not self.stopped:
+                        self.start_failures.append({"returncode": returncode,
+                                                    "first_error": first_error[0] if first_error else ""})
             with contextlib.suppress(OSError):
                 connection.shutdown(socket.SHUT_RDWR)
             connection.close()
-            with contextlib.suppress(OSError):
-                process.kill()
-            process.wait()
 
     def _admit(self, message: dict, pending: dict, pending_lock: threading.Lock, reply) -> bool:
         method = message.get("method")
