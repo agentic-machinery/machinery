@@ -110,7 +110,7 @@ OVERLAY_PATHSPECS = (
 # shared ``.agents`` tree. A file there is not an overlay only when the deploy's own
 # ``--check`` verifies it as a current planned output: the release and the committed sources fix its bytes
 # (``verified_deploy_outputs``).
-DEPLOY_ROOTS = (".agent", ".agents", ".claude", ".codex", ".cursor", ".gemini")
+DEPLOY_ROOTS = (".agent", ".agents", ".claude", ".codex", ".cursor")
 DEPLOY_CHECK_TIMEOUT_S = 120.0
 
 

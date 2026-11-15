@@ -285,7 +285,6 @@ class CommitInputs:
                 name = body[space + 1:nul].decode("utf-8", "surrogateescape")
                 if "/" in name or name in entries:
                     raise Invalid("noncanonical deployment input: " + path)
-                relative(name)
                 entries[name] = (body[offset:space], body[nul + 1:nul + 1 + width].hex())
                 offset = nul + 1 + width
             found.append(entries)
@@ -340,6 +339,7 @@ class CommitInputs:
             following = []
             for (prefix, _), entries in zip(level, listed, strict=True):
                 for name, (mode, child) in sorted(entries.items()):
+                    relative(name)  # only names the deployment reads; a lookup checks its own path
                     if mode == self.TREE_MODE:
                         following.append((prefix + name + "/", child))
                     else:
