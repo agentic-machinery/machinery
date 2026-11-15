@@ -382,12 +382,14 @@ def build(tree: Tree) -> Plan:
             skill_names.add(name)
         # Product lint selection is code-side. Generic consumers never run curriculum checks.
         if tree.read("curriculum/l2-uk-en/curriculum.yaml") is not None:
-            from lu_machinery.lint.lint_prompts import RULES
+            from lu_machinery.lint.lint_prompts import RULES, rule_matches_path
             for path, (blob, _mode) in items.items():
                 if not path.endswith(".md") or not (path.startswith("skills/") or path.startswith("phases/")):
                     continue
-                for rule_id, severity, _description, _glob, pattern, exception in RULES:
-                    if severity == "error" and any(pattern.search(line) and not (exception and exception.search(line)) for line in blob.decode().splitlines()):
+                for rule_id, severity, _description, file_glob, pattern, exception in RULES:
+                    if severity != "error" or not rule_matches_path(path, file_glob):
+                        continue
+                    if any(pattern.search(line) and not (exception and exception.search(line)) for line in blob.decode().splitlines()):
                         raise Invalid("prompt lint: " + rule_id)
         destination = groups.setdefault(group, {})
         for path, (blob, mode) in items.items():
@@ -409,8 +411,14 @@ def build(tree: Tree) -> Plan:
         outputs[full] = out
     for provider in providers:
         target = TARGETS[provider]
+        # A declared replacement permits an overlay; it must not erase shared
+        # defaults when that consumer supplies no replacement source (#552).
+        replacements = [prefix for prefix in inventory["provider_replacements"].get(provider, [])
+                        if any(name == prefix or name.startswith(prefix + "/")
+                               for name in groups.get(provider, {}))]
         for path, out in groups["shared"].items():
-            if out.owner == "product" and replaces(provider, path):
+            if out.owner == "product" and any(path == prefix or path.startswith(prefix + "/")
+                                              for prefix in replacements):
                 continue
             if out.owner == "fleet":
                 destinations = inventory["files"][path]["targets"].get(provider, [])

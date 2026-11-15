@@ -678,3 +678,32 @@ def test_packaged_resource_edits_load_without_stale_pins_and_change_identity(tmp
     inventory["provider_replacements"]["codex"].append("scratch-metadata")
     inventory_path.write_bytes(plan.encoded(inventory))
     assert plan.release_inputs()[2] != identity
+
+
+@pytest.mark.parametrize("memory_overlay", [False, True])
+def test_declared_but_missing_overlay_does_not_drop_shared_memory(consumer, monkeypatch, memory_overlay):
+    """A declared but absent provider overlay must not silently remove shared memory."""
+    if not memory_overlay:
+        (consumer / "agents_extensions/codex/memory/MEMORY.md").unlink()
+    assert invoke(monkeypatch, consumer) == 0
+    expected = "codex memory\n" if memory_overlay else "shared memory\n"
+    assert (consumer / ".codex/memory/MEMORY.md").read_text() == expected
+    assert invoke(monkeypatch, consumer, check=True) == 0
+
+
+@pytest.mark.parametrize(("path", "text", "expected"), [
+    ("phases/content.md", "persona\n", 0),
+    ("phases/research.md", "persona\n", 2),
+    ("phases/content.md", "Helpful Neighbor\n", 2),
+])
+def test_scoped_prompt_lint_does_not_reject_unrelated_content(consumer, monkeypatch, path, text, expected):
+    """A research-only prompt rule must respect its file glob without disabling global rules."""
+    write(consumer, "curriculum/l2-uk-en/curriculum.yaml", "tracks: {}\n")
+    write(consumer, "agents_extensions/shared/" + path, text)
+    before = snapshot(consumer)
+    assert invoke(monkeypatch, consumer) == expected
+    if expected:
+        assert snapshot(consumer) == before
+    else:
+        assert (consumer / (".claude/" + path)).read_text() == text
+        assert invoke(monkeypatch, consumer, check=True) == 0
