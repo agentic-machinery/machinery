@@ -131,7 +131,8 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
-    """Defect class: false landing attribution from prose, quotes, code fences, suffixed values or another branch."""
+    """Defect class: false landing attribution from prose, quotes, code fences, inline code spans, suffixed values
+    or another branch."""
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -151,6 +152,8 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
         "docs: example\n\n```text\nX-Agent: codex/t-fence\n```\n",
         "docs: unclosed example\n\n~~~\nX-Agent: claude/t-tilde\n",
         "docs: inline code is no fence\n\n```X-Agent``` names the task.\n\nX-Agent: codex/t-inline\n",
+        # An inline code span that runs across lines of one paragraph is an example, not a landing.
+        "docs: inline example\n\nThe trailer reads `\nX-Agent: claude/t-span\n` in a commit.\n",
     ]
     for message in messages:
         _git(repo, "commit", "-q", "--allow-empty", "-m", message)
@@ -165,11 +168,11 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
     assert landing.repositories == {"read": 1} and landing.by_repository == {"fixture": 2}
     batch_state, tasks = _state(tmp_path)
     for task_id in ("t-real", "t-real-2", "t-prose", "t-quote", "t-suffix", "t-fence", "t-tilde", "t-inline",
-                    "t-branch"):
+                    "t-span", "t-branch"):
         _record(tasks, task_id)
     rows.backfill(tasks, batch_state)
     write = _row(_window(batch_state, landing), "gpt-6.1-sol", "write")
-    assert write["tasks"] == 9 and write["landed"] == 2
+    assert write["tasks"] == 10 and write["landed"] == 2
 
 
 def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, monkeypatch):
@@ -203,6 +206,38 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     assert [t for t in ("leaky", "odd-model") if t in metrics] == []
     assert '"model": "unknown"' in text and '{effort="high",model="unknown",role="write",window="7d"} 1.0' in metrics
     assert snapshot["windows"]["7d"]["allowance"] == []  # an API-key label is no admitted pool
+
+
+def test_pr_reviewed_for_two_author_models_exports_other_on_metrics(tmp_path, monkeypatch):
+    """Defect class: an unbounded /metrics label value, from author ids joined after each one was bounded."""
+    batch_state, tasks = _state(tmp_path)
+    _review(tasks, "a-review", "incorrect", [], pr=5, review_author_model="gpt-6.1-sol", pinned_head="1" * 40)
+    _review(tasks, "b-review", "correct", [], pr=5, review_author_model="claude-sonnet-5-5", pinned_head="2" * 40)
+    rows.backfill(tasks, batch_state)
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    ctx = SimpleNamespace(roots=SimpleNamespace(batch_state_dir=batch_state, live_repo_root=tmp_path))
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    registry = CollectorRegistry()
+    registry.register(stats.ModelStatsCollector(ctx))
+
+    metrics = generate_latest(registry).decode()
+
+    assert [a["model"] for a in snapshot["windows"]["7d"]["authors"]] == ["claude-sonnet-5-5+gpt-6.1-sol"]
+    assert 'model="other",role="author",window="7d"} 2.0' in metrics
+    assert "claude-sonnet-5-5+gpt-6.1-sol" not in metrics
+
+
+def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
+    """Defect class: a missing duration read as zero wall time, understating wall hours per landed task."""
+    batch_state, tasks = _state(tmp_path)
+    _record(tasks, "timed", duration_s=3600)
+    _record(tasks, "untimed")
+    rows.backfill(tasks, batch_state)
+
+    write = _row(_window(batch_state, stats.Landing(task_ids={"timed", "untimed"})), "gpt-6.1-sol", "write")
+
+    assert write["landed"] == 2 and write["wall_seconds"]["n"] == 1
+    assert write["wall_hours_per_landed"] == {"value": None, "n": 2, "low_sample": True}
 
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
