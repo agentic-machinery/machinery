@@ -624,6 +624,24 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         response_schema_version="milestones.v1",
     ),
     RouteContract(
+        "/api/fleet/model-stats",
+        "exact",
+        "http",
+        "Per model, role (write, review) and task class over a window: tasks, terminal status mix, landed tasks, "
+        "median and p90 wall time, tokens and wall hours per landed task, review verdicts and blocking findings, "
+        "author-side review rounds, and weekly allowance spent per landed task, each with its sample size (#581).",
+        "Dispatch task records (hot store, then archive), whole-line X-Agent trailers on each registered "
+        "repository's local origin/main (never fetched), review .result sidecars and the records' allowance readings.",
+        "Single-flight refresh every 300s per window while requested; healthy data at most 420s old; the first "
+        "request of a window answers pending with Retry-After 5.",
+        ("model-stats.html", "operators"),
+        "Joins what /api/runtime/usage (ACP runs only) and /api/fleet/workers/v1 (live workers) do not; "
+        "agent_success in the fleet facade counts runs without landing or rounds.",
+        "medium if a low-sample rate or a confounded comparison is read as a routing verdict",
+        "keep as the model value reading; routing stays a CTO decision",
+        response_schema_version="model-stats.v1",
+    ),
+    RouteContract(
         "/api/git/pull-requests",
         "exact",
         "http",
@@ -824,9 +842,21 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "GET /api/milestones, /api/delegate/active, /api/delegate/recent, /api/runtime/subscriptions, /api/runtime/logins, /api/git/pull-requests, /api/ops/v1/alerts and /api/comms/v1/metrics.",
         "HTTP reads every 30 seconds; a local one-second clock advances each source's age and labels it STALE past its stated bound, or unavailable when the source cannot be read. No model calls or agent polling.",
         ("humans", "operators"),
-        "The only machinery page; product pages are the product's.",
+        "The machinery home; product pages are the product's.",
         "medium if a stale reading is read as current",
         "keep as the machinery home",
+    ),
+    PageContract(
+        "model-stats.html",
+        "/model-stats",
+        "Model value, waste and speed: which model lands work per wall hour and per allowance share, which wastes "
+        "runs and which is slow, per role and task class, each figure labelled with its window and sample size.",
+        "GET /api/fleet/model-stats?days=7|30.",
+        "HTTP read on load and on window change; the snapshot is at most 420 seconds old and its age is shown.",
+        ("humans", "operators"),
+        "Reads one route; the machinery home shows live usage, not outcomes.",
+        "medium if a low-sample rate is read as a verdict",
+        "keep",
     ),
 )
 
