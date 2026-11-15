@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
 
 if __package__ and "." in __package__:
@@ -31,7 +32,7 @@ else:  # run by path: the install root (parent of this package) must be importab
 # named by ``--project-root`` (the deploy gate, #12818), else the product checkout that
 # ``product_root`` selects when the scan runs (C-4746); never to this file.
 # Directories to scan for prompt/skill files (deploy gate)
-PROMPT_SCAN_RELS = ("gemini_extensions/skills", "agents_extensions/shared/phases")
+PROMPT_SCAN_RELS = ("agents_extensions/shared/phases",)
 ORCHESTRATOR_PROMPT_REL = "docs/prompts/orchestrators"
 CURRICULUM_MANIFEST_REL = "curriculum/l2-uk-en/curriculum.yaml"
 LEGACY_PROMPT_MIGRATION_REL = "agents_extensions/shared/curriculum-lifecycle/config/legacy-prompt-migration.v1.yaml"
@@ -222,6 +223,11 @@ def _project_root(project_root: Path | None) -> Path:
     return product_root() if project_root is None else project_root
 
 
+def rule_matches_path(filepath: Path | str, file_glob: str) -> bool:
+    """Apply a line rule's existing filename scope without opening the file."""
+    return file_glob == "*.md" or fnmatch(str(filepath), f"*{file_glob.lstrip('*')}")
+
+
 def check_line_rules(filepath: Path, *, project_root: Path | None = None) -> list[dict]:
     """Check per-line rules against a file."""
     violations = []
@@ -231,10 +237,8 @@ def check_line_rules(filepath: Path, *, project_root: Path | None = None) -> lis
 
     for rule_id, severity, description, file_glob, pattern, exception in RULES:
         # Check file glob match
-        if file_glob != "*.md":
-            from fnmatch import fnmatch
-            if not fnmatch(str(filepath), f"*{file_glob.lstrip('*')}"):
-                continue
+        if not rule_matches_path(filepath, file_glob):
+            continue
 
         for i, line in enumerate(lines, 1):
             if pattern.search(line):

@@ -332,7 +332,6 @@ tests/ci/test_ci_timings.py
 tests/ci/test_component_shadow.py
 tests/ci/test_coverage_diff.py
 tests/ci/test_coverage_ref.py
-tests/ci/test_cursor_cloud_pytest_verify.py
 tests/ci/test_data_tier_in_place.py
 tests/ci/test_dependency_advisory_issue.py
 tests/ci/test_dispatch_xdist_cap.py
@@ -494,7 +493,6 @@ tests/lib/test_start_claude_profiles.py
 tests/lib/test_start_codex_claude_code.py
 tests/lib/test_start_codex_profiles.py
 tests/lib/test_start_cto_wrappers.py
-tests/lib/test_start_cursor_launcher.py
 tests/maintenance/test_batch_state_retention.py
 tests/maintenance/test_claude_session_scratch.py
 tests/maintenance/test_github_cache.py
@@ -830,13 +828,8 @@ tests/fixtures/product_tree/start-claude.sh
 tests/fixtures/product_tree/start-codex-cto.sh
 tests/fixtures/product_tree/start-codex-driver.sh
 tests/fixtures/product_tree/start-codex.sh
-tests/fixtures/product_tree/start-cursor-driver.sh
 tests/fixtures/product_tree/start-gemini-driver.sh
 tests/fixtures/product_tree/start-gemini.sh
-tests/fixtures/product_tree/start-glm.sh
-tests/fixtures/product_tree/start-glmcc.sh
-tests/fixtures/product_tree/start-grok-driver.sh
-tests/fixtures/product_tree/start-grok.sh
 tests/fixtures/product_tree/start-muse-driver.sh
 tests/fixtures/routing_baseline/baseline.json.gz
 tests/fixtures/routing_baseline/inputs.json

@@ -7,9 +7,11 @@ for explicit delegate workers; Spark remains on hold. Delegate, direct runner
 calls and adapter planning apply the existing catalog execution gate before a
 native process or version probe. Activation does not certify native permissions,
 contributor/write behavior, formal review or driver use.
-After catalog admission, only Wonder-Full's `implementation` role with
-`workspace-write`, or `investigation` role with `read-only`, passes worker
-classification. Missing roles, other combinations and Spark execution refuse.
+After catalog admission, only Wonder-Full's `investigation` role with
+`read-only` passes worker classification. Every other mode is refused with
+`muse_worker_mode_refused` before admission, by dispatch, the provider builder,
+the adapter and the direct sandbox entry. Missing roles, other combinations and
+Spark execution refuse.
 Spark stream parsing remains available for qualification without admission.
 
 ## Permission and transport contracts
@@ -17,19 +19,19 @@ Spark stream parsing remains available for qualification without admission.
 | Delegate mode | Native profile | Available tools |
 | --- | --- | --- |
 | `read-only` | `:read-only` | `read_file` |
-| `workspace-write` | `:ask-me` | `read_file`, `write_file`, `edit_file` |
 
 Shell execution, web tools, reminders, user-input requests and foreign personal
 context are disabled. The toolset excludes subordinate agents and session
-messaging. Read-only workers also receive `--disable-write`. File edits in write
-mode remain subject to the native profile. These workers cannot run commands,
-tests, Git commits or pushes themselves. Normal delegate finalization still
-decides whether a write task produced its required deliverable.
+messaging. Every worker receives `--provider meta` and `--disable-write`. These
+workers cannot edit files, run commands or tests, or make Git commits or pushes.
+The bubblewrap sandbox remounts its private root read-only, so traversal cannot
+create files outside the read-only workspace and scratch mounts.
 
 The adapter pins `--workspace` to the managed dispatch worktree and disables
 Muse's separate worktree creation. It uses a fresh session UUID and a private
 prompt file in the task's managed scratch lease. Resume is refused. Contributor
-mode is explicitly off. The adapter requests `MUSE_NO_AUTO_UPDATE=1`; that
+mode is always off; a dispatch records the caller's `requested_contributor_mode`
+and the effective `contributor_mode` (`off`). The adapter requests `MUSE_NO_AUTO_UPDATE=1`; that
 variable must survive the shared child-environment sanitizer before admission.
 
 The shared runner retains process identity, cancellation, deadlines, primary

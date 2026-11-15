@@ -234,10 +234,9 @@ def test_wheel_only_deployer_isolation_idempotency_and_false_green(release):
     skill.write_text("---\nname: consumer\ndescription: Consumer example\n---\nRead this example.\n")
     with zipfile.ZipFile(wheel) as archive:
         inventory = json.loads(archive.read("lu_machinery/agent_deploy/release.v1.json"))
-    descriptor = {"providers": ["claude", "codex", "agy", "gemini"], "sources": {
+    descriptor = {"providers": ["claude", "codex", "agy"], "sources": {
         "shared": {"path": "agents_extensions/shared", "required": True},
-        "codex": {"path": "agents_extensions/codex", "required": True},
-        "gemini": {"path": "gemini_extensions", "required": False}}, "preserve": []}
+        "codex": {"path": "agents_extensions/codex", "required": True}}, "preserve": []}
     (consumer / "agents_extensions/deployment.v1.json").write_text(json.dumps(descriptor))
     # Configurations are input fixtures. Independent assertions below never use
     # the inventory to derive expected output paths, bytes, modes, or counts.

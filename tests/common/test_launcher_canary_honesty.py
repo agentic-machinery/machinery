@@ -13,13 +13,13 @@ from tests.launcher_sandbox import launcher_environment
 
 # The wheel test hides the checkout tree. The shell under test is the installed package.
 REPO = machinery_root()
-PROVIDERS = ("gemini", "cursor", "grok", "claude", "kimi", "glm", "codex")
+PROVIDERS = ("gemini", "claude", "codex")
 
 
 def _canary_binding_probe(
     provider: str, dry_run: str, tmp_path: Path, *, inherited: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    if provider not in ("codex", "kimi"):
+    if provider != "codex":
         assert (REPO / "launchers" / f"{provider}.sh").is_file(), f"missing supported launcher adapter: {provider}"
     anchor = tmp_path / "state-anchor"
     if not (anchor / ".git").is_dir():
@@ -79,7 +79,7 @@ def test_noop_adapter_does_not_claim_a_canary(provider: str, dry_run: str, tmp_p
     assert "ran its provider canary" not in result.stdout
     adapter = REPO / "launchers" / f"{provider}.sh"
     if adapter.is_file() and (
-        provider in ("gemini", "cursor") or (provider in ("claude", "kimi") and dry_run == "1")
+        provider == "gemini" or (provider == "claude" and dry_run == "1")
     ):
         assert f"{provider} adapter: provider canary: not run" in result.stdout
         assert "would run provider canary" not in result.stdout
