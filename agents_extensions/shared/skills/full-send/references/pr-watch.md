@@ -16,7 +16,7 @@ the accountable driver's cycle.
   gh pr view "$PR" --json state,isDraft,headRefOid,mergeable,mergeStateStatus,autoMergeRequest
   gh pr checks "$PR"
   "$PY" -m lu_machinery.publish read checks --sha "$HEAD_SHA"   # REST, when GraphQL is spent
-  "$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json   # refused in the write boundary: use autoMergeRequest
+  "$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json
   ```
 
 - A review round does not wait for the PR's `CI Gate`: it runs in parallel with CI on the head

@@ -137,8 +137,6 @@ From `$SHA`, the commit identified under Changelog, with `$V` the version in
 
 3. Accept it in a clean, machinery-only virtual environment outside any checkout.
    This proves the candidate lock installs and imports without consumer packages.
-   The [five-route canary](runbooks/write-worker-boundary.md#build-and-install-the-artifact)
-   separately uses the consumer runtime required by its Sources server.
    `$CANDIDATE_LOCK` is the lock assembled in step 2; `$P` is the clean
    environment's absolute interpreter:
 
@@ -241,18 +239,6 @@ From `$SHA`, the commit identified under Changelog, with `$V` the version in
    `NODE_OPTIONS` loading `b4a` must execute the `react-native-b4a` marker as
    the positive control. Remove the markers and confirm the prefix still
    validates.
-
-   Run the five-route write-boundary canary
-   ([runbook](runbooks/write-worker-boundary.md#five-route-canary)) when the
-   release contains a change that affects worker-sandbox behavior and no
-   recorded table matches. It is required: all five routes (`claude`, `codex`,
-   `cursor`, `agy`, `opencode`) must pass every check through the installed
-   wheel. Evidence recorded earlier on the same source SHA and wheel SHA-256
-   as this release candidate may be reused instead of re-running; any other
-   evidence is void. A route that cannot run is incomplete evidence: wait for
-   capacity or record an explicit exception, never substitute another route.
-   Put the table, with the wheel SHA-256 and installed-package provenance, in
-   the release's Acceptance section.
 
    Then check that every packaged resource resolves from the installed wheel
    and exercise lazy runtime paths. Running the agent deployer's plan and apply

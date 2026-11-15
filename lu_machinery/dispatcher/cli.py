@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import json
-import math
 import os
 import re
 import subprocess
@@ -337,54 +336,7 @@ def _worktrees(repo_key: str | None, include_archive: bool) -> list[dict]:
     return rows
 
 
-def _dispatch_through_broker(args) -> int:
-    """Inside a write boundary the task store is read-only: the launcher's broker starts the review (#423)."""
-    from lu_machinery.dispatcher import write_boundary
-
-    if args.mode != "read-only" or args.dry_run:
-        raise ValueError("write_boundary_refused: inside a write boundary only a read-only review is dispatched, "
-                         "through the launcher's broker")
-    if args.task_card or args.allow_open_dependency or args.refuse_on_overlap:
-        raise ValueError("write_boundary_refused: the broker's review dispatch takes no task card or overlap flags")
-    if (args.prompt is None) == (args.prompt_file is None):
-        raise ValueError("provide exactly one of --prompt or --prompt-file")
-    source = args.prompt if args.prompt is not None else args.prompt_file
-    prompt = sys.stdin.read() if source == "-" else (args.prompt if args.prompt is not None
-                                                     else Path(source).read_text(encoding="utf-8"))
-    payload = {"task_id": args.task_id, "pr": args.pr, "pinned_head": args.pinned_head, "agent": args.agent,
-               "model": args.model, "effort": args.effort, "prompt": prompt, "review_profile": args.review_profile,
-               "risk": args.risk, "review_mode": args.review_mode, "codex_account": args.codex_account,
-               "claude_account": args.claude_account}
-    reply = write_boundary.broker_call("review-dispatch", payload)
-    sys.stdout.write(reply.get("stdout", ""))
-    sys.stderr.write(reply.get("stderr", ""))
-    return int(reply.get("returncode", 1))
-
-
-def _wait_through_broker(args) -> int:
-    """Inside a write boundary a review this worker dispatched is waited on by the host's broker (#557, #591).
-
-    The wait is bounded per request (``write_boundary.REVIEW_WAIT_MAX``): a longer ``--timeout`` exits 124 while the
-    review still runs, as the host's wait does, and the caller runs the same wait again. The printed record carries
-    the reviewer's sealed reply as ``result`` once the review is done.
-    """
-    from lu_machinery.dispatcher import write_boundary
-
-    if not 0 <= args.timeout < float("inf"):  # NaN fails too
-        raise ValueError("timeout must be nonnegative and poll interval positive")
-    # Whole seconds, rounded up: a fractional wait must never become 0, the host wait's unlimited sentinel.
-    timeout = min(math.ceil(args.timeout), write_boundary.REVIEW_WAIT_MAX) if args.timeout else write_boundary.REVIEW_WAIT_MAX
-    payload = {"task_id": args.task_id, "timeout": timeout, **({"run_nonce": args.run_nonce} if args.run_nonce else {})}
-    reply = write_boundary.broker_call("review-wait", payload)
-    sys.stdout.write(reply.get("stdout", ""))
-    sys.stderr.write(reply.get("stderr", ""))
-    code = reply.get("returncode")
-    return code if type(code) is int and 0 <= code < 256 else 1
-
-
 def _dispatch(args) -> int:
-    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
-        return _dispatch_through_broker(args)
     if binding := store.review_binding(vars(args)):
         # Bound attempts have their own accounting; PR selectors would also charge their records to a PR budget.
         if args.branch is not None or args.pr is not None:
@@ -843,10 +795,6 @@ def main(argv=None) -> int:
                 return 1
             print(json.dumps(result, indent=2))
             return 0
-        if (args.command == "wait" and os.environ.get("LU_WRITE_BOUNDARY_BROKER")
-                and not store.record_path(args.task_id).exists()):
-            # Only this task's own records are visible inside; another task (its review) is the host's to read.
-            return _wait_through_broker(args)
         code = 0
         if args.command == "worktrees":
             result = _worktrees(args.repo, args.all)

@@ -1161,10 +1161,9 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
     """
     _stop_task_services(record)
-    request = (record.get("write_boundary") or {}).get("closeout_request")
     # Attribution needs the checkout's origin, so take it before removal. Closeout itself runs afterward.
-    merged = None
-    if not request and record.get("mode") == "workspace-write" and "closeout" not in record:
+    request = merged = None
+    if record.get("mode") == "workspace-write" and "closeout" not in record:
         merged = git.merged_delivery(record)
     _reap_worktree(record, patience=patience, salvage=salvage)
     if record.get("worktree_disposition") == "removed":
@@ -1357,9 +1356,9 @@ def settle_left_worktrees(salvage: bool = False) -> None:
 def _end_lingering(child: subprocess.Popen, spec: TaskSpec) -> None:
     """End a provider that outlived its terminal result, keeping what its launcher still has to write.
 
-    The read-only AGY launcher and the write boundary's launcher record their receipts once the sandbox
-    exits, so only the sandbox's tree is killed and the launcher is given time to finish; anything still
-    alive after that is killed whole.
+    A read-only launcher (AGY's or the write boundary's) records its receipt once the sandbox exits, so only
+    the sandbox's tree is killed and the launcher is given time to finish; a write provider gets the same
+    grace. Anything still alive after that is killed whole.
     """
     if spec.mode == "workspace-write" or spec.mode == "read-only":
         with contextlib.suppress(psutil.Error):
@@ -1496,6 +1495,16 @@ def _adopt_orphans() -> bool:
         return False
 
 
+def _read_only_boundary(spec: TaskSpec) -> bool:
+    """Whether the supervisor runs this provider inside ``write_boundary``: native read-only routes only.
+
+    Read-only AGY and Muse keep their own sandboxes. A workspace-write worker runs as the dispatching user, in
+    its dispatch worktree, with its own provider login, network, ``git`` and ``gh`` (operator order
+    NO-WORKER-SANDBOX-1115); the worktree, owned-path hooks, push scan, review and merge queue still apply.
+    """
+    return spec.mode == "read-only" and spec.agent not in {"agy", "muse"}
+
+
 def _provider_env(spec: TaskSpec) -> dict[str, str]:
     """Mark the trusted Claude launch before build; supervise always wraps it before Popen."""
     env = child_env(spec)
@@ -1544,7 +1553,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         if child and child.returncode is None and (
             spec.mode == "workspace-write" or spec.mode == "read-only"
         ):
-            # The write boundary's launcher ends the sandbox, imports the branch tip and records its receipt.
+            # A read-only launcher ends its sandbox and records its receipt; a write provider may exit cleanly.
             with contextlib.suppress(ProcessLookupError):
                 child.send_signal(signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -1677,10 +1686,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 stdin.seek(0)
                 output_sizes = out.tell(), err.tell()
                 checkpoint()  # the last one before the provider starts: a cancelled run launches nothing
-                if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent not in {"agy", "muse"}):
-                    # Native reviewers and write workers run inside the OS boundary (#423, #100); there is no
-                    # unsandboxed fallback. The launcher refuses with its receipt when the boundary cannot start.
-                    # A relaunch always rebuilds the invocation first, so it is wrapped exactly once.
+                if _read_only_boundary(spec):
+                    # Native reviewers run inside the OS boundary (#423, #100); there is no unsandboxed fallback.
+                    # The launcher refuses with its receipt when the boundary cannot start. A relaunch always
+                    # rebuilds the invocation first, so it is wrapped exactly once.
                     try:
                         invocation = replace(invocation, argv=write_boundary.launcher(spec, invocation, path))
                     except ValueError as exc:
@@ -1747,7 +1756,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 continue
             break
         store.begin_settlement(record)
-        if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent not in {"agy", "muse"}):
+        if _read_only_boundary(spec):
             # Only the receipt the launcher writes outside the sandbox proves the run was contained (#423).
             boundary, refusal = write_boundary.verify(path, spec.task_id, spec.mode)
             record["write_boundary"] = boundary
@@ -1855,10 +1864,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.begin_settlement(record)
                 except store.TaskRecordError as exc:
                     status, error = "crashed", exc.code
-            # A killed launcher leaves its scratch and token copy; residue is recorded, never raised.
-            if (spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent not in {"agy", "muse"})) and (
-                residue := write_boundary.discard(spec.task_id)
-            ):
+            # A killed launcher leaves its scratch; residue is recorded, never raised.
+            if _read_only_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
                 record["write_boundary_cleanup"] = residue
             if spec.agent == "agy" and spec.mode == "read-only":
                 # A bound attempt already counted its Sources bodies and replaced the stream with

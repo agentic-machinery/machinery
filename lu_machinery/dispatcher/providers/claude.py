@@ -8,6 +8,7 @@ from pathlib import Path
 
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common.jsonl import jsonl_lines
+from lu_machinery.common.repo_root import product_root
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from lu_machinery.dispatcher.write_boundary import sources_command
@@ -30,10 +31,11 @@ from lu_machinery.lib import rules_core
 # core that ``require_core`` checks is appended to the system prompt instead.
 _READ_TOOLSET = "Read,Grep,Glob,Bash,WebFetch,WebSearch"
 _READ_TOOLS = "Read,Grep,Glob,LS,WebFetch,WebSearch,Bash"
-# Every run, read-only or workspace-write, gets the Sources MCP server explicitly: the write boundary's
-# fixed stdio command to its Sources relay (``write_boundary.sources_command``), never an MCP file of the
-# task's worktree, whose change could turn it into a command, or of the product, whose loopback service
-# the boundary cannot reach; and alone, as --strict-mcp-config drops every other server (#10074);
+# Every run, read-only or workspace-write, gets the Sources MCP server explicitly, never from an MCP file of
+# the task's worktree, whose change could turn it into a command: a read-only run, inside the boundary, names
+# its fixed stdio command to the Sources relay (``write_boundary.sources_command``); a workspace-write run,
+# on the host, takes the product checkout's own ``sources`` entry. Alone, as --strict-mcp-config drops every
+# other server (#10074);
 # --restricted would skip the project settings that approve .mcp.json servers anyway. Only the tools the
 # server annotates read-only are allowed, so authors, judges and fixers can check their own words; the
 # ones that persist fetched entries (sources_read_only.sources_tool_sets) are denied by name.
@@ -116,9 +118,12 @@ def managed_policy(env: Mapping[str, str]) -> str | None:
     return None
 
 
-def _sources_mcp_config() -> str:
-    command, *args = sources_command()
-    server = {"type": "stdio", "command": command, "args": args}
+def _sources_mcp_config(mode: str) -> str:
+    if mode == "read-only":
+        command, *args = sources_command()
+        server = {"type": "stdio", "command": command, "args": args}
+    else:
+        server = json.loads((product_root() / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"][_SOURCES_SERVER]
     return json.dumps({"mcpServers": {_SOURCES_SERVER: server}}, separators=(",", ":"))
 
 
@@ -228,7 +233,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
             key: value for key, value in env.items()
             if key != "CLAUDE_CODE_SHELL_PREFIX" and not key.startswith("LU_REVIEW_SHELL_")
         }
-    argv += ["--mcp-config", _sources_mcp_config(), "--strict-mcp-config"]
+    argv += ["--mcp-config", _sources_mcp_config(spec.mode), "--strict-mcp-config"]
     readers, writers = sources_tool_sets()
     allowed_tools = ",".join([allowed_tools, *(f"mcp__{_SOURCES_SERVER}__{name}" for name in readers)])
     denies = ",".join([denies, *(f"mcp__{_SOURCES_SERVER}__{name}" for name in writers)])

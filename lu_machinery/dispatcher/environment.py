@@ -17,8 +17,8 @@ from lu_machinery.dispatcher import store
 from lu_machinery.dispatcher.types import TaskSpec
 
 # A worker's scratch lives at /var/tmp/<task-id>, exported as LU_TASK_SCRATCH. The worker creates it on
-# demand; settlement removes it together with the task's worktree (worker._settle_task_scratch). Inside the
-# write boundary the launcher points it under the private TMPDIR instead. Tests replace the base.
+# demand; settlement removes it together with the task's worktree (worker._settle_task_scratch). Inside a
+# read-only review's boundary the launcher points it under the private TMPDIR instead. Tests replace the base.
 TASK_SCRATCH_BASE = Path("/var/tmp")
 
 
@@ -133,8 +133,7 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
     # refuse without it (#100), so a configured anchor reaches every child, whatever its mode.
     if os.environ.get(PRIMARY_ROOT_ENV, ""):
         env[PRIMARY_ROOT_ENV] = os.environ[PRIMARY_ROOT_ENV]
-    # Write providers need these paths for Git hooks. write_boundary.launcher does not mark names
-    # already present here as host-only, so contained providers retain them too. No credential is added.
+    # Write providers need these paths for Git hooks. No credential is added.
     # Read-only AGY, Claude and Muse launchers also need the configured interpreter and product.
     if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent in {"agy", "claude", "muse"}):
         names = (INTERPRETER_ENV, PRODUCT_ROOT_ENV)

@@ -114,7 +114,6 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    (`"$PY" -m lu_machinery.fleet_comms channel publish … --recipient claude-cto`; the CTO's one durable recipient, never a `claude-cto-<id>` name).
 8. **Drain the inbox, then enqueue** at the approved head. The merge-queue keeper may already
    have queued it: check `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json` first.
-   Inside the write boundary that read is refused: use `autoMergeRequest` from step 7's `gh pr view`.
 
    ```bash
    "$PY" -m lu_machinery.publish pr-merge --number "$PR" --match-head "$HEAD_SHA"
@@ -134,10 +133,6 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
     ```bash
     "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
     ```
-
-    Inside the write boundary `merge_closeout` cannot reach GitHub (exit 2): request it with
-    `echo '{"pr": N}' | "$PY" -m lu_machinery.dispatcher.write_boundary call closeout-request`;
-    the host runs it after the task settles and records the result as the receipt's `closeout`.
 
     `merge_closeout` proves no worktree still holds the PR and that its branches are gone; it
     removes no worktree. Exit 0 with a residue-free receipt is required, with one expected
