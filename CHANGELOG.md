@@ -10,6 +10,34 @@ notices them.
 
 ## [Unreleased]
 
+<a id="v0.1.21"></a>
+## [0.1.21] - 2026-11-15
+
+### Added
+
+- Gemini 4 Hydrogen is an AGY work route at the low, medium, high and xhigh thinking levels, with work roles only (no review, advisory or Ukrainian review role). The native AGY adapter also accepts the Gemini 4 Carbon selectors that dispatch already admitted. ([#588](https://github.com/learn-ukrainian/machinery/pull/588))
+- Dispatch with `--task-card` refuses to start while a dependency listed on the card is still open or unreadable (`--allow-open-dependency` admits one named entry), and reports owned paths that overlap another live write task in the same repository (`--refuse-on-overlap` turns that into a refusal). ([#593](https://github.com/learn-ukrainian/machinery/pull/593))
+
+### Changed
+
+- Fleet Comms creates deliveries only for recipients that something reads. Messages, subscriptions and channels addressed to an unknown name or a settled task are refused with the cause, mail to a task that has settled expires with its cause instead of becoming a dead letter a week later, and the metrics collector counts dead letters by cause over 24 hours and 7 days. ([#595](https://github.com/learn-ukrainian/machinery/pull/595))
+- The context rollover hooks take usage from the status line's live figure, then the latest real model turn in the transcript, and never estimate it from the transcript's size. When usage is unknown no rollover tier fires and no handoff is requested. Code Mode's synthetic zero-usage entries are skipped. ([#600](https://github.com/learn-ukrainian/machinery/pull/600), [#597](https://github.com/learn-ukrainian/machinery/pull/597))
+- The write-boundary canary uses the consumer's Python and runtime lock, and the dispatch receipt records a Sources server that exits during startup, with its exit code and a redacted first error line. ([#571](https://github.com/learn-ukrainian/machinery/pull/571))
+
+### Fixed
+
+- Write workers inside the write boundary can read their PR, checks and CI runs with `gh`, run the publisher's reads and the review budget check, and wait for their review and read its result. ([#598](https://github.com/learn-ukrainian/machinery/pull/598))
+- Write workers in a registered private repository can push through the write boundary. The host push scan uses the same Git binary, environment and options as the push, and a destination rewritten by Git URL configuration is scanned as public. ([#590](https://github.com/learn-ukrainian/machinery/pull/590))
+- The Monitor API no longer rereads unchanged malformed or foreign task files on every refresh, and its task snapshot no longer delays other API routes at startup. A task file that cannot be read no longer publishes an under-counted routing budget. ([#599](https://github.com/learn-ukrainian/machinery/pull/599), [#604](https://github.com/learn-ukrainian/machinery/pull/604))
+- After approval, one clean merge of the base branch that only regenerates the rename-map hash no longer uses up the review budget. Other merges and real conflict resolutions are still charged. ([#602](https://github.com/learn-ukrainian/machinery/pull/602))
+- AGY runs on Gemini 4 Hydrogen and Carbon check the provider's reported model identity, as Argon runs already did, so a missing or substituted model is refused instead of passing unattested. ([#601](https://github.com/learn-ukrainian/machinery/pull/601))
+
+### Removed
+
+- The unused sealed review snapshot engine is removed. AGY plain asks run the same as before, and AGY reviews stay refused. ([#582](https://github.com/learn-ukrainian/machinery/pull/582))
+- Seven unused one-shot tools are removed: the budget screen, delivery baseline, coverage report, agent pitfall census, goal-driver size cap, HTML migration tool and GUI session lease. ([#580](https://github.com/learn-ukrainian/machinery/pull/580))
+- The Grok session canary runbook and protocol no longer describe a production rollover step. ([#596](https://github.com/learn-ukrainian/machinery/pull/596))
+
 <a id="v0.1.20"></a>
 ## [0.1.20] - 2026-11-15
 
@@ -498,7 +526,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.21...HEAD
+[0.1.21]: https://github.com/learn-ukrainian/machinery/compare/v0.1.20...v0.1.21
 [0.1.20]: https://github.com/learn-ukrainian/machinery/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/learn-ukrainian/machinery/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/learn-ukrainian/machinery/compare/v0.1.17...v0.1.18
