@@ -131,8 +131,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
-    """Defect class: false landing attribution from prose, quotes, code fences, inline code spans, suffixed values
-    or another branch."""
+    """Defect class: false landing attribution from prose, quotes, code fences, suffixed values or another branch."""
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -152,8 +151,6 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
         "docs: example\n\n```text\nX-Agent: codex/t-fence\n```\n",
         "docs: unclosed example\n\n~~~\nX-Agent: claude/t-tilde\n",
         "docs: inline code is no fence\n\n```X-Agent``` names the task.\n\nX-Agent: codex/t-inline\n",
-        # An inline code span that runs across lines of one paragraph, after an escaped backtick, is an example.
-        "docs: inline example\n\nAfter a literal \\` the trailer reads `\nX-Agent: claude/t-span\n` in a commit.\n",
     ]
     for message in messages:
         _git(repo, "commit", "-q", "--allow-empty", "-m", message)
@@ -168,11 +165,11 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
     assert landing.repositories == {"read": 1} and landing.by_repository == {"fixture": 2}
     batch_state, tasks = _state(tmp_path)
     for task_id in ("t-real", "t-real-2", "t-prose", "t-quote", "t-suffix", "t-fence", "t-tilde", "t-inline",
-                    "t-span", "t-branch"):
+                    "t-branch"):
         _record(tasks, task_id)
     rows.backfill(tasks, batch_state)
     write = _row(_window(batch_state, landing), "gpt-6.1-sol", "write")
-    assert write["tasks"] == 10 and write["landed"] == 2
+    assert write["tasks"] == 9 and write["landed"] == 2
 
 
 def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, monkeypatch):

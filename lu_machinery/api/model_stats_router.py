@@ -20,7 +20,6 @@ from __future__ import annotations
 import math
 import re
 import subprocess
-import uuid
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -31,8 +30,6 @@ from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
-from markdown_it import MarkdownIt
-from markdown_it.token import Token
 from prometheus_client.core import GaugeMetricFamily
 
 from lu_machinery.common.git_context import sanitized_git_env
@@ -58,9 +55,9 @@ BLOCKING = frozenset({"P0", "P1"})
 P0_P2 = frozenset({"P0", "P1", "P2"})
 # One whole line, so prose or a suffixed value that mentions a trailer never lands a task.
 _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
-_LINE_ENDINGS = re.compile(r"\r\n|\r|\n")  # CommonMark's three, as markdown-it normalizes them
-_ALNUM = re.compile(r"[A-Za-z0-9]+")
-_COMMONMARK = MarkdownIt("commonmark")
+# CommonMark: a backtick fence's info string has no backtick, so "```X-Agent``` ..." is inline code, not a fence.
+_FENCE_OPEN = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
+_FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
 
 router = APIRouter()
 
@@ -68,37 +65,23 @@ router = APIRouter()
 def trailer_task_ids(message: str) -> set[str]:
     """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
 
-    The message is parsed as CommonMark (markdown-it, the parser ``review.verdict_parser`` uses). A whole source
-    line that is a trailer counts only where that same line renders as one line of plain text in a top-level
-    paragraph or heading: a code fence or code block, an inline code span (across lines too, honoring backslash
-    escapes), a quote, a list item or HTML is an example, never attribution. Each candidate line's task id is
-    first replaced by a unique marker whose letters and digits differ but whose punctuation is the same, which
-    leaves the parse unchanged, so a rendered line is attributed to its own source line and never to a copy.
+    Lines inside a backtick or tilde code fence (CommonMark: closed by a run of the same character at least as long,
+    else open to the end) are examples, never attribution. This is a line scan, not a Markdown parser; its known
+    limits (docs/runbooks/model-stats.md) are that a trailer-shaped line inside an inline code span running across
+    lines still counts, and that an unclosed fence earlier in a message hides the trailers after it.
     """
-    if "X-Agent:" not in message:
-        return set()
-    lines = _LINE_ENDINGS.split(message)
-    markers: dict[str, str] = {}
-    for index, line in enumerate(lines):
-        if match := _TRAILER.fullmatch(line):
-            marked = _ALNUM.sub(lambda _run: uuid.uuid4().hex, match.group(1))
-            lines[index] = line[:match.start(1)] + marked
-            markers[lines[index]] = match.group(1)
     found: set[str] = set()
-    block: Token | None = None
-    for token in _COMMONMARK.parse("\n".join(lines)) if markers else ():
-        if token.nesting == 1:
-            block = token
-        if token.type != "inline" or block is None or block.level != 0:
+    fence: str | None = None
+    for line in message.splitlines():
+        if fence is not None:
+            close = _FENCE_CLOSE.fullmatch(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = None
             continue
-        rendered: list[str] = []
-        for child in [*(token.children or []), None]:
-            if child is not None and child.type not in ("softbreak", "hardbreak"):
-                rendered.append(child.content if child.type in ("text", "text_special") else "\0")
-                continue
-            if (task := markers.get("".join(rendered))) is not None:
-                found.add(task)
-            rendered = []
+        if opened := _FENCE_OPEN.fullmatch(line):
+            fence = opened.group(1) or opened.group(2)
+        elif trailer := _TRAILER.fullmatch(line):
+            found.add(trailer.group(1))
     return found
 
 

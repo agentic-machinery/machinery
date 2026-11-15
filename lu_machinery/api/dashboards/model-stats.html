@@ -52,7 +52,9 @@
   <section><h2>Value: landed tasks per wall hour against first-round approval <span class="meta" id="chart-meta"></span></h2>
     <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), and the plain rows under each effort split that effort by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
     <div id="chart">Loading…</div></section>
-  <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2><div id="write">Loading…</div></section>
+  <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
+    <p class="muted">Landed: the task's whole-line <code>X-Agent</code> trailer is on a registered <code>main</code> outside a code fence, or the task recorded its own merged PR. The trailer is found by a line scan, not a Markdown parser: a trailer-shaped line inside inline code that runs across lines still counts, and a fence left open earlier in a commit message hides the trailers after it (see the runbook's landing source).</p>
+    <div id="write">Loading…</div></section>
   <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2><div id="review">Loading…</div></section>
   <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2><div id="author">Loading…</div></section>
   <section><h2>Weekly allowance spent per landed task <span class="meta" id="allowance-meta"></span></h2><div id="allowance">Loading…</div></section>

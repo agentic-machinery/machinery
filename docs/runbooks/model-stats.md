@@ -53,13 +53,13 @@ a row a settlement failed to write.
   totals, split again by task class, so `code` at `high` and `code` at `low` compare directly.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
-- **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer that the commit
-  message, parsed as CommonMark, renders as one plain-text line of a top-level paragraph or heading (a fenced,
-  indented, inline-code, quoted, list or HTML example never counts), on a registered
-  repository's local `origin/main` since the first row, or that recorded its own merged delivery into `main`
-  (`delivery_merge_sha`, proven against GitHub at settlement). `landed_by` reports how many landed by trailer,
-  by recorded merge, or both. The Monitor never fetches; trailer landing is as fresh as the last fetch of each
-  checkout. `coverage.landing.trailer_task_ids_by_repository` counts trailer task ids per repository.
+- **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer outside a code
+  fence, in a commit message on a registered repository's local `origin/main` since the first row, or that
+  recorded its own merged delivery into `main` (`delivery_merge_sha`, proven against GitHub at settlement).
+  `landed_by` reports how many landed by trailer, by recorded merge, or both. The Monitor never fetches; trailer
+  landing is as fresh as the last fetch of each checkout. `coverage.landing.trailer_task_ids_by_repository`
+  counts trailer task ids per repository. See [Landing source](#landing-source) for why the trailer is read and
+  what the line scan cannot see.
 - **Wall hours per landed**: wall time of all write tasks of that model divided by its landed tasks, so failed
   attempts are charged to the work that landed. It is unknown (null) when any of those tasks has no recorded
   duration; `wall_seconds.n` counts the tasks that have one. Tokens per landed task are computed the same way. Fresh input
@@ -112,6 +112,31 @@ rows and the route. No task ids, paths or accounts.
 | `lu_model_stats_week_not_done` | week, model, effort, role, status | not-done tasks per ISO week and status |
 
 A series with no denominator (no landed task, no read review) is absent rather than 0.
+
+## Landing source
+
+The recorded merged delivery alone cannot answer "did this task land" over the route's windows. The dispatcher
+records `delivery_pr` and `delivery_merge_sha` for every merged write task only since 2026-11-14 (#548); before
+that it recorded them only when the task branch could not show the delivery, so the 30-day, 90-day and all-time
+windows would read as almost nothing landed. A task inside the write boundary that asks for its own closeout
+records the closeout's PR, not `delivery_pr`, and work a successor lands after the task settled is never
+recorded on the original task. Every agent commit carries its `X-Agent` trailer, so the trailer on `main` is the
+one source that covers all history; the recorded delivery is added to it.
+
+The trailer is read by a line scan: a whole line `X-Agent: <harness>/<task>` counts unless it sits inside a
+backtick or tilde code fence. Git's own trailer parser is not used because it reads only the last paragraph, and a
+squash merge puts most task trailers in earlier paragraphs (on the product repository's `main` it finds 1,724
+task ids where the line scan finds 8,672). The line scan is not a Markdown parser, so it has two known limits:
+
+- a trailer-shaped line inside an inline code span that runs across lines (a backtick opened on the line before)
+  still counts as landed;
+- a fence opened in the message prose and never closed hides every trailer after it (one task id in the
+  product repository's history at 2026-11-15).
+
+Measured on 2026-11-15 over every commit of both repositories' local `origin/main` (11,538 and 442): the scan
+finds 8,672 and 10 task ids, against 8,673 and 10 for a fence-blind whole-line scan (the one missed is the
+unclosed-fence case above). A CommonMark parser found 8,671 and 10; the one id it rejected that this scan counts
+is a real trailer written straight after a list item, so the parser would undercount, not correct, this scan.
 
 ## Reference comparison (2026-11-15)
 
