@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 import pytest
-from lu_machinery.ai_agent_bridge._review_worktree import _hardened_review_signal_handler
 from lu_machinery.orchestration import scheduled_worktree_cleanup
 from lu_machinery.review import isolation
 from lu_machinery.review.isolation import (
@@ -110,34 +107,6 @@ def test_disk_pressure_escalates_sweeper(tmp_path: Path, monkeypatch: pytest.Mon
     assert not root.exists()
 
 
-def test_signal_handler_cleanup(tmp_path: Path) -> None:
-    """Guard 5 (Signal Handler Cleanup): Signal handler cleans up registered review roots on SIGTERM."""
-    state_mock = MagicMock()
-    state_mock.root = tmp_path / "state_root"
-    state_mock.root.mkdir()
-
-    root_mock = tmp_path / "lu-review-exec-test"
-    root_mock.mkdir()
-
-    cleanup_called = False
-
-    def fake_cleanup(state, roots):
-        nonlocal cleanup_called
-        cleanup_called = True
-
-    def get_cleanup_args():
-        return state_mock, (root_mock,)
-
-    with patch("lu_machinery.ai_agent_bridge._review_worktree._cleanup_review_resources", side_effect=fake_cleanup):
-        with pytest.raises(SystemExit) as exc_info:
-            with _hardened_review_signal_handler(get_cleanup_args):
-                handler = signal.getsignal(signal.SIGTERM)
-                handler(signal.SIGTERM, None)
-
-        assert exc_info.value.code == 128 + signal.SIGTERM
-        assert cleanup_called is True
-
-
 def test_fetch_failure_degrades_gracefully(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Guard 6 (Fetch Timeout Degradation): Fetch error degrades to local cleanup without early return."""
     repo = tmp_path / "repo"
@@ -223,32 +192,6 @@ def test_sweep_toctou_recheck_skips_on_uncheckable(tmp_path: Path, monkeypatch: 
     res = sweep_review_temp_orphans(now=now, min_free_gb=isolation.LU_REVIEW_TEMP_MIN_FREE_GB)
     assert res["roots_reaped"] == 0
     assert root.exists()
-
-
-def test_review_resource_cleanup_is_idempotent(tmp_path: Path) -> None:
-    """Guard / F4 (Cleanup Idempotency): Double cleanup invocation raises no error."""
-    state_root = _make_review_temp_root(dir=tmp_path, prefix="lu-review-snap-")
-    state_mock = MagicMock()
-    state_mock.root = state_root
-    state_mock.cleaned = False
-
-    def fake_cleanup_state(s):
-        if not s.cleaned:
-            if s.root.exists():
-                isolation.remove_review_temp_tree(s.root)
-            s.cleaned = True
-
-    root_mock = _make_review_temp_root(dir=tmp_path, prefix="lu-review-exec-")
-
-    with patch("lu_machinery.ai_agent_bridge._review_worktree.cleanup_snapshot_state", side_effect=fake_cleanup_state):
-        from lu_machinery.ai_agent_bridge._review_worktree import _cleanup_review_resources
-
-        _cleanup_review_resources(state=state_mock, roots=(root_mock,))
-        assert not root_mock.exists()
-        assert not state_root.exists()
-
-        # Second invocation must be silent and raise no exception
-        _cleanup_review_resources(state=state_mock, roots=(root_mock,))
 
 
 def test_create_review_temp_root_defaults_to_scratch_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

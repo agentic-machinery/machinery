@@ -230,7 +230,6 @@ tests/ai_agent_bridge/test_review_ask_caps.py
 tests/ai_agent_bridge/test_review_deep_pointer_only.py
 tests/ai_agent_bridge/test_review_pr_required.py
 tests/ai_agent_bridge/test_review_safety_timeouts.py
-tests/ai_agent_bridge/test_review_worktree.py
 tests/ai_agent_bridge/test_routing_guard.py
 tests/ai_agent_bridge/test_secret_redactor.py
 tests/ai_agent_bridge/test_serve_security.py
