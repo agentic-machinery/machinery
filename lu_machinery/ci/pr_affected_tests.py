@@ -418,7 +418,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         else None
     )
     run = set(guards) if reason else set(selected)
-    if reason == BUDGET_REASON:
+    if reason and not infrastructure:
         # Over the safe budget: changed tests fill what the guards leave, cheapest
         # first, so the same rule bounds the mandatory selection and the importers.
         used = guard_estimate
@@ -469,7 +469,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
             run.add(p)
             budget += durations.get(p, default)
     timeout = min(CAP_SECONDS, max(TIMEOUT_SECONDS, math.ceil(budget * VARIANCE_RATIO))) if budget > used else TIMEOUT_SECONDS
-    if (set(imported) | set(readers)) - run:
+    if not reason and (set(imported) | set(readers)) - run:
         reason = BUDGET_REASON if fill_limit == SAFE_SECONDS else "recorded estimate exceeds 600 second cap"
     # A whole file already covers its pinned ids.
     run = sorted(p for p in run if "::" not in p or guard_file(p) not in run)

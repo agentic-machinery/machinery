@@ -358,10 +358,14 @@ def overflow_import_plan(tmp_path: Path, installed: tuple[Path, Path]) -> dict:
         "tests/test_beta.py": "def test_ok():\n    from scripts import runner\n    assert runner\n",
         "scripts/unrelated.py": "VALUE = 1\n",
         "tests/test_delta.py": "from scripts import unrelated\n\ndef test_ok():\n    assert unrelated\n",
-        "scripts/ci/pytest-file-durations.json": json.dumps(dict(zip(FILES, (100, 1, 350, 2), strict=True))),
+        "tests/test_epsilon.py": "def test_ok():\n    assert True\n",
+        "scripts/ci/pytest-file-durations.json": json.dumps({
+            **dict(zip(FILES, (100, 1, 450, 2), strict=True)), "tests/test_epsilon.py": 1,
+        }),
     })
     base = _git(root, "rev-parse", "HEAD^1")
     (root / "tests/test_gamma.py").write_text("def test_changed():\n    assert True\n", encoding="utf-8")
+    (root / "tests/test_epsilon.py").write_text("def test_changed():\n    assert True\n", encoding="utf-8")
     _git(root, "commit", "-am", "change a test too slow for the remaining PR budget")
     code = (
         "import json, sys; from lu_machinery.ci.pr_affected_tests import plan; "
@@ -375,9 +379,11 @@ def overflow_import_plan(tmp_path: Path, installed: tuple[Path, Path]) -> dict:
 def test_changed_test_budget_overflow_still_selects_function_from_import(overflow_import_plan: dict) -> None:
     """Defect class: an over-budget changed test suppresses an affordable function-level importer."""
     assert overflow_import_plan["importing_test_files"] == ["tests/test_beta.py"]
-    assert "tests/test_beta.py" in overflow_import_plan["run_files"]
+    assert overflow_import_plan["run_files"] == [
+        "tests/test_alpha.py", "tests/test_beta.py", "tests/test_epsilon.py",
+    ]
     assert overflow_import_plan["deferred_files"] == ["tests/test_gamma.py"]
-    assert overflow_import_plan["estimate_seconds"] == 161
+    assert overflow_import_plan["estimate_seconds"] == 162
     assert overflow_import_plan["estimate_seconds"] <= overflow_import_plan["safe_budget_seconds"]
 
 
