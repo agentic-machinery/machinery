@@ -621,9 +621,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
     status alone is unverifiable. A High-tier or security-sensitive change still needs that
     one recorded approval where the recorder is off. There is no second seat. A PR whose
     files change learner content takes its Ukrainian seats even with no Ukrainian verdict
-    recorded yet (#12181). A change to the
-    review output contract is refused until its canary evidence covers every reviewer route
-    (``scripts.review.contract_canary``, #12399).
+    recorded yet (#12181). Review-contract canaries are release acceptance, not a PR gate.
     """
     from lu_machinery.fleet_comms.review_publication import DEFAULT_STATUS_CONTEXT
     from lu_machinery.orchestration.integration_sweep import (
