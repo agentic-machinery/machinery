@@ -183,6 +183,15 @@ def git_records(*args: str, cwd: Path) -> list[str] | None:
     return output.split("\0")[:-1]
 
 
+def worktree_records(*args: str, root: Path) -> list[str] | None:
+    """``git_records`` for a listing of the checkout at ``root`` itself (machinery#22).
+
+    ``--work-tree`` outranks ``core.worktree``, so a setting written while the gate runs cannot point the
+    listing at another directory than the one validated.
+    """
+    return git_records(f"--work-tree={root}", *args, cwd=root)
+
+
 def parse_updates(text: str) -> list[Update]:
     updates = []
     for line in text.splitlines():
@@ -453,13 +462,13 @@ def reject_untracked_inputs(root: Path, head: str | None = None) -> str | None:
     """
     # Names stay byte for byte (``git_records``): a text-mode read turns CR and CRLF into LF, so a
     # deployed output would be looked up under, and hashed from, another name than the one Git listed.
-    listing = git_records("ls-files", "-z", "--others", "--", *OVERLAY_PATHSPECS, cwd=root)
+    listing = worktree_records("ls-files", "-z", "--others", "--", *OVERLAY_PATHSPECS, root=root)
     if listing is None:
         raise GateOutcome("state_unavailable", "cannot list untracked validation inputs", incomplete=True)
     candidates = [path for path in listing if path]
     tracked: set[str] = set()
     if any("node_modules" in Path(path).parts for path in candidates):
-        tracked_listing = git_records("ls-files", "-z", "--cached", cwd=root)
+        tracked_listing = worktree_records("ls-files", "-z", "--cached", root=root)
         if tracked_listing is None:
             raise GateOutcome("state_unavailable", "cannot list tracked dependency inputs", incomplete=True)
         tracked = set(tracked_listing)
@@ -494,7 +503,9 @@ def build_plan(update: Update, root: Path, launcher: str, config: str) -> Plan |
             f"{update.local_ref} ({update.local_sha[:12]}) is not the checked-out HEAD ({head[:12] or 'unknown'}); "
             "push from the worktree that has the commit checked out so the exact commit is the one validated",
         )
-    dirty = git_records("status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", cwd=root)
+    dirty = worktree_records(
+        "status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", root=root
+    )
     if dirty is None or dirty:
         raise GateOutcome("dirty_tree", "tracked files differ from the outgoing commit; commit or restore them first")
     deploy_manifest = reject_untracked_inputs(root, head)

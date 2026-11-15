@@ -928,3 +928,27 @@ def test_inputs_commit_plans_from_the_commit_not_the_checkout(deployed):
                                   str(deployed), "--check", "--inputs-commit", oid], capture_output=True, text=True,
                                  env=git_environment(), check=False)
         assert refused.returncode == 2 and "invalid deployment" in refused.stderr, refused.stderr
+
+
+@pytest.mark.parametrize("redirect", ["core-worktree", "replace-ref"])
+def test_inputs_commit_reads_ignore_worker_git_settings(deployed, redirect):
+    """Checkout Git settings changed during a check must not redirect what --inputs-commit reads."""
+    committed = (deployed / plan.DESCRIPTOR).read_bytes()
+    alternate = committed.replace(b'"required": true', b'"required": false')
+    # A committed copy under the checkout's own name: a lookup relative to the checkout's parent finds it.
+    write(deployed, f"{deployed.name}/{plan.DESCRIPTOR}", alternate)
+    commit_all(deployed, "an alternate descriptor")
+
+    def git(*arguments):
+        return subprocess.run(["git", "-C", str(deployed), *arguments], capture_output=True, text=True, check=True,
+                              env=git_environment()).stdout.strip()
+
+    head = git("rev-parse", "HEAD")
+    with plan.selected_tree(str(deployed), check=True) as tree:
+        if redirect == "core-worktree":
+            git("config", "core.worktree", str(deployed.parent))
+        else:
+            git("replace", git("rev-parse", f"HEAD:{plan.DESCRIPTOR}"), git("rev-parse", f"HEAD:{deployed.name}/{plan.DESCRIPTOR}"))
+        inputs = plan.CommitInputs(tree, head)
+        assert inputs.read(plan.DESCRIPTOR) == (committed, 0o644)
+        assert set(inputs.inventory("agents_extensions/claude")) == {"settings.json", "hooks/product.py"}
