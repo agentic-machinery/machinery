@@ -340,16 +340,29 @@ approval C-5541):
   Fleet verbs. A verb added to the broker later is refused for a private repository until it is listed.
   `github-read` is narrowed to the authorized PR and its checks: `pull`, `pr-files`, `commits`,
   `comments`, `reviews`, `timeline` and `issue` by that PR's number, `checks` and `commit` by the task's
-  branch tip or that PR's live head. The authorized PR is the one the task record names (`--pr`, a
-  review's PR), else the PR whose head is the dispatched branch, checked live. `run`, `jobs`,
-  `check-annotations` and any other PR or issue number are refused.
+  branch tip or that PR's live head. `run`, `jobs`, `check-annotations` and any other PR or issue
+  number are refused.
+- **One authorized PR (private role).** Every private PR operation (`github-read`, `pr-edit`,
+  `pr-comment`, `pr-merge`, `pr-ownership`, `review-dispatch`, `record-verdict`, `closeout-request`)
+  acts on one PR. With the task record's `--pr` (a review's PR, frozen into the launch), every operation
+  must name that number. Without it, the task's first PR operation binds its own PR, checked live: open,
+  in the task's repository (not a fork), its head the dispatched (or continued PR) branch and its base the
+  repository's default branch. The binding never moves for the rest of the run. A head branch name alone
+  never authorizes a PR: a closed or merged PR of a reused branch name, and a PR of the same branch
+  against another base, are refused.
+- **One hand-off audience (private role).** `fleet-publish` delivers only to `claude-cto` on channel
+  `cto`, fixed in the broker rather than taken from the request: another channel, another or an extra
+  recipient, and a publish with no recipients (it would reach every channel subscriber) are refused, and
+  `in_reply_to` must be a message this task published earlier in the run. Public tasks' publication is
+  unchanged.
 - **Unknown or unresolved origin.** Every GitHub verb is refused.
 
 Why this keeps private content in: the worker already holds its private checkout and reaches the public
 internet, so what A6 must stop is the host login moving private content somewhere the task does not
 already reach. Bound verbs only send the worker's own commits and texts back to its own private
 repository, and read back only its own PR and checks. Nothing names another repository (a named `repo`
-that differs is refused), another branch or another PR. The push scan, the publisher's content scan, the
+that differs is refused), another branch or another PR, and Fleet carries the worker's text only to its
+hand-off audience, so what it read of its own PR reaches no other seat. The push scan, the publisher's content scan, the
 credential isolation (no GitHub credential and no GitHub route inside) and the review and CI gates are the
 same for both roles. The read-only `gh` relay and the read-only AGY boundary stay public-only.
 
@@ -536,11 +549,15 @@ The task, dispatched with `--repo <private key>` and a fresh branch, runs these 
 
 - Step P1: commit one canary file and `git push origin HEAD`; open a draft PR with the publisher's
   `pr-create` (no `--repo`); start its review with `write_boundary call review-dispatch` on that PR at the
-  pushed head; publish one Fleet message with `write_boundary call fleet-publish`.
+  pushed head; publish one Fleet message to `claude-cto` on channel `cto` with `write_boundary call
+  fleet-publish`.
 - Step P2, negative controls: `git push origin HEAD:refs/heads/<another branch>`; `pr-create` and `push`
   naming another registered repository (`"repo": "<other OWNER/REPO>"`); `pr-comment` on an unrelated open
   PR of the private repository; `github-read` of an unrelated PR, of an issue number and of a workflow run
-  id (`run`). Each must be refused (`returncode` 2).
+  id (`run`); `pr-comment` and `github-read` of a closed (or merged) PR whose head branch has the task's
+  branch name, and of an open PR from the task's branch against another base (prepare both on the host
+  before the run and record their numbers); `pr-edit` of a PR other than the task's own; `fleet-publish`
+  to another channel and to another or an extra recipient. Each must be refused (`returncode` 2).
 
 The review it dispatches runs read-only and, in Step P3, reads its PR with `github-read` (`pull`,
 `pr-files`, `reviews`), its checks (`checks` at the pinned head), and once an unrelated PR number, which
@@ -552,10 +569,14 @@ must be refused.
 | Private PR create | Receipt `broker` lists `pr-create` with `returncode` 0; the PR's head is the task's branch, its base the default branch, in the same repository | pass |
 | Private review dispatch | Receipt `broker` lists `review-dispatch` with `returncode` 0; the review task's record names the PR, the pinned head and the task as `initiator` | pass |
 | Reviewer reads | The review's receipt lists the Step P3 `github-read` calls of its own PR and checks with `returncode` 0, and the unrelated-PR read with `returncode` 2 | pass |
-| Fleet publication | Receipt `broker` lists `fleet-publish` with `returncode` 0, and the message is on the plane with the task id as sender | pass |
+| Fleet publication | Receipt `broker` lists `fleet-publish` with `returncode` 0, and the message is on the plane with the task id as sender, addressed to `claude-cto` on `cto` | pass |
 | Cross-repository refusal | The Step P2 requests naming another repository are refused; that repository's branches, PRs and comments are unchanged against its baseline | pass |
 | Wrong-branch refusal | The Step P2 push to another branch is refused; the private repository's branch list differs from the baseline only by the task's own branch | pass |
 | Unrelated-PR refusal | The Step P2 `pr-comment` and `github-read` of an unrelated PR, issue or run are refused; the unrelated PR has no new comment | pass |
+| Closed same-branch PR refusal | The Step P2 `pr-comment` and `github-read` of the closed PR with the task's branch name are refused; that PR has no new comment | pass |
+| Different-base PR refusal | The Step P2 `pr-comment` and `github-read` of the open different-base PR from the task's branch are refused; that PR has no new comment | pass |
+| Other-PR edit refusal | The Step P2 `pr-edit` of a PR other than the task's own is refused; that PR's title and body are unchanged | pass |
+| Fleet audience refusal | The Step P2 `fleet-publish` requests to another channel and to another or an extra recipient are refused; the plane has no message from the task outside `claude-cto` on `cto` | pass |
 | Zero unauthorized mutations | Against the baseline, the only changes on GitHub are the task's branch, its PR and the review's verdict comment on it | pass |
 
 Close the canary PR unmerged and delete its branch afterwards, as for the five routes. The evidence record

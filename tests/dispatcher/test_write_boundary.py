@@ -607,10 +607,16 @@ def broker(primary, tmp_path, monkeypatch):
     instance = write_boundary._Broker.__new__(write_boundary._Broker)
     instance.boundary = _Launch(repo, scratch, _git(worktree, "rev-parse", "HEAD"))
     instance.steps = []
+    instance.bound_pr, instance.published = None, set()
     instance.pulls = {7: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "main"},
                       9: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "release"},
+                      # Historical PRs of a reused branch name: the same head branch, an older head, the default base.
+                      10: {"state": "CLOSED", "headRefName": "task", "headRefOid": "4" * 40,
+                           "isCrossRepository": False, "baseRefName": "main"},
+                      11: {"state": "MERGED", "headRefName": "task", "headRefOid": "5" * 40,
+                           "isCrossRepository": False, "baseRefName": "main"},
                       8: {"state": "OPEN", "headRefName": "other", "headRefOid": "1" * 40, "isCrossRepository": False}}
     monkeypatch.setattr(write_boundary._Broker, "_repository_slug", lambda self: "owner/repo")
 
@@ -881,6 +887,65 @@ def test_private_repository_reads_only_the_authorized_pr_and_its_checks(broker):
                     {"name": "checks", "sha": "2" * 40}, {"name": "run", "number": 8}):
         assert "private repository" in _refused(lambda request=request: broker._github_read(request))
     assert [argv[1] for _module, argv in broker.steps] == ["reviews", "checks"]
+
+
+@pytest.mark.parametrize("foreign", [9, 10, 11], ids=["different-base", "closed-same-branch", "merged-same-branch"])
+@pytest.mark.parametrize("operation", ["read", "comment", "edit"])
+def test_private_repository_acts_only_on_its_one_bound_pr(broker, operation, foreign):
+    """Defect class: private PR identity leak. In a private repository a PR other than the task's own is read,
+    commented on or edited because its head branch has the dispatched branch's name (a closed or merged PR of a
+    reused branch, or an open PR against another base), or because the launch's --pr is not compared with the
+    named PR, so private content of another PR reaches the worker or another PR is changed (#565 round 1, F1)."""
+    broker.launch_repository = ("owner/repo", True)
+    call = {"read": lambda pr: broker._github_read({"name": "pull", "number": pr}),
+            "comment": lambda pr: broker._pr_comment({"pr": pr, "body": "x"}),
+            "edit": lambda pr: broker._pr_edit({"pr": pr, "title": "t"})}[operation]
+    # No launch PR: the same-named branch's other PR is never bound as the task's own.
+    _refused(lambda: call(foreign))
+    assert broker.bound_pr is None and broker.steps == []
+    # The open own PR against the default base binds; the binding then never moves to another PR.
+    assert call(7)["returncode"] == 0 and broker.bound_pr == 7
+    assert "own PR (7)" in _refused(lambda: call(foreign))
+    assert broker.bound_pr == 7 and len(broker.steps) == 1
+    # A launch --pr: every operation names that PR, whatever the named PR's branch.
+    broker.bound_pr, broker.boundary.args.pr = None, 7
+    broker.steps.clear()
+    _refused(lambda: call(foreign))
+    assert call(7)["returncode"] == 0 and len(broker.steps) == 1
+
+
+_HANDOFF = {"channel": "cto", "body": "hand-off", "idempotency_key": "k1", "recipients": ["claude-cto"]}
+
+
+@pytest.mark.parametrize("leak", [{"channel": "shared"}, {"recipients": ["claude-cto", "codex"]},
+                                  {"recipients": ["codex"]}, {"recipients": []}, {"recipients": None},
+                                  {"in_reply_to": "message-foreign"}],
+                         ids=["other-channel", "extra-recipient", "other-recipient", "no-recipients",
+                              "recipients-omitted", "foreign-reply"])
+def test_private_repository_publishes_only_to_its_frozen_handoff_audience(broker, monkeypatch, leak):
+    """Defect class: private audience leak. A private task's fleet-publish reaches a channel, recipient or thread
+    the request chose (another channel, an extra or other recipient, every channel subscriber when no recipient is
+    named, or a reply into a foreign message's conversation), so private PR content read through the broker
+    reaches a seat outside the task's hand-off audience; or the hand-off itself is refused (#565 round 1, F2)."""
+    published = []
+
+    def fleet(self, argv, stdin=None):
+        published.append(argv)
+        return {"returncode": 0, "stdout": json.dumps({"message_id": f"message-{len(published)}"}), "stderr": ""}
+
+    monkeypatch.setattr(write_boundary._Broker, "_fleet", fleet)
+    broker.launch_repository = ("owner/repo", True)
+    request = {key: value for key, value in {**_HANDOFF, **leak}.items() if value is not None}
+    assert "private repository" in _refused(lambda: broker._fleet_publish(request))
+    assert published == []
+    # The hand-off to the frozen audience is admitted, and so is a reply to the task's own earlier message.
+    assert broker._fleet_publish(_HANDOFF)["returncode"] == 0
+    assert broker._fleet_publish({**_HANDOFF, "idempotency_key": "k2", "in_reply_to": "message-1"})["returncode"] == 0
+    assert [argv[argv.index("--recipient") + 1] for argv in published] == ["claude-cto", "claude-cto"]
+    assert [argv[2] for argv in published] == ["cto", "cto"] and published[-1][-2:] == ["--in-reply-to", "message-1"]
+    # A public repository's publication is unchanged (#565 changes nothing for it).
+    broker.launch_repository = ("owner/repo", False)
+    assert broker._fleet_publish({**request, "idempotency_key": "k3"})["returncode"] == 0
 
 
 # -- the skills' own publish commands forward to the broker inside the boundary (#443) --------------------------------
