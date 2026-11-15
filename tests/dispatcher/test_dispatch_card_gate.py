@@ -6,12 +6,14 @@ from lu_machinery.dispatcher import git, store
 from tests.dispatcher.test_core_admission import admission_dispatch  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
-CARD = "## Outcome\nShip it.\n\n## Dependencies\n- #575 (dispatcher write boundary)\n- #12\n\n## Terminal goal\nmerge\n"
+# The sandbox repository's GitHub field is a local remote path, so the card names fully qualified references.
+OPEN, CLOSED = "learn-ukrainian/machinery#575", "learn-ukrainian/machinery#12"
 
 
 def _github(states, monkeypatch):
-    """Answer the dispatcher's GitHub issue reads from ``states``; a missing issue raises like a failed read."""
+    """Answer the dispatcher's GitHub issue reads from ``states``; a missing issue raises like a refused read."""
     def gh(*args, **_kwargs):
+        assert args[0] == "api" and args[1].startswith("repos/learn-ukrainian/machinery/issues/"), args
         number = int(args[1].rpartition("/")[2])
         if number not in states:
             raise git.GitHubRefused("GitHub admission refused the read")
@@ -20,45 +22,54 @@ def _github(states, monkeypatch):
     monkeypatch.setattr(git, "_gh", gh)
 
 
-def _card(tmp_path):
+def _card(tmp_path, *entries):
     path = tmp_path / "card.md"
-    path.write_text(CARD, encoding="utf-8")
+    lines = "".join(f"- {entry}\n" for entry in entries)
+    path.write_text(f"## Outcome\nShip it.\n\n## Dependencies\n{lines}\n## Terminal goal\nmerge\n", encoding="utf-8")
     return str(path)
 
 
-def test_open_dependency_is_refused_before_launch(admission_dispatch, tmp_path, monkeypatch, capsys):  # noqa: F811
-    """Defect class: a dispatch whose card names an open dependency is admitted."""
+def test_open_or_unparseable_dependency_is_refused_before_launch(admission_dispatch, tmp_path, monkeypatch, capsys):  # noqa: F811
+    """Defect class: a dispatch whose card names an open dependency (or one the gate cannot read as a reference) is admitted."""
     _github({575: "open", 12: "closed"}, monkeypatch)
-    assert admission_dispatch.dispatch("--task-card", _card(tmp_path), "--dry-run") == 2
+    card = _card(tmp_path, OPEN, CLOSED, "Follow-up for #12")
+    assert admission_dispatch.dispatch("--task-card", card, "--dry-run") == 2
     error = capsys.readouterr().err
-    assert "task_card_dependency_refused" in error and "#575 (open)" in error and "#12" not in error
+    assert "task_card_dependency_refused" in error
+    assert f"{OPEN} (open)" in error and "Follow-up for #12 (unparseable)" in error and f"{CLOSED} (" not in error
     assert admission_dispatch.spawned == []
 
 
 def test_override_admits_the_named_dependency_and_is_recorded(admission_dispatch, tmp_path, monkeypatch):  # noqa: F811
     """Defect class: the per-reference override admits the dispatch but the task record does not name it."""
     _github({575: "open", 12: "closed"}, monkeypatch)
-    assert admission_dispatch.dispatch("--task-card", _card(tmp_path), "--allow-open-dependency", "#575") == 0
+    assert admission_dispatch.dispatch("--task-card", _card(tmp_path, OPEN, CLOSED), "--allow-open-dependency", OPEN) == 0
     gate = store.read("adm-worker")["task_card"]
-    assert gate["allowed_open_dependencies"] == [gate["dependencies"][0]["ref"]]
-    assert gate["dependencies"][0]["ref"].endswith("#575") and gate["dependencies"][1]["state"] == "closed"
+    assert gate["dependencies"] == [{"ref": OPEN, "state": "open"}, {"ref": CLOSED, "state": "closed"}]
+    assert gate["allowed_open_dependencies"] == [OPEN]
 
 
 def test_github_read_failure_refuses_unless_that_reference_is_allowed(admission_dispatch, tmp_path, monkeypatch, capsys):  # noqa: F811
     """Defect class: a dependency whose state cannot be read is admitted (the gate fails open)."""
     _github({575: "closed"}, monkeypatch)
-    assert admission_dispatch.dispatch("--task-card", _card(tmp_path), "--dry-run") == 2
-    assert "#12 (unreadable (GitHubRefused))" in capsys.readouterr().err
-    assert admission_dispatch.dispatch("--task-card", _card(tmp_path), "--allow-open-dependency", "#12", "--dry-run") == 0
+    card = _card(tmp_path, OPEN, CLOSED)
+    assert admission_dispatch.dispatch("--task-card", card, "--dry-run") == 2
+    assert f"{CLOSED} (unreadable (GitHubRefused))" in capsys.readouterr().err
+    assert admission_dispatch.dispatch("--task-card", card, "--allow-open-dependency", CLOSED, "--dry-run") == 0
 
 
 def test_overlap_with_a_live_writer_by_directory_prefix_is_listed_and_refusable(admission_dispatch, monkeypatch, capsys):  # noqa: F811
     """Defect class: a live write task owning a directory is missed when the new task owns a file inside it."""
+    def writer(task_id, owned, repo="public", status="running", mode="workspace-write"):
+        return {"task_id": task_id, "status": status, "mode": mode, "repo": repo, "owned_paths": owned}
+
     live = [
-        {"task_id": "live-writer", "status": "running", "mode": "workspace-write", "owned_paths": ["docs/runbooks/"]},
-        {"task_id": "live-reader", "status": "running", "mode": "read-only", "owned_paths": ["docs/runbooks"]},
-        {"task_id": "done-writer", "status": "done", "mode": "workspace-write", "owned_paths": ["docs/runbooks"]},
-        {"task_id": "other-writer", "status": "running", "mode": "workspace-write", "owned_paths": ["docs/runbooks-old"]},
+        writer("live-writer", ["docs/runbooks/"]),
+        writer("live-reader", ["docs/runbooks"], mode="read-only"),
+        writer("done-writer", ["docs/runbooks"], status="done"),
+        writer("sibling-writer", ["docs/runbooks-old"]),
+        writer("glob-writer", ["docs/runbooks/*.py"]),
+        writer("other-repo-writer", ["docs/runbooks"], repo="private"),
     ]
     monkeypatch.setattr(store, "list_tasks", lambda *_a, **_k: live)
     owned = ("--owned-path", "docs/runbooks/dispatch.md")

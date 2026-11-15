@@ -439,8 +439,9 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
         )
 
 
-# ``#N`` or ``owner/repo#N``; a dependency line may hold several, the card flag and an override exactly one.
-_ISSUE_REF = r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#([1-9][0-9]*)"
+# ``#N`` or ``owner/repo#N``: the card flag, an override, and the only dependency entry the gate reads.
+_ISSUE_REF = re.compile(r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#([1-9][0-9]*)")
+_SLUG = re.compile(r"[A-Za-z0-9][\w.-]*/[\w.-]+")
 _DEPENDENCIES = re.compile(r"^##[ \t]+Dependencies[ \t]*$(.*?)(?=^#{1,6}[ \t]|\Z)", re.MULTILINE | re.DOTALL)
 
 
@@ -454,36 +455,27 @@ def card_dependencies(text: str) -> list[str] | None:
     return [line for line in lines if line and line.rstrip(".").casefold() != "none"]
 
 
-def _dependency_key(ref: str, repo: str) -> str:
-    """``owner/repo#N`` (``#N`` in ``repo``) for an issue reference; any other text is an exact title."""
-    match = re.fullmatch(_ISSUE_REF, ref.strip())
-    return f"{(match.group(1) or repo).casefold()}#{match.group(2)}" if match else ref.strip()
-
-
-def _dependency_state(key: str, repo: str) -> str:
-    """``open`` or ``closed``, read through the dispatcher's GitHub path; a title must match exactly one issue."""
-    if match := re.fullmatch(_ISSUE_REF, key):
-        return str(json.loads(git._gh("api", f"repos/{match.group(1)}/issues/{match.group(2)}"))["state"])
-    query = f'repo:{repo} in:title "{key.replace(chr(34), " ")}"'
-    items = json.loads(git._gh("api", "-X", "GET", "search/issues", "-f", f"q={query}"))["items"]
-    exact = [item["state"] for item in items if item["title"] == key]
-    if len(exact) != 1:
-        raise ValueError(f"title matches {len(exact)} issues")
-    return str(exact[0])
+def _dependency_key(entry: str, repo: str | None) -> str:
+    """``owner/repo#N`` for a reference standing alone (``#N`` in ``repo``); any other entry stays as written."""
+    match = _ISSUE_REF.fullmatch(entry.strip())
+    if match and (match.group(1) or (repo and _SLUG.fullmatch(repo))):
+        return f"{(match.group(1) or repo or '').casefold()}#{match.group(2)}"
+    return entry.strip()
 
 
 def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
-    """Refuse a dispatch whose task card names a dependency that is open or unreadable, unless allowed (#583).
+    """Refuse a dispatch whose task card names a dependency that is not closed, unless allowed (#583).
 
-    ``card`` is ``#N`` or ``owner/repo#N`` (the issue body is the card) or a card file; ``#N`` and titles in its
-    ``## Dependencies`` section belong to the card's repository. Each dependency that is not ``closed`` refuses
-    unless ``allowed`` names it (``--allow-open-dependency``). Returns the ``task_card`` record field.
+    ``card`` is ``#N`` or ``owner/repo#N`` (the issue body is the card) or a card file. Each entry of its
+    ``## Dependencies`` section must be ``#N`` (in the card's repository) or ``owner/repo#N`` alone on its line,
+    or ``none``. An entry that is open, unreadable or not such a reference refuses unless ``allowed``
+    (``--allow-open-dependency``) names it. Returns the ``task_card`` record field.
     """
-    match = re.fullmatch(_ISSUE_REF, card.strip())
+    match = _ISSUE_REF.fullmatch(card.strip())
     try:
         if match:
             repo = match.group(1) or repo
-            if not repo:
+            if not (repo and _SLUG.fullmatch(repo)):
                 raise ValueError("no GitHub repository")
             text = json.loads(git._gh("api", f"repos/{repo}/issues/{match.group(2)}"))["body"] or ""
         else:
@@ -493,15 +485,19 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
     lines = card_dependencies(text)
     if lines is None:
         raise ValueError(f"task_card_unreadable: {card} has no ## Dependencies section")
-    keys = [_dependency_key(ref, repo or "") for line in lines
-            for ref in ([m.group(0) for m in re.finditer(_ISSUE_REF, line)] or [line])]
-    allow = {_dependency_key(ref, repo or "") for ref in allowed}
+    allow = {_dependency_key(entry, repo) for entry in allowed}
     dependencies, refused = [], []
-    for key in dict.fromkeys(keys):
-        try:
-            state = _dependency_state(key, repo or "")
-        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
-            state = f"unreadable ({type(exc).__name__})"
+    for key in dict.fromkeys(_dependency_key(line, repo) for line in lines):
+        if (reference := _ISSUE_REF.fullmatch(key)) is None:
+            state = "unparseable"
+        elif reference.group(1) is None:
+            state = "unreadable (no GitHub repository)"
+        else:
+            try:
+                issue = json.loads(git._gh("api", f"repos/{reference.group(1)}/issues/{reference.group(2)}"))
+                state = str(issue["state"])
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                state = f"unreadable ({type(exc).__name__})"
         dependencies.append({"ref": key, "state": state})
         if state != "closed" and key not in allow:
             refused.append(f"{key} ({state})")
@@ -512,21 +508,31 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             "allowed_open_dependencies": [d["ref"] for d in dependencies if d["state"] != "closed"]}
 
 
-def owned_path_overlap(owned_paths, task_id: str) -> list[str]:
-    """Live write tasks whose owned paths equal, contain or lie inside one of ``owned_paths``, by task id (#583)."""
-    from lu_machinery.dispatcher import ownership, scope
+def _claims_overlap(mine: str, theirs: str) -> bool:
+    """Whether two owned-path claims can own a common path: either claim owns the other as written.
 
-    mine = [root for root in map(scope.literal_root, owned_paths) if root]
+    A literal claim owns itself and everything below it, so literal claims overlap when one is the other
+    or a directory above it; a wildcard claim is matched by the shared ownership predicate.
+    """
+    from lu_machinery.guardrails.delegate_ownership import normalize_claim, path_is_owned
+
+    return path_is_owned(normalize_claim(mine).norm, [theirs]) or path_is_owned(normalize_claim(theirs).norm, [mine])
+
+
+def owned_path_overlap(owned_paths, task_id: str, repo_key: str) -> list[str]:
+    """Live write tasks of repository ``repo_key`` with an owned path overlapping one of ``owned_paths`` (#583)."""
+    from lu_machinery.dispatcher import ownership
+
     found = []
     for record in store.list_tasks():
-        if record.get("status") not in store.ACTIVE or record.get("mode") == "read-only" or record.get("task_id") == task_id:
+        if (record.get("status") not in store.ACTIVE or record.get("mode") == "read-only"
+                or record.get("task_id") == task_id or record.get("repo") != repo_key):
             continue
         try:
             theirs = ownership.effective_scope(record)
         except ValueError:
             theirs = record.get("owned_paths") or []
-        roots = [root for path in theirs if isinstance(path, str) and (root := scope.literal_root(path))]
-        if any(a == b or a.startswith(b + "/") or b.startswith(a + "/") for a in mine for b in roots):
+        if any(_claims_overlap(a, b) for a in owned_paths for b in theirs if isinstance(b, str)):
             found.append(record["task_id"])
     return sorted(found)
 

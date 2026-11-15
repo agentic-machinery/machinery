@@ -225,13 +225,15 @@ become a second coordination plane.
 #### Task-card dependencies and owned-path overlap
 
 `--task-card '#N'` (also `owner/repo#N` or a staged card file) reads the card's
-`## Dependencies` section and refuses the dispatch, before anything is created,
-while a listed `#N`, `owner/repo#N` or exact same-repository issue title is open
-or its state cannot be read; `--allow-open-dependency '#N'` admits that one
-reference, and the task record's `task_card` field names it. Every write dispatch
-with owned paths prints the live write tasks whose owned paths equal, contain or
-lie inside its own and records them as `owned_path_overlap`;
-`--refuse-on-overlap` refuses it instead. Both run under `--dry-run` (#583).
+`## Dependencies` section, where each line is `#N` or `owner/repo#N` alone, or
+`none`. Before anything is created, it refuses the dispatch while a listed issue
+or PR is open, its state cannot be read, or a line is anything else;
+`--allow-open-dependency '#N'` (or the exact line) admits that one entry, and the
+task record's `task_card` field names it. Every write dispatch with owned paths
+prints the live write tasks of the same repository whose owned paths overlap its
+own (the same path, a directory above or below it, or a matching pattern) and
+records them as `owned_path_overlap`; `--refuse-on-overlap` refuses it instead.
+Both run under `--dry-run` (#583).
 
 #### Sibling-repo dispatch
 

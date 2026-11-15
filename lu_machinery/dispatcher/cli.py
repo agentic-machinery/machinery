@@ -171,19 +171,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--task-card", metavar="CARD",
-        help="Task card, e.g. '#583', learn-ukrainian/machinery#583 or a card file: refuse while a #N, owner/repo#N "
-        "or exact same-repository title in its '## Dependencies' section is open or unreadable; the record names "
-        "the dependencies (default: no card, no check)",
+        help="Task card, e.g. '#583', learn-ukrainian/machinery#583 or a card file. Each '## Dependencies' line must "
+        "be #N or owner/repo#N alone, or 'none'; refuse while one is open, unreadable or another line. The record "
+        "names the dependencies (default: no card, no check)",
     )
     dispatch.add_argument(
         "--allow-open-dependency", action="append", default=[], metavar="REF",
-        help="Admit this open or unreadable --task-card dependency, e.g. '#575'; recorded in the task record "
-        "(repeatable; default: none)",
+        help="Admit this open, unreadable or unparseable --task-card dependency, e.g. '#575' or the exact line; "
+        "recorded in the task record (repeatable; default: none)",
     )
     dispatch.add_argument(
         "--refuse-on-overlap", action="store_true",
-        help="Refuse a write task whose owned paths equal, contain or lie inside a live write task's; the overlap "
-        "is always printed and recorded (default: off)",
+        help="Refuse a write task whose owned paths overlap a live write task's in the same repository (same path, "
+        "directory above or below, or matching pattern); the overlap is always printed and recorded (default: off)",
     )
     dispatch.add_argument("--dry-run", action="store_true", help="Print plan; create nothing (default: off)")
     dispatch.add_argument("--print-advisory-binding", action="store_true",
@@ -459,7 +459,7 @@ def _dispatch(args) -> int:
     if args.task_card:
         gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
     if args.mode != "read-only" and args.owned_path:
-        overlap = checks.owned_path_overlap(args.owned_path, task_id)
+        overlap = checks.owned_path_overlap(args.owned_path, task_id, info["key"])
         if overlap:
             print(f"dispatcher: owned paths overlap live write tasks: {', '.join(overlap)}", file=sys.stderr)
             if args.refuse_on_overlap:
