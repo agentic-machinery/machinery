@@ -26,8 +26,9 @@ case "${1-}" in
 esac
 
 repo_root="$(git rev-parse --show-toplevel)"
-# This installer's checkout-relative path, from its own location, for the rerun hints.
-installer_rel="$(basename "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/install_git_hooks.sh"
+# The machinery tree that holds this installer, and its absolute path for the rerun hints.
+installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+installer_path="$installer_dir/install_git_hooks.sh"
 tracked_hooks_dir="$repo_root/.githooks"
 if [[ ! -d "$tracked_hooks_dir" ]]; then
     echo "Tracked hooks directory not found at $tracked_hooks_dir" >&2
@@ -106,29 +107,27 @@ is_current_delegator() {
 
 # Hook types .pre-commit-config.yaml asks to run, from a real YAML parse
 # (default_install_hook_types, default_stages, and every hook's stages).
+# The selector and the stage reader come from the machinery tree that holds
+# this installer (the installed release in a consumer checkout), never from the
+# consumer's checkout. Roots and interpreter follow the hook boundary
+# (project_hook_context_resolve): a configured LEARN_UKRAINIAN_PRIMARY_REPO_ROOT
+# is required, and the interpreter is LEARN_UKRAINIAN_PYTHON when set, else that
+# validated primary's .venv/bin/python. The caller runs this in a subshell, so
+# the roots it exports do not leak into the rest of the installer.
 declared_stages() {
-    local config="$1" source_root interpreter python git_common_dir main_root
-    # Same selector the tracked hooks use (.githooks/_lib.sh): the checkout's
-    # lib/project_interpreter.sh, or the primary checkout's copy when this
-    # worktree does not hold one.
-    source_root="$repo_root"
-    if [[ ! -f "$source_root/lu_machinery/lib/project_interpreter.sh" ]]; then
-        git_common_dir="$(git rev-parse --git-common-dir)"
-        if [[ "$git_common_dir" != /* ]]; then
-            git_common_dir="$repo_root/$git_common_dir"
-        fi
-        main_root="$(cd "$git_common_dir/.." && pwd -P)"
-        source_root="$main_root"
-    fi
-    interpreter="$source_root/lu_machinery/lib/project_interpreter.sh"
+    local config="$1" interpreter
+    interpreter="$installer_dir/lib/project_interpreter.sh"
     if [[ ! -f "$interpreter" ]]; then
         echo "Git hook installer: project interpreter selector not found at $interpreter" >&2
         return 127
     fi
     # shellcheck source=lu_machinery/lib/project_interpreter.sh
     source "$interpreter"
-    python="$(project_interpreter_resolve "$repo_root")" || return 127
-    (cd "$repo_root" && "$python" lu_machinery/pre_commit/declared_hook_stages.py "$config")
+    if ! project_hook_context_resolve "$repo_root"; then
+        echo "Git hook installer: hook context unavailable (step=${PROJECT_HOOK_BOOTSTRAP_STEP:-unknown}); configure LEARN_UKRAINIAN_PRIMARY_REPO_ROOT and the project interpreter" >&2
+        return 127
+    fi
+    project_python_run "$LEARN_UKRAINIAN_PYTHON" -m "$PROJECT_PACKAGE.pre_commit.declared_hook_stages" "$config"
 }
 
 run_check() {
@@ -158,7 +157,7 @@ run_check() {
             echo "$hook_name: UNSAFE — $wrapper is a symlink" >&2
             failures=$((failures + 1))
         elif [[ -f "$wrapper" ]] && grep -qF "$entire_marker" "$wrapper"; then
-            echo "$hook_name: RETIRED — $wrapper is an Entire CLI wrapper (rerun $installer_rel)" >&2
+            echo "$hook_name: RETIRED — $wrapper is an Entire CLI wrapper (rerun $installer_path)" >&2
             failures=$((failures + 1))
         fi
     done
@@ -175,7 +174,7 @@ run_check() {
         elif [[ -f "$wrapper" ]] && grep -qF "$entire_marker" "$wrapper"; then
             : # reported as RETIRED above
         else
-            echo "$stage: UNREACHABLE — $wrapper does not run the current repo delegator (rerun $installer_rel)" >&2
+            echo "$stage: UNREACHABLE — $wrapper does not run the current repo delegator (rerun $installer_path)" >&2
             failures=$((failures + 1))
         fi
     done <<<"$stages"
