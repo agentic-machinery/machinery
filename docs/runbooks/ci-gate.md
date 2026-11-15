@@ -307,10 +307,9 @@ files; those are imported only with `import type`, which the compiler erases.
 - Within a shard, `-n logical --dist=worksteal` spreads single tests over the
   runner's cores, so one long file no longer pins a shard. The old workflow
   used `--dist=loadfile`, so tests of one file never overlapped. Tests that
-  share a fixed resource must now serialize themselves: the two fixed-port
-  smokes in `tests/test_work_dashboard_private_integration.py` take a file
-  lock in the run's shared temp root. Without the lock, one of them skipped
-  with "ports busy" in every new-workflow run.
+  share a fixed resource must now serialize themselves, for example with a
+  file lock in the run's shared temp root. Two fixed-port smokes without such
+  a lock once skipped with "ports busy" in every new-workflow run.
 - Weights never change which files run; a wrong weight only costs balance.
   `Refresh pytest durations` takes the median of the last five successful
   merge-group `pytest-file-durations` artifacts (downloaded concurrently),
@@ -418,23 +417,6 @@ The history shard keeps full Git history: eight pinned test files read history
 by `lu_machinery/ci/split_tests.py`).
 Other shards are shallow. #9211 rejected blobless checkout because those
 history readers need the committed blobs as well as the commit graph.
-
-## Cloud advisory runner dependency parity (#6977 slice A)
-
-`lu_machinery/ci/cursor_cloud_full_pytest.sh` (the offline-verifiable Cursor cloud
-pytest prototype; see `docs/design/2026-09-06-cloud-agent-pytest-advisory.md`)
-mirrors the `python-ci-env` install: same lockfile exclude set
-(`torch`/`torchvision`/`open_clip_torch`/`stanza`), `uv pip` when available,
-`packages/v4-runtime --no-build-isolation` + `build_assets.py`, and an
-unconditional hard-fail manifest hydrate. It also requires
-`LEARN_UKRAINIAN_CP_PG_DSN` whenever control-plane tests are selected, and
-detects (never sudo-installs) the native deps `lu_machinery/ci/start_postgres.sh`
-provisions (`bubblewrap`, `libpq`). It plans node-ID shards with
-`lu_machinery/ci/pytest_shards.py` (`plan` / `run` / `verify-artifacts`), which
-GitHub Actions no longer uses. **When the CI dependency install changes,
-update the runner script to match** — a drifted runner is a false-green risk.
-Runner ↔ CI parity is covered offline by
-`tests/ci/test_cursor_cloud_pytest_verify.py`.
 
 ## Advisory component shadow (#9721 slice 6)
 

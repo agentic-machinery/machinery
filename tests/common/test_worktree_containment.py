@@ -832,3 +832,33 @@ def test_deferred_trap_envfile_cannot_clear_uv_context(layout: Layout, timing: s
         timeout=60,
     )
     assert result.returncode == 2, result.stderr
+
+
+@pytest.mark.parametrize("invalid", ["worktree", "relative", "missing", "nongit", "symlinked_git", "commondir"])
+def test_primary_guard_refuses_invalid_mandatory_authority(layout: Layout, invalid: str):
+    """An invalid mandatory primary must not be replaced by an otherwise valid product."""
+    primary = layout.main
+    value = {
+        "worktree": str(layout.dispatch_wt), "relative": ".", "missing": str(layout.outside / "missing"),
+        "nongit": str(layout.outside),
+    }.get(invalid, str(primary))
+    if invalid == "symlinked_git":
+        original = primary / ".git"
+        moved = layout.outside / "git-metadata"
+        original.rename(moved)
+        original.symlink_to(moved, target_is_directory=True)
+    elif invalid == "commondir":
+        (primary / ".git/commondir").write_text(".\n")
+    environment = _clean_env()
+    environment.update(LU_PRODUCT_ROOT=str(primary), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=value)
+    environment.pop("LEARN_UK_ALLOW_PRIMARY_WRITE", None)
+    hook = Path(__file__).resolve().parents[2] / "agents_extensions/shared/hooks/guard-primary-checkout-write.py"
+    result = subprocess.run(
+        [sys.executable, str(hook)], cwd=layout.dispatch_wt, env=environment,
+        input=json.dumps({"tool_name": "Write", "cwd": str(layout.dispatch_wt),
+                          "tool_input": {"file_path": str(primary / "tracked.txt")}}),
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "product_root_unavailable" in result.stderr
+    assert (primary / "tracked.txt").read_text() == "tracked\n"

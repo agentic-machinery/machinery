@@ -265,3 +265,53 @@ def test_a_published_verdict_naming_a_never_started_run_is_refused():
     crashed = crashed_without_reply("never-started", APPROVED, minute=1, publish=True)
     with pytest.raises(LineageRefused, match="published verdict of task never-started has no review run on record"):
         lineage(crashed)
+
+
+def _crashed(task, *, provider_pgid=None, result_sha256=None, include_provider=True, status="crashed"):
+    """A terminal run with no reply. Provider fields are omitted when ``include_provider`` is false."""
+    record = {
+        "task_id": task,
+        "worktree_base_sha": EARLY,
+        "pinned_head": EARLY,
+        "model": "gpt-6.1-sol",
+        "agent": "codex",
+        "started_at": started(4),
+        "status": status,
+        "review_profile": "code",
+    }
+    if include_provider:
+        record["provider_pgid"] = provider_pgid
+        record["result_sha256"] = result_sha256
+    return ReviewRun(task, record, None)
+
+
+def test_a_crashed_run_with_no_provider_pgid_and_no_reply_is_admitted():
+    """Defect class: a supervisor crash before any provider starts leaves no reply and blocks the lineage forever.
+
+    A terminal non-done run is admitted as carrying no verdict when ``provider_pgid`` is null or
+    absent and there is no result digest, which is the PR #12894 shape (status crashed, both null).
+    """
+    approve = review("sol-ok", APPROVED, "VERDICT: APPROVE", minute=1)
+    for name, run in (
+        ("null", _crashed("crashed-null")),
+        ("absent", _crashed("crashed-absent", include_provider=False)),
+    ):
+        seats, superseded = lineage(approve, (run, None))
+        assert seats == ["openai"], name
+        assert superseded == [], name
+
+
+@pytest.mark.parametrize(
+    "status,provider_pgid,result_sha256",
+    [("crashed", None, "ab" * 32), ("done", None, None)],
+    ids=["result-digest", "done-run"],
+)
+def test_a_missing_reply_without_proof_the_provider_never_ran_is_still_refused(status, provider_pgid, result_sha256):
+    """Defect class: a missing reply is admitted only for a non-done run whose record proves no provider ran.
+
+    A result digest means a provider may have produced a verdict, and a ``done`` run is unchanged.
+    """
+    approve = review("sol-ok", APPROVED, "VERDICT: APPROVE", minute=1)
+    missing = _crashed("missing-reply", provider_pgid=provider_pgid, result_sha256=result_sha256, status=status)
+    with pytest.raises(LineageRefused, match=rf"review task missing-reply \({status}\) has no reply on record"):
+        lineage(approve, (missing, None))

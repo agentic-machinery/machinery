@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -248,3 +249,95 @@ def test_invalid_bound_refuses_with_typed_runtime_error_before_spawn(boundary, t
                       tool_config=config, **_bound_kwargs())
     assert type(error.value).__name__ == "RulesCoreDeliveryError"
     assert boundary == []
+
+
+CORE_DIR = rules_core.source_path(rules_core.CORE_REL).parent
+
+
+@pytest.fixture
+def legacy_core_sources(tmp_path, monkeypatch):
+    # Keep the original assertion helper's combined-directory view while the
+    # loader reads fleet core and product addendum from their respective owners.
+    combined = tmp_path / "core-sources"
+    combined.mkdir()
+    for name, source in (
+        ("core.md", rules_core.source_path(rules_core.CORE_REL)),
+        ("core-curriculum.md", rules_core.source_path(rules_core.CONTENT_ADDENDUM_REL)),
+    ):
+        (combined / name).write_bytes(source.read_bytes())
+    monkeypatch.setitem(globals(), "CORE_DIR", combined)
+
+
+@pytest.fixture
+def missing_core(tmp_path, monkeypatch):
+    empty = tmp_path / "no-core"
+    empty.mkdir()
+    source_path = rules_core.source_path
+    monkeypatch.setattr(
+        rules_core, "source_path",
+        lambda rel, root=None: empty / "core.md" if rel == rules_core.CORE_REL else source_path(rel, root),
+    )
+    return empty
+
+
+def _msg() -> dict:
+    return {"from": "claude", "task_id": "t1", "type": "query", "content": "hello", "data": None}
+
+
+def _legacy_rows():
+    from lu_machinery.ai_agent_bridge import _prompts
+
+    return (
+        ("bridge-claude", lambda: _prompts.build_claude_prompt(_msg())),
+        ("bridge-claude-review", lambda: _prompts.build_claude_prompt(_msg(), review=True, review_branch="b")),
+        ("bridge-codex", lambda: _prompts.build_codex_prompt(_msg())),
+        ("bridge-agy", lambda: _prompts.build_agy_prompt(_msg())),
+        ("bridge-gemini", lambda: _prompts.build_gemini_prompt(_msg(), False, None, False, None)),
+    )
+
+
+def _anchors(seat: str) -> tuple[str, ...]:
+    first, last = rules_core.pillar_anchors(rules_core.core_text("core"))
+    if seat == "core":
+        return first, last
+    addendum = [
+        line for line in (CORE_DIR / "core-curriculum.md").read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    return first, last, addendum[0], addendum[-1]
+
+
+def _assert_core(context: str, seat: str, row: str, *, context_bytes: int | None = None) -> None:
+    assert len((CORE_DIR / "core.md").read_bytes()) <= 40_000
+    block = rules_core.core_block(seat)
+    # CONTENT-CEILING-1106: curriculum adds its source and separator, within one wrapper.
+    ceiling = 40_960
+    if seat == "content":
+        addendum = (CORE_DIR / "core-curriculum.md").read_text(encoding="utf-8").rstrip() + "\n"
+        ceiling += len(addendum.encode("utf-8")) + len(rules_core.FILE_SEP.encode("utf-8"))
+        ceiling += len("content") - len("core")
+    assert len(block.encode("utf-8")) <= ceiling, f"{row}: binding {seat} block exceeds {ceiling} bytes"
+    assert block in context, f"{row}: the exact {seat} block is not in the assembled context"
+    for anchor in _anchors(seat):
+        assert anchor in context, f"{row}: anchor {anchor!r} missing"
+    if seat == "core":
+        addendum_first = _anchors("content")[2]
+        assert addendum_first not in context, f"{row}: a core seat must not carry the curriculum addendum"
+    if context_bytes is None:
+        context_bytes = len(context.encode("utf-8"))
+    print(
+        f"[rules-core bytes] {row}: seat={seat} core_bytes={len(block.encode('utf-8'))} context_bytes={context_bytes}"
+    )
+
+@pytest.mark.parametrize("index", range(5))
+def test_legacy_bridge_builder_leads_with_the_core(index: int, legacy_core_sources) -> None:
+    row, build = _legacy_rows()[index]
+    prompt = build()
+    assert prompt.startswith(rules_core.core_block("core") + "\n\n"), row
+    _assert_core(prompt, "core", row)
+
+
+@pytest.mark.parametrize("index", range(5))
+def test_legacy_bridge_builder_without_the_core_refuses(index: int, missing_core: Path) -> None:
+    _, build = _legacy_rows()[index]
+    with pytest.raises(SystemExit, match=r"bridge: refused: .*core\.md"):
+        build()

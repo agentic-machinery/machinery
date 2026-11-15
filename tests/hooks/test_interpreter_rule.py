@@ -517,9 +517,10 @@ def test_project_python_and_githooks_follow_the_rule(tmp_path: Path) -> None:
     """The hook installer and the hooks use the selector, not a worktree venv.
 
     ``pre_commit/project_python.sh`` is gone. The installed ``install_git_hooks.sh``
-    sources ``lib/project_interpreter.sh`` and resolves for the worktree, as
-    ``.githooks/_lib.sh`` does. The checkout package is removed before CI runs
-    this file, so the installer is read from the installed package.
+    sources its own release's ``lib/project_interpreter.sh`` and resolves through
+    the hook boundary, as ``.githooks/_lib.sh`` does. The checkout
+    package is removed before CI runs this file, so the installer is read from
+    the installed package.
     The same function proves the tracked pre-push hook: a planted fixture value is refused, a clean
     push is allowed, and a missing scanner refuses the push.
     """
@@ -529,7 +530,7 @@ def test_project_python_and_githooks_follow_the_rule(tmp_path: Path) -> None:
     plain.write_text("", encoding="utf-8")
     installer = (machinery_root() / "install_git_hooks.sh").read_text(encoding="utf-8")
     assert "lu_machinery/lib/project_interpreter.sh" in installer
-    assert "project_interpreter_resolve" in installer
+    assert "project_hook_context_resolve" in installer
     assert "project_python.sh" not in installer
     assert not (SOURCE / "lu_machinery/pre_commit/project_python.sh").exists()
     selector = (
