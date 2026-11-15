@@ -2145,10 +2145,10 @@ def _read_through_broker(operation, repo, fields, *, paginate, slurp, cwd, env, 
         )
     payload = {"name": operation, **fields, **({"paginate": True} if paginate else {})}
     if repo or (env or {}).get("GH_REPO"):
-        dest = repository(cwd, _validated_environment(env), repo)
-        if dest == "unknown" or not dest.startswith("github.com/"):
+        host, _, slug = repository(cwd, _validated_environment(env), repo).partition("/")
+        if host != "github.com" or not slug:
             raise gate.PublishBlocked("OPSEC: read repository unresolved.")
-        payload["repo"] = dest.split("/", 1)[1]
+        payload["repo"] = slug
     reply = write_boundary.broker_call("github-read", payload)
     code = reply.get("returncode")
     code = code if type(code) is int and 0 <= code < 256 else 1
