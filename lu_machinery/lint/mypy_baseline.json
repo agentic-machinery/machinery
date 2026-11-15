@@ -1063,46 +1063,6 @@
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"None | str\", variable has type \"str\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"None | tuple[str, str]\", variable has type \"tuple[str, str]\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"int\", variable has type \"Signals\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "index",
-      "message": "Invalid index type \"Any | None\" for \"dict[str, set[int]]\"; expected type \"str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "index",
-      "message": "Unsupported target for indexed assignment (\"object\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "index",
-      "message": "Unsupported target for indexed assignment (\"object\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
-      "code": "operator",
-      "message": "Unsupported operand types for / (\"Path\" and \"None\")"
-    },
-    {
       "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"_RolloutRecord\", variable has type \"None\")"
@@ -8866,21 +8826,6 @@
       "path": "lu_machinery/review/seeds/score.py",
       "code": "union-attr",
       "message": "Item \"Clean\" of \"Clean | Seed\" has no attribute \"dimension\""
-    },
-    {
-      "path": "lu_machinery/review/snapshot.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bytes\""
-    },
-    {
-      "path": "lu_machinery/review/snapshot.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/review/snapshot.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
     },
     {
       "path": "lu_machinery/review/target_resolution.py",

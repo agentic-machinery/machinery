@@ -287,6 +287,5 @@ Use the dispatch's prescribed shared interpreter as `PROJECT_PYTHON`.
   tests/review/test_attempt_artifact_binding.py \
   tests/agent_runtime/test_acpx_adapter.py \
   tests/test_delegate_review_admission.py \
-  tests/ai_agent_bridge/test_review_worktree.py \
   -n 2 -q --tb=short
 ```

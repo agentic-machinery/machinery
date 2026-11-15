@@ -34,13 +34,6 @@ from ._ask_lifecycle import launch_background_ask, record_ask_failure, record_as
 from ._db import get_db, set_session
 from ._messaging import acknowledge, send_message
 from ._prompts import build_agy_prompt, require_core_or_exit
-from ._review_worktree import (
-    ReviewWorktreeError,
-    append_review_prompt_evidence,
-    provision_review_worktree,
-    review_target_from_message,
-    review_target_payload,
-)
 
 _DEFAULT_AGY_BRIDGE_TIMEOUT_SECONDS = 900
 _NO_TIMEOUT_AGY_BRIDGE_TIMEOUT_SECONDS = 24 * 60 * 60
@@ -519,7 +512,6 @@ def ask_agy(
         from_model=from_model,
         to_model=effective_model,
         effort=effort,
-        review_target=review_target_payload(review_branch, review_pr_number),
     )
     register_ask(msg_id)
     if background:
@@ -579,8 +571,7 @@ def process_for_agy(
         reason="the Antigravity CLI has no per-invocation effort control",
     )
 
-    review_target = review_target_from_message(msg) if review else None
-    if review or review_target is not None:
+    if review:
         # Defense in depth: process-ask may re-enter with review=true.
         raise ValueError(AGY_SEALED_REVIEW_UNSUPPORTED)
 
@@ -595,66 +586,29 @@ def process_for_agy(
         else:
             print(f"   Hard timeout: {timeout_val}s")
 
+    prompt = build_agy_prompt(msg)
+    # Bridge Q&A keeps an out-of-tree scratch cwd for write-mode containment
+    # and grants repository read access through repo_read_root (--add-dir).
+    tool_config = {
+        "bridge_repo_read": True,
+        "repo_read_root": str(_config.REPO_ROOT),
+    }
     try:
-        with provision_review_worktree(
-            review_target,
-            repo_root=_config.REPO_ROOT,
-            allow_local_fallback=bool(review),
-        ) as checkout:
-            prompt = build_agy_prompt(
-                msg,
-                review,
-                review_branch=checkout.branch if checkout else None,
-                review_pr_number=checkout.pr_number if checkout else None,
-                review_worktree_provisioned=checkout is not None,
-            )
-            # Reviews grant evidence-only snapshot access via --add-dir and
-            # isolation tool_config; never the primary checkout as surface.
-            # #5285: never --dangerously-skip-permissions on the review path;
-            # runner enforces OS sandbox when review_isolation is set.
-            if review:
-                if checkout is None:
-                    raise ReviewWorktreeError(
-                        "exact-target-required: review requires a sealed neutral "
-                        "snapshot; refusing primary checkout fallback"
-                    )
-                tool_config = checkout.isolation_tool_config("agy")
-                review_cwd = checkout.path
-            else:
-                tool_config = {
-                    "bridge_repo_read": True,
-                    "repo_read_root": str(_config.REPO_ROOT),
-                }
-                review_cwd = _agy_ask_scratch_cwd()
-            prompt = append_review_prompt_evidence(
-                prompt,
-                review=review,
-                checkout=checkout,
-                engine="agy",
-            )
-            result = agent_runner.invoke(
-                "agy",
-                prompt,
-                # Reviews use read-only accounting; non-review keeps danger for
-                # headless tool prompts (skip-permissions path).
-                mode="read-only" if review else "danger",
-                # Reviews run with cwd=sealed snapshot; non-review keeps
-                # out-of-tree scratch cwd for write-mode containment.
-                cwd=review_cwd,
-                model=model,
-                effort=effort,
-                task_id=msg["task_id"],
-                session_id=None,
-                tool_config=tool_config,
-                entrypoint="bridge",
-                hard_timeout=timeout_val,
-                stall_timeout=min(600, timeout_val),
-            )
-            if review and checkout is not None:
-                checkout.bind_review_result(result, engine="agy")
-    except ReviewWorktreeError as exc:
-        _handle_agy_error(msg, message_id, f"Agy review checkout failed: {exc}")
-        return None
+        result = agent_runner.invoke(
+            "agy",
+            prompt,
+            # Headless tool prompts need the skip-permissions path.
+            mode="danger",
+            cwd=_agy_ask_scratch_cwd(),
+            model=model,
+            effort=effort,
+            task_id=msg["task_id"],
+            session_id=None,
+            tool_config=tool_config,
+            entrypoint="bridge",
+            hard_timeout=timeout_val,
+            stall_timeout=min(600, timeout_val),
+        )
     except RateLimitedError as exc:
         _handle_agy_error(msg, message_id, f"Agy rate limited: {exc}")
         return None

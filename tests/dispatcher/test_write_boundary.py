@@ -607,10 +607,16 @@ def broker(primary, tmp_path, monkeypatch):
     instance = write_boundary._Broker.__new__(write_boundary._Broker)
     instance.boundary = _Launch(repo, scratch, _git(worktree, "rev-parse", "HEAD"))
     instance.steps = []
+    instance.bound_pr, instance.published, instance.pr_create_spent = None, set(), False
     instance.pulls = {7: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "main"},
                       9: {"state": "OPEN", "headRefName": "task", "headRefOid": instance.boundary.tip,
                           "isCrossRepository": False, "baseRefName": "release"},
+                      # Historical PRs of a reused branch name: the same head branch, an older head, the default base.
+                      10: {"state": "CLOSED", "headRefName": "task", "headRefOid": "4" * 40,
+                           "isCrossRepository": False, "baseRefName": "main"},
+                      11: {"state": "MERGED", "headRefName": "task", "headRefOid": "5" * 40,
+                           "isCrossRepository": False, "baseRefName": "main"},
                       8: {"state": "OPEN", "headRefName": "other", "headRefOid": "1" * 40, "isCrossRepository": False}}
     monkeypatch.setattr(write_boundary._Broker, "_repository_slug", lambda self: "owner/repo")
 
@@ -733,6 +739,55 @@ def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, p
     assert "default branch" in _refused(lambda: broker._push({"head": broker.boundary.tip}))
 
 
+_PRIVATE_URL = "https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git"
+
+
+@pytest.mark.parametrize(("url", "host", "scanned"), [
+    (_PRIVATE_URL, None, False),
+    ("https://github.com/example-owner/unregistered.git", None, True),
+    (_PRIVATE_URL, "tls-off-masked", True),
+    (_PRIVATE_URL, "rewritten", True),
+], ids=["private-exempt", "public-scanned", "private-tls-off-masked-by-host-config-scanned",
+        "private-rewritten-destination-scanned"])
+def test_host_push_scan_exempts_only_a_registered_private_destination(primary, monkeypatch, url, host, scanned):
+    """Defect classes: the broker's host push scan treats a registered private destination as public (it cannot
+    prove the transport's route and refuses every private push), or exempts a public destination from the scan,
+    or proves the route with configuration the transport does not use: host global or command-scope settings that
+    mask the repository's http.sslVerify=false, or a URL that a rewrite sends to another destination (#565)."""
+    _, worktree, _ = primary
+    tip = _git(worktree, "rev-parse", "HEAD")
+    monkeypatch.delenv("LU_OPSEC_REAL_GIT", raising=False)  # the broker's host environment carries no pin
+    if host == "tls-off-masked":  # only the repository's own configuration reaches the transport
+        _git(worktree, "config", "http.sslVerify", "false")
+        (Path(os.environ["HOME"]) / "global.gitconfig").write_text(f'[http "{url}"]\n\tsslVerify = true\n')
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(Path(os.environ["HOME"]) / "global.gitconfig"))
+        for name, value in {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.sslVerify",
+                            "GIT_CONFIG_VALUE_0": "true"}.items():
+            monkeypatch.setenv(name, value)
+    elif host == "rewritten":
+        _git(worktree, "config", "url.https://example.invalid/public.git.insteadOf", url)
+    real_run, seen = subprocess.run, {}
+
+    def run(argv, **kwargs):
+        if "-I" in argv:  # the real host push scan, in its own interpreter
+            seen["scan"] = real_run(argv, **kwargs)
+            return seen["scan"]
+        if "push" not in argv:
+            return real_run(argv, **kwargs)
+        seen["push"] = argv  # the transport is not run: nothing leaves the test
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    try:
+        write_boundary._git(worktree, "push", "--quiet", "--no-verify", "--porcelain",
+                            "--force-with-lease=refs/heads/task:", url, f"{tip}:refs/heads/task")
+    except write_boundary.Refused:
+        assert scanned  # a public scan may refuse (synthetic history or no matcher); a private push never is
+    assert (b"commit(s) scanned" in seen["scan"].stderr) is scanned, seen["scan"].stderr
+    if not scanned:
+        assert seen["scan"].returncode == 0 and os.path.isabs(seen["push"][0])
+
+
 def test_fetch_base_updates_only_the_default_branch_tracking_ref(broker, primary, tmp_path, monkeypatch):
     """Defect class: the fetch verb takes a request-chosen ref or refspec, or rewrites a tracking ref, so a worker
     fetches arbitrary remote state into the shared primary."""
@@ -826,6 +881,171 @@ def test_github_read_runs_only_named_reads_of_the_own_repository(broker):
     assert "positive id" in _refused(lambda: broker._github_read({"name": "pull", "number": "7; rm"}))
     assert broker._github_read({"name": "checks", "sha": broker.boundary.tip})["returncode"] == 0
     assert broker.steps[-1] == ("publish.github", ["read", "checks", "--repo", "owner/repo", "--sha", broker.boundary.tip])
+    # A public repository keeps its unnarrowed reads (#565 changes nothing for it): any run, issue or PR id.
+    for request in ({"name": "run", "number": 5}, {"name": "issue", "number": 99}, {"name": "pull", "number": 8},
+                    {"name": "checks", "sha": "2" * 40}):
+        assert broker._github_read(request)["returncode"] == 0
+    assert len(broker.steps) == 5
+
+
+def test_private_repository_refuses_cross_repository_publication(broker, primary, monkeypatch):
+    """Defect class: cross-repository publication. A private primary's push or PR create that names another
+    repository is published there (or on the private one instead of refused), or an origin that is no registered
+    repository gets any GitHub verb, so private content reaches a repository other than its own (#565, C-5541)."""
+    from lu_machinery.dispatcher import agy_sandbox
+
+    broker.launch_repository = ("owner/repo", True)
+    monkeypatch.setattr(write_boundary._Broker, "_remote", lambda self, slug: pytest.fail("a remote was resolved"))
+    tip = broker.boundary.tip
+    assert "repository" in _refused(lambda: broker._push({"head": tip, "repo": "owner/other"}))
+    assert "repository" in _refused(lambda: broker._pr_create({"title": "t", "body": "b", "repo": "owner/other"}))
+    assert broker.steps == [] and broker.boundary.fetched == []
+    # The launch freezes an origin outside the registry as a refusal, never as a repository to act on.
+    repo, _, _ = primary
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/unregistered.git")
+    monkeypatch.setattr(agy_sandbox, "public_repository", lambda name: False)
+    monkeypatch.setattr(agy_sandbox, "private_repository", lambda name: False)
+    frozen = write_boundary._Broker._resolve_repository(broker)
+    assert isinstance(frozen, write_boundary._BrokerRefusal) and "not a registered repository" in str(frozen)
+    monkeypatch.setattr(agy_sandbox, "private_repository", lambda name: name == "owner/unregistered")
+    assert write_boundary._Broker._resolve_repository(broker) == ("owner/unregistered", True)
+
+
+def test_private_repository_reads_only_the_authorized_pr_and_its_checks(broker):
+    """Defect class: private read scope leak. In a private repository github-read returns an unrelated PR, issue,
+    workflow run or check run (or checks of a commit that is not the task's), so a worker that reaches the public
+    internet reads private content beyond its own PR; or the authorized PR and its checks are refused (C-5541)."""
+    broker.launch_repository = ("owner/repo", True)
+    tip = broker.boundary.tip
+    # A write worker: the authorized PR is the one whose head is its dispatched branch, checked live.
+    for request in ({"name": "pull", "number": 7}, {"name": "comments", "number": 7}, {"name": "checks", "sha": tip},
+                    {"name": "commit", "sha": tip}):
+        assert broker._github_read(request)["returncode"] == 0, request
+    for request in ({"name": "pull", "number": 8}, {"name": "issue", "number": 99}, {"name": "run", "number": 5},
+                    {"name": "jobs", "number": 5}, {"name": "check-annotations", "number": 5},
+                    {"name": "checks", "sha": "2" * 40}, {"name": "pull"}, {"name": "pull", "number": 7, "sha": tip}):
+        _refused(lambda request=request: broker._github_read(request))
+    assert [argv[1] for _module, argv in broker.steps] == ["pull", "comments", "checks", "commit"]
+    # A reviewer: the launch's --pr is the authorized PR; its live head's checks are readable too.
+    broker.steps.clear()
+    broker.boundary.args.mode, broker.boundary.args.pr = "read-only", 8
+    broker.boundary.tip = "3" * 40
+    assert broker._github_read({"name": "reviews", "number": 8})["returncode"] == 0
+    assert broker._github_read({"name": "checks", "sha": "1" * 40})["returncode"] == 0
+    for request in ({"name": "reviews", "number": 7}, {"name": "timeline", "number": 9},
+                    {"name": "checks", "sha": "2" * 40}, {"name": "run", "number": 8}):
+        assert "private repository" in _refused(lambda request=request: broker._github_read(request))
+    assert [argv[1] for _module, argv in broker.steps] == ["reviews", "checks"]
+
+
+@pytest.mark.parametrize(("operation", "foreign"), [
+    *((operation, foreign) for operation in ("read", "comment", "edit") for foreign in (9, 10, 11)),
+    ("create", "launch-pr"), ("create", "bound-pr-merged"), ("create", "second-create")],
+    ids=[*(f"{operation}-{name}" for operation in ("read", "comment", "edit")
+           for name in ("different-base", "closed-same-branch", "merged-same-branch")),
+         "create-after-launch-pr", "create-after-bound-pr-merged", "create-after-own-create"])
+def test_private_repository_acts_only_on_its_one_bound_pr(broker, monkeypatch, operation, foreign):
+    """Defect class: private PR identity leak. In a private repository a PR other than the task's own is read,
+    commented on or edited because its head branch has the dispatched branch's name (a closed or merged PR of a
+    reused branch, or an open PR against another base), or because the launch's --pr is not compared with the
+    named PR, so private content of another PR reaches the worker or another PR is changed (#565 round 1, F1).
+
+    Defect class: private second-PR creation. A private task's pr-create is admitted although it already has its
+    one authorized PR (the launch's --pr, or a bound PR since merged), or a second pr-create is admitted after its
+    first created PR, so the host login opens a PR outside the one-PR boundary (#565 round 2, F1)."""
+    broker.launch_repository = ("owner/repo", True)
+    if operation == "create":
+        _private_second_pr_creation(broker, monkeypatch, foreign)
+        return
+    call = {"read": lambda pr: broker._github_read({"name": "pull", "number": pr}),
+            "comment": lambda pr: broker._pr_comment({"pr": pr, "body": "x"}),
+            "edit": lambda pr: broker._pr_edit({"pr": pr, "title": "t"})}[operation]
+    # No launch PR: the same-named branch's other PR is never bound as the task's own.
+    _refused(lambda: call(foreign))
+    assert broker.bound_pr is None and broker.steps == []
+    # The open own PR against the default base binds; the binding then never moves to another PR.
+    assert call(7)["returncode"] == 0 and broker.bound_pr == 7
+    assert "own PR (7)" in _refused(lambda: call(foreign))
+    assert broker.bound_pr == 7 and len(broker.steps) == 1
+    # A launch --pr: every operation names that PR, whatever the named PR's branch.
+    broker.bound_pr, broker.boundary.args.pr = None, 7
+    broker.steps.clear()
+    _refused(lambda: call(foreign))
+    assert call(7)["returncode"] == 0 and len(broker.steps) == 1
+
+
+def _private_second_pr_creation(broker, monkeypatch, case: str) -> None:
+    """One private second-PR creation case of the test above: refused, and a first create still admitted and bound."""
+
+    def module(self, name, argv, key, stdin=None, cwd=None):
+        self.steps.append((name, argv))
+        created = "https://github.com/owner/repo/pull/12\n" if argv[0] == "pr-create" else ""
+        return {"returncode": 0, "stdout": created, "stderr": ""}
+
+    def creates() -> list[list[str]]:
+        return [argv for _name, argv in broker.steps if argv[0] == "pr-create"]
+
+    monkeypatch.setattr(write_boundary._Broker, "_module", module)
+    request = {"title": "Title", "body": "Body"}
+    # A continuation continues its branch's existing PR and never opens another.
+    broker.boundary.target = "refs/heads/assigned"
+    assert "continuation" in _refused(lambda: broker._pr_create(request))
+    broker.boundary.target = broker.boundary.branch
+    if case == "launch-pr":
+        broker.boundary.args.pr = 7
+        assert "own PR (7)" in _refused(lambda: broker._pr_create(request))
+        broker.boundary.args.pr = None
+    elif case == "bound-pr-merged":
+        # The reviewer's probe: PR 7 bound, then merged, then the branch moves on; another PR is never opened.
+        assert broker._pr_edit({"pr": 7, "title": "t"})["returncode"] == 0 and broker.bound_pr == 7
+        broker.pulls[7] = {**broker.pulls[7], "state": "MERGED"}
+        broker.boundary.tip = "6" * 40
+        assert "own PR (7)" in _refused(lambda: broker._pr_create(request))
+        assert broker.bound_pr == 7
+        broker.bound_pr = None
+    assert creates() == []
+    # With no authorized PR the first create is admitted, and the PR it returns is bound before the next request.
+    assert broker._pr_create(request)["returncode"] == 0 and broker.bound_pr == 12
+    assert "own PR (12)" in _refused(lambda: broker._pr_create(request))
+    if case == "second-create":
+        # Even when the first create's PR number was never printed (so nothing was bound), the create is spent.
+        broker.bound_pr = None
+        assert "at most one PR" in _refused(lambda: broker._pr_create(request))
+    assert len(creates()) == 1
+
+
+_HANDOFF ={"channel": "cto", "body": "hand-off", "idempotency_key": "k1", "recipients": ["claude-cto"]}
+
+
+@pytest.mark.parametrize("leak", [{"channel": "shared"}, {"recipients": ["claude-cto", "codex"]},
+                                  {"recipients": ["codex"]}, {"recipients": []}, {"recipients": None},
+                                  {"in_reply_to": "message-foreign"}],
+                         ids=["other-channel", "extra-recipient", "other-recipient", "no-recipients",
+                              "recipients-omitted", "foreign-reply"])
+def test_private_repository_publishes_only_to_its_frozen_handoff_audience(broker, monkeypatch, leak):
+    """Defect class: private audience leak. A private task's fleet-publish reaches a channel, recipient or thread
+    the request chose (another channel, an extra or other recipient, every channel subscriber when no recipient is
+    named, or a reply into a foreign message's conversation), so private PR content read through the broker
+    reaches a seat outside the task's hand-off audience; or the hand-off itself is refused (#565 round 1, F2)."""
+    published = []
+
+    def fleet(self, argv, stdin=None):
+        published.append(argv)
+        return {"returncode": 0, "stdout": json.dumps({"message_id": f"message-{len(published)}"}), "stderr": ""}
+
+    monkeypatch.setattr(write_boundary._Broker, "_fleet", fleet)
+    broker.launch_repository = ("owner/repo", True)
+    request = {key: value for key, value in {**_HANDOFF, **leak}.items() if value is not None}
+    assert "private repository" in _refused(lambda: broker._fleet_publish(request))
+    assert published == []
+    # The hand-off to the frozen audience is admitted, and so is a reply to the task's own earlier message.
+    assert broker._fleet_publish(_HANDOFF)["returncode"] == 0
+    assert broker._fleet_publish({**_HANDOFF, "idempotency_key": "k2", "in_reply_to": "message-1"})["returncode"] == 0
+    assert [argv[argv.index("--recipient") + 1] for argv in published] == ["claude-cto", "claude-cto"]
+    assert [argv[2] for argv in published] == ["cto", "cto"] and published[-1][-2:] == ["--in-reply-to", "message-1"]
+    # A public repository's publication is unchanged (#565 changes nothing for it).
+    broker.launch_repository = ("owner/repo", False)
+    assert broker._fleet_publish({**request, "idempotency_key": "k3"})["returncode"] == 0
 
 
 # -- the skills' own publish commands forward to the broker inside the boundary (#443) --------------------------------
@@ -844,15 +1064,18 @@ _FORWARDED = {
 }
 
 
-@pytest.mark.parametrize("target", ["own", "foreign", "private"])
+@pytest.mark.parametrize("target", ["own", "foreign", "private", "private-foreign"])
 @pytest.mark.parametrize("operation", sorted(_FORWARDED))
 def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary, tmp_path, monkeypatch, operation,
                                                                          target, push_sandbox):  # noqa: F811
     """Defect class: inside the boundary the commands the skills name (git push, the publisher's PR verbs) do not
     reach the broker, so every worker is stuck at its first publish; or they reach it aimed at another branch or PR
-    and the broker publishes there (or silently on the worker's own branch instead) rather than refusing; or the
-    primary is a registered private repository and the host login still acts on it for a worker that reaches the
-    public internet (decision A6)."""
+    and the broker publishes there (or silently on the worker's own branch instead) rather than refusing.
+
+    The private targets are a registered private primary (#565, C-5541). Defect class "private worker cannot
+    publish": its own branch, PR and default base are refused, so a private-repository worker ends
+    no_deliverable. Defect class "wrong-branch publication": a private primary's push to a branch other than the
+    dispatched one (or a PR verb on another branch's PR) reaches GitHub."""
     import sys
 
     from lu_machinery.dispatcher import agy_sandbox
@@ -862,9 +1085,9 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(push_sandbox.root))
     monkeypatch.setattr(write_boundary, "machinery_path", lambda relative: push_sandbox.root / "lu_machinery" / relative)
     slug = "owner/repo"
-    if target == "private":  # the registry's own private entry, checked by the real eligibility rule
+    if target.startswith("private"):  # the registry's own private entry, checked by the real eligibility rules
         slug = next(item.github for item in load_fleet_repos().values() if item.role.startswith("private-"))
-        assert not agy_sandbox.public_repository(slug)
+        assert not agy_sandbox.public_repository(slug) and agy_sandbox.private_repository(slug)
     else:
         monkeypatch.setattr(agy_sandbox, "public_repository", lambda name: name == "owner/repo")
     _git(repo, "remote", "add", "origin", f"https://github.com/{slug}.git")
@@ -889,8 +1112,7 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
         argv) or {"returncode": 0, "stdout": "published\n", "stderr": ""})
     body = tmp_path / "body.md"
     body.write_text("Body\n")
-    # A private primary gets the own-target command: only the repository's eligibility refuses it.
-    command = _FORWARDED[operation][target == "foreign"].format(py=sys.executable, body=body, tip=tip)
+    command = _FORWARDED[operation][target.endswith("foreign")].format(py=sys.executable, body=body, tip=tip)
     code = write_boundary.main([
         "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
         "--receipt", str(receipt), "--author-model", "claude-opus-5-5", "--",
@@ -901,17 +1123,15 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     exit_code, output = int((worktree / "code.txt").read_text()), (worktree / "out.txt").read_text()
     requests = [(row["verb"], row["returncode"]) for row in result["broker"]]
     remote_refs = _git(tmp_path, "--git-dir", str(remote), "for-each-ref", "--format=%(objectname) %(refname)")
-    if target == "own":
+    if not target.endswith("foreign"):
         assert exit_code == 0 and requests == [(operation, 0)], output
         if operation == "push":
             assert remote_refs == f"{tip} refs/heads/task" and steps == []
         else:
-            assert steps and steps[-1][0] == operation and steps[-1][steps[-1].index("--repo") + 1] == "owner/repo"
+            assert steps and steps[-1][0] == operation and steps[-1][steps[-1].index("--repo") + 1] == slug
     else:
         assert exit_code != 0 and requests == [(operation, 2)] and "refused" in output, output
         assert steps == [] and remote_refs == ""
-        if target == "private":
-            assert "not a registered public repository" in result["broker"][0]["refused"], result["broker"]
 
 
 def test_boundary_commit_of_an_owned_path_succeeds_and_an_unowned_path_is_refused(primary, monkeypatch):
