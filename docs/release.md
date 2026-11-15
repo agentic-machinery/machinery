@@ -30,8 +30,9 @@ gh run list -R learn-ukrainian/machinery --branch main --workflow "CI Gate" --li
   --json headSha,conclusion,status,databaseId,event
 ```
 
-The two SHAs must differ. The CI Gate row for `origin/main` must be
-`conclusion: success`. If either is not, do not cut.
+The two SHAs must differ. The CI Gate row for `$SHA`, the commit being
+tagged (Changelog, last step), must be `conclusion: success`. If either is
+not, do not cut.
 
 ## Rollback
 
@@ -71,6 +72,13 @@ The release worker is the only writer. Worker PRs do not edit
    date) with the `<a id="v$V"></a>` anchor line above it, leave
    `Unreleased` empty, and add the `[$V]` compare link at the bottom
    (`compare/v<previous>...v$V`; `Unreleased` compares `v$V...HEAD`).
+4. The release PR is the last PR in the release: `$SHA` is its merge commit,
+   and PRs merged after it ride the next train. It was written against an
+   earlier `main`, so at cut time list the exact range being tagged,
+   `git log --first-parent --format='%s' "v<previous>..$SHA"`. Every PR it
+   lists, other than the release PR, must have an entry or have been left out
+   under step 2. If one is missing, land a changelog-only PR that adds it,
+   set `$SHA` to that PR's merge commit, and repeat this step.
 
 The `/machinery` page links the installed version to
 `CHANGELOG.md#v<version>` on `main`, so the anchor line is required.
@@ -105,7 +113,7 @@ It fails when a dependency in `pyproject.toml` has no pin.
 
 ## Cut a release
 
-From the `main` commit identified above, with `$V` the version in
+From `$SHA`, the commit identified under Changelog, with `$V` the version in
 `pyproject.toml` and `$SHA` the full commit:
 
 1. Build once, outside any checkout, with the build pins of the
@@ -250,6 +258,20 @@ From the `main` commit identified above, with `$V` the version in
    and exercise lazy runtime paths. Running the agent deployer's plan and apply
    against a scratch consumer is one such path. Import alone is not
    acceptance.
+
+   Last, collect the consumer's tests against the candidate. Copy the
+   consumer's live environment (`$CONSUMER_VENV`, the product's `.venv`),
+   install the candidate lock over the copy with the install command above,
+   and collect from a fresh checkout of product `main`. A non-zero exit or
+   any collection error stops the cut:
+
+   ```bash
+   cp -a "$CONSUMER_VENV" "$WORK/consumer-venv"
+   C="$WORK/consumer-venv/bin/python"
+   "$C" -m pip install --force-reinstall --no-index --find-links "$WHEELHOUSE" --require-hashes -r "$CANDIDATE_LOCK"
+   git clone --depth 1 --branch main https://github.com/learn-ukrainian/learn-ukrainian.github.io "$WORK/product"
+   (cd "$WORK/product" && env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$C" -m pytest --collect-only -q tests)
+   ```
 
 4. Tag and publish. Push the annotated tag `v$V` on `$SHA`, then create the
    release with all three assets in one call. `$NOTES` starts with the
