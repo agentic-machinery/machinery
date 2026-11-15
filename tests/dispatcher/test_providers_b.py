@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from lu_machinery.agent_runtime.adapters.codex import _sources_read_only_flags
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.common.repo_root import product_root
 from lu_machinery.dispatcher import agy_sandbox, runtime_context, write_boundary
 from lu_machinery.dispatcher.providers import PROVIDERS, load
 from lu_machinery.dispatcher.runtime_context import read_roots
@@ -125,11 +126,15 @@ UNKNOWN = {
     "cursor": '{"type":"result","subtype":"unrecognized","result":"Finished."}',
     "agy": '{"event":"result","result":{"status":"UNRECOGNIZED","response":"Finished."}}',
 }
-# The write boundary's fixed stdio command to its Sources relay; Claude loads only this server.
-def sources_mcp_config():
-    command, *args = write_boundary.sources_command()
-    return json.dumps({"mcpServers": {"sources": {"type": "stdio", "command": command, "args": args}}},
-                      separators=(",", ":"))
+# Claude loads only this server: read-only, the write boundary's fixed stdio command to its Sources relay;
+# workspace-write, on the host, the product checkout's own entry.
+def sources_mcp_config(mode="read-only"):
+    if mode == "read-only":
+        command, *args = write_boundary.sources_command()
+        server = {"type": "stdio", "command": command, "args": args}
+    else:
+        server = json.loads((product_root() / ".mcp.json").read_text())["mcpServers"]["sources"]
+    return json.dumps({"mcpServers": {"sources": server}}, separators=(",", ":"))
 
 
 STUB = """import json, os, pathlib, sys
@@ -292,7 +297,7 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
         if mode == "read-only":
             expected += ["--restricted", "--tools", "Read,Grep,Glob,Bash,WebFetch,WebSearch",
                          "--append-system-prompt-file", str(rules_core.source_path(rules_core.CORE_REL))]
-        expected += ["--mcp-config", sources_mcp_config(), "--strict-mcp-config", "--allowedTools"]
+        expected += ["--mcp-config", sources_mcp_config(mode), "--strict-mcp-config", "--allowedTools"]
         expected += [
             (
                 # Read-only Bash runs inside the whole-process write boundary, not a shell prefix.
@@ -383,10 +388,12 @@ def test_claude_task_exposes_only_the_trusted_sources_mcp_readers(tmp_path, mode
     spec = TaskSpec("uk-review", "claude", "claude-opus-5-5", "high", mode, tmp_path, prompt, tmp_path / "f")
     argv = load("claude").build(spec, {}).argv
     config = json.loads(argv[argv.index("--mcp-config") + 1])
-    # The boundary's relay through its fixed paths: no product or worktree MCP file, no loopback service.
-    assert config == {"mcpServers": {"sources": {
+    # Never the worktree's MCP file: read-only, the boundary's relay through its fixed paths; workspace-write, the
+    # product checkout's own entry.
+    assert config == ({"mcpServers": {"sources": {
         "type": "stdio", "command": str(Path(sys.executable).resolve()),
         "args": ["-I", "/run/lu-write-boundary/sources-stdio.py", "/run/lu-write-boundary/sources.sock"]}}}
+        if mode == "read-only" else json.loads(sources_mcp_config(mode)))
     assert "--strict-mcp-config" in argv
     assert ("--restricted" in argv) is (mode == "read-only")
     readers, writers = sources_tool_sets()

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.dispatcher import write_boundary
+from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.opsec.test_git_push_scan import push_sandbox  # noqa: F401
 
 # One of GitHub's published address ranges; the launcher reads the real ones on the host.
@@ -1141,7 +1142,7 @@ _FORWARDED = {
                    "{py} -m lu_machinery.publish pr-comment --number 8 --body-file {body}"),
     "pr-merge": ("{py} -m lu_machinery.publish pr-merge --number 7 --match-head {tip}",
                  "{py} -m lu_machinery.publish pr-merge --number 8 --match-head {tip}"),
-    # The reads of the chain (#575, #557, #591): a named read, the review budget check and the wait on its own review.
+    # The reads of the chain (#575, #557): a named read and the review budget check.
     "github-read": ("{py} -m lu_machinery.publish read pull --number 7",
                     "{py} -m lu_machinery.publish read pull --number 7 --repo owner/other"),
     # An inherited GH_REPO is the read's repository claim (env=None inherits), never dropped for the launch's own.
@@ -1149,13 +1150,9 @@ _FORWARDED = {
                         "GH_REPO=owner/other {py} -m lu_machinery.publish read pull --number 7"),
     "budget-check": ("{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 7",
                      "{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 8"),
-    "review-wait": ("{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
-                    "wait wb-test-review-r1 --timeout 0.5",
-                    "{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
-                    "wait other-review-r1 --timeout 5"),
 }
 # The host step's first argument, where it is not the verb itself.
-_HOST_STEP = {"github-read": "read", "github-read-env": "read", "review-wait": "wait"}
+_HOST_STEP = {"github-read": "read", "github-read-env": "read"}
 # The broker verb, where the case name is not the verb itself.
 _VERB = {"github-read-env": "github-read"}
 
@@ -1225,11 +1222,8 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
             assert remote_refs == f"{tip} refs/heads/task" and steps == []
         else:
             assert steps and steps[-1][0] == _HOST_STEP.get(operation, operation)
-            if operation == "review-wait":  # a fractional wait stays bounded, never 0 (the host's unlimited wait)
-                assert steps[-1][-2:] == ["--timeout", "1"], steps
-            else:
-                flag = "--repository" if operation == "budget-check" else "--repo"
-                assert steps[-1][steps[-1].index(flag) + 1] == slug
+            flag = "--repository" if operation == "budget-check" else "--repo"
+            assert steps[-1][steps[-1].index(flag) + 1] == slug
     else:
         assert exit_code != 0 and requests == [(_VERB.get(operation, operation), 2)] and "refused" in output, output
         assert steps == [] and remote_refs == ""
@@ -1385,3 +1379,51 @@ print("VIEW_OK")
     log = _git(worktree, "log", "--format=%s")
     assert "owned change" in log and "granted change" in log and "outside change" not in log, log
     assert receipt["import"]["status"] == "imported"
+
+
+def test_write_dispatch_launches_the_provider_directly_with_its_own_login(sandbox, monkeypatch, tmp_path):
+    """Defect class: a workspace-write dispatch is wrapped in the write boundary, so the worker runs with a copied
+    or bound login and no GitHub (operator order NO-WORKER-SANDBOX-1115). The supervisor must start the provider
+    itself, with the dispatching user's HOME and the selected login directory, and wait on no boundary receipt."""
+    from types import SimpleNamespace
+
+    from lu_machinery.dispatcher import store, worker
+    from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
+    from tests.dispatcher.conftest import run_git
+
+    home = tmp_path / "user-home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv(write_boundary.BROKER_ENV, raising=False)
+    monkeypatch.setenv("LU_TASKS_DIR", str(sandbox.tasks))
+    capture = tmp_path / "provider-env.json"
+    script = "import json, os, sys; open(sys.argv[1], 'w').write(json.dumps(dict(os.environ))); print('Finished.')"
+    provider = SimpleNamespace(
+        build=lambda spec, env: Invocation([sys.executable, "-c", script, str(capture)], b"", env, None),
+        parse=lambda stdout, _stderr, _code, _final: ParsedResult(stdout.strip() or None, None, None),
+    )
+    wrapped = []
+    monkeypatch.setattr(worker.providers, "load", lambda _agent: provider)
+    monkeypatch.setattr(worker.write_boundary, "launcher", lambda *args: wrapped.append("launcher") or [])
+    monkeypatch.setattr(worker.write_boundary, "verify", lambda *args, **kwargs: wrapped.append("verify") or ({}, None))
+    monkeypatch.setattr(worker.headroom, "check_plan", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker, "_reap_settled", lambda *_args, **_kwargs: None)
+    spec = TaskSpec("direct-write", "claude", "claude-opus-5-5", None, "workspace-write", sandbox.repo,
+                    tmp_path / "direct-write.prompt", sandbox.tasks / "direct-write.result", "a")
+    spec.prompt_file.write_bytes(b"write")
+    record = store.new_record(spec, {"key": "public", "github": str(sandbox.remote)}, "main",
+                              run_git(sandbox.repo, "rev-parse", "HEAD"), {"research_owned_path": []})
+    record["prompt_file"] = str(sandbox.tasks / "direct-write.prompt")
+    path = store.create(record, b"write")
+    (sandbox.tasks / "logs").mkdir()
+    worker.supervise(path, {}, 30)
+    settled = json.loads(path.read_text())
+    # The provider ran and committed nothing, so settlement reached the delivery check (a boundary refusal fails).
+    assert (settled["status"], settled.get("error")) == ("no_deliverable", "no_commits_or_unknown")
+    assert wrapped == [] and "write_boundary" not in settled
+    seen = json.loads(capture.read_text())
+    assert seen["HOME"] == str(home)
+    assert seen["CLAUDE_CONFIG_DIR"] == str(home / ".claude")
+    assert write_boundary.BROKER_ENV not in seen

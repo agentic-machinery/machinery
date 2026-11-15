@@ -183,18 +183,17 @@ def test_scope_checks_each_own_commit(sandbox, delivery_settle, history, monkeyp
 
 
 @pytest.mark.parametrize(
-    ("repo_key", "mode", "pr_state", "closeout_code", "explicit"),
+    ("repo_key", "mode", "pr_state", "closeout_code"),
     [
-        pytest.param("public", "workspace-write", "MERGED", 0, False, id="merged-settlement-omits-closeout"),
-        pytest.param("machinery", "workspace-write", "MERGED", 0, False, id="wrong-repository-root"),
-        pytest.param("public", "workspace-write", "OPEN", 0, False, id="unmerged-triggers-closeout"),
-        pytest.param("public", "read-only", "MERGED", 0, False, id="read-only-triggers-closeout"),
-        pytest.param("public", "workspace-write", "MERGED", 1, False, id="nonzero-closeout-hidden"),
-        pytest.param("public", "workspace-write", "MERGED", 0, True, id="boundary-closeout-runs-twice"),
+        pytest.param("public", "workspace-write", "MERGED", 0, id="merged-settlement-omits-closeout"),
+        pytest.param("machinery", "workspace-write", "MERGED", 0, id="wrong-repository-root"),
+        pytest.param("public", "workspace-write", "OPEN", 0, id="unmerged-triggers-closeout"),
+        pytest.param("public", "read-only", "MERGED", 0, id="read-only-triggers-closeout"),
+        pytest.param("public", "workspace-write", "MERGED", 1, id="nonzero-closeout-hidden"),
     ],
 )
 def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
-    merged_delivery_world, monkeypatch, tmp_path, repo_key, mode, pr_state, closeout_code, explicit,
+    merged_delivery_world, monkeypatch, tmp_path, repo_key, mode, pr_state, closeout_code,
 ):
     """Defect classes: omitted, misrouted, premature, hidden-failure and duplicate settlement closeout.
 
@@ -210,8 +209,6 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     world.prs[78] = {**MERGED, "state": pr_state, "headRefOid": record["head_sha"]}
     world.files[78] = ["docs/owned.md"]
     request = {"pr": 78, "repo": slug, "repo_root": str(root)}
-    if explicit:
-        record["write_boundary"] = {"closeout_request": request}
     monkeypatch.setattr(git, "resolve_repo", lambda key: (root, {"github": slug}) if key == repo_key else None)
     monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
     monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
