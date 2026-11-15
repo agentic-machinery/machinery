@@ -631,6 +631,57 @@ def _refused(call) -> str:
     return str(refusal.value)
 
 
+def test_failed_broker_push_receipt_retains_redacted_git_error(broker, monkeypatch):
+    """Defect class: broker push failures hide Git's cause or expose credentials in replies and receipts."""
+    secret = "ghp_" + "A" * 36
+    diagnostic = f"fatal: unable to access https://probe:{secret}@example.invalid/repo"
+    monkeypatch.setattr(write_boundary._Broker, "_remote", lambda self, slug: ("https://example.invalid/repo", []))
+    monkeypatch.setattr(write_boundary._Broker, "_peer_inside", lambda self, connection: True)
+    broker.seen, broker.records = set(), []
+
+    class Connection:
+        def __init__(self, request):
+            self.request = json.dumps(request).encode()
+            self.reply = b""
+
+        def settimeout(self, timeout):
+            pass
+
+        def recv(self, size):
+            request, self.request = self.request, b""
+            return request
+
+        def sendall(self, data):
+            self.reply += data
+
+    # Exercise the receipt writer as well as the Git transport, including pre-push Git steps.
+    for index, step in enumerate(("fetch", "ls-remote", "push")):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if "-I" in argv:  # the unchanged host push scan
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            failed = step in argv
+            return subprocess.CompletedProcess(argv, 128 if failed else 0, "",
+                                               diagnostic + "\nsecond error line\n" if failed else "")
+
+        def fetch_objects(tip):
+            write_boundary._git(broker.boundary.repository, "fetch", "unused")
+
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr(broker.boundary, "fetch_objects", fetch_objects)
+        connection = Connection({"verb": "push", "request_id": f"{index:032x}",
+                                 "payload": {"head": broker.boundary.tip}})
+        broker._handle(connection)
+        reply = json.loads(connection.reply)
+        expected = f"git {step} failed: fatal: unable to access https://probe:[REDACTED_SECRET]@example.invalid/repo"
+        assert reply == {"returncode": 2, "stdout": "", "stderr": expected}
+        assert broker.records[-1]["refused"] == expected
+        assert secret not in json.dumps(broker.records) + connection.reply.decode()
+        assert sum(step in argv for argv in calls) == 1  # a failure is never retried
+
+
 def test_push_publishes_only_the_launch_branch_at_its_tip_fast_forward(broker, primary, tmp_path, monkeypatch):
     """Defect class: the push verb publishes another branch, a commit other than the worker's tip, a rewrite of the
     remote branch or unscanned text, so a worker overwrites someone else's work or leaks text past the push scan."""

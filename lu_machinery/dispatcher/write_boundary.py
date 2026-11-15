@@ -476,9 +476,14 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
         capture_output=True, text=True, timeout=_GIT_TIMEOUT, check=False, env=env, stdin=subprocess.DEVNULL,
     )
     if result.returncode:
+        from lu_machinery.secret_redactor import redact_text
+
+        # Redact before selecting/truncating: a credential may cross a line or the receipt's limit.
+        lines = (redact_text(result.stderr) or "").splitlines()
+        detail = f": {lines[0]}" if lines else ""
         if command[:1] == ["push"] and "[rejected]" in result.stdout and "(stale info)" in result.stdout:
-            raise Refused("host push [rejected] (stale info)")
-        raise Refused(f"git {args[0]} failed")
+            raise Refused(f"host push [rejected] (stale info){detail}")
+        raise Refused(f"git {command[0]} failed{detail}")
     return result.stdout
 
 
@@ -1147,6 +1152,15 @@ class _Broker:
 
     def _push(self, payload: dict) -> dict:
         """Publish this task's branch at the exact commit named, fast-forward only, after the push scan."""
+        try:
+            return self._push_checked(payload)
+        except Refused as exc:
+            # Object import and ls-remote can fail before the final push; keep their Git diagnostic too.
+            from lu_machinery.secret_redactor import redact_text
+
+            return {"returncode": 2, "stdout": "", "stderr": redact_text(str(exc))}
+
+    def _push_checked(self, payload: dict) -> dict:
         if "head" not in payload or not set(payload) <= {"head", "branch", "repo", "lease"}:
             raise _BrokerRefusal("push takes head, and optionally branch, repo and lease")
         head = payload["head"]
@@ -1182,11 +1196,8 @@ class _Broker:
                 raise _BrokerRefusal("the remote branch is not an ancestor of head: only a fast-forward is "
                                      "published") from None
         lease = f"--force-with-lease={branch}:{remote or ''}"
-        try:
-            _git(self.boundary.repository, *credentials, "push", "--quiet", "--no-verify", "--porcelain", lease, url,
-                 f"{head}:{branch}", git_dir=self.boundary.common, network=True)
-        except Refused as exc:
-            return {"returncode": 2, "stdout": "", "stderr": str(exc)}
+        _git(self.boundary.repository, *credentials, "push", "--quiet", "--no-verify", "--porcelain", lease, url,
+             f"{head}:{branch}", git_dir=self.boundary.common, network=True)
         return {"returncode": 0, "stdout": f"pushed {head} to {branch} on {slug}\n", "stderr": ""}
 
     def _fetch_base(self, payload: dict) -> dict:
