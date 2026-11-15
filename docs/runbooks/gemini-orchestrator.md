@@ -7,7 +7,7 @@
 
 ## Launcher
 
-`start-gemini.sh` is the native Antigravity (`agy`) CLI launcher for Gemini. It mirrors `start-claude.sh` and `start-grok.sh` but targets the Gemini seat.
+`start-gemini.sh` is the native Antigravity (`agy`) CLI launcher for Gemini. It mirrors `start-claude.sh` but targets the Gemini seat.
 
 ## Usage
 

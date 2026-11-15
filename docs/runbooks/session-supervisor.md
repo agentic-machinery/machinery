@@ -129,9 +129,9 @@ hook surface expects:
 | `SESSION_STREAM_LEASE_ID` | new lease id | `lease-…` |
 | `SESSION_STREAM_GENERATION` | session generation | `1` |
 | `SESSION_STREAM_FENCING_TOKEN` | fencing token | `1` |
-| `SESSION_STREAM_AGENT` | agent identity | `grok` |
-| `SESSION_STREAM_HARNESS` | harness identity | `grok-tui` |
-| `SESSION_STREAM_INSTANCE_ID` | distinct runtime instance | `grok-12345` |
+| `SESSION_STREAM_AGENT` | agent identity | `codex` |
+| `SESSION_STREAM_HARNESS` | harness identity | `codex-tui` |
+| `SESSION_STREAM_INSTANCE_ID` | distinct runtime instance | `codex-12345` |
 | `SESSION_STREAM_PROCESS_ID` | holder PID | `12345` |
 | `SESSION_STREAM_TASK_ID` | optional task id | `5512-pr-j1-launchers` |
 | `SESSION_STREAM_HEARTBEAT_AT` | last heartbeat timestamp | `2026-07-20T21:00:00Z` |
@@ -154,8 +154,8 @@ launchers.
 ```bash
 source "${PROJECT_DIR}/lu_machinery/lib/session_supervisor.sh"
 claim_session_supervisor_env \
-  "epic:4707" "grok" "grok-tui" "5512-pr-j1-launchers" "grok-$$" \
-  "$PROJECT_DIR" "start-grok.sh" "harness"
+  "epic:4707" "codex" "codex-tui" "5512-pr-j1-launchers" "codex-$$" \
+  "$PROJECT_DIR" "start-codex.sh" "harness"
 ```
 
 The helper:
@@ -214,14 +214,14 @@ successor, or changes its exit status when publication fails.
 {
   "schema_version": 1,
   "written_at": "2026-07-20T21:00:00Z",
-  "launcher": "start-grok.sh",
+  "launcher": "start-codex.sh",
   "epic": "harness",
   "stream_id": "epic:4707",
   "session_id": "session-…",
   "lease_id": "lease-…",
-  "agent": "grok",
-  "harness": "grok-tui",
-  "instance_id": "grok-12345",
+  "agent": "codex",
+  "harness": "codex-tui",
+  "instance_id": "codex-12345",
   "process_id": 12345,
   "task_id": "5512-pr-j1-launchers"
 }

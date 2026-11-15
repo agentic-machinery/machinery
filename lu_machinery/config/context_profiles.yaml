@@ -43,7 +43,7 @@ profiles:
     rollover_warning_percentages: [65.0, 70.0, 75.0]
     rollover_mode: operator_restart
 
-  # GLM Claude-Code adapter behind start-glm.sh.
+  # Historical GLM-5.3 observation profile; retirement blocks new launches.
   glmcc_glm53:
     profile_id: glmcc_glm53
     transport: glmcc
