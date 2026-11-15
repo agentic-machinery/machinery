@@ -609,13 +609,16 @@ class SourcesRelay:
         def drain_stderr() -> None:
             from lu_machinery.secret_redactor import redact_text
 
-            with process.stderr:
+            stderr = process.stderr
+            assert stderr is not None  # Popen above always creates stderr=PIPE.
+            with stderr:
                 # Bounded reads drain even a server emitting an enormous unterminated line.
                 # Keep the final non-empty line: Python traceback headers carry no cause.
-                while line := process.stderr.readline(_SOURCES_ERROR_LIMIT):
+                while line := stderr.readline(_SOURCES_ERROR_LIMIT):
                     if line.strip():
-                        last_error[:] = [redact_text(line.decode("utf-8", "replace").rstrip())
-                                         [:_SOURCES_ERROR_LIMIT]]
+                        error = redact_text(line.decode("utf-8", "replace").rstrip())
+                        assert error is not None  # redact_text preserves non-None input.
+                        last_error[:] = [error[:_SOURCES_ERROR_LIMIT]]
 
         stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
         stderr_thread.start()
