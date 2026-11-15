@@ -269,6 +269,104 @@ From the `main` commit identified above, with `$V` the version in
 
 ## Consumers
 
+### Product agent deployment
+
+An enrolled consumer runs the installed deployer with an explicit checkout:
+
+```bash
+"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --project-root "$LU_PRODUCT_ROOT"
+"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --project-root "$LU_PRODUCT_ROOT" --check
+```
+
+The interpreter variable above must name the configured absolute executable.
+The descriptor is `agents_extensions/deployment.v1.json`. Its `sources` select
+product resources; fleet resources come from the installed wheel. A declared
+provider replacement suppresses shared product defaults only when that provider
+actually supplies a source in the replacement subtree. Without a Codex memory
+overlay, shared `memory/MEMORY.md` therefore remains deployed.
+
+Parity fixtures must include the product's
+`curriculum/l2-uk-en/curriculum.yaml` marker so they exercise curriculum prompt
+linting. The deployer honors each existing prompt rule's filename filter;
+research-only rules do not apply to ordinary content templates.
+
+`--check` is the named replacement for both legacy `deploy_prompts.sh --dry-run`
+and `check_rules_deployment.sh --tracked-mirrors-only`. It writes nothing and
+verifies every enabled target, including bytes, modes, ownership and retirement.
+It exits 1 for drift, 2 for invalid input, and 0 for a verified deployment.
+Legacy dry-run returned 0 while merely displaying proposed changes; the tracked
+check ignored untracked outputs. Those narrower semantics are not aliases.
+The caller must enroll, apply, then check the complete composed tree. A fresh
+checkout with no ownership manifest cannot pass check before apply. Runtime
+subtrees belong in the descriptor's explicit `preserve` list, which cannot
+overlap planned outputs.
+
+The product workflow `rules-deployment-check.yml` and its tracked-mirror test in
+`tests/test_deploy_script_idempotency.py` must switch from the old option to
+apply followed by `--check` on an enrolled scratch consumer. The legacy deploy
+script declares `--dry-run`, but no executable product caller uses that option.
+Consumer migration owns those edits.
+
+#### Mandatory hook settings
+
+The primary dirt audit was introduced by product issue #11253 and merged in
+[product PR #11323](https://github.com/learn-ukrainian/learn-ukrainian/pull/11323),
+commit `6f1b96c669d4d46847cec427af799dc9e0483461`. It brackets shell calls with
+snapshots so writes hidden inside a script can be attributed. Its original
+fail-open audit semantics are unchanged. The release deployer's mandatory
+delegator validation was introduced by
+[machinery PR #133](https://github.com/learn-ukrainian/machinery/pull/133),
+commit `4dc5c36d02403d24abf363a558ebbe7442474f64`. Missing delegators still
+refuse the entire deploy before any output is written.
+
+Before product enrollment, add this group to each of `hooks.PreToolUse`,
+`hooks.PostToolUse` and `hooks.PostToolUseFailure` in the product source
+`agents_extensions/shared/settings.json`, retaining all existing groups:
+
+```json
+{
+  "matcher": "Bash",
+  "hooks": [
+    {
+      "type": "command",
+      "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/audit-primary-checkout-dirt.py",
+      "timeout": 10
+    }
+  ]
+}
+```
+
+Codex's required SessionStart, compact SessionStart, Stop and SessionEnd
+commands use the configured primary with a missing-variable refusal and
+`|| exit 2`. This preserves the product's approved authority contract from
+[product PR #13000](https://github.com/learn-ukrainian/learn-ukrainian/pull/13000),
+commit `634791134ee45cbf06335734ea61c255565c0815`, instead of requiring the
+older `git rev-parse --show-toplevel` spelling. Existing product Codex hooks
+already meet that requirement; no Codex settings edit is needed.
+
+#### Accepted differences from the legacy mirrors
+
+Product parity compares every legacy provider output and every installed-only
+provider output for presence, bytes and mode. The per-file receipt for #552
+also retains each reason and the complete text differences. These differences
+are intentional:
+
+- Nineteen schemas moved unchanged to `lu_machinery/schemas` with their readers
+  in [#86](https://github.com/learn-ukrainian/machinery/pull/86), commit
+  `8aacc521744832fda8af0fcabd4029609a985181`. Twenty-one session-stream files
+  moved to `lu_machinery/session_streams` and their callers migrated in
+  [#120](https://github.com/learn-ukrainian/machinery/pull/120), commit
+  `00d92c96e1f5fd041543eb85ac1bba2262d3ffa8`. Their 120 obsolete provider
+  mirrors are not restored. The wheel supplies the canonical resources.
+- Fleet hooks, rules, contracts and skills use current release bytes, including
+  installed-module references. AGY core parts derive from that release core.
+  The two additional fleet rule sources are release-owned, not product overrides.
+- The existing release contract normalizes regular files to 0644 and executable
+  files to 0755. Parity must prove the execute bit is retained for every file;
+  losing an execute bit on a directly invoked file is a regression.
+- The release ownership manifest replaces the legacy shared-to-agent manifest.
+  These control files are recorded separately from the provider-output census.
+
 A consumer adopts a release with one PR that replaces its
 `requirements-machinery.lock` with the consumer lock above. Shared locks name
 packages, versions and hashes only, never a host path. On the server,
