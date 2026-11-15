@@ -183,7 +183,6 @@
   "tests/ai_agent_bridge/test_ui_agy.py": 0.095,
   "tests/ai_agent_bridge/test_ui_codex.py": 0.211,
   "tests/ai_agent_bridge/test_wake_overlap_detection.py": 8.455,
-  "tests/ai_agent_bridge/test_worktree_brief.py": 0.036,
   "tests/ai_llm/test_ai_llm_claude_call.py": 0.108,
   "tests/ai_llm/test_ai_llm_codex_call.py": 0.183,
   "tests/ai_llm/test_ai_llm_fallback.py": 0.394,

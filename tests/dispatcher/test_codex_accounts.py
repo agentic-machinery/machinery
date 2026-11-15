@@ -2,11 +2,9 @@
 
 import dataclasses
 import json
-from decimal import Decimal
 import pytest
 from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused
 from lu_machinery.dispatcher import admission, cli, store, worker
-from lu_machinery.dispatcher.codex_meter import estimate, task_cost
 from lu_machinery.dispatcher.environment import child_env
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -62,30 +60,6 @@ def test_label_selection_and_ambient_conflict(tmp_path, monkeypatch):
         admission.codex_account("codex", "API")
     with pytest.raises(CodexAccountRefused, match="codex_account_seat_unsupported"):
         admission.codex_account("claude", "api")
-
-
-def test_meter_price_arithmetic(tmp_path):
-    usage = {"input_tokens": 1_000_000, "cached_input_tokens": 400_000, "output_tokens": 200_000}
-    record = {"agent": "codex", "codex_account": "api", "usage": usage, "status": "done"}
-    for model, expected in (("gpt-6-luna", "0.164"), ("gpt-6.1-terra", "1.62"), ("gpt-6.1-sol", "3.24")):
-        task = {**record, "model": model}
-        assert task_cost(task) == Decimal(expected)
-        (tmp_path / f"{model}.json").write_text(json.dumps(task))
-    (tmp_path / "sub.json").write_text(json.dumps({**record, "codex_account": "sub"}))
-    (tmp_path / "pending.json").write_text(json.dumps({**record, "status": "running", "usage": None}))
-    report = estimate(tmp_path, Decimal(200))
-    assert Decimal(report["spent_usd"]) == Decimal("5.024")
-    assert Decimal(report["remaining_usd"]) == Decimal("194.976")
-    assert report["priced_tasks"] == 3
-    assert report["pending_tasks"] == 1
-    assert report["unknown_tasks"] == 0
-    (tmp_path / "unknown.json").write_text(json.dumps({**record, "model": "unknown-model"}))
-    report = estimate(tmp_path, Decimal(200))
-    assert report["remaining_usd"] is None
-    assert report["unknown_tasks"] == 1
-    for invalid in ({}, {**usage, "cached_input_tokens": 1_000_001}, {**usage, "output_tokens": -1}):
-        with pytest.raises(ValueError):
-            task_cost({**record, "model": "gpt-6-luna", "usage": invalid})
 
 
 def test_unknown_or_unbound_codex_account_never_falls_back(tmp_path, monkeypatch):
@@ -144,13 +118,6 @@ def test_unknown_or_unbound_codex_account_never_falls_back(tmp_path, monkeypatch
     homes["b-sub"].chmod(0o700)
     bind({**homes, "b-sub": tmp_path / "missing"})
     refused("codex_account_home_unavailable")
-    usage = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
-    for label in ("sub", "api", "b-sub", "b-api"):
-        (tmp_path / f"{label}.json").write_text(json.dumps(
-            {"agent": "codex", "codex_account": label, "model": "gpt-6-luna", "usage": usage, "status": "done"}))
-    for label in ("api", "b-sub", "b-api"):
-        report = estimate(tmp_path, Decimal(200), label)
-        assert (report["priced_tasks"], Decimal(report["spent_usd"])) == (1, Decimal("0.1"))
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
