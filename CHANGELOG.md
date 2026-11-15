@@ -10,6 +10,26 @@ notices them.
 
 ## [Unreleased]
 
+<a id="v0.1.20"></a>
+## [0.1.20] - 2026-11-15
+
+### Changed
+
+- Muse workers are restricted to read-only tasks, and product-owned configuration and forwarding entries stay under product control during migration to the installed release. ([#558](https://github.com/learn-ukrainian/machinery/pull/558), [#555](https://github.com/learn-ukrainian/machinery/pull/555))
+
+### Fixed
+
+- Write workers inside the boundary can run governed tests, continue their assigned PR and receive and acknowledge their Fleet inbox deliveries. ([#560](https://github.com/learn-ukrainian/machinery/pull/560))
+- Dispatcher settlement runs merged-PR closeout after removing the worker's worktree and reports closeout failures. ([#548](https://github.com/learn-ukrainian/machinery/pull/548))
+- Agent deployment preserves shared Codex memory when a product overlay is absent, accepts the approved configured-primary hook commands and applies prompt lint rules only to their intended files. ([#556](https://github.com/learn-ukrainian/machinery/pull/556))
+- Hook installation checks work from the installed release in enrolled product checkouts, and the Monitor API service template loads product configuration through the installed machinery resources. ([#555](https://github.com/learn-ukrainian/machinery/pull/555))
+- The pre-push gate accepts verified deployed agent outputs without requiring workers to delete their session files; verification reads deployment inputs from the outgoing commit's objects. ([#567](https://github.com/learn-ukrainian/machinery/pull/567))
+
+### Removed
+
+- Retired launchers and the Gemini CLI deployment target are removed; deployment retires previously owned Gemini CLI copies while preserving unowned files. ([#558](https://github.com/learn-ukrainian/machinery/pull/558))
+- Runbooks and component listings no longer direct operators to retired launcher names. ([#563](https://github.com/learn-ukrainian/machinery/pull/563), [#564](https://github.com/learn-ukrainian/machinery/pull/564))
+
 <a id="v0.1.19"></a>
 ## [0.1.19] - 2026-11-14
 
@@ -477,7 +497,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.19...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.20...HEAD
+[0.1.20]: https://github.com/learn-ukrainian/machinery/compare/v0.1.19...v0.1.20
 [0.1.19]: https://github.com/learn-ukrainian/machinery/compare/v0.1.18...v0.1.19
 [0.1.18]: https://github.com/learn-ukrainian/machinery/compare/v0.1.17...v0.1.18
 [0.1.17]: https://github.com/learn-ukrainian/machinery/compare/v0.1.16...v0.1.17
