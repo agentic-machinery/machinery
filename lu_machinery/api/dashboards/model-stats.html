@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model value</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; --fg: #1d1f23; --muted: #646a73; --bg: #f4f5f7; --card: #fff; --line: #e3e4e8;
+          --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --link: #0969da; --dot: #0969da; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e7ea; --muted: #9aa0aa; --bg: #15171a; --card: #1d2024; --line: #30343a;
+            --ok: #3fb950; --warn: #d29922; --bad: #f85149; --link: #58a6ff; --dot: #58a6ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 10px 20px;
+           display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  header h1 { margin: 0; font-size: 18px; }
+  .purpose { margin: 0; flex: 1 1 16rem; font-size: 13px; color: var(--muted); }
+  select { font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  main { display: grid; gap: 14px; padding: 14px 20px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; overflow-x: auto; }
+  h2 { margin: 0 0 6px; font-size: 15px; }
+  h2 .meta { font-weight: normal; font-size: 12px; color: var(--muted); margin-left: 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.cls td { color: var(--muted); font-size: 13px; }
+  tr.cls td:first-child { padding-left: 32px; }
+  tr.eff td:first-child { padding-left: 16px; font-style: italic; }
+  .low { color: var(--warn); font-size: 11px; margin-left: 3px; }
+  .muted { color: var(--muted); } .error { color: var(--bad); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  svg text { fill: var(--muted); font-size: 11px; }
+  svg .label { fill: var(--fg); }
+  svg .grid { stroke: var(--line); stroke-width: 1; }
+  svg circle { stroke: var(--dot); stroke-width: 2; }
+  svg circle.full { fill: var(--dot); }
+  svg circle.hollow { fill: var(--card); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Model value</h1>
+  <p class="purpose">Which model lands work, which wastes runs and which is slow, from our own dispatch records. Routing stays a CTO decision; read the confounders in the runbook.</p>
+  <label>Window <select id="window"><option value="7d">7 days</option><option value="30d">30 days</option><option value="90d">90 days</option><option value="all">All history</option></select></label>
+  <span class="muted" id="age">Loading…</span>
+</header>
+<main id="main">
+  <section><h2>Value: landed tasks per wall hour against first-round approval <span class="meta" id="chart-meta"></span></h2>
+    <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), and the plain rows under each effort split that effort by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
+    <div id="chart">Loading…</div></section>
+  <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
+    <p class="muted">Landed: the task's whole-line <code>X-Agent</code> trailer is on a registered <code>main</code> outside a code fence, or the task recorded its own merged PR. The trailer is found by a line scan, not a Markdown parser: a trailer-shaped line inside inline code that runs across lines still counts, and a fence left open earlier in a commit message hides the trailers after it (see the runbook's landing source).</p>
+    <div id="write">Loading…</div></section>
+  <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2><div id="review">Loading…</div></section>
+  <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2><div id="author">Loading…</div></section>
+  <section><h2>Weekly allowance spent per landed task <span class="meta" id="allowance-meta"></span></h2><div id="allowance">Loading…</div></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const LOW = '<span class="low" title="fewer than 10 in the denominator">low n</span>';
+const num = (v, d = 0) => v === null || v === undefined ? "—" : Number(v).toLocaleString(undefined, {maximumFractionDigits: d});
+const pct = (r) => r && r.value !== null ? `${num(r.value * 100)}%` : "—";
+const rate = (r, d = 2) => r && r.value !== null ? num(r.value, d) : "—";
+const n = (r) => r ? `${r.n}${r.low_sample ? LOW : ""}` : "—";
+const mins = (v) => v === null || v === undefined ? "—" : num(v / 60, 0);
+const cell = (v) => `<td class="num">${v}</td>`;
+const timedOf = (r) => r.wall_seconds.n === r.tasks ? "" : ` <span class="low" title="tasks with a recorded duration">of ${r.wall_seconds.n}</span>`;
+
+function table(head, rows) {
+  return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+
+function rowName(r, kind) {
+  return kind === "eff" ? `effort ${esc(r.effort)}` : kind === "cls" ? esc(r.class) : `<b>${esc(r.model)}</b>`;
+}
+
+function writeRow(r, kind) {
+  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(r.status.done)}`
+    + `${cell(pct(r.no_deliverable))}${cell(pct(r.not_done))}${cell(r.landed)}${cell(pct(r.landed_rate))}`
+    + `${cell(rate(r.wall_hours_per_landed, 1))}${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}`
+    + `${cell(r.output_tokens_per_landed.value === null ? "—" : num(r.output_tokens_per_landed.value / 1000) + "k")}</tr>`;
+}
+
+function reviewRow(r, kind) {
+  const v = r.verdicts;
+  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
+    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain} / ${v.unparsed}`)}${cell(pct(r.approve_rate))}`
+    + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}${cell(n(r.approve_rate))}`
+    + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
+}
+
+function withClasses(models, role, render) {
+  return models.filter((m) => m.role === role).flatMap((m) =>
+    [render(m, ""), ...m.by_effort.flatMap((e) => [render(e, "eff"),
+      ...e.by_class.map((c) => render(c, "cls"))])]);
+}
+
+function chart(data, label) {
+  const authors = new Map(data.authors.map((a) => [a.model, a]));
+  const timed = (m) => m.wall_seconds.n === m.tasks && m.wall_seconds.total_seconds > 0;
+  const points = data.models.filter((m) => m.role === "write" && m.landed > 0 && timed(m) && authors.has(m.model)).map((m) => {
+    const a = authors.get(m.model);
+    return {model: m.model, x: m.landed / (m.wall_seconds.total_seconds / 3600), y: a.first_round_approved.value,
+            low: m.landed < 10 || a.prs < 10, landed: m.landed, hours: m.wall_seconds.total_hours, prs: a.prs};
+  }).filter((p) => p.y !== null);
+  if (!points.length) return '<p class="muted">No model has both landed tasks and reviewed PRs in this window.</p>';
+  const W = 640, H = 300, L = 48, R = 16, T = 12, B = 36;
+  const xmax = Math.max(...points.map((p) => p.x)) * 1.15;
+  const sx = (x) => L + (x / xmax) * (W - L - R), sy = (y) => T + (1 - y) * (H - T - B);
+  const grid = [0, 0.25, 0.5, 0.75, 1].map((y) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${sy(y)}" y2="${sy(y)}"/>`
+    + `<text x="${L - 6}" y="${sy(y) + 4}" text-anchor="end">${y * 100}%</text>`).join("");
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => `<text x="${sx(f * xmax)}" y="${H - B + 16}" text-anchor="middle">${num(f * xmax, 2)}</text>`).join("");
+  const dots = points.map((p) => `<g><title>${esc(p.model)}: ${num(p.x, 2)} landed per wall hour (${p.landed} landed in ${num(p.hours, 1)} h); `
+    + `first-round approval ${num(p.y * 100)}% of ${p.prs} PRs${p.low ? " (low sample)" : ""}</title>`
+    + `<circle class="${p.low ? "hollow" : "full"}" cx="${sx(p.x)}" cy="${sy(p.y)}" r="5"/>`
+    + `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="12" style="fill:transparent;stroke:none"/>`
+    + `<text class="label" x="${sx(p.x) + 8}" y="${sy(p.y) - 7}">${esc(p.model)}</text></g>`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="Landed tasks per wall hour against first-round approval rate, ${esc(label)}">`
+    + `${grid}${ticks}<text x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle">landed write tasks per wall hour of all write tasks</text>`
+    + `<text transform="rotate(-90)" x="${-(T + H - B) / 2}" y="12" text-anchor="middle">first-round approval</text>${dots}</svg>`;
+}
+
+function landingRead(landing) {
+  const repos = landing.repositories || {}, read = repos.read || 0;
+  const total = Object.values(repos).reduce((s, v) => s + v, 0);
+  return `${read} of ${total} repositories${read < total ? " (landing undercounted)" : ""}`;
+}
+
+async function load() {
+  const name = $("window").value;
+  let data;
+  try {
+    const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}`, {cache: "no-store"});
+    data = await response.json();
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (err) {
+    $("age").innerHTML = `<span class="error">unavailable: ${esc(err.message)}</span>`;
+    return;
+  }
+  if (data.status === "pending") {
+    $("age").textContent = "Collecting… retrying in 5 s";
+    setTimeout(load, 5000);
+    return;
+  }
+  const since = data.window.since.slice(0, 16).replace("T", " ");
+  const label = `${name === "all" ? "all history" : name} from ${since} UTC`;
+  const by = data.landed_by || {};
+  $("age").textContent = `Window ${label}; data ${Math.round(data.age_seconds)} s old; ${data.records} settled tasks; `
+    + `${data.coverage.landing.trailer_task_ids} trailer task ids from ${landingRead(data.coverage.landing)}; `
+    + `landed by trailer ${by.trailer || 0}, by recorded merge ${by.delivery || 0}, both ${by.both || 0}`;
+  const writes = data.models.filter((m) => m.role === "write"), reviews = data.models.filter((m) => m.role === "review");
+  const total = (rows) => rows.reduce((s, r) => s + r.tasks, 0);
+  $("chart-meta").textContent = label;
+  $("chart").innerHTML = chart(data, label);
+  $("write-meta").textContent = `${label}; n = ${total(writes)} tasks`;
+  $("write").innerHTML = table(["Model / class", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
+    "Wall h per landed", "Median min", "p90 min", "Output tokens per landed"], withClasses(data.models, "write", writeRow));
+  $("review-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
+  $("review").innerHTML = table(["Model / profile/risk", "Tasks", "Not done", "Correct / incorrect / uncertain / unparsed",
+    "Approve %", "Blocking (P0–P1) per review", "P0–P2 per review", "Reviews read", "Median min", "p90 min"],
+    withClasses(data.models, "review", reviewRow));
+  $("author-meta").textContent = `${label}; n = ${data.authors.reduce((s, a) => s + a.prs, 0)} PRs`;
+  $("author").innerHTML = table(["Author model", "PRs", "Rounds per PR", "Approved eventually", "First-round approved",
+    "Blocking (P0–P1) per PR", "P0–P2 per PR"], data.authors.map((a) => `<tr><td><b>${esc(a.model)}</b></td>`
+    + `${cell(n({n: a.prs, low_sample: a.low_sample}))}${cell(rate(a.rounds_per_pr))}${cell(pct(a.approved_eventually))}`
+    + `${cell(pct(a.first_round_approved))}${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`));
+  $("allowance-meta").textContent = `${label}; tasks with start and finish readings only; unknown readings are excluded, never 0`;
+  $("allowance").innerHTML = data.allowance.length ? table(["Pool", "Model", "Effort", "Tasks with readings", "Landed",
+    "Points spent", "Points per landed", "Reset crossed"], data.allowance.map((a) => `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>`
+    + `${cell(n({n: a.tasks, low_sample: a.low_sample}))}${cell(n(a.pct_points_per_landed))}${cell(num(a.pct_points_spent, 1))}`
+    + `${cell(rate(a.pct_points_per_landed))}${cell(a.reset_crossed)}</tr>`))
+    : '<p class="muted">No write task in this window has both readings yet (recording started with #581).</p>';
+}
+$("window").addEventListener("change", load);
+load();
+</script>
+</body>
+</html>

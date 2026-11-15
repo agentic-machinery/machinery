@@ -78,9 +78,9 @@ def timestamp(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):  # unparseable, or outside the datetime range once moved to UTC
         return None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 def tokens(usage: object) -> tuple[int, int, int]:
@@ -390,6 +390,60 @@ def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# Every stored number is at most a signed 64-bit integer, so no sum or ratio over any number of rows overflows a
+# float or serializes as infinity.
+MAX_VALUE = 2**63 - 1
+
+
+def _count_value(value: object) -> bool:
+    return type(value) is int and 0 <= value <= MAX_VALUE
+
+
+def _measure(value: object, top: float = MAX_VALUE) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return 0 <= value <= top  # NaN fails both comparisons; an integer of any size compares exactly
+
+
+def _optional(value: object, check: Any) -> bool:
+    return value is None or check(value)
+
+
+def _reading_ok(value: object) -> bool:
+    return value == "unknown" or (isinstance(value, dict) and value.keys() == {"remaining_pct"}
+                                  and _measure(value["remaining_pct"], 100))
+
+
+def _sha(value: object) -> bool:
+    return isinstance(value, str) and _SHA.fullmatch(value) is not None
+
+
+def _well_formed(row: Mapping[str, Any]) -> bool:
+    """Whether every nested value has the shape ``summary_row`` writes; a damaged row is skipped, never trusted."""
+    tokens_ = row.get("tokens")
+    allowance = row.get("allowance")
+    review = row.get("review")
+    landing = row.get("landing")
+    return all((
+        all(_optional(row.get(name), lambda v: timestamp(v) is not None) for name in ("started_at", "finished_at")),
+        _optional(row.get("duration_s"), _measure),
+        isinstance(tokens_, dict) and tokens_.keys() == {"fresh_input", "cached_input", "output"}
+        and all(_count_value(v) for v in tokens_.values()),
+        _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
+                  and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
+                  and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
+        _optional(review, lambda r: isinstance(r, dict) and r.keys() == {"verdict", "priorities"}
+                  and isinstance(r["verdict"], str) and r["verdict"] in VERDICTS
+                  and isinstance(r["priorities"], dict)
+                  and all(p in PRIORITIES and _count_value(n) for p, n in r["priorities"].items())),
+        _optional(row.get("pr"), _count_value),
+        _optional(row.get("pinned_head"), _sha),
+        _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
+                  and _count_value(d["pr"]) and _sha(d["merge_sha"])),
+        _optional(row.get("source_mtime_ns"), _count_value),
+    ))
+
+
 def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]]:
     """Every task's latest row (a later line of a task id supersedes an earlier one), and read counts."""
     counts: Counter[str] = Counter()
@@ -406,7 +460,8 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
             except (ValueError, RecursionError):
                 counts["malformed_lines"] += 1
                 continue
-            if not isinstance(row, dict) or row.get("schema") != ROW_SCHEMA or not valid_task_id(row.get("task_id")):
+            if (not isinstance(row, dict) or row.get("schema") != ROW_SCHEMA or not valid_task_id(row.get("task_id"))
+                    or not _well_formed(row)):
                 counts["malformed_lines"] += 1
                 continue
             counts["lines"] += 1
