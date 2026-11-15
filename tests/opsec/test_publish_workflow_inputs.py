@@ -2,6 +2,7 @@
 
 
 
+from lu_machinery.common.repo_root import machinery_path
 import json
 import subprocess
 import pytest
@@ -698,7 +699,7 @@ def test_nondefault_public_catalog_entry_is_not_private(monkeypatch):
 )
 def test_publish_consumer_cli_help_runs_as_script(path):
     result = subprocess.run(
-        [sys.executable, str(ROOT / path), "--help"], cwd=ROOT, capture_output=True, text=True, timeout=15
+        [sys.executable, str(machinery_path(path.removeprefix("lu_machinery/"))), "--help"], cwd=ROOT, capture_output=True, text=True, timeout=15
     )
     assert result.returncode == 0, result.stderr.splitlines()[-1:] if result.stderr else ""
     assert "usage:" in result.stdout.lower()
@@ -1065,7 +1066,7 @@ def real_tooling():
     import yaml
 
     override = os.environ.get("LU_OPSEC_TEST_TOOLING")
-    repos = yaml.safe_load((ROOT / machinery_package() / "config/fleet_repos.yaml").read_text())["repos"]
+    repos = yaml.safe_load((machinery_path("config/fleet_repos.yaml")).read_text())["repos"]
     path = (
         Path(override)
         if override

@@ -1,6 +1,7 @@
 """Opt-in Grok reviewer shell and hook boundary."""
 
 from __future__ import annotations
+from tests.agent_runtime.product_roots import claude_plan_binary as claude_plan_binary
 
 import json
 import os
@@ -862,6 +863,7 @@ def test_live_claude_reader_allowed_writer_denied(tmp_path: Path) -> None:
     ), "no native writer permission denial: a model refusing to call is insufficient evidence"
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_workspace_write_names_mcp_servers_from_config(tmp_path: Path) -> None:
     config = tmp_path / "mcp.json"
@@ -885,6 +887,7 @@ def test_workspace_write_names_mcp_servers_from_config(tmp_path: Path) -> None:
     assert "NotebookEdit" not in granted
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.usefixtures("worker_cwd_product")
 def test_workspace_write_mcp_config_comes_from_worker_cwd(tmp_path: Path) -> None:
@@ -906,6 +909,7 @@ def test_workspace_write_mcp_config_comes_from_worker_cwd(tmp_path: Path) -> Non
     assert "mcp__sources__*" not in granted
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_explicit_mcp_config_path_wins_over_worker_cwd(tmp_path: Path) -> None:
     (tmp_path / ".mcp.json").write_text(
@@ -944,6 +948,7 @@ def test_explicit_mcp_config_path_wins_over_worker_cwd(tmp_path: Path) -> None:
     assert not any(name.startswith("mcp__") for name in missing_granted)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.usefixtures("worker_cwd_product")
 def test_workspace_write_rejects_invalid_mcp_config(tmp_path: Path) -> None:
@@ -974,6 +979,7 @@ def test_workspace_write_rejects_invalid_mcp_config(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.usefixtures("worker_cwd_product")
 def test_workspace_write_rejects_unreadable_mcp_config(tmp_path: Path) -> None:
@@ -995,6 +1001,7 @@ def test_workspace_write_rejects_unreadable_mcp_config(tmp_path: Path) -> None:
         config.chmod(0o644)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_workspace_write_rejects_inexpressible_mcp_server_name(tmp_path: Path) -> None:
     config = tmp_path / "mcp.json"
@@ -1014,6 +1021,7 @@ def test_workspace_write_rejects_inexpressible_mcp_server_name(tmp_path: Path) -
         )
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_reviewer_tools_opt_in_installs_profile(tmp_path: Path) -> None:
     plan = ClaudeAdapter().build_invocation(
@@ -1039,6 +1047,7 @@ def test_reviewer_tools_opt_in_installs_profile(tmp_path: Path) -> None:
     assert any(command.endswith("guard-reviewer-publish.py") for command in commands)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_discussion_readonly_keeps_separate_permissions(tmp_path: Path) -> None:
     plan = ClaudeAdapter().build_invocation(
@@ -1209,6 +1218,7 @@ def test_worker_guards_refuse_an_unreadable_hook_command(tmp_path: Path, monkeyp
         _settings_from(tmp_path, monkeypatch)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_readonly_transport_rejects_every_push_wrapper(tmp_path: Path) -> None:
     remote = tmp_path / "remote.git"
@@ -1342,6 +1352,7 @@ def _mcp_config(cmd: list[str]) -> dict:
     return json.loads(cmd[index + 1])
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_reviewer_loads_only_the_trusted_sources_server(tmp_path: Path) -> None:
     from lu_machinery.agent_runtime.review_mcp import isolated_sources_mcp_config
@@ -1381,6 +1392,7 @@ def test_reviewer_loads_only_the_trusted_sources_server(tmp_path: Path) -> None:
     assert any(command.endswith("guard-primary-checkout-write.py") for command in commands)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize(
     "worktree_config",
@@ -1409,6 +1421,7 @@ def test_worktree_mcp_json_gains_the_reviewer_nothing(tmp_path: Path, worktree_c
     assert not any(name.startswith("mcp__other_tool") for name in _granted(cmd))
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_reviewer_refuses_a_caller_mcp_config_outside_formal_full_access(tmp_path: Path) -> None:
     config = tmp_path / "sources.json"
@@ -1419,6 +1432,7 @@ def test_reviewer_refuses_a_caller_mcp_config_outside_formal_full_access(tmp_pat
         _reviewer_plan(tmp_path, mcp_config_path=str(config), review_access="isolated")
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_full_review_access_keeps_review_tool_set(tmp_path: Path) -> None:
     from lu_machinery.agent_runtime.review_mcp import review_tools_allowed_csv
@@ -1438,6 +1452,7 @@ def test_full_review_access_keeps_review_tool_set(tmp_path: Path) -> None:
     assert cmd[cmd.index("--mcp-config") - 1] == "--strict-mcp-config"
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("allowed_tools", ["mcp__sources__*", "Read,Bash(git push *)", ""])
 @pytest.mark.parametrize("strict_mcp_config", [False, True])
@@ -1520,6 +1535,7 @@ READ_ONLY_PATHS = {
 }
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("session_id", [None, "00000000-0000-4000-8000-000000000000"])
 @pytest.mark.parametrize("path", sorted(READ_ONLY_PATHS))
@@ -1559,6 +1575,7 @@ def _alias_sources_config(path: Path, server: str) -> Path:
     return path
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("strict_mcp_config", [False, True])
 @pytest.mark.parametrize("server", ALTERNATE_SERVER_NAMES)
@@ -1593,6 +1610,7 @@ def test_explicit_config_alternate_server_name_cannot_expose_a_writer(
         assert not _claude_denies(denied, f"mcp__{server}__{name}"), name
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("tool_config", [None, {"allowed_tools": "mcp__sources_alias__*"}, {"reviewer_tools": True}])
 def test_settings_provided_alternate_server_name_cannot_expose_a_writer(tmp_path: Path, tool_config) -> None:
@@ -1627,6 +1645,7 @@ def test_settings_provided_alternate_server_name_cannot_expose_a_writer(tmp_path
         assert not _claude_denies(denied, f"mcp__sources_alias__{name}"), name
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 def test_ad_hoc_discuss_env_denies_every_sources_writer(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AB_DISCUSS_READONLY", "1")
@@ -1642,6 +1661,7 @@ def test_ad_hoc_discuss_env_denies_every_sources_writer(tmp_path: Path, monkeypa
     assert _denied(plan.cmd) == WRITER_DENIES
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize(
     "tool_config",
@@ -1674,6 +1694,7 @@ def test_write_and_danger_modes_never_deny_sources_writers(tmp_path: Path, mode:
         assert "Bash" in _granted(plan.cmd)
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("tool_config", [None, {"reviewer_tools": True}, {"allowed_tools": "mcp__sources__*"}])
 def test_unreadable_server_declarations_refuse_read_only_launch(tmp_path: Path, monkeypatch, tool_config) -> None:

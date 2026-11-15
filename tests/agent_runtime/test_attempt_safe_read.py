@@ -1,6 +1,7 @@
 """Adversarial parent reads: no seat-controlled name can expose host bytes."""
 
 from __future__ import annotations
+from tests.agent_runtime.product_roots import claude_plan_binary as claude_plan_binary
 
 import os
 from pathlib import Path
@@ -1087,6 +1088,7 @@ def test_prepare_review_attempt_refuses_reused_attempt_id(manifest_file: Path, t
         )
 
 
+@pytest.mark.usefixtures("claude_plan_binary")
 @pytest.mark.usefixtures('configured_roots', 'fake_codex_user_home', 'fake_agy_user_home', '_host_independent_umask', '_matched_review_contract')
 def test_claude_adapter_command_line_contains_review_grant(
     manifest_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
