@@ -29,6 +29,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import github_client
+
 # The machinery package's directory name, which a change lists its files under, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
 # (the package directory on ``sys.path``) cannot shorten it.
@@ -334,13 +336,14 @@ try:
     with contextlib.redirect_stdout(output):
         code = main(sys.argv[1:])
     if code:
-        settled = True
+        # Dispatch may have started a supervisor before reporting an error.
+        # Without a task identity and terminal wait, settlement is unknown.
         print(output.getvalue())
         raise SystemExit(code)
     task_id, nonce = output.getvalue().strip().splitlines()[-2:]
     identity = [task_id, '--run-nonce', nonce]
     code = main(['wait', *identity])
-    settled = True
+    settled = code in (0, 1)
     if code:
         raise SystemExit(code)
     print(record(task_id))
@@ -354,8 +357,8 @@ finally:
 
 
 def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bool = True) -> subprocess.CompletedProcess:
-    """One argv-only subprocess boundary, also used by the dry-run plan's executor."""
-    result = subprocess.run(list(argv), cwd=cwd, env=dict(env), text=True, capture_output=True, check=False)
+    """Use the shared GitHub client seam, including its non-GitHub argv transport."""
+    result = github_client.run(list(argv), cwd=cwd, env=dict(env), text=True, capture_output=True, check=False)
     if check and result.returncode:
         raise CanaryError(f"command failed ({result.returncode}): {shlex.join(argv)}\n{result.stderr.strip()}")
     return result
@@ -379,12 +382,9 @@ def _run_steps(
         [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
         [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
          "--require-hashes", "--only-binary=:all:", "-r", str(mount / "requirements-machinery.lock")],
-        [python, "-I", "-c", "import pathlib, sys, sysconfig; "
-         "pathlib.Path(sysconfig.get_path('purelib'), 'contract-canary.pth').write_text(sys.argv[1] + '\\n')",
+        [python, "-I", "-c", "import pathlib, sys, sysconfig; pathlib.Path(sysconfig.get_path('purelib'), 'contract-canary.pth').write_text(sys.argv[1] + '\\n')",
          str(mount)],
-        [python, "-I", "-B", "-c", "from lu_machinery.dispatcher.worker import _dispatcher_code; "
-         "import sys; c = _dispatcher_code(); "
-         "assert c['head'] == sys.argv[1] and c['clean'] and c['read_only'], c", head],
+        [python, "-I", "-B", "-c", "from lu_machinery.dispatcher.worker import _dispatcher_code; import sys; c = _dispatcher_code(); assert c['head'] == sys.argv[1] and c['clean'] and c['read_only'], c", head],
     ]
     prompt = (
         f"Read-only review-contract canary at {head}. Inspect lu_machinery/review/contract_canary.py "
@@ -433,8 +433,6 @@ def run(args: argparse.Namespace) -> int:
     env.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(primary_root()), LU_PRODUCT_ROOT=str(product_root()))
     head = args.head
     if args.pr is not None:
-        from lu_machinery.common import github_client
-
         result = github_client.run(
             ["gh", "pr", "view", str(args.pr), "--repo", repository["github"], "--json", "headRefOid"],
             cwd=source, env=env, text=True, capture_output=True, check=True,
@@ -455,7 +453,8 @@ def run(args: argparse.Namespace) -> int:
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
     )
     # Force a full score even if this head's changed files do not touch the contract.
-    check = [str(work / "consumer/bin/python"), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
+    # Isolated host imports select the installed gate used by the keeper, not the candidate.
+    check = [str(interpreter), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")

@@ -701,9 +701,10 @@ canonical receipt using `contract_canary.record`:
 The per-route deadline defaults to 1200 seconds; change it with
 `--hard-timeout <positive-seconds>`. A changed catalog route set refuses the run
 until the runner's model map is updated. The runner prints the candidate head,
-image SHA-256, each route's PASS/FAIL and the existing `contract_canary check`
-result. Optional positional changed paths are forwarded to `check`; the gate's
-own path is always included so even a head outside the contract receives a full
+image SHA-256, each route's PASS/FAIL and the installed host's `contract_canary check`
+result, using the keeper's gate rather than the candidate's copy. Optional
+positional changed paths are forwarded to `check`; the gate's own path is always
+included so even a head outside the contract receives a full
 four-route score. Receipts stay in shared `batch_state/review-contract-canary/`;
 the dispatcher owns task worktree settlement. These receipts are canary evidence
 and cannot serve as the PR's independent review of record.
@@ -716,8 +717,10 @@ venv, mount, unit, task or receipt; it supplies no live canary proof. Resolving
 
 Normal completion and setup/route failures unmount and remove the temporary
 environment. If unmounting fails, or the client is interrupted while a route's
-completion is unknown, the runner reports the retained environment. Settle the
-named unit's tasks, then unmount before removing that directory; never remove a
+completion is unknown, the runner reports the retained environment. A dispatch
+error or a non-terminal wait also keeps settlement unknown; only wait exits 0
+and 1 confirm a terminal task. Settle the named unit's tasks, then unmount before
+removing that directory; never remove a
 mounted tree. A fresh invocation uses new task identities and retains prior
 canonical receipts until a successful route replaces them.
 

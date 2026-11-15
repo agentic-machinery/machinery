@@ -269,6 +269,8 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
 
 def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypatch, capsys):
     """A worker can inspect the complete plan without escaping its write boundary."""
+    import sys
+
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-585")
     monkeypatch.setattr(canary, "_invoke", lambda *a, **kw: pytest.fail("dry-run executed a command"))
     assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
@@ -280,6 +282,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output
+    assert f"{sys.executable} -I -B -m lu_machinery.review.contract_canary check" in output
     assert output.count("systemd-run --user") == 4
     assert list(runner_roots.iterdir()) == []
     assert canary.main(["run", "--head", "a" * 40]) == 2
@@ -293,6 +296,8 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     runner_roots, monkeypatch, capsys, failure,
 ):
     """Route/check failure fails closed; setup and cleanup errors preserve a mounted tree."""
+    import sys
+
     commands = []
     mounted = False
 
@@ -321,6 +326,8 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
             code = 1 if failure == "route" and route == "claude" else 0
             output = "" if failure == "unit-lost" else "CANARY-ROUTE-SETTLED\n"
         if "check" in argv:
+            assert argv[:5] == [sys.executable, "-I", "-B", "-m", "lu_machinery.review.contract_canary"]
+            assert "consumer" not in argv[0]
             code = 1 if failure == "check" else 0
             output = "needs-contract-canary: missing: codex\n" if code else "ok\n"
         if "-u" in argv:
@@ -375,9 +382,11 @@ def test_runner_resolves_pr_head_once_before_planning(runner_roots, monkeypatch,
     assert "--pinned-head " + "d" * 40 in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("outcome", ["done", "failed", "interrupted"])
-def test_route_bootstrap_records_only_terminal_success_and_cancels_interruption(monkeypatch, outcome):
-    """A failed or interrupted task cannot be promoted to a canonical canary receipt."""
+@pytest.mark.parametrize("outcome", [
+    "done", "failed", "interrupted", "dispatch-error", "unknown-wait", "timeout-wait", "recovered-wait",
+])
+def test_route_bootstrap_records_only_terminal_success_and_cancels_interruption(monkeypatch, capsys, outcome):
+    """Unknown dispatch/wait status never signals settlement or records a receipt."""
     import signal
     import sys
     from lu_machinery.dispatcher import cli
@@ -389,12 +398,18 @@ def test_route_bootstrap_records_only_terminal_success_and_cancels_interruption(
         calls.append(argv[0])
         if argv[0] == "dispatch":
             print("canary-task\nnonce-42")
-            return 0
+            return 2 if outcome == "dispatch-error" else 0
         assert argv[1:] == ["canary-task", "--run-nonce", "nonce-42"]
         if argv[0] == "wait" and calls.count("wait") == 1:
             if outcome == "interrupted":
                 raise KeyboardInterrupt
+            if outcome in {"unknown-wait", "recovered-wait"}:
+                return 2
+            if outcome == "timeout-wait":
+                return 124
             return 1 if outcome == "failed" else 0
+        if argv[0] == "wait" and outcome in {"unknown-wait", "timeout-wait"}:
+            return 2
         return 0
 
     monkeypatch.setattr(cli, "main", main)
@@ -411,8 +426,17 @@ def test_route_bootstrap_records_only_terminal_success_and_cancels_interruption(
         assert exc.value.code == 1
         assert calls == ["dispatch", "wait"]
         assert receipts == []
-    else:
+    elif outcome == "interrupted":
         with pytest.raises(KeyboardInterrupt):
             exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
         assert calls == ["dispatch", "wait", "cancel", "wait"]
         assert receipts == []
+    else:
+        with pytest.raises(SystemExit) as exc:
+            exec(compile(canary._RUN_ROUTE, "<canary-bootstrap>", "exec"), {})
+        assert exc.value.code == (124 if outcome == "timeout-wait" else 2)
+        assert calls == (["dispatch"] if outcome == "dispatch-error" else ["dispatch", "wait", "cancel", "wait"])
+        assert receipts == []
+    assert ("CANARY-ROUTE-SETTLED" in capsys.readouterr().out.splitlines()) == (
+        outcome in {"done", "failed", "interrupted", "recovered-wait"}
+    )
