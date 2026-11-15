@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -285,6 +286,7 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
+            version = os.fstat(stream.fileno()).st_mtime_ns
         if exclusive:
             os.link(name, path)
         else:
@@ -296,6 +298,24 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
         refresh_running_boundary_view(record)
     finally:
         Path(name).unlink(missing_ok=True)
+    if record.get("status") not in ACTIVE:
+        _record_summary_row(path, record, version)
+
+
+def _record_summary_row(path: Path, record: dict, version: int) -> None:
+    """Append the settled record's model-stats row (#581) after its write; a failure only logs, never unsettles.
+
+    The rows live beside the task store the record was written in (``<batch_state>/tasks/<id>.json`` puts them in
+    ``<batch_state>/model-stats``); a record written anywhere else belongs to no task store and gets no row.
+    """
+    if path.parent.name != "tasks":
+        return
+    try:
+        from lu_machinery.api import model_stats_rows
+
+        model_stats_rows.record_settled(path, record, path.parent.parent, version)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("model-stats summary row not written: %s", type(exc).__name__)
 
 
 def create(record: dict, prompt: bytes) -> Path:
