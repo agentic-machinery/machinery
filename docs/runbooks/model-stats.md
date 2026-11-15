@@ -18,7 +18,8 @@ modification time of the record file it came from). A failed row write is logged
 status; settlement waits at most 5 s for the rows lock. An append closes any torn line an earlier failed append
 left, so a fragment costs only itself. A record whose task id is not a dispatcher task id gets no row. The reader
 skips any line whose values do not have the shape the writer gives them (for example a token count that is not a
-whole number, or a landing without its PR number and merge SHA) and counts it in `coverage.rows.malformed_lines`,
+whole number, a number above 2^63 - 1, a timestamp that does not convert to UTC, or a landing without its PR number
+and merge SHA) and counts it in `coverage.rows.malformed_lines`. The bound keeps every sum and ratio finite,
 so a damaged line never stops the snapshot or turns into a figure; the next backfill rewrites that task's row
 from its record while the record exists.
 

@@ -78,9 +78,9 @@ def timestamp(value: object) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):  # unparseable, or outside the datetime range once moved to UTC
         return None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
 
 
 def tokens(usage: object) -> tuple[int, int, int]:
@@ -390,17 +390,19 @@ def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+# Every stored number is at most a signed 64-bit integer, so no sum or ratio over any number of rows overflows a
+# float or serializes as infinity.
+MAX_VALUE = 2**63 - 1
+
+
 def _count_value(value: object) -> bool:
-    return type(value) is int and value >= 0
+    return type(value) is int and 0 <= value <= MAX_VALUE
 
 
-def _measure(value: object, top: float = math.inf) -> bool:
+def _measure(value: object, top: float = MAX_VALUE) -> bool:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return False
-    try:
-        return math.isfinite(value) and 0 <= value <= top
-    except OverflowError:  # an integer too large for a float
-        return False
+    return 0 <= value <= top  # NaN fails both comparisons; an integer of any size compares exactly
 
 
 def _optional(value: object, check: Any) -> bool:
@@ -423,7 +425,7 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
     review = row.get("review")
     landing = row.get("landing")
     return all((
-        all(_optional(row.get(name), lambda v: isinstance(v, str)) for name in ("started_at", "finished_at")),
+        all(_optional(row.get(name), lambda v: timestamp(v) is not None) for name in ("started_at", "finished_at")),
         _optional(row.get("duration_s"), _measure),
         isinstance(tokens_, dict) and tokens_.keys() == {"fresh_input", "cached_input", "output"}
         and all(_count_value(v) for v in tokens_.values()),
