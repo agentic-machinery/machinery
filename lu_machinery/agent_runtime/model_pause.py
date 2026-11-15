@@ -492,7 +492,9 @@ def _reading_window_passed(view: Mapping[str, Any], lane: str, account: ClaudeAc
 
 
 _MONITOR_READ_TIMEOUT_S = 5.0
-_MONITOR_READY_WAIT_S = 30.0  # covers the cold first routing-budget fill after a restart (~15 s measured)
+# Covers a whole restart: stop to first routing-budget answer measured 32-68 s over 13 restarts
+# (2026-11-14/15; drain, start, cold fill), plus one attempt so the attempt in flight at the fill lands.
+_MONITOR_READY_WAIT_S = 75.0
 _MONITOR_RETRY_PAUSE_S = 1.0
 _MONITOR_DOWN_MEMO_S = 30.0  # after one spent wait, later reads in this process do one 3 s attempt, not another wait
 _monitor_wait_spent_at: float | None = None

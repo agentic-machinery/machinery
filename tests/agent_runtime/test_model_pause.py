@@ -620,3 +620,33 @@ def test_headroom_read_right_after_startup_returns_reading_or_typed_unknown(monk
     with pytest.raises(mp.MonitorUnavailable):
         mp.routing_budget_used_pct("codex", account=HOST_ACCOUNT)
     assert attempts["n"] == spent + 1
+
+
+def test_headroom_read_waits_out_a_whole_measured_restart_window(monkeypatch) -> None:
+    """Defect (readiness wait shorter than a restart): a read started at an API stop was refused.
+
+    Measured restarts kept routing-budget silent for up to 68 s, past the old 30 s
+    wait, so admission refused with MODEL_HEADROOM_MONITOR_UNAVAILABLE. Each attempt
+    hangs on the held socket until its timeout; the Monitor answers 68 s after the stop.
+    """
+    import io
+    import types
+
+    clock = {"t": 0.0}
+
+    def held_until_ready(_url, timeout):
+        if clock["t"] + timeout < 68.0:
+            clock["t"] += timeout
+            raise TimeoutError("timed out")
+        clock["t"] = max(clock["t"], 68.0)
+        fresh = {"stale": False, "freshness": "fresh", "weekly_used_pct": 50}
+        return io.StringIO(json.dumps({"agents": {"claude": {"status": "warm", "codexbar": fresh}}}))
+
+    def sleep(seconds):
+        clock["t"] += seconds
+
+    monkeypatch.setattr(mp, "time", types.SimpleNamespace(monotonic=lambda: clock["t"], sleep=sleep))
+    monkeypatch.setattr(mp, "_monitor_wait_spent_at", None)
+    monkeypatch.setattr(mp.urllib.request, "urlopen", held_until_ready)
+    policy = {"headroom": [{"lane": "claude", "pattern": "claude-*", "max_weekly_used_pct": 90}]}
+    assert mp.refusal_reason("claude-opus-5-5", policy=policy, used_pct=mp.account_used_pct(HOST_ACCOUNT)) is None
