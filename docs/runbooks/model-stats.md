@@ -54,13 +54,14 @@ a row a settlement failed to write.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
 - **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer, outside any code
-  fence (a fenced or quoted example never counts), on a registered
+  fence or inline code span (a fenced, inline-code or quoted example never counts), on a registered
   repository's local `origin/main` since the first row, or that recorded its own merged delivery into `main`
   (`delivery_merge_sha`, proven against GitHub at settlement). `landed_by` reports how many landed by trailer,
   by recorded merge, or both. The Monitor never fetches; trailer landing is as fresh as the last fetch of each
   checkout. `coverage.landing.trailer_task_ids_by_repository` counts trailer task ids per repository.
 - **Wall hours per landed**: wall time of all write tasks of that model divided by its landed tasks, so failed
-  attempts are charged to the work that landed. Tokens per landed task are computed the same way. Fresh input
+  attempts are charged to the work that landed. It is unknown (null) when any of those tasks has no recorded
+  duration; `wall_seconds.n` counts the tasks that have one. Tokens per landed task are computed the same way. Fresh input
   includes cache writes; output includes reasoning tokens (Codex `output_tokens` already include them; the
   reasoning or thinking counts of Cursor, AGY and OpenCode are added).
 - **Review figures** come from each finished review's `.result`, read once into its row with the review contract's
@@ -69,7 +70,8 @@ a row a settlement failed to write.
   2026-11-15 reference script counted that. Per-review rates divide by reviews whose result was read.
 - **Author figures**: per PR reviewed in the window, rounds are distinct pinned heads; first-round approval is
   the verdict on the earliest-reviewed head; "approved eventually" means any head was judged correct. They split
-  by author model only: a review records its author's model but not the author's effort.
+  by author model only: a review records its author's model but not the author's effort. A PR reviewed for
+  more than one author model is grouped under the joined ids (`a+b`), which `/metrics` exports as `other`.
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
   `agy_claude`, `cursor`) and its remaining weekly allowance at start and finish from the Monitor
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
