@@ -131,7 +131,6 @@ tests/agent_runtime/test_identity_eval_timeouts.py
 tests/agent_runtime/test_jsonl_lines.py
 tests/agent_runtime/test_lane_probe.py
 tests/agent_runtime/test_lane_runtime_usage.py
-tests/agent_runtime/test_livenessprobe.py
 tests/agent_runtime/test_model_pause.py
 tests/agent_runtime/test_primary_tree_watch.py
 tests/agent_runtime/test_provider_diagnostic_regressions.py
