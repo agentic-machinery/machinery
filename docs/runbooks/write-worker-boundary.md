@@ -96,8 +96,12 @@ One bubblewrap invocation per launch, built in full by the launcher:
   `<task>.inputs` (inputs a driver stages for the worker) and Codex's `.codex-schemas/<task>.json`.
   Claude's and Cursor's file tools get the same grants (`--add-dir`): the shared skills and
   `<task>.inputs`.
-- Writable: the task worktree, a private `TMPDIR` (also `LU_SCRATCH_ROOT` and `XDG_RUNTIME_DIR`) and
-  the declared outputs (the final-message file and AGY's write log).
+- Writable: the task worktree, a private `TMPDIR` (also `LU_SCRATCH_ROOT` and `XDG_RUNTIME_DIR`),
+  the declared outputs (the final-message file and AGY's write log) and, for a write dispatch, the host's
+  test-slot pool at its default location (#557; [test slots](test-slots.md#write-boundary-workers)), so
+  governed tests queue with the host's own runs. The pool and its `queue` and `holders` directories are
+  mount points, so no directory a host run resolves can be replaced; the canary checks that each
+  refuses a rename (`EBUSY`). The receipt's `test_slots` records whether it was bound.
 - Network: only the CONNECT-only egress proxy of the formal review attempts (`attempt_network`),
   reached through the in-namespace forwarder. Any public host on port 443 except GitHub: its names
   (`github.com`, every name below it, and `ghcr.io`) and every name that resolves into the address
@@ -200,6 +204,8 @@ forward to it on their own when that variable is set, so a worker runs the usual
 | `dispatch.py dispatch --mode read-only ...` | `review-dispatch` | Starts the review in its own normal sandbox |
 | `record_cf_verdict.py --task-id T --pr N` | `record-verdict` | Records the verdict under the host's PR lock |
 | `fleet_comms channel publish ...` | `fleet-publish` | Appends the message with the task id as sender |
+| `fleet_comms deliveries receive\|ack ...` | `fleet-deliveries` | Receives or acknowledges a delivery addressed to the task |
+| `write_boundary call pr-ownership` | `pr-ownership` | Runs `pr_ownership accept` or `queue-exit` as the task, for its own PR |
 | `write_boundary.broker_call("closeout-request", {"pr": N})` | `closeout-request` | Runs `merge_closeout --apply` after exit |
 
 Every verb has a fixed schema, builds its own argv (never a shell) and takes its identities from the
@@ -209,6 +215,14 @@ launch, never from the request:
   Another sandbox, or a host process, cannot act as this task even when it can see the socket file.
 - **Task identity.** The review task id must be `<task>-review-<suffix>`. The Fleet sender is the task
   id, the source is `write-worker`, and the idempotency key is prefixed with the task id.
+- **Fleet plane.** Fleet verbs run on the dispatcher's plane: `FLEET_COMMS_ROOT` when the launch has it,
+  else the plane anchored at the product checkout, which is the one plane seats read. A task whose
+  primary is another registered checkout therefore reaches its dispatcher too (#557).
+- **Inbox.** `fleet-deliveries` takes `receive` (optional `lease_seconds`) or `ack` (`delivery_id`,
+  `fence_token`). The recipient and the lease owner are always the task id; a request naming another is
+  refused. Before an `ack`, the host reads the delivery and refuses one addressed to anyone else. Other
+  delivery operations (`claim`, `read`, `consume`, `status`, `expire-stale`) are not relayed:
+  `receive` claims and reads in one call.
 - **Exact head.** `review-dispatch` checks on GitHub that the PR is open in the primary's own
   repository and that its head branch is the dispatched branch. The pinned head must equal both the PR's
   live head and the worker's branch tip. The host then copies that commit from the private Git layer
@@ -265,11 +279,23 @@ stdin.
 | `pr-edit` | `pr`, `title` and/or `body`, optional `repo` | Edits the title or body of the worker's own open PR |
 | `pr-comment` | `pr`, `body`, optional `repo` | Comments on the worker's own open or merged PR |
 | `pr-merge` | `pr`, `head`, optional `repo` | Enqueues the worker's own PR at `head` |
+| `pr-ownership` | `command` (`accept` or `queue-exit`), `pr`, optional `repo`, `custody`, `from` | Runs `pr_ownership` as the task for its own open PR |
 | `github-read` | `name`, optional `number` or `sha` | One named read of the repository |
 
 What every publication verb takes from the launch, never from the request: the repository (the
 primary's registered GitHub origin), the branch, the base (the repository's default branch on
 GitHub) and PR ownership (the PR's head branch is the dispatched branch, in the same repository).
+
+**Continuing an assigned PR (#557).** A successor or takeover is dispatched with
+`--branch <PR head branch>` (the task's `publish_branch`), as `pr_ownership` already requires. The
+worktree starts at that branch's remote head on the task's own branch, and the dispatcher passes the
+PR branch to the launcher (`--publish-branch`). For such a task the publication branch is the PR
+branch instead of the task's own: `push` publishes the worker's tip there, fast-forward only, and
+`pr-edit`, `pr-comment`, `pr-merge`, `pr-ownership`, `review-dispatch`, `record-verdict` and
+`closeout-request` accept only the PR whose head is that branch. The task's own branch name is then
+refused, and so is the repository's default branch. Push with `git push origin HEAD:<PR branch>`, then
+take ownership with
+`echo '{"command": "accept", "pr": N}' | python -m lu_machinery.dispatcher.write_boundary call pr-ownership`.
 No verb takes an argv, endpoint, refspec or host path. The optional `branch`, `head`, `base` and
 `repo` fields only narrow a request: each must equal the launch's own value (a branch may be given as
 `refs/heads/<name>`), or the request is refused. `lease` is the remote branch's expected commit
@@ -356,8 +382,9 @@ re-running it.
   Stop the affected task at once, and mark the run failed, on a containment breach (a path other than the route's own login yields
   entries or bytes, or a primary file takes a write) or on any credential exposure. A credential seen in an
   output is reported by role and never copied into the PR.
-- Use disposable canary branches and an owned path that is a new file under a scratch directory of the
-  worktree. Delete the canary branches afterwards through the usual cleanup authority.
+- Use disposable canary branches and PRs and an owned path that is a new file under a scratch directory
+  of the worktree. Close the canary PRs unmerged and delete their branches afterwards through the usual
+  cleanup authority.
 
 ### Build and install the artifact
 
@@ -387,21 +414,27 @@ variables are required: `LU_PRODUCT_ROOT` names the consumer checkout the canary
 one that resolves `origin/$BRANCH`), `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` names the primary checkout that
 holds the task store, and `LEARN_UKRAINIAN_PYTHON` names `$P`:
 
+Each route continues an assigned PR (#557): before the run, push one disposable branch
+`canary-$ID-$route-pr` from `origin/$BRANCH` with one commit, and open a draft PR from it to the default
+branch (host side, through the usual publisher). Dispatch each route with that branch as `--branch`:
+
 ```bash
 export LU_PRODUCT_ROOT="<consumer checkout>" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="<primary checkout>"
 export LEARN_UKRAINIAN_PYTHON="$P"
 for route in claude codex cursor agy opencode; do
   "$P" -m lu_machinery.dispatcher.cli dispatch \
     --agent "$route" --model "<catalog model for $route>" --mode workspace-write \
-    --task-id "canary-$ID-$route" --base "origin/$BRANCH" \
+    --task-id "canary-$ID-$route" --base "origin/$BRANCH" --branch "canary-$ID-$route-pr" \
     --owned-path "tmp-boundary-canary/canary-$ID-$route.txt" \
     --hard-timeout 900 --prompt-file "$PROMPTS/canary-$ID-$route.prompt"   # prints the task id and run nonce
 done
 "$P" -m lu_machinery.dispatcher.cli wait "canary-$ID-<route>" --run-nonce "<nonce>" --timeout 900   # per task
 ```
 
-Launch the five without waiting between them if capacity admits; wait for each with `wait`, never by
-polling. Verify the flags with `dispatch --help` of the installed version before the run. Each prompt is the same bounded, mechanical task with the task id changed:
+As soon as each task id is known, send it one Fleet message addressed to it (host side,
+`fleet_comms channel publish <channel> - --sender <operator seat> --recipient canary-$ID-$route`) whose
+body is one line naming a nonce. Launch the five without waiting between them if capacity admits; wait for
+each with `wait`, never by polling. Verify the flags with `dispatch --help` of the installed version before the run. Each prompt is the same bounded, mechanical task with the task id changed:
 
 - Step A: call the Sources `verify_word` tool once with a common word and report whether it returned a
   result (quote the first line) or failed (quote the error). Do not retry.
@@ -415,7 +448,18 @@ polling. Verify the flags with `dispatch --help` of the installed version before
   in the prompt, by role; this public document carries no host path or credential name, and the list is
   host configuration kept with the host's private operating notes.
 - Step C: create the canary file, `git add` it, `git commit` with a message and an `X-Agent` trailer,
-  and `git push -u origin HEAD`. No PR is opened.
+  and push it to the assigned PR's branch: `git push origin HEAD:canary-$ID-$route-pr`. Then take
+  ownership: `echo '{"command": "accept", "pr": <PR>}' | python -m lu_machinery.dispatcher.write_boundary call
+  pr-ownership`. Negative controls: `git push origin HEAD` (the task's own branch name) and a `pr-comment`
+  on another route's canary PR must both be refused. No new PR is opened.
+- Step E: run one small pytest file through the pool with the governor on (never `LU_TEST_SLOTS=off`):
+  `python -m lu_machinery.common.test_slots run -- python -m pytest -q -p no:cacheprovider <file>`, with a
+  file of the checkout that needs no network, then `python -m lu_machinery.common.test_slots status --json`.
+  Report both exit statuses, the pytest summary line, and `pool_exists` and `error` from the status.
+- Step F: receive the Fleet delivery (`fleet_comms deliveries receive --recipient <task id> --worker-id
+  <task id>`), report the nonce it carries, and acknowledge it (`deliveries ack <delivery_id> --worker-id
+  <task id> --fence-token <fence_token>`). Negative control: `deliveries receive --recipient <another seat>`
+  must be refused.
 - Step D, a negative control, before Step C's commit: print only whether the hook environment variables
   are set (never their values) and the installed package's import path as the hook interpreter sees it.
   Then create one new file outside the owned path (a name used only for this control), `git add` it and
@@ -441,6 +485,10 @@ fill one table row per route:
 | Sources through the relay | Step A returned a `verify_word` result, and the receipt `sources` block shows `completed` of at least 1 with `verify_word` among `tools`, and `failed` 0 | pass |
 | Own login only | Step B reports `READABLE` for the route's own login; no other login is `READABLE` | pass |
 | Every other credential and private state | Step B reports `DENIED` or `EMPTY` for every other provider and account login, every other credential store and the private state directory, and never `READABLE` | pass |
+| Continuation push | Receipt `broker` lists `push` with `returncode` 0; the PR branch's remote head equals the task's `head_sha`; the Step C negative controls are refused (`returncode` 2) | pass |
+| PR ownership | Receipt `broker` lists `pr-ownership` with `returncode` 0, and the host's ownership state names the task as the PR's successor | pass |
+| Tests under the governor | Receipt `test_slots.bound` is true; Step E's run exits 0 with its pytest summary, and its status shows `pool_exists` true and no `error` | pass |
+| Inbox | Step F quotes the nonce sent to the task; the delivery is `acknowledged` on the host; receipt `broker` lists `fleet-deliveries` twice with `returncode` 0, and the negative control is refused | pass |
 | Task status | The task ended `done`, the worktree is gone, and nothing else was changed | pass |
 
 Until a route's Sources projection ships, its Sources row fails and the canary blocks: that is the intended
@@ -480,7 +528,10 @@ five tasks, and runs them itself otherwise.
   and `--milestone` are refused before sending), `pr-merge` needs `--match-head`, and a push that
   deletes a branch or rewrites the published one is refused.
 - The product's tracked `scripts.publish` copy forwards only once it runs this package's publisher.
-- Fleet messages can be sent but not received or acknowledged inside.
+- Inside, Fleet messages can be sent, and the task's own deliveries received and acknowledged; no other
+  recipient's deliveries are readable.
+- `pr_ownership` does not forward on its own yet; inside, its `accept` and `queue-exit` run through
+  `write_boundary call pr-ownership`.
 - Decision A4 changes what a worker sees. It no longer reads the real provider configuration beyond the
   selected login's guard-bound state (no plugins, session history or other account), other tasks' records (stage a brief's inputs in
   `<task>.inputs`), private data roots such as `LU_SENSE_PROOF_DIR`, or driver files under `/var/tmp`.

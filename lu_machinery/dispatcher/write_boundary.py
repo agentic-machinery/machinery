@@ -143,6 +143,9 @@ _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
     "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "GH_CONFIG_DIR",
     "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
+    # The host's test-slot governor settings: the launcher selects and sizes the pool it binds as the dispatcher's
+    # own runs do (#557). The pool directory is never passed inside; the size, wait and switch are (``_slot_env``).
+    "LU_TEST_SLOTS", "LU_TEST_SLOTS_DIR", "LU_TEST_SLOTS_COUNT", "LU_TEST_SLOTS_WAIT_S",
 })
 
 # The host broker (decision CONTAIN-BROKER-1113). Inside the boundary the task store, the Fleet plane and the
@@ -150,8 +153,8 @@ _HOST_CONTEXT = frozenset({
 # typed verbs. Each verb has a fixed schema, and every identity it acts under comes from the launch, never the
 # request.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
-_BROKER_VERBS = ("review-dispatch", "record-verdict", "fleet-publish", "closeout-request", "push", "fetch-base",
-                 "pr-create", "pr-edit", "pr-comment", "pr-merge", "github-read")
+_BROKER_VERBS = ("review-dispatch", "record-verdict", "fleet-publish", "fleet-deliveries", "closeout-request", "push",
+                 "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge", "pr-ownership", "github-read")
 # Named reads of the worker's own repository (the publisher's fixed GET templates); no security-alert reads.
 _GITHUB_READS = frozenset({"pull", "pr-files", "commits", "commit", "comments", "reviews", "timeline", "issue",
                            "checks", "check-annotations", "run", "jobs"})
@@ -192,7 +195,9 @@ _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
 _CURSOR_SOURCES_SERVER = "sources-relay"
 _BROKER_TIMEOUTS = {"review-dispatch": 300, "record-verdict": 900, "fleet-publish": 120, "gh": 120,
-                    "closeout-request": 900, "publish": 300, "pr-merge": 900}
+                    "closeout-request": 900, "publish": 300, "pr-merge": 900, "pr-ownership": 300}
+# A Fleet delivery id or artifact id as the authority service mints them; never a flag.
+_DELIVERY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 def sources_command() -> list[str]:
@@ -356,6 +361,9 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
     if spec.agent in _SOURCES_MCP_HOME and spec.mode == "workspace-write":
         argv += ["--sources-mcp", spec.agent]
+    if spec.mode == "workspace-write" and spec.options.get("branch"):
+        # The PR branch a continuation (``dispatch --branch``, recorded as ``publish_branch``) publishes to (#557).
+        argv += ["--publish-branch", spec.options["branch"]]
     if spec.agent == "codex" and spec.mode == "read-only":
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
@@ -865,7 +873,7 @@ class _Broker:
                                "state,headRefName,headRefOid,isCrossRepository,baseRefName"])
         if not isinstance(facts, dict):
             raise _BrokerRefusal("the PR cannot be read on GitHub")
-        branch = self.boundary.branch.removeprefix("refs/heads/")
+        branch = self.boundary.target.removeprefix("refs/heads/")
         if facts.get("isCrossRepository") is not False or facts.get("headRefName") != branch:
             raise _BrokerRefusal("the PR's head is not this task's dispatched branch")
         if facts.get("state") not in states:
@@ -916,8 +924,10 @@ class _Broker:
             raise _BrokerRefusal("repo is not this task's repository")
         branch = payload.get("branch")
         if branch is not None and not (isinstance(branch, str)
-                                       and "refs/heads/" + branch.removeprefix("refs/heads/") == self.boundary.branch):
-            raise _BrokerRefusal("branch is not this task's dispatched branch")
+                                       and "refs/heads/" + branch.removeprefix("refs/heads/") == self.boundary.target):
+            raise _BrokerRefusal("branch is not this task's dispatched branch"
+                                 + (f" ({self.boundary.target.removeprefix('refs/heads/')}, the PR it continues)"
+                                    if self.boundary.target != self.boundary.branch else ""))
         claimed_base = payload.get("base")
         if claimed_base is not None and not (isinstance(claimed_base, str) and base is not None
                                              and claimed_base.removeprefix("refs/heads/") == base):
@@ -934,10 +944,10 @@ class _Broker:
     # -- host steps ----------------------------------------------------------------------------------------------
 
     def _run(self, argv: list[str], timeout_key: str, *, stdin: bytes | None = None,
-             env: dict[str, str] | None = None) -> dict:
+             env: dict[str, str] | None = None, cwd: Path | None = None) -> dict:
         env = {**_host_child_env(self.boundary.args.task_id), **(env or {})}
         # A fixed argv built by this class from validated fields, never a shell.
-        self.child = subprocess.Popen(argv, cwd=self.boundary.repository, env=env, stdin=subprocess.PIPE,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        self.child = subprocess.Popen(argv, cwd=cwd or self.boundary.repository, env=env, stdin=subprocess.PIPE,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             out, err = self.child.communicate(stdin, timeout=_BROKER_TIMEOUTS[timeout_key])
@@ -949,11 +959,22 @@ class _Broker:
         return {"returncode": returncode, "stdout": out[:_MAX_REQUEST].decode("utf-8", "replace"),
                 "stderr": err[:_MAX_REQUEST].decode("utf-8", "replace")}
 
-    def _module(self, module: str, argv: list[str], timeout_key: str, stdin: bytes | None = None) -> dict:
+    def _module(self, module: str, argv: list[str], timeout_key: str, stdin: bytes | None = None,
+                cwd: Path | None = None) -> dict:
         code = (f"import sys; sys.path.insert(0, sys.argv[1]); from {_PACKAGE}.{module} import main; "
                 "raise SystemExit(main(sys.argv[2:]))")
         package_parent = str(machinery_path("dispatcher/write_boundary.py").parents[2])
-        return self._run([sys.executable, "-I", "-c", code, package_parent, *argv], timeout_key, stdin=stdin)
+        return self._run([sys.executable, "-I", "-c", code, package_parent, *argv], timeout_key, stdin=stdin, cwd=cwd)
+
+    def _fleet(self, argv: list[str], stdin: bytes | None = None) -> dict:
+        """One Fleet Comms CLI step on the dispatcher's plane.
+
+        Without ``FLEET_COMMS_ROOT`` the plane is anchored at the working directory's primary checkout, and the one
+        plane the fleet reads is the product's; a task whose primary is another registered checkout would otherwise
+        publish to, and read from, a plane no seat watches (#557).
+        """
+        cwd = None if os.environ.get("FLEET_COMMS_ROOT") else _product_checkout()
+        return self._module("fleet_comms.cli", argv, "fleet-publish", stdin=stdin, cwd=cwd)
 
     def _review_dispatch(self, payload: dict) -> dict:
         allowed = {"task_id", "pr", "pinned_head", "agent", "model", "effort", "prompt", "review_profile", "risk",
@@ -990,7 +1011,7 @@ class _Broker:
         _write_private(prompt_file, prompt.encode(), 0o400)
         argv = ["dispatch", "--repo", repo_key, "--agent", words["agent"], "--model", words["model"],
                 "--mode", "read-only", "--worktree", "--task-id", task, "--prompt-file", str(prompt_file),
-                "--branch", self.boundary.branch.removeprefix("refs/heads/"), "--pinned-head", pinned,
+                "--branch", self.boundary.target.removeprefix("refs/heads/"), "--pinned-head", pinned,
                 "--pr", str(number), "--review-profile", words["review_profile"], "--risk", words["risk"],
                 "--review-author-model", self.boundary.args.author_model, "--review-mode", "cross_family",
                 "--initiator", self.boundary.args.task_id]
@@ -1032,7 +1053,46 @@ class _Broker:
             if not (isinstance(reply_to, str) and _IDEMPOTENCY.fullmatch(reply_to)):
                 raise _BrokerRefusal("in_reply_to is malformed")
             argv += ["--in-reply-to", reply_to]
-        return self._module("fleet_comms.cli", argv, "fleet-publish", stdin=body.encode())
+        return self._fleet(argv, stdin=body.encode())
+
+    def _fleet_deliveries(self, payload: dict) -> dict:
+        """Receive or acknowledge one Fleet delivery addressed to this task, leased by this task (#557).
+
+        The recipient and the lease owner are the task id, never the request's: a worker reads only what its
+        dispatcher sent it. An acknowledgement first checks on the host that the delivery's recipient is this task.
+        """
+        task = self.boundary.args.task_id
+        command = payload.get("command")
+        for name in ("recipient", "worker_id"):
+            if payload.get(name) is not None and payload[name] != task:
+                raise _BrokerRefusal(f"{name} is not this task's id: a worker receives only its own deliveries")
+        if command == "receive":
+            if not set(payload) <= {"command", "recipient", "worker_id", "lease_seconds"}:
+                raise _BrokerRefusal("receive takes recipient, worker_id and lease_seconds")
+            argv = ["deliveries", "receive", "--recipient", task, "--worker-id", task]
+            if (seconds := payload.get("lease_seconds")) is not None:
+                if type(seconds) is not int or not 0 < seconds <= 3600:
+                    raise _BrokerRefusal("lease_seconds must be 1 to 3600")
+                argv += ["--lease-seconds", str(seconds)]
+            return self._fleet(argv)
+        if command == "ack":
+            if not {"command", "delivery_id", "fence_token"} <= set(payload) <= {
+                    "command", "delivery_id", "fence_token", "recipient", "worker_id"}:
+                raise _BrokerRefusal("ack takes delivery_id, fence_token and worker_id")
+            delivery, fence = payload["delivery_id"], payload["fence_token"]
+            if not (isinstance(delivery, str) and _DELIVERY_ID.fullmatch(delivery)):
+                raise _BrokerRefusal("delivery_id is malformed")
+            if type(fence) is not int or not 0 < fence < 2**62:
+                raise _BrokerRefusal("fence_token must be a positive whole number")
+            found = self._fleet(["deliveries", "status", delivery])
+            try:
+                recipient = json.loads(found["stdout"]).get("recipient") if found["returncode"] == 0 else None
+            except (ValueError, AttributeError):
+                recipient = None
+            if recipient != task:
+                raise _BrokerRefusal("the delivery is not addressed to this task")
+            return self._fleet(["deliveries", "ack", delivery, "--worker-id", task, "--fence-token", str(fence)])
+        raise _BrokerRefusal("command must be receive or ack")
 
     def _closeout_request(self, payload: dict) -> dict:
         if set(payload) != {"pr"}:
@@ -1041,6 +1101,27 @@ class _Broker:
         self.closeout_request = {"pr": number, "repo": slug, "repo_root": str(self.boundary.repository)}
         return {"returncode": 0, "stdout": f"closeout of PR {number} runs on the host after this task's worktree "
                 "is settled\n", "stderr": ""}
+
+    def _pr_ownership(self, payload: dict) -> dict:
+        """``pr_ownership accept`` or ``queue-exit`` as this task, for its own PR only (#557).
+
+        The PR must be open with the task's publication branch as its head: the dispatched branch, or for a
+        continuation the PR branch it was dispatched with (``--branch``). The successor is the task id.
+        """
+        if not {"command", "pr"} <= set(payload) <= {"command", "pr", "repo", "custody", "from"}:
+            raise _BrokerRefusal("pr-ownership takes command, pr, and optionally repo, custody and from")
+        command, custody, predecessor = payload["command"], payload.get("custody", False), payload.get("from")
+        if command not in ("accept", "queue-exit"):
+            raise _BrokerRefusal("command must be accept or queue-exit")
+        if type(custody) is not bool or (predecessor is not None and not (
+                isinstance(predecessor, str) and _TASK_ID.fullmatch(predecessor))):
+            raise _BrokerRefusal("custody must be true or false and from a task id")
+        if command != "accept" and (custody or predecessor is not None):
+            raise _BrokerRefusal("custody and from are accept options")
+        number, slug, _facts = self._pull_request({"pr": payload["pr"], "repo": payload.get("repo")}, "OPEN")
+        argv = [command, "--pr", str(number), "--repo", slug, *(["--custody"] if custody else []),
+                *(["--from", predecessor] if predecessor is not None else [])]
+        return self._module("orchestration.pr_ownership", argv, "pr-ownership")
 
     # -- publication (decision PUBLISH-CRED-1113): the worker holds no GitHub credential and has no route to
     # GitHub, so every publication is one of these verbs. The host's own login does the write, through the
@@ -1079,7 +1160,9 @@ class _Broker:
         if lease is not None and not (isinstance(lease, str) and (lease == "" or _OBJECT_ID.fullmatch(lease))):
             raise _BrokerRefusal("lease must be a full commit id, or empty for an absent branch")
         url, credentials = self._remote(slug)
-        branch = self.boundary.branch
+        branch = self.boundary.target
+        if branch != self.boundary.branch and branch == f"refs/heads/{self._default_branch(slug)}":
+            raise _BrokerRefusal("a continuation never publishes to the repository's default branch")
         self.boundary.fetch_objects(head)
         listing = _git(self.boundary.repository, *credentials, "ls-remote", url, branch, git_dir=self.boundary.common,
                        network=True)
@@ -1129,7 +1212,7 @@ class _Broker:
         base = self._default_branch(slug)
         self._claimed({"repo": payload.get("repo"), "branch": payload.get("head"), "base": payload.get("base")}, slug,
                       base)
-        fields = ["--head", self.boundary.branch.removeprefix("refs/heads/"), "--base", base,
+        fields = ["--head", self.boundary.target.removeprefix("refs/heads/"), "--base", base,
                   f"--title={title}", "--body-file", self._text_file(body)]
         return self._publish("pr-create", slug, [*fields, *(["--draft"] if draft else [])])
 
@@ -1248,6 +1331,7 @@ class _Boundary:
         self.gh: Any = None
         self.created = False
         self.created_outputs: list[Path] = []
+        self.slot_env: dict[str, str] = {}  # the bound test-slot pool's settings for the worker (#557)
 
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
@@ -1285,6 +1369,14 @@ class _Boundary:
         if not self.branch.startswith("refs/heads/"):
             raise Refused("the worktree is not on a branch")
         self.tip = _git(self.worktree, "rev-parse", "--verify", "HEAD^{commit}").strip()
+        # What the broker publishes to and counts as the task's own PR: the dispatched branch, or the PR branch a
+        # continuation was dispatched with (``--branch``, the task's ``publish_branch``), and never both (#557).
+        self.target = self.branch
+        if (publish := self.args.publish_branch) is not None:
+            if (self.args.mode != "workspace-write" or not _BRANCH.fullmatch(publish) or publish.startswith("refs/")
+                    or ".." in publish or publish.endswith((".lock", "/", ".")) or "//" in publish):
+                raise Refused("--publish-branch is not a plain branch name of a write dispatch")
+            self.target = f"refs/heads/{publish}"
         self.common, self.git_dir, self.repository = common, git_dir, repository
         # The primary's own Git state stays read-only inside, on top of the private overlay; that includes
         # its checked-out branch when the ref is a loose file (a packed one is covered by packed-refs).
@@ -1363,6 +1455,9 @@ class _Boundary:
         shared = _resolved(shared_root())
         projected_reads = [shared] if shared is not None and shared.is_dir() and _under(shared, _MASKED_ROOTS) else []
         restores = [*base_restores, *own, self.worktree, *outputs, *credentials, tmp, boundary, *projected_reads]
+        slot_pool = None if read_only else self._test_slot_pool()
+        if slot_pool is not None:
+            restores.append(slot_pool[1])
         if self.args.runtime is not None:
             restores.append(Path(self.args.runtime))
         if self.args.codex_auth is not None:
@@ -1386,6 +1481,11 @@ class _Boundary:
         probes += self._view_probes(home, data, masks, restores, private, credentials, own, nonce)
         for path in projected_reads:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
+        if slot_pool is not None:
+            probes.append({"op": "stat", "path": str(slot_pool[1]), "expect_any": ["OK"]})
+            probes.append({"op": "rename", "path": str(slot_pool[1]), "expect_any": ["EBUSY", "EROFS"]})
+            for name in ("queue", "holders"):
+                probes.append({"op": "rename", "path": str(slot_pool[1] / name), "expect_any": ["EBUSY"]})
         self.receipt["canary"] = {"probes_planned": len(probes), "passed": False}
         self.receipt["view"] = {"data_roots": len(data), "toolchain": len(toolchain), "checkouts": len(checkouts),
                                 "private_masks": len(private), "own_records": len(own)}
@@ -1416,6 +1516,13 @@ class _Boundary:
         for path in outputs:
             argv += ["--bind", str(path), str(path)]
         argv += ["--bind", str(tmp), str(tmp), "--ro-bind", str(boundary), str(boundary)]
+        if slot_pool is not None:
+            # The host's test-slot pool, writable where a sandboxed run finds it, so governed tests queue with the
+            # host's own runs (#557); ``test_slots.launcher_bound`` accepts only this mount inside. Its queue and
+            # holder directories are mount points too: host runs resolve them by name, so a worker that could rename
+            # one and put a link in its place would steer host unlinks and creates outside the pool (review F1).
+            for name in ("", "queue", "holders"):
+                argv += ["--bind", str(slot_pool[0] / name), str(slot_pool[1] / name)]
         runtime = tmp
         if self.args.runtime is not None:
             from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
@@ -1494,6 +1601,7 @@ class _Boundary:
             env["CODEX_HOME"] = str(codex_home)
         if self.args.sources_mcp == "opencode":
             env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
+        env.update(self.slot_env)
         if (store := _pre_commit_store(home)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
@@ -1534,6 +1642,39 @@ class _Boundary:
             # worktrees in place and reports them), never by the launcher while the worktree still exists.
             self.receipt["closeout_request"] = self.broker.closeout_request
         return returncode
+
+    def _test_slot_pool(self) -> tuple[Path, Path] | None:
+        """The host's test-slot pool and where a write worker finds it inside: its default location (#557).
+
+        The pool is prepared and its whole path verified here, on the host, where owners are real; the bind then
+        pins the directory, not its name. Without the governor (disabled, or a pool that cannot be prepared) nothing
+        is bound and a governed run inside refuses, typed, as before: the run itself is not refused for it.
+        """
+        from lu_machinery.common import test_slots
+
+        try:
+            if not test_slots.enabled():
+                self.receipt["test_slots"] = {"bound": False, "reason": "disabled"}
+                return None
+            settings = {test_slots.ENABLE_ENV: "on", test_slots.COUNT_ENV: str(test_slots.pool_size(os.environ)),
+                        test_slots.WAIT_ENV: f"{test_slots.wait_timeout(os.environ):g}"}
+            pool = test_slots._open_pool(os.environ).resolve(strict=True)
+        except (test_slots.SlotError, OSError) as exc:
+            reason = exc.reason if isinstance(exc, test_slots.SlotError) else type(exc).__name__
+            self.receipt["test_slots"] = {"bound": False, "reason": reason}
+            return None
+        # Bound where it resolves, as every restore is, so its mount point already exists whatever covers its
+        # parents inside; a sandboxed run finds the pool only at the default location, so only that one is bound.
+        if pool != test_slots._default_pool():
+            self.receipt["test_slots"] = {"bound": False, "reason": "pool_not_at_default_location"}
+            return None
+        if _overlaps(pool, self.worktree) or _overlaps(pool, self.repository) or _under(pool, _MASKED_ROOTS):
+            self.receipt["test_slots"] = {"bound": False, "reason": "pool_overlaps_the_view"}
+            return None
+        # The worker's runs size and wait as the host's do; the pool itself is found by its mount (review F2).
+        self.slot_env = settings
+        self.receipt["test_slots"] = {"bound": True, "pool_size": int(settings[test_slots.COUNT_ENV])}
+        return pool, pool
 
     def _claude_login(self, home: Path, repository: Path) -> tuple[tuple[Path, Path] | None, list[Path]]:
         """The selected Claude login's projection, wherever it lives: a private directory bound at its resolved
@@ -2043,6 +2184,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--receipt", required=True)
     parser.add_argument("--mode", choices=("workspace-write", "read-only"), default="workspace-write")
     parser.add_argument("--runtime", help="The read-only Codex task's existing private scratch lease")
+    parser.add_argument("--publish-branch", help="The PR branch a continuation dispatch publishes to (its "
+                        "publish_branch); the broker pushes and owns that PR only")
     parser.add_argument("--author-model", help="The dispatched model, the review family check's author "
                         "(default: none; the broker then dispatches no review)")
     parser.add_argument("--output", action="append", help="A declared output file the provider writes")

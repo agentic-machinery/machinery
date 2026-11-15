@@ -25,6 +25,9 @@ A sandbox that shows the pool's root-owned ancestors under an unmapped owner and
 the pool, so a Codex read-only review takes ``review`` slots in its trusted dispatch worker before the sandbox
 starts (#11230, #10744). There, a process in a user namespace that maps only part of the id range, as a sandbox
 does, may not choose the pool (:data:`DIR_ENV`, :data:`SCRATCH_ROOT_ENV`) and may join only a ``review`` hold.
+The write boundary instead binds the host's pool, verified on the host, writable at the default location (#557):
+there a sandboxed run queues in the host-wide pool like any other run (:func:`launcher_bound`), and its xdist
+workers join the hold it took in that same user namespace.
 
 A review's governed test runs take turns: one run holds the hold's session lock, and only that run's own
 descendants join its turn. They prove it through :data:`SESSION_ENV`, which names the turn's process, its start
@@ -193,16 +196,58 @@ def user_namespaced() -> bool:
         return True
 
 
+def _user_namespace() -> str:
+    """This process's user namespace as the kernel names it (``user:[<inode>]``), or empty when unreadable."""
+    try:
+        return os.readlink("/proc/self/ns/user")
+    except OSError:
+        return ""
+
+
+def _default_pool() -> Path:
+    return DEFAULT_SCRATCH_ROOT / f"test-slots-{os.geteuid()}"
+
+
+def _unescape_mount_path(value: str) -> str:
+    """A mount point field of ``/proc/self/mountinfo``, whose space, tab, newline and backslash are octal escapes."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def launcher_bound(path: Path) -> bool:
+    """Whether ``path`` is, in this process's view, a writable mount exactly at that path (#557).
+
+    The write boundary's launcher binds the host's pool, verified on the host, at the default location. A process in
+    the sandbox cannot create a mount (it has no capabilities and no new user namespace), so the kernel's mount table
+    tells the launcher's pool from a directory the sandbox made itself. A read-only view, as Codex's review sandbox
+    mounts it, is not one: there a run joins only its launcher's review hold.
+    """
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    target, options = str(path), None
+    for line in lines:
+        fields = line.split(" ")
+        if len(fields) > 5 and _unescape_mount_path(fields[4]) == target:
+            options = fields[5].split(",")  # the last mount at a path is the one its name resolves to
+    return options is not None and "rw" in options and os.path.realpath(path) == target
+
+
 def pool_dir(environ: Mapping[str, str] | None = None) -> Path:
     """The pool directory this environment selects; nothing is created.
 
     A sandboxed process (:func:`user_namespaced`) gets only the default location: a pool it could point at, such as
-    one it built in a writable directory, would let it count slots no launcher issued (#11230).
+    one it built in a writable directory, would let it count slots no launcher issued (#11230). There
+    :data:`SCRATCH_ROOT_ENV`, which the write boundary's launcher sets to the run's private scratch, does not select
+    the pool when the launcher bound the host's pool at the default location (:func:`launcher_bound`); otherwise it
+    refuses as a choice of pool.
     """
     env = os.environ if environ is None else environ
     override = env.get(DIR_ENV, "").strip()
     root = env.get(SCRATCH_ROOT_ENV, "").strip()
     if (override or root) and user_namespaced():
+        if not override and launcher_bound(_default_pool()):
+            return _default_pool()
         raise SlotError(
             "pool_override_refused",
             f"a sandboxed run cannot choose the pool; unset {DIR_ENV} and {SCRATCH_ROOT_ENV} so it uses the "
@@ -212,7 +257,9 @@ def pool_dir(environ: Mapping[str, str] | None = None) -> Path:
         if not os.path.isabs(override):
             raise SlotError("invalid_configuration", f"{DIR_ENV} must be an absolute path")
         return Path(override)
-    base = Path(root) if root else DEFAULT_SCRATCH_ROOT
+    if not root:
+        return _default_pool()
+    base = Path(root)
     if not base.is_absolute():
         raise SlotError("invalid_configuration", f"{SCRATCH_ROOT_ENV} must be an absolute path")
     return base / f"test-slots-{os.geteuid()}"
@@ -339,10 +386,28 @@ def _private_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _bound_pool(path: Path) -> Path | None:
+    """The launcher-bound pool of a sandboxed process (:func:`launcher_bound`), else ``None``.
+
+    Inside a user namespace that maps only this user the pool's root-owned ancestors show an unmapped owner, so the
+    walk of :func:`_verified_directory` cannot tell root from another user there. The launcher verified the whole
+    path on the host with real owners before it bound the directory, a bind pins the directory itself rather than
+    its name, and the sandbox can neither create nor move a mount. So here only the pool itself is checked: a real
+    directory this user owns, private, never created by the sandbox.
+    """
+    if not user_namespaced() or path != _default_pool() or not launcher_bound(path):
+        return None
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise SlotError("pool_unavailable", "the launcher-bound pool directory is not private to this user")
+    return path
+
+
 def _open_pool(env: Mapping[str, str]) -> Path:
     """Return the verified, link-free pool directory with its queue and holder directories, creating them."""
     try:
-        path = _verified_directory(pool_dir(env), create=True)
+        selected = pool_dir(env)
+        path = _bound_pool(selected) or _verified_directory(selected, create=True)
         assert path is not None  # creating never reports a missing component
         _private_directory(path)
         for name in ("queue", "holders"):
@@ -616,6 +681,7 @@ def acquire(
         "kind": kind,
         "task_id": _task_label(task_id if task_id is not None else env.get(TASK_ENV)),
         "pid": os.getpid(),
+        "userns": _user_namespace(),  # only runs in this namespace join a non-review hold from a sandbox (#557)
         "requested": int(requested),
         "queued_at": time.time(),
     }
@@ -834,7 +900,9 @@ def _live_holder(env: Mapping[str, str]) -> _Marked | None:
     tasks = {_task_label(held.get("task_id")), _task_label(env.get(TASK_ENV))} - {"unknown"}
     if len(tasks) > 1:
         return None
-    if kind != "review" and user_namespaced():
+    # A sandboxed run joins a hold its trusted launcher issued only as a review turn (#11230). A hold a run in the
+    # same sandbox took in the launcher-bound pool (#557) is that sandbox's own, and its xdist workers join it.
+    if kind != "review" and user_namespaced() and (not held.get("userns") or held.get("userns") != _user_namespace()):
         return None
     root = path.parent.parent
     if not all(_slot_claimed_by(root, index, path.name, nonce) for index in slots):
@@ -1216,7 +1284,8 @@ def status(environ: Mapping[str, str] | None = None) -> dict[str, object]:
         report["enabled"] = enabled(env)
         size = pool_size(env)
         report.update(pool_size=size, slots_free=size, wait_timeout_s=wait_timeout(env))
-        path = _verified_directory(pool_dir(env), create=False)  # verifies the path, creates nothing
+        selected = pool_dir(env)
+        path = _bound_pool(selected) or _verified_directory(selected, create=False)  # verifies, creates nothing
         if path is None:
             return report
         try:

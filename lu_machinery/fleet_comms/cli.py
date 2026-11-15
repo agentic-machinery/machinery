@@ -793,12 +793,38 @@ def _refuse_kimi_recipients(recipients: list[str] | tuple[str, ...]) -> None:
         raise FleetCommsCliError(str(exc)) from exc
 
 
+def _deliveries_through_broker(args: argparse.Namespace) -> int:
+    """Inside a write boundary the plane is read-only: the launcher's broker receives and acknowledges the task's
+    own deliveries, with the task id as recipient and lease owner (#557)."""
+    from lu_machinery.dispatcher import write_boundary
+
+    if args.deliveries_command not in {"receive", "ack"} or args.root:
+        raise FleetCommsCliError("inside a write boundary only deliveries receive and ack of this task's own "
+                                 "deliveries are relayed, through the launcher's broker; use the task id as "
+                                 "--recipient and --worker-id")
+    if args.deliveries_command == "receive":
+        payload: dict[str, Any] = {"command": "receive", "recipient": args.recipient, "worker_id": args.worker_id,
+                                   "lease_seconds": args.lease_seconds}
+    else:
+        if args.acknowledgment_artifact_id is not None:
+            raise FleetCommsCliError("inside a write boundary an acknowledgement carries no artifact")
+        payload = {"command": "ack", "delivery_id": args.delivery_id, "worker_id": args.worker_id,
+                   "fence_token": args.fence_token}
+    reply = write_boundary.broker_call("fleet-deliveries", payload)
+    sys.stdout.write(str(reply.get("stdout", "")))
+    sys.stderr.write(str(reply.get("stderr", "")))
+    code = reply.get("returncode")
+    return code if code in (EXIT_OK, EXIT_NOT_FOUND) else EXIT_ERROR
+
+
 def cmd_deliveries(args: argparse.Namespace) -> int:
     """Expose fenced delivery operations; read and receive return bodies to the lease holder."""
     from lu_machinery.control_plane.storage import ControlPlaneError
     from lu_machinery.fleet_comms.artifacts import ArtifactStoreError
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 
+    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
+        return _deliveries_through_broker(args)
     if args.deliveries_command in {"claim", "receive"}:
         _refuse_kimi_recipients((args.recipient,))
     try:
@@ -906,6 +932,8 @@ def _add_deliveries_parser(sub: Any) -> None:
         "  ineligible for retention deletion. Expiry sends one summary notification. Their dead\n"
         "  letters carry reason expired_by_cleanup, which recent-failure windows do not count.\n"
         "  These commands open the authority store, initializing/migrating it if necessary.\n"
+        "  Inside a write boundary only receive and ack run, through the launcher's broker, for the\n"
+        "  task's own deliveries (recipient and worker id are the task id).\n"
         "Exit codes: 0 = success, 1 = no claimable delivery or delivery not found,\n"
         "  2 = usage error, 3 = operation refused or storage error.\n"
         f"Related: {_PACKAGE}.authority.AuthorityService; channels publish; plane-status."
