@@ -49,8 +49,6 @@ def _confirmed(tmp_path: Path) -> Path:
                         "replacement_task_id": REPLACEMENT,
                         "lifecycle_state": "confirmed",
                     },
-                    "canary_proof": {"status": "PASS"},
-                    "strict_verdict": {"verdict": "PASS"},
                 },
                 "cleanup": {"old_automation_ready_to_delete": True, "confirmed_at": "2026-10-03T00:00:00Z"},
             }

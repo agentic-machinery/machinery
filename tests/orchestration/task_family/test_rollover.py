@@ -95,8 +95,6 @@ def _confirmed_state(data: dict[str, object]) -> dict[str, object]:
             "thread_id": replacement_id,
             "resumed_thread_id": replacement_id,
             "confirmed_at": "2026-07-15T10:00:00Z",
-            "canary_proof": {"status": "PASS", "replacement_thread_id": replacement_id},
-            "strict_verdict": {"verdict": "PASS", "correct": 10, "k": 10},
         },
         "cleanup": {"old_automation_ready_to_delete": True},
     }

@@ -132,12 +132,6 @@ def _lease(
             "runtime_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}",
             "handoff_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/handoff.md",
             "bootstrap_prompt_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/bootstrap.md",
-            "semantic_snapshot_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/semantic-snapshot.json",
-            "strict_probe_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/strict-probe.json",
-            "strict_questions_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/strict-questions.json",
-            "strict_answers_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/strict-answers.json",
-            "strict_verdict_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/strict-verdict.json",
-            "canary_proof_path": f".agent/thread-rollovers/{agent}/{lineage}/generation-0001/{rollover_id}/canary-pass.json",
         },
         "cleanup": {
             "old_automation_ready_to_delete": status == "started",
@@ -147,8 +141,6 @@ def _lease(
     }
     if status == "started":
         result["replacement"]["confirmed_at"] = prepared_at
-        result["replacement"]["strict_verdict"] = {"verdict": "PASS", "correct": 10, "k": 10}
-        result["replacement"]["canary_proof"] = {"status": "PASS"}
     return result
 
 
@@ -388,7 +380,7 @@ def test_confirmed_rollover_is_not_live_and_requires_cleanup(tmp_path: Path) -> 
     )
 
     assert record["state"] == registry.RolloverState.CONFIRMED.value
-    assert "strict_recall" not in record
+    assert "strict_recall" not in record and "canary" not in record
     assert not registry.is_live_pending(record)
     audit = registry.audit_fleet(tmp_path, now=datetime(2026, 7, 16, 10, tzinfo=UTC))
     assert audit["entries"][0]["classification"] == "confirmed but incompletely cleaned"
