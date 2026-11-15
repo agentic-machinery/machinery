@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import time
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from lu_machinery.agent_runtime import model_pause
 from lu_machinery.api import model_stats_rows as rows
 from lu_machinery.dispatcher import store, worker
 
@@ -56,6 +59,9 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
         stream.write(b'{"schema": "model-stats-row.v1", "task_id": "torn')  # an append cut short
     (tasks / "archive").mkdir()
     _record(tasks / "archive", "w2", duration_s=1200, usage=usage, research_task_family="code")
+    # A legacy record's id is not checked on read: one that is no dispatcher task id is never stored.
+    (tasks / "archive" / "legacy.json").write_text(json.dumps(
+        {"schema_version": 1, "task_id": "/srv/private/model", "agent": "codex", "status": "done"}))
     # The next settlement closes the torn line first, so only the fragment is lost.
     store.replace(_record(tasks, "old", finished_at=(SINCE - timedelta(days=40)).isoformat(), duration_s=99),
                   tasks / "old.json")
@@ -74,15 +80,16 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     again = rows.backfill(tasks, batch_state)
 
     assert (first["added"], first["refreshed"], first["already_present"]) == (4, 1, 2)
+    assert first["invalid_task_id"] == 1 and "/srv/private/model" not in rows.rows_path(batch_state).read_text()
     assert (again["added"], again["refreshed"]) == (0, 0)
     assert rows.read_rows(batch_state)[1]["malformed_lines"] == 1
 
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
-    """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0)."""
-    monkeypatch.setattr(worker, "_monitor_listening", lambda: True)
+    """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
+    launch or settlement on an unready Monitor, or the wrong window recorded as the weekly allowance."""
     readings = iter([None, 35.0])
-    monkeypatch.setattr(worker.model_pause, "routing_budget_used_pct", lambda lane, *, account: next(readings))
+    monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
 
     record["allowance"] = worker._allowance(record, "start")
@@ -93,8 +100,25 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
     assert record["allowance"]["finish"]["remaining_pct"] == 65.0
     assert worker._allowance({"agent": "opencode", "model": "deepseek-v4.1-flash"}, "start") == {
         "pool": None, "meter": "weekly_remaining_pct", "start": "unknown", "finish": "unknown"}
-    monkeypatch.setattr(worker, "_monitor_listening", lambda: False)
+    monkeypatch.undo()
+    # A Monitor answering 503 gets one request: no readiness wait, no retry, no admission down memo.
+    requests = []
+
+    def unready(url, timeout):
+        requests.append(url)
+        raise urllib.error.HTTPError(url, 503, "starting", None, None)
+
+    monkeypatch.setattr(model_pause.urllib.request, "urlopen", unready)
+    memo = model_pause._monitor_wait_spent_at
     assert worker._allowance({"agent": "cursor"}, "finish")["finish"] == "unknown"
+    assert len(requests) == 1 and model_pause._monitor_wait_spent_at == memo
+    # AGY Claude records its weekly window, never the stricter five-hour one.
+    windows = {"five_hour": {"used_pct": 90.0}, "weekly": {"used_pct": 20.0}}
+    snapshot = {"agents": {"gemini": {"status": "ok", "codexbar": {"stale": False, "freshness": "fresh"},
+                                      "claude_gpt_windows": windows}}}
+    monkeypatch.setattr(model_pause.urllib.request, "urlopen", lambda url, timeout: io.BytesIO(json.dumps(snapshot).encode()))
+    agy = worker._allowance({"agent": "agy", "model": "claude-opus-5-5"}, "start")
+    assert agy["pool"] == "agy_claude" and agy["start"]["remaining_pct"] == 80.0
 
     batch_state, tasks = _state(tmp_path)
     _record(tasks, "half", allowance=record["allowance"])

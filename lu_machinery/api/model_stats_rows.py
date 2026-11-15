@@ -51,6 +51,8 @@ UNSET = "unset"
 NATIVE_ALIASES = ("opus", "sonnet", "haiku")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+# The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.
+_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _EFFORT_SUFFIX = re.compile(rf"-({VARIANT_SUFFIX.pattern})\Z")
 # Plan-metered pools only; an API-key account label names no allowance and is never stored.
 POOLS = frozenset({*(f"claude:{label}" for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS),
@@ -240,20 +242,25 @@ def _landing(record: Mapping[str, Any]) -> dict[str, Any] | None:
     return {"pr": int(pr), "merge_sha": sha}
 
 
+def valid_task_id(value: object) -> bool:
+    """Whether ``value`` is a dispatcher task id; any other value is never stored, so no free text enters a row."""
+    return isinstance(value, str) and _TASK_ID.match(value) is not None and ".." not in value
+
+
 def _iso(value: object) -> str | None:
     moment = timestamp(value)
     return moment.isoformat() if moment else None
 
 
 def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None) -> dict[str, Any] | None:
-    """The summary row of a settled task record, or None for an active or foreign record.
+    """The summary row of a settled task record, or None for an active or foreign record or an invalid task id.
 
     ``source_mtime_ns`` is the record file's modification time when it was read: of two rows for one task id, the
     one from the later record version is the current one.
     """
     task_id = record.get("task_id")
     status = record.get("status")
-    if not isinstance(task_id, str) or not task_id or not isinstance(status, str) or status in ACTIVE:
+    if not valid_task_id(task_id) or not isinstance(status, str) or status in ACTIVE:
         return None
     options = _options(record)
     role = role_of(record)
@@ -399,7 +406,7 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
             except (ValueError, RecursionError):
                 counts["malformed_lines"] += 1
                 continue
-            if not isinstance(row, dict) or row.get("schema") != ROW_SCHEMA or not isinstance(row.get("task_id"), str):
+            if not isinstance(row, dict) or row.get("schema") != ROW_SCHEMA or not valid_task_id(row.get("task_id")):
                 counts["malformed_lines"] += 1
                 continue
             counts["lines"] += 1
@@ -421,6 +428,9 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
             counts["unreadable"] += 1
             continue
         if not isinstance(record, dict) or not isinstance(record.get("task_id"), str):
+            continue
+        if not valid_task_id(record["task_id"]):
+            counts["invalid_task_id"] += 1
             continue
         if record["task_id"] in seen:  # the hot record outranks an archived copy
             counts["duplicate_task_ids"] += 1

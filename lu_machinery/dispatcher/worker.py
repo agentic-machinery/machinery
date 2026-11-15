@@ -9,13 +9,11 @@ import math
 import os
 import re
 import signal
-import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1509,9 +1507,8 @@ def _provider_env(spec: TaskSpec) -> dict[str, str]:
     return env
 
 
-# Weekly plan meters the Monitor routing-budget publishes per pool (model_pause.routing_budget_used_pct, #581).
+# Weekly plan meters the Monitor routing-budget publishes per pool (model_pause.weekly_used_pct_reading, #581).
 _CODEX_ALLOWANCE_POOLS = {"sub": "codex:a", "b-sub": "codex:b"}
-ALLOWANCE_CONNECT_TIMEOUT_S = 0.5
 
 
 def _allowance_pool(record: dict) -> tuple[str, str, claude_account_lane.ClaudeAccount | None] | None:
@@ -1540,25 +1537,13 @@ def _allowance_pool(record: dict) -> tuple[str, str, claude_account_lane.ClaudeA
     return None
 
 
-def _monitor_listening() -> bool:
-    """One short connect to the Monitor, so a best-effort reading never spends the admission's readiness wait."""
-    url = urllib.parse.urlsplit(model_pause._monitor_base())
-    port = url.port or (443 if url.scheme == "https" else 80)
-    try:
-        socket.create_connection((url.hostname or "localhost", port), timeout=ALLOWANCE_CONNECT_TIMEOUT_S).close()
-    except OSError:
-        return False
-    return True
-
-
 def _allowance_reading(pool: tuple[str, str, claude_account_lane.ClaudeAccount | None] | None) -> dict | str:
     """The pool's remaining weekly allowance now, or ``"unknown"``; a missing reading is never 0. Never raises."""
     if pool is None:
         return "unknown"
     try:
-        if not _monitor_listening():
-            return "unknown"
-        used = model_pause.routing_budget_used_pct(pool[1], account=pool[2])
+        # One bounded telemetry read: never the admission reader's readiness wait or its down memo.
+        used = model_pause.weekly_used_pct_reading(pool[1], account=pool[2])
     except Exception:  # the Monitor or its snapshot is unavailable: no reading
         return "unknown"
     if used is None or not math.isfinite(used):
