@@ -12,6 +12,7 @@ review snapshot sealing are therefore recoverable after a process crash.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -20,7 +21,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from lu_machinery.agent_runtime.retired_seat_admission import ACP_MODE, BRIDGE_MODE, KimiAdmissionRefused
 from lu_machinery.agent_runtime.target_admission import (
@@ -237,10 +238,9 @@ def _registered_recipients() -> frozenset[str]:
         return cached
     names = {DURABLE_CTO_RECIPIENT, *_channels._load_registry_slots(paths[0])}
     if len(names) > 1:
-        try:
+        # A broken lane file leaves the roster's slots.
+        with contextlib.suppress(Exception):
             names.update(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
-        except Exception:  # noqa: BLE001 - a broken lane file leaves the roster's slots
-            pass
     roster = frozenset(names)
     _ROSTER_CACHE.clear()
     _ROSTER_CACHE[tuple(key)] = roster
@@ -332,7 +332,7 @@ class AuthorityStaleLeaseError(AuthorityServiceError):
 class AuthorityRecipientRefused(AuthorityServiceError):
     """A publish or subscription named a recipient no drain reads; ``cause`` names why."""
 
-    _CAUSES = {
+    _CAUSES: ClassVar[dict[str, tuple[str, str]]] = {
         "not_registered": (RECIPIENT_NOT_REGISTERED_REASON, "is neither a registered slot nor a live task id"),
         "settled_task": (RECIPIENT_SETTLED_REASON, "is a task that has settled"),
         "unknown": ("recipient_unverifiable", "could not be checked against the slot roster or its task record"),
