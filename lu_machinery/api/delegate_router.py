@@ -664,7 +664,9 @@ def _delegate_task_rows_locked(
                 )
             except OSError:
                 # An I/O failure can recover without changing file metadata.
-                # Do not turn it into an indefinitely cached absence.
+                # Do not turn it into an indefinitely cached absence, and do
+                # not publish a generation that omits the unread record.
+                generation_observed = False
                 continue
             if task is None:
                 # Foreign or damaged records are misses too. Otherwise every
