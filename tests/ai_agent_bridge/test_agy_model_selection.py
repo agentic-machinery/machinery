@@ -9,7 +9,6 @@ so the read must come from there (ported from kubedojo's fixed bridge).
 from __future__ import annotations
 
 import json
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -19,10 +18,6 @@ from lu_machinery.agent_runtime.result import Result
 from lu_machinery.ai_agent_bridge import _agy
 from lu_machinery.ai_agent_bridge._agy import _extract_target_model, ask_agy, process_for_agy
 from lu_machinery.ai_agent_bridge import _config
-from lu_machinery.ai_agent_bridge._review_worktree import (
-    ProvisionedReviewWorktree,
-    ReviewIsolationEvidenceBinder,
-)
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
@@ -56,7 +51,7 @@ def test_ukrainian_content_review_can_still_route_to_agy(monkeypatch):
     assert sent["args"][2] == "review"
     assert sent["to_llm"] == "agy"
     assert sent["to_model"] == "gemini-3.8-flash-high"
-    assert sent["review_target"] is None
+    assert sent.get("review_target") is None
 
 
 def test_data_with_other_keys_but_no_to_model_returns_none():
@@ -129,15 +124,7 @@ def test_agy_bridge_records_unsandboxed_repo_read_mode(monkeypatch):
     assert spawn_cwd.is_dir()
 
 
-def test_agy_branch_review_fails_closed_until_native_isolation_exists(monkeypatch, tmp_path):
-    binder = ReviewIsolationEvidenceBinder()
-    checkout = ProvisionedReviewWorktree(
-        path=tmp_path / "review-checkout",
-        branch="feature/review",
-        sha="a" * 40,
-        evidence_binder=binder,
-    )
-    checkout.path.mkdir()
+def test_agy_branch_review_fails_closed_until_native_isolation_exists(monkeypatch):
     msg = {
         "id": 9,
         "task_id": "branch-review",
@@ -149,17 +136,7 @@ def test_agy_branch_review_fails_closed_until_native_isolation_exists(monkeypatc
     }
     captured: dict[str, object] = {}
 
-    @contextmanager
-    def fake_checkout(*_args, **_kwargs):
-        yield checkout
-
     monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy._fetch_agy_message", lambda _id: msg)
-    monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.provision_review_worktree", fake_checkout)
-    monkeypatch.setattr(
-        ProvisionedReviewWorktree,
-        "review_prompt_evidence",
-        lambda self, engine: "\nSEALED_DOSSIER",
-    )
     monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.acknowledge", lambda _id: None)
     monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.send_message", lambda **_kwargs: 10)
     monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.record_ask_reply", lambda *_args: None)
@@ -188,7 +165,6 @@ def test_agy_branch_review_fails_closed_until_native_isolation_exists(monkeypatc
     with pytest.raises(ValueError, match="agy_isolated_review_unsupported"):
         process_for_agy(9, review=True, stdout_only=True)
     assert captured == {}
-    assert binder.expected_engine is None
 
 
 @pytest.mark.parametrize("model", ["claude-sonnet-5-5-high", "claude-opus-5-5-high"])

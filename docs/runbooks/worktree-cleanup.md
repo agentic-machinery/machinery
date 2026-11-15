@@ -130,8 +130,7 @@ The remaining recursive deletion and `rmdir` hits operate on runtime leases,
 review snapshot/neutral metadata, capture records, generated staging/output,
 owned hook metadata, empty deployed mirror directories, or audit fixtures.
 They are not registered worktree-root removers. In particular,
-`audit/test_handoff_identity.sh` removes a mock rollover directory, and
-`review/snapshot.py` only calls `rmdir` on an empty extracted overlay member.
+`audit/test_handoff_identity.sh` removes a mock rollover directory.
 
 The guard inventories all Git-ignored regular files, including `.cache/`
 outputs never named in a response. No-checkout runtimes have an empty index and
