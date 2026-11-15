@@ -16,7 +16,11 @@ The dispatcher store appends a row after each write of a settled record in a `ta
 task id wins, so the record's final update decides. Each row carries its record version (`source_mtime_ns`, the
 modification time of the record file it came from). A failed row write is logged and never changes the task's
 status; settlement waits at most 5 s for the rows lock. An append closes any torn line an earlier failed append
-left, so a fragment costs only itself. A record whose task id is not a dispatcher task id gets no row.
+left, so a fragment costs only itself. A record whose task id is not a dispatcher task id gets no row. The reader
+skips any line whose values do not have the shape the writer gives them (for example a token count that is not a
+whole number, or a landing without its PR number and merge SHA) and counts it in `coverage.rows.malformed_lines`,
+so a damaged line never stops the snapshot or turns into a figure; the next backfill rewrites that task's row
+from its record while the record exists.
 
 The file sits beside `batch_state/tasks/`, not in it: archiving or deleting task records never removes a row,
 so every window, including `all`, keeps working after retention. It is one append-only JSON-lines file under an
