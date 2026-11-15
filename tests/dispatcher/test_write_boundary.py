@@ -1411,7 +1411,7 @@ def test_write_dispatch_launches_the_provider_directly_with_its_own_login(sandbo
     monkeypatch.setattr(worker.headroom, "check_runtime", lambda *args, **kwargs: None)
     monkeypatch.setattr(worker, "_reap_settled", lambda *_args, **_kwargs: None)
     spec = TaskSpec("direct-write", "claude", "claude-opus-5-5", None, "workspace-write", sandbox.repo,
-                    sandbox.repo / "direct-write.prompt", sandbox.tasks / "direct-write.result", "a")
+                    tmp_path / "direct-write.prompt", sandbox.tasks / "direct-write.result", "a")
     spec.prompt_file.write_bytes(b"write")
     record = store.new_record(spec, {"key": "public", "github": str(sandbox.remote)}, "main",
                               run_git(sandbox.repo, "rev-parse", "HEAD"), {"research_owned_path": []})
@@ -1420,7 +1420,8 @@ def test_write_dispatch_launches_the_provider_directly_with_its_own_login(sandbo
     (sandbox.tasks / "logs").mkdir()
     worker.supervise(path, {}, 30)
     settled = json.loads(path.read_text())
-    assert settled["status"] == "done", settled.get("error")
+    # The provider ran and committed nothing, so settlement reached the delivery check (a boundary refusal fails).
+    assert (settled["status"], settled.get("error")) == ("no_deliverable", "no_commits_or_unknown")
     assert wrapped == [] and "write_boundary" not in settled
     seen = json.loads(capture.read_text())
     assert seen["HOME"] == str(home)
