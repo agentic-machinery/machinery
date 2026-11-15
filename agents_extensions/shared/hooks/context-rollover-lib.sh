@@ -141,8 +141,16 @@ context_hook_state() {
 context_latest_usage_tokens() {
   local transcript="$1" usage="${2:-}"
   if [ -z "$usage" ]; then
+    # Code Mode appends assistant rows whose model is "<synthetic>" and whose
+    # usage is all zeros. Those rows are not the live turn. A real zero still
+    # counts; no matching row is 0. The usage-argument branch below is unchanged.
     usage=$(tail -200 "$transcript" 2>/dev/null \
-      | jq -s '[.[] | select(.type == "assistant" and (.message.usage | type) == "object")] | last | .message.usage // empty' 2>/dev/null)
+      | jq -s '[.[] | select(
+          .type == "assistant"
+          and (.message | type) == "object"
+          and .message.model != "<synthetic>"
+          and (.message.usage | type) == "object"
+        )] | last | .message.usage // empty' 2>/dev/null)
   fi
   if [ -z "$usage" ] || [ "$usage" = "null" ]; then
     printf '0\n'

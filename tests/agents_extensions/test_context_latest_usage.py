@@ -242,6 +242,79 @@ def test_repeated_id_counts_only_last_usage_bearing_line(tmp_path: Path) -> None
     assert latest_tokens(transcript) == 589_549
 
 
+def assistant_turn(usage: dict, model: str = "claude-sonnet-5-5") -> dict:
+    return {"type": "assistant", "message": {"model": model, "usage": usage}}
+
+
+ZERO_USAGE = {
+    "input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0,
+}
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected"),
+    [
+        (
+            [
+                assistant_turn(
+                    {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 200,
+                        "cache_creation_input_tokens": 50,
+                    }
+                ),
+                assistant_turn(ZERO_USAGE, "<synthetic>"),
+                assistant_turn(ZERO_USAGE, "<synthetic>"),
+                assistant_turn(ZERO_USAGE, "<synthetic>"),
+            ],
+            350,
+        ),
+        (
+            [
+                assistant_turn({"input_tokens": 306_000}),
+                assistant_turn(ZERO_USAGE),
+            ],
+            0,
+        ),
+        (
+            [
+                assistant_turn(
+                    {
+                        "input_tokens": 306_000,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "iterations": [
+                            {
+                                "type": "message",
+                                "input_tokens": 306_000,
+                                "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 0,
+                            },
+                            {"type": "message", **ZERO_USAGE},
+                        ],
+                    }
+                ),
+            ],
+            0,
+        ),
+    ],
+    ids=[
+        "trailing-synthetic-zeros-keep-real-total",
+        "real-zero-after-306000-stays-zero",
+        "final-message-iteration-zero-stays-zero",
+    ],
+)
+def test_synthetic_zero_usage_does_not_replace_a_real_reading(
+    tmp_path: Path, entries: list[dict], expected: int
+) -> None:
+    """Code Mode `<synthetic>` zeros must not hide the last real reading, and a real zero stays 0."""
+    transcript = tmp_path / "usage.jsonl"
+    transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    assert latest_tokens(transcript) == expected
+
+
 @pytest.mark.parametrize(
     "content", ["", '{"type":"assistant","message":{}}\n', '{"type":"assistant","message":{"usage":null}}\n']
 )
