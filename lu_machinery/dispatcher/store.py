@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -296,6 +297,18 @@ def _write_atomic(path: Path, record: dict, exclusive: bool) -> None:
         refresh_running_boundary_view(record)
     finally:
         Path(name).unlink(missing_ok=True)
+    if record.get("status") not in ACTIVE:
+        _record_summary_row(path, record)
+
+
+def _record_summary_row(path: Path, record: dict) -> None:
+    """Append the settled record's model-stats row (#581) after its write; a failure only logs, never unsettles."""
+    try:
+        from lu_machinery.api import model_stats_rows
+
+        model_stats_rows.record_settled(path, record, tasks_dir().parent)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("model-stats summary row not written: %s", type(exc).__name__)
 
 
 def create(record: dict, prompt: bytes) -> Path:

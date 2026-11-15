@@ -1,148 +1,60 @@
-"""Per-model value, waste and speed from our own dispatch records (#581).
+"""Per-model value, waste and speed from our own dispatch history (#581).
 
-One read-only collector joins three sources over a window:
+One read-only collector joins two durable sources:
 
-* dispatch task records (hot store, then archive; the first record of a task id wins),
-* ``X-Agent: <harness>/<task>`` lines on each registered repository's local ``origin/main``
-  (the landing join), and
-* review ``.result`` sidecars (verdict and finding priorities only).
+* the per-task summary rows (``model_stats_rows``; written at settlement and backfilled once from every hot and
+  archived task record), so any window back to the first record survives task-record retention, and
+* ``X-Agent: <harness>/<task>`` lines on each registered repository's local ``origin/main`` (the landing join),
+  together with the merged delivery a task recorded itself.
 
-Definitions follow the CTO's 2026-11-15 reference scripts: a task is a review when its mode is
-``read-only`` or its id names a review, otherwise a write; a write task lands when its id appears
-in a whole-line ``X-Agent`` trailer; review rounds are the distinct pinned heads reviewed per PR.
-Only counts and model or class labels leave this module: no prompt, body, path, account or task id.
+One refresh computes every window (7, 30, 90 days and all) and the ISO-week buckets; the route serves a window
+of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``. Every figure
+splits by the concrete model id and the effective effort (``unset`` when none was recorded). Definitions follow
+the CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a
+review, otherwise a write; review rounds are the distinct pinned heads reviewed per PR. Only counts and model,
+effort, class, pool and repository labels leave this module: no prompt, body, path, account or task id.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import os
 import re
-import stat
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
+from prometheus_client.core import GaugeMetricFamily
 
-from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
-from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
-from lu_machinery.review.model_catalog import canonical_model_id, load_model_catalog
 
+from .model_stats_rows import POOLS, VERDICTS, read_rows, timestamp
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
 from .state_helpers import cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
 
-SCHEMA_VERSION = "model-stats.v1"
+SCHEMA_VERSION = "model-stats.v2"
 REFRESH_SECONDS = 300.0
 FRESHNESS_BOUND_SECONDS = 420.0
 LOW_SAMPLE = 10
-MAX_DAYS = 31
-GIT_TIMEOUT_SECONDS = 20.0
-MAX_RESULT_BYTES = 4 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 30.0
+WINDOWS: dict[str, int | None] = {"7d": 7, "30d": 30, "90d": 90, "all": None}
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed")
-VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
+ALL_EFFORTS = "all"
 # Review policy blocks on P0 and P1 (fleet_comms.review_publication.BLOCKING_PRIORITIES); the
 # reference script counted P0-P2, so both are reported.
 BLOCKING = frozenset({"P0", "P1"})
 P0_P2 = frozenset({"P0", "P1", "P2"})
 # A whole line, so prose or a quoted example that mentions a trailer never lands a task.
 _TRAILER = re.compile(r"^X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*$", re.MULTILINE)
-_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
-_NATIVE_CLAUDE_ALIASES = ("opus", "sonnet", "haiku")
-# Plan-metered pools only; an API-key account label names no allowance and is never echoed.
-_POOLS = frozenset({*(f"claude:{label}" for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS),
-                    "codex:a", "codex:b", "agy_claude", "gemini", "cursor"})
 
 router = APIRouter()
-
-
-def _label(value: object, default: str = "unknown") -> str:
-    if isinstance(value, str) and _LABEL.fullmatch(value) and ".." not in value:
-        return value
-    return default
-
-
-def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
-        return None
-    return float(value)
-
-
-def _timestamp(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
-
-
-class ModelNames:
-    """Requested model labels as catalog ids; native Claude aliases name their family's newest id."""
-
-    def __init__(self) -> None:
-        try:
-            self.catalog: dict[str, Any] | None = load_model_catalog()
-        except Exception:  # no catalog: labels are reported as recorded
-            self.catalog = None
-        self._cache: dict[str, str] = {}
-
-    def __call__(self, raw: object) -> str:
-        label = _label(raw)
-        if label not in self._cache:
-            self._cache[label] = self._resolve(label)
-        return self._cache[label]
-
-    def _resolve(self, label: str) -> str:
-        if label == "unknown" or self.catalog is None:
-            return label
-        canonical = canonical_model_id(label, self.catalog)
-        if canonical:
-            return _label(canonical)
-        family = label.lower().split("[", 1)[0]
-        if family in _NATIVE_CLAUDE_ALIASES:
-            prefix = f"claude-{family}-"
-            ids = [mid for mid in (self.catalog.get("models") or {}) if isinstance(mid, str) and mid.startswith(prefix)]
-            if ids:
-                return max(ids, key=lambda mid: tuple(int(p) for p in mid[len(prefix):].split("-") if p.isdigit()))
-        return label
-
-
-def tokens(usage: object) -> tuple[int, int, int]:
-    """(fresh input incl. cache writes, cached reads, output incl. reasoning), per provider shape."""
-    if not isinstance(usage, Mapping):
-        return (0, 0, 0)
-
-    def n(mapping: Mapping[str, Any], key: str) -> int:
-        value = mapping.get(key)
-        return value if type(value) is int and value >= 0 else 0
-
-    u = usage
-    if "cache_read_input_tokens" in u:  # Claude
-        return (n(u, "input_tokens") + n(u, "cache_creation_input_tokens"), n(u, "cache_read_input_tokens"),
-                n(u, "output_tokens"))
-    if "cached_input_tokens" in u:  # Codex: input_tokens includes cached
-        return (max(0, n(u, "input_tokens") - n(u, "cached_input_tokens")), n(u, "cached_input_tokens"),
-                n(u, "output_tokens") + n(u, "reasoning_output_tokens"))
-    if "inputTokens" in u:  # Cursor
-        return (n(u, "inputTokens") + n(u, "cacheWriteTokens"), n(u, "cacheReadTokens"),
-                n(u, "outputTokens") + n(u, "reasoningTokens"))
-    if "cache_read_tokens" in u:  # AGY
-        return (n(u, "input_tokens"), n(u, "cache_read_tokens"), n(u, "output_tokens") + n(u, "thinking_tokens"))
-    cache = u.get("cache")
-    if isinstance(cache, Mapping):  # opencode
-        return (n(u, "input"), n(cache, "read"), n(u, "output") + n(u, "reasoning"))
-    return (0, 0, 0)
 
 
 def trailer_task_ids(message: str) -> set[str]:
@@ -154,9 +66,11 @@ def trailer_task_ids(message: str) -> set[str]:
 class Landing:
     task_ids: set[str] = field(default_factory=set)
     repositories: Counter[str] = field(default_factory=Counter)
+    by_repository: Counter[str] = field(default_factory=Counter)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"landed_task_ids": len(self.task_ids), "repositories": dict(sorted(self.repositories.items()))}
+        return {"trailer_task_ids": len(self.task_ids), "repositories": dict(sorted(self.repositories.items())),
+                "trailer_task_ids_by_repository": dict(sorted(self.by_repository.items()))}
 
 
 def scan_landing(primary_root: Path, since: datetime) -> Landing:
@@ -183,60 +97,18 @@ def scan_landing(primary_root: Path, since: datetime) -> Landing:
             landing.repositories["unavailable"] += 1
             continue
         landing.repositories["read"] += 1
+        found: set[str] = set()
         for message in completed.stdout.split("\x01"):
-            landing.task_ids |= trailer_task_ids(message)
+            found |= trailer_task_ids(message)
+        landing.by_repository[repo.key] += len(found)
+        landing.task_ids |= found
     return landing
 
 
-def _result(path: Path, record: Mapping[str, Any]) -> tuple[str, Counter[str]] | None:
-    """Verdict and finding priorities from the record's adjacent ``.result`` sidecar, else None."""
-    declared = record.get("result_file")
-    name = Path(declared).name if isinstance(declared, str) and declared else f"{path.stem}.result"
-    if not name.endswith(".result"):
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
         return None
-    try:
-        fd = os.open(path.with_name(name), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(MAX_RESULT_BYTES + 1)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    if len(raw) > MAX_RESULT_BYTES:
-        return None
-    try:
-        payload = json.loads(raw)
-    except (ValueError, RecursionError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    overall = payload.get("overall")
-    verdict = overall.get("correctness") if isinstance(overall, dict) else None
-    priorities: Counter[str] = Counter()
-    for finding in payload.get("findings") or []:
-        if isinstance(finding, dict) and finding.get("priority") in ("P0", "P1", "P2", "P3"):
-            priorities[finding["priority"]] += 1
-    return (verdict if verdict in VERDICTS[:3] else "unparsed"), priorities
-
-
-def _allowance(record: Mapping[str, Any]) -> tuple[str, float] | None:
-    """(pool, percentage points of weekly allowance spent) when both readings exist, else None."""
-    block = record.get("allowance")
-    if not isinstance(block, Mapping) or block.get("pool") not in _POOLS:
-        return None
-    readings = []
-    for side in ("start", "finish"):
-        reading = block.get(side)
-        value = _number(reading.get("remaining_pct")) if isinstance(reading, Mapping) else None
-        if value is None or value > 100:
-            return None
-        readings.append(value)
-    return block["pool"], readings[0] - readings[1]
+    return float(value)
 
 
 def _rate(numerator: float, denominator: int, digits: int = 3) -> dict[str, Any]:
@@ -259,6 +131,72 @@ def _median(values: list[float]) -> float | None:
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
 
+@dataclass
+class _Row:
+    task_id: str
+    model: str
+    effort: str
+    role: str
+    task_class: str
+    status: str
+    moment: datetime
+    started: datetime | None
+    duration: float | None
+    tokens: tuple[int, int, int]
+    trailer: bool
+    delivery: bool
+    review: tuple[str, Counter[str]] | None
+    allowance: tuple[str, float] | None
+    raw: Mapping[str, Any]
+
+    @property
+    def landed(self) -> bool:
+        return self.role == "write" and (self.trailer or self.delivery)
+
+
+def _allowance(block: object) -> tuple[str, float] | None:
+    """(pool, percentage points of weekly allowance spent) when both readings exist, else None."""
+    if not isinstance(block, Mapping) or block.get("pool") not in POOLS:
+        return None
+    readings = []
+    for side in ("start", "finish"):
+        reading = block.get(side)
+        value = _number(reading.get("remaining_pct")) if isinstance(reading, Mapping) else None
+        if value is None or value > 100:
+            return None
+        readings.append(value)
+    return block["pool"], readings[0] - readings[1]
+
+
+def _count(mapping: Mapping[str, Any], key: str) -> int:
+    value = mapping.get(key)
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing) -> Iterator[_Row]:
+    for raw in raw_rows:
+        moment = timestamp(raw.get("finished_at")) or timestamp(raw.get("started_at"))
+        if moment is None:
+            continue
+        status = raw.get("status")
+        role = "review" if raw.get("role") == "review" else "write"
+        review = raw.get("review") if isinstance(raw.get("review"), Mapping) else None
+        priorities = review.get("priorities") if review and isinstance(review.get("priorities"), Mapping) else {}
+        counts = cast(dict[str, Any], raw.get("tokens")) if isinstance(raw.get("tokens"), Mapping) else {}
+        yield _Row(
+            task_id=raw["task_id"], model=str(raw.get("model") or "unknown"), effort=str(raw.get("effort") or "unset"),
+            role=role, task_class=str(raw.get("class") or "unclassified"),
+            status=status if status in STATUSES else "other", moment=moment, started=timestamp(raw.get("started_at")),
+            duration=_number(raw.get("duration_s")),
+            tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
+            trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
+            review=((review.get("verdict") if review.get("verdict") in VERDICTS else "unparsed"),
+                    Counter({p: int(n) for p, n in priorities.items() if isinstance(n, int)})) if review else None,
+            allowance=_allowance(raw.get("allowance")) if role == "write" else None,
+            raw=raw,
+        )
+
+
 class _Group:
     def __init__(self) -> None:
         self.status: Counter[str] = Counter()
@@ -267,6 +205,8 @@ class _Group:
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
         self.priorities: Counter[str] = Counter()
+        self.allowance: Counter[str] = Counter()
+        self.points = 0.0
 
     def add(self, row: _Row) -> None:
         self.status[row.status] += 1
@@ -277,13 +217,20 @@ class _Group:
         if row.review is not None:
             self.verdicts[row.review[0]] += 1
             self.priorities.update(row.review[1])
+        if row.allowance is not None:
+            if row.allowance[1] < 0:  # the weekly window reset between the readings
+                self.allowance["reset_crossed"] += 1
+            else:
+                self.allowance["tasks"] += 1
+                self.allowance["landed"] += row.landed
+                self.points += row.allowance[1]
 
     def to_dict(self, role: str) -> dict[str, Any]:
         tasks = sum(self.status.values())
         hours = sum(self.durations) / 3600
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
-            "status": {name: self.status[name] for name in (*STATUSES, "in_flight", "other")},
+            "status": {name: self.status[name] for name in (*STATUSES, "other")},
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
             "wall_seconds": {"median": _median(self.durations), "p90": _p90(self.durations),
@@ -296,6 +243,7 @@ class _Group:
                 wall_hours_per_landed=_rate(hours, self.landed, 2),
                 output_tokens_per_landed=_rate(self.tokens[2], self.landed, 0),
                 fresh_input_tokens_per_landed=_rate(self.tokens[0], self.landed, 0),
+                allowance_pct_points_per_landed=_rate(self.points, self.allowance["landed"], 2),
             )
         else:
             parsed = sum(self.verdicts[v] for v in VERDICTS[:3])
@@ -308,112 +256,38 @@ class _Group:
         return out
 
 
-@dataclass
-class _Row:
-    task_id: str
-    model: str
-    role: str
-    task_class: str
-    status: str
-    started: datetime | None
-    duration: float | None
-    tokens: tuple[int, int, int]
-    landed: bool
-    review: tuple[str, Counter[str]] | None
-    record: Mapping[str, Any]
+def _ordered(groups: Mapping[Any, _Group]) -> list[tuple[Any, _Group]]:
+    return sorted(groups.items(), key=lambda item: (-sum(item[1].status.values()), item[0]))
 
 
-def _records(tasks_dir: Path, since: datetime, until: datetime) -> tuple[list[tuple[Path, dict[str, Any]]], Counter[str]]:
-    coverage: Counter[str] = Counter()
-    seen: set[str] = set()
-    out = []
-    floor = since.timestamp()
-    for path in iter_task_records(tasks_dir, include_archive=True):
-        if path.name.endswith(".write-boundary.json") or ".sandbox." in path.name:
-            continue
-        try:
-            # A record is rewritten at settlement, so one last written before the window cannot end in it.
-            if path.stat().st_mtime < floor:
-                continue
-            record = read_task_record(path)
-        except (OSError, ValueError):
-            coverage["unreadable"] += 1
-            continue
-        if not isinstance(record, dict) or not isinstance(record.get("task_id"), str):
-            continue
-        moment = _timestamp(record.get("finished_at")) or _timestamp(record.get("started_at"))
-        if moment is None or not since <= moment < until:
-            continue
-        if record["task_id"] in seen:
-            coverage["duplicate_task_ids"] += 1
-            continue
-        seen.add(record["task_id"])
-        out.append((path, record))
-    coverage["records"] = len(out)
-    return out, coverage
-
-
-def collect(tasks_dir: Path, since: datetime, until: datetime, landing: Landing) -> dict[str, Any]:
-    """Aggregate the window's task records; ``landing`` supplies the landed task ids."""
-    names = ModelNames()
-    records, coverage = _records(tasks_dir, since, until)
-    rows: list[_Row] = []
-    for path, record in records:
-        task_id = record["task_id"]
-        options: Mapping[str, Any] = record["options"] if isinstance(record.get("options"), dict) else {}
-        mode = record.get("mode") or options.get("mode")
-        role = "review" if mode == "read-only" or "review" in task_id else "write"
-        if role == "review":
-            task_class = (f"{_label(record.get('review_profile') or options.get('review_profile'), 'code')}/"
-                          f"{_label(record.get('review_risk') or options.get('risk'))}")
-        else:
-            task_class = _label(record.get("research_task_family"), "unclassified")
-        raw_status = record.get("status")
-        status = (raw_status if raw_status in STATUSES
-                  else "in_flight" if raw_status in ("spawning", "running", "needs_finalize") else "other")
-        rows.append(_Row(
-            task_id=task_id, model=names(record.get("model")), role=role, task_class=task_class, status=status,
-            started=_timestamp(record.get("started_at")), duration=_number(record.get("duration_s")),
-            tokens=tokens(record.get("usage")), landed=role == "write" and task_id in landing.task_ids,
-            review=(_result(path, record) or ("unparsed", Counter())) if role == "review" and status == "done"
-            else None,
-            record=record,
-        ))
-    return {
-        "models": _models(rows),
-        "authors": _authors(rows, names),
-        "allowance": _allowance_rows(rows),
-        "coverage": {**dict(coverage), "landing": landing.to_dict()},
-    }
-
-
-def _models(rows: Iterable[_Row]) -> list[dict[str, Any]]:
+def _models(rows: list[_Row]) -> list[dict[str, Any]]:
+    """Per (model, role): the totals over every effort, then the same figures per effort and per class."""
     totals: dict[tuple[str, str], _Group] = defaultdict(_Group)
+    efforts: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     classes: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     for row in rows:
-        totals[(row.model, row.role)].add(row)
-        classes[(row.model, row.role)][row.task_class].add(row)
-    out = []
-    for (model, role), group in sorted(totals.items(), key=lambda item: (-sum(item[1].status.values()), item[0])):
-        by_class = [{"class": name, **cls.to_dict(role)} for name, cls in sorted(
-            classes[(model, role)].items(), key=lambda item: (-sum(item[1].status.values()), item[0]))]
-        out.append({"model": model, "role": role, **group.to_dict(role), "by_class": by_class})
-    return out
+        key = (row.model, row.role)
+        totals[key].add(row)
+        efforts[key][row.effort].add(row)
+        classes[key][row.task_class].add(row)
+    return [
+        {"model": model, "role": role, "effort": ALL_EFFORTS, **group.to_dict(role),
+         "by_effort": [{"effort": name, **cls.to_dict(role)} for name, cls in _ordered(efforts[(model, role)])],
+         "by_class": [{"class": name, **cls.to_dict(role)} for name, cls in _ordered(classes[(model, role)])]}
+        for (model, role), group in _ordered(totals)
+    ]
 
 
-def _authors(rows: Iterable[_Row], names: ModelNames) -> list[dict[str, Any]]:
+def _authors(rows: list[_Row]) -> list[dict[str, Any]]:
     """Author-side review outcomes: rounds are distinct pinned heads per PR, ordered by first review start."""
     prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": {}})
     for row in rows:
-        record = row.record
-        options: Mapping[str, Any] = record["options"] if isinstance(record.get("options"), dict) else {}
-        pr = record.get("pr", options.get("pr"))
-        author = record.get("review_author_model") or options.get("review_author_model")
-        if row.role != "review" or not author or not pr or isinstance(pr, bool):
+        pr, author = row.raw.get("pr"), row.raw.get("author_model")
+        if row.role != "review" or not author or not pr:
             continue
-        entry = prs[(_label(record.get("repo") or options.get("repo"), "public"), str(pr))]
-        entry["authors"].add(names(author))
-        head = record.get("pinned_head") or options.get("pinned_head") or row.task_id
+        entry = prs[(str(row.raw.get("repo") or "public"), str(pr))]
+        entry["authors"].add(author)
+        head = row.raw.get("pinned_head") or row.task_id
         started = row.started or datetime.max.replace(tzinfo=UTC)
         previous = entry["heads"].get(head)
         known = row.review if row.review is not None and row.review[0] != "unparsed" else None
@@ -445,75 +319,199 @@ def _authors(rows: Iterable[_Row], names: ModelNames) -> list[dict[str, Any]]:
     ]
 
 
-def _allowance_rows(rows: Iterable[_Row]) -> list[dict[str, Any]]:
-    """Weekly allowance spent per landed write task, from tasks with both readings; unknown is excluded."""
-    groups: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
-    spent: dict[tuple[str, str], float] = defaultdict(float)
+def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
+    """Weekly allowance spent per landed write task per pool, model and effort; unknown readings are excluded."""
+    groups: dict[tuple[str, str, str], _Group] = defaultdict(_Group)
     for row in rows:
-        if row.role != "write":
-            continue
-        reading = _allowance(row.record)
-        if reading is None:
-            continue
-        pool, delta = reading
-        key = (pool, row.model)
-        if delta < 0:  # the weekly window reset between the readings
-            groups[key]["reset_crossed"] += 1
-            continue
-        groups[key]["tasks"] += 1
-        groups[key]["landed"] += row.landed
-        spent[key] += delta
+        if row.allowance is not None:
+            groups[(row.allowance[0], row.model, row.effort)].add(row)
     return [
-        {"pool": pool, "model": model, "tasks": c["tasks"], "landed": c["landed"],
-         "reset_crossed": c["reset_crossed"], "low_sample": c["tasks"] < LOW_SAMPLE,
-         "pct_points_spent": round(spent[(pool, model)], 2),
-         "pct_points_per_landed": _rate(spent[(pool, model)], c["landed"], 2)}
-        for (pool, model), c in sorted(groups.items())
+        {"pool": pool, "model": model, "effort": effort, "tasks": g.allowance["tasks"],
+         "landed": g.allowance["landed"], "reset_crossed": g.allowance["reset_crossed"],
+         "low_sample": g.allowance["tasks"] < LOW_SAMPLE, "pct_points_spent": round(g.points, 2),
+         "pct_points_per_landed": _rate(g.points, g.allowance["landed"], 2)}
+        for (pool, model, effort), g in sorted(groups.items())
     ]
 
 
-def window(days: int, since: date | None, now: datetime | None = None) -> tuple[datetime, datetime]:
+def summarize(rows: Iterable[_Row]) -> dict[str, Any]:
+    """Every figure of one window's rows."""
+    selected = list(rows)
+    return {
+        "models": _models(selected), "authors": _authors(selected), "allowance": _allowance_rows(selected),
+        "records": len(selected),
+        # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
+        "landed_by": dict(sorted(Counter(
+            "both" if row.trailer and row.delivery else "trailer" if row.trailer else "delivery"
+            for row in selected if row.landed).items())),
+    }
+
+
+def week_of(moment: datetime) -> str:
+    year, week, _ = moment.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _weeks(rows: list[_Row]) -> list[dict[str, Any]]:
+    """Counts per ISO week (by finish, else start), concrete model, effective effort and role."""
+    groups: dict[tuple[str, str, str, str], _Group] = defaultdict(_Group)
+    for row in rows:
+        groups[(week_of(row.moment), row.model, row.effort, row.role)].add(row)
+    return [
+        {"week": week, "model": model, "effort": effort, "role": role, "tasks": sum(g.status.values()),
+         "landed": g.landed, "status": {name: g.status[name] for name in (*STATUSES, "other") if g.status[name]}}
+        for (week, model, effort, role), g in sorted(groups.items())
+    ]
+
+
+def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = None, *,
+            landing: Landing | None = None) -> dict[str, Any]:
+    """One snapshot: every window and the ISO-week buckets, from the summary rows and one landing scan."""
     until = now or datetime.now(UTC)
-    start = (datetime.combine(since, datetime.min.time(), tzinfo=UTC) if since is not None
-             else until - timedelta(days=days))
-    if not until - timedelta(days=MAX_DAYS) <= start < until:
-        raise ValueError(f"window start must be within the last {MAX_DAYS} days")
-    return start, until
-
-
-def compute(ctx: MonitorContext, start: datetime, until: datetime, *, days: int | None) -> dict[str, Any]:
-    landing = scan_landing(ctx.roots.live_repo_root, start)
-    payload = collect(ctx.roots.batch_state_dir / "tasks", start, until, landing)
+    raw_rows, row_counts = read_rows(batch_state_dir)
+    moments = [m for m in (timestamp(r.get("finished_at")) or timestamp(r.get("started_at")) for r in raw_rows) if m]
+    first = min(moments, default=until)
+    if landing is None:
+        landing = scan_landing(primary_root, first)
+    rows = [row for row in _rows(raw_rows, landing) if row.moment < until]
+    windows = {}
+    for name, days in WINDOWS.items():
+        since = first if days is None else until - timedelta(days=days)
+        windows[name] = {
+            "window": {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
+                       "cohort": "finished_at, else started_at, in [since, until)"},
+            **summarize(row for row in rows if since <= row.moment),
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
-        "window": {"since": start.isoformat(), "until": until.isoformat(), "days": days,
-                   "cohort": "finished_at, else started_at, in [since, until)"},
         "low_sample_below": LOW_SAMPLE,
-        **payload,
+        "first_record": first.isoformat() if moments else None,
+        "windows": windows,
+        "weeks": _weeks(rows),
+        "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict()},
     }
+
+
+def _cache_key(ctx: MonitorContext) -> str:
+    return ctx_scoped_ttl_key(ctx, "model-stats", SCHEMA_VERSION)
+
+
+def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
+    """The stored snapshot and its age; schedules the single-flight refresh when absent or older than 300 s."""
+    key = _cache_key(ctx)
+    stored = cache_get_stored(key)
+    if stored is None or stored[1] >= REFRESH_SECONDS:
+        schedule_cache_refresh(key, REFRESH_SECONDS,
+                               lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root))
+    return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
 @router.get("")
 async def model_stats(
-    days: int = Query(default=7, ge=1, le=MAX_DAYS),
-    since: date | None = Query(default=None, description="Window start (UTC date); overrides days"),
+    window: Literal["7d", "30d", "90d", "all"] = Query(default="7d", description="Window: 7d, 30d, 90d or all"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
-    """Serve one cached snapshot per window; a refresh runs off-loop with the shared single flight."""
-    try:
-        start, until = window(days, since)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from None
-    key = ctx_scoped_ttl_key(ctx, "model-stats", since.isoformat() if since else f"{days}d")
-    stored = cache_get_stored(key)
-    if stored is None or stored[1] >= REFRESH_SECONDS:
-        schedule_cache_refresh(key, REFRESH_SECONDS,
-                               lambda: compute(ctx, start, until, days=None if since else days))
+    """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight."""
+    stored = cached_snapshot(ctx)
     if stored is None:
         return JSONResponse({"status": "pending", "schema_version": SCHEMA_VERSION},
                             headers={**snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True),
                                      "Retry-After": "5"})
-    payload = cast(dict[str, Any], stored[0])
-    return JSONResponse({**payload, "status": "ok", "age_seconds": round(stored[1], 1)},
-                        headers=snapshot_headers(stored[1], FRESHNESS_BOUND_SECONDS))
+    snapshot, age = stored
+    body = {key: value for key, value in snapshot.items() if key != "windows"}
+    return JSONResponse({**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)},
+                        headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
+
+
+# Grafana's contract (docs/runbooks/model-stats.md): names and label sets change only with that runbook.
+_LABELS = ["window", "model", "effort", "role"]
+_WEEK_LABELS = ["week", "model", "effort", "role"]
+
+
+def _gauge(name: str, help_text: str, labels: list[str]) -> GaugeMetricFamily:
+    return GaugeMetricFamily(f"lu_model_stats_{name}", help_text, labels=labels)
+
+
+class ModelStatsCollector:
+    """Expose the route's cached snapshot on ``/metrics``; a scrape never computes, it only schedules a refresh."""
+
+    def __init__(self, context: MonitorContext) -> None:
+        self.context = context
+
+    def collect(self) -> Iterator[GaugeMetricFamily]:
+        try:
+            stored = cached_snapshot(self.context)
+        except Exception:  # an unusable context never breaks the scrape
+            stored = None
+        health = GaugeMetricFamily("lu_model_stats_collection_success", "Whether a model-stats snapshot exists.")
+        health.add_metric([], int(stored is not None))
+        yield health
+        if stored is None:
+            return
+        snapshot, age = stored
+        age_gauge = GaugeMetricFamily("lu_model_stats_snapshot_age_seconds", "Age of the model-stats snapshot.")
+        age_gauge.add_metric([], round(age, 3))
+        yield age_gauge
+        yield from self._windows(snapshot["windows"])
+        yield from self._weeks(snapshot["weeks"])
+
+    @staticmethod
+    def _windows(windows: Mapping[str, Mapping[str, Any]]) -> Iterator[GaugeMetricFamily]:
+        g = {
+            "tasks": _gauge("tasks", "Settled tasks in the window.", _LABELS),
+            "landed": _gauge("landed", "Write tasks in the window that landed on a registered main.", _LABELS),
+            "not_done": _gauge("not_done", "Tasks in the window that ended in a status other than done.",
+                               [*_LABELS, "status"]),
+            "median": _gauge("wall_seconds_median", "Median task wall time in seconds.", _LABELS),
+            "p90": _gauge("wall_seconds_p90", "90th percentile task wall time in seconds.", _LABELS),
+            "output": _gauge("output_tokens_per_landed", "Output tokens of all write tasks per landed task.", _LABELS),
+            "blocking": _gauge("blocking_findings_per_review", "P0-P1 findings per read review result.", _LABELS),
+            "rounds": _gauge("review_rounds_per_pr", "Distinct reviewed heads per authored PR (role author).",
+                             _LABELS),
+            "allowance": _gauge("allowance_pct_points_per_landed",
+                                "Weekly allowance points spent per landed task, tasks with both readings only.",
+                                _LABELS),
+        }
+        for name, window in windows.items():
+            for model in window["models"]:
+                for entry in (model, *model["by_effort"]):
+                    labels = [name, model["model"], entry["effort"], model["role"]]
+                    g["tasks"].add_metric(labels, entry["tasks"])
+                    for status in (*STATUSES[1:], "other"):
+                        if entry["status"][status]:
+                            g["not_done"].add_metric([*labels, status], entry["status"][status])
+                    for key, value in (("median", entry["wall_seconds"]["median"]),
+                                       ("p90", entry["wall_seconds"]["p90"])):
+                        if value is not None:
+                            g[key].add_metric(labels, value)
+                    rates = (("output", "output_tokens_per_landed"), ("allowance", "allowance_pct_points_per_landed"),
+                             ("blocking", "blocking_per_review"))
+                    if model["role"] == "write":
+                        g["landed"].add_metric(labels, entry["landed"])
+                    for key, field_name in rates:
+                        value = (entry.get(field_name) or {}).get("value")
+                        if value is not None:
+                            g[key].add_metric(labels, value)
+            for author in window["authors"]:
+                if author["rounds_per_pr"]["value"] is not None:
+                    g["rounds"].add_metric([name, author["model"], ALL_EFFORTS, "author"],
+                                           author["rounds_per_pr"]["value"])
+        yield from g.values()
+
+    @staticmethod
+    def _weeks(weeks: Iterable[Mapping[str, Any]]) -> Iterator[GaugeMetricFamily]:
+        tasks = _gauge("week_tasks", "Settled tasks per ISO week.", _WEEK_LABELS)
+        landed = _gauge("week_landed", "Landed write tasks per ISO week.", _WEEK_LABELS)
+        not_done = _gauge("week_not_done", "Tasks per ISO week that did not end done.", [*_WEEK_LABELS, "status"])
+        for week in weeks:
+            labels = [week["week"], week["model"], week["effort"], week["role"]]
+            tasks.add_metric(labels, week["tasks"])
+            if week["role"] == "write":
+                landed.add_metric(labels, week["landed"])
+            for status, count in week["status"].items():
+                if status != "done":
+                    not_done.add_metric([*labels, status], count)
+        yield tasks
+        yield landed
+        yield not_done

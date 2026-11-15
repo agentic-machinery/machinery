@@ -29,6 +29,7 @@
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   tr.cls td { color: var(--muted); font-size: 13px; }
   tr.cls td:first-child { padding-left: 16px; }
+  tr.eff td:first-child { padding-left: 16px; font-style: italic; }
   .low { color: var(--warn); font-size: 11px; margin-left: 3px; }
   .muted { color: var(--muted); } .error { color: var(--bad); }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
@@ -44,12 +45,12 @@
 <header>
   <h1>Model value</h1>
   <p class="purpose">Which model lands work, which wastes runs and which is slow, from our own dispatch records. Routing stays a CTO decision; read the confounders in the runbook.</p>
-  <label>Window <select id="days"><option value="7">7 days</option><option value="30">30 days</option></select></label>
+  <label>Window <select id="window"><option value="7d">7 days</option><option value="30d">30 days</option><option value="90d">90 days</option><option value="all">All history</option></select></label>
   <span class="muted" id="age">Loading…</span>
 </header>
 <main id="main">
   <section><h2>Value: landed tasks per wall hour against first-round approval <span class="meta" id="chart-meta"></span></h2>
-    <p class="muted">One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
+    <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), plain sub-rows by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
     <div id="chart">Loading…</div></section>
   <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2><div id="write">Loading…</div></section>
   <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2><div id="review">Loading…</div></section>
@@ -72,18 +73,20 @@ function table(head, rows) {
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
-function writeRow(r, cls) {
-  const name = cls ? esc(r.class) : `<b>${esc(r.model)}</b>`;
-  return `<tr class="${cls ? "cls" : ""}"><td>${name}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(r.status.done)}`
+function rowName(r, kind) {
+  return kind === "eff" ? `effort ${esc(r.effort)}` : kind === "cls" ? esc(r.class) : `<b>${esc(r.model)}</b>`;
+}
+
+function writeRow(r, kind) {
+  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(r.status.done)}`
     + `${cell(pct(r.no_deliverable))}${cell(pct(r.not_done))}${cell(r.landed)}${cell(pct(r.landed_rate))}`
     + `${cell(rate(r.wall_hours_per_landed, 1))}${cell(mins(r.wall_seconds.median))}${cell(mins(r.wall_seconds.p90))}`
     + `${cell(r.output_tokens_per_landed.value === null ? "—" : num(r.output_tokens_per_landed.value / 1000) + "k")}</tr>`;
 }
 
-function reviewRow(r, cls) {
-  const name = cls ? esc(r.class) : `<b>${esc(r.model)}</b>`;
+function reviewRow(r, kind) {
   const v = r.verdicts;
-  return `<tr class="${cls ? "cls" : ""}"><td>${name}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
+  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
     + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain} / ${v.unparsed}`)}${cell(pct(r.approve_rate))}`
     + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}${cell(n(r.approve_rate))}`
     + `${cell(mins(r.wall_seconds.median))}${cell(mins(r.wall_seconds.p90))}</tr>`;
@@ -91,7 +94,8 @@ function reviewRow(r, cls) {
 
 function withClasses(models, role, render) {
   return models.filter((m) => m.role === role).flatMap((m) =>
-    [render(m, false), ...(m.by_class.length > 1 ? m.by_class.map((c) => render(c, true)) : [])]);
+    [render(m, ""), ...m.by_effort.map((e) => render(e, "eff")),
+     ...(m.by_class.length > 1 ? m.by_class.map((c) => render(c, "cls")) : [])]);
 }
 
 function chart(data, label) {
@@ -125,10 +129,10 @@ function landingRead(landing) {
 }
 
 async function load() {
-  const days = $("days").value;
+  const name = $("window").value;
   let data;
   try {
-    const response = await fetch(`/api/fleet/model-stats?days=${days}`, {cache: "no-store"});
+    const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}`, {cache: "no-store"});
     data = await response.json();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
   } catch (err) {
@@ -141,9 +145,11 @@ async function load() {
     return;
   }
   const since = data.window.since.slice(0, 16).replace("T", " ");
-  const label = `${days} days from ${since} UTC`;
-  $("age").textContent = `Window ${label}; data ${Math.round(data.age_seconds)} s old; ${data.coverage.records} task records; `
-    + `${data.coverage.landing.landed_task_ids} landed task ids from ${landingRead(data.coverage.landing)}`;
+  const label = `${name === "all" ? "all history" : name} from ${since} UTC`;
+  const by = data.landed_by || {};
+  $("age").textContent = `Window ${label}; data ${Math.round(data.age_seconds)} s old; ${data.records} settled tasks; `
+    + `${data.coverage.landing.trailer_task_ids} trailer task ids from ${landingRead(data.coverage.landing)}; `
+    + `landed by trailer ${by.trailer || 0}, by recorded merge ${by.delivery || 0}, both ${by.both || 0}`;
   const writes = data.models.filter((m) => m.role === "write"), reviews = data.models.filter((m) => m.role === "review");
   const total = (rows) => rows.reduce((s, r) => s + r.tasks, 0);
   $("chart-meta").textContent = label;
@@ -161,13 +167,13 @@ async function load() {
     + `${cell(n({n: a.prs, low_sample: a.low_sample}))}${cell(rate(a.rounds_per_pr))}${cell(pct(a.approved_eventually))}`
     + `${cell(pct(a.first_round_approved))}${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`));
   $("allowance-meta").textContent = `${label}; tasks with start and finish readings only; unknown readings are excluded, never 0`;
-  $("allowance").innerHTML = data.allowance.length ? table(["Pool", "Model", "Tasks with readings", "Landed",
-    "Points spent", "Points per landed", "Reset crossed"], data.allowance.map((a) => `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td>`
+  $("allowance").innerHTML = data.allowance.length ? table(["Pool", "Model", "Effort", "Tasks with readings", "Landed",
+    "Points spent", "Points per landed", "Reset crossed"], data.allowance.map((a) => `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>`
     + `${cell(n({n: a.tasks, low_sample: a.low_sample}))}${cell(n(a.pct_points_per_landed))}${cell(num(a.pct_points_spent, 1))}`
     + `${cell(rate(a.pct_points_per_landed))}${cell(a.reset_crossed)}</tr>`))
     : '<p class="muted">No write task in this window has both readings yet (recording started with #581).</p>';
 }
-$("days").addEventListener("change", load);
+$("window").addEventListener("change", load);
 load();
 </script>
 </body>

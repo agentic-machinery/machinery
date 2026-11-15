@@ -324,6 +324,7 @@
  "lu_machinery/api/dashboards/model-stats.html": "machinery",
  "lu_machinery/api/milestones_router.py": "machinery",
  "lu_machinery/api/model_stats_router.py": "machinery",
+ "lu_machinery/api/model_stats_rows.py": "machinery",
  "lu_machinery/api/panel_values.py": "machinery",
  "package-lock.json": "product",
  "package.json": "product",
