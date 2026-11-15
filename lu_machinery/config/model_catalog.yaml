@@ -781,13 +781,15 @@ models:
     notes: >-
       Gemini work and comparative-evaluation route over AGY (#586), measured
       against Gemini 4 Carbon; Carbon stays the preferred Gemini work route until
-      that comparison reports. AGY selectors gemini-4-hydrogen-low, -medium,
-      -high and -xhigh (#586 task card); a 2026-11-12 evaluation ran -medium and
-      -high through AGY. Dispatch: `python -m lu_machinery.dispatch dispatch
-      --agent agy --model gemini-4-hydrogen-medium`; -low, -high and -xhigh are
-      explicit selections only. Hydrogen holds no review role, so it is refused
-      for any review of record; review ladders, the Ukrainian review route and
-      the certified Gemini driver seat are unchanged. Model card (2026-11-12):
+      that comparison reports. Live `agy models` probe on 2026-11-15 (12:55Z,
+      agy 1.5.9) lists gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh,
+      gemini-4-hydrogen-medium and gemini-4-hydrogen-low; a 2026-11-12
+      evaluation ran -medium and -high through AGY. Dispatch: `python -m
+      lu_machinery.dispatch dispatch --agent agy --model
+      gemini-4-hydrogen-medium`; -low, -high and -xhigh are explicit selections
+      only. Hydrogen holds no review role, so it is refused for any review of
+      record; review ladders, the Ukrainian review route and the certified
+      Gemini driver seat are unchanged. Model card (2026-11-12):
       adapted from Gemini 4 Carbon, one 1M-token window shared by input and
       output (64K synchronous output by default), knowledge cutoff March 2026,
       four thinking levels, occasional slowness or timeouts and higher token use

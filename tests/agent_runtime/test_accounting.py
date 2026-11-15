@@ -141,9 +141,31 @@ def test_observation_requires_current_task_and_nonce(tmp_path, pin):
             task_id="accounting-task", run_nonce="accounting-run", invocation_id="a" * 32,
             cli_sha256="b" * 64, cli_version="fixture",
         )
+        substituted_stream = "\n".join(map(json.dumps, [
+            {"event": "init", "model": "gemini-4-hydrogen-high", "session_id": "7cd3ba85-817f-4a03-8223-1ff39ca42419"},
+            {"event": "result", "result": {
+                "status": "SUCCESS", "response": "READY", "conversation_id": "7cd3ba85-817f-4a03-8223-1ff39ca42419",
+            }},
+        ])) + "\n"
+        substituted_identity = runner._observe_agy_identity(
+            stdout=substituted_stream,
+            plan=InvocationPlan(cmd=["fixture", "--model", pin], cwd=tmp_path),
+            task_id="accounting-task", run_nonce="accounting-run", invocation_id="c" * 32,
+            cli_sha256="b" * 64, cli_version="fixture",
+        )
     finally:
         runner._AGY_OBSERVED_IDENTITY.reset(token)
     assert identity is not None
+    assert substituted_identity is not None
+    assert substituted_identity["actual_model"] == "gemini-4-hydrogen-high"
+    assert substituted_identity["actual_family"] == "google"
+    assert substituted_identity["substituted"] is True
+    from lu_machinery.agent_runtime.adapters.agy import agy_model_state
+
+    assert agy_model_state(
+        agent="agy", model=pin, identity=substituted_identity,
+        task_id="accounting-task", run_nonce="accounting-run", invocation_id="c" * 32,
+    )["resolved_model_family"] == "google"
     for task_id, nonce, expected_model in [
         ("accounting-task", "accounting-run", pin),
         ("another-task", "accounting-run", None),

@@ -200,7 +200,9 @@ def _observe_agy_identity(
 
     family = next((
         spec["family"] for key, spec in load_model_catalog()["models"].items()
-        if key == observed_slug or spec.get("routing_wire_ids", {}).get("agy") == observed_slug
+        if key == observed_slug
+        or spec.get("routing_wire_ids", {}).get("agy") == observed_slug
+        or observed_slug in spec.get("runtime_model_ids", ())
     ), None) if observed_slug else None
     provider_session = events[0].get("provider_session_id")
     if provider_session is None and terminal:
