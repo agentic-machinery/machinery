@@ -694,8 +694,10 @@ five tasks, and runs them itself otherwise.
 
 ## Review contract canary
 
-For dispatcher/review output-contract changes, run the supported host command at
-exactly the candidate head before enqueueing:
+Once per release cut, run the supported host command at the exact release
+candidate head during [release acceptance](../release.md#cut-a-release),
+regardless of which paths changed. Contract-path PRs do not need per-PR
+canary receipts:
 
 ```bash
 .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr <N>
@@ -738,12 +740,14 @@ The per-route deadline defaults to 1200 seconds; change it with
 `--hard-timeout <positive-seconds>`. A changed catalog route set refuses the run
 until the runner's model map is updated. The runner prints the candidate head,
 image SHA-256, each route's PASS/FAIL and the installed host's `contract_canary check`
-result, using the keeper's gate rather than the candidate's copy. Optional
-positional changed paths are forwarded to `check`; the gate's own path is always
+result, using the installed host's receipt checker rather than the candidate's copy.
+Optional positional changed paths are forwarded to `check`; the canary's own path is always
 included so even a head outside the contract receives a full
 four-route score. Receipts stay in shared `batch_state/review-contract-canary/`;
 the dispatcher owns task worktree settlement. These receipts are canary evidence
-and cannot serve as the PR's independent review of record.
+and cannot serve as the PR's independent review of record. Record the route table
+and candidate head in the release's Acceptance section; a failing route or an
+incomplete receipt check blocks the release.
 
 Exit 0 means all routes and the existing receipt check passed. Exit 1 names a
 route/check failure; exit 2 means invalid input, setup or cleanup failed.
