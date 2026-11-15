@@ -41,6 +41,7 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 
 # Executed by the hook as a file, so imports do not depend on the hook's cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -199,6 +200,37 @@ def shallow_boundaries(path: str, length: int) -> set[str]:
     return {line.decode("ascii") for line in lines}
 
 
+class Transport(NamedTuple):
+    """The Git a caller that scans before its own push sends with: binary, environment and leading options.
+
+    A pre-push hook runs inside the push, so it inherits the push's environment and command-scope settings, and
+    Git hands it the URL after rewriting. A caller that scans first (the write boundary's broker) names its
+    transport here instead, and every Git call of the scan, the trusted-route proof included, runs with exactly
+    this binary, environment and options: the push's configuration sources, command-scope settings and
+    repository, never the scanner process's own. The scanner keeps its process environment for its own lookups
+    (catalogue, publisher reads, override, deadline).
+    """
+
+    git: str
+    environment: dict[str, str]
+    options: tuple[str, ...]
+
+    @classmethod
+    def from_json(cls, text: str) -> Transport:
+        value = json.loads(text)
+        git, environment, options = value["git"], value["environment"], value["options"]
+        if not (
+            isinstance(git, str)
+            and os.path.isabs(git)
+            and isinstance(environment, dict)
+            and all(isinstance(key, str) and isinstance(item, str) for key, item in environment.items())
+            and isinstance(options, list)
+            and all(isinstance(option, str) for option in options)
+        ):
+            raise gate.PublishBlocked("OPSEC: push transport malformed; push refused.")
+        return cls(git, environment, tuple(options))
+
+
 def real_git(environment: dict[str, str]) -> str:
     """The git the shim pushed with; otherwise git from PATH, which Git starts with its own exec path."""
     pinned = environment.get("LU_OPSEC_REAL_GIT", "")
@@ -208,13 +240,18 @@ def real_git(environment: dict[str, str]) -> str:
 class Repository:
     """Read-only object queries through the real git in the hook's repository."""
 
-    def __init__(self, git: str, environment: dict[str, str], *, pin_hooks: bool = True):
+    def __init__(
+        self, git: str, environment: dict[str, str], *, pin_hooks: bool = True, options: tuple[str, ...] = ()
+    ):
+        # options are a caller transport's own leading options (Transport), so every query reads its
+        # configuration and repository; the scan's settings below follow them and win for their own keys.
         # Replacement objects change what readers see but not what a pack sends,
         # and a commit-graph file is a local cache of parents that git trusts
         # without rehashing, so every query reads the original objects (the
         # flag and these -c options outrank caller configuration).
         self.base = [
             git,
+            *options,
             "--no-replace-objects",
             "-c",
             "core.useReplaceRefs=false",
@@ -409,7 +446,9 @@ def trusted_route(repository: Repository, remote: str, url: str) -> bool:
     helper. A configured ssh program (GIT_SSH_COMMAND, GIT_SSH, core.sshCommand),
     a remote helper (<transport>::<address>, remote.<name>.vcs), another exec
     path or disabled certificate verification can deliver elsewhere, so such a
-    destination is scanned as public.
+    destination is scanned as public, and so is a URL that a rewrite
+    (url.<base>.insteadOf or pushInsteadOf) or a remote section of that name
+    would redirect.
     """
     caller = repository.caller
     value = url.strip()
@@ -425,8 +464,21 @@ def trusted_route(repository: Repository, remote: str, url: str) -> bool:
     standard = repository.text("--exec-path", environment=default).strip()
     if "GIT_EXEC_PATH" in caller and os.path.realpath(caller["GIT_EXEC_PATH"]) != os.path.realpath(standard):
         return False
-    keys = {key for key, _ in repository.config()}
+    entries = repository.config()
+    keys = {key for key, _ in entries}
     if f"remote.{remote}.vcs" in keys:
+        return False
+    # A hook receives the URL Git pushes to, after rewriting; a Transport caller names the URL it asked for. A
+    # rewrite that applies to it, or a remote section of its name (a URL push reads remote.<url>.pushurl),
+    # sends the push somewhere the destination does not name. Git rewrites by plain prefix: any match counts.
+    if any(
+        key.startswith("url.")
+        and key.endswith((".insteadof", ".pushinsteadof"))
+        and (item is None or value.startswith(item))
+        for key, item in entries
+    ):
+        return False
+    if remote == url and any(key.startswith(f"remote.{remote}.") for key in keys):
         return False
     if ssh:
         return not ({"GIT_SSH_COMMAND", "GIT_SSH"} & caller.keys() or "core.sshcommand" in keys)
@@ -628,13 +680,22 @@ def isolate_scanner(repository: Repository) -> None:
         os.environ.pop(name, None)
 
 
-def scan_push(arguments: list[str], data: bytes, environment: dict[str, str], *, public_repository=None) -> None:
+def scan_push(
+    arguments: list[str],
+    data: bytes,
+    environment: dict[str, str],
+    *,
+    public_repository=None,
+    transport: Transport | None = None,
+) -> None:
     """Raise PublishBlocked unless every public text of this push is clean, already public or overridden.
 
     arguments are the hook's (remote name, URL) and data its whole input.
     public_repository reports the canonical public default-branch head; by
     default it is the catalogue's public repository the destination names
-    (from_catalog), built only when the push sends commits.
+    (from_catalog), built only when the push sends commits. transport, for a
+    caller that scans before its own push, is the Git every scan query runs
+    with; by default that is the hook's own environment.
     """
     if len(arguments) != 2:
         raise gate.PublishBlocked("OPSEC: pre-push hook arguments malformed; push refused.")
@@ -644,10 +705,13 @@ def scan_push(arguments: list[str], data: bytes, environment: dict[str, str], *,
         print("OPSEC: push scan deferred: this push goes to the write boundary broker, which scans the exact update "
               "on the host before it sends anything.", file=sys.stderr)
         return
-    if "GIT_SHALLOW_FILE" in environment:
+    if "GIT_SHALLOW_FILE" in (environment if transport is None else transport.environment):
         # git walks the file this names, while git rev-parse --git-path still names the repository's own.
         raise gate.PublishBlocked("OPSEC: GIT_SHALLOW_FILE is not supported for a scanned push; push refused.")
-    repository = Repository(real_git(environment), environment)
+    if transport is None:
+        repository = Repository(real_git(environment), environment)
+    else:
+        repository = Repository(transport.git, transport.environment, options=transport.options)
     object_format = repository.object_format()
     updates = parse_updates(data, ID_LENGTH[object_format])
     isolate_scanner(repository)
@@ -743,15 +807,26 @@ def exec_caller_hook(arguments: list[str], data: bytes, environment: dict[str, s
     return 1
 
 
-def main(argv: list[str] | None = None, *, stdin: bytes | None = None, public_repository=None, chain=None) -> int:
-    """The pre-push hook: scan, then run the caller's hook; any failure refuses the push (non-zero)."""
+def main(
+    argv: list[str] | None = None,
+    *,
+    stdin: bytes | None = None,
+    public_repository=None,
+    chain=None,
+    transport: str | None = None,
+) -> int:
+    """The pre-push hook: scan, then run the caller's hook; any failure refuses the push (non-zero).
+
+    transport is a Transport as JSON, from a caller that scans before it runs its own push.
+    """
     arguments = sys.argv[1:] if argv is None else argv
     environment = dict(os.environ)
     data = b""
     try:
         with deadline(scan_timeout(environment)):
             data = sys.stdin.buffer.read() if stdin is None else stdin
-            scan_push(arguments, data, environment, public_repository=public_repository)
+            parsed = None if transport is None else Transport.from_json(transport)
+            scan_push(arguments, data, environment, public_repository=public_repository, transport=parsed)
     except ScanTimeout:
         print("OPSEC: push scan timed out; push refused.", file=sys.stderr)
         return 1
