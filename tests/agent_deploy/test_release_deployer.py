@@ -682,9 +682,10 @@ def test_packaged_resource_edits_load_without_stale_pins_and_change_identity(tmp
     assert plan.release_inputs()[2] != identity
 
 
+
 # Defect class of every test below: installed-deploy output verification in reject_untracked_inputs
 # (machinery#22). A consumer deploys the real packaged release through the deploy CLI, and the pre-push
-# gate checks the result through a launcher, as a consumer's pre-push hook runs it.
+# gate runs the deploy's check in this interpreter, as a consumer's pre-push hook runs it.
 GATE_PRODUCT_HOOK = b"#!/usr/bin/env python3\nprint('product hook')\n"
 
 
@@ -707,16 +708,20 @@ def commit_all(root, message):
         subprocess.run(["git", "-C", str(root), *command], check=True, capture_output=True, env=git_environment())
 
 
-def deploy_cli(root):
-    result = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root)],
-                            capture_output=True, text=True, env=git_environment(), check=False)
+def deploy_cli(root, *options):
+    result = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root),
+                             *options], capture_output=True, text=True, env=git_environment(), check=False)
     assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def release_inventory():
+    return plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
 
 
 def release_hook():
     """One release-owned Python hook the Claude provider deploys, from the packaged inventory."""
-    inventory = plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
-    return next(target for name, record in sorted(inventory["files"].items()) if name.endswith(".py")
+    return next(target for name, record in sorted(release_inventory()["files"].items()) if name.endswith(".py")
                 for target in record["targets"].get("claude", []))
 
 
@@ -725,9 +730,8 @@ def deployed(tmp_path):
     root = tmp_path / "gate-consumer"
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True, env=git_environment())
-    inventory = plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
     settings: dict = {}
-    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+    for requirement in release_inventory()["required_hooks"]["claude"][".claude/settings.json"]:
         *parents, event = requirement["path"]
         node = settings
         for name in parents:
@@ -740,90 +744,128 @@ def deployed(tmp_path):
     write(root, ".gitignore", "/.claude/\n/.agents/\n/.deploy-state/\n")
     commit_all(root, "consumer")
     deploy_cli(root)
-    launcher = write(tmp_path, "launcher.sh", f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n', 0o755)
-    return root, str(launcher)
+    return root
 
 
-def gate_verdict(gate, root, launcher):
+def gate_verdict(gate, root):
     try:
-        return gate.reject_untracked_inputs(root, launcher), None
+        return gate.reject_untracked_inputs(root), None
     except gate.GateOutcome as error:
         return None, error
 
 
+def forge_manifest_listing(root, extra):
+    """The checkout's manifest, rewritten to own ``extra`` as a product output with its current bytes."""
+    manifest = json.loads((root / plan.STATE).read_bytes())
+    manifest["files"][extra] = {"type": "file", "sha256": hashlib.sha256((root / extra).read_bytes()).hexdigest(),
+                                "mode": 0o644, "owner": "product", "source": "agents_extensions/claude/extra.py"}
+    return plan.encoded(manifest)
+
+
 def test_installed_deploy_outputs_verified_by_check_are_not_untracked_inputs(deployed, monkeypatch):
     """The #22 refusal: release- and product-owned hook copies the session runs from block every push."""
-    root, launcher = deployed
     gate = load_gate(monkeypatch)
-    listed = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--", "*.py"], capture_output=True,
+    listed = subprocess.run(["git", "-C", str(deployed), "ls-files", "--others", "--", "*.py"], capture_output=True,
                             text=True, check=True, env=git_environment()).stdout.split()
     assert {".claude/hooks/product.py", release_hook()} <= set(listed)
-    manifest, error = gate_verdict(gate, root, launcher)
+    manifest, error = gate_verdict(gate, deployed)
     assert error is None
-    assert manifest == hashlib.sha256((root / plan.STATE).read_bytes()).hexdigest()
+    assert manifest == hashlib.sha256((deployed / plan.STATE).read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize("change", ["product-copy", "release-copy", "source-committed-after-deploy"])
+@pytest.mark.parametrize("change", ["product-copy", "release-copy", "source-committed-after-deploy",
+                                    "mode-changed-after-deploy", "source-edited-during-check"])
 def test_deployed_output_edited_after_deploy_is_refused(deployed, monkeypatch, change):
-    """A stale or edited copy is not the deploy's current output, so it stays an overlay."""
-    root, launcher = deployed
+    """A stale or edited copy, or one deployed from an uncommitted source, is not a verified output."""
     gate = load_gate(monkeypatch)
-    assert gate_verdict(gate, root, launcher)[1] is None
+    assert gate_verdict(gate, deployed)[1] is None
+    changed, cause = ".claude/hooks/product.py", "output drift: .claude/hooks/product.py"
+    source = deployed / "agents_extensions/claude/hooks/product.py"
     if change == "source-committed-after-deploy":
-        write(root, "agents_extensions/claude/hooks/product.py", GATE_PRODUCT_HOOK + b"print('changed')\n", 0o755)
-        commit_all(root, "source change")
-        changed = ".claude/hooks/product.py"
+        source.write_bytes(GATE_PRODUCT_HOOK + b"print('changed')\n")
+        commit_all(deployed, "source change")
+    elif change == "mode-changed-after-deploy":
+        (deployed / changed).chmod(0o644)
+    elif change == "source-edited-during-check":
+        # The source holds other bytes only while the check reads it: the copy matches the plan, not the commit.
+        source.write_bytes(GATE_PRODUCT_HOOK + b"print('uncommitted')\n")
+        deploy_cli(deployed)
+        cause = "a product-owned copy differs from its source in the outgoing commit"
     else:
-        changed = ".claude/hooks/product.py" if change == "product-copy" else release_hook()
-        with (root / changed).open("ab") as handle:
+        changed = changed if change == "product-copy" else release_hook()
+        cause = f"output drift: {changed}"
+        with (deployed / changed).open("ab") as handle:
             handle.write(b"print('edited')\n")
-    _, error = gate_verdict(gate, root, launcher)
+    _, error = gate_verdict(gate, deployed)
     assert error is not None and error.reason == "untracked_inputs"
-    assert f"output drift: {changed}" in error.detail
+    assert cause in error.detail
 
 
 @pytest.mark.parametrize("extra", [".claude/hooks/extra.py", ".claude/extra.py", ".agents/extra.py"])
 def test_unplanned_file_in_provider_directory_is_refused(deployed, monkeypatch, extra):
     """A file the plan does not own is refused, whether or not the deploy's check inventories its name."""
-    root, launcher = deployed
     gate = load_gate(monkeypatch)
-    assert gate_verdict(gate, root, launcher)[1] is None
-    write(root, extra, "value = 1\n")
-    _, error = gate_verdict(gate, root, launcher)
+    assert gate_verdict(gate, deployed)[1] is None
+    write(deployed, extra, "value = 1\n")
+    _, error = gate_verdict(gate, deployed)
     assert error is not None and error.reason == "untracked_inputs"
     assert extra in error.detail
 
 
 @pytest.mark.parametrize(("failure", "cause"), [
-    ("no-manifest", "no deploy ownership manifest"),
-    ("launcher-fails", "the deploy check exited 3"),
-    ("manifest-changes-during-check", "the deploy ownership manifest changed during the check"),
+    ("no-manifest", "the deploy check exited 1"),
+    ("check-cannot-run", "the deploy check exited 3"),
+    ("forged-manifest-on-disk", "the deploy check exited 1"),
+    ("manifest-swapped-back-during-check", ".claude/extra.py"),
     ("symlinked-copy", "the deploy check exited 2"),
 ])
 def test_failed_deploy_check_keeps_provider_files_refused(deployed, monkeypatch, tmp_path, failure, cause):
-    """Without a passing check over an unchanged manifest, no provider file is exempt."""
-    root, launcher = deployed
+    """Only the check's own recomposed manifest can exempt a file; the checkout's manifest never does."""
     gate = load_gate(monkeypatch)
-    assert gate_verdict(gate, root, launcher)[1] is None
+    assert gate_verdict(gate, deployed)[1] is None
+    state = deployed / plan.STATE
     if failure == "no-manifest":
-        (root / plan.STATE).unlink()
-    elif failure == "launcher-fails":
-        launcher = str(write(tmp_path, "failing-launcher.sh", "#!/usr/bin/env bash\nexit 3\n", 0o755))
-    elif failure == "manifest-changes-during-check":
-        launcher = str(write(tmp_path, "rewriting-launcher.sh", f'#!/usr/bin/env bash\n"{sys.executable}" "$@"\n'
-                             f'status=$?\nprintf " " >> "{root / plan.STATE}"\nexit $status\n', 0o755))
+        state.unlink()
+    elif failure == "check-cannot-run":
+        monkeypatch.setattr(gate.sys, "executable", str(write(tmp_path, "failing.sh", "#!/bin/sh\nexit 3\n", 0o755)))
+    elif failure in ("forged-manifest-on-disk", "manifest-swapped-back-during-check"):
+        write(deployed, ".claude/extra.py", "value = 1\n")
+        forged = write(tmp_path, "forged.json", forge_manifest_listing(deployed, ".claude/extra.py"))
+        if failure == "forged-manifest-on-disk":
+            shutil.copyfile(forged, state)
+        else:
+            # The genuine manifest is in place only while the check runs; the forged one before and after.
+            genuine = write(tmp_path, "genuine.json", state.read_bytes())
+            shutil.copyfile(forged, state)
+            swap = (f'#!/bin/sh\ncp "{genuine}" "{state}"\n"{sys.executable}" "$@"\nstatus=$?\n'
+                    f'cp "{forged}" "{state}"\nexit $status\n')
+            monkeypatch.setattr(gate.sys, "executable", str(write(tmp_path, "swapping.sh", swap, 0o755)))
     else:
-        copy = root / ".claude/hooks/product.py"
+        copy = deployed / ".claude/hooks/product.py"
         target = write(tmp_path, "product-copy.py", copy.read_bytes(), 0o755)
         copy.unlink()
         copy.symlink_to(target)
-    _, error = gate_verdict(gate, root, launcher)
+    _, error = gate_verdict(gate, deployed)
     assert error is not None and error.reason == "untracked_inputs"
     assert cause in error.detail
 
 
 def test_gate_provider_directories_match_deploy_targets(monkeypatch):
-    """Layout drift: the gate must name every directory the deploy writes, and its ownership manifest."""
+    """Layout drift: the gate must name every directory the deploy writes."""
     gate = load_gate(monkeypatch)
     assert sorted(gate.DEPLOY_ROOTS) == sorted({*plan.TARGETS.values(), ".agents"})
-    assert gate.DEPLOY_STATE == plan.STATE
+
+
+def test_print_manifest_is_the_recomposed_plan_not_the_checkout_copy(deployed):
+    """The check's manifest output must come from its recomposed plan, never from the worker's file."""
+    genuine = (deployed / plan.STATE).read_bytes()
+    assert deploy_cli(deployed, "--check", "--print-manifest").encode() == genuine
+    write(deployed, ".claude/extra.py", "value = 1\n")
+    (deployed / plan.STATE).write_bytes(forge_manifest_listing(deployed, ".claude/extra.py"))
+    result = subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--project-root",
+                             str(deployed), "--check", "--print-manifest"], capture_output=True, env=git_environment(),
+                            check=False)
+    assert result.returncode == 1 and result.stdout == b""
+    (deployed / plan.STATE).write_bytes(genuine)
+    printed = deploy_cli(deployed, "--check", "--print-manifest")
+    assert ".claude/extra.py" not in json.loads(printed)["files"]

@@ -23,14 +23,14 @@ The hook does not run `pre-commit`, `lint_opsec_leaks.py --commit-range` or `che
 
 `main()` refuses a push (`untracked_inputs`) when an untracked or ignored `*.py`, `*.pth`, `pytest.ini`, `tox.ini`, `setup.cfg` or `pyproject.toml` lies outside the outgoing commit (`reject_untracked_inputs`). Two derived sets are exempt. The first is dependency files under a `node_modules` directory whose sibling `package-lock.json` is tracked. The second is the current output of the installed agent deploy (machinery#22).
 
-The installed deploy (`python -I -m lu_machinery.agent_deploy --project-root <checkout>`) writes release-owned and product-owned files into the provider directories `.agent`, `.agents`, `.claude`, `.codex`, `.cursor` and `.gemini`, with its ownership manifest at `.deploy-state/agent-deploy.v1.json`. Agent sessions run their hooks from those copies, so a worker must not delete them to push. When a listed file lies in a provider directory, the gate runs the deploy's own `--check` through the project launcher. A file is exempt only if all of these hold:
+The installed deploy (`python -I -m lu_machinery.agent_deploy --project-root <checkout>`) writes release-owned and product-owned files into the provider directories `.agent`, `.agents`, `.claude`, `.codex`, `.cursor` and `.gemini`, with its ownership manifest at `.deploy-state/agent-deploy.v1.json`. Agent sessions run their hooks from those copies, so a worker must not delete them to push. When a listed file lies in a provider directory, the gate runs the deploy's own check in the interpreter that runs the gate: `python -I -m lu_machinery.agent_deploy --project-root <checkout> --check --print-manifest`. The check rebuilds the plan from the installed release and the checkout's sources and verifies every planned output and the checkout's manifest. It writes nothing and prints the manifest it rebuilt. The gate never reads the checkout's own manifest file. A file is exempt only if all of these hold:
 
 - the check exits 0;
-- the manifest reads the same before and after the check;
 - the file is a regular file, not a symlink;
-- its SHA-256 equals its manifest record.
+- its SHA-256 and mode equal its record in the manifest the check printed;
+- for a product-owned record, the file's bytes equal the outgoing commit's blob at the record's source path. Release-owned bytes come from the installed release.
 
-The digest of that manifest joins the receipt (`agent_deploy`). Everything else stays refused, and the refusal states why the deploy did not verify the files: an edited or stale copy, an extra file, a symlink, a missing manifest, or a check that fails or cannot run. To fix it, commit the agent extension sources, run the deploy again, then push. `.githooks/pre-push` in this repository does not call `main()`. A consumer whose pre-push hook does call it gets this behaviour.
+The digest of the printed manifest joins the receipt (`agent_deploy`). Everything else stays refused, and the refusal states why: an edited or stale copy, an extra file, a symlink, a copy that differs from its committed source, or a check that fails or cannot run. To fix it, commit the agent extension sources, run the deploy again, then push. `.githooks/pre-push` in this repository does not call `main()`. A consumer whose pre-push hook does call it gets this behaviour.
 
 ## Bypass
 

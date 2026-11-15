@@ -16,7 +16,9 @@ def main() -> int:
         epilog="""Examples:
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project
   .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check
+  .venv/bin/python -I -m lu_machinery.agent_deploy --project-root /work/project --check --print-manifest
 Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json; check writes nothing.
+--print-manifest prints the ownership manifest the check recomposed and verified (JSON) instead of its summary.
 Exit codes: 0 verified/applied; 1 drift or application failure; 2 invalid/unsafe input.
 Recovery after an interrupted fresh apply followed by source edits:
   Keep a copy of the desired source edits. Restore the product sources and installed
@@ -29,11 +31,15 @@ Related: agents_extensions/deployment.v1.json; machinery #100.""",
     )
     parser.add_argument("--project-root", default=None, help="Absolute consumer Git root, e.g. /work/project; default: LU_PRODUCT_ROOT, otherwise refuse")
     parser.add_argument("--check", action="store_true", help="Verify recomposed outputs without writing anything; default: apply")
+    parser.add_argument("--print-manifest", action="store_true",
+                        help="With --check: print the recomposed, verified ownership manifest on stdout; default: a summary")
     args = parser.parse_args()
+    if args.print_manifest and not args.check:
+        parser.error("--print-manifest requires --check")
     try:
         selected = args.project_root if args.project_root is not None else os.environ.get("LU_PRODUCT_ROOT")
         with selected_tree(selected, args.check) as tree:
-            return deploy(tree, check=args.check)
+            return deploy(tree, check=args.check, print_manifest=args.print_manifest)
     except Invalid as exc:
         print(f"invalid deployment: {exc}", file=sys.stderr)
         return 2

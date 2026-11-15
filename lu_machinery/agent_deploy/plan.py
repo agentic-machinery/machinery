@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tomllib
 import unicodedata
 from collections.abc import Callable, Iterator
@@ -581,14 +582,19 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     return problems
 
 
-def deploy(tree: Tree, *, check: bool) -> int:
+def deploy(tree: Tree, *, check: bool, print_manifest: bool = False) -> int:
     plan = build(tree)
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:
         raise Drift("; ".join(problems))
     if check:
-        print(f"verified {len(plan.files)} outputs")
+        # The recomposed manifest, never the checkout's copy: a caller binds its trust to what was verified.
+        if print_manifest:
+            sys.stdout.buffer.write(plan.manifest())
+            sys.stdout.flush()
+        else:
+            print(f"verified {len(plan.files)} outputs")
         return 0
     try:
         return apply(tree, plan, old)

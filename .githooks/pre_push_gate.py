@@ -106,11 +106,11 @@ OVERLAY_PATHSPECS = (
     ":(glob)**/pyproject.toml",
 )
 # The provider directories the installed agent deploy (``lu_machinery.agent_deploy``) writes into a
-# consumer checkout, and its ownership manifest (machinery#22). Keep in parity with ``plan.TARGETS``, the
-# shared ``.agents`` tree and ``plan.STATE``. A file there is not an overlay only when the deploy's own
-# ``--check`` verifies it as a current planned output: the release and the committed sources fix its bytes.
+# consumer checkout (machinery#22). Keep in parity with ``plan.TARGETS`` and the
+# shared ``.agents`` tree. A file there is not an overlay only when the deploy's own
+# ``--check`` verifies it as a current planned output: the release and the committed sources fix its bytes
+# (``verified_deploy_outputs``).
 DEPLOY_ROOTS = (".agent", ".agents", ".claude", ".codex", ".cursor", ".gemini")
-DEPLOY_STATE = ".deploy-state/agent-deploy.v1.json"
 DEPLOY_CHECK_TIMEOUT_S = 120.0
 
 
@@ -342,69 +342,140 @@ def is_deploy_output(path: str) -> bool:
     return path.split("/", 1)[0] in DEPLOY_ROOTS
 
 
-def regular_bytes(path: Path) -> bytes | None:
-    """The bytes of ``path`` when it is a regular file; ``None`` for a symlink, special file or error."""
+def regular_file(path: Path) -> tuple[bytes, int] | None:
+    """``(bytes, permission bits)`` of a regular file; ``None`` for a final symlink, special file or error."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
     try:
         with os.fdopen(descriptor, "rb") as handle:
-            return handle.read() if stat.S_ISREG(os.fstat(handle.fileno()).st_mode) else None
+            status = os.fstat(handle.fileno())
+            return (handle.read(), stat.S_IMODE(status.st_mode)) if stat.S_ISREG(status.st_mode) else None
     except OSError:
         return None
 
 
-def verified_deploy_outputs(paths: list[str], *, root: Path, launcher: str) -> tuple[set[str], str | None, str]:
+def blob_id(data: bytes, object_format: str) -> str:
+    """Git's object id for a blob holding ``data``, in the repository's object format."""
+    return hashlib.new(object_format, b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def committed_blobs(paths: list[str], *, root: Path) -> tuple[str, dict[str, str]] | None:
+    """``(object format, {path: blob id})`` for the regular-file entries HEAD holds at ``paths``."""
+    object_format = (git_ok("rev-parse", "--show-object-format", cwd=root) or "").strip()
+    records = git_records("--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", *paths, cwd=root) if paths else []
+    if object_format not in ("sha1", "sha256") or records is None:
+        return None
+    blobs: dict[str, str] = {}
+    for record in records:
+        meta, _, name = record.partition("\t")
+        fields = meta.split(" ")
+        if len(fields) == 3 and fields[1] == "blob" and fields[0] in ("100644", "100755"):
+            blobs[name] = fields[2]
+    return object_format, blobs
+
+
+def checked_deploy_manifest(root: Path) -> tuple[bytes | None, str]:
+    """``(manifest, why not)``: the ownership manifest the installed deploy's ``--check`` recomposed.
+
+    The check runs in this interpreter (the project interpreter that runs the gate), isolated (``-I``:
+    no checkout directory, ``PYTHONPATH`` or user site on its import path). It recomposes the plan from
+    the installed release and the checkout's sources, verifies every planned output and the checkout's
+    manifest, writes nothing, and prints the manifest it recomposed. The checkout's own manifest file is
+    never read here, so a worker who swaps it while the check runs gains nothing.
+    """
+    command = [
+        sys.executable,
+        "-I",
+        "-m",
+        f"{_MACHINERY}.agent_deploy",
+        "--project-root",
+        str(root),
+        "--check",
+        "--print-manifest",
+    ]
+    try:
+        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        result = subprocess.run(  # fixed argv, no shell: this interpreter and the installed deploy's check
+            command, capture_output=True, check=False, cwd=root, env=clean_environment(), timeout=DEPLOY_CHECK_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return None, f"the deploy check could not run ({type(error).__name__})"
+    if result.returncode != 0:
+        text = result.stderr.decode("utf-8", "replace").strip() or result.stdout.decode("utf-8", "replace").strip()
+        last = text.splitlines()[-1:] or [""]
+        return None, f"the deploy check exited {result.returncode}: {last[0][:300]}"
+    return result.stdout, ""
+
+
+def manifest_records(manifest: bytes) -> dict[str, dict[str, object]] | None:
+    """The file records of a manifest, each with a text ``sha256``, an integer ``mode`` and an owner."""
+
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate JSON member")
+        return dict(pairs)
+
+    try:
+        files = json.loads(manifest, object_pairs_hook=unique).get("files")
+    except (ValueError, UnicodeError, AttributeError):
+        return None
+    if not isinstance(files, dict):
+        return None
+    for record in files.values():
+        if not (
+            isinstance(record, dict)
+            and isinstance(record.get("sha256"), str)
+            and type(record.get("mode")) is int
+            and record.get("owner") in ("fleet", "product")
+            and isinstance(record.get("source"), str)
+        ):
+            return None
+    return files
+
+
+def verified_deploy_outputs(paths: list[str], *, root: Path) -> tuple[set[str], str | None, str]:
     """``(proven, manifest digest, why not)``: the ``paths`` the installed deploy verifies as its outputs.
 
-    The deploy's ``--check`` recomposes its plan from the installed release and the checkout's committed
-    sources (the caller already refused a dirty tree), verifies every planned output and its ownership
-    manifest, and writes nothing. The manifest must read the same before and after the check, so its
-    records are the ones the check verified. A path is proven only as a regular file, no final symlink,
-    whose SHA-256 equals its manifest record. No manifest, a check that fails or cannot run, or a
-    manifest that changed proves nothing, and the reason says which.
+    A path is proven only when the check passes and the path is a regular file (no final symlink) whose
+    SHA-256 and mode equal the record in the manifest the check recomposed. A product-owned record must
+    also name a source whose blob in the outgoing commit holds those bytes, so a source edited for the
+    length of the check and restored proves nothing; release-owned bytes come from the installed release.
+    A check that fails or cannot run, or a manifest without valid records, proves nothing, and the
+    reason says which.
     """
     if not any(is_deploy_output(path) for path in paths):
         return set(), None, ""
-    before = regular_bytes(root / DEPLOY_STATE)
-    if before is None:
-        return set(), None, f"no deploy ownership manifest at {DEPLOY_STATE}"
-    command = ["bash", launcher, "-I", "-m", f"{_MACHINERY}.agent_deploy", "--project-root", str(root), "--check"]
-    try:
-        # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        result = subprocess.run(  # fixed argv, no shell: the configured launcher and the deploy's own check
-            command,
-            capture_output=True,
-            check=False,
-            cwd=root,
-            env=clean_environment(),
-            text=True,
-            timeout=DEPLOY_CHECK_TIMEOUT_S,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        return set(), None, f"the deploy check could not run ({type(error).__name__})"
-    if result.returncode != 0:
-        last = (result.stderr.strip() or result.stdout.strip()).splitlines()[-1:]
-        return set(), None, f"the deploy check exited {result.returncode}: {(last or [''])[0][:300]}"
-    if regular_bytes(root / DEPLOY_STATE) != before:
-        return set(), None, "the deploy ownership manifest changed during the check"
-    try:
-        files = json.loads(before)["files"]
-    except (ValueError, TypeError, KeyError):
-        files = None
-    if not isinstance(files, dict):
-        return set(), None, "the deploy ownership manifest has no file records"
-    proven = set()
+    manifest, unverified = checked_deploy_manifest(root)
+    if manifest is None:
+        return set(), None, unverified
+    records = manifest_records(manifest)
+    if records is None:
+        return set(), None, "the deploy check printed no valid ownership manifest"
+    candidates = {}
     for path in paths:
-        record = files.get(path) if is_deploy_output(path) else None
-        data = regular_bytes(root / path) if isinstance(record, dict) else None
-        if data is not None and hashlib.sha256(data).hexdigest() == record.get("sha256"):
-            proven.add(path)
-    return proven, hashlib.sha256(before).hexdigest(), ""
+        record = records.get(path) if is_deploy_output(path) else None
+        found = regular_file(root / path) if record is not None else None
+        if found is not None and (hashlib.sha256(found[0]).hexdigest(), found[1]) == (record["sha256"], record["mode"]):
+            candidates[path] = (found[0], record)
+    sources = sorted({str(record["source"]) for _, record in candidates.values() if record["owner"] == "product"})
+    committed = committed_blobs(sources, root=root)
+    if committed is None:
+        return set(), None, "cannot read the outgoing commit's agent extension sources"
+    object_format, blobs = committed
+    proven = {
+        path
+        for path, (data, record) in candidates.items()
+        if record["owner"] == "fleet" or blobs.get(str(record["source"])) == blob_id(data, object_format)
+    }
+    unverified = (
+        "a product-owned copy differs from its source in the outgoing commit" if proven != set(candidates) else ""
+    )
+    return proven, hashlib.sha256(manifest).hexdigest(), unverified
 
 
-def reject_untracked_inputs(root: Path, launcher: str) -> str | None:
+def reject_untracked_inputs(root: Path) -> str | None:
     """Refuse when untracked or ignored Python/config files could change the run but not the receipt.
 
     Two derived sets are not overlays: dependency directories proven by their lockfile, and current
@@ -424,7 +495,7 @@ def reject_untracked_inputs(root: Path, launcher: str) -> str | None:
             raise GateOutcome("state_unavailable", "cannot list tracked dependency inputs", incomplete=True)
         tracked = set(tracked_listing)
     overlays = [path for path in candidates if not is_regenerable_dependency_input(path, root=root, tracked=tracked)]
-    outputs, manifest, unverified = verified_deploy_outputs(overlays, root=root, launcher=launcher)
+    outputs, manifest, unverified = verified_deploy_outputs(overlays, root=root)
     overlays = sorted(path for path in overlays if path not in outputs)
     if overlays:
         shown = ", ".join(overlays[:10]) + (f" (+{len(overlays) - 10} more)" if len(overlays) > 10 else "")
@@ -455,7 +526,7 @@ def build_plan(update: Update, root: Path, launcher: str, config: str) -> Plan |
     dirty = git_records("status", "--porcelain", "-z", "--untracked-files=no", "--ignore-submodules=none", cwd=root)
     if dirty is None or dirty:
         raise GateOutcome("dirty_tree", "tracked files differ from the outgoing commit; commit or restore them first")
-    deploy_manifest = reject_untracked_inputs(root, launcher)
+    deploy_manifest = reject_untracked_inputs(root)
     base, base_fallback = outgoing_base(update, root)
     if base == head and base_fallback is None:  # only a remote tip equal to the head is nothing outgoing
         return None
