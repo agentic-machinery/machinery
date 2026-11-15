@@ -90,6 +90,16 @@ _CASES = {
     "F2-gh-private-repo": (False, "gh pr view 1 --repo {private_repo} --json number"),
     "F2-gh-unregistered-repo": (False, "gh issue view 1 -R example/unregistered --json number"),
     "F2-gh-unresolved-repo": (False, "gh pr view 1 --json number"),
+    # Every repository selector is checked at the form's own flag arity (cf-598 r1/r2 F1): run list's boolean -a
+    # hid a later selector, so run list is not relayed; an unlisted flag, GH_REPO and GH_HOST are checked too.
+    "F2-gh-run-list-all-R": (False, "gh run list --repo {public_repo} -a -R {private_repo}"),
+    "F2-gh-run-list-all-repo-eq": (False, "gh run list --repo {public_repo} -a --repo={private_repo}"),
+    "F2-gh-run-list-all-R-glued": (False, "gh run list --repo {public_repo} -a -R{private_repo}"),
+    "F2-gh-run-list-all-repo": (False, "gh run list --repo {public_repo} -a --repo {private_repo}"),
+    "F2-gh-cluster-R": (False, "gh pr list --repo {public_repo} -dR {private_repo}"),
+    "F2-gh-unlisted-flag": (False, "gh pr checks 1 --repo {public_repo} --bogus -R {private_repo}"),
+    "F2-gh-env-repo": (False, "GH_REPO={private_repo} gh pr view 1 --repo {public_repo} --json number"),
+    "F2-gh-env-host": (False, "GH_HOST=localhost gh pr view 1 --repo {public_repo} --json number"),
     "granted-shell-scratch": (True, "echo ok > \"$TMPDIR/probe\" && cat \"$TMPDIR/probe\""),
     "granted-interpreter": (True, f"{_PY} -c \"import pytest; print('interpreter-ok')\""),
     "granted-named-test": (True, f"{_PY} -m pytest -q -p no:cacheprovider test_probe.py"),
@@ -114,8 +124,10 @@ def test_review_boundary_refuses_bypass_classes_and_keeps_execution(tmp_path, ca
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, timeout=30)
     private_repo = next(item.github for item in load_fleet_repos().values() if item.role.startswith("private-"))
+    public_repo = next(item.github for item in load_fleet_repos().values() if item.role.startswith("public-"))
     command = template.format(remote=remote, primary=primary, metadata=ipaddress.ip_address(2852039166),
-                              private=ipaddress.ip_address(167772161), private_repo=private_repo)
+                              private=ipaddress.ip_address(167772161), private_repo=private_repo,
+                              public_repo=public_repo)
     argv, env = _launch(tmp_path, worktree, "adversarial", ["/bin/sh", "-c", command])
     run = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=180, check=False, cwd=worktree)
     receipt = json.loads((tmp_path / "adversarial.sandbox.json").read_text())

@@ -99,12 +99,28 @@ _GIT_TIMEOUT = 120
 INPUT_MOUNT = "/agy-inputs"
 MAX_INPUTS = 8
 MAX_INPUT_BYTES = 8 << 20
-# The read-only gh forms the AGY boundary relays; nothing else reaches the host's gh.
-_GH_READS = frozenset({("pr", "view"), ("pr", "diff"), ("pr", "checks"), ("issue", "view"), ("run", "view")})
+# The read-only gh forms the boundary relays, each with every flag it admits (gh 2.98) and that flag's arity:
+# value flags take the next argument (or ``=VALUE``), boolean flags none. Arity is per form because one letter
+# differs between forms (``-a`` is run view's --attempt, pr list's --assignee and run list's boolean --all);
+# reading a boolean as valued would skip the check of the word after it (a ``-R``). Any flag not listed is
+# refused, so a flag gh adds later cannot change what the relay reads. --repo/-R is handled apart; --web/-w (a
+# browser on the host) and --search/-S (``repo:`` qualifiers widen a listing) are never listed. run list is not
+# relayed: pr checks gives a PR's runs, and the full-send chain reads no other listing.
+_GH_JSON = {"--json": True, "--jq": True, "-q": True, "--template": True, "-t": True, "--help": False}
+_GH_READS = {
+    ("pr", "view"): {**_GH_JSON, "--comments": False, "-c": False},
+    ("pr", "diff"): {"--allow-escape-sequences": False, "--color": True, "--exclude": True, "-e": True,
+                     "--name-only": False, "--patch": False, "--help": False},
+    ("pr", "checks"): {**_GH_JSON, "--fail-fast": False, "--interval": True, "-i": True, "--required": False,
+                       "--watch": False},
+    ("pr", "list"): {**_GH_JSON, "--app": True, "--assignee": True, "-a": True, "--author": True, "-A": True,
+                     "--base": True, "-B": True, "--draft": False, "-d": False, "--head": True, "-H": True,
+                     "--label": True, "-l": True, "--limit": True, "-L": True, "--state": True, "-s": True},
+    ("issue", "view"): {**_GH_JSON, "--comments": False, "-c": False},
+    ("run", "view"): {**_GH_JSON, "--attempt": True, "-a": True, "--exit-status": False, "--job": True, "-j": True,
+                      "--log": False, "--log-failed": False, "--verbose": False, "-v": False},
+}
 _GH_TIMEOUT = 300
-# Flags of those forms that take a separate value; every other argument is a flag or an operand.
-_GH_VALUE_FLAGS = frozenset({"--json", "-q", "--jq", "-t", "--template", "--job", "-j", "--attempt", "-a",
-                             "--color", "--interval", "-i"})
 # A number, #number or branch name: never a host, URL or OWNER/REPO#N selector.
 _GH_OPERAND = re.compile(r"#?[A-Za-z0-9._/-]+")
 # The one value --repo/-R accepts: OWNER/REPO on github.com. HOST/OWNER/REPO and URLs name another host.
@@ -114,7 +130,9 @@ import json, os, socket, sys
 directory = os.open(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir), os.O_RDONLY)
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as relay:
     relay.connect(f"/proc/self/fd/{{directory}}/gh.sock")  # avoids the sockaddr_un length limit
-    relay.sendall(json.dumps({{"argv": sys.argv[1:]}}).encode())
+    # GH_REPO and GH_HOST go along so the relay checks them; the host's gh never sees the shell's environment.
+    selectors = {{name: os.environ[name] for name in ("GH_REPO", "GH_HOST") if name in os.environ}}
+    relay.sendall(json.dumps({{"argv": sys.argv[1:], "environment": selectors}}).encode())
     relay.shutdown(socket.SHUT_WR)
     reply = json.loads(b"".join(iter(lambda: relay.recv(65536), b"")))
 sys.stdout.write(reply["stdout"])
@@ -978,15 +996,16 @@ def gh_refusal(argv) -> str | None:
     return _gh_parse(argv)[0]
 
 
-def gh_selection(argv, checkout: Path) -> tuple[list[str] | None, str]:
+def gh_selection(argv, checkout: Path, environment=None) -> tuple[list[str] | None, str]:
     """The argv the host's ``gh`` runs for ``argv`` and its repository, or None and the refusal (decision A6).
 
-    The repository is the one ``--repo``/``-R`` names, else ``checkout``'s origin, resolved here on the host. It
-    must be a registered public repository. The argv the host runs names it first, right after the subcommand,
-    so gh never picks a repository of its own from Git remotes or its default-repository setting, and any
-    later ``--repo`` gh reads (it keeps the last one) is the same repository.
+    ``environment`` is the caller's ``GH_REPO`` and ``GH_HOST``, as the shim sends them. The repository is the one
+    ``--repo``/``-R`` or ``GH_REPO`` names (all of them the same one), else ``checkout``'s origin, resolved here on
+    the host. It must be a registered public repository. The argv the host runs names it first, right after the
+    subcommand, and the host's gh runs without GH_REPO, so gh never picks a repository of its own from Git remotes
+    or its default-repository setting, and any later ``--repo`` gh reads (it keeps the last one) is the same one.
     """
-    refusal, named = _gh_parse(argv)
+    refusal, named = _gh_parse(argv, environment)
     if refusal is not None:
         return None, refusal
     if len({name.casefold() for name in named}) > 1:
@@ -999,54 +1018,68 @@ def gh_selection(argv, checkout: Path) -> tuple[list[str] | None, str]:
     return [argv[0], argv[1], "--repo", selected, *argv[2:]], selected
 
 
-def _gh_parse(argv) -> tuple[str | None, list[str]]:
-    """The refusal of ``argv``, or None, and every repository it names with ``--repo``/``-R``."""
+def _gh_parse(argv, environment=None) -> tuple[str | None, list[str]]:
+    """The refusal of ``argv``, or None, and every repository it names with ``--repo``/``-R`` or ``GH_REPO``.
+
+    The arguments are read as gh's flag parser reads them, with the arity of the form's own flags: a value flag
+    takes ``=VALUE``, the rest of its shorthand cluster or the next argument; a boolean takes none.
+    """
     if not (isinstance(argv, list) and 2 <= len(argv) <= 64
             and all(isinstance(arg, str) and "\0" not in arg and len(arg) <= 4096 for arg in argv)):
         return "the gh request is malformed", []
-    if (argv[0], argv[1]) not in _GH_READS:
-        return "only gh pr view, gh pr diff, gh pr checks, gh issue view and gh run view are relayed", []
+    flags = _GH_READS.get((argv[0], argv[1]))
+    if flags is None:
+        return "only gh pr view, gh pr diff, gh pr checks, gh pr list, gh issue view and gh run view are relayed", []
+    environment = {} if environment is None else environment
+    if not (isinstance(environment, dict) and set(environment) <= {"GH_REPO", "GH_HOST"}
+            and all(isinstance(value, str) and "\0" not in value for value in environment.values())):
+        return "the gh request is malformed", []
+    named: list[str] = []
     # gh runs on the host's network with the host's login, so nothing may choose another host: the
     # repository is the worktree's own remote or an OWNER/REPO on github.com given as ``--repo X``,
-    # ``--repo=X`` or ``-R X``. A URL operand or any other repository form names another host;
-    # --web/-w (also inside a cluster such as -cw) opens a browser on the host.
+    # ``--repo=X``, ``-R X`` or GH_REPO. A URL operand or any other repository form names another host.
+    if environment.get("GH_HOST") and environment["GH_HOST"].casefold() != "github.com":
+        return "GH_HOST names another host; only github.com is read", []
+    if environment.get("GH_REPO"):  # gh ignores an empty GH_REPO
+        if not _GH_REPO.fullmatch(environment["GH_REPO"]):
+            return "GH_REPO accepts only OWNER/REPO on github.com", []
+        named.append(environment["GH_REPO"])
     if any("://" in arg for arg in argv[2:]):
         return "a URL operand is refused; name a repository with --repo OWNER/REPO", []
-    expect_value = expect_repo = False
-    named: list[str] = []
-    for arg in argv[2:]:
-        if expect_repo:
-            if not _GH_REPO.fullmatch(arg):
-                return "--repo/-R accepts only OWNER/REPO on github.com", []
-            named.append(arg)
-            expect_repo = False
-        elif expect_value:  # a flag's value: --json fields, a --jq or --template expression, a job id
-            expect_value = False
-        elif arg == "--":  # gh would read every later argument as an operand, --repo included
+    args = iter(argv[2:])
+    for arg in args:
+        if arg == "--":  # gh would read every later argument as an operand, --repo included
             return "a bare -- is refused", []
-        elif arg.startswith("--"):
+        if arg.startswith("--"):
             name, equals, value = arg.partition("=")
             if name == "--repo":
-                if equals and not _GH_REPO.fullmatch(value):
+                value = value if equals else next(args, None)
+                if value is None or not _GH_REPO.fullmatch(value):
                     return "--repo/-R accepts only OWNER/REPO on github.com", []
-                if equals:
-                    named.append(value)
-                expect_repo = not equals
-            elif name.startswith(("--web", "--repo")):
-                return f"gh {name} is refused", []
-            else:
-                expect_value = not equals and name in _GH_VALUE_FLAGS
+                named.append(value)
+            elif name not in flags:
+                return f"gh {argv[0]} {argv[1]} {name} is refused", []
+            elif flags[name] and not equals and next(args, None) is None:
+                return f"gh {name} needs a value", []
         elif arg.startswith("-") and len(arg) > 1:
-            if arg == "-R":
-                expect_repo = True
-            elif "w" in arg or "R" in arg:
-                return f"gh {arg} is refused", []
-            else:
-                expect_value = len(arg) == 2 and arg in _GH_VALUE_FLAGS
+            for position, letter in enumerate(arg[1:], 2):  # a cluster of shorthands, such as -cq EXPR
+                if letter == "R":
+                    if arg != "-R":  # -RX and -cR X would select a repository inside a cluster
+                        return "-R stands alone: -R OWNER/REPO", []
+                    value = next(args, None)
+                    if value is None or not _GH_REPO.fullmatch(value):
+                        return "--repo/-R accepts only OWNER/REPO on github.com", []
+                    named.append(value)
+                    break
+                valued = flags.get("-" + letter)
+                if valued is None:
+                    return f"gh {argv[0]} {argv[1]} -{letter} is refused", []
+                if valued:  # the rest of the cluster is the value, else the next argument is
+                    if position == len(arg) and next(args, None) is None:
+                        return f"gh -{letter} needs a value", []
+                    break
         elif not _GH_OPERAND.fullmatch(arg):
             return "an operand naming another repository or host is refused", []
-    if expect_repo:
-        return "--repo/-R needs an OWNER/REPO value", []
     return None, named
 
 
@@ -1093,10 +1126,11 @@ class _GhBroker:
             chunks.append(chunk)
             size += len(chunk)
         try:
-            argv = json.loads(b"".join(chunks))["argv"]
-        except (ValueError, KeyError, TypeError):
-            argv = None
-        command, selected = gh_selection(argv, self.cwd)
+            request = json.loads(b"".join(chunks))
+            argv, environment = request["argv"], request.get("environment")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            argv = environment = None
+        command, selected = gh_selection(argv, self.cwd, environment)
         refusal = (selected if command is None else None) or (None if self.gh else "gh is not installed on the host")
         reply = {"returncode": 1, "stdout": "", "stderr": f"review boundary: {refusal}\n"}
         if refusal is None and command is not None:

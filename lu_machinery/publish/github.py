@@ -2129,6 +2129,43 @@ def _publish_through_broker(verb, fields, *, cwd, env, stdin, capture_output, te
     return subprocess.CompletedProcess(["write_boundary", "call", verb], code, out, err)
 
 
+def _read_through_broker(operation, repo, fields, *, paginate, slurp, cwd, env, capture_output, text):
+    """Send one named read to the write boundary's host broker (``github-read``); the host's login reads it.
+
+    Inside the boundary there is no GitHub login or route, so a direct read can only fail. The broker reads only
+    the launch's repository, with the same fixed templates; any other read is refused here, before anything is sent.
+    """
+    from lu_machinery.dispatcher import write_boundary
+
+    names = sorted(write_boundary.GITHUB_READS)
+    if operation not in write_boundary.GITHUB_READS or set(fields) - {"number", "sha"} or slurp:
+        raise gate.PublishBlocked(
+            "WRITE_BOUNDARY: inside the write boundary only these reads are relayed, by --number or --sha and "
+            f"without --slurp: {', '.join(names)}; nothing was sent."
+        )
+    payload = {"name": operation, **fields, **({"paginate": True} if paginate else {})}
+    # env=None inherits os.environ: an inherited GH_REPO is claimed like an explicit one, so the broker refuses a
+    # foreign repository instead of reading the launch's.
+    environment = _validated_environment(env)
+    if repo or environment.get("GH_REPO"):
+        host, _, slug = repository(cwd, environment, repo).partition("/")
+        if host != "github.com" or not slug:
+            raise gate.PublishBlocked("OPSEC: read repository unresolved.")
+        payload["repo"] = slug
+    reply = write_boundary.broker_call("github-read", payload)
+    code = reply.get("returncode")
+    code = code if type(code) is int and 0 <= code < 256 else 1
+    out, err = str(reply.get("stdout", "")), str(reply.get("stderr", ""))
+    if not capture_output:
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    if not text:
+        out, err = out.encode(), err.encode()
+    return subprocess.CompletedProcess(["write_boundary", "call", "github-read"], code, out, err)
+
+
 @github_client.rate_limited_command
 def publish(
     verb: str,
@@ -3173,8 +3210,11 @@ def read(
     **fields,
 ):
     """Specific API reads with fixed GET endpoints or internally built query documents."""
-    environment = _validated_environment(env)
     cwd = Path(cwd or Path.cwd())
+    if os.environ.get(BROKER_ENV) and runner is None:
+        return _read_through_broker(operation, repo, fields, paginate=paginate, slurp=slurp, cwd=cwd, env=env,
+                                    capture_output=capture_output, text=text)
+    environment = _validated_environment(env)
     if operation == "dependabot-alerts":
         # All inherited Git state is untrusted, including config injection.
         environment = {key: value for key, value in environment.items() if not key.startswith("GIT_")}

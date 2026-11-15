@@ -877,15 +877,22 @@ def test_github_read_runs_only_named_reads_of_the_own_repository(broker):
     """Defect class: the read verb forwards a request-chosen endpoint, method or repository, so the host login
     performs a write or reads another repository's security state for the worker."""
     assert "name must be one of" in _refused(lambda: broker._github_read({"name": "dependabot-alerts"}))
-    assert "github-read takes" in _refused(lambda: broker._github_read({"name": "pull", "repo": "a/b"}))
+    assert "github-read takes" in _refused(lambda: broker._github_read({"name": "pull", "endpoint": "a/b"}))
+    assert "this task's repository" in _refused(lambda: broker._github_read({"name": "pull", "number": 7, "repo": "a/b"}))
+    assert "paginate" in _refused(lambda: broker._github_read({"name": "comments", "number": 7, "paginate": "yes"}))
     assert "positive id" in _refused(lambda: broker._github_read({"name": "pull", "number": "7; rm"}))
+    assert broker.steps == []
     assert broker._github_read({"name": "checks", "sha": broker.boundary.tip})["returncode"] == 0
     assert broker.steps[-1] == ("publish.github", ["read", "checks", "--repo", "owner/repo", "--sha", broker.boundary.tip])
     # A public repository keeps its unnarrowed reads (#565 changes nothing for it): any run, issue or PR id.
     for request in ({"name": "run", "number": 5}, {"name": "issue", "number": 99}, {"name": "pull", "number": 8},
                     {"name": "checks", "sha": "2" * 40}):
         assert broker._github_read(request)["returncode"] == 0
-    assert len(broker.steps) == 5
+    # The publisher's own read, forwarded from inside, names the launch's repository and may paginate (a long thread).
+    assert broker._github_read({"name": "comments", "number": 7, "repo": "Owner/Repo", "paginate": True})["returncode"] == 0
+    assert broker.steps[-1] == ("publish.github", ["read", "comments", "--repo", "owner/repo", "--number", "7",
+                                                   "--paginate"])
+    assert len(broker.steps) == 6
 
 
 def test_private_repository_refuses_cross_repository_publication(broker, primary, monkeypatch):
@@ -1061,7 +1068,23 @@ _FORWARDED = {
                    "{py} -m lu_machinery.publish pr-comment --number 8 --body-file {body}"),
     "pr-merge": ("{py} -m lu_machinery.publish pr-merge --number 7 --match-head {tip}",
                  "{py} -m lu_machinery.publish pr-merge --number 8 --match-head {tip}"),
+    # The reads of the chain (#575, #557, #591): a named read, the review budget check and the wait on its own review.
+    "github-read": ("{py} -m lu_machinery.publish read pull --number 7",
+                    "{py} -m lu_machinery.publish read pull --number 7 --repo owner/other"),
+    # An inherited GH_REPO is the read's repository claim (env=None inherits), never dropped for the launch's own.
+    "github-read-env": ("GH_REPO={slug} {py} -m lu_machinery.publish read pull --number 7",
+                        "GH_REPO=owner/other {py} -m lu_machinery.publish read pull --number 7"),
+    "budget-check": ("{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 7",
+                     "{py} -m lu_machinery.review.record_cf_verdict budget-check --repository {slug} --pr 8"),
+    "review-wait": ("{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
+                    "wait wb-test-review-r1 --timeout 0.5",
+                    "{py} -c 'from lu_machinery.dispatcher.cli import main; raise SystemExit(main())' "
+                    "wait other-review-r1 --timeout 5"),
 }
+# The host step's first argument, where it is not the verb itself.
+_HOST_STEP = {"github-read": "read", "github-read-env": "read", "review-wait": "wait"}
+# The broker verb, where the case name is not the verb itself.
+_VERB = {"github-read-env": "github-read"}
 
 
 @pytest.mark.parametrize("target", ["own", "foreign", "private", "private-foreign"])
@@ -1112,7 +1135,7 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
         argv) or {"returncode": 0, "stdout": "published\n", "stderr": ""})
     body = tmp_path / "body.md"
     body.write_text("Body\n")
-    command = _FORWARDED[operation][target.endswith("foreign")].format(py=sys.executable, body=body, tip=tip)
+    command = _FORWARDED[operation][target.endswith("foreign")].format(py=sys.executable, body=body, tip=tip, slug=slug)
     code = write_boundary.main([
         "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
         "--receipt", str(receipt), "--author-model", "claude-opus-5-5", "--",
@@ -1124,13 +1147,18 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     requests = [(row["verb"], row["returncode"]) for row in result["broker"]]
     remote_refs = _git(tmp_path, "--git-dir", str(remote), "for-each-ref", "--format=%(objectname) %(refname)")
     if not target.endswith("foreign"):
-        assert exit_code == 0 and requests == [(operation, 0)], output
+        assert exit_code == 0 and requests == [(_VERB.get(operation, operation), 0)], output
         if operation == "push":
             assert remote_refs == f"{tip} refs/heads/task" and steps == []
         else:
-            assert steps and steps[-1][0] == operation and steps[-1][steps[-1].index("--repo") + 1] == slug
+            assert steps and steps[-1][0] == _HOST_STEP.get(operation, operation)
+            if operation == "review-wait":  # a fractional wait stays bounded, never 0 (the host's unlimited wait)
+                assert steps[-1][-2:] == ["--timeout", "1"], steps
+            else:
+                flag = "--repository" if operation == "budget-check" else "--repo"
+                assert steps[-1][steps[-1].index(flag) + 1] == slug
     else:
-        assert exit_code != 0 and requests == [(operation, 2)] and "refused" in output, output
+        assert exit_code != 0 and requests == [(_VERB.get(operation, operation), 2)] and "refused" in output, output
         assert steps == [] and remote_refs == ""
 
 
