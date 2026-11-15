@@ -700,11 +700,9 @@ regardless of which paths changed. Contract-path PRs do not need per-PR
 canary receipts:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr <N>
-# Or pin a full commit explicitly:
-.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-sha>
+.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha>
 # Inspect the complete command plan from a worker or host:
-.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr <N> --dry-run
+.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha> --dry-run
 ```
 
 The host needs the existing provider credentials and account bindings, a working
@@ -712,8 +710,8 @@ systemd user bus, `git`, `mksquashfs`, `snapfuse` and `fusermount3` (or
 `fusermount`). Use the configured project interpreter and primary/product roots.
 The command does not install host tools or change host configuration.
 
-The runner resolves a PR head once, clones the registered repository, fetches
-and checks out that exact commit, and builds a SquashFS image. It also fetches
+The runner uses the supplied head (or resolves a PR head once with `--pr`),
+clones the registered repository, fetches and checks out that exact commit, and builds a SquashFS image. It also fetches
 the candidate object into the registered primary's Git object store so the
 existing dispatcher can create its pinned review worktrees there. It mounts
 the image read-only beneath the home directory, where fusermount permits
