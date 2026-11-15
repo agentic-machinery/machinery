@@ -257,7 +257,7 @@ launch, never from the request:
   (using the project interpreter). The recorder forwards it automatically; exit 0 admits the round,
   while a host refusal retains its JSON reason and prevents dispatch. A request naming another PR's
   branch or repository is refused before the host recorder runs. In the boundary receipt, the
-  corresponding entry is `{"verb": "budget-check", "returncode": 0, "refused": null}` for admission;
+  corresponding entry includes `{"verb": "budget-check", "returncode": 0, "refused": null}` for admission;
   inspect the command's JSON as well as this transport receipt.
 - **Replay.** Each request id is accepted once per run. The dispatcher refuses an existing task id.
 - **Paths.** No request names a host path. The prompt arrives as text and the host writes it to the
