@@ -888,7 +888,7 @@ def build_cold_start_board(
 ) -> dict[str, Any]:
     """Build driver cold start board with fail-open diagnostic probes."""
     r_root = repo_root or Path.cwd()
-    p_root = root if root is not None else default_plane_root(repo_root=r_root)
+    p_root = root if root is not None else default_plane_root(repo_root=repo_root)
 
     env_probe = run_fail_open_probe("capsule_session_env", _probe_capsule_session_env, stream_id, agent)
 
