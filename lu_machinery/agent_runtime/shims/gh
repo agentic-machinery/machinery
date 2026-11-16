@@ -36,13 +36,15 @@ EOF
   exit 1
 }
 
+# The real gh skips every agent shim copy, under any package name, as gh_entry's
+# real_gh does: the product checkout keeps its own copies under `scripts`, and an
+# installed release's sit in site-packages. A copy that skipped only its own
+# package's directory would hand gh_entry another copy, which it refuses.
 _real_gh() {
-  local shim_dir package
+  local shim_dir
   shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  package="${shim_dir%/*/*}"
-  package="${package##*/}"
 
-  if [[ -n "${AGENT_REAL_GH:-}" && "${AGENT_REAL_GH:-}" != "$shim_dir/gh" && "${AGENT_REAL_GH:-}" != */"$package"/agent_runtime/shims/gh ]]; then
+  if [[ -n "${AGENT_REAL_GH:-}" && "${AGENT_REAL_GH:-}" != "$shim_dir/gh" && "${AGENT_REAL_GH:-}" != */agent_runtime/shims/gh ]]; then
     printf '%s\n' "$AGENT_REAL_GH"
     return 0
   fi
@@ -50,7 +52,7 @@ _real_gh() {
   local path_entry
   IFS=':' read -r -a _path_entries <<< "${AGENT_ORIGINAL_PATH:-${PATH:-}}"
   for path_entry in "${_path_entries[@]}"; do
-    [[ -z "$path_entry" || "$path_entry" == "$shim_dir" || "$path_entry" == */"$package"/agent_runtime/shims ]] && continue
+    [[ -z "$path_entry" || "$path_entry" == "$shim_dir" || "$path_entry" == */agent_runtime/shims || "$path_entry" == */agent_runtime/shims/ ]] && continue
     if [[ -x "$path_entry/gh" ]]; then
       printf '%s\n' "$path_entry/gh"
       return 0
@@ -108,7 +110,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   repo_root="$(cd "$(dirname "$shim_file")/../../.." && pwd)"
   # shellcheck disable=SC1091
   source "$(dirname "$shim_file")/../../lib/project_interpreter.sh"
-  if ! python="$(project_interpreter_resolve "$repo_root")"; then
+  if ! python="$(project_tree_interpreter_resolve "$repo_root")"; then
     echo "error: agent gh shim cannot find the project interpreter; refusing to run gh unguarded." >&2
     exit 127
   fi

@@ -100,7 +100,12 @@ def home(tmp_path: Path) -> Path:
 
 
 def test_shell_resolver_matrix(tmp_path: Path, home: Path) -> None:
-    """The shell resolver selects the override or the primary venv, or refuses."""
+    """The shell resolver selects the override or the primary venv, or refuses.
+
+    The agent shims' resolver also selects an installed package's own virtual environment interpreter, and
+    refuses any other site-packages (defect class: a shim run from an installed wheel looked for
+    ``site-packages/.venv/bin/python``).
+    """
     primary, worktree, log = _layout(tmp_path, primary_venv=True, worktree_venv=True)
     override = _wrapper(tmp_path / "override-python", log)
     plain = tmp_path / "plain-file"
@@ -135,6 +140,67 @@ def test_shell_resolver_matrix(tmp_path: Path, home: Path) -> None:
     assert "is not used" in refused.stderr
     assert str(bare_worktree / ".venv" / "bin" / "python") not in refused.stdout
     assert not (bare_primary / ".venv" / "bin" / "python").exists()
+
+    # The agent shims' rule: a checkout keeps the rule above; an installed package selects its own
+    # virtual environment's interpreter, and any other site-packages refuses.
+    tree = f'source "{LIB / "project_interpreter.sh"}" && project_tree_interpreter_resolve'
+    checkout = _bash(f'{tree} "{worktree}"', env=_base_env(tmp_path), cwd=worktree)
+    assert checkout.returncode == 0, checkout.stderr
+    assert checkout.stdout.strip() == str(primary / ".venv" / "bin" / "python")
+    venv, site = _installed_layout(tmp_path / "installed", log)
+    venv_python = str(venv / "bin" / "python3.12")
+    (tmp_path / "alias").symlink_to(venv, target_is_directory=True)
+    selected_cases = (
+        ("site", site, {}, venv_python),
+        ("symlinked-venv", tmp_path / "alias" / site.relative_to(venv), {}, venv_python),
+        ("override", site, {"LEARN_UKRAINIAN_PYTHON": str(override)}, str(override)),
+    )
+    for name, root, extra, expected in selected_cases:
+        result = _bash(f'{tree} "{root}"', env={**_base_env(tmp_path), **extra}, cwd=tmp_path)
+        assert (result.returncode, result.stdout.strip()) == (0, expected), (name, result.stderr)
+    assert _bash(f'{tree} "{site}"', env={**_base_env(tmp_path), "LEARN_UKRAINIAN_PYTHON": str(plain)}, cwd=tmp_path).returncode != 0
+
+    def unlink_pyvenv_cfg(venv: Path, site: Path) -> Path:
+        (venv / "pyvenv.cfg").unlink()
+        return site
+
+    def add_git_entry(venv: Path, site: Path) -> Path:
+        (site / ".git").mkdir()
+        return site
+
+    def drop_versioned_python(venv: Path, site: Path) -> Path:
+        (venv / "bin" / "python3.12").unlink()
+        return site
+
+    def move_out_of_lib(venv: Path, site: Path) -> Path:
+        (venv / "lib").rename(venv / "share")
+        return venv / "share" / "python3.12" / "site-packages"
+
+    for broken in (unlink_pyvenv_cfg, add_git_entry, drop_versioned_python, move_out_of_lib):
+        root = broken(*_installed_layout(tmp_path / broken.__name__, log))
+        result = _bash(f'{tree} "{root}"', env=_base_env(tmp_path), cwd=tmp_path)
+        assert result.returncode != 0, (broken.__name__, result.stdout)
+        assert result.stdout == "", broken.__name__
+        assert "project interpreter not found" in result.stderr, (broken.__name__, result.stderr)
+
+
+def _installed_layout(base: Path, log: Path, *, code: int = 0, args_path: Path | None = None) -> tuple[Path, Path]:
+    """A virtual environment with the agent shims and push hook installed in site-packages, as a wheel does.
+
+    Its ``bin/python3.12`` only records that it ran (and its arguments to ``args_path``) and exits with ``code``.
+    """
+    venv = base / "venv"
+    site = venv / "lib" / "python3.12" / "site-packages"
+    package = site / "lu_machinery"
+    for relative in (
+        "agent_runtime/shims/gh", "agent_runtime/shims/git", "agent_runtime/shims/npm", "agent_runtime/shims/npx",
+        "agent_runtime/npm_guard.py", "lib/project_interpreter.sh", "opsec/push_hooks/pre-push", "opsec/git_push.py",
+    ):
+        (package / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(machinery_root() / relative, package / relative)
+    (venv / "pyvenv.cfg").write_text("include-system-site-packages = false\n", encoding="utf-8")
+    _record(venv / "bin" / "python3.12", log, code=code, args_path=args_path)
+    return venv, site
 
 
 def test_launcher_interpreter_matrix(tmp_path: Path) -> None:
@@ -727,6 +793,60 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     assert str(override) in log.read_text(encoding="utf-8"), gh_run.stderr
     assert refused([str(SOURCE / "lu_machinery/agent_runtime/shims/gh"), "auth", "status"], cwd=worktree, extra=gh_env).returncode != 0
     assert log.read_text(encoding="utf-8") == ""
+
+    # Installed from a wheel with no interpreter configured, each agent shim (and the push hook the git
+    # shim pins) runs its own virtual environment's interpreter, never one named by the working
+    # directory; outside a virtual environment it refuses.
+    installed_log = tmp_path / "installed.log"
+    installed_args = tmp_path / "installed.args"
+    installed_venv, installed_site = _installed_layout(tmp_path / "wheel", installed_log, code=2, args_path=installed_args)
+    installed_package = installed_site / "lu_machinery"
+    installed_env = {**base, "AGENT_NO_MERGE": "1", "AGENT_REAL_GH": str(fake_gh)}
+    installed_calls = (
+        (["agent_runtime/shims/gh", "auth", "status"], ""),
+        (["agent_runtime/shims/git", "checkout", "topic"], ""),
+        (["agent_runtime/shims/npm", "--version"], ""),
+        (["agent_runtime/shims/npx", "--version"], ""),
+        (["opsec/push_hooks/pre-push", "origin", "unused"], "a b c d\n"),
+    )
+    for call, stdin in installed_calls:
+        installed_log.write_text("", encoding="utf-8")
+        log.write_text("", encoding="utf-8")
+        run = _run([str(installed_package / call[0]), *call[1:]], cwd=worktree, env=installed_env, stdin=stdin)
+        assert run.returncode != 0, (call, run.stderr)
+        assert str(installed_venv / "bin/python3.12") in installed_log.read_text(encoding="utf-8"), (call, run.stderr)
+        assert log.read_text(encoding="utf-8") == "", call
+    # On one PATH with another package's copy (the product checkout keeps its shims under `scripts`), the
+    # installed gh and git skip every agent shim directory and reach the real tool, not that copy
+    # (defect class: copies that skip only their own package's directory hand each other the call).
+    product_shims = tmp_path / "product/scripts/agent_runtime/shims"
+    shutil.copytree(installed_package / "agent_runtime/shims", product_shims)
+    real_bin = tmp_path / "real-bin"
+    _executable(real_bin / "gh", "#!/bin/sh\necho real-gh\n")
+    _executable(real_bin / "git", "#!/bin/sh\necho real-git\n")
+    stacked_path = os.pathsep.join([str(installed_package / "agent_runtime/shims"), f"{product_shims}/", str(real_bin), base["PATH"]])
+    for variable in ("PATH", "AGENT_ORIGINAL_PATH"):
+        stacked_env = {**base, "PATH": stacked_path, variable: stacked_path}
+        installed_args.write_text("", encoding="utf-8")
+        # A pinned AGENT_REAL_GH naming another copy is skipped too.
+        stacked_gh = _run(
+            [str(installed_package / "agent_runtime/shims/gh"), "--version"],
+            cwd=tmp_path,
+            env={**stacked_env, "AGENT_REAL_GH": str(product_shims / "gh")},
+        )
+        gh_args = installed_args.read_text(encoding="utf-8").splitlines()
+        assert "lu_machinery.opsec.gh_entry" in gh_args, (variable, stacked_gh.stderr)
+        assert gh_args[gh_args.index("lu_machinery.opsec.gh_entry") + 1] == str(real_bin / "gh"), (variable, gh_args)
+        stacked_git = _run([str(installed_package / "agent_runtime/shims/git"), "--version"], cwd=tmp_path, env=stacked_env)
+        assert (stacked_git.returncode, stacked_git.stdout) == (0, "real-git\n"), (variable, stacked_git.stderr)
+    (installed_venv / "pyvenv.cfg").unlink()
+    for call, stdin in installed_calls:
+        installed_log.write_text("", encoding="utf-8")
+        run = _run([str(installed_package / call[0]), *call[1:]], cwd=worktree, env=installed_env, stdin=stdin)
+        assert run.returncode != 0, (call, run.stderr)
+        assert "is not <venv>/lib/pythonX.Y/site-packages of a virtual environment" in run.stderr, (call, run.stderr)
+        assert installed_log.read_text(encoding="utf-8") == "", call
+        assert log.read_text(encoding="utf-8") == "", call
 
     _executable(tmp_path / "bin/curl", """#!/bin/sh
 url=
