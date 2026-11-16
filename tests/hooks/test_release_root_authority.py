@@ -224,6 +224,11 @@ def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(rel
         assert refused.returncode == 2 and "BLOCKED by guard-admin-merge" in refused.stderr, refused.stderr
     missing = run("ls", LEARN_UKRAINIAN_PYTHON=str(tmp_path / "absent-python"))
     assert missing.returncode == 2 and "HOOK-BOOTSTRAP-FAILED" in missing.stderr, missing.stderr
+    # A configured interpreter that runs but lacks the release refuses too, never exit 1.
+    bare = tmp_path / "bare-venv"
+    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(bare)], check=True)
+    unloadable = run("git status", LEARN_UKRAINIAN_PYTHON=str(bare / "bin/python"))
+    assert unloadable.returncode == 2 and "cannot load the installed guard" in unloadable.stderr, unloadable.stderr
 
 
 def test_bare_healer_does_not_heal_release_instead_of_product(release, product):
