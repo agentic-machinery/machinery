@@ -34,7 +34,7 @@ it (an attributed fetch, a run, a receipt), not only that it merged.
 
 Each decision with who approved it. Designated approval is Opus 5.5 and Sol 6.1, the
 non-author completing an advisor's proposal (operator-expectations.md item 12); panel voices
-such as Muse advise and never replace it, and the author's family never approves its own
+advise and never replace it, and the author's family never approves its own
 proposal. A disagreement goes to the operator. The operator is informed; approved work does
 not wait on the operator. Operator-only items (core.md P6) wait for the operator while
 independent work continues; list each as a residual with a workaround and the command output
@@ -45,16 +45,28 @@ that shows it is operator-only.
 Use it for a consequential design decision, when the operator asks for a second opinion
 ("council"), or for a named unresolved risk on a critical PR. Not for routine PRs.
 
-- **Members:** live eligible routes only: Opus via Claude, Sol via Codex, Grok via Cursor
-  (`model-assignment.md`). Muse may add advice but never replaces designated approval
-  (operator-expectations.md item 12). AGY read-only dispatch runs inside the dispatcher's
-  bubblewrap boundary (C-3027) and is refused only on a host that cannot start it. Grok is
-  out of Ukrainian-content questions. An unavailable member is reported, never substituted,
-  and the panel is then not called complete.
+- **Order:** the council comes first: each member answers the frozen question on its own,
+  read-only and scored (below). Then at most one ACP `discuss` round with 2 to 4 seats
+  ([review-merge-cleanup](review-merge-cleanup.md)) takes up only the points where the
+  members disagree. A discussion never counts as review or approval.
+- **Members:** live eligible routes only: Opus 5.5 via Claude, Sol 6.1 via Codex, Grok 4.7
+  via Cursor (`model-assignment.md`). On Ukrainian language, culture and heritage questions,
+  Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment), and
+  Gemini 4 Hydrogen via AGY (`--agent agy --model gemini-4-hydrogen-medium`) joins as a fourth
+  member (operator order 2026-11-16). Both advise in the council and the discussion only, never
+  as review of record or designated approval. AGY read-only dispatch runs inside the
+  dispatcher's bubblewrap boundary (C-3027) and is refused only on a host that cannot start it;
+  Hydrogen is then unavailable, and an ACP seat on the agy route may join the discussion round
+  only. An unavailable member is reported, never substituted, and the panel is then not called
+  complete.
 - **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
   ([policy](../../review-loop/references/policy.md)); never "until all members are satisfied".
+- **Act on each result as it arrives:** check its findings against the code at once and
+  decide fixes while the other members still run. Edit no file while a member still reviews
+  the same checkout. A late non-blocking result (no P0 or P1) from a member the decision did
+  not wait for is feedback only; a late P0 or P1 is checked and dispositioned like any finding.
 - **Findings and score:** every panelist returns written findings plus `SCORE n/10` with a
   one-line rationale, against this rubric: 10 = no findings; 7-9 = only P2/P3; 4-6 = an open
   P1; 1-3 = a P0 or the wrong approach. A score never gates a merge: the verdict and the
@@ -67,7 +79,8 @@ Use it for a consequential design decision, when the operator asks for a second 
   approval and `full-send` are unchanged.
   Before a panel round, bring the head up to date as `review-loop` step 0 says.
 
-Learned from tstack's `council` skill (MIT, Theo Browne); the text is our own.
+Learned from t3dotgg/tstack's `council` skill (MIT, Theo Browne), including its 2026-11-11
+rules on acting on each delegate's result (commit 11e37a74); the text is our own.
 
 ## Sources
 
