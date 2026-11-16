@@ -73,7 +73,7 @@ _guard_python() {
   root="$(cd "$shim_dir/../../.." && pwd)"
   # shellcheck disable=SC1091
   source "$shim_dir/../../lib/project_interpreter.sh"
-  project_interpreter_resolve "$root"
+  project_tree_interpreter_resolve "$root"
 }
 
 guard_python="$(_guard_python)" || true

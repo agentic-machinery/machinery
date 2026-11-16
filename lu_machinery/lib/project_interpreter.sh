@@ -41,6 +41,11 @@
 #   stdout: absolute interpreter path (exit 0)
 #   stderr: "Error: project interpreter not found: <paths tried>" (exit 1)
 #
+# project_tree_interpreter_resolve <code-root>
+#   the agent shims' rule: project_interpreter_resolve, except that an
+#   installed package's site-packages selects its own virtual environment's
+#   interpreter (see its definition)
+#
 # project_python_command <python>
 #   sets PROJECT_PYTHON_COMMAND to the argv prefix that starts <python> isolated
 #   on this library's own machinery tree; append `-m <module> [args...]` or
@@ -390,3 +395,53 @@ project_hook_context_resolve() {
     export LEARN_UKRAINIAN_PYTHON="$interpreter"
 }
 # LU_HOOK_RESOLVERS_END
+
+# project_tree_interpreter_resolve <code-root>
+#   the interpreter for a program that runs the machinery tree it ships in (the
+#   agent shims), where <code-root> is the directory that holds the package.
+#   A configured LEARN_UKRAINIAN_PYTHON wins, as in project_interpreter_resolve.
+#   A <code-root> named site-packages is a package installed in a Python
+#   environment: the interpreter is that environment's own
+#   <venv>/bin/pythonX.Y, accepted only when <code-root> is physically
+#   <venv>/lib[64]/pythonX.Y/site-packages, <venv>/pyvenv.cfg is a regular file
+#   (PEP 405) and <code-root> has no .git entry; anything else there (a system
+#   or user site, a missing interpreter) refuses. It is the interpreter the
+#   package was installed for, chosen by the code's own location, never by PATH
+#   or the working directory; whoever can replace it can replace the shim
+#   beside it, so it trusts nothing the shim does not already run. Any other
+#   <code-root> (a checkout or a release tree) follows project_interpreter_resolve.
+#   stdout: absolute interpreter path (exit 0)
+#   stderr: "Error: project interpreter not found: <reason>" (exit 1)
+project_tree_interpreter_resolve() {
+    local root lib version venv python configured
+
+    configured="$(project_interpreter_configured)" || return 1
+    if [ -n "$configured" ]; then
+        printf '%s\n' "$configured"
+        return 0
+    fi
+    root="$(_project_physical_dir "${1:?project_tree_interpreter_resolve: code root required}")" || {
+        echo "Error: project interpreter not found: code root $1 does not exist or its path has a newline" >&2
+        return 1
+    }
+    if [ "${root##*/}" != site-packages ]; then
+        project_interpreter_resolve "$root"
+        return
+    fi
+    lib="${root%/*}"
+    version="${lib##*/}"
+    lib="${lib%/*}"
+    venv="${lib%/*}"
+    python="$venv/bin/$version"
+    if [[ ! "$version" =~ ^python[0-9]+\.[0-9]+t?$ ]] || [[ "${lib##*/}" != lib && "${lib##*/}" != lib64 ]] \
+        || [ -z "$venv" ] || [ -L "$venv/pyvenv.cfg" ] || [ ! -f "$venv/pyvenv.cfg" ] \
+        || [ -e "$root/.git" ] || [ -L "$root/.git" ]; then
+        echo "Error: project interpreter not found: $root is not <venv>/lib/pythonX.Y/site-packages of a virtual environment (set LEARN_UKRAINIAN_PYTHON)" >&2
+        return 1
+    fi
+    if [ -d "$python" ] || [ ! -x "$python" ]; then
+        echo "Error: project interpreter not found: $python is not an executable file" >&2
+        return 1
+    fi
+    printf '%s\n' "$python"
+}

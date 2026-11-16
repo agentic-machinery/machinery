@@ -32,7 +32,8 @@ _opsec_restore_override() {
   fi
 }
 
-# The one project interpreter (R66).
+# The one project interpreter (R66); an installed shim uses the interpreter of
+# the virtual environment it is installed in (project_tree_interpreter_resolve).
 # A runner that must pin an interpreter sets LEARN_UKRAINIAN_PYTHON.
 # Sourced in this shell: a later command substitution must not be the only source,
 # or project_python_run would be missing when the guard runs.
@@ -41,7 +42,7 @@ _shim_root="$(cd "$_shim_dir/../../.." && pwd)"
 # shellcheck disable=SC1091
 source "$_shim_dir/../../lib/project_interpreter.sh"
 _shim_project_python() {
-  project_interpreter_resolve "$_shim_root"
+  project_tree_interpreter_resolve "$_shim_root"
 }
 
 _deny() {

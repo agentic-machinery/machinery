@@ -108,7 +108,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   repo_root="$(cd "$(dirname "$shim_file")/../../.." && pwd)"
   # shellcheck disable=SC1091
   source "$(dirname "$shim_file")/../../lib/project_interpreter.sh"
-  if ! python="$(project_interpreter_resolve "$repo_root")"; then
+  if ! python="$(project_tree_interpreter_resolve "$repo_root")"; then
     echo "error: agent gh shim cannot find the project interpreter; refusing to run gh unguarded." >&2
     exit 127
   fi
