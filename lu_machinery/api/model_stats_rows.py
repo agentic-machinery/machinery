@@ -47,8 +47,9 @@ ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 UNSET = "unset"
-# Harness aliases that name a family but no version; stored as recorded, never given one.
-NATIVE_ALIASES = ("opus", "sonnet", "haiku")
+# Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
+# statistics map one to a catalog id only where the rows make it unambiguous).
+NATIVE_ALIASES = ("opus", "sonnet", "haiku", "fable")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 # The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.

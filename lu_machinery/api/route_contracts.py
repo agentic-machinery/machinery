@@ -629,13 +629,16 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "http",
         "Per concrete model id, effective effort, role (write, review) and task class over a 7d, 30d, 90d or all "
         "window: tasks, terminal status mix, landed tasks, median and p90 wall time, tokens and wall hours per "
-        "landed task, review verdicts and blocking findings, author-side review rounds, weekly allowance spent per "
-        "landed task and ISO-week counts, each with its sample size (#581). /metrics exposes the same snapshot.",
+        "landed task, review verdicts and blocking findings of parsed reviews of record, author-side review rounds, "
+        "first-round approval per author, first reviewer and review class, what followed a blocked first round, "
+        "routed catalog models idle in the window, weekly allowance spent per landed task and ISO-week counts, each "
+        "with its sample size (#581). /metrics exposes the same snapshot.",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
         "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
         "One single-flight snapshot of every window, refreshed every 300s while the route or /metrics is read; "
-        "healthy data at most 420s old; the first request answers pending with Retry-After 5.",
+        "healthy data at most 420s old; a request with no snapshot waits up to 15s for that collect, then answers "
+        "pending with Retry-After 1.",
         ("model-stats.html", "operators"),
         "Joins what /api/runtime/usage (ACP runs only) and /api/fleet/workers/v1 (live workers) do not; "
         "agent_success in the fleet facade counts runs without landing or rounds.",
