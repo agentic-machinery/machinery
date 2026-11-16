@@ -673,8 +673,10 @@ class Cut:
         shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
         if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
             raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
+        # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
+        # than inheriting the caller's value or none.
         result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
-                          env={**self.env(), "LU_PRODUCT_ROOT": str(product)}, check=False)
+                          env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
         summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
         if result.returncode:
             raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
