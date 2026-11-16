@@ -278,6 +278,31 @@ def test_only_a_bump_since_a_full_release_still_skips(tmp_path):
     assert titles == ["chore(release): record 0.1.22 and start 0.1.23 (#630)"]
 
 
+def test_consumer_collection_names_the_candidate_interpreter(monkeypatch, tmp_path):
+    """Defect class: collection inherits the caller's LEARN_UKRAINIAN_PYTHON; unset, 43 product modules fail to import."""
+    monkeypatch.delenv("LEARN_UKRAINIAN_PYTHON", raising=False)
+    site, product, candidate = tmp_path / "site", tmp_path / "product", tmp_path / "accept/bin/python"
+    site.mkdir()
+    cut = Cut(work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo="learn-ukrainian/machinery",
+              product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python", primary=tmp_path,
+              alert=False, x_agent="claude/claude-cto", built="0.1.24")
+    collected: list[dict[str, str]] = []
+
+    def run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        stdout = {release_cut._SITE_PATHS: f"{tmp_path / 'host-site'}\n", release_cut._SHOW_LU: f"0.1.24\n{site}/lu_machinery/__init__.py\n"}
+        if "pytest" in command:
+            collected.append(kwargs["env"])
+            return subprocess.CompletedProcess(command, 0, "44149 tests collected\n", "")
+        if "purelib" in command[-1]:
+            return subprocess.CompletedProcess(command, 0, f"{site}\n", "")
+        return subprocess.CompletedProcess(command, 0, stdout.get(command[-1], "d" * 40 + "\n"), "")
+
+    cut.run = run
+    assert cut.consumer_collection(candidate, product) == "44149 tests collected"
+    assert [(env["LEARN_UKRAINIAN_PYTHON"], env["LU_PRODUCT_ROOT"]) for env in collected] == [(str(candidate), str(product))]
+
+
 @pytest.fixture
 def group_writable_umask():
     """The host's umask: 0002, under which the first 0.1.23 dry run wrote a 664 .nvmrc."""
