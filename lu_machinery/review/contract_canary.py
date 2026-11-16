@@ -376,10 +376,8 @@ def _run_steps(
     """Build the exact argv plan without creating files, units, mounts or tasks.
 
     The checkout holds only the candidate commit (a depth-1 fetch, never the repository's
-    history), and ``run`` removes it once the image is built. The locked ``lu-machinery`` wheel
-    a consumer lock pins is on no package index, so with a wheelhouse the consumer venv also
-    finds wheels there; the lock's hashes still decide which bytes install. A machinery lock
-    pins only dependencies and needs none.
+    history), and ``run`` removes it once the image is built. With a wheelhouse, the consumer
+    venv also finds wheels there; the lock's hashes still decide which bytes install.
     """
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
@@ -479,6 +477,11 @@ def run(args: argparse.Namespace) -> int:
     if not args.dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
         raise CanaryError("run must execute on the host, outside a dispatched worker; use --dry-run here")
     source, repository = resolve_repo(args.repo)
+    if repository["key"] != "machinery":
+        # A consumer tree has no lu_machinery package: the installed wheel, not the candidate, would
+        # supervise its routes, and the attestation step refuses that before any provider call.
+        raise CanaryError(f"--repo {args.repo}: only machinery heads can be canaried; this runner cannot attest "
+                          f"the dispatcher of a {repository['key']} head")
     env = sanitized_git_env(strip_config_injection=True)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
@@ -520,7 +523,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"refuse unless {Path.home()} has room for about twice the registered checkout's tree plus "
               f"{_VENV_ALLOWANCE // 2**20} MiB below the dispatch admission's disk refuse level")
         if not wheelhouse:
-            print(f"{WHEELHOUSE_ENV} is unset: no --find-links, so a lock that pins lu-machinery cannot install")
+            print(f"{WHEELHOUSE_ENV} is unset: pip uses the package index only")
         print(f"mkdir {work / 'mount'} (temporary directory under home; fusermount refuses /var/tmp)")
         for command in setup:
             print(shlex.join(command))
@@ -615,8 +618,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "run", help="Build, run, record and score the sealed-checkout canary on the host",
         description="Orchestrate the four-route review-contract canary at an exact head.\n"
         "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.\n"
-        f"{WHEELHOUSE_ENV}, when set, is an absolute wheelhouse path pip also searches (needed when the\n"
-        "candidate lock pins lu-machinery itself). A run refuses before creating\n"
+        f"Only machinery heads are supported. {WHEELHOUSE_ENV}, when set, is an absolute wheelhouse\n"
+        "path pip also searches. A run refuses before creating\n"
         "anything when its estimated disk need would reach the dispatch admission's disk refuse level.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
@@ -629,7 +632,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "2 invalid input, too little disk, setup or cleanup failure.\n"
         "Related: docs/runbooks/write-worker-boundary.md#review-contract-canary.",
     )
-    runner.add_argument("--repo", default="machinery", help="Fleet registry key holding the candidate code (default: machinery)")
+    runner.add_argument("--repo", default="machinery",
+                        help="Fleet registry key holding the candidate code; only machinery is supported (default: machinery)")
     target = runner.add_mutually_exclusive_group(required=True)
     target.add_argument("--head", help="Exact candidate commit, 40 lowercase hex characters (default: from --pr)")
     target.add_argument("--pr", type=int, help="PR whose head to resolve once, e.g. 585 (default: use --head)")

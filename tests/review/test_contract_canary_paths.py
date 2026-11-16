@@ -321,6 +321,9 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
     output = capsys.readouterr().out
     assert "--only-binary=:all: -r " in output and f"{canary.WHEELHOUSE_ENV} is unset" in output
+    # A product head's dispatcher would be the installed wheel, which nothing can attest.
+    assert canary.main(["run", "--repo", "public", "--head", "a" * 40, "--dry-run"]) == 2
+    assert "only machinery heads can be canaried" in capsys.readouterr().err
     assert list(runner_roots.iterdir()) == []
 
 
