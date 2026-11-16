@@ -184,10 +184,10 @@ def test_shell_resolver_matrix(tmp_path: Path, home: Path) -> None:
         assert "project interpreter not found" in result.stderr, (broken.__name__, result.stderr)
 
 
-def _installed_layout(base: Path, log: Path, *, code: int = 0) -> tuple[Path, Path]:
+def _installed_layout(base: Path, log: Path, *, code: int = 0, args_path: Path | None = None) -> tuple[Path, Path]:
     """A virtual environment with the agent shims and push hook installed in site-packages, as a wheel does.
 
-    Its ``bin/python3.12`` only records that it ran and exits with ``code``.
+    Its ``bin/python3.12`` only records that it ran (and its arguments to ``args_path``) and exits with ``code``.
     """
     venv = base / "venv"
     site = venv / "lib" / "python3.12" / "site-packages"
@@ -199,7 +199,7 @@ def _installed_layout(base: Path, log: Path, *, code: int = 0) -> tuple[Path, Pa
         (package / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(machinery_root() / relative, package / relative)
     (venv / "pyvenv.cfg").write_text("include-system-site-packages = false\n", encoding="utf-8")
-    _record(venv / "bin" / "python3.12", log, code=code)
+    _record(venv / "bin" / "python3.12", log, code=code, args_path=args_path)
     return venv, site
 
 
@@ -798,7 +798,8 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     # shim pins) runs its own virtual environment's interpreter, never one named by the working
     # directory; outside a virtual environment it refuses.
     installed_log = tmp_path / "installed.log"
-    installed_venv, installed_site = _installed_layout(tmp_path / "wheel", installed_log, code=2)
+    installed_args = tmp_path / "installed.args"
+    installed_venv, installed_site = _installed_layout(tmp_path / "wheel", installed_log, code=2, args_path=installed_args)
     installed_package = installed_site / "lu_machinery"
     installed_env = {**base, "AGENT_NO_MERGE": "1", "AGENT_REAL_GH": str(fake_gh)}
     installed_calls = (
@@ -815,6 +816,29 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
         assert run.returncode != 0, (call, run.stderr)
         assert str(installed_venv / "bin/python3.12") in installed_log.read_text(encoding="utf-8"), (call, run.stderr)
         assert log.read_text(encoding="utf-8") == "", call
+    # On one PATH with another package's copy (the product checkout keeps its shims under `scripts`), the
+    # installed gh and git skip every agent shim directory and reach the real tool, not that copy
+    # (defect class: copies that skip only their own package's directory hand each other the call).
+    product_shims = tmp_path / "product/scripts/agent_runtime/shims"
+    shutil.copytree(installed_package / "agent_runtime/shims", product_shims)
+    real_bin = tmp_path / "real-bin"
+    _executable(real_bin / "gh", "#!/bin/sh\necho real-gh\n")
+    _executable(real_bin / "git", "#!/bin/sh\necho real-git\n")
+    stacked_path = os.pathsep.join([str(installed_package / "agent_runtime/shims"), f"{product_shims}/", str(real_bin), base["PATH"]])
+    for variable in ("PATH", "AGENT_ORIGINAL_PATH"):
+        stacked_env = {**base, "PATH": stacked_path, variable: stacked_path}
+        installed_args.write_text("", encoding="utf-8")
+        # A pinned AGENT_REAL_GH naming another copy is skipped too.
+        stacked_gh = _run(
+            [str(installed_package / "agent_runtime/shims/gh"), "--version"],
+            cwd=tmp_path,
+            env={**stacked_env, "AGENT_REAL_GH": str(product_shims / "gh")},
+        )
+        gh_args = installed_args.read_text(encoding="utf-8").splitlines()
+        assert "lu_machinery.opsec.gh_entry" in gh_args, (variable, stacked_gh.stderr)
+        assert gh_args[gh_args.index("lu_machinery.opsec.gh_entry") + 1] == str(real_bin / "gh"), (variable, gh_args)
+        stacked_git = _run([str(installed_package / "agent_runtime/shims/git"), "--version"], cwd=tmp_path, env=stacked_env)
+        assert (stacked_git.returncode, stacked_git.stdout) == (0, "real-git\n"), (variable, stacked_git.stderr)
     (installed_venv / "pyvenv.cfg").unlink()
     for call, stdin in installed_calls:
         installed_log.write_text("", encoding="utf-8")

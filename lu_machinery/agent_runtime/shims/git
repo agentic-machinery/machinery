@@ -53,15 +53,15 @@ EOF
   exit 1
 }
 
+# The real git skips every agent shim copy, under any package name: the product
+# checkout keeps its own copies under `scripts`, and an installed release's sit in
+# site-packages. Two copies that skipped only their own package's directory would
+# exec each other until the re-entry limit refuses.
 _real_git() {
-  local shim_dir package
+  local shim_dir
   shim_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  # The machinery package directory holds this shim at agent_runtime/shims; its name comes from
-  # the shim's unresolved location (design-v1 amendment 1).
-  package="${shim_dir%/*/*}"
-  package="${package##*/}"
 
-  if [[ -n "${AGENT_REAL_GIT:-}" && "${AGENT_REAL_GIT:-}" != "$shim_dir/git" && "${AGENT_REAL_GIT:-}" != */"$package"/agent_runtime/shims/git ]]; then
+  if [[ -n "${AGENT_REAL_GIT:-}" && "${AGENT_REAL_GIT:-}" != "$shim_dir/git" && "${AGENT_REAL_GIT:-}" != */agent_runtime/shims/git ]]; then
     printf '%s\n' "$AGENT_REAL_GIT"
     return 0
   fi
@@ -69,7 +69,7 @@ _real_git() {
   local path_entry
   IFS=':' read -r -a _path_entries <<< "${AGENT_ORIGINAL_PATH:-${PATH:-}}"
   for path_entry in "${_path_entries[@]}"; do
-    [[ -z "$path_entry" || "$path_entry" == "$shim_dir" || "$path_entry" == */"$package"/agent_runtime/shims ]] && continue
+    [[ -z "$path_entry" || "$path_entry" == "$shim_dir" || "$path_entry" == */agent_runtime/shims || "$path_entry" == */agent_runtime/shims/ ]] && continue
     if [[ -x "$path_entry/git" ]]; then
       printf '%s\n' "$path_entry/git"
       return 0
