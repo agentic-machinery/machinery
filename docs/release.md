@@ -93,7 +93,8 @@ product checkout:
 
 ```bash
 LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
-  "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut
+  "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut \
+  --x-agent claude/claude-cto
 ```
 
 If the installed release predates `lu_machinery.release_cut`, run the same
@@ -102,10 +103,20 @@ command without `-I` and with `PYTHONPATH` set to a machinery `main` checkout.
 Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
 the command stops at that step and sends a Fleet alert to `claude-cto` that
 names the step. Its work directory (`~/.lu-release-cut-*`) is kept, holding
-`cut.log`, the built files, the wheelhouse and the npm cache. `cut --dry-run`
-runs everything except the tag, the publish, the two PRs and the live canary
-(it prints the canary's plan). Run it two hours before a window so the product
-can land fixes first. The command does these steps in order:
+`cut.log`, the built files, the wheelhouse and the npm cache. `cut` and
+`post-release` require `--x-agent <agent>/<task-or-seat>`. The value is the
+`X-Agent` trailer on the adopt commit and the post-release commit. An empty
+or malformed value is refused, and there is no default. Examples:
+
+```bash
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-cto
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto
+```
+
+`cut --dry-run` runs everything except the tag, the publish, the two PRs and
+the live canary (it prints the canary's plan). Run it two hours before a
+window so the product can land fixes first. The command does these steps in
+order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
    and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when
@@ -218,7 +229,7 @@ on so the next window cuts the next version. Each of these steps runs even if
 an earlier one fails. The host installs only versions the product has adopted.
 
 Commits in the command's fresh clones use the `user.name` and `user.email` of
-the registered machinery checkout.
+the registered machinery checkout, and each ends with the `--x-agent` trailer.
 
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by
