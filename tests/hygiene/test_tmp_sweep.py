@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -291,6 +293,7 @@ def inventory(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.setattr(sweep, "process_snapshot", lambda: ([], True))
     monkeypatch.setattr(sweep, "registered_worktrees", lambda _: set())
     monkeypatch.setattr(sweep, "protected_roots", lambda: set())
+    monkeypatch.delenv(sweep.HOLDER_PROBE_ENV, raising=False)
 
     def make(name="impl-8755-probe", status="done", finished="2020-01-01T00:00:00Z"):
         path = root / name
@@ -692,6 +695,72 @@ def test_post_rename_process_probe_blocks_reap_and_restores(inventory, monkeypat
     report = inventory.run(apply=True)
     assert report["rows"][0]["reason"] == "quarantine_live_process" and report["rows"][0]["decision"] == "preserve"
     assert (path / "payload").exists() and not list(inventory.root.glob(sweep.QUARANTINE_PREFIX + "*"))
+
+
+def _fake_holder_probe(tmp_path, monkeypatch, *, output=b"", status=0, sleep=0.0):
+    script = tmp_path / "fake-holder-probe.py"
+    script.write_text(f"import sys, time\ntime.sleep({sleep!r})\nsys.stdout.buffer.write({output!r})\nsys.exit({status})\n")
+    monkeypatch.setenv(sweep.HOLDER_PROBE_ENV, shlex.join([sys.executable, "-I", str(script)]))
+
+
+@pytest.mark.parametrize(
+    "scenario,decision,probe",
+    [
+        ("holders", "preserve", {"outcome": "complete", "reason": None, "records": 2}),
+        ("no_holders", "quarantined", {"outcome": "complete", "reason": None, "records": 0}),
+        ("exit_2", "preserve", {"outcome": "failed", "reason": "exit_status_2", "records": 0}),
+        ("timeout", "preserve", {"outcome": "failed", "reason": "timeout", "records": 0}),
+        ("malformed", "preserve", {"outcome": "failed", "reason": "malformed_output", "records": 0}),
+        ("out_of_scope", "preserve", {"outcome": "out_of_scope", "reason": "location_outside_probe_areas", "records": 0}),
+        ("unset", "preserve", {"outcome": "unset", "reason": None, "records": 0}),
+    ],
+)
+def test_holder_probe_completes_liveness_only_on_a_clean_run(inventory, tmp_path, monkeypatch, scenario, decision, probe):
+    """Defect class: a failed, hung, garbled or out-of-area privileged probe authorizes deletion, or a clean probe's holder is ignored."""
+    path = inventory.make()
+    # The host's own scan: some process could not be read.
+    monkeypatch.setattr(sweep, "process_snapshot", lambda: ([], False))
+    held = f"{path}/a\tb\nc".encode()  # a path splits on the first two tabs only
+    outputs = {
+        "holders": b"4242\tfd\t" + held + b"\0" + b"7\tcwd\t/tmp\0",
+        "malformed": b"4242\tfd\t" + held,  # no record terminator
+    }
+    if scenario != "unset":
+        _fake_holder_probe(
+            tmp_path, monkeypatch, output=outputs.get(scenario, b""),
+            status=2 if scenario == "exit_2" else 0, sleep=30.0 if scenario == "timeout" else 0.0,
+        )
+    if scenario == "timeout":
+        monkeypatch.setattr(sweep, "HOLDER_PROBE_TIMEOUT_S", 0.5)
+    if scenario == "out_of_scope":
+        monkeypatch.setattr(sweep, "HOLDER_PROBE_AREAS", (Path("/var/tmp"),))
+    report = inventory.run(apply=True)
+    row = report["rows"][0]
+    complete = probe["outcome"] == "complete"
+    assert report["holder_probe"] == probe and report["process_probe_complete"] is complete
+    reason = {"holders": "live_process", "no_holders": "dead_attributed_task"}.get(scenario, "liveness_unknown")
+    assert (row["decision"], row["reason"]) == (decision, reason)
+    assert row["live_pids"] == ([4242] if scenario == "holders" else [])
+    assert path.exists() is (decision == "preserve")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"4242\tfd\t/tmp/x",
+        b"4242\t/tmp/x\0",
+        b"4242\tsocket\t/tmp/x\0",
+        b"+42\tfd\t/tmp/x\0",
+        b"0\tfd\t/tmp/x\0",
+        b"4242\tfd\ttmp/x\0",
+        b"4242\tfd\t/tmp/../etc\0",
+        b"4242\tfd\t/home/x\0",
+        b"4242\tfd\t/tmp/x\0\0",
+    ],
+)
+def test_holder_records_refuse_malformed_output(output):
+    """Defect class: a garbled or out-of-contract record parsed as a clean (holder-free) probe."""
+    assert sweep._holder_records(output) is None
 
 
 def test_malformed_specific_run_never_falls_back_to_finished_parent(inventory):
