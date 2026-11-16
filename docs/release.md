@@ -111,8 +111,12 @@ command without `-I` and with `PYTHONPATH` set to a machinery `main` checkout.
 Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
 the command stops at that step and sends a Fleet alert to `claude-cto` that
 names the step. The alert is published from `$PRIMARY`, so it reaches the
-primary checkout's Fleet plane. Its work directory (`~/.lu-release-cut-*`) is kept, holding
-`cut.log`, the built files, the wheelhouse and the npm cache. The command adds
+primary checkout's Fleet plane. After a successful cut, its work directory
+(`~/.lu-release-cut-*`) keeps `cut.log`, `dist/`, `wheelhouse/`, the release-note
+and PR-body files, `markers.log` and `published/`. As its last step, the cut removes
+only `accept`, `product`, `npm-cache`, `build-venv`, `agent-consumer`, `src`,
+`src.tar`, `home` and `tmp`; other entries remain. Failed, interrupted and dry-run
+cuts keep the entire work directory for diagnosis. The command adds
 022 to the caller's umask for the whole run, so nothing it creates is group- or
 other-writable and Node admission accepts the prefix it provisions. `cut` and
 `post-release` require `--x-agent <agent>/<task-or-seat>`. The value is the

@@ -721,6 +721,31 @@ class Cut:
 
     # Promotion and post-release
 
+    def remove_rebuildable_scratch(self) -> None:
+        """After success, retain evidence and remove only the named scratch entries."""
+        self.step = "remove rebuildable scratch"
+        root = self.work.resolve(strict=True)
+        paths = [root / name for name in ("accept", "product", "npm-cache", "build-venv", "agent-consumer",
+                                          "src", "src.tar", "home", "tmp")]
+        # Validate every target before deleting any of them. Never follow a target outside the cut.
+        for path in paths:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root) or resolved == root:
+                raise CutError(f"refusing scratch cleanup outside the work directory: {path}")
+        for path in paths:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                # Sealed Node trees are read-only. Restore owner access without following their symlinks.
+                path.chmod(path.stat().st_mode | stat.S_IRWXU)
+                for directory, children, _files in os.walk(path, followlinks=False):
+                    for name in children:
+                        child = Path(directory) / name
+                        if not child.is_symlink():
+                            child.chmod(child.stat().st_mode | stat.S_IRWXU)
+                shutil.rmtree(path)
+        self.say("removed rebuildable scratch; release evidence retained")
+
     def promote(self, notes: str) -> None:
         self.step = "promote"
         notes_file = self.work / "notes-release.md"
@@ -954,6 +979,7 @@ def execute(cut: Cut) -> int:
         "both need a review of record.",
         f"release-cut-{cut.version}-released",
     )
+    cut.remove_rebuildable_scratch()
     cut.say(f"done: v{cut.version} released in {int(time.monotonic() - cut.started)} s")
     return 0
 
@@ -969,7 +995,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto\n"
         "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
         "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
-        "Outputs: step lines on stdout; the work directory keeps cut.log, dist, wheelhouse and npm cache.\n"
+        "Outputs: step lines on stdout; successful cuts keep cut.log, dist, wheelhouse and release evidence;\n"
+        "failed or interrupted cuts keep the entire work directory.\n"
         "Exit codes: 0 released, skipped as unchanged, dry run passed or consumer collection passed; 1 refused\n"
         "or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
         "Related: docs/release.md#cut-a-release.",
