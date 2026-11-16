@@ -85,6 +85,7 @@ from lu_machinery.orchestration.tmp_leak_sweep import (
     listening_socket_paths,
     socket_node_listening,
 )
+from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record
 from lu_machinery.orchestration.worktree_claims import _SUPERSEDED_RECORD_RE
 
 
@@ -180,6 +181,15 @@ def load_tasks(root: Path) -> TaskInventory:
     runs are history and claim nothing. Every path value of a record whose
     status is not settled (``runtime_tmp_root``, ``worktree_path``, ``cwd``,
     environment and argument values) is a reference.
+
+    Records are told from other JSON by the shared task-record reader: the
+    receipts dispatch writes beside a record (``.write-boundary.json``,
+    ``.sandbox.json``, ``.tool-results.json``) when they name another task, and
+    JSON that carries no record markers, are not records: they shadow their
+    name but leave the inventory complete. A damaged file (truncated, blank
+    under a record name, unknown schema, wrong identity), receipt names
+    included, still makes it incomplete, and so does any other record whose
+    ``task_id`` is not its file name.
     """
     records: dict[str, dict[str, Any]] = {}
     references: set[Path] = set()
@@ -200,8 +210,14 @@ def load_tasks(root: Path) -> TaskInventory:
             if path.is_symlink():
                 raise ValueError("symlinked task record")
             raw = path.read_bytes()
-            data = json.loads(raw)
-            if not isinstance(data, dict) or data.get("task_id") != stem:
+            data = parse_task_record(path, raw)
+            if data is None:
+                continue  # Not a task record: claims nothing and hides no record.
+            if "task_id" in data and data["task_id"] != stem:
+                # A receipt dispatch writes beside its owner's record names that owner.
+                # A task whose own ID ends in a receipt suffix is still read as a record.
+                if _is_dispatcher_sidecar(path):
+                    continue
                 raise ValueError("not a current task record")
         except (OSError, ValueError, RecursionError):
             complete = False

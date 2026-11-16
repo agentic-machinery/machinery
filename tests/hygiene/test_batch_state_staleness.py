@@ -199,7 +199,8 @@ def test_expiry_never_releases_unknown_live_held_or_tracked_state(expiry_box, mo
     elif case == "unknown_task":
         b.task.unlink()
     elif case == "unknown_inventory":
-        (b.task.parent / "broken.json").write_text("invalid")
+        # A truncated record: JSON with no record markers is not a record and leaves the inventory complete.
+        (b.task.parent / "broken.json").write_text('{"task_id": "broken", "status": "runn')
     elif case == "held":
         b.holds.write_text(json.dumps({"schema": retention.SCHEMA,
                                       "holds": [{"path": f"batch_state/{b.entry.name}/deep/file", "reason": "evidence"}]}))

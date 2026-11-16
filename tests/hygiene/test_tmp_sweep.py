@@ -482,13 +482,35 @@ def test_reference_forms_follow_a_symlink_before_a_later_dotdot(tmp_path):
 
 
 def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
-    (tmp_path / "bad.json").write_text("not json")
-    (tmp_path / "wrong.json").write_text(json.dumps({"task_id": "someone-else"}))
+    """Defect classes: a damaged or misnamed record read as complete, or non-record JSON read as damaged."""
+    # Dispatch receipts and JSON without record markers are not records: they shadow their name only.
+    (tmp_path / "impl-1.write-boundary.json").write_text(json.dumps({"schema": "receipt", "task_id": "impl-1"}))
+    (tmp_path / "impl-1.sandbox.json").write_text(json.dumps({"task_id": "impl-1"}))
+    (tmp_path / "impl-1.review.json").write_text(json.dumps({"findings": [], "target": "/tmp/held"}))
+    (tmp_path / "notes.json").write_text("not json")
     (tmp_path / "list.json").write_text("[]")
     inventory = sweep.load_tasks(tmp_path)
-    assert set(inventory.records) == {"bad", "wrong", "list"}
+    assert inventory.complete is True and not inventory.references
+    assert set(inventory.records) == {"impl-1.write-boundary", "impl-1.sandbox", "impl-1.review", "notes", "list"}
     assert all(record["status"] is None for record in inventory.records.values())
-    assert inventory.complete is False
+    # A task whose own ID ends in a receipt suffix is a record, and its paths still protect.
+    own = {"task_id": "own.sandbox", "status": "running", "cwd": "/tmp/own-held"}
+    (tmp_path / "own.sandbox.json").write_text(json.dumps(own))
+    inventory = sweep.load_tasks(tmp_path)
+    assert inventory.records["own.sandbox"]["status"] == "running" and Path("/tmp/own-held") in inventory.references
+    (tmp_path / "own.sandbox.json").unlink()
+    for name, raw in (
+        ("wrong.json", json.dumps({"task_id": "someone-else"})),
+        ("cut.json", '{"task_id": "cut", "status": "runn'),
+        ("blank.json", "\0\0"),
+        ("future.json", json.dumps({"task_id": "future", "schema_version": 9})),
+    ):
+        (tmp_path / name).write_text(raw)
+        inventory = sweep.load_tasks(tmp_path)
+        assert inventory.complete is False, name
+        assert inventory.records[name.removesuffix(".json")]["status"] is None
+        (tmp_path / name).unlink()
+    assert sweep.load_tasks(tmp_path).complete is True
     assert sweep.load_tasks(tmp_path / "absent").complete is False
 
 
