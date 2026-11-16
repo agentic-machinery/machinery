@@ -9,6 +9,20 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.25"></a>
+## [0.1.25] - 2026-11-16
+
+### Changed
+
+- Check the PR head's wheel against a pinned product revision in CI Gate ([#647](https://github.com/learn-ukrainian/machinery/pull/647))
+
+### Fixed
+
+- Collect consumer tests with the candidate as the project interpreter ([#648](https://github.com/learn-ukrainian/machinery/pull/648))
+- Require the pytest shards on a PR that changes pytest infrastructure ([#651](https://github.com/learn-ukrainian/machinery/pull/651))
+- Run Claude Python guards under the resolved project interpreter ([#652](https://github.com/learn-ukrainian/machinery/pull/652))
+- Fail closed on unrecognized requirement lines and bind lu-machinery to the checked wheel ([#653](https://github.com/learn-ukrainian/machinery/pull/653))
+
 ### Fixed
 
 - Settle a merged stacked worker as done when its pull request landed on the default branch after the recorded base branch was deleted
@@ -604,7 +618,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.25...HEAD
+[0.1.25]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.24
 [0.1.23]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/learn-ukrainian/machinery/compare/v0.1.21...v0.1.22
