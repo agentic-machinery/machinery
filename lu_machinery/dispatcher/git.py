@@ -172,7 +172,9 @@ def ownership_git(record: dict, head: str | None = None):
     """Walk trusted remote objects in a private config/ref namespace.
 
     The delivery is the task's recorded branch, or ``head``, a full commit id fetched by id (a merged
-    pull request's final head, which the remote still serves after its branch is deleted).
+    pull request's final head, which the remote still serves after its branch is deleted). With
+    ``head`` set, the recorded base is fetched by its commit id too: that branch ref is deleted
+    once the task's pull request has merged into the default branch instead of into it.
 
     A command-line include.path override is not a local-config sandbox. A fresh
     bare Git directory excludes both worker config and config.worktree,
@@ -203,16 +205,23 @@ def ownership_git(record: dict, head: str | None = None):
     # Ignore unrecorded branch names so an observed ref cannot widen delivery trust.
     if record.get("remote_ref") in allowed_refs:
         delivery_ref = record["remote_ref"]
+    base_ref = f"refs/heads/{base.removeprefix('origin/')}"
     if head is not None:
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
             raise ValueError("delivery head must be a full object name")
-        delivery_ref = head
-    base_ref = f"refs/heads/{base.removeprefix('origin/')}"
-    # Distinct refs are required to keep the base independent of the delivery.
-    if delivery_ref == base_ref:
+        # The merged walk names commits, not branches. The recorded base branch is
+        # already gone once its own pull request has merged and this one has been
+        # retargeted; the commit id recorded at dispatch is still served by SHA.
+        delivery_source, base_source = head, task_base
+    else:
+        delivery_source, base_source = delivery_ref, base_ref
+    # Distinct branch refs keep the base independent of the delivery. A merged walk
+    # fetched by commit id may name one commit twice: an accepted reset records the
+    # PR head as the task start, and that commit is still the delivery.
+    if head is None and delivery_source == base_source:
         raise ValueError("delivery ref must differ from base ref")
-    refspecs = (f"+{base_ref}:refs/heads/base",
-                f"+{delivery_ref}:refs/heads/delivery")
+    refspecs = (f"+{base_source}:refs/heads/base",
+                f"+{delivery_source}:refs/heads/delivery")
     with _private_remote_git(record["task_id"], remote) as (run, git_dir):
         fetch = partial(run, "fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none",
                         timeout=VERIFICATION_FETCH_TIMEOUT)
@@ -994,19 +1003,49 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
                 yield pr["number"]
 
 
+_DEFAULT_BRANCH = re.compile(r"ref: refs/heads/(\S+)\s+HEAD")
+
+
+def _remote_default_branch(record: dict) -> str:
+    """The recorded remote's default branch, from ``HEAD``'s symref, not from a configured name."""
+    remote = record["worktree_remote_url"]
+    with _private_remote_git(record["task_id"] + "-default-branch", remote) as (run, _):
+        advertised = run("ls-remote", "--symref", "--", "origin", "HEAD")
+    for line in advertised.splitlines():
+        match = _DEFAULT_BRANCH.match(line)
+        if match:
+            return match.group(1)
+    raise ValueError("remote default branch is not advertised")
+
+
+def _fetch_merged_parent(run, merge: str) -> str:
+    """The first parent of ``merge``, fetched by id from the same remote the walk uses.
+
+    A squash onto the default branch is not contained in the recorded base commit, and a
+    ``--depth`` fetch into an already-complete repository would cut history back to shallow.
+    """
+    depth = ("--depth=2",) if run("rev-parse", "--is-shallow-repository") == "true" else ()
+    run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *depth, "--", "origin", merge,
+        timeout=VERIFICATION_FETCH_TIMEOUT)
+    return run("rev-parse", "--verify", merge + "^1")
+
+
 def merged_delivery(record: dict) -> dict | None:
     """The merged pull request that carries this task's delivery, or None when none is proven.
 
     A task that ends with its work merged has nothing left on its own branch to inspect: the
     PR it accepted, or the one opened from its branch, is the delivery, and a worker may have
     reset or deleted the branch after the merge. A candidate counts only when GitHub reports
-    it MERGED into the task's base after the task started, with a merge commit and a task-authored
-    commit (or an explicit task acceptance when it added no commits). Any lookup failure is None, so the
-    caller falls back to refusing on the local evidence. ``paths`` is every path the PR
-    changed, rename sources included, plus every path any commit of the task's touched, as the
-    settlement walk reads them from the PR's final head (a reverted change still counts). The task's own head must also be published (nothing
-    ahead of the task start, the PR's final head, or already in the PR or the base), so merged
-    work never hides further work that was not pushed.
+    it MERGED after the task started into the task's recorded base branch or the remote's
+    default branch (a stacked task's base is the parent branch, and the pull request is
+    retargeted onto the default branch once that parent is gone), with a merge commit and a
+    task-authored commit (or an explicit task acceptance when it added no commits). Any lookup
+    failure is None, so the caller falls back to refusing on the local evidence. ``paths`` is
+    every path the PR changed, rename sources included, plus every path any commit of the task's
+    touched, as the settlement walk reads them from the PR's final head (a reverted change still
+    counts). The task's own head must also be published (nothing ahead of the task start, the
+    PR's final head, or already in the PR or the base), so merged work never hides further work
+    that was not pushed.
     """
     from lu_machinery.dispatcher import ownership
 
@@ -1016,13 +1055,25 @@ def merged_delivery(record: dict) -> dict | None:
         if repo is None:
             return None
         started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
+        accepted_default = None
+
+        def accepted_base(name: str) -> bool:
+            nonlocal accepted_default
+            if name == base:
+                return True
+            # One symref read per settlement. A stacked task's recorded base is the parent
+            # branch; GitHub merges the pull request into the default branch after that parent is gone.
+            if accepted_default is None:
+                accepted_default = _remote_default_branch(record)
+            return name == accepted_default
+
         for number in _merged_delivery_candidates(record, repo):
             pr = json.loads(_gh("pr", "view", str(number), "--repo", repo, "--json",
                                 "state,baseRefName,mergedAt,headRefOid,mergeCommit,isCrossRepository"))
-            if (pr["state"] != "MERGED" or pr["baseRefName"] != base
-                    or pr["isCrossRepository"] or not pr["mergeCommit"]
+            if (pr["state"] != "MERGED" or pr["isCrossRepository"] or not pr["mergeCommit"]
                     or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pr["mergeCommit"]["oid"])
-                    or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started):
+                    or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started
+                    or not accepted_base(pr["baseRefName"])):
                 continue
             # An accepted pull request is the task's whatever it committed; otherwise a commit of its own must carry
             # its trailer, and a matching branch name alone never attributes another task's work.
@@ -1048,11 +1099,11 @@ def merged_delivery(record: dict) -> dict | None:
             # every commit the PR's final head adds to the base it merged into (the merge's first parent).
             with ownership_git(record, head=pr["headRefOid"]) as run:
                 start = record.get("worktree_start_sha", record["worktree_base_sha"])
+                parent = _fetch_merged_parent(run, pr["mergeCommit"]["oid"])
                 # The exit snapshot may be a reset to the squash merge. Count the PR head's own range.
                 commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
                 history = ownership.delivered_paths(
-                    run, pr["headRefOid"], run("rev-parse", "--verify", pr["mergeCommit"]["oid"] + "^1"),
-                    start, commits_expected=commits_expected)
+                    run, pr["headRefOid"], parent, start, commits_expected=commits_expected)
             record.pop("merged_delivery_lookup", None)
             return dict(repo=repo, number=number, merged_at=pr["mergedAt"],
                         merge_sha=pr["mergeCommit"]["oid"],

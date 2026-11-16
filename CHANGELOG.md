@@ -9,6 +9,10 @@ this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Settle a merged stacked worker as done when its pull request landed on the default branch after the recorded base branch was deleted
+
 <a id="v0.1.24"></a>
 ## [0.1.24] - 2026-11-16
 
