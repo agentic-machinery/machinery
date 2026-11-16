@@ -36,13 +36,33 @@ CANONICAL_ROOT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
 
 case "$MODE" in
   pre-tool-use)
-    printf '%s' "$PAYLOAD" \
+    # Codex blocks a tool call only on exit 2; any other non-zero status is a
+    # non-blocking error that lets the call run. The policy allows with exit 0
+    # and no stdout, and denies with exit 2. Every other outcome (an
+    # interpreter that cannot start, a release without the policy module, an
+    # ImportError, a crash or signal, or stdout on an allow, which the policy
+    # never writes) is refused here with exit 2 and one reason line.
+    policy_out=$(printf '%s' "$PAYLOAD" \
       | project_python_run "$PYTHON_BIN" -m lu_machinery.agent_runtime.codex_hook_policy \
         --python-bin "$PYTHON_BIN" \
         --hooks-dir "$HOOKS_DIR" \
-        --canonical-root "$CANONICAL_ROOT"
-    policy_rc=${PIPESTATUS[1]}
-    [ "$policy_rc" -eq 0 ] || exit "$policy_rc"
+        --canonical-root "$CANONICAL_ROOT")
+    policy_rc=$?
+    case "$policy_rc" in
+      0)
+        [ -z "$policy_out" ] && exit 0
+        printf '%s\n' 'CODEX-HOOK-POLICY-FAILED: the policy wrote unexpected stdout on allow; blocking the tool call fail-closed.' >&2
+        exit 2
+        ;;
+      2)
+        [ -z "$policy_out" ] || printf '%s\n' "$policy_out"
+        exit 2
+        ;;
+      *)
+        printf 'CODEX-HOOK-POLICY-FAILED: the policy exited %s (could not start, import or finish); blocking the tool call fail-closed.\n' "$policy_rc" >&2
+        exit 2
+        ;;
+    esac
     ;;
 
   post-tool-use)

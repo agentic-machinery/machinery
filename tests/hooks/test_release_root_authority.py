@@ -752,6 +752,16 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     if anchor == "configured":
         assert not refused and "HOOK-BOOTSTRAP-FAILED" not in result.stdout + result.stderr, (
             result.returncode, result.stdout, result.stderr)
+        if entry == "codex-entry":
+            # Allow is exit 0 with no stdout; a guard's deny stays exit 2 with its own reason,
+            # never the entry's policy-failure refusal.
+            assert result.stdout == "" and "CODEX-HOOK-POLICY-FAILED" not in result.stderr, result.stderr
+            payload["tool_input"]["command"] = "python3 -c 1"
+            denied = subprocess.run(argv, input=json.dumps(payload), text=True, capture_output=True,
+                                    cwd=worktree, env=env, timeout=60)
+            assert denied.returncode == 2, (denied.stdout, denied.stderr)
+            assert "enforce-venv" in denied.stderr or ".venv/bin/python" in denied.stderr, denied.stderr
+            assert "CODEX-HOOK-POLICY-FAILED" not in denied.stderr, denied.stderr
     else:
         assert refused, (result.returncode, result.stdout, result.stderr)
         if entry == "git-hook-lib":

@@ -670,6 +670,10 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     assert log.read_text(encoding="utf-8") == ""
     codex_selected = selected([str(codex), "pre-tool-use"], cwd=worktree, extra=codex_extra, stdin=payload)
     assert str(override) in log.read_text(encoding="utf-8"), codex_selected.stderr
+    # The selected interpreter exits 1, as an ImportError of the policy module does; Codex
+    # lets a call run on any status but 2, so the entry must refuse with 2 (fail closed).
+    assert codex_selected.returncode == 2, codex_selected.stderr
+    assert "CODEX-HOOK-POLICY-FAILED: the policy exited 1" in codex_selected.stderr
 
     deploy = str(SOURCE / "lu_machinery/deploy_prompts.sh")
     deploy_extra = {"LU_PRODUCT_ROOT": str(primary)}
