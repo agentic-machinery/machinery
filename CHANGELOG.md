@@ -9,6 +9,27 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.27"></a>
+## [0.1.27] - 2026-11-16
+
+### Added
+
+- Let the tmp sweep use the privileged holder probe ([#663](https://github.com/learn-ukrainian/machinery/pull/663))
+
+### Changed
+
+- When to convene a council, and keep the author-family member ([#662](https://github.com/learn-ukrainian/machinery/pull/662))
+
+### Fixed
+
+- Keep the temp-sweep user unit able to raise privileges ([#664](https://github.com/learn-ukrainian/machinery/pull/664))
+- Remove rebuildable scratch after a successful cut ([#666](https://github.com/learn-ukrainian/machinery/pull/666))
+- Stop copying hook Python modules into consumer checkouts ([#667](https://github.com/learn-ukrainian/machinery/pull/667))
+- Refuse worker settings that would drop a blocking guard ([#668](https://github.com/learn-ukrainian/machinery/pull/668))
+- Stop copying render_catalog_tables.py into consumer checkouts ([#669](https://github.com/learn-ukrainian/machinery/pull/669))
+- Keep the contract canary's work directory to one tree ([#670](https://github.com/learn-ukrainian/machinery/pull/670))
+- Fail Codex policy startup closed ([#672](https://github.com/learn-ukrainian/machinery/pull/672))
+
 <a id="v0.1.26"></a>
 ## [0.1.26] - 2026-11-16
 
@@ -629,7 +650,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.26...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.27...HEAD
+[0.1.27]: https://github.com/learn-ukrainian/machinery/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/learn-ukrainian/machinery/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.24
