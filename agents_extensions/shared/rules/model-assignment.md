@@ -867,7 +867,8 @@ uses Sol high; legacy results do not establish either model's qualification.
 sign-off on this section approves them):**
 1. **Pool-minus-author** — the panel is the area pool MINUS whoever authored the work under
    review (self-adjusting when an advisor is the worker). Family-independence accounting
-   still binds for the review of record.
+   still binds for the review of record. A council keeps its author-family member
+   (operator order 2026-11-16; `drive-epic` `references/decision-report.md` § Council).
 2. **Size by stakes** — routine PRs: NO panel (formal cross-family review only) · 2 seats
    for designs/plans · 3 seats at high effort for contested verdicts, architecture,
    learner-facing calls.

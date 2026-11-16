@@ -42,8 +42,21 @@ that shows it is operator-only.
 
 ## Council: optional independent panel
 
-Use it for a consequential design decision, when the operator asks for a second opinion
-("council"), or for a named unresolved risk on a critical PR. Not for routine PRs.
+**When to use it.** Normal review (`review-loop`, one cross-family review of record) is the
+default and is required on every PR. Add a council only for:
+
+1. a new architecture, process or policy decision that needs designated approval;
+2. design approval before code for a critical-risk change (deletion engines, privilege,
+   release or deploy tooling, security boundaries, data migrations);
+3. a PR whose reviewer of record has spent 2 rounds on the same area, or where the author
+   and the reviewer disagree;
+4. a Ukrainian language, culture or heritage question that the Sources tools (VESUM,
+   dictionaries, corpus) cannot settle;
+5. an operator request ("council").
+
+Never for routine low or medium risk PRs or Dependabot bumps. Each council records which
+member found what and whether the normal reviewer missed it, so this rule can be tightened
+or loosened from that data after about 20 councils.
 
 - **Order:** the council comes first: each member answers the frozen question on its own,
   read-only and scored (below). Then at most one ACP `discuss` round with 2 to 4 seats
@@ -58,7 +71,11 @@ Use it for a consequential design decision, when the operator asks for a second 
   dispatcher's bubblewrap boundary (C-3027) and is refused only on a host that cannot start it;
   Hydrogen is then unavailable, and an ACP seat on the agy route may join the discussion round
   only. An unavailable member is reported, never substituted, and the panel is then not called
-  complete.
+  complete. A member from the author's model family, the author's own model included, stays
+  on the panel (operator order 2026-11-16; the council's exception to pool-minus-author in
+  `model-assignment.md`): it reviews and scores, and its findings are handled like any
+  member's. The exact-head review of record and designated approval stay outside the
+  author's family.
 - **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
