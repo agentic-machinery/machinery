@@ -665,22 +665,29 @@ class Cut:
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
         self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")
 
+    def probe(self, argv: Sequence[str | Path], parse):
+        """One read of remote state. Any failure, a timeout included, is unknown (None), never an exception."""
+        try:
+            return parse(self.run(argv, check=False, timeout=120))
+        except Exception:  # an unreadable probe leaves only its own value unknown
+            return None
+
     def remote_state(self) -> tuple[bool | None, str | None, list[int] | None]:
         """What GitHub holds for this version: the tag, the release and the open adopt PRs; None is unknown."""
         tag = f"v{self.version}"
-        listed = self.run(["git", "ls-remote", "--exit-code", "--tags", self.machinery_remote, f"refs/tags/{tag}"],
-                          check=False, timeout=120)
-        tagged = {0: True, 2: False}.get(listed.returncode)
-        viewed = self.run(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"],
-                          check=False, timeout=120)
-        release: str | None = None
-        if viewed.returncode == 0:
-            release = "prerelease" if json.loads(viewed.stdout)["isPrerelease"] else "released"
-        elif "release not found" in viewed.stderr.lower():
-            release = "absent"
-        prs = self.run(["gh", "pr", "list", "-R", self.product_repo, "--head", f"release/lu-machinery-{self.version}",
-                        "--state", "open", "--json", "number"], check=False, timeout=120)
-        adopt = [row["number"] for row in json.loads(prs.stdout)] if prs.returncode == 0 else None
+
+        def release_state(viewed: subprocess.CompletedProcess[str]) -> str | None:
+            if viewed.returncode == 0:
+                return "prerelease" if json.loads(viewed.stdout)["isPrerelease"] else "released"
+            return "absent" if "release not found" in viewed.stderr.lower() else None
+
+        tagged = self.probe(["git", "ls-remote", "--exit-code", "--tags", self.machinery_remote, f"refs/tags/{tag}"],
+                            lambda listed: {0: True, 2: False}.get(listed.returncode))
+        release = self.probe(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"],
+                             release_state)
+        adopt = self.probe(["gh", "pr", "list", "-R", self.product_repo, "--head", f"release/lu-machinery-{self.version}",
+                            "--state", "open", "--json", "number"],
+                           lambda prs: [int(row["number"]) for row in json.loads(prs.stdout)] if prs.returncode == 0 else None)
         return tagged, release, adopt
 
     def clean_up(self, cause: str) -> str:
@@ -688,7 +695,8 @@ class Cut:
 
         A full release or an unknown state is never withdrawn. A pushed tag whose release is absent or still a
         pre-release consumed the version: the pre-release is marked withdrawn, open adopt PRs are closed and the
-        post-release PR records the version as yanked so the next cut tags the next one.
+        post-release PR records the version as yanked so the next cut tags the next one. Every step is attempted
+        whatever happened to the others, and each outcome is reported.
         """
         tagged, release, adopt = self.remote_state()
         tag = f"v{self.version}"
@@ -705,15 +713,18 @@ class Cut:
             try:
                 action()
                 done.append(f"{label}: done")
-            except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
-                done.append(f"{label}: FAILED ({str(exc).splitlines()[0][:200]})")
+            except Exception as exc:  # each obligation is independent of the others
+                detail = (str(exc) or type(exc).__name__).splitlines()[0][:200]
+                done.append(f"{label}: FAILED ({detail})")
 
-        if release == "prerelease":
+        def withdraw() -> None:
             notes_file = self.work / "notes-withdrawn.md"
             notes_file.write_text(f"**Withdrawn:** release acceptance failed ({cause}). Do not adopt this "
                                   "version; the next version replaces it.\n\n" + self.notes, encoding="utf-8")
-            attempt("mark the pre-release withdrawn", lambda: self.publisher(
-                "release-edit", "--repo", self.machinery_repo, "--tag", tag, "--notes-file", str(notes_file)))
+            self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", tag, "--notes-file", str(notes_file))
+
+        if release == "prerelease":
+            attempt("mark the pre-release withdrawn", withdraw)
         for number in adopt or []:
             attempt(f"close adopt PR #{number}", lambda number=number: self.publisher(
                 "pr-close", "--repo", self.product_repo, "--number", str(number)))
