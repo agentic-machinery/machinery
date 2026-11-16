@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.agent_runtime.agy_hook_config import native_hook_command
+from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
 from lu_machinery.common.repo_root import machinery_root
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -198,6 +198,32 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
     assert unavailable.returncode == 0
     assert "audit skipped" in unavailable.stderr
     assert "Traceback" not in unavailable.stderr
+
+
+@pytest.mark.parametrize("mode", CLAUDE_GUARD_MODES)
+def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(release, product, tmp_path, mode):
+    """Defect class: a Claude guard delegator run by the ``python3`` PATH selects, which cannot
+    import the release, refused every tool call. With no venv on PATH the native guard command
+    runs under the configured primary's interpreter, still refuses what its guard refuses, and
+    refuses when that interpreter is unavailable."""
+    shutil.copytree(release.parent / "venv", product / ".venv", symlinks=True)
+    argv = shlex.split(native_hook_command(mode))
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CLAUDE_PROJECT_DIR": str(product),
+           "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product), "XDG_STATE_HOME": str(tmp_path / "state")}
+
+    def run(command, **extra):
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(product),
+                   "hook_event_name": "PreToolUse", "session_id": "native-guard", "tool_use_id": "call"}
+        return subprocess.run(argv, input=json.dumps(payload), text=True, capture_output=True,
+                              cwd=product, env={**env, **extra}, timeout=60)
+
+    benign = run("ls")
+    assert benign.returncode == 0, benign.stderr
+    if mode == "claude-guard-admin-merge":
+        refused = run("gh pr merge 1 --admin")
+        assert refused.returncode == 2 and "BLOCKED by guard-admin-merge" in refused.stderr, refused.stderr
+    missing = run("ls", LEARN_UKRAINIAN_PYTHON=str(tmp_path / "absent-python"))
+    assert missing.returncode == 2 and "HOOK-BOOTSTRAP-FAILED" in missing.stderr, missing.stderr
 
 
 def test_bare_healer_does_not_heal_release_instead_of_product(release, product):

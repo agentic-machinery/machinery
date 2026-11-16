@@ -590,6 +590,21 @@ def test_mandatory_hooks_cannot_be_globally_disabled_or_made_unreachable(consume
     assert snapshot(consumer) == before
 
 
+def test_bytecode_caches_are_neither_drift_nor_deployed_but_a_loose_pyc_is(consumer, monkeypatch):
+    """Defect class: importing a deployed script wrote ``__pycache__`` beside it, and the next
+    ``--check`` and deploy refused it as unknown output, so the launcher refused to start."""
+    assert invoke(monkeypatch, consumer) == 0
+    write(consumer, ".claude/skills/product/__pycache__/helper.cpython-312.pyc", b"\x00bytecode")
+    write(consumer, ".agents/skills/fleet/__pycache__/helper.cpython-312.pyc", b"\x00bytecode")
+    write(consumer, "agents_extensions/shared/skills/product/__pycache__/source.cpython-312.pyc", b"\x00bytecode")
+    assert invoke(monkeypatch, consumer, check=True) == 0
+    assert invoke(monkeypatch, consumer) == 0
+    assert not (consumer / ".claude/skills/product/__pycache__/source.cpython-312.pyc").exists()
+    # Outside a cache directory a .pyc imports without its source, so it is still unknown output.
+    write(consumer, ".claude/skills/product/helper.pyc", b"\x00bytecode")
+    assert invoke(monkeypatch, consumer, check=True) == 1
+
+
 @pytest.mark.parametrize("kind", ["skill", "file"])
 def test_codex_provider_never_plans_retired_skill_discovery(consumer, monkeypatch, kind):
     """F2: provider skills use .agents; an invalid skills leaf refuses before any write."""
@@ -745,6 +760,18 @@ def release_hook():
     """One release-owned Python hook the Claude provider deploys, from the packaged inventory."""
     return next(target for name, record in sorted(release_inventory()["files"].items()) if name.endswith(".py")
                 for target in record["targets"].get("claude", []))
+
+
+def test_release_requires_each_claude_python_guard_as_its_native_command():
+    """Defect class: a mandatory Claude Python delegator run by the interpreter PATH selects,
+    or release bytes drifting from the installed native hook command they must equal."""
+    from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
+
+    commands = [hook["command"] for requirement in release_inventory()["required_hooks"]["claude"][".claude/settings.json"]
+                for hook in requirement["hooks"]]
+    assert [command for command in commands if command.endswith(".py")] == []
+    natives = {native_hook_command(mode) for mode in (*CLAUDE_GUARD_MODES, "claude-audit-hook")}
+    assert {command for command in commands if command.startswith("/bin/bash ")} == natives
 
 
 @pytest.fixture

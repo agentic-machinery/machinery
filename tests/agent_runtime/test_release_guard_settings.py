@@ -49,6 +49,28 @@ def test_product_tree_cannot_supply_fleet_guard_executables(tmp_path, monkeypatc
             assert not script.is_relative_to(tmp_path)
 
 
+def test_native_guard_commands_run_the_release_guard_and_stale_bytes_refuse(tmp_path, monkeypatch):
+    """Defect class: a worker silently dropping the product's native Claude guard registrations."""
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
+    settings = tmp_path / "agents_extensions/shared/settings.json"
+    settings.parent.mkdir(parents=True)
+
+    def write(*commands):
+        hooks = [{"type": "command", "command": command, "onFailure": "block"} for command in commands]
+        settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": hooks}]}}))
+
+    write(*map(config.native_hook_command, (*config.CLAUDE_GUARD_MODES, "claude-audit-hook")))
+    hooks = Path(claude.__file__).absolute().parents[3] / "agents_extensions/shared/hooks"
+    # The audit is an unpaired observer in worker settings; every guard runs from the release.
+    assert json.loads(claude._worker_guard_settings()) == {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "onFailure": "block",
+         "command": shlex.join([sys.executable, "-I", str(hooks / (mode.removeprefix("claude-") + ".py"))])}
+        for mode in config.CLAUDE_GUARD_MODES]}]}}
+    write(config.native_hook_command("claude-guard-admin-merge").replace("set -u\n", "set -u \n", 1))
+    with pytest.raises(RuntimeError, match="unsupported form"):
+        claude._worker_guard_settings()
+
+
 def test_missing_product_settings_refuses_without_filesystem_traceback(tmp_path, monkeypatch):
     """A missing consumer setting must refuse explicitly instead of FileNotFoundError."""
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
