@@ -172,6 +172,21 @@ def _strict_schema_path(spec: TaskSpec, document: dict) -> str:
     return str(path)
 
 
+def _workspace_sources_transport() -> list[str]:
+    """The Sources URL a workspace-write run names, or nothing when the product declares no server.
+
+    Write workers run outside the boundary, so no task-local config.toml defines Sources.
+    The URL is the product checkout entry the Claude provider passes for the same mode.
+    """
+    from lu_machinery.dispatcher.providers.claude import _sources_mcp_config
+
+    server = json.loads(_sources_mcp_config("workspace-write"))["mcpServers"].get(SOURCES_SERVER)
+    url = server.get("url") if isinstance(server, dict) else None
+    if not isinstance(url, str) or not url.strip():
+        return []
+    return ["-c", "mcp_servers.sources.url=" + json.dumps(url)]
+
+
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     from lu_machinery.dispatcher.checks import check_model_admission
 
@@ -188,8 +203,12 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     if spec.effort is not None:
         argv += ["-c", f"model_reasoning_effort={spec.effort}"]
     # Hosted connectors run on the provider's side, out of the egress proxy's sight (#7181). Sources is the
-    # read-only boundary's relay for reviews; only Sources readers are enabled in either mode.
-    argv += ["--disable", "apps", *_sources_read_only_flags(sources_tool_sets()[0])]
+    # read-only boundary's relay for reviews; only Sources readers are enabled in either mode. A
+    # workspace-write run has no boundary config, so the argv also names the server's transport.
+    sources = _sources_read_only_flags(sources_tool_sets()[0])
+    if spec.mode == "workspace-write":
+        sources = [*_workspace_sources_transport(), *sources]
+    argv += ["--disable", "apps", *sources]
     if spec.mode in {"read-only", "workspace-write"}:
         # Read-only reviews use the supervisor's worktree/Git mounts; an inner sandbox cannot
         # start under --disable-userns. Write workers run directly, as the dispatching seat.

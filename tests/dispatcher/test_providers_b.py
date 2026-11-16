@@ -138,6 +138,21 @@ def sources_mcp_config(mode="read-only"):
 
 
 STUB = """import json, os, pathlib, sys
+# Codex rejects mcp_servers.sources with no url and no command. An empty CODEX_HOME
+# config.toml is that case; the workspace-write argv has to carry the transport.
+if os.environ.get("STUB_CODEX_EMPTY_CONFIG") == "1":
+    import tomllib
+    loaded = tomllib.loads(pathlib.Path(os.environ["CODEX_HOME"], "config.toml").read_text())
+    servers = loaded.get("mcp_servers") or {}
+    defined = servers.get("sources") if isinstance(servers, dict) else None
+    file_transport = isinstance(defined, dict) and bool(defined.get("url") or defined.get("command"))
+    argv_transport = any(
+        arg.startswith("mcp_servers.sources.url=") or arg.startswith("mcp_servers.sources.command=")
+        for arg in sys.argv
+    )
+    if not file_transport and not argv_transport:
+        print("Error loading config.toml: invalid transport in mcp_servers.sources", file=sys.stderr)
+        raise SystemExit(1)
 pathlib.Path(os.environ["CAPTURE"]).write_text(json.dumps({
     "argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": sys.stdin.buffer.read().hex(),
     "account": os.environ.get("CLAUDE_CONFIG_DIR"), "marker": os.environ.get("PROVIDER_TEST"),
@@ -246,6 +261,15 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
 
     env = dict(os.environ, CAPTURE=str(tmp_path / "capture.json"), STUB_STREAM=SUCCESS[provider], PROVIDER_TEST="kept")
     env["CLAUDE_CONFIG_DIR"] = str(tmp_path / "selected-account-a")
+    if provider == "codex" and mode == "workspace-write":
+        # Replay the dispatch argv against a CODEX_HOME whose config.toml defines no MCP server.
+        # The binary is this test's stub: a live codex exec against an empty home has no auth and
+        # cannot answer (401). The stub applies the same transport check and then exits 0.
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text("# no mcp servers\n")
+        env["CODEX_HOME"] = str(codex_home)
+        env["STUB_CODEX_EMPTY_CONFIG"] = "1"
     # A launch may already carry the removed per-shell variables. Read-only builds strip them
     # whether or not the whole-process marker is present.
     planted = {}
@@ -261,6 +285,8 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
         env.update(planted)
     original_env = env.copy()
     invocation = load(provider).build(spec, env)
+    if provider == "codex" and mode == "read-only":
+        assert not any(arg.startswith("mcp_servers.sources.url=") for arg in invocation.argv)
     expected = {
         "codex": ["exec", "--json", "-C", str(worktree), "-m", "explicit-model", "-o", str(final)],
         "claude": ["-p", "--model", "explicit-model"],
@@ -288,8 +314,11 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
     if provider == "codex":
         if effort:
             expected += ["-c", "model_reasoning_effort=high"]
-        expected += ["--disable", "apps", *_sources_read_only_flags(sources_tool_sets()[0]),
-                     "--dangerously-bypass-approvals-and-sandbox"]
+        sources = [*_sources_read_only_flags(sources_tool_sets()[0])]
+        if mode == "workspace-write":
+            url = json.loads(sources_mcp_config(mode))["mcpServers"]["sources"]["url"]
+            sources = ["-c", "mcp_servers.sources.url=" + json.dumps(url), *sources]
+        expected += ["--disable", "apps", *sources, "--dangerously-bypass-approvals-and-sandbox"]
     elif provider == "claude":
         if effort:
             expected += ["--effort", "high"]
