@@ -57,11 +57,17 @@ def _pull_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changed: str)
     monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
 
 
-def _gate(monkeypatch: pytest.MonkeyPatch, shards: str, **results: str) -> int:
+def _gate(monkeypatch: pytest.MonkeyPatch, scope: str | None, shards: str, **results: str) -> int:
+    """Aggregate a PR run; ``scope`` is pr-scope's ``full-suite`` output, None for a workflow without the job."""
     needs = {name: "success" for name in gate.COMMON | {gate.SCOPE}}
     needs |= {name: shards for name in gate.FULL} | {"queue-metadata-scan": "skipped"} | results
     assert set(needs) == JOBS
-    monkeypatch.setenv("NEEDS_JSON", json.dumps({name: {"result": value, "outputs": {}} for name, value in needs.items()}))
+    jobs = {name: {"result": value, "outputs": {}} for name, value in needs.items()}
+    if scope is None:
+        del jobs[gate.SCOPE]
+    elif needs[gate.SCOPE] == "success":
+        jobs[gate.SCOPE]["outputs"] = {"full-suite": scope}
+    monkeypatch.setenv("NEEDS_JSON", json.dumps(jobs))
     monkeypatch.setattr(sys, "argv", ["gate"])
     return gate.main()
 
@@ -77,7 +83,7 @@ def test_infrastructure_pr_passes_with_green_shards(
 ) -> None:
     _pull_request(tmp_path, monkeypatch, "pyproject.toml")
     assert _scope(monkeypatch, tmp_path) == "full-suite=true\n"
-    assert _gate(monkeypatch, "success") == 0
+    assert _gate(monkeypatch, "true", "success") == 0
     out = capsys.readouterr().out
     assert "pytest: success, expected success" in out
     assert "pytest infrastructure changed, so the full pytest suite" in out
@@ -92,10 +98,13 @@ def test_infrastructure_pr_fails_without_every_green_shard_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], job: str, result: str,
 ) -> None:
     _pull_request(tmp_path, monkeypatch, "pyproject.toml")
-    assert _gate(monkeypatch, "success", **{job: result}) == 1
+    assert _gate(monkeypatch, "true", "success", **{job: result}) == 1
     assert "CI Gate green" not in capsys.readouterr().out
     # Today's PR shape, every shard job skipped, is no longer enough either.
-    assert _gate(monkeypatch, "skipped") == 1
+    assert _gate(monkeypatch, "true", "skipped") == 1
+    # Nor is a scope job without a readable decision.
+    for scope in ("", "yes", "True"):
+        assert _gate(monkeypatch, scope, "success") == 1
 
 
 def test_ordinary_pr_keeps_the_shards_skipped(
@@ -103,7 +112,9 @@ def test_ordinary_pr_keeps_the_shards_skipped(
 ) -> None:
     _pull_request(tmp_path, monkeypatch, "scripts/runner.py")
     assert _scope(monkeypatch, tmp_path) == "full-suite=false\n"
-    assert _gate(monkeypatch, "skipped") == 0
-    assert "the full pytest suite was not run" in capsys.readouterr().out
-    assert _gate(monkeypatch, "success") == 1
-    assert _gate(monkeypatch, "skipped", **{gate.SCOPE: "skipped"}) == 1
+    # With the scope job, and as before it, in a workflow that has none.
+    for scope in ("false", None):
+        assert _gate(monkeypatch, scope, "skipped") == 0
+        assert "the full pytest suite was not run" in capsys.readouterr().out
+        assert _gate(monkeypatch, scope, "success") == 1
+    assert _gate(monkeypatch, "false", "skipped", **{gate.SCOPE: "skipped"}) == 1

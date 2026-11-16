@@ -13,7 +13,7 @@ from pathlib import Path
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMMON = frozenset({"secret-scan", "hydrate-release-assets", "checks", "dependency-audit", "pr-affected", "frontend"})
 FULL = frozenset({"refresh-pytest-durations", "pytest", "pytest-report"})
-# The product job that runs --pr-scope; the FULL jobs' PR conditions read its output.
+# The job that runs --pr-scope; the FULL jobs' PR conditions and this gate read its output.
 SCOPE = "pr-scope"
 
 
@@ -133,12 +133,19 @@ def main() -> int:
             print(f"full-suite={decision}")
             return 0
         results = json.loads(os.environ["NEEDS_JSON"])
-        if set(results) != COMMON | FULL | {"queue-metadata-scan", SCOPE}:
+        # A workflow without the pr-scope job keeps the PR tier it had before that job:
+        # a consumer adopts a release by changing its lock alone, then adds the job.
+        if set(results) - {SCOPE} != COMMON | FULL | {"queue-metadata-scan"}:
             raise ValueError("missing or unexpected CI dependencies")
-        # A PR runs the affected tests instead of the shards, unless it changes pytest
-        # infrastructure: the selector then runs guards only, so the shards run and are
-        # required. The full tier runs both.
-        full_pr = tier == "admission" and pr_full_suite(payload, actual)
+        # A PR runs the affected tests instead of the shards, unless pr-scope reports that
+        # it changes pytest infrastructure: the selector then runs guards only, so the
+        # shards run and are required. The full tier runs both.
+        full_pr = False
+        if tier == "admission" and SCOPE in results and results[SCOPE].get("result") == "success":
+            decision = results[SCOPE]["outputs"]["full-suite"]
+            if decision not in {"true", "false"}:
+                raise ValueError("invalid PR pytest scope")
+            full_pr = decision == "true"
         failed = False
         for name, result in sorted(results.items()):
             expected = "success" if name in COMMON or (name in FULL and (tier == "full" or full_pr)) or (
