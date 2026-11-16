@@ -19,6 +19,7 @@ import sys
 import tempfile
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -52,7 +53,7 @@ def load_pip_audit_ignores(ignore_file: Path) -> list[str]:
 _LU_MACHINERY_NAME = "lu-machinery"
 _WHEELHOUSE_ENV = "LU_MACHINERY_WHEELHOUSE"
 _DIST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
-_VERSION_OPERATOR = re.compile(r"^(===|==|~=|!=|<=|>=|<|>|\s)")
+_VERSION_OPERATOR = re.compile(r"^(===|==|~=|!=|<=|>=|<|>|\s|\()")
 _EXACT_PIN = re.compile(
     r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==(?P<version>\S+)(?P<rest>.*)$"
 )
@@ -89,11 +90,8 @@ def _logical_lines(text: str) -> list[str]:
     return logical
 
 
-def _normalized_distribution_name(specifier: str) -> str | None:
-    """PEP 503 name of a requirement specifier, or None when it is not one."""
-    body = specifier.split(";", 1)[0].strip()
-    if not body or body.startswith(("-", ".", "/")):
-        return None
+def _regex_distribution_name(body: str) -> str | None:
+    """PEP 503 name from a specifier the standards parser did not accept."""
     if "@" in body:
         body = body.split("@", 1)[0].strip()
     body = body.split("[", 1)[0].strip()
@@ -106,21 +104,70 @@ def _normalized_distribution_name(specifier: str) -> str | None:
     return _pep503_name(match.group(0))
 
 
-def _path_requirement(repo_root: Path, line: str) -> Path | None:
-    """Local path a requirements line installs, relative to the consumer root."""
-    token = line.split()[0]
-    if token in {"-e", "--editable"}:
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            return None
-        token = parts[1].split()[0]
-    elif token.startswith("--editable="):
-        token = token.split("=", 1)[1].split()[0]
-    if not token.startswith(("./", "../", "/")):
+def _normalized_distribution_name(specifier: str) -> str | None:
+    """PEP 503 name of a requirement specifier, or None when it is not one.
+
+    Parentheses (``name(>=1)``) and direct URLs are requirement forms. A local
+    path is not a name; the caller resolves those separately.
+    """
+    body = specifier.split(";", 1)[0].strip()
+    if not body or body.startswith(("-", ".", "/")):
         return None
-    target = Path(token)
-    if not target.is_absolute():
-        target = repo_root / target
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+    except ImportError:
+        return _regex_distribution_name(body)
+    try:
+        return _pep503_name(Requirement(body).name)
+    except InvalidRequirement:
+        return _regex_distribution_name(body)
+
+
+def _strip_path_extras(token: str) -> str:
+    if token.endswith("]") and "[" in token and "/" not in token[token.rfind("[") :]:
+        return token.rpartition("[")[0]
+    return token
+
+
+def _path_requirement(repo_root: Path, line: str) -> Path | None:
+    """Local path a requirements line installs, relative to the consumer root.
+
+    Pip treats a separator or a leading dot as a path, including ``packages/runtime``
+    and ``./packages/runtime[extra]``. Editable forms include ``-e ./path`` and
+    ``-e./path``. ``name @ file://`` and a bare ``file:`` URL point at the same tree.
+    """
+    body = line.split(";", 1)[0].strip()
+    if body.startswith("--editable="):
+        body = body.split("=", 1)[1].strip()
+    elif body.startswith("--editable "):
+        body = body[len("--editable ") :].strip()
+    elif body.startswith("-e "):
+        body = body[3:].strip()
+    elif body.startswith("-e") and len(body) > 2 and body[2] in "./~":
+        body = body[2:].strip()
+    if not body or body.startswith("-"):
+        return None
+    url = body
+    if " @ " in body:
+        url = body.split(" @ ", 1)[1].strip()
+    elif "@" in body:
+        left, right = body.split("@", 1)
+        if not (left.strip().startswith(".") or "/" in left):
+            url = right.strip()
+    url = _strip_path_extras(url.strip())
+    if url.startswith("file:"):
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "file":
+            return None
+        target = Path(urllib.parse.unquote(parsed.path))
+    elif "://" in url:
+        return None
+    elif url.startswith(".") or "/" in url or url.startswith("~"):
+        target = Path(url)
+        if not target.is_absolute():
+            target = repo_root / target
+    else:
+        return None
     return target
 
 
@@ -155,12 +202,10 @@ def _requirements_name_lu_machinery(repo_root: Path, requirements_file: Path) ->
     ``lu-machinery-extras`` is a different distribution and does not count.
     """
     for line in _logical_lines(requirements_file.read_text(encoding="utf-8")):
-        path = _path_requirement(repo_root, line)
-        if path is not None:
-            if _LU_MACHINERY_NAME in _project_dependency_names(path):
-                return True
-            continue
         if _normalized_distribution_name(line) == _LU_MACHINERY_NAME:
+            return True
+        path = _path_requirement(repo_root, line)
+        if path is not None and _LU_MACHINERY_NAME in _project_dependency_names(path):
             return True
     return False
 
@@ -237,13 +282,14 @@ def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Itera
     Yields an empty mapping when the requirements do not name ``lu-machinery``,
     so the audit command stays exactly as it is today. Otherwise yields
     ``PIP_FIND_LINKS`` (a directory containing only the hash-checked wheel) and
-    ``PIP_CONSTRAINT`` (a file whose only line is ``lu-machinery=={version}``).
+    ``PIP_CONSTRAINT`` (an unhashed ``lu-machinery @ file:`` URL of that staged wheel).
 
-    The constraint file is unhashed on purpose: one ``--hash`` makes pip require
-    hashes on every line of ``requirements-lock.txt``, which has none. The wheel
-    comes from ``LU_MACHINERY_WHEELHOUSE``; this does not download it. A missing
-    pin, a hash mismatch, or a missing wheel raises :class:`LuMachineryAuditWheelError`
-    before the caller starts pip-audit.
+    A version pin alone does not bind the candidate: pip may download another
+    build of the same version from an index. A direct file URL does, and because
+    it has no ``--hash`` it does not make pip require hashes on
+    ``requirements-lock.txt``. The wheel comes from ``LU_MACHINERY_WHEELHOUSE``;
+    this does not download it. A missing pin, a hash mismatch, or a missing wheel
+    raises :class:`LuMachineryAuditWheelError` before the caller starts pip-audit.
     """
     if not _requirements_name_lu_machinery(repo_root, requirements_file):
         yield {}
@@ -262,8 +308,9 @@ def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Itera
                 f"staged {staged.name} sha256 {staged_digest} does not match requirements-machinery.lock"
             )
         constraint = root / "lu-machinery-constraint.txt"
-        # Unhashed: a hash here would force hashes onto requirements-lock.txt.
-        constraint.write_text(f"lu-machinery=={pin.version}\n", encoding="utf-8")
+        # File URL, not ``==version``: an index can offer another build of the
+        # same version. No ``--hash``, so the unhashed consumer lock still resolves.
+        constraint.write_text(f"lu-machinery @ {staged.resolve().as_uri()}\n", encoding="utf-8")
         yield {"PIP_FIND_LINKS": str(links), "PIP_CONSTRAINT": str(constraint)}
 
 

@@ -208,7 +208,8 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
     assert req.read_text(encoding="utf-8") == original
     constraint = captured["constraint"]
     assert isinstance(constraint, str)
-    assert constraint.strip() == "lu-machinery==9.9.9"
+    assert constraint.strip().startswith("lu-machinery @ file:")
+    assert wheel_name in constraint
     assert "--hash" not in constraint
     assert captured["wheel_hash"] == digest
     cmd = captured["cmd"]
@@ -256,6 +257,26 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
     with patch("subprocess.run") as missing_run:
         assert audit_python(mismatch, mismatch / "ignore.yaml") == 1
     missing_run.assert_not_called()
+
+    # Forms pip accepts must reach the wheel check, not skip it.
+    spelled = tmp_path / "spelled"
+    spelled.mkdir()
+    runtime = spelled / "packages" / "runtime"
+    write_pyproject(runtime, "demo-runtime", ["lu-machinery>=0.1.21"])
+    runtime_uri = runtime.resolve().as_uri()
+    monkeypatch.delenv("LU_MACHINERY_WHEELHOUSE", raising=False)
+    for spelled_line in (
+        "packages/runtime",
+        "./packages/runtime[extra]",
+        runtime_uri,
+        f"demo-runtime @ {runtime_uri}",
+        "-e./packages/runtime",
+        "lu-machinery(>=0.1.21)",
+    ):
+        (spelled / "requirements-lock.txt").write_text(spelled_line + "\n", encoding="utf-8")
+        with patch("subprocess.run") as spelled_run:
+            assert audit_python(spelled, spelled / "ignore.yaml") == 1, spelled_line
+        spelled_run.assert_not_called()
 
 
 @patch("subprocess.run")
