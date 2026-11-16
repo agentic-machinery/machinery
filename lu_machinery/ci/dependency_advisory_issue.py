@@ -13,7 +13,10 @@ issue body. The workflow applies the action with ``gh``.
 
 Reuses the suppression logic from ``scripts/ci/audit_dependencies.py`` so
 "unsuppressed" means exactly what the blocking audit enforces: every pip-audit
-finding, and High/Critical npm findings.
+finding, and High/Critical npm findings. The pip-audit invocation shares
+``pip_audit_requirement_env`` with that blocking audit, so a first-party
+``lu-machinery`` requirement resolves from ``LU_MACHINERY_WHEELHOUSE`` instead
+of PyPI.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from lu_machinery.ci.audit_dependencies import (
     filter_npm_audit_vulnerabilities,
     load_npm_audit_ignores,
     load_pip_audit_ignores,
+    pip_audit_requirement_env,
 )
 from lu_machinery.common.repo_root import product_root
 
@@ -136,8 +140,15 @@ def collect_npm_findings(vulns: dict, ignored_ids: list[str], *, target: str) ->
     return findings
 
 
-def _run_json_command(cmd: list[str], *, cwd: Path, timeout: int, label: str) -> tuple[dict, int]:
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+def _run_json_command(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    timeout: int,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> tuple[dict, int]:
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     try:
         data = json.loads(result.stdout)
     except (ValueError, TypeError) as exc:
@@ -181,9 +192,14 @@ def run_collect(
     ]
     for vuln_id in load_pip_audit_ignores(pip_ignore):
         pip_cmd.extend(["--ignore-vuln", vuln_id])
-    pip_report, pip_code = _run_json_command(
-        pip_cmd, cwd=repo_root, timeout=PIP_AUDIT_TIMEOUT_SECONDS, label="pip-audit"
-    )
+    with pip_audit_requirement_env(repo_root, req_file) as extra:
+        pip_report, pip_code = _run_json_command(
+            pip_cmd,
+            cwd=repo_root,
+            timeout=PIP_AUDIT_TIMEOUT_SECONDS,
+            label="pip-audit",
+            env=({**os.environ, **extra} if extra else None),
+        )
     if pip_code not in (0, 1):
         raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
     findings.extend(collect_python_findings(pip_report))
