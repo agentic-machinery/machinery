@@ -25,7 +25,7 @@ TITLES = ["fix(review): count a shared branch's review rounds per pull request (
 
 
 def decide(**changes):
-    inputs = {"head": HEAD, "last_tag": "v0.1.21", "last_tag_commit": TAG_COMMIT, "titles": TITLES,
+    inputs = {"head": HEAD, "last_tag": "v0.1.21", "last_tag_commit": TAG_COMMIT, "baseline": "v0.1.21", "titles": TITLES,
               "versions": NEXT, "tags": ["v0.1.20", "v0.1.21"], "runs": GREEN}
     return preflight(**{**inputs, **changes})
 
@@ -173,7 +173,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
         product_remote=str(tmp_path / "product.git"), machinery_repo="learn-ukrainian/machinery",
         product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python", primary=tmp_path,
-        alert=False, x_agent="claude/claude-cto", version="0.1.22", previous="0.1.21",
+        alert=False, x_agent="claude/claude-cto", version="0.1.22", previous="0.1.21", baseline="0.1.21",
         git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
     )
     # The host pre-push scan refuses a fixture that is not the public repository. The commit is what this test reads.
@@ -200,6 +200,82 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         ["git", "-C", str(product), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
     assert adopt.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+
+
+def _released_history(tmp_path, commits, releases):
+    """A machinery remote whose first-parent history is ``commits`` ((title, version, tag)), and a dry-run Cut on it.
+
+    GitHub is faked: ``releases`` maps a tag to its release's isPrerelease, and HEAD's CI Gate push run succeeded.
+    """
+    seed = tmp_path / "seed"
+    _init_repo(seed)
+    for title, version, tag in commits:
+        (seed / "pyproject.toml").write_text(f'[project]\nname = "lu-machinery"\nversion = "{version}"\n', encoding="utf-8")
+        package = {"name": "lu-machinery-acp", "version": version}
+        (seed / "package.json").write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
+        lock = {**package, "packages": {"": {"version": version}}}
+        (seed / "package-lock.json").write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
+        _git(seed, "add", ".")
+        _git(seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", title)
+        if tag:
+            _git(seed, "tag", tag)
+    remote = tmp_path / "machinery.git"
+    subprocess.run(["git", "clone", "--quiet", "--bare", str(seed), str(remote)], check=True, capture_output=True)
+    head = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True,
+                          text=True).stdout.strip()
+    work = tmp_path / "work"
+    work.mkdir()
+    cut = Cut(work=work, dry_run=True, machinery_remote=str(remote), product_remote=str(tmp_path / "product.git"),
+              machinery_repo="learn-ukrainian/machinery", product_repo="learn-ukrainian/learn-ukrainian",
+              host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="claude/claude-cto")
+    original_run = cut.run
+
+    def run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        if command[:3] == ["gh", "run", "list"]:
+            return subprocess.CompletedProcess(command, 0, json.dumps([{**GREEN[0], "headSha": head}]), "")
+        if command[:3] == ["gh", "release", "view"]:
+            if command[3] not in releases:
+                return subprocess.CompletedProcess(command, 1, "", "release not found\n")
+            return subprocess.CompletedProcess(command, 0, json.dumps({"isPrerelease": releases[command[3]]}), "")
+        return original_run(argv, **kwargs)
+
+    cut.run = run
+    return cut
+
+
+def test_a_withdrawn_last_tag_cuts_everything_merged_since_the_last_full_release(tmp_path):
+    """Defect class: after a withdrawn pre-release the skip rule and notes start at its tag, so changes never ship."""
+    cut = _released_history(tmp_path, [
+        ("seed versions", "0.1.22", "v0.1.22"),
+        ("chore(release): record 0.1.22 and start 0.1.23 (#630)", "0.1.23", None),
+        ("fix(dispatcher): an unreadable stranger no longer voids the fallback settlement stop (#632)", "0.1.23", None),
+        ("fix(api): name the model-stats store without a transcript filename (#641)", "0.1.23", "v0.1.23"),
+        ("chore(release): record 0.1.23 and start 0.1.24 (#644)", "0.1.24", None),
+    ], releases={"v0.1.22": False, "v0.1.23": True})
+    decision, titles, built = cut.preflight()
+    assert (decision.action, decision.version, built) == ("cut", "0.1.24", "0.1.24")
+    assert decision.reason.endswith("4 commit(s) since v0.1.22")
+    assert (cut.previous, cut.baseline) == ("0.1.23", "0.1.22")
+    url = "https://github.com/learn-ukrainian/machinery/pull/"
+    assert release_notes(titles, "learn-ukrainian/machinery") == (
+        "### Fixed\n\n"
+        f"- An unreadable stranger no longer voids the fallback settlement stop ([#632]({url}632))\n"
+        f"- Name the model-stats store without a transcript filename ([#641]({url}641))\n"
+    )
+
+
+def test_only_a_bump_since_a_full_release_still_skips(tmp_path):
+    """Defect class: the withdrawn-release walk turns an unchanged window after a full release into an empty cut."""
+    cut = _released_history(tmp_path, [
+        ("seed versions", "0.1.21", "v0.1.21"),
+        ("fix(review): count a shared branch's review rounds per pull request (#627)", "0.1.22", "v0.1.22"),
+        ("chore(release): record 0.1.22 and start 0.1.23 (#630)", "0.1.23", None),
+    ], releases={"v0.1.21": False, "v0.1.22": False})
+    decision, titles, _built = cut.preflight()
+    assert (decision.action, decision.version) == ("skip", "0.1.23")
+    assert decision.reason == "unchanged: nothing but the version bump merged since v0.1.22"
+    assert titles == ["chore(release): record 0.1.22 and start 0.1.23 (#630)"]
 
 
 @pytest.fixture
