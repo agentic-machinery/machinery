@@ -21,7 +21,7 @@ semantics, scope freezing, non-mutating checks, cross-family reviewer
 resolution, finding adjudication, and separate behavior proof. A clean
 working tree never substitutes for reviewing a requested commit or PR.
 
-For the review of record, use `"$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py"` after the
+For the review of record, use `"$PY" -m lu_machinery.review.record_cf_verdict` after the
 toolful review settles. It posts a PR comment bound to the exact head, with
 model/family/harness provenance. GitHub rejects an API approval review when the
 shared bot identity also authored the PR (`gh pr review --approve` uses that API).

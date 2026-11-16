@@ -137,7 +137,7 @@ interpreter does not select the primary checkout's Python modules.
    applies the clean-merge exemption and the lineage's one repair-verification round:
 
    ```bash
-   "$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py" budget-check --repository "$REPOSITORY" --pr "$PR"
+   "$PY" -m lu_machinery.review.record_cf_verdict budget-check --repository "$REPOSITORY" --pr "$PR"
    ```
 
    Exit 0 admits the round; carry any `repair_round` receipt (its approved and candidate heads,
@@ -158,7 +158,7 @@ interpreter does not select the primary checkout's Python modules.
    ([policy](references/policy.md#recording-the-verdict)).
 
    ```bash
-   "$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py" --task-id "$REVIEW_TASK" --pr "$PR"
+   "$PY" -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR"
    ```
 
    Exit 0 means recorded with a JSON receipt; exit 1 means refused, so nothing is recorded.

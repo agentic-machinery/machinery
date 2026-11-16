@@ -93,6 +93,6 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   failure instead of a verdict, which charges no round once per lineage:
 
   ```bash
-  "$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py" capability-failure --task-id "$REVIEW_TASK" --pr "$PR" \
+  "$PY" -m lu_machinery.review.record_cf_verdict capability-failure --task-id "$REVIEW_TASK" --pr "$PR" \
     --capability <sources-mcp|test-execution|shell|browser|checkout-data|ci-logs> --authority claude-cto
   ```

@@ -55,7 +55,7 @@ Work in a git worktree under `.worktrees/dispatch/<agent>/<task>/`
 (auto-created by the runtime when you pass bare `--worktree`). Do NOT
 create a feature branch in the main checkout. Concrete dispatch:
 
-    .venv/bin/python lu_machinery/dispatch.py dispatch \
+    .venv/bin/python -m lu_machinery.dispatch dispatch \
         --agent codex --model gpt-6.1-sol \
         --task-id <task-id> \
         --mode workspace-write \
@@ -64,7 +64,7 @@ create a feature branch in the main checkout. Concrete dispatch:
         --prompt-file brief.md
 
     # For dispatches that warrant peak Opus 5.5 reasoning:
-    .venv/bin/python lu_machinery/dispatch.py dispatch \
+    .venv/bin/python -m lu_machinery.dispatch dispatch \
         --agent claude --model claude-opus-5-5 --effort xhigh \
         --task-id <task-id> --mode workspace-write --worktree \
         --base origin/main --prompt-file brief.md

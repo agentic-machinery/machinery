@@ -73,7 +73,7 @@ through Cursor (D-129, #10464), and the Other Models pool never carries a review
 # pace detail per lane (remaining%, pace lines, will_last, deficit):
 .venv/bin/python -m lu_machinery.fleet.usage show
 # then dispatch with an explicit eligible provider/model:
-.venv/bin/python lu_machinery/dispatch.py dispatch --agent <lane> --model <catalog-model> --prompt-file <brief> --worktree
+.venv/bin/python -m lu_machinery.dispatch dispatch --agent <lane> --model <catalog-model> --prompt-file <brief> --worktree
 ```
 
 **Refuse deficit when cooler seats exist.** Do **not** habit-route to Codex (or any

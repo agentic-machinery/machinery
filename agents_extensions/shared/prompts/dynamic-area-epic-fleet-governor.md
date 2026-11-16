@@ -227,7 +227,7 @@ cross-family review.
 - Native children are OpenAI-family helpers and never satisfy the independent
   cross-family review gate.
 
-External work uses `.venv/bin/python lu_machinery/dispatch.py dispatch` with a
+External work uses `.venv/bin/python -m lu_machinery.dispatch dispatch` with a
 stable task ID, exact agent/model/harness, explicit mode, lifecycle ledger,
 worktree for writes, and deliberate research classification:
 
