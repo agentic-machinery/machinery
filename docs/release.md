@@ -403,22 +403,27 @@ delegator validation was introduced by
 commit `4dc5c36d02403d24abf363a558ebbe7442474f64`. Missing delegators still
 refuse the entire deploy before any output is written.
 
-Before product enrollment, add this group to each of `hooks.PreToolUse`,
-`hooks.PostToolUse` and `hooks.PostToolUseFailure` in the product source
-`agents_extensions/shared/settings.json`, retaining all existing groups:
+The mandatory delegators are the exact commands under `required_hooks` in the
+release inventory, `lu_machinery/agent_deploy/release.v1.json`. Copy them
+unchanged into the product source `agents_extensions/shared/settings.json` (the
+dirt audit goes in each of `hooks.PreToolUse`, `hooks.PostToolUse` and
+`hooks.PostToolUseFailure`), retaining all existing groups. The Python guards
+and the dirt audit run as modules of the installed release through that
+command's bootstrap (`"$LEARN_UKRAINIAN_PYTHON" -I -m
+agents_extensions.shared.hooks.<hook>`).
 
-```json
-{
-  "matcher": "Bash",
-  "hooks": [
-    {
-      "type": "command",
-      "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/audit-primary-checkout-dirt.py",
-      "timeout": 10
-    }
-  ]
-}
-```
+The deploy copies no Python hook module into a consumer: a copy in the product
+tree could be imported in place of the pinned release. A consumer command that
+names `$CLAUDE_PROJECT_DIR/.claude/hooks/<hook>.py`, or the same path under
+`.codex`, `.agent` or `.cursor`, names a file that does not exist. Claude Code
+treats that failure (exit 127) as a non-blocking error, so the hook silently
+stops running; use the bootstrap command instead. A deployed `hooks/`
+directory holds only the release's shell hooks, which consumer settings invoke
+by path; each finds the installed release (`MACHINERY_DIR`) and runs its Python
+from there. After an upgrade from a release that copied the modules, the next
+apply removes those copies like any other output the plan no longer holds. A
+copy edited after its deploy is not removed: apply reports it as a modified
+retirement candidate and exits 1.
 
 Codex's required SessionStart, compact SessionStart, Stop and SessionEnd
 commands use the configured primary with a missing-variable refusal and

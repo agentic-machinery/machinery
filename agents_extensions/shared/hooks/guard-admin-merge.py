@@ -314,7 +314,7 @@ def _block_msg(reason: str) -> str:
         "Per #M-0.5, --admin is ONLY for explicitly-advisory failures. If a blocking check is\n"
         "red: STOP, report, and ask — do NOT bypass. If this is a genuine advisory-only case,\n"
         "fix the failing checks first, or the human runs the merge directly.\n\n"
-        "Hook source: .claude/hooks/guard-admin-merge.py\n"
+        "Hook source: agents_extensions/shared/hooks/guard-admin-merge.py\n"
     )
 
 

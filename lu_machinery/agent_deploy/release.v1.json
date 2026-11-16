@@ -71,20 +71,7 @@
     "hooks/audit-primary-checkout-dirt.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/audit-primary-checkout-dirt.py"
-        ],
-        "claude": [
-          ".claude/hooks/audit-primary-checkout-dirt.py"
-        ],
-        "codex": [
-          ".codex/hooks/audit-primary-checkout-dirt.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/audit-primary-checkout-dirt.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/auto-audit.sh": {
       "mode": 493,
@@ -143,20 +130,7 @@
     "hooks/context-hook-state.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/context-hook-state.py"
-        ],
-        "claude": [
-          ".claude/hooks/context-hook-state.py"
-        ],
-        "codex": [
-          ".codex/hooks/context-hook-state.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/context-hook-state.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/context-monitor.sh": {
       "mode": 493,
@@ -251,146 +225,42 @@
     "hooks/guard-admin-merge.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-admin-merge.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-admin-merge.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-admin-merge.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-admin-merge.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-branch-switch-in-main.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-branch-switch-in-main.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-branch-switch-in-main.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-branch-switch-in-main.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-branch-switch-in-main.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-pr-merge.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-pr-merge.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-pr-merge.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-pr-merge.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-pr-merge.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-primary-checkout-write.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-primary-checkout-write.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-primary-checkout-write.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-primary-checkout-write.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-primary-checkout-write.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-public-github-text.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-public-github-text.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-public-github-text.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-public-github-text.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-public-github-text.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-reviewer-publish.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-reviewer-publish.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-reviewer-publish.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-reviewer-publish.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-reviewer-publish.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/guard-secret-print.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/guard-secret-print.py"
-        ],
-        "claude": [
-          ".claude/hooks/guard-secret-print.py"
-        ],
-        "codex": [
-          ".codex/hooks/guard-secret-print.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/guard-secret-print.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/heal-core-bare.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/heal-core-bare.py"
-        ],
-        "claude": [
-          ".claude/hooks/heal-core-bare.py"
-        ],
-        "codex": [
-          ".codex/hooks/heal-core-bare.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/heal-core-bare.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/post-compact.sh": {
       "mode": 493,
@@ -467,38 +337,12 @@
     "hooks/shell_redirects.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/shell_redirects.py"
-        ],
-        "claude": [
-          ".claude/hooks/shell_redirects.py"
-        ],
-        "codex": [
-          ".codex/hooks/shell_redirects.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/shell_redirects.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/shell_shlex.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/shell_shlex.py"
-        ],
-        "claude": [
-          ".claude/hooks/shell_shlex.py"
-        ],
-        "codex": [
-          ".codex/hooks/shell_shlex.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/shell_shlex.py"
-        ]
-      }
+      "targets": {}
     },
     "hooks/stamp-pytest.sh": {
       "mode": 493,
@@ -539,20 +383,7 @@
     "hooks/tool_names.py": {
       "mode": 493,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/hooks/tool_names.py"
-        ],
-        "claude": [
-          ".claude/hooks/tool_names.py"
-        ],
-        "codex": [
-          ".codex/hooks/tool_names.py"
-        ],
-        "cursor": [
-          ".cursor/hooks/tool_names.py"
-        ]
-      }
+      "targets": {}
     },
     "prompts/dynamic-area-epic-fleet-governor.md": {
       "mode": 420,
