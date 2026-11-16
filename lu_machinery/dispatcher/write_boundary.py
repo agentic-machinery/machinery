@@ -343,6 +343,17 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
     return summary, None
 
 
+def _git_remote(slug: str) -> tuple[str, list[str]]:
+    """Scoped HTTPS destination for host settlement and cleanup, independent of the review broker."""
+    from lu_machinery.common.git_credentials import verification_credentials
+
+    url = f"https://github.com/{slug}.git"
+    settings = verification_credentials(url)
+    if not settings:
+        raise Refused("the repository is not a registered github.com destination")
+    return url, [arg for setting in settings for arg in ("-c", setting)]
+
+
 def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = False) -> str:
     """Host Git with no user or system configuration, hooks or fsmonitor: nothing the worker wrote runs.
 
@@ -360,13 +371,7 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
     # HTTPS, including when the protected origin uses SSH.
     if (network and command[:1] in (["push"], ["ls-remote"]) and len(command) >= 3
             and (match := _GITHUB_REMOTE.fullmatch(command[-2]))):
-        from lu_machinery.common.git_credentials import verification_credentials
-
-        command[-2] = f"https://github.com/{match.group(1)}.git"
-        settings = verification_credentials(command[-2])
-        if not settings:
-            raise Refused("the repository is not a registered github.com destination")
-        credentials = [arg for setting in settings for arg in ("-c", setting)]
+        command[-2], credentials = _git_remote(match.group(1))
         args = (*credentials, *command)
     git = "git"
     options = ["--no-replace-objects", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
