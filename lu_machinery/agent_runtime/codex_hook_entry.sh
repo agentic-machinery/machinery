@@ -36,13 +36,36 @@ CANONICAL_ROOT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
 
 case "$MODE" in
   pre-tool-use)
-    printf '%s' "$PAYLOAD" \
-      | project_python_run "$PYTHON_BIN" -m lu_machinery.agent_runtime.codex_hook_policy \
+    # Codex blocks only exit 2. The policy allows with exit 0 and no stdout;
+    # every other status must fail closed. A sentinel preserves trailing
+    # newlines so even newline-only unexpected stdout cannot look like allow.
+    policy_out=$(
+      printf '%s' "$PAYLOAD" \
+        | project_python_run "$PYTHON_BIN" -m lu_machinery.agent_runtime.codex_hook_policy \
         --python-bin "$PYTHON_BIN" \
         --hooks-dir "$HOOKS_DIR" \
         --canonical-root "$CANONICAL_ROOT"
-    policy_rc=${PIPESTATUS[1]}
-    [ "$policy_rc" -eq 0 ] || exit "$policy_rc"
+      policy_rc=${PIPESTATUS[1]}
+      printf '.'
+      exit "$policy_rc"
+    )
+    policy_rc=$?
+    policy_out=${policy_out%.}
+    case "$policy_rc" in
+      0)
+        [ -z "$policy_out" ] && exit 0
+        printf '%s\n' 'CODEX-HOOK-POLICY-FAILED: the policy wrote unexpected stdout on allow; blocking the tool call fail-closed.' >&2
+        exit 2
+        ;;
+      2)
+        printf '%s' "$policy_out"
+        exit 2
+        ;;
+      *)
+        printf 'CODEX-HOOK-POLICY-FAILED: the policy exited %s (could not start, import or finish); blocking the tool call fail-closed.\n' "$policy_rc" >&2
+        exit 2
+        ;;
+    esac
     ;;
 
   post-tool-use)

@@ -82,7 +82,14 @@ without letting one slow merge guard starve the other.
 
 `codex_hook_policy.py` converts an individual guard timeout into exit code `2`
 with a concrete reason. Per the Codex `PreToolUse` contract, exit `2` blocks the
-tool call; a timeout therefore fails closed. The manifest's 45-second outer
+tool call; a timeout therefore fails closed. The entry also fails closed for
+`PreToolUse` when the policy cannot start, import or finish: it preserves allow
+(exit `0`, no stdout) and deny (exit `2`, stdout forwarded), and converts every
+other outcome to exit `2` with one `CODEX-HOOK-POLICY-FAILED` reason line on
+stderr. This includes a missing interpreter, a release without the policy
+module, an `ImportError`, a crash or signal, and unexpected stdout on allow,
+including non-JSON or newline-only output. Bootstrap failures before the policy
+starts exit `2` with `HOOK-BOOTSTRAP-FAILED`. The manifest's 45-second outer
 timeout remains a last-resort ceiling above the 3-second venv guard, local-chain,
 and concurrent network-guard budgets.
 

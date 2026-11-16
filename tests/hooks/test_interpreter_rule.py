@@ -486,7 +486,7 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
 
     def remote_has(sha: str) -> bool:
         probe = subprocess.run(
-            [real_git, "cat-file", "-e", sha], cwd=remote, env=env, capture_output=True, text=True, timeout=30,
+            [real_git, "cat-file", "-e", sha], check=False, cwd=remote, env=env, capture_output=True, text=True, timeout=30,
         )
         return probe.returncode == 0
 
@@ -670,6 +670,9 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     assert log.read_text(encoding="utf-8") == ""
     codex_selected = selected([str(codex), "pre-tool-use"], cwd=worktree, extra=codex_extra, stdin=payload)
     assert str(override) in log.read_text(encoding="utf-8"), codex_selected.stderr
+    # A policy startup/import failure must block; Codex only blocks exit 2.
+    assert codex_selected.returncode == 2, codex_selected.stderr
+    assert "CODEX-HOOK-POLICY-FAILED: the policy exited 1" in codex_selected.stderr
 
     deploy = str(SOURCE / "lu_machinery/deploy_prompts.sh")
     deploy_extra = {"LU_PRODUCT_ROOT": str(primary)}

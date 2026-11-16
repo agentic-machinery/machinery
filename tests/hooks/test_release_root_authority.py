@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
+from lu_machinery.agent_runtime.agy_hook_config import (
+    CLAUDE_GUARD_MODES,
+    native_hook_command,
+)
 from lu_machinery.common.repo_root import machinery_root
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -98,7 +101,7 @@ def run_hook(
     }
     return subprocess.run(
         [str(release.parent / "venv/bin/python"), "-I", "-B", str(release / HOOKS / name)],
-        input=json.dumps(payload),
+        check=False, input=json.dumps(payload),
         text=True,
         capture_output=True,
         cwd=cwd or product,
@@ -167,16 +170,16 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
         payload = {"tool_name": "Bash", "tool_input": {"command": "echo safe"},
                    "cwd": str(product), "hook_event_name": "PreToolUse",
                    "session_id": "release-root", "tool_use_id": "native-audit"}
-        before = subprocess.run(command, input=json.dumps(payload), text=True,
+        before = subprocess.run(command, check=False, input=json.dumps(payload), text=True,
                                 capture_output=True, cwd=product, env=env, timeout=30)
         assert before.returncode == 0, before.stderr
         (product / "new-dirt").write_text("fixture")
         payload["hook_event_name"] = "PostToolUse"
-        after = subprocess.run(command, input=json.dumps(payload), text=True,
+        after = subprocess.run(command, check=False, input=json.dumps(payload), text=True,
                                capture_output=True, cwd=product, env=env, timeout=30)
         assert after.returncode == 2 and "new-dirt" in after.stderr, after
         env["LEARN_UKRAINIAN_PYTHON"] = str(product / "missing-python")
-        refused = subprocess.run(command, input="{}", text=True, capture_output=True,
+        refused = subprocess.run(command, check=False, input="{}", text=True, capture_output=True,
                                  cwd=product, env=env, timeout=30)
         assert refused.returncode == 2 and "HOOK-BOOTSTRAP-FAILED" in refused.stderr
         return
@@ -214,7 +217,7 @@ def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(rel
     def run(command, **extra):
         payload = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(product),
                    "hook_event_name": "PreToolUse", "session_id": "native-guard", "tool_use_id": "call"}
-        return subprocess.run(argv, input=json.dumps(payload), text=True, capture_output=True,
+        return subprocess.run(argv, check=False, input=json.dumps(payload), text=True, capture_output=True,
                               cwd=product, env={**env, **extra}, timeout=60)
 
     benign = run("ls")
@@ -293,7 +296,7 @@ def run_shell(path, *args, env=None, cwd):
     base = {"PATH": os.environ["PATH"], "HOME": str(cwd)}
     return subprocess.run(
         ["bash", str(path), *args],
-        input=json.dumps({"session_id": "release-root", "hook_event_name": "Stop"}),
+        check=False, input=json.dumps({"session_id": "release-root", "hook_event_name": "Stop"}),
         text=True,
         capture_output=True,
         cwd=cwd,
@@ -340,7 +343,7 @@ def test_shell_hook_refuses_location_derived_project(release, product, tmp_path,
         env["LEARN_UKRAINIAN_PYTHON"] = str(release.parent / "venv/bin/python")
     result = subprocess.run(
         ["bash", "-x", str(hooks / name)],
-        input=json.dumps({"session_id": "release-root", "hook_event_name": "Stop",
+        check=False, input=json.dumps({"session_id": "release-root", "hook_event_name": "Stop",
                           "transcript_path": str(transcript)}),
         text=True, capture_output=True, cwd=cwd, env=env, timeout=30,
     )
@@ -580,7 +583,7 @@ def _run_code_hook(hooks, product, tmp_path, name):
     }
     result = subprocess.run(
         ["bash", str(hooks / name)],
-        input=json.dumps(payload),
+        check=False, input=json.dumps(payload),
         text=True,
         capture_output=True,
         cwd=product,
@@ -627,7 +630,7 @@ def test_codex_entry_hands_hooks_the_payload_project(release, product, checkout)
             str(release / "lu_machinery/agent_runtime/codex_hook_entry.sh"),
             "post-tool-use",
         ],
-        input=json.dumps(payload),
+        check=False, input=json.dumps(payload),
         text=True,
         capture_output=True,
         cwd=checkout_root,
@@ -678,7 +681,7 @@ def test_codex_entry_audit_child_keeps_the_tree_off_sys_path(product, tmp_path):
             str(tree / "lu_machinery/agent_runtime/codex_hook_entry.sh"),
             "post-tool-use",
         ],
-        input=json.dumps(payload),
+        check=False, input=json.dumps(payload),
         text=True,
         capture_output=True,
         cwd=product,
@@ -743,7 +746,7 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
         argv = ["bash", str(release / script), *args]
     payload = {"tool_name": "Bash", "tool_input": {"command": "printf safe"}, "cwd": str(worktree),
                "hook_event_name": "PreToolUse", "session_id": "bootstrap"}
-    result = subprocess.run(argv, input=json.dumps(payload), text=True, capture_output=True,
+    result = subprocess.run(argv, check=False, input=json.dumps(payload), text=True, capture_output=True,
                             cwd=worktree, env=env, timeout=60)
     assert not marker.exists(), result.stderr
     # Without the anchor every entry refuses (a non-zero exit, or AGY's deny answer); with it,
@@ -752,6 +755,32 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     if anchor == "configured":
         assert not refused and "HOOK-BOOTSTRAP-FAILED" not in result.stdout + result.stderr, (
             result.returncode, result.stdout, result.stderr)
+        if entry == "codex-entry":
+            assert result.stdout == "" and "CODEX-HOOK-POLICY-FAILED" not in result.stderr, result.stderr
+            payload["tool_input"]["command"] = "python3 -c 1"
+            denied = subprocess.run(argv, check=False, input=json.dumps(payload), text=True, capture_output=True,
+                                    cwd=worktree, env=env, timeout=60)
+            assert denied.returncode == 2, (denied.stdout, denied.stderr)
+            assert "enforce-venv" in denied.stderr or ".venv/bin/python" in denied.stderr, denied.stderr
+            assert "CODEX-HOOK-POLICY-FAILED" not in denied.stderr, denied.stderr
+
+            # Exercise real import failures and non-JSON output in a private release copy.
+            broken = tmp_path / "broken-release"
+            shutil.copytree(release, broken)
+            policy = broken / "lu_machinery/agent_runtime/codex_hook_policy.py"
+            policy.unlink()
+            broken_argv = ["bash", str(broken / HOOK_BOOTSTRAP_ENTRIES[entry][0]), "pre-tool-use"]
+            for source in (None, "raise ImportError('policy dependency missing')\n",
+                           "print('not JSON')\n", "print()\n"):
+                if source is not None:
+                    policy.write_text(source)
+                failed = subprocess.run(broken_argv, check=False, input=json.dumps(payload), text=True,
+                                        capture_output=True, cwd=worktree, env=env, timeout=60)
+                assert failed.returncode == 2, (source, failed.stdout, failed.stderr)
+                assert failed.stdout == "", failed.stdout
+                reasons = [line for line in failed.stderr.splitlines()
+                           if line.startswith("CODEX-HOOK-POLICY-FAILED:")]
+                assert len(reasons) == 1, failed.stderr
     else:
         assert refused, (result.returncode, result.stdout, result.stderr)
         if entry == "git-hook-lib":
@@ -767,7 +796,7 @@ def test_hook_shell_ordinary_session_falls_back_without_temporary_files(release,
            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(product),
            "LEARN_UKRAINIAN_PYTHON": str(release.parent / "venv/bin/python")}
     result = subprocess.run(shlex.split(native_hook_command("agy-stop-hook")),
-                            input="{}", text=True, capture_output=True,
+                            check=False, input="{}", text=True, capture_output=True,
                             cwd=product, env=env, timeout=30)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"decision": "allow"}
@@ -783,7 +812,7 @@ def test_hook_driver_without_tmpdir_uses_the_system_temporary_directory(release,
            "LU_DRIVER_STATE_FILE": str(tmp_path / "driver-state"),
            "SESSION_HANDOFF_AGENT": "worker"}
     result = subprocess.run(shlex.split(native_hook_command("agy-stop-hook")),
-                            input="{}", text=True, capture_output=True,
+                            check=False, input="{}", text=True, capture_output=True,
                             cwd=product, env=env, timeout=30)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"decision": "allow"}
