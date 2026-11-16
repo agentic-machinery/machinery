@@ -631,8 +631,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "window: tasks, terminal status mix, landed tasks, median and p90 wall time, tokens and wall hours per "
         "landed task, review verdicts and blocking findings, author-side review rounds, weekly allowance spent per "
         "landed task and ISO-week counts, each with its sample size (#581). /metrics exposes the same snapshot.",
-        "The durable model-stats summary rows (batch_state/model-stats/rows.jsonl, written at settlement and "
-        "backfilled from hot and archived task records), whole-line X-Agent trailers on each registered "
+        "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
+        "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
         "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
         "One single-flight snapshot of every window, refreshed every 300s while the route or /metrics is read; "
         "healthy data at most 420s old; the first request answers pending with Retry-After 5.",
