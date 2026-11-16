@@ -1,0 +1,20 @@
+# The product revision CI Gate checks each machinery wheel against: the
+# installed-wheel job of ci-gate.yml checks out learn-ukrainian/
+# learn-ukrainian.github.io at `commit`, collects its tests with the release
+# cut's consumer_collection step and runs the `test` files below, all with
+# the wheel built from the tested head first on the path.
+#
+# Bump deliberately, never to "latest main": pick a product main commit whose
+# CI Gate succeeded, set `commit` to its full SHA, check that every `test`
+# path still exists there (move or replace one the product moved), and land it
+# as its own PR. That PR's CI run is the proof that the bump collects and
+# passes. A product change that needs a newer machinery release is not a
+# reason to bump past that release's adoption.
+#
+# Pinned 2026-11-16: product main dc4d39e1, CI Gate success.
+commit dc4d39e121628005caf34614b0bcc1889f436fad
+# Key consumer tests: product tests that run the installed lu-machinery at
+# runtime across the seams collection only imports.
+test tests/api/test_installed_monitor_drill_routes.py
+test tests/test_launcher_installed_helper_chain.py
+test tests/review/test_product_hooks.py
