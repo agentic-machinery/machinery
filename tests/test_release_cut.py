@@ -29,7 +29,7 @@ CHANGELOG = (
     f"[Unreleased]: https://github.com/{REPO}/compare/v0.1.21...HEAD\n"
     f"[0.1.21]: https://github.com/{REPO}/compare/v0.1.20...v0.1.21\n"
 )
-HAND_WRITTEN = CHANGELOG.replace("## [Unreleased]\n\n", "## [Unreleased]\n\n### Fixed\n\n- Hand-written line\n\n")
+HAND_WRITTEN = "### Fixed\n\n- Hand-written line\n\n"
 
 
 def decide(**changes):
@@ -92,13 +92,23 @@ def test_ci_gate_not_green_on_the_exact_commit_refuses(runs, expected):
     assert expected in decision.reason
 
 
-def test_hand_written_unreleased_lines_refuse_instead_of_joining_the_release():
-    """Defect class: lines a worker PR wrote under Unreleased are filed under the next release, as on #655."""
-    decision = decide(changelog=HAND_WRITTEN)
+@pytest.mark.parametrize("opener", [
+    "",
+    "## [Pending fixes]\n\n",
+    '<a id="validation"></a>\n',
+    "[ticket]: https://example.invalid/42\n\n",
+    '<a id="v0.1.22"></a>\n## [0.1.21] - 2026-11-16\n\n',
+])
+def test_hand_written_unreleased_lines_refuse_instead_of_joining_the_release(opener):
+    """Defect class: lines a worker PR wrote under Unreleased are filed under the next release, as on #655,
+    including lines that open with a heading, anchor or link definition that is not a release's start."""
+    changelog = CHANGELOG.replace("## [Unreleased]\n\n", "## [Unreleased]\n\n" + opener + HAND_WRITTEN)
+    first = (opener or HAND_WRITTEN).splitlines()[0]
+    decision = decide(changelog=changelog)
     assert decision.action == "refuse"
-    assert "Unreleased is not empty (starts '### Fixed')" in decision.reason
+    assert f"Unreleased is not empty (starts {first!r})" in decision.reason
     with pytest.raises(CutError, match="Unreleased is not empty"):
-        record_changelog(HAND_WRITTEN, version="0.1.22", previous="0.1.21", date="2026-11-16",
+        record_changelog(changelog, version="0.1.22", previous="0.1.21", date="2026-11-16",
                          notes="### Fixed\n\n- Generated\n", repo=REPO)
 
 

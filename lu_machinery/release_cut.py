@@ -41,9 +41,11 @@ _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
-# Where the Unreleased section ends: the next release's anchor or heading, or the link block.
+# Unreleased is empty when the next non-blank text starts a release (its anchor, then its heading)
+# or is the trailing block of link definitions; anything else is hand-written content.
 _UNRELEASED = "## [Unreleased]\n\n"
-_UNRELEASED_END = re.compile(r'^(?:<a id="v|## \[|\[[^\]\n]+\]: )', re.MULTILINE)
+_RELEASE_START = re.compile(r'<a id="v(\d+\.\d+\.\d+)"></a>\n## \[\1\] - ')
+_LINK_DEFINITION = re.compile(r"\[[^\]\n]+\]: \S+")
 _REMOVAL_WORDS = frozenset({"remove", "removes", "retire", "retires", "delete", "deletes", "drop", "drops"})
 SECTIONS = ("Added", "Changed", "Fixed", "Removed")
 VERSION_FILES = ("pyproject.toml", "package.json", "package-lock.json")
@@ -207,11 +209,10 @@ def unreleased_must_be_empty(text: str) -> None:
     """
     if text.count(_UNRELEASED) != 1:
         raise CutError("CHANGELOG.md lacks one Unreleased heading")
-    rest = text.split(_UNRELEASED, 1)[1]
-    end = _UNRELEASED_END.search(rest)
-    held = rest[:end.start() if end else len(rest)].strip()
-    if held:
-        first = held.splitlines()[0][:120]
+    rest = text.split(_UNRELEASED, 1)[1].lstrip()
+    lines = [line for line in rest.splitlines() if line.strip()]
+    if not _RELEASE_START.match(rest) and not all(_LINK_DEFINITION.fullmatch(line) for line in lines):
+        first = lines[0][:120]
         raise CutError(f"CHANGELOG.md Unreleased is not empty (starts {first!r}); the release command is its only "
                        "writer, so remove those lines on main first (docs/release.md, Changelog)")
 
