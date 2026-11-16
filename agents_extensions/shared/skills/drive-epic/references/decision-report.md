@@ -42,8 +42,27 @@ that shows it is operator-only.
 
 ## Council: optional independent panel
 
-Use it for a consequential design decision, when the operator asks for a second opinion
-("council"), or for a named unresolved risk on a critical PR. Not for routine PRs.
+**When to use it.** Every PR gets normal review: one reviewer of record through `review-loop`,
+under the applicable tier (the review policy's Low-tier exception and the Ukrainian
+profile's Sources-backed seats stand). Add a council only for:
+
+1. a consequential, unresolved choice between materially different approaches (a decision
+   that needs designated approval does not need a council for that reason alone);
+2. a new critical-risk design, or materially changed safety assumptions (deletion engines,
+   privilege, release or deploy tooling, security boundaries, data migrations), not routine
+   implementation of an approved design;
+3. a named, materially unresolved critical risk, found at any stage, including the first
+   review;
+4. an unresolved blocking defect class, or a material disagreement between the author and the
+   reviewer of record, after two review rounds (not merely more work in the same area);
+5. a Ukrainian language, culture or heritage question where the council interprets
+   conflicting evidence or makes a pedagogical judgment; missing tools or missing attestation
+   stay unresolved, and model agreement never establishes a language norm;
+6. an operator request ("council"), which overrides the exclusion below.
+
+Never for routine low or medium risk PRs or Dependabot bumps. Each council records its
+actionable findings by member, what the reviewer of record missed, model cost and rework
+avoided; after about 20 councils this rule is tightened or loosened from that data.
 
 - **Order:** the council comes first: each member answers the frozen question on its own,
   read-only and scored (below). Then at most one ACP `discuss` round with 2 to 4 seats
@@ -58,7 +77,11 @@ Use it for a consequential design decision, when the operator asks for a second 
   dispatcher's bubblewrap boundary (C-3027) and is refused only on a host that cannot start it;
   Hydrogen is then unavailable, and an ACP seat on the agy route may join the discussion round
   only. An unavailable member is reported, never substituted, and the panel is then not called
-  complete.
+  complete. A member from the author's model family, the author's own model included, stays
+  on the panel (operator order 2026-11-16; the council's exception to pool-minus-author in
+  `model-assignment.md`): it reviews and scores, and its findings are handled like any
+  member's. The exact-head review of record follows the applicable tier, and designated
+  approval stays outside the author's family.
 - **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
@@ -74,10 +97,16 @@ Use it for a consequential design decision, when the operator asks for a second 
 - **Output:** evidence, dissent, scores, dispositions and owners go in this report and the
   durable task record. For a PR panel, record each round in a rounds table in the PR body
   (round, member, verdict, score, key finding).
-- **On a PR** the panel shares the `review-loop` budget and ledger; `review-loop` keeps the
+- **On a PR** the panel shares the `review-loop` budget and ledger, counted by reviewed
+  head: several members on one head are one round. After round 2, run the council on that
+  second head, settle the design, and keep the third head for fixes and the reviewer of
+  record's verdict. A council at a new third head uses the last round and authorizes no
+  fourth head, and council consensus never clears a recorded rejection. `review-loop` keeps the
   single exact-head review of record, so the panel adds no second review path. Designated
   approval and `full-send` are unchanged.
-  Before a panel round, bring the head up to date as `review-loop` step 0 says.
+  Before a panel round, bring the head up to date as `review-loop` step 0 says, except for
+  the council after round 2: it reads the unchanged second head and the open ledger before
+  any fix, and step 0 then applies to the third head's review of record.
 
 Learned from t3dotgg/tstack's `council` skill (MIT, Theo Browne), including its 2026-11-11
 rules on acting on each delegate's result (commit 11e37a74); the text is our own.
