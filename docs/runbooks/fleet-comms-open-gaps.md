@@ -2,6 +2,9 @@
 
 Status board for the three residual fleet-comms problems after Sol phases 0–5.
 
+Write workers use the ordinary Fleet Comms CLI directly. The removed write-worker boundary no longer
+forwards message publication or delivery operations; native read-only reviewers retain only GitHub reads.
+
 ## 1. Large ask replies — #5392
 
 **Problem:** Big review/diff replies could land as a short SQLite body with no

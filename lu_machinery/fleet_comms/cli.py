@@ -118,8 +118,6 @@ def cmd_plane_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-
-
 def fleet_status_payload(
     status: dict[str, Any],
     repo_root: Path | None = None,
@@ -793,38 +791,12 @@ def _refuse_kimi_recipients(recipients: list[str] | tuple[str, ...]) -> None:
         raise FleetCommsCliError(str(exc)) from exc
 
 
-def _deliveries_through_broker(args: argparse.Namespace) -> int:
-    """Inside a write boundary the plane is read-only: the launcher's broker receives and acknowledges the task's
-    own deliveries, with the task id as recipient and lease owner (#557)."""
-    from lu_machinery.dispatcher import write_boundary
-
-    if args.deliveries_command not in {"receive", "ack"} or args.root:
-        raise FleetCommsCliError("inside a write boundary only deliveries receive and ack of this task's own "
-                                 "deliveries are relayed, through the launcher's broker; use the task id as "
-                                 "--recipient and --worker-id")
-    if args.deliveries_command == "receive":
-        payload: dict[str, Any] = {"command": "receive", "recipient": args.recipient, "worker_id": args.worker_id,
-                                   "lease_seconds": args.lease_seconds}
-    else:
-        if args.acknowledgment_artifact_id is not None:
-            raise FleetCommsCliError("inside a write boundary an acknowledgement carries no artifact")
-        payload = {"command": "ack", "delivery_id": args.delivery_id, "worker_id": args.worker_id,
-                   "fence_token": args.fence_token}
-    reply = write_boundary.broker_call("fleet-deliveries", payload)
-    sys.stdout.write(str(reply.get("stdout", "")))
-    sys.stderr.write(str(reply.get("stderr", "")))
-    code = reply.get("returncode")
-    return code if code in (EXIT_OK, EXIT_NOT_FOUND) else EXIT_ERROR
-
-
 def cmd_deliveries(args: argparse.Namespace) -> int:
     """Expose fenced delivery operations; read and receive return bodies to the lease holder."""
     from lu_machinery.control_plane.storage import ControlPlaneError
     from lu_machinery.fleet_comms.artifacts import ArtifactStoreError
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 
-    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
-        return _deliveries_through_broker(args)
     if args.deliveries_command in {"claim", "receive"}:
         _refuse_kimi_recipients((args.recipient,))
     try:
@@ -1085,32 +1057,11 @@ def cmd_channel_context(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _channel_publish_through_broker(args: argparse.Namespace) -> int:
-    """Inside a write boundary the plane is read-only: the launcher's broker publishes as the task (#423)."""
-    from lu_machinery.dispatcher import write_boundary
-
-    if args.kind != "message" or args.conversation_id or args.correlation_id or args.deadline_at or args.root:
-        raise FleetCommsCliError("inside a write boundary only a plain message is published, through the launcher's "
-                                 "broker; its sender is the task id")
-    payload = {"channel": args.name, "body": _body_argument(args.body), "idempotency_key": args.idempotency_key,
-               "recipients": list(args.recipient or [])}
-    if args.in_reply_to:
-        payload["in_reply_to"] = args.in_reply_to
-    reply = write_boundary.broker_call("fleet-publish", payload)
-    sys.stdout.write(reply.get("stdout", ""))
-    sys.stderr.write(reply.get("stderr", ""))
-    if reply.get("returncode") != 0:
-        raise FleetCommsCliError("the write boundary broker did not publish the message")
-    return EXIT_OK
-
-
 def cmd_channel_publish(args: argparse.Namespace) -> int:
     """Append one immutable message and atomically create its fan-out deliveries."""
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 
     _refuse_kimi_recipients(args.recipient)
-    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
-        return _channel_publish_through_broker(args)
     try:
         with AuthorityService(root=_authority_root(args)) as service:
             message = service.publish_message(
@@ -1132,7 +1083,6 @@ def cmd_channel_publish(args: argparse.Namespace) -> int:
     payload["content_included"] = False
     sys.stdout.write(_json_dump(payload))
     return EXIT_OK
-
 
 
 def cmd_github_metrics(args: argparse.Namespace) -> int:
@@ -1964,7 +1914,6 @@ def cmd_cold_start_board(args: argparse.Namespace) -> int:
 
     sys.stdout.write(output)
     return EXIT_OK
-
 
 
 def main(argv: list[str] | None = None) -> int:
