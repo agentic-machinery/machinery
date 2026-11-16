@@ -454,7 +454,7 @@ state. It is never purged automatically. Every apply run lists it as
 `quarantine_kept_ambiguous_entries`, until a person disposes of it, in
 either of two ways:
 
-1. Restore it (preferred): `.venv/bin/python -m scripts.hygiene.tmp_sweep
+1. Restore it (preferred): `.venv/bin/python -m lu_machinery.hygiene.tmp_sweep
    restore <ledger-id>` renames what survives back to the original path; the
    result reports `mismatch` and lists what is missing or changed (exit 1 is
    expected here). Inspect it there. Anything left becomes an ordinary
@@ -550,7 +550,7 @@ the later commands and retains scratch. Inspect without changing anything:
 
 This mode accepts only the repository's shared `batch_state` root. It cannot
 be combined with `--temp-root` or `--unattributed-scratch`. New producers can
-call `scripts.hygiene.batch_state_retention.write_scratch_expiry(directory,
+call `lu_machinery.hygiene.batch_state_retention.write_scratch_expiry(directory,
 owner=canonical_task_id, purpose="disposable output")` before writing payloads.
 The helper exclusively creates `.scratch-expiry.json` with a seven-day UTC
 expiry by default. An explicit timezone-aware UTC `delete_after` is supported.
