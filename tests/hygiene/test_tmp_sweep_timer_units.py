@@ -33,8 +33,18 @@ def test_service_and_timer_contract() -> None:
     # The data-volume drop-in is product-retained (docs/step7/port_triage.py, #127 R20).
     # This package's unit template does not ship it.
     assert "PrivateTmp" not in service  # the sweep must see the real system temp area
-    # Enforced in user managers (seccomp); PrivateNetwork= is accepted there but isolates nothing.
-    assert "RestrictAddressFamilies=AF_UNIX" in service.splitlines()
+    # A user manager forces NoNewPrivileges=yes for every seccomp filter, so sudo
+    # cannot run the holder probe. The filter stays absent; IPAddressDeny= remains.
+    assert [line for line in service.splitlines() if line.startswith("RestrictAddressFamilies=")] == []
+    assert [
+        "# No RestrictAddressFamilies= here: in a user manager every seccomp-based",
+        "# setting forces NoNewPrivileges, and sudo then refuses to run the probe.",
+    ] == [
+        line
+        for line in service.splitlines()
+        if line.startswith("# No RestrictAddressFamilies=") or line.startswith("# setting forces NoNewPrivileges")
+    ]
+    assert 'Environment="LU_TMP_SWEEP_HOLDER_PROBE=sudo -n /usr/local/libexec/lu-tmp-holders"' in service.splitlines()
     assert "IPAddressDeny=any" in service.splitlines()
     assert [line for line in timer.splitlines() if line.startswith("OnCalendar=")] == ["OnCalendar=*-*-* *:30:00 UTC"]
     assert "RandomizedDelaySec=10min" in timer.splitlines()
@@ -209,51 +219,15 @@ def test_rendered_units_pass_systemd_analyze(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.skipif(
-    os.environ.get("LU_SYSTEMD_USER_PROBES") != "1",
-    reason="creates a transient unit in the real user service manager; opt in with LU_SYSTEMD_USER_PROBES=1",
-)
-def test_service_sandbox_refuses_network_sockets() -> None:
-    """Run the service's own network directives in a transient user unit and try to open sockets.
+def test_service_omits_address_family_filter() -> None:
+    """The user unit must not set an address-family filter.
 
-    This talks to the host's real systemd user manager, so it runs only on explicit opt-in.
+    In a user manager that filter forces NoNewPrivileges=yes, so sudo cannot run
+    the holder probe. IPAddressDeny= stays and is not treated as socket refusal:
+    a user manager accepts it without enforcing it. The old opt-in transient
+    unit proved the filter, which this unit is no longer allowed to set.
     """
     service = (installer.TEMPLATE_DIR / installer.UNITS[0]).read_text()
-    properties = [
-        line
-        for line in service.splitlines()
-        if line.startswith(("RestrictAddressFamilies=", "IPAddressDeny=", "PrivateNetwork="))
-    ]
-    environment = dict(os.environ)
-    environment.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    if not shutil.which("systemd-run"):
-        pytest.skip("systemd-run is not installed")
-    manager = subprocess.run(
-        ["systemctl", "--user", "show-environment"], capture_output=True, env=environment, check=False, timeout=30
-    )
-    if manager.returncode:
-        pytest.skip("no reachable systemd user manager on this runner")
-    probe = (
-        "import socket\n"
-        "for family in (socket.AF_INET, socket.AF_INET6):\n"
-        "    try:\n"
-        "        socket.socket(family, socket.SOCK_STREAM).close()\n"
-        "        print('open', family.name)\n"
-        "    except OSError:\n"
-        "        print('refused', family.name)\n"
-        "socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close()\n"
-        "print('open AF_UNIX')\n"
-    )
-    command = ["systemd-run", "--user", "--wait", "--pipe", "--quiet"]
-    for line in properties:
-        command += ["-p", line]
-    result = subprocess.run(
-        [*command, sys.executable, "-I", "-c", probe],
-        capture_output=True,
-        text=True,
-        env=environment,
-        check=False,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.split("\n")[:3] == ["refused AF_INET", "refused AF_INET6", "open AF_UNIX"]
+    assert [line for line in service.splitlines() if line.startswith("RestrictAddressFamilies=")] == []
+    assert "IPAddressDeny=any" in service.splitlines()
+    assert not any(line.startswith("PrivateNetwork=") for line in service.splitlines())
