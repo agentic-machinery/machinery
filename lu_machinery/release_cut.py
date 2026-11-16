@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -316,6 +317,19 @@ class Cut:
         env.update(extra)
         return env
 
+    def venv(self, path: Path) -> Path:
+        """A venv with no group- or other-writable file; returns its interpreter.
+
+        venv copies its activate scripts with the source's mode (shutil.copymode), which the umask
+        does not mask, and some Python installs ship them 0664.
+        """
+        self.run([self.host_python, "-I", "-m", "venv", path])
+        for script in (path / "bin").iterdir():
+            mode = script.lstat().st_mode
+            if stat.S_ISREG(mode) and mode & 0o022:
+                script.chmod(stat.S_IMODE(mode) & ~0o022)
+        return path / "bin/python"
+
     def git(self, repo: Path, *args: str, **kwargs) -> str:
         return self.run(["git", "-C", repo, *args], **kwargs).stdout.strip()
 
@@ -383,12 +397,11 @@ class Cut:
         workflow = (src / ".github/workflows/ci-gate.yml").read_text(encoding="utf-8")
         pins = self.work / "build-requirements.txt"
         pins.write_text(heredoc(workflow, "cat > build-requirements.txt <<'REQUIREMENTS'"), encoding="utf-8")
-        build_venv = self.work / "build-venv"
-        self.run([self.host_python, "-I", "-m", "venv", build_venv])
-        self.run([build_venv / "bin/python", "-I", "-m", "pip", "install", "--no-cache-dir",
+        build_python = self.venv(self.work / "build-venv")
+        self.run([build_python, "-I", "-m", "pip", "install", "--no-cache-dir",
                   "--disable-pip-version-check", "--no-input", "--require-hashes", "--only-binary=:all:",
                   "--requirement", pins])
-        self.run([build_venv / "bin/python", "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
+        self.run([build_python, "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
                   "--outdir", dist, src], env=self.scratch_env())
         files = {"wheel": dist / f"lu_machinery-{built_version}-py3-none-any.whl",
                  "sdist": dist / f"lu_machinery-{built_version}.tar.gz"}
@@ -421,8 +434,7 @@ class Cut:
         """Clean machinery-only environment: install, pip check and isolated import."""
         self.step = "clean install"
         venv = self.work / "accept"
-        self.run([self.host_python, "-I", "-m", "venv", venv])
-        python = venv / "bin/python"
+        python = self.venv(venv)
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "-r", consumer_lock])
         self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"])

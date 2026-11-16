@@ -230,10 +230,17 @@ _PREPARE_PREFIX = (
 
 def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeypatch, tmp_path, group_writable_umask):
     """Defect class: under a 0002 umask the cut's Node prefix is group-writable and Node admission refuses it."""
-    _host(monkeypatch, tmp_path, Path(sys.executable))
+    interpreter = tmp_path / "bin/python"
+    interpreter.parent.mkdir()
+    # `-I -m venv <path>`: venv copies activate scripts with their source mode, which the umask does not mask.
+    interpreter.write_text('#!/bin/sh\nmkdir -p "$4/bin" && : > "$4/bin/activate" && chmod 664 "$4/bin/activate"\n',
+                           encoding="utf-8")
+    interpreter.chmod(0o755)
+    _host(monkeypatch, tmp_path, interpreter)
     work = tmp_path / "work"
 
     def execute(cut):
+        cut.venv(cut.work / "accept")
         cut.run([sys.executable, "-I", "-c", _PREPARE_PREFIX, cut.work])
         return 0
 
@@ -245,6 +252,7 @@ def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeyp
         _check_node_artifact(directory, directory=True)
     writable = {str(path.relative_to(tmp_path)): oct(path.lstat().st_mode & 0o777)
                 for path in (work, *work.rglob("*")) if path.lstat().st_mode & 0o022}
+    assert (work / "accept/bin/activate").is_file()
     assert writable == {}
     assert os.umask(0o002) == 0o002, "main() must restore the caller's umask"
 
