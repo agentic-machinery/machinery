@@ -20,7 +20,10 @@
 #   is codeql.yml beside this file, outside the gate. installed-wheel builds the release wheel
 #   from the tracked tree, installs it offline with requirements-machinery.lock
 #   (pip --require-hashes) into a clean venv and imports every lu_machinery
-#   module from it. pytest calls tests.yml for the full six-shard suite on
+#   module from it. It then checks that wheel against the product commit
+#   pinned in product-consumer.pin beside this file: the release cut's
+#   consumer test collection (release_cut consumer-collection) and the pin's
+#   key consumer tests, on PRs and merge groups alike. pytest calls tests.yml for the full six-shard suite on
 #   merge_group, push and workflow_dispatch. pull_request calls that workflow
 #   as pr-affected and does not run the full suite.
 # - The mypy job imports lu_machinery from the checkout: it runs the ratchet
@@ -1361,7 +1364,7 @@ jobs:
   installed-wheel:
     name: Installed wheel
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1489,6 +1492,114 @@ jobs:
           env -i PATH=/usr/bin:/bin HOME="$work/scratch/home" TMPDIR="$work/scratch" \
             LEARN_UKRAINIAN_PYTHON="$work/consumer/bin/python" \
             "$work/consumer/bin/python" -I -B "$work/import_all.py" "$work/consumer"
+
+      # Product consumer check: the release cut's consumer test collection, then
+      # the pinned key tests, at the product commit in product-consumer.pin,
+      # with this wheel first. It runs in the consumer venv after the import
+      # check, the order the cut uses.
+      - name: Read the product consumer pin
+        id: pin
+        run: |
+          set -euo pipefail
+          pin=.github/workflows/product-consumer.pin
+          commits="$(grep -c '^commit ' "$pin" || true)"
+          commit="$(sed -nE 's/^commit ([0-9a-f]{40})$/\1/p' "$pin")"
+          if [ "$commits" -ne 1 ] || [ -z "$commit" ]; then
+            echo "::error::${pin} must hold exactly one 'commit <full SHA>' line"
+            exit 1
+          fi
+          tests=()
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              '' | '#'* | 'commit '*) ;;
+              'test '*)
+                path="${line#test }"
+                if ! [[ "$path" =~ ^tests/[A-Za-z0-9_/-]+\.py$ ]]; then
+                  echo "::error::${pin}: not a product test file path: ${path}"
+                  exit 1
+                fi
+                tests+=("$path")
+                ;;
+              *)
+                echo "::error::${pin}: unknown line: ${line}"
+                exit 1
+                ;;
+            esac
+          done < "$pin"
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "::error::${pin} names no key test"
+            exit 1
+          fi
+          printf '%s\n' "${tests[@]}" > "$RUNNER_TEMP/installed-wheel/key-tests.txt"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+          echo "Product pin learn-ukrainian/learn-ukrainian.github.io@${commit}; ${#tests[@]} key test file(s)"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: learn-ukrainian/learn-ukrainian.github.io
+          ref: ${{ steps.pin.outputs.commit }}
+          path: product
+          persist-credentials: false
+
+      - name: Build the product environment at the pin
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/installed-wheel"
+          product="$GITHUB_WORKSPACE/product"
+          cd "$work"
+          python -I -m venv uv-venv
+          cat > uv-requirements.txt <<'REQUIREMENTS'
+          uv==0.12.9 \
+              --hash=sha256:5badfd805fd88bf99b4b4f044f6e8f762f1892cab27477f4427bb473e93dd049
+          REQUIREMENTS
+          uv-venv/bin/python -I -m pip install --no-cache-dir --disable-pip-version-check \
+            --no-input --require-hashes --only-binary=:all: --requirement uv-requirements.txt
+          uv="$work/uv-venv/bin/uv"
+          # The product's own CI install (.github/actions/python-ci-env at the
+          # pin), less its lu-machinery release: the candidate replaces it.
+          python -I -m venv --without-pip product-venv
+          grep -viE -e '^(torch|torchvision|open_clip_torch|stanza)==' -e '^\./packages/v4-runtime$' \
+            "$product/requirements-lock.txt" > product-requirements.txt
+          "$uv" pip install --python product-venv/bin/python --no-deps -r product-requirements.txt
+          cd "$product"
+          "$uv" pip install --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
+          "$work/product-venv/bin/python" packages/v4-runtime/build_assets.py
+
+      - name: Collect the product's tests with the candidate first
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/installed-wheel"
+          product="$GITHUB_WORKSPACE/product"
+          candidate="$work/consumer/bin/python"
+          wheel="$(find "$work/dist" -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl')"
+          version="$(python -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$work/src/pyproject.toml")"
+          commit="$(git -C "$product" rev-parse HEAD)"
+          echo "Testing lu-machinery ${version} sha256:$(sha256sum "$wheel" | cut -d' ' -f1) against learn-ukrainian/learn-ukrainian.github.io@${commit}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          # Product modules resolve the project interpreter at import; the
+          # 0.1.23 cut failed its collection with this unset.
+          export LEARN_UKRAINIAN_PYTHON="$candidate"
+          # The cut's own step, from the installed candidate (release_cut consumer-collection).
+          if ! "$candidate" -I -m lu_machinery.release_cut consumer-collection --python "$candidate" \
+              --product "$product" --product-python "$work/product-venv/bin/python" --version "$version" \
+              --work "$work/collection" | tee -a "$GITHUB_STEP_SUMMARY"; then
+            sed -n '/= ERRORS =/,$p' "$work/collection/cut.log" | tail -n 200
+            exit 1
+          fi
+
+      - name: Run the key consumer tests with the candidate first
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/installed-wheel"
+          product="$GITHUB_WORKSPACE/product"
+          candidate="$work/consumer/bin/python"
+          mapfile -t tests < "$work/key-tests.txt"
+          cd "$product"
+          # The collection environment: the candidate's venv now ends with the
+          # product environment's site-packages.
+          env -u PYTHONPATH LEARN_UKRAINIAN_PYTHON="$candidate" LU_PRODUCT_ROOT="$product" \
+            LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$product" "$candidate" -m pytest "${tests[@]}"
+          echo "Key consumer tests passed: ${tests[*]}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove build files
         if: always()
