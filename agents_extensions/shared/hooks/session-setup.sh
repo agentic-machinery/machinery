@@ -95,13 +95,11 @@ fi
 # CI can't catch it; only a local canary can. Detect the exact absolute
 # self-link here and leave repair to the explicit doctor command. See
 # docs/bug-autopsies/node-modules-eloop-symlink.md.
-_LU_SYMLINK_DOCTOR=lu_machinery/hygiene/check_self_symlinks.py
 for _nm in "$_LU_REPO/node_modules" "$_LU_REPO/site/node_modules"; do
   if [ -L "$_nm" ] && [ "$(readlink "$_nm" 2>/dev/null)" = "$_nm" ]; then
-    echo "WARNING: self-referential symlink detected at $_nm (npm spawn ELOOP). Inspect it, then run: .venv/bin/python $_LU_SYMLINK_DOCTOR --fix" >&2
+    echo "WARNING: self-referential symlink detected at $_nm (npm spawn ELOOP). Inspect it, then run: .venv/bin/python -m lu_machinery.hygiene.check_self_symlinks --fix" >&2
   fi
 done
-unset _LU_SYMLINK_DOCTOR
 
 # Skip in non-interactive (headless) mode
 if [ -n "$CLAUDE_NON_INTERACTIVE" ] || [ -n "$LEARN_UKRAINIAN_PIPELINE" ] || [ -n "$GEMINI_SESSION" ]; then
@@ -610,7 +608,6 @@ EOF
 build_handoff_fallback() {
   local warning_text="$1"
   local prefix=""
-  local prepare_script=lu_machinery/orchestration/thread_handoff.py
 
   if [ -n "$warning_text" ]; then
     prefix="$warning_text
@@ -622,7 +619,7 @@ build_handoff_fallback() {
 ${prefix}PREVIOUS-SESSION HANDOFF — legacy git router opt-in could not locate a compact handoff.
 
 Do not dump or rewrite docs/session-state/current.md. For thread rollover, run:
-.venv/bin/python ${prepare_script} prepare --agent $HANDOFF_AGENT
+.venv/bin/python -m lu_machinery.orchestration.thread_handoff prepare --agent $HANDOFF_AGENT
 
 ---
 EOF
