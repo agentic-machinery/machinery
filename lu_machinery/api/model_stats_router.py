@@ -9,20 +9,23 @@ One read-only collector joins two durable sources:
 
 One refresh computes every window (7, 30, 90 days and all) and the ISO-week buckets; the route serves a window
 of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``. Every figure
-splits by the concrete model id and the effective effort (``unset`` when none was recorded). Definitions follow
-the CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a
-review, otherwise a write; review rounds are the distinct pinned heads reviewed per PR. Only counts and model,
-effort, class, pool and repository labels leave this module: no prompt, body, path, account or task id.
+splits by the concrete model id and the effective effort (``unset`` when none was recorded); a bare Claude alias
+(``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
+CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
+otherwise a write. Verdict figures count only reviews of record (a review that names its PR and the author's
+model) whose reply parsed; review rounds are the distinct pinned heads such reviews judged per PR. Only counts and
+model, effort, class, pool and repository labels leave this module: no prompt, body, path, account or task id.
 """
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import subprocess
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -32,6 +35,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 from prometheus_client.core import GaugeMetricFamily
 
+from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
@@ -39,11 +43,13 @@ from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
-from .state_helpers import cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
+from .state_helpers import cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
 
 SCHEMA_VERSION = "model-stats.v2"
 REFRESH_SECONDS = 300.0
 FRESHNESS_BOUND_SECONDS = 420.0
+# A request that finds no snapshot waits this long for the single-flight collect before it answers pending.
+COLD_WAIT_SECONDS = 15.0
 LOW_SAMPLE = 10
 GIT_TIMEOUT_SECONDS = 30.0
 WINDOWS: dict[str, int | None] = {"7d": 7, "30d": 30, "90d": 90, "all": None}
@@ -168,7 +174,9 @@ class _Row:
     tokens: tuple[int, int, int]
     trailer: bool
     delivery: bool
+    # A review of record's verdict and finding priorities; None for every other task.
     review: tuple[str, Counter[str]] | None
+    author: str | None
     allowance: tuple[str, float] | None
     raw: Mapping[str, Any]
 
@@ -196,18 +204,61 @@ def _count(mapping: Mapping[str, Any], key: str) -> int:
     return value if type(value) is int and value >= 0 else 0
 
 
-def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing) -> Iterator[_Row]:
+def _moment(raw: Mapping[str, Any]) -> datetime | None:
+    return timestamp(raw.get("finished_at")) or timestamp(raw.get("started_at"))
+
+
+def alias_resolver(raw_rows: Iterable[Mapping[str, Any]]) -> Callable[[str, datetime], str]:
+    """Map a bare Claude alias (``opus``) to the catalog model it ran, where the rows make that unambiguous.
+
+    The alias runs its family's newest catalog id (the dispatcher's own resolution, ``_newest_claude``). A row
+    counts as that id only when it is no older than the first row that names the id and no other model of the
+    family appears in any row at or after it; otherwise its version is unknown and the alias stays as recorded.
+    """
+    first: dict[str, datetime] = {}
+    last: dict[str, datetime] = {}
     for raw in raw_rows:
-        moment = timestamp(raw.get("finished_at")) or timestamp(raw.get("started_at"))
+        moment, model = _moment(raw), raw.get("model")
+        if moment is None or not isinstance(model, str):
+            continue
+        first[model] = min(first.get(model, moment), moment)
+        last[model] = max(last.get(model, moment), moment)
+    targets: dict[str, str | None] = {}
+
+    def resolve(model: str, moment: datetime) -> str:
+        if model not in NATIVE_ALIASES:
+            return model
+        if model not in targets:
+            targets[model] = _newest_claude(model)
+        target = targets[model]
+        if target is None or target not in first or moment < first[target]:
+            return model
+        prefix = f"claude-{model}-"
+        if any(other != target and other.startswith(prefix) and seen >= moment for other, seen in last.items()):
+            return model
+        return target
+
+    return resolve
+
+
+def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
+          resolve: Callable[[str, datetime], str] = lambda model, _moment: model) -> Iterator[_Row]:
+    for raw in raw_rows:
+        moment = _moment(raw)
         if moment is None:
             continue
         status = raw.get("status")
         role = "review" if raw.get("role") == "review" else "write"
         review = raw.get("review") if isinstance(raw.get("review"), Mapping) else None
+        # A review of record names the reviewed PR and the author's model; advice, critics and canaries do not.
+        author = raw.get("author_model") if role == "review" and raw.get("pr") is not None else None
+        if not author:
+            review = author = None
         priorities = review.get("priorities") if review and isinstance(review.get("priorities"), Mapping) else {}
         counts = cast(dict[str, Any], raw.get("tokens")) if isinstance(raw.get("tokens"), Mapping) else {}
         yield _Row(
-            task_id=raw["task_id"], model=str(raw.get("model") or "unknown"), effort=str(raw.get("effort") or "unset"),
+            task_id=raw["task_id"], model=resolve(str(raw.get("model") or "unknown"), moment),
+            effort=str(raw.get("effort") or "unset"),
             role=role, task_class=str(raw.get("class") or "unclassified"),
             status=status if status in STATUSES else "other", moment=moment, started=timestamp(raw.get("started_at")),
             duration=_number(raw.get("duration_s")),
@@ -215,6 +266,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing) -> Iterator[_
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
             review=((review.get("verdict") if review.get("verdict") in VERDICTS else "unparsed"),
                     Counter({p: int(n) for p, n in priorities.items() if isinstance(n, int)})) if review else None,
+            author=resolve(str(author), moment) if author else None,
             allowance=_allowance(raw.get("allowance")) if role == "write" else None,
             raw=raw,
         )
@@ -239,7 +291,8 @@ class _Group:
         self.landed += row.landed
         if row.review is not None:
             self.verdicts[row.review[0]] += 1
-            self.priorities.update(row.review[1])
+            if row.review[0] != "unparsed":
+                self.priorities.update(row.review[1])
         if row.allowance is not None:
             if row.allowance[1] < 0:  # the weekly window reset between the readings
                 self.allowance["reset_crossed"] += 1
@@ -247,6 +300,18 @@ class _Group:
                 self.allowance["tasks"] += 1
                 self.allowance["landed"] += row.landed
                 self.points += row.allowance[1]
+
+    def merge(self, other: _Group) -> _Group:
+        """Add another group's tasks: one pass over the rows, then cheap merges, builds every coarser group."""
+        self.status.update(other.status)
+        self.durations.extend(other.durations)
+        self.tokens = [a + b for a, b in zip(self.tokens, other.tokens, strict=True)]
+        self.landed += other.landed
+        self.verdicts.update(other.verdicts)
+        self.priorities.update(other.priorities)
+        self.allowance.update(other.allowance)
+        self.points += other.points
+        return self
 
     def to_dict(self, role: str) -> dict[str, Any]:
         tasks = sum(self.status.values())
@@ -273,6 +338,7 @@ class _Group:
                 allowance_pct_points_per_landed=_rate(self.points, self.allowance["landed"], 2),
             )
         else:
+            # Reviews of record only; an unparsed reply is shown but enters no rate.
             parsed = sum(self.verdicts[v] for v in VERDICTS[:3])
             out.update(
                 verdicts={name: self.verdicts[name] for name in VERDICTS},
@@ -287,24 +353,43 @@ def _ordered(groups: Mapping[Any, _Group]) -> list[tuple[Any, _Group]]:
     return sorted(groups.items(), key=lambda item: (-sum(item[1].status.values()), item[0]))
 
 
-def _models(rows: list[_Row]) -> list[dict[str, Any]]:
+# (model, role, effort, class): the finest split; every other model figure is a merge of these.
+_Fine = dict[tuple[str, str, str, str], _Group]
+
+
+def _fine(rows: Iterable[_Row]) -> _Fine:
+    fine: _Fine = defaultdict(_Group)
+    for row in rows:
+        fine[(row.model, row.role, row.effort, row.task_class)].add(row)
+    return fine
+
+
+def _bounded(fine: _Fine) -> _Fine:
+    """The same groups under /metrics labels: a model or effort outside the catalog's known values is ``other``."""
+    bounded: _Fine = defaultdict(_Group)
+    for (model, role, effort, task_class), group in fine.items():
+        bounded[(metric_model(model), role, metric_effort(effort), task_class)].merge(group)
+    return bounded
+
+
+def _models(fine: _Fine) -> list[dict[str, Any]]:
     """Per (model, role): the totals over every effort and their class split, then per effort with its own classes."""
     totals: dict[tuple[str, str], _Group] = defaultdict(_Group)
     classes: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     efforts: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
-    effort_classes: dict[tuple[str, str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
-    for row in rows:
-        key = (row.model, row.role)
-        totals[key].add(row)
-        classes[key][row.task_class].add(row)
-        efforts[key][row.effort].add(row)
-        effort_classes[(*key, row.effort)][row.task_class].add(row)
+    effort_classes: dict[tuple[str, str, str], dict[str, _Group]] = defaultdict(dict)
+    for (model, role, effort, task_class), group in fine.items():
+        key = (model, role)
+        totals[key].merge(group)
+        classes[key][task_class].merge(group)
+        efforts[key][effort].merge(group)
+        effort_classes[(*key, effort)][task_class] = group
 
     def by_class(groups: Mapping[str, _Group], role: str) -> list[dict[str, Any]]:
         return [{"class": name, **group.to_dict(role)} for name, group in _ordered(groups)]
 
     return [
-        {"model": model, "role": role, "effort": ALL_EFFORTS, **group.to_dict(role),
+        {"model": model, "identity": identity(model), "role": role, "effort": ALL_EFFORTS, **group.to_dict(role),
          "by_effort": [{"effort": effort, **cls.to_dict(role),
                         "by_class": by_class(effort_classes[(model, role, effort)], role)}
                        for effort, cls in _ordered(efforts[(model, role)])],
@@ -313,45 +398,85 @@ def _models(rows: list[_Row]) -> list[dict[str, Any]]:
     ]
 
 
-def _authors(rows: list[_Row], name: Callable[[str], str] = str) -> list[dict[str, Any]]:
-    """Author-side review outcomes: rounds are distinct pinned heads per PR, ordered by first review start."""
-    prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": {}})
+def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
+    """One outcome per reviewed PR, from its parsed reviews of record only (an unparsed reply is no round).
+
+    Rounds are the distinct pinned heads, ordered by their first review's start; the first round is the earliest
+    review of the earliest head, and its reviewer and review class are the ones the matrix splits by.
+    """
+    prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": defaultdict(list)})
+    never = datetime.max.replace(tzinfo=UTC)
     for row in rows:
-        pr, author = row.raw.get("pr"), row.raw.get("author_model")
-        if row.role != "review" or not author or not pr:
+        if row.review is None or row.review[0] == "unparsed" or row.author is None:
             continue
-        entry = prs[(str(row.raw.get("repo") or "public"), str(pr))]
-        entry["authors"].add(str(author))
-        head = row.raw.get("pinned_head") or row.task_id
-        started = row.started or datetime.max.replace(tzinfo=UTC)
-        previous = entry["heads"].get(head)
-        known = row.review if row.review is not None and row.review[0] != "unparsed" else None
-        if previous is None:
-            entry["heads"][head] = [started, known]
-        else:
-            previous[0] = min(previous[0], started)
-            if previous[1] is None:
-                previous[1] = known
-    by_author: dict[str, Counter[str]] = defaultdict(Counter)
+        entry = prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))]
+        entry["authors"].add(row.author)
+        entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
+            (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class))
+    outcomes = []
     for entry in prs.values():
-        heads = sorted(entry["heads"].values(), key=lambda head: head[0])
-        verdicts = [head[1][0] if head[1] else None for head in heads]
-        counts = by_author[name("+".join(sorted(entry["authors"])))]
+        heads = sorted((sorted(reviews, key=lambda r: r[:2]) for reviews in entry["heads"].values()),
+                       key=lambda reviews: reviews[0][:2])
+        _, _, verdict, _, reviewer, review_class = heads[0][0]
+        after_block = None
+        if verdict != "correct":
+            after_block = ("approved_on_same_head" if any(r[2] == "correct" for r in heads[0][1:])
+                           else "approved_on_new_head" if any(r[2] == "correct" for h in heads[1:] for r in h)
+                           else "not_approved")
+        outcomes.append({
+            "author": "+".join(sorted(entry["authors"])), "rounds": len(heads), "first": verdict,
+            "reviewer": reviewer, "class": review_class, "after_block": after_block,
+            "approved": any(r[2] == "correct" for h in heads for r in h),
+            # Findings of each round: the head's first review.
+            "blocking": sum(h[0][3][p] for h in heads for p in BLOCKING),
+            "p0_p2": sum(h[0][3][p] for h in heads for p in P0_P2),
+        })
+    return outcomes
+
+
+AFTER_BLOCK = ("approved_on_new_head", "approved_on_same_head", "not_approved")
+
+
+def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str) -> list[dict[str, Any]]:
+    """Author-side review outcomes per author model (a PR with two author models is grouped under ``a+b``)."""
+    by_author: dict[str, Counter[str]] = defaultdict(Counter)
+    for pr in prs:
+        counts = by_author[name(pr["author"])]
         counts["prs"] += 1
-        counts["rounds"] += len(heads)
-        counts["approved"] += "correct" in verdicts
-        counts["first_round_approved"] += verdicts[0] == "correct"
-        counts["blocking"] += sum(sum(head[1][1][p] for p in BLOCKING) for head in heads if head[1])
-        counts["p0_p2"] += sum(sum(head[1][1][p] for p in P0_P2) for head in heads if head[1])
+        counts["rounds"] += pr["rounds"]
+        counts["approved"] += pr["approved"]
+        counts["first_round_approved"] += pr["first"] == "correct"
+        counts["blocking"] += pr["blocking"]
+        counts["p0_p2"] += pr["p0_p2"]
+        if pr["after_block"] is not None:
+            counts["blocked"] += 1
+            counts[pr["after_block"]] += 1
     return [
-        {"model": author, "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
+        {"model": author, "identity": identity(author), "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
          "rounds_per_pr": _rate(c["rounds"], c["prs"], 2),
          "approved_eventually": _rate(c["approved"], c["prs"]),
          "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
          "blocking_per_pr": _rate(c["blocking"], c["prs"], 2),
-         "p0_p2_per_pr": _rate(c["p0_p2"], c["prs"], 2)}
+         "p0_p2_per_pr": _rate(c["p0_p2"], c["prs"], 2),
+         # After a first round that did not approve: did a later round approve a new head (the author changed the
+         # code), the same head (approved without a change), or nothing yet in this window?
+         "after_blocked_first_round": {"blocked": c["blocked"],
+                                       **{outcome: _rate(c[outcome], c["blocked"]) for outcome in AFTER_BLOCK}}}
         for author, c in sorted(by_author.items(), key=lambda item: (-item[1]["prs"], item[0]))
     ]
+
+
+def _matrix(prs: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """First-round approval per (author, first reviewer, review class), and per pair over every class (``all``)."""
+    cells: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for pr in prs:
+        for review_class in (ALL_CLASSES, pr["class"]):
+            cell = cells[(pr["author"], pr["reviewer"], review_class)]
+            cell[0] += pr["first"] == "correct"
+            cell[1] += 1
+    return [{"author": author, "reviewer": reviewer, "class": review_class, "approved": approved,
+             "first_round_approved": _rate(approved, n)}
+            for (author, reviewer, review_class), (approved, n) in sorted(cells.items())]
 
 
 def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
@@ -369,12 +494,18 @@ def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
     ]
 
 
-def summarize(rows: Iterable[_Row]) -> dict[str, Any]:
+def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
+              prs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Every figure of one window's rows."""
     selected = list(rows)
+    fine = _fine(selected) if fine is None else fine
+    prs = _prs(selected) if prs is None else prs
+    used = {model for model, *_ in fine}
     return {
-        "models": _models(selected), "authors": _authors(selected), "allowance": _allowance_rows(selected),
-        "records": len(selected),
+        "models": _models(fine), "authors": _authors(prs), "first_round_matrix": _matrix(prs),
+        "allowance": _allowance_rows(selected), "records": len(selected),
+        # Every model the catalog still routes (not retired) that ran no task in this window.
+        "idle_catalog_models": sorted(_routed_models() - used),
         # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
         "landed_by": dict(sorted(Counter(
             "both" if row.trailer and row.delivery else "trailer" if row.trailer else "delivery"
@@ -383,13 +514,43 @@ def summarize(rows: Iterable[_Row]) -> dict[str, Any]:
 
 
 OTHER = "other"
+ALL_CLASSES = "all"
 _KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
 
 
 @lru_cache(maxsize=1)
+def _catalog_models() -> dict[str, Any]:
+    return dict(load_model_catalog().get("models") or {})
+
+
+@lru_cache(maxsize=1)
 def _known_models() -> frozenset[str]:
-    catalog = load_model_catalog()
-    return frozenset({*(catalog.get("models") or {}), *NATIVE_ALIASES, "unknown"})
+    return frozenset({*_catalog_models(), *NATIVE_ALIASES, "unknown"})
+
+
+def _routed_models() -> frozenset[str]:
+    try:
+        models = _catalog_models()
+    except Exception:  # no catalog: no model is known to be routed
+        return frozenset()
+    return frozenset(mid for mid, info in models.items()
+                     if isinstance(info, Mapping) and info.get("lifecycle") != "retired")
+
+
+# What a model label that is not a catalog id stands for; the page groups and labels these apart.
+_NOT_CONCRETE = {**dict.fromkeys(NATIVE_ALIASES, "alias"), "auto": "harness_choice", "unknown": "unreported",
+                 "unrecognized": "unreported"}
+
+
+def identity(model: str) -> str:
+    """``catalog`` for a catalog id; else ``alias`` (version not observed), ``harness_choice`` (Cursor Auto),
+    ``unreported`` (no model reported), ``joint`` (a PR reviewed for two author models) or ``not_in_catalog``."""
+    try:
+        if model in _catalog_models():
+            return "catalog"
+    except Exception:  # no catalog: no value is known to be a catalog id
+        pass
+    return _NOT_CONCRETE.get(model, "joint" if "+" in model else "not_in_catalog")
 
 
 def metric_model(model: str) -> str:
@@ -411,11 +572,18 @@ def week_of(moment: datetime) -> str:
     return f"{year}-W{week:02d}"
 
 
-def _weeks(rows: list[_Row]) -> list[dict[str, Any]]:
+_Weeks = dict[tuple[str, str, str, str], _Group]
+
+
+def _week_groups(rows: Iterable[_Row]) -> _Weeks:
     """Counts per ISO week (by finish, else start), concrete model, effective effort and role."""
-    groups: dict[tuple[str, str, str, str], _Group] = defaultdict(_Group)
+    groups: _Weeks = defaultdict(_Group)
     for row in rows:
         groups[(week_of(row.moment), row.model, row.effort, row.role)].add(row)
+    return groups
+
+
+def _weeks(groups: _Weeks) -> list[dict[str, Any]]:
     return [
         {"week": week, "model": model, "effort": effort, "role": role, "tasks": sum(g.status.values()),
          "landed": g.landed, "status": {name: g.status[name] for name in (*STATUSES, "other") if g.status[name]}}
@@ -428,31 +596,35 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     """One snapshot: every window and the ISO-week buckets, from the summary rows and one landing scan."""
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
-    moments = [m for m in (timestamp(r.get("finished_at")) or timestamp(r.get("started_at")) for r in raw_rows) if m]
+    moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     if landing is None:
         landing = scan_landing(primary_root, first)
-    rows = [row for row in _rows(raw_rows, landing) if row.moment < until]
-    # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
-    bounded = [replace(row, model=metric_model(row.model), effort=metric_effort(row.effort)) for row in rows]
+    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
     windows, metric_windows = {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
+        selected = [row for row in rows if since <= row.moment]
+        fine, prs = _fine(selected), _prs(selected)
         windows[name] = {
             "window": {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                        "cohort": "finished_at, else started_at, in [since, until)"},
-            **summarize(row for row in rows if since <= row.moment),
+            **summarize(selected, fine, prs),
         }
-        selected = [row for row in bounded if since <= row.moment]
-        metric_windows[name] = {"models": _models(selected), "authors": _authors(selected, metric_model)}
+        # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
+        metric_windows[name] = {"models": _models(_bounded(fine)), "authors": _authors(prs, metric_model)}
+    weeks = _week_groups(rows)
+    bounded_weeks: _Weeks = defaultdict(_Group)
+    for (week, model, effort, role), group in weeks.items():
+        bounded_weeks[(week, metric_model(model), metric_effort(effort), role)].merge(group)
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
         "low_sample_below": LOW_SAMPLE,
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
-        "weeks": _weeks(rows),
-        "metrics": {"windows": metric_windows, "weeks": _weeks(bounded)},
+        "weeks": _weeks(weeks),
+        "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict()},
     }
 
@@ -461,13 +633,16 @@ def _cache_key(ctx: MonitorContext) -> str:
     return ctx_scoped_ttl_key(ctx, "model-stats", SCHEMA_VERSION)
 
 
+def _compute(ctx: MonitorContext) -> Callable[[], dict[str, Any]]:
+    return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root)
+
+
 def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
     """The stored snapshot and its age; schedules the single-flight refresh when absent or older than 300 s."""
     key = _cache_key(ctx)
     stored = cache_get_stored(key)
     if stored is None or stored[1] >= REFRESH_SECONDS:
-        schedule_cache_refresh(key, REFRESH_SECONDS,
-                               lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root))
+        schedule_cache_refresh(key, REFRESH_SECONDS, _compute(ctx))
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
@@ -476,12 +651,25 @@ async def model_stats(
     window: Literal["7d", "30d", "90d", "all"] = Query(default="7d", description="Window: 7d, 30d, 90d or all"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
-    """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight."""
+    """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
+
+    With no snapshot yet (a fresh Monitor), the request joins that flight for up to ``COLD_WAIT_SECONDS`` and is
+    answered as soon as it finishes, so the first page load waits for the collect itself, never a poll interval.
+    """
     stored = cached_snapshot(ctx)
     if stored is None:
-        return JSONResponse({"status": "pending", "schema_version": SCHEMA_VERSION},
-                            headers={**snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True),
-                                     "Retry-After": "5"})
+        try:
+            computed = await asyncio.wait_for(
+                cache_get_or_compute_async(_cache_key(ctx), REFRESH_SECONDS, _compute(ctx)), COLD_WAIT_SECONDS)
+        except TimeoutError:  # the flight keeps running; the page asks again
+            return JSONResponse({"status": "pending", "schema_version": SCHEMA_VERSION},
+                                headers={**snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True),
+                                         "Retry-After": "1"})
+        except Exception as exc:  # a failed collect is reported, never retried in a loop by the page
+            return JSONResponse({"status": "unavailable", "schema_version": SCHEMA_VERSION,
+                                 "error": type(exc).__name__}, status_code=503,
+                                headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
+        stored = (computed, 0.0)
     snapshot, age = stored
     body = {key: value for key, value in snapshot.items() if key not in ("windows", "metrics")}
     return JSONResponse({**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)},

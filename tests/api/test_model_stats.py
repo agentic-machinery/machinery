@@ -7,17 +7,22 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest
 
 from lu_machinery.agent_runtime import model_pause
 from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
+from lu_machinery.api.monitor_context import get_ctx
+from lu_machinery.api.state_helpers import cache_invalidate
 from lu_machinery.dispatcher import store, worker
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
@@ -33,8 +38,9 @@ def _record(tasks: Path, task_id: str, **fields) -> dict:
 
 
 def _review(tasks: Path, task_id: str, correctness: str, priorities: list[str], **fields) -> None:
-    _record(tasks, task_id, mode="read-only", agent="claude", model="opus", resolved_model="claude-opus-5-5",
-            resolved_model_known=True, review_profile="code", review_risk="medium", **fields)
+    _record(tasks, task_id, **{"mode": "read-only", "agent": "claude", "model": "opus",
+                               "resolved_model": "claude-opus-5-5", "resolved_model_known": True,
+                               "review_profile": "code", "review_risk": "medium", **fields})
     findings = [{"id": f"F{i}", "priority": p, "body": f"finding body {i}"} for i, p in enumerate(priorities)]
     (tasks / f"{task_id}.result").write_text(json.dumps({"overall": {"correctness": correctness}, "findings": findings}))
 
@@ -112,7 +118,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
 
     review = _row(payload, "claude-opus-5-5", "review")
     assert review["tasks"] == 3 and "landed" not in review
-    assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 1}
+    # r3 names no PR, so it is a review task but no review of record: its verdict enters no figure.
+    assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 0}
     assert review["blocking_per_review"]["value"] == 1.0 and review["p0_p2_per_review"]["value"] == 1.5
     assert review["by_class"][0]["class"] == "code/medium"
 
@@ -331,3 +338,139 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
     assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
+
+
+def _at(hours: float) -> str:
+    return (NOW - timedelta(hours=hours)).isoformat()
+
+
+def test_only_parsed_reviews_of_record_enter_verdict_figures(tmp_path):
+    """Defect class: an unparsed reply, or a review that is not of record (advice, critic, canary), counted as a
+    verdict, which lowers every author's first-round approval and every reviewer's approve rate."""
+    batch_state, tasks = _state(tmp_path)
+    _review(tasks, "u-review", "incorrect", [], pr=9, review_author_model="gpt-6.1-sol", pinned_head="1" * 40,
+            started_at=_at(3))
+    (tasks / "u-review.result").write_text("Looks fine to me.")  # no verdict the review contract reads
+    _review(tasks, "p-review", "correct", [], pr=9, review_author_model="gpt-6.1-sol", pinned_head="2" * 40)
+    _review(tasks, "canary-review", "incorrect", ["P0"])  # names no PR or author model: not a review of record
+    rows.backfill(tasks, batch_state)
+
+    window = _window(batch_state, stats.Landing())
+
+    review = _row(window, "claude-opus-5-5", "review")
+    assert review["tasks"] == 3
+    assert review["verdicts"] == {"correct": 1, "incorrect": 0, "uncertain": 0, "unparsed": 1}
+    assert review["approve_rate"] == {"value": 1.0, "n": 1, "low_sample": True}
+    assert review["blocking_per_review"]["value"] == 0.0
+    (author,) = window["authors"]
+    assert (author["prs"], author["rounds_per_pr"]["value"], author["first_round_approved"]["value"]) == (1, 1.0, 1.0)
+    assert author["after_blocked_first_round"]["blocked"] == 0
+
+
+def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):
+    """Defect class: one first-round figure per author that mixes author, reviewer and risk; the first round taken
+    in row order instead of by start; or a blocked PR's later outcome misread (new head, same head, none)."""
+    batch_state, tasks = _state(tmp_path)
+    sol, grok, sonnet = "gpt-6.1-sol", "grok-4.7", {"resolved_model": "claude-sonnet-5-5"}
+    critical = {"review_profile": "infra", "review_risk": "critical"}
+    heads = {name: name[-1] * 40 for name in ("h1", "h2", "h3", "h4", "h5", "h6")}
+    # PR 1: Sol, blocked by Opus, then a new head approved.
+    _review(tasks, "p1a-review", "incorrect", ["P1"], pr=1, review_author_model=sol, pinned_head=heads["h1"],
+            started_at=_at(6), **critical)
+    _review(tasks, "p1b-review", "correct", [], pr=1, review_author_model=sol, pinned_head=heads["h2"],
+            started_at=_at(4), **critical)
+    # PR 2: Sol, approved by Sonnet at once.
+    _review(tasks, "p2-review", "correct", [], pr=2, review_author_model=sol, pinned_head=heads["h3"], **sonnet)
+    # PR 3: Grok, approved by Opus first; a later Sonnet review of the same head (stored first) is no first round.
+    _review(tasks, "a3-review", "incorrect", [], pr=3, review_author_model=grok, pinned_head=heads["h4"],
+            started_at=_at(2), **sonnet, **critical)
+    _review(tasks, "p3-review", "correct", [], pr=3, review_author_model=grok, pinned_head=heads["h4"],
+            started_at=_at(5), **critical)
+    # PR 4: Grok, blocked by Opus, then the same head approved; PR 5: Grok, blocked by Sonnet, nothing after.
+    _review(tasks, "p4a-review", "incorrect", [], pr=4, review_author_model=grok, pinned_head=heads["h5"],
+            started_at=_at(5), **critical)
+    _review(tasks, "p4b-review", "correct", [], pr=4, review_author_model=grok, pinned_head=heads["h5"],
+            started_at=_at(3), **sonnet, **critical)
+    _review(tasks, "p5-review", "uncertain", [], pr=5, review_author_model=grok, pinned_head=heads["h6"], **sonnet)
+    rows.backfill(tasks, batch_state)
+
+    window = _window(batch_state, stats.Landing())
+
+    cells = {(c["author"], c["reviewer"], c["class"]): (c["approved"], c["first_round_approved"]["n"])
+             for c in window["first_round_matrix"]}
+    assert cells == {
+        (sol, "claude-opus-5-5", "all"): (0, 1), (sol, "claude-opus-5-5", "infra/critical"): (0, 1),
+        (sol, "claude-sonnet-5-5", "all"): (1, 1), (sol, "claude-sonnet-5-5", "code/medium"): (1, 1),
+        (grok, "claude-opus-5-5", "all"): (1, 2), (grok, "claude-opus-5-5", "infra/critical"): (1, 2),
+        (grok, "claude-sonnet-5-5", "all"): (0, 1), (grok, "claude-sonnet-5-5", "code/medium"): (0, 1),
+    }
+    after = {a["model"]: a["after_blocked_first_round"] for a in window["authors"]}
+    assert after[sol]["blocked"] == 1 and after[sol]["approved_on_new_head"]["value"] == 1.0
+    assert after[grok]["blocked"] == 2
+    assert [after[grok][k]["value"] for k in stats.AFTER_BLOCK] == [0.0, 0.5, 0.5]
+
+
+def test_aliases_map_to_the_model_they_ran_only_when_unambiguous(tmp_path):
+    """Defect class: a harness alias shown as a separate model, mapped to a version it may not have run, or a
+    routed catalog model missing from the page because it ran nothing in the window."""
+    batch_state, tasks = _state(tmp_path)
+    _record(tasks, "opus-observed", agent="claude", model="claude-opus-5-5", finished_at=_at(3))
+    _record(tasks, "opus-alias", agent="claude", model="opus", finished_at=_at(2))
+    _record(tasks, "sonnet-alias-early", agent="claude", model="sonnet", finished_at=_at(5))
+    _record(tasks, "sonnet-observed", agent="claude", model="claude-sonnet-5-5", finished_at=_at(3))
+    _record(tasks, "cursor-auto", agent="cursor", model="auto")
+    _record(tasks, "no-model", agent="cursor", model=None)
+    _record(tasks, "hydrogen", agent="agy", model="gemini-4-hydrogen")
+    _review(tasks, "alias-review", "correct", [], model="opus", resolved_model_known=False, pr=1,
+            review_author_model="opus")
+    rows.backfill(tasks, batch_state)
+
+    window = _window(batch_state, stats.Landing())
+
+    seen = {(r["model"], r["role"]): (r["identity"], r["tasks"]) for r in window["models"]}
+    assert seen == {
+        ("claude-opus-5-5", "write"): ("catalog", 2), ("claude-opus-5-5", "review"): ("catalog", 1),
+        ("claude-sonnet-5-5", "write"): ("catalog", 1), ("sonnet", "write"): ("alias", 1),
+        ("auto", "write"): ("harness_choice", 1), ("unknown", "write"): ("unreported", 1),
+        ("gemini-4-hydrogen", "write"): ("catalog", 1),
+    }
+    assert [(a["model"], a["identity"]) for a in window["authors"]] == [("claude-opus-5-5", "catalog")]
+    idle = window["idle_catalog_models"]
+    assert idle and not {"gemini-4-hydrogen", "claude-opus-5-5"} & set(idle)
+    assert all(stats.identity(model) == "catalog" for model in idle)
+
+
+def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypatch):
+    """Defect class: a fresh Monitor answering pending so the page waits a fixed poll interval although the collect
+    finishes sooner, a second collect for one cold start, or a slow collect holding the request without bound."""
+    release, calls = threading.Event(), []
+
+    def fake_collect(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            release.wait(10)
+        return {"schema_version": stats.SCHEMA_VERSION, "windows": {"7d": {"records": len(calls)}}, "metrics": {}}
+
+    monkeypatch.setattr(stats, "collect", fake_collect)
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=tmp_path,
+                                                live_repo_root=tmp_path))
+    app = FastAPI()
+    app.include_router(stats.router, prefix="/model-stats")
+    app.dependency_overrides[get_ctx] = lambda: ctx
+    try:
+        with TestClient(app) as client:
+            cold = client.get("/model-stats")
+            assert cold.json()["status"] == "ok" and cold.json()["records"] == 1 and calls == [1]
+
+            cache_invalidate(str(tmp_path.resolve()))
+            monkeypatch.setattr(stats, "COLD_WAIT_SECONDS", 0.05)
+            slow = client.get("/model-stats")
+            assert slow.json()["status"] == "pending" and slow.headers["Retry-After"] == "1"
+            release.set()
+            deadline = time.monotonic() + 5
+            while (body := client.get("/model-stats").json())["status"] != "ok" and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert body["records"] == 2 and calls == [1, 1]
+    finally:
+        release.set()
+        cache_invalidate(str(tmp_path.resolve()))

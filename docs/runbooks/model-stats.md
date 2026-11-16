@@ -26,9 +26,8 @@ from its record while the record exists.
 The file sits beside `batch_state/tasks/`, not in it: archiving or deleting task records never removes a row,
 so every window, including `all`, keeps working after retention. It is one append-only JSON-lines file under an
 advisory lock, the same kind of store as the Monitor's `batch_state/load-samples/`. At the 2026-11 rate (about
-400 tasks a day, about 520 bytes a row) it grows by roughly 75 MB a year. Measured on 100,000 synthetic rows:
-reading takes about 1.4 s and a full refresh of every window and week about 5 s, off the event loop, once per
-300 s. Past about 500,000 rows, revisit the store (an indexed table or weekly roll-ups).
+400 tasks a day, about 520 bytes a row) it grows by roughly 75 MB a year. Past about 500,000 rows, revisit the
+store (an indexed table or weekly roll-ups).
 
 ### Backfill (once, after the release that adds the rows)
 
@@ -43,14 +42,38 @@ older version of its record (`refreshed`), and prints the counts. A malformed re
 and never stops it. It never changes a task record, and rerunning it adds nothing new, so it is also the repair for
 a row a settlement failed to write.
 
+## Speed
+
+One refresh reads the rows once and adds each task to its finest group (model, role, effort, class) once per
+window; every coarser figure, and the `/metrics` copy with bounded labels, is a merge of those groups. Measured on
+2026-11-16 on the backfilled store (27,572 rows), in one process outside the Monitor: reading 0.6 s, the landing
+scan of eight repositories 0.5 s, the aggregation 2.2 s (3.3 s before this layout). A warm request serves the
+stored snapshot in about 10 ms (7d, about 650 KB) to 20 ms (`all`, about 1.5 MB).
+
+The snapshot is refreshed off the event loop every 300 s while the route or `/metrics` is read. A request that
+finds no snapshot (a Monitor that just started) joins that single flight and is answered as soon as it finishes,
+waiting at most 15 s; only past that does it answer `pending` with `Retry-After: 1`, and the page asks again
+after that many seconds. Measured end to end on the same store, a cold request got its data after 2.5 s (5.2 s
+before, when it answered `pending` with `Retry-After: 5` and the page polled every 5 s). A failed collect answers
+503 and the page shows it; it never polls a failure.
+
 ## Definitions
 
 - **Window**: a task counts when its `finished_at` (else `started_at`) falls in `[since, until)`; `all` starts at
   the first row. One refresh computes every window and the weekly buckets.
 - **Model**: the concrete model id: the model the runtime observed from the provider when it attested one, else
   the requested model's catalog id (`grok-4.7-high` is `grok-4.7`, `claude-opus-5-5[1m]` is `claude-opus-5-5`).
-  A bare harness alias with no observed model (`opus`) stays `opus`: its version was not recorded, and the
-  statistics never guess it. Unknown versions (`claude-opus-5-6`) stay as recorded.
+  Rows store a bare harness alias with no observed model (`opus`, `sonnet`, `haiku`, `fable`) as recorded. The
+  statistics count it as the catalog id it ran only where that is unambiguous: the dispatcher resolves the alias
+  to its family's newest catalog id (`model_pause._newest_claude`), and a row counts as that id when it is no
+  older than the first row naming the id and no other model of the family appears in any row at or after it.
+  Otherwise the version is unknown and the alias stays. Unknown versions (`claude-opus-5-6`) stay as recorded.
+  Each model carries an `identity`: `catalog`, or for a label that names no concrete model `alias` (version not
+  observed), `harness_choice` (Cursor `auto`), `unreported` (`unknown`, `unrecognized`: the harness reported no
+  model), `joint` (a PR reviewed for two author models) or `not_in_catalog` (any other spelling). The page lists
+  catalog models first and groups the rest under "Not a concrete model id" with that label.
+- **Idle catalog models**: `idle_catalog_models` lists every catalog model the catalog still routes (lifecycle
+  not `retired`) that ran no task in the window, so a routed model never silently drops off the page.
 - **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
   `high`, `gemini-3.8-flash-medium` is `medium`); else `unset`. A catalog id that merely ends in an effort word
   (`gemini-3.8-flash-high`) is `unset` without a recorded effort. Legacy values such as `not-exposed` stay as
@@ -72,12 +95,24 @@ a row a settlement failed to write.
   reasoning or thinking counts of Cursor, AGY and OpenCode are added).
 - **Review figures** come from each finished review's `.result`, read once into its row with the review contract's
   own parser (bare JSON, one fenced JSON object, or the `VERDICT:`/`SCORE:` envelope): `overall.correctness` and
-  finding priorities; anything else, including a findings container that is not a list, is `unparsed`. Blocking means P0 or P1, as the review policy defines it; P0–P2 is shown too because the
-  2026-11-15 reference script counted that. Per-review rates divide by reviews whose result was read.
-- **Author figures**: per PR reviewed in the window, rounds are distinct pinned heads; first-round approval is
-  the verdict on the earliest-reviewed head; "approved eventually" means any head was judged correct. They split
-  by author model only: a review records its author's model but not the author's effort. A PR reviewed for
-  more than one author model is grouped under the joined ids (`a+b`), which `/metrics` exports as `other`.
+  finding priorities; anything else, including a findings container that is not a list, is `unparsed`. Only a
+  **review of record** has verdict figures: a review task that names the reviewed PR and the author's model.
+  Advice, approvals, critics and canaries are read-only tasks without them; they count in tasks, status and time,
+  never in a verdict. `verdicts` still shows a review of record whose reply did not parse, but no rate counts it:
+  approval and findings per review divide by parsed reviews of record. Blocking means P0 or P1, as the review
+  policy defines it; P0–P2 is shown too because the 2026-11-15 reference script counted that.
+- **Author figures**: per PR reviewed in the window, only parsed reviews of record count; an unparsed reply is no
+  round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
+  review; the first round is the earliest review of the earliest head. "Approved eventually" means any parsed
+  review approved. They split by author model only: a review records its author's model but not the author's
+  effort. A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
+  exports as `other`.
+- **After a blocked first round** (`after_blocked_first_round`, per author): of the PRs whose first round did not
+  approve, the share where a later review approved a new head (the author changed the code), approved the same
+  head (no change), or where nothing approved yet in the window.
+- **First-round matrix** (`first_round_matrix`): per author, first reviewer and review class of that first
+  review (`profile/risk`, and `all`), the PRs and how many the first round approved. See [Author or
+  reviewer](#author-or-reviewer).
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
   `agy_claude`, `cursor`) and its remaining weekly allowance at start and finish from the Monitor
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
@@ -92,7 +127,8 @@ Prometheus keeps about 15 days, so long history comes from the `window="all"` an
 scrape, not from range queries. A scrape never computes: it reads the cached snapshot and schedules a refresh
 when the snapshot is older than 300 seconds. Label values come from finite sets: `window` is `7d`, `30d`, `90d` or
 `all`; `week` is an ISO week (`2026-W46`) since the first row; `model` is a catalog model id, a bare native alias
-(`opus`, `sonnet`, `haiku`) or `unknown`, and any other spelling is `other`; `effort` is a catalog effort word
+(`opus`, `sonnet`, `haiku`, `fable`) whose version could not be determined, or `unknown`, and any other spelling
+is `other`; `effort` is a catalog effort word
 (`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `thinking`, `thinking-<level>`), `unset`, `not-exposed`,
 `unknown` or `all` (every effort of that model), and any other value is `other`; `role` is `write`, `review` or
 `author`; `status` is a terminal status other than `done` (`no_deliverable`, `failed`, `timeout`, `rate_limited`,
@@ -109,14 +145,36 @@ rows and the route. No task ids, paths or accounts.
 | `lu_model_stats_wall_seconds_median` | window, model, effort, role | median wall seconds |
 | `lu_model_stats_wall_seconds_p90` | window, model, effort, role | 90th percentile wall seconds |
 | `lu_model_stats_output_tokens_per_landed` | window, model, effort, role=write | output tokens of all writes per landed task |
-| `lu_model_stats_blocking_findings_per_review` | window, model, effort, role=review | P0–P1 findings per read review |
-| `lu_model_stats_review_rounds_per_pr` | window, model, effort=all, role=author | reviewed heads per authored PR |
+| `lu_model_stats_blocking_findings_per_review` | window, model, effort, role=review | P0–P1 findings per parsed review of record |
+| `lu_model_stats_review_rounds_per_pr` | window, model, effort=all, role=author | heads judged by a parsed review of record per authored PR |
 | `lu_model_stats_allowance_pct_points_per_landed` | window, model, effort, role=write | weekly allowance points per landed task, tasks with both readings |
 | `lu_model_stats_week_tasks` | week, model, effort, role | settled tasks per ISO week |
 | `lu_model_stats_week_landed` | week, model, effort, role=write | landed write tasks per ISO week |
 | `lu_model_stats_week_not_done` | week, model, effort, role, status | not-done tasks per ISO week and status |
 
 A series with no denominator (no landed task, no read review) is absent rather than 0.
+
+## Author or reviewer
+
+One first-round approval per author mixes three things: how good the author's change was, how strict its
+reviewer is, and how risky the work was. The matrix separates them as far as the records allow. Down one column
+the reviewer is fixed, so differences between rows are on the authors' side; along one row the author is fixed,
+so differences between columns are on the reviewers' side; choosing a review class fixes the risk. Routing still
+confounds inside a class (some authors get the hardest or most security-sensitive work), and a cell below 10 PRs
+is marked low sample.
+
+What the records cannot show is which reviewer findings were real. Counting the share of findings fixed in a
+later round, against PRs approved without that change, needs per finding an id that stays the same across rounds
+and the finding's recorded disposition (fixed, disputed, waived). Neither exists: a summary row keeps only the
+number of findings per priority, the reviewer chooses finding ids afresh in every reply, and the verdict recorder
+links no later round to an earlier finding (it keeps only the P3 residual ids of an approval). The PR-level
+outcome after a blocked first round (new head, same head, none) is what is shown instead, and is labelled as such.
+
+On 2026-11-16 over all history (parsed reviews of record): with Sol 6.1 as first reviewer, Grok 4.7 PRs were
+approved first time 78% (178 PRs), Sonnet 5.5 68% (164) and Opus 5.5 45% (362); inside infra/critical alone
+Opus 5.5 41% (227) and Grok 4.7 63% (38). Opus 5.5 as first reviewer approved Sol 6.1 58% (211) and Grok 4.7
+65% (62), lower than Sol 6.1 approved Grok 4.7, so Sol 6.1 is not the stricter reviewer of the two. After a
+blocked first round, 81% of Opus 5.5 PRs were approved on a new head and 1.5% on the same head.
 
 ## Landing source
 
@@ -159,7 +217,8 @@ dropped the trailer.
 
 These numbers describe our routing, not the models alone. Harder and security work is routed to Opus and Sol,
 so their per-task wall time and rounds are inflated. Author and reviewer families are paired by policy, so a
-reviewer's blocking rate partly measures the authors it is paired with. Allowance readings are pool-wide:
+reviewer's blocking rate partly measures the authors it is paired with; read the first-round matrix, not one
+author figure, before blaming either side. Allowance readings are pool-wide:
 tasks that run at the same time on one pool each see the whole drop, so points per landed task overstate the
 per-task share under concurrency, and the meter's resolution is one reading per probe. Landing depends on the
 trailer surviving the merge or on the task observing its own merge; work merged later by another seat, through

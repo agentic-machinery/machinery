@@ -30,6 +30,9 @@
   tr.cls td { color: var(--muted); font-size: 13px; }
   tr.cls td:first-child { padding-left: 32px; }
   tr.eff td:first-child { padding-left: 16px; font-style: italic; }
+  tr.group td { color: var(--muted); font-weight: 600; padding-top: 10px; }
+  tr.total td { font-weight: 600; }
+  .note { font-size: 13px; color: var(--muted); }
   .low { color: var(--warn); font-size: 11px; margin-left: 3px; }
   .muted { color: var(--muted); } .error { color: var(--bad); }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
@@ -50,13 +53,22 @@
 </header>
 <main id="main">
   <section><h2>Value: landed tasks per wall hour against first-round approval <span class="meta" id="chart-meta"></span></h2>
-    <p class="muted">Rows are concrete model ids (a bare alias such as <code>opus</code> means the version was not observed); italic sub-rows split by effective effort (<code>unset</code>: none recorded), and the plain rows under each effort split that effort by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
-    <div id="chart">Loading…</div></section>
+    <p class="muted">Rows are concrete model ids. A bare alias such as <code>opus</code> counts as the catalog model it ran where the records make that unambiguous; labels that still name no concrete model are grouped last in each table and say why. Italic sub-rows split by effective effort (<code>unset</code>: none recorded), and the plain rows under each effort split that effort by task class. One dot per author model with at least one landed task and one reviewed PR. Hollow dots: fewer than 10 PRs or 10 landed tasks (low sample). The tables below hold the same numbers.</p>
+    <div id="chart">Loading…</div><p class="note" id="idle"></p></section>
+  <section><h2>Author or reviewer? First-round approval by author and first reviewer <span class="meta" id="matrix-meta"></span></h2>
+    <p class="muted">Each cell: of the PRs that author model wrote, the share its first reviewer approved in the first round (approved/PRs). Read down a column to compare authors judged by the same reviewer (the author's side); read along a row to compare reviewers of the same author (the reviewer's side). Pick a review class to hold the risk constant. Only parsed reviews of record count (a review that names its PR and the author's model). Routing still confounds: inside one class the hardest or most security-sensitive work goes to some authors more than others.</p>
+    <label>Review class <select id="matrix-class"><option value="all">all classes</option></select></label>
+    <div id="matrix">Loading…</div></section>
   <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
     <p class="muted">Landed: the task's whole-line <code>X-Agent</code> trailer is on a registered <code>main</code> outside a code fence, or the task recorded its own merged PR. The trailer is found by a line scan, not a Markdown parser: a trailer-shaped line inside inline code that runs across lines still counts, and a fence left open earlier in a commit message hides the trailers after it (see the runbook's landing source).</p>
     <div id="write">Loading…</div></section>
-  <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2><div id="review">Loading…</div></section>
-  <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2><div id="author">Loading…</div></section>
+  <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2>
+    <p class="muted">Tasks, status and time count every read-only task. Verdicts, approval and findings count only reviews of record (the review names its PR and the author's model); advice, critics and canaries enter no verdict figure, and an unparsed reply is shown but enters no rate.</p>
+    <div id="review">Loading…</div></section>
+  <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2>
+    <p class="muted">Rounds are the distinct heads a parsed review of record judged. After a first round that did not approve, a later round approved a new head (the author changed the code), approved the same head (no change), or nothing approved it yet in this window.</p>
+    <div id="author">Loading…</div>
+    <p class="note">Which individual findings were fixed cannot be counted from these records: a summary row keeps only the number of findings per priority; a reviewer chooses its finding ids afresh in each reply; and no round records what became of an earlier round's findings (fixed, disputed or waived). Counting it needs a finding id that stays the same across rounds and that finding's recorded disposition.</p></section>
   <section><h2>Weekly allowance spent per landed task <span class="meta" id="allowance-meta"></span></h2><div id="allowance">Loading…</div></section>
 </main>
 <script>
@@ -76,8 +88,20 @@ function table(head, rows) {
   return `<table><thead><tr>${head.map((h) => `<th>${esc(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
+const IDENTITY = {alias: "harness alias, version not observed", harness_choice: "Cursor Auto: the harness chose the model",
+  unreported: "the harness reported no model", not_in_catalog: "spelling outside the model catalog",
+  joint: "PR reviewed for two author models"};
+const named = (r) => `<b>${esc(r.model)}</b>${r.identity && r.identity !== "catalog" ? ` <span class="muted">(${esc(IDENTITY[r.identity] || r.identity)})</span>` : ""}`;
+
 function rowName(r, kind) {
-  return kind === "eff" ? `effort ${esc(r.effort)}` : kind === "cls" ? esc(r.class) : `<b>${esc(r.model)}</b>`;
+  return kind === "eff" ? `effort ${esc(r.effort)}` : kind === "cls" ? esc(r.class) : named(r);
+}
+
+// Catalog models first; labels that name no concrete model follow under their own heading.
+function grouped(items, render, width) {
+  const concrete = items.filter((r) => r.identity === "catalog"), rest = items.filter((r) => r.identity !== "catalog");
+  return [...concrete.flatMap(render), ...(rest.length
+    ? [`<tr class="group"><td colspan="${width}">Not a concrete model id</td></tr>`, ...rest.flatMap(render)] : [])];
 }
 
 function writeRow(r, kind) {
@@ -95,10 +119,42 @@ function reviewRow(r, kind) {
     + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
 }
 
-function withClasses(models, role, render) {
-  return models.filter((m) => m.role === role).flatMap((m) =>
+function withClasses(models, role, render, width) {
+  return grouped(models.filter((m) => m.role === role), (m) =>
     [render(m, ""), ...m.by_effort.flatMap((e) => [render(e, "eff"),
-      ...e.by_class.map((c) => render(c, "cls"))])]);
+      ...e.by_class.map((c) => render(c, "cls"))])], width);
+}
+
+function matrix(data, cls) {
+  const cells = data.first_round_matrix.filter((c) => c.class === cls);
+  if (!cells.length) return '<p class="muted">No parsed review of record in this window and class.</p>';
+  const tally = (key) => {
+    const totals = new Map();
+    for (const c of cells) {
+      const t = totals.get(c[key]) || {ok: 0, n: 0};
+      t.ok += c.approved; t.n += c.first_round_approved.n; totals.set(c[key], t);
+    }
+    return [...totals.entries()].sort((a, b) => b[1].n - a[1].n || (a[0] < b[0] ? -1 : 1));
+  };
+  const authors = tally("author"), reviewers = tally("reviewer");
+  const at = new Map(cells.map((c) => [`${c.author}\u0000${c.reviewer}`, c]));
+  const share = (ok, n) => n ? `${num(ok / n * 100)}% <span class="muted">${ok}/${n}</span>${n < 10 ? LOW : ""}` : "—";
+  const all = cells.reduce((t, c) => ({ok: t.ok + c.approved, n: t.n + c.first_round_approved.n}), {ok: 0, n: 0});
+  const rows = authors.map(([author, t]) => `<tr><td><b>${esc(author)}</b></td>${reviewers.map(([reviewer]) => {
+    const c = at.get(`${author}\u0000${reviewer}`);
+    return cell(c ? share(c.approved, c.first_round_approved.n) : "—");
+  }).join("")}${cell(share(t.ok, t.n))}</tr>`);
+  rows.push(`<tr class="total"><td>All authors</td>${reviewers.map(([, t]) => cell(share(t.ok, t.n))).join("")}${cell(share(all.ok, all.n))}</tr>`);
+  return table(["Author (row) / first reviewer (column)", ...reviewers.map(([r]) => r), "All reviewers"], rows);
+}
+
+function matrixClasses(data) {
+  const select = $("matrix-class"), chosen = select.value;
+  const sizes = new Map();
+  for (const c of data.first_round_matrix) if (c.class !== "all") sizes.set(c.class, (sizes.get(c.class) || 0) + c.first_round_approved.n);
+  select.innerHTML = '<option value="all">all classes</option>' + [...sizes.entries()].sort((a, b) => b[1] - a[1])
+    .map(([c, n]) => `<option value="${esc(c)}">${esc(c)} (${n} PRs)</option>`).join("");
+  select.value = sizes.has(chosen) ? chosen : "all";
 }
 
 function chart(data, label) {
@@ -132,20 +188,31 @@ function landingRead(landing) {
   return `${read} of ${total} repositories${read < total ? " (landing undercounted)" : ""}`;
 }
 
+let current = null;
+
+function renderMatrix() {
+  if (!current) return;
+  const cls = $("matrix-class").value;
+  $("matrix-meta").textContent = `${current.label}; ${cls === "all" ? "all review classes" : cls}`;
+  $("matrix").innerHTML = matrix(current.data, cls);
+}
+
 async function load() {
   const name = $("window").value;
-  let data;
+  let data, retry;
   try {
     const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}`, {cache: "no-store"});
     data = await response.json();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    retry = Math.max(1, Number(response.headers.get("Retry-After")) || 1);
   } catch (err) {
     $("age").innerHTML = `<span class="error">unavailable: ${esc(err.message)}</span>`;
     return;
   }
   if (data.status === "pending") {
-    $("age").textContent = "Collecting… retrying in 5 s";
-    setTimeout(load, 5000);
+    // The server already waited for the collect; this only runs when it is slower than that wait.
+    $("age").textContent = `Collecting… retrying in ${retry} s`;
+    setTimeout(load, retry * 1000);
     return;
   }
   const since = data.window.since.slice(0, 16).replace("T", " ");
@@ -158,18 +225,29 @@ async function load() {
   const total = (rows) => rows.reduce((s, r) => s + r.tasks, 0);
   $("chart-meta").textContent = label;
   $("chart").innerHTML = chart(data, label);
+  $("idle").textContent = data.idle_catalog_models.length
+    ? `Routed catalog models with no task in this window: ${data.idle_catalog_models.join(", ")}.`
+    : "Every routed catalog model ran at least one task in this window.";
+  current = {data, label};
+  matrixClasses(data);
+  renderMatrix();
   $("write-meta").textContent = `${label}; n = ${total(writes)} tasks`;
   $("write").innerHTML = table(["Model / class", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
-    "Wall h per landed", "Median min", "p90 min", "Output tokens per landed"], withClasses(data.models, "write", writeRow));
+    "Wall h per landed", "Median min", "p90 min", "Output tokens per landed"], withClasses(data.models, "write", writeRow, 11));
   $("review-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
-  $("review").innerHTML = table(["Model / profile/risk", "Tasks", "Not done", "Correct / incorrect / uncertain / unparsed",
-    "Approve %", "Blocking (P0–P1) per review", "P0–P2 per review", "Reviews read", "Median min", "p90 min"],
-    withClasses(data.models, "review", reviewRow));
+  $("review").innerHTML = table(["Model / profile/risk", "Tasks", "Not done",
+    "Reviews of record: correct / incorrect / uncertain / unparsed", "Approve %", "Blocking (P0–P1) per review",
+    "P0–P2 per review", "Parsed reviews of record", "Median min", "p90 min"],
+    withClasses(data.models, "review", reviewRow, 10));
   $("author-meta").textContent = `${label}; n = ${data.authors.reduce((s, a) => s + a.prs, 0)} PRs`;
+  const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
   $("author").innerHTML = table(["Author model", "PRs", "Rounds per PR", "Approved eventually", "First-round approved",
-    "Blocking (P0–P1) per PR", "P0–P2 per PR"], data.authors.map((a) => `<tr><td><b>${esc(a.model)}</b></td>`
+    "Not approved first round", "then approved on a new head", "then approved on the same head", "not approved yet",
+    "Blocking (P0–P1) per PR", "P0–P2 per PR"], grouped(data.authors, (a) => [`<tr><td>${named(a)}</td>`
     + `${cell(n({n: a.prs, low_sample: a.low_sample}))}${cell(rate(a.rounds_per_pr))}${cell(pct(a.approved_eventually))}`
-    + `${cell(pct(a.first_round_approved))}${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`));
+    + `${cell(pct(a.first_round_approved))}${cell(a.after_blocked_first_round.blocked)}`
+    + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
+    + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
   $("allowance-meta").textContent = `${label}; tasks with start and finish readings only; unknown readings are excluded, never 0`;
   $("allowance").innerHTML = data.allowance.length ? table(["Pool", "Model", "Effort", "Tasks with readings", "Landed",
     "Points spent", "Points per landed", "Reset crossed"], data.allowance.map((a) => `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>`
@@ -178,6 +256,7 @@ async function load() {
     : '<p class="muted">No write task in this window has both readings yet (recording started with #581).</p>';
 }
 $("window").addEventListener("change", load);
+$("matrix-class").addEventListener("change", renderMatrix);
 load();
 </script>
 </body>
