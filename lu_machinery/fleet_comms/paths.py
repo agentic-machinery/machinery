@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.guardrails.worktree_containment import (
     NotAGitRepositoryError,
     canonicalize,
@@ -71,10 +72,9 @@ def local_plane_is_retired(
     env = os.environ.get(ENV_ROOT)
     if env:
         return _retired_marker_present(Path(env).expanduser().resolve())
-    candidate = repo_root if repo_root is not None else Path.cwd()
     try:
-        base = resolve_main_root(candidate)
-    except NotAGitRepositoryError:
+        base = resolve_main_root(repo_root) if repo_root is not None else state_root()
+    except (NotAGitRepositoryError, MachineryConfigError):
         return False
     return _retired_marker_present((base / DEFAULT_ROOT_REL).resolve())
 
@@ -96,41 +96,48 @@ def default_plane_root(
     repo_root: Path | None = None,
     allow_non_git: bool = False,
 ) -> Path:
-    """Resolve fleet state beneath the primary checkout, unless explicitly overridden.
+    """Resolve the one Fleet Comms authority store, unless explicitly overridden.
 
     Anchoring order:
 
     1. ``FLEET_COMMS_ROOT`` env override, validated as a dedicated storage root.
-    2. The primary checkout that owns the shared ``.git`` store, resolved from
-       ``repo_root`` (default: process cwd).
+    2. ``repo_root`` when the caller names one (the Monitor API's configured state
+       root, a fixture): the primary checkout that owns its shared ``.git`` store.
+    3. Otherwise the shared-state anchor, :func:`lu_machinery.common.repo_root.state_root`
+       (``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``). Without it the installed package raises
+       ``StateRootError``, which names the variable.
 
-    When neither applies — the candidate is not inside a git repository — the
-    default is a HARD ERROR (#6863), never a silent fallback to the raw
-    candidate. The old fallback let a process running with a garbage cwd (a
-    transport-leak directory fragment at the repo root) materialize a shadow
-    ``batch_state/fleet-comms/v1`` tree there, converting a quoting bug into
-    silent message loss. Isolated non-git callers and test fixtures must opt in
-    explicitly with ``allow_non_git=True``.
+    The working directory is never consulted: a command run from another
+    repository's checkout (a machinery worktree) once anchored on that
+    repository's primary and created a second, unread store there.
+
+    A named ``repo_root`` outside any git repository is a HARD ERROR (#6863),
+    never a silent fallback to the raw candidate. The old fallback let a process
+    running with a garbage cwd (a transport-leak directory fragment at the repo
+    root) materialize a shadow ``batch_state/fleet-comms/v1`` tree there,
+    converting a quoting bug into silent message loss. Isolated non-git callers
+    and test fixtures must opt in explicitly with ``allow_non_git=True``.
     """
     try:
         env = os.environ.get(ENV_ROOT)
         if env:
             root = validate_plane_root(Path(env))
+        elif repo_root is None:
+            root = validate_plane_root(state_root() / DEFAULT_ROOT_REL)
         else:
-            candidate = repo_root if repo_root is not None else Path.cwd()
             try:
-                base = resolve_main_root(candidate)
+                base = resolve_main_root(repo_root)
             except NotAGitRepositoryError as exc:
                 if not allow_non_git:
                     raise PlaneRootAnchorError(
-                        f"refusing to anchor the fleet-comms plane root at {candidate}: "
+                        f"refusing to anchor the fleet-comms plane root at {repo_root}: "
                         "not inside a git repository, so the primary checkout cannot be "
                         "verified. A silent fallback here once materialized a shadow "
                         "comms DB under a garbage cwd (#6863). Set FLEET_COMMS_ROOT for an "
                         "explicit override, or pass allow_non_git=True for an isolated "
                         "non-git fixture."
                     ) from exc
-                base = candidate.resolve()
+                base = repo_root.resolve()
             root = validate_plane_root(base / DEFAULT_ROOT_REL)
         _refuse_retired_local_plane(root)
     except PlaneRootAnchorError:

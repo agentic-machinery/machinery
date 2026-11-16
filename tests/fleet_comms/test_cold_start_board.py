@@ -172,8 +172,9 @@ def test_all_probes_board_structure(tmp_path):
         assert pdict["status"] in {"ok", "degraded", "error", "skipped"}
 
 
-def test_probe_failure_degrades():
+def test_probe_failure_degrades(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """An exception inside a probe wrapper degrades the board fail-open without raising."""
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
 
     def broken_probe():
         raise RuntimeError("simulated database failure")
@@ -220,7 +221,7 @@ def test_gh_pr_list_success_with_fake_cli(tmp_path: Path, monkeypatch: pytest.Mo
     }
 
 
-def test_size_cap():
+def test_size_cap(tmp_path, monkeypatch):
     """Probe data truncates strings >200 chars, lists >5 items, and keeps board <=16KiB."""
     long_string = "x" * 300
     long_list = [f"item_{i}" for i in range(20)]
@@ -238,13 +239,15 @@ def test_size_cap():
     assert capped["items"][-1] == {"_truncated": "15 items omitted"}
 
     # Verify overall board JSON output respects 16KiB limit
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
     board = build_cold_start_board(stream_id="epic:9999", needle="test")
     serialized = json.dumps(board, indent=2)
     assert len(serialized.encode("utf-8")) <= MAX_BOARD_BYTES
 
 
-def test_no_claim_or_write_calls(monkeypatch):
+def test_no_claim_or_write_calls(tmp_path, monkeypatch):
     """Verify that building cold start board makes no session lease claim or write calls."""
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
     try:
         from lu_machinery.session_streams import handoff
 
@@ -259,8 +262,9 @@ def test_no_claim_or_write_calls(monkeypatch):
     assert board["board_status"] in {"ok", "degraded"}
 
 
-def test_orient_timeout_skipped_does_not_degrade_board():
+def test_orient_timeout_skipped_does_not_degrade_board(tmp_path, monkeypatch):
     """Monitor timeout → orient_lean skipped; board_status stays ok if load-bearing ok."""
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
     ok_payload = {"mode": "authority", "schema": {"applied_version": 7}}
 
     with (
@@ -376,8 +380,9 @@ def test_session_streams_db_uses_primary_checkout(tmp_path: Path):
     assert resolved.is_file()
 
 
-def test_cli_cold_start_board(capsys):
+def test_cli_cold_start_board(capsys, tmp_path, monkeypatch):
     """CLI subcommand cold-start-board runs cleanly and returns exit code 0."""
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
     code = cli_main(["cold-start-board", "--stream-id", "epic:9999", "--agent", "test-agent"])
     assert code == EXIT_OK
 

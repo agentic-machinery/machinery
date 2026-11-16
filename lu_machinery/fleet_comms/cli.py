@@ -1144,11 +1144,7 @@ def cmd_acp_verify(args: argparse.Namespace) -> int:
         verify_discussion_receipt,
     )
 
-    root = (
-        Path(args.root).expanduser()
-        if args.root
-        else default_plane_root(repo_root=Path.cwd())
-    )
+    root = Path(args.root).expanduser() if args.root else default_plane_root()
     try:
         payload = verify_discussion_receipt(
             root=root,
