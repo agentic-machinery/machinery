@@ -19,7 +19,6 @@ import sys
 import tempfile
 import tomllib
 import urllib.error
-import urllib.parse
 import urllib.request
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -29,6 +28,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import yaml
+from packaging.requirements import InvalidRequirement, Requirement
 
 from lu_machinery.common.repo_root import product_root
 
@@ -52,162 +52,193 @@ def load_pip_audit_ignores(ignore_file: Path) -> list[str]:
 # PEP 503: lowercase, and collapse runs of "-", "_" and "." to a single "-".
 _LU_MACHINERY_NAME = "lu-machinery"
 _WHEELHOUSE_ENV = "LU_MACHINERY_WHEELHOUSE"
-_DIST_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?")
-_VERSION_OPERATOR = re.compile(r"^(===|==|~=|!=|<=|>=|<|>|\s|\()")
-_EXACT_PIN = re.compile(
-    r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==(?P<version>\S+)(?P<rest>.*)$"
-)
+_MACHINERY_LOCK = "requirements-machinery.lock"
+# pip's comment rule: "#" at the start of a line or after whitespace.
+_COMMENT = re.compile(r"(^|\s+)#.*$")
+_LEADING_NAME = re.compile(r"\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)")
+_EXACT_PIN = re.compile(r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)==(?P<version>\S+)(?P<rest>.*)$")
 _HASH_TOKEN = re.compile(r"--hash=sha256:([0-9a-fA-F]{64})\Z")
 _SAFE_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
+# The one accepted local path form: ``./dir`` or ``../dir``, optionally with extras.
+_LOCAL_PATH = re.compile(r"(?P<path>\.\.?/[A-Za-z0-9._/-]+)(?:\[[A-Za-z0-9._,-]+\])?\Z")
+# The one accepted direct reference: a git URL pinned to a full commit, with no user info.
+_PINNED_GIT_URL = re.compile(r"git\+https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+@[0-9a-f]{40}\Z")
+# pip installs a requirement ending in an archive suffix as a file (pip's ARCHIVE_EXTENSIONS).
+_ARCHIVE_SUFFIXES = (
+    ".zip",
+    ".whl",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
+    ".tar.gz",
+    ".tgz",
+    ".tar",
+)
 
 
 class LuMachineryAuditWheelError(RuntimeError):
-    """The consumer requires lu-machinery and the checked wheel cannot be staged."""
+    """The audit cannot bind ``lu-machinery`` to the checked wheel, so it must not run."""
 
 
 def _pep503_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _logical_lines(text: str) -> list[str]:
-    """Join backslash continuations and drop comments and blank lines."""
-    logical: list[str] = []
-    pending = ""
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not pending and (not stripped or stripped.startswith("#")):
+def _logical_lines(text: str) -> list[tuple[int, str]]:
+    """``(first line number, line)`` pairs, joined and stripped the way pip does.
+
+    A trailing backslash continues a line unless the line is a comment; comments
+    are removed after joining; blank results are dropped.
+    """
+    logical: list[tuple[int, str]] = []
+    pending: list[str] = []
+    first = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        if not pending:
+            first = number
+        if line.endswith("\\") and not _COMMENT.match(line):
+            pending.append(line.strip("\\"))
             continue
-        without_comment = raw.split(" #", 1)[0].rstrip()
-        if without_comment.endswith("\\"):
-            pending += without_comment[:-1].strip() + " "
-            continue
-        pending += without_comment.strip()
-        if pending.strip():
-            logical.append(" ".join(pending.split()))
-        pending = ""
-    if pending.strip():
-        logical.append(" ".join(pending.split()))
+        if _COMMENT.match(line):
+            line = " " + line
+        pending.append(line)
+        joined = _COMMENT.sub("", "".join(pending)).strip()
+        pending = []
+        if joined:
+            logical.append((first, joined))
+    if pending:
+        joined = _COMMENT.sub("", "".join(pending)).strip()
+        if joined:
+            logical.append((first, joined))
     return logical
 
 
-def _regex_distribution_name(body: str) -> str | None:
-    """PEP 503 name from a specifier the standards parser did not accept."""
-    if "@" in body:
-        body = body.split("@", 1)[0].strip()
-    body = body.split("[", 1)[0].strip()
-    match = _DIST_NAME.match(body)
-    if match is None:
-        return None
-    rest = body[match.end() :]
-    if rest and _VERSION_OPERATOR.match(rest) is None:
-        return None
-    return _pep503_name(match.group(0))
+def _split_options(line: str) -> tuple[str, list[str]]:
+    """pip's split: the requirement ends at the first space-separated token starting with ``-``."""
+    tokens = line.split(" ")
+    for index, token in enumerate(tokens):
+        if token.startswith("-"):
+            return " ".join(tokens[:index]).strip(), " ".join(tokens[index:]).split()
+    return line.strip(), []
 
 
-def _normalized_distribution_name(specifier: str) -> str | None:
-    """PEP 503 name of a requirement specifier, or None when it is not one.
-
-    Parentheses (``name(>=1)``) and direct URLs are requirement forms. A local
-    path is not a name; the caller resolves those separately.
-    """
-    body = specifier.split(";", 1)[0].strip()
-    if not body or body.startswith(("-", ".", "/")):
-        return None
-    try:
-        from packaging.requirements import InvalidRequirement, Requirement
-    except ImportError:
-        return _regex_distribution_name(body)
-    try:
-        return _pep503_name(Requirement(body).name)
-    except InvalidRequirement:
-        return _regex_distribution_name(body)
-
-
-def _strip_path_extras(token: str) -> str:
-    if token.endswith("]") and "[" in token and "/" not in token[token.rfind("[") :]:
-        return token.rpartition("[")[0]
-    return token
-
-
-def _path_requirement(repo_root: Path, line: str) -> Path | None:
-    """Local path a requirements line installs, relative to the consumer root.
-
-    Pip treats a separator or a leading dot as a path, including ``packages/runtime``
-    and ``./packages/runtime[extra]``. Editable forms include ``-e ./path``,
-    ``-e./path`` and ``-epath`` (the argument may be a relative path, an extra
-    or a ``file:`` URL). ``name @ file://`` and a bare ``file:`` URL point at the
-    same tree.
-    """
-    body = line.split(";", 1)[0].strip()
-    if body.startswith("--editable="):
-        body = body.split("=", 1)[1].strip()
-    elif body.startswith("--editable "):
-        body = body[len("--editable ") :].strip()
-    elif body.startswith("-e "):
-        body = body[3:].strip()
-    elif body.startswith("-e") and len(body) > 2 and body[2] != "-":
-        body = body[2:].strip()
-    if not body or body.startswith("-"):
-        return None
-    url = body
-    if " @ " in body:
-        url = body.split(" @ ", 1)[1].strip()
-    elif "@" in body:
-        left, right = body.split("@", 1)
-        if not (left.strip().startswith(".") or "/" in left):
-            url = right.strip()
-    url = _strip_path_extras(url.strip())
-    if url.startswith("file:"):
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "file":
-            return None
-        target = Path(urllib.parse.unquote(parsed.path))
-    elif "://" in url:
-        return None
-    elif url.startswith(".") or "/" in url or url.startswith("~"):
-        target = Path(url)
-        if not target.is_absolute():
-            target = repo_root / target
-    else:
-        return None
-    return target
-
-
-def _project_dependency_names(package_dir: Path) -> list[str]:
-    """PEP 503 names from ``[project].dependencies``, excluding optional extras."""
-    pyproject = package_dir / "pyproject.toml"
-    if not pyproject.is_file():
-        return []
-    try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise LuMachineryAuditWheelError(f"cannot read {pyproject}: {exc}") from exc
-    project = data.get("project")
-    if not isinstance(project, dict):
-        return []
-    dependencies = project.get("dependencies") or []
-    if not isinstance(dependencies, list):
-        raise LuMachineryAuditWheelError(f"{pyproject} [project].dependencies is not a list")
-    names: list[str] = []
-    for dependency in dependencies:
-        if not isinstance(dependency, str):
-            continue
-        name = _normalized_distribution_name(dependency)
-        if name is not None:
-            names.append(name)
+def _dependency_names(source: Path, specifiers: object, field: str) -> set[str]:
+    if not isinstance(specifiers, list) or not all(isinstance(item, str) for item in specifiers):
+        raise LuMachineryAuditWheelError(f"{source} {field} is not a list of strings")
+    names: set[str] = set()
+    for specifier in specifiers:
+        try:
+            names.add(_pep503_name(Requirement(specifier).name))
+        except InvalidRequirement as exc:
+            raise LuMachineryAuditWheelError(f"{source} {field} has an unreadable entry {specifier!r}") from exc
     return names
 
 
-def _requirements_name_lu_machinery(repo_root: Path, requirements_file: Path) -> bool:
-    """True when the lock or a path requirement names exactly ``lu-machinery``.
+def _path_project_names(package_dir: Path) -> set[str]:
+    """PEP 503 names a local project can install: runtime, optional and build requirements.
 
-    ``lu-machinery-extras`` is a different distribution and does not count.
+    Optional groups count whether or not the line asks for them; a project whose
+    dependencies are dynamic or unreadable is refused, because they cannot be checked.
     """
-    for line in _logical_lines(requirements_file.read_text(encoding="utf-8")):
-        if _normalized_distribution_name(line) == _LU_MACHINERY_NAME:
-            return True
-        path = _path_requirement(repo_root, line)
-        if path is not None and _LU_MACHINERY_NAME in _project_dependency_names(path):
+    pyproject = package_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        raise LuMachineryAuditWheelError(f"{package_dir} has no pyproject.toml to read")
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise LuMachineryAuditWheelError(f"cannot read {pyproject}: {exc}") from exc
+    project = data.get("project")
+    if not isinstance(project, dict):
+        raise LuMachineryAuditWheelError(f"{pyproject} has no [project] table")
+    dynamic = project.get("dynamic", [])
+    if not isinstance(dynamic, list) or {"dependencies", "optional-dependencies"} & set(map(str, dynamic)):
+        raise LuMachineryAuditWheelError(f"{pyproject} declares dynamic dependencies")
+    names = _dependency_names(pyproject, project.get("dependencies", []), "[project].dependencies")
+    optional = project.get("optional-dependencies", {})
+    if not isinstance(optional, dict):
+        raise LuMachineryAuditWheelError(f"{pyproject} [project].optional-dependencies is not a table")
+    for group, specifiers in optional.items():
+        names |= _dependency_names(pyproject, specifiers, f"[project].optional-dependencies.{group}")
+    build = data.get("build-system", {})
+    if not isinstance(build, dict):
+        raise LuMachineryAuditWheelError(f"{pyproject} [build-system] is not a table")
+    names |= _dependency_names(pyproject, build.get("requires", []), "[build-system].requires")
+    return names
+
+
+def _line_names(repo_root: Path, line: str) -> set[str]:
+    """PEP 503 names one requirements line can install; refuse every unrecognized form.
+
+    Accepted: ``name[extras]==version`` or ``===version`` (markers allowed), a
+    ``name @ git+https://host/path@<40-hex commit>`` reference to anything but
+    ``lu-machinery``, and a ``./dir`` or ``../dir`` project whose pyproject.toml
+    is read. The only accepted option is ``--hash=sha256:``. Everything else
+    pip would also accept (editables in any spelling, URLs, includes,
+    constraints, index options, unpinned names, environment variables) raises.
+    """
+    if "${" in line:
+        raise LuMachineryAuditWheelError("environment variable reference")
+    requirement, options = _split_options(line)
+    if not requirement:
+        raise LuMachineryAuditWheelError(f"unsupported option line {options[0]!r}")
+    for option in options:
+        if _HASH_TOKEN.fullmatch(option) is None:
+            raise LuMachineryAuditWheelError(f"unsupported option {option!r}")
+    path = _LOCAL_PATH.fullmatch(requirement)
+    if path is not None:
+        if options:
+            raise LuMachineryAuditWheelError("hash options on a local path")
+        return _path_project_names(repo_root / path.group("path"))
+    if requirement.startswith((".", "/", "~")):
+        raise LuMachineryAuditWheelError("local path outside the ./dir or ../dir form")
+    if requirement.split(";", 1)[0].strip().lower().endswith(_ARCHIVE_SUFFIXES):
+        raise LuMachineryAuditWheelError("pip reads a requirement with an archive suffix as a file")
+    try:
+        parsed = Requirement(requirement)
+    except InvalidRequirement as exc:
+        raise LuMachineryAuditWheelError("not a pinned requirement or a ./dir path") from exc
+    name = _pep503_name(parsed.name)
+    if parsed.url is not None:
+        if name == _LU_MACHINERY_NAME:
+            raise LuMachineryAuditWheelError("lu-machinery by direct reference")
+        if options or parsed.extras or _PINNED_GIT_URL.fullmatch(parsed.url) is None:
+            raise LuMachineryAuditWheelError("direct reference that is not a git URL pinned to a full commit")
+        return {name}
+    specifiers = list(parsed.specifier)
+    if len(specifiers) != 1 or specifiers[0].operator not in ("==", "===") or "*" in specifiers[0].version:
+        raise LuMachineryAuditWheelError("requirement not pinned to one exact version")
+    return {name}
+
+
+def _requirements_need_lu_machinery(repo_root: Path, requirements_file: Path) -> bool:
+    """True when a line, or a local project it installs, names exactly ``lu-machinery``.
+
+    Every line must be a recognized form (:func:`_line_names`); any other line
+    raises, naming the file, line number and reason. ``lu-machinery-extras`` is a
+    different distribution and does not count.
+    """
+    need = False
+    for number, line in _logical_lines(requirements_file.read_text(encoding="utf-8")):
+        try:
+            need |= _LU_MACHINERY_NAME in _line_names(repo_root, line)
+        except LuMachineryAuditWheelError as exc:
+            raise LuMachineryAuditWheelError(
+                f"{requirements_file.name} line {number}: {exc}; refusing to audit {line!r}"
+            ) from exc
+    return need
+
+
+def _lock_names_lu_machinery(lock: Path) -> bool:
+    """True when any line of the consumer's machinery lock starts with the name ``lu-machinery``."""
+    if not lock.is_file():
+        return False
+    for _, line in _logical_lines(lock.read_text(encoding="utf-8")):
+        match = _LEADING_NAME.match(line)
+        if match is not None and _pep503_name(match.group(1)) == _LU_MACHINERY_NAME:
             return True
     return False
 
@@ -223,7 +254,12 @@ def _lu_machinery_pin(lock: Path) -> _LuMachineryPin:
     if not lock.is_file():
         raise LuMachineryAuditWheelError(f"{lock.name} does not pin lu-machinery")
     pins: list[_LuMachineryPin] = []
-    for line in _logical_lines(lock.read_text(encoding="utf-8")):
+    named = 0
+    for _, line in _logical_lines(lock.read_text(encoding="utf-8")):
+        leading = _LEADING_NAME.match(line)
+        if leading is None or _pep503_name(leading.group(1)) != _LU_MACHINERY_NAME:
+            continue
+        named += 1
         match = _EXACT_PIN.match(line)
         if match is None or _pep503_name(match.group("name")) != _LU_MACHINERY_NAME:
             continue
@@ -237,16 +273,14 @@ def _lu_machinery_pin(lock: Path) -> _LuMachineryPin:
         for token in rest.split():
             hashed = _HASH_TOKEN.fullmatch(token)
             if hashed is None:
-                raise LuMachineryAuditWheelError(
-                    f"{lock.name} lu-machinery pin has an unsupported token {token!r}"
-                )
+                raise LuMachineryAuditWheelError(f"{lock.name} lu-machinery pin has an unsupported token {token!r}")
             hashes.add(hashed.group(1).lower())
         if not hashes:
             raise LuMachineryAuditWheelError(f"{lock.name} pins lu-machinery without a sha256 hash")
         pins.append(_LuMachineryPin(version, frozenset(hashes)))
-    if len(pins) != 1:
+    if len(pins) != 1 or named != 1:
         raise LuMachineryAuditWheelError(
-            f"{lock.name} must pin exactly one lu-machinery version; found {len(pins)}"
+            f"{lock.name} must pin exactly one lu-machinery version; found {named} lu-machinery line(s)"
         )
     return pins[0]
 
@@ -256,17 +290,13 @@ def _hash_checked_wheel(pin: _LuMachineryPin) -> Path:
     raw = os.environ.get(_WHEELHOUSE_ENV, "").strip()
     filename = f"lu_machinery-{pin.version}-py3-none-any.whl"
     if not raw:
-        raise LuMachineryAuditWheelError(
-            "LU_MACHINERY_WHEELHOUSE is unset; refusing to fetch lu-machinery from PyPI"
-        )
+        raise LuMachineryAuditWheelError("LU_MACHINERY_WHEELHOUSE is unset; refusing to fetch lu-machinery from PyPI")
     wheel = Path(raw) / filename
     if not wheel.is_file():
         raise LuMachineryAuditWheelError(f"LU_MACHINERY_WHEELHOUSE has no {filename}")
     digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     if digest not in pin.hashes:
-        raise LuMachineryAuditWheelError(
-            f"{filename} sha256 {digest} does not match requirements-machinery.lock"
-        )
+        raise LuMachineryAuditWheelError(f"{filename} sha256 {digest} does not match requirements-machinery.lock")
     return wheel
 
 
@@ -281,10 +311,18 @@ def _pip_audit_process_env(extra: Mapping[str, str]) -> dict[str, str] | None:
 def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Iterator[dict[str, str]]:
     """Environment that lets pip-audit resolve ``lu-machinery`` without PyPI.
 
-    Yields an empty mapping when the requirements do not name ``lu-machinery``,
-    so the audit command stays exactly as it is today. Otherwise yields
-    ``PIP_FIND_LINKS`` (a directory containing only the hash-checked wheel) and
-    ``PIP_CONSTRAINT`` (an unhashed ``lu-machinery @ file:`` URL of that staged wheel).
+    Fails closed first: every line of ``requirements_file`` must be a form
+    :func:`_line_names` recognizes, or this raises before pip-audit starts.
+
+    When the consumer's ``requirements-machinery.lock`` names ``lu-machinery``,
+    this always yields ``PIP_FIND_LINKS`` (a directory containing only the
+    hash-checked wheel) and ``PIP_CONSTRAINT`` (an unhashed ``lu-machinery @
+    file:`` URL of that staged wheel). pip applies a constraint wherever the
+    name appears in the resolution, so ``lu-machinery`` required by a pinned
+    package, a git reference or a local project, directly or transitively,
+    resolves only from that wheel. When the lock does not name it but a line or
+    a local project does, this raises. Otherwise it yields an empty mapping and
+    the audit command stays exactly as before.
 
     A version pin alone does not bind the candidate: pip may download another
     build of the same version from an index. A direct file URL does, and because
@@ -293,10 +331,12 @@ def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Itera
     this does not download it. A missing pin, a hash mismatch, or a missing wheel
     raises :class:`LuMachineryAuditWheelError` before the caller starts pip-audit.
     """
-    if not _requirements_name_lu_machinery(repo_root, requirements_file):
+    lock = repo_root / _MACHINERY_LOCK
+    need = _requirements_need_lu_machinery(repo_root, requirements_file)
+    if not need and not _lock_names_lu_machinery(lock):
         yield {}
         return
-    pin = _lu_machinery_pin(repo_root / "requirements-machinery.lock")
+    pin = _lu_machinery_pin(lock)
     wheel = _hash_checked_wheel(pin)
     with tempfile.TemporaryDirectory(prefix="lu-machinery-audit-") as tmp:
         root = Path(tmp)

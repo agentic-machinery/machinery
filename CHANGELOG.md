@@ -11,7 +11,7 @@ this file.
 
 ### Fixed
 
-- The dependency audit resolves a consumer's `lu-machinery` requirement from the hash-checked wheel in `LU_MACHINERY_WHEELHOUSE` instead of PyPI. The constraint names that staged wheel by file URL, so another build of the same version on an index cannot replace it. Path requirements pip accepts, including a compact `-e` with no separator, reach that check. A missing pin, a hash mismatch, or a missing wheel fails the audit before pip-audit runs.
+- The dependency audit resolves `lu-machinery` from the hash-checked wheel in `LU_MACHINERY_WHEELHOUSE` instead of PyPI. It refuses, before pip-audit runs, any `requirements-lock.txt` line that is not an exact `==` pin, a git reference pinned to a full commit, or a `./dir` project with a readable static `pyproject.toml`; editables, URLs, includes and index options all fail. When `requirements-machinery.lock` pins `lu-machinery`, a file-URL constraint binds it wherever it appears in the resolution, transitive dependencies included. A missing pin, a hash mismatch or a missing wheel fails the audit.
 
 <a id="v0.1.24"></a>
 ## [0.1.24] - 2026-11-16

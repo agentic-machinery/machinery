@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 from lu_machinery.ci.audit_dependencies import (
@@ -157,6 +158,9 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
     The fixture names lu-machinery only through ./packages/v4-runtime.
     lu-machinery-extras does not count. A wheel that is not the lock digest,
     and a declared wheelhouse without that wheel, return 1 and do not run pip-audit.
+    Defect class: a lu-machinery dependency the requirements lines do not show
+    (transitive) resolving from an index; when the machinery lock pins
+    lu-machinery the constraint applies even if no line names it.
     """
 
     def write_pyproject(directory: Path, name: str, dependencies: list[str]) -> None:
@@ -227,7 +231,7 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
     monkeypatch.delenv("LU_MACHINERY_WHEELHOUSE", raising=False)
 
     def fake_unset(_cmd: list[str], **kwargs: object) -> MagicMock:
-        captured["extras_env"] = kwargs.get("env", None)
+        captured["extras_env"] = kwargs.get("env")
         return MagicMock(returncode=0, stdout="", stderr="")
 
     with patch("subprocess.run", side_effect=fake_unset):
@@ -281,6 +285,91 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
         with patch("subprocess.run") as spelled_run:
             assert audit_python(spelled, spelled / "ignore.yaml") == 1, spelled_line
         spelled_run.assert_not_called()
+
+    # The machinery lock pins lu-machinery and no line names it: a pinned package
+    # or a commit-pinned git reference can still pull it in, so the constraint applies.
+    transitive = tmp_path / "transitive"
+    transitive.mkdir()
+    (transitive / "requirements-machinery.lock").write_text(
+        f"lu-machinery==9.9.9 \\\n    --hash=sha256:{digest}\n", encoding="utf-8"
+    )
+    (transitive / "requirements-lock.txt").write_text(
+        "requests==2.32.0 \\\n    --hash=sha256:" + ("cd" * 32) + "\n"
+        "ipa-uk @ git+https://github.com/lang-uk/ipa-uk.git@e7fc944faca090ca985d5ca09a24c59154d9dea1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LU_MACHINERY_WHEELHOUSE", str(wheelhouse))
+    captured.clear()
+    with patch("subprocess.run", side_effect=fake_run) as transitive_run:
+        assert audit_python(transitive, transitive / "ignore.yaml") == 0
+    transitive_run.assert_called_once()
+    assert captured["wheel_hash"] == digest
+    assert str(captured["constraint"]).startswith("lu-machinery @ file:")
+
+
+_REFUSED_REQUIREMENT_FORMS = (
+    "-eruntime",
+    "-eruntime[extra]",
+    "-e runtime",
+    "-e runtime[extra]",
+    "--editable runtime",
+    "--editable runtime[extra]",
+    "--editable=runtime",
+    "--editable=runtime[extra]",
+    "-e ./runtime",
+    "runtime",
+    "runtime/",
+    "./runtime ; python_version > '3'",
+    "./empty",
+    "file:runtime",
+    "demo-runtime @ file:runtime",
+    "https://example.invalid/demo-1.0-py3-none-any.whl",
+    "demo @ https://example.invalid/demo-1.0-py3-none-any.whl",
+    "git+https://example.invalid/demo.git#egg=demo",
+    "demo @ git+https://example.invalid/demo.git@main",
+    "lu-machinery @ git+https://example.invalid/lu-machinery.git@" + "0" * 40,
+    "-r other.txt",
+    "-c other.txt",
+    "--index-url https://example.invalid/simple",
+    "--extra-index-url https://example.invalid/simple",
+    "-f ./wheels",
+    "requests",
+    "requests>=2.0",
+    "requests==2.*",
+    "requests==2.32.0 --config-settings=x=y",
+    "requests==1.0+x.whl",
+    "${RUNTIME}",
+)
+
+
+@pytest.mark.parametrize("line", _REFUSED_REQUIREMENT_FORMS)
+def test_unrecognized_requirement_line_fails_closed(line: str, tmp_path: Path, monkeypatch, capsys) -> None:
+    """Any line that is not a pinned name, a commit-pinned git reference or a ./dir project returns 1.
+
+    Defect class: a requirement spelling the classifier does not recognize being
+    read as "does not need lu-machinery" instead of refusing the audit. The wheel
+    and pin are valid, so only the line itself can stop pip-audit.
+    """
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "pyproject.toml").write_text(
+        '[project]\nname = "demo-runtime"\nversion = "1.0.0"\ndependencies = ["lu-machinery>=0.1.21"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "empty").mkdir()
+    payload = b"fake-lu-machinery-9.9.9"
+    wheelhouse = tmp_path / "wheelhouse"
+    wheelhouse.mkdir()
+    (wheelhouse / "lu_machinery-9.9.9-py3-none-any.whl").write_bytes(payload)
+    (tmp_path / "requirements-machinery.lock").write_text(
+        f"lu-machinery==9.9.9 --hash=sha256:{hashlib.sha256(payload).hexdigest()}\n", encoding="utf-8"
+    )
+    (tmp_path / "requirements-lock.txt").write_text(f"requests==2.32.0\n{line}\n", encoding="utf-8")
+    monkeypatch.setenv("LU_MACHINERY_WHEELHOUSE", str(wheelhouse))
+    with patch("subprocess.run") as refused_run:
+        assert audit_python(tmp_path, tmp_path / "ignore.yaml") == 1
+    refused_run.assert_not_called()
+    assert "requirements-lock.txt line 2:" in capsys.readouterr().err
 
 
 @patch("subprocess.run")
