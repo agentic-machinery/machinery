@@ -633,6 +633,12 @@ _WORKER_UNPAIRED_HOOKS = frozenset({_DEPLOYED_HOOKS_PREFIX + "audit-primary-chec
 
 
 @cache
+def _worker_unpaired_hooks() -> frozenset[str]:
+    """The unpaired observers above, in the deployed path form and the native command form."""
+    return _WORKER_UNPAIRED_HOOKS | {native_hook_command("claude-audit-hook")}
+
+
+@cache
 def _native_guard_files() -> dict[str, str]:
     """Each native Claude guard command, by its exact bytes, to the guard file it runs."""
     return {native_hook_command(mode): mode.removeprefix("claude-") + ".py" for mode in CLAUDE_GUARD_MODES}
@@ -692,7 +698,11 @@ def _worker_guard_settings(*, publish_guard: bool = False) -> str:
 
     The product supplies its provider settings; mandatory guard executables come
     from the installed machinery release. Python guards run under this process's
-    interpreter with ``-I``.
+    interpreter with ``-I``. A hook that is not a fleet guard is dropped, except
+    a blocking one (``onFailure: block``), which refuses the whole settings: a
+    worker never runs without a guard the product made mandatory. It is not
+    carried through as written, because its executable would then come from the
+    worker-writable product tree instead of the release.
     """
     try:
         source = json.loads((product_root() / "agents_extensions/shared/settings.json").read_text(encoding="utf-8"))
@@ -702,11 +712,16 @@ def _worker_guard_settings(*, publish_guard: bool = False) -> str:
     for group in source["hooks"]["PreToolUse"]:
         hooks = []
         for hook in group["hooks"]:
-            if hook.get("command") in _WORKER_UNPAIRED_HOOKS:
+            if hook.get("command") in _worker_unpaired_hooks():
                 continue
             invocation = _worker_guard_invocation(hook.get("command", ""))
             if invocation is not None:
                 hooks.append({**hook, "command": invocation})
+            elif hook.get("onFailure") == "block":
+                raise RuntimeError(
+                    f"Claude worker blocking hook has no release guard (matcher {group['matcher']!r}): "
+                    f"{hook.get('command', hook)!r}"
+                )
         if hooks:
             groups.append({"matcher": group["matcher"], "hooks": hooks})
     if publish_guard:
