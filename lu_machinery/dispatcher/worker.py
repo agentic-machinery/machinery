@@ -1067,11 +1067,35 @@ def _is_own_descendant(pid: int) -> bool:
     raise worker_leftovers.ScanUnknown(f"ancestry of {pid} kept changing")
 
 
+def _fallback_tree_reader():
+    """A host reader for the fallback stop that leaves out unreadable processes outside the supervisor's tree.
+
+    A fallback launch has no cgroup of its own, so the scan reads the dispatch marker of every process on the
+    host started after the supervisor. A process of this user that is not dumpable, or that runs as another
+    user in the same cgroup, hides that marker, and the scan reported the whole stop as unknown, which kept a
+    finished task's worktree as ``provider_liveness_unknown``. The stop only acts on processes in the
+    supervisor's own tree (``_is_own_descendant``). So a hidden marker on any other process cannot change
+    its result: that process reads as unmarked. A hidden marker on a descendant still fails closed.
+    """
+    from lu_machinery.orchestration import worker_leftovers
+
+    class Reader(worker_leftovers.ProcFsReader):
+        def dispatch_task_id(self, pid: int) -> str | None:
+            try:
+                return super().dispatch_task_id(pid)
+            except worker_leftovers.ScanUnknown:
+                if _is_own_descendant(pid):
+                    raise
+                return None
+
+    return Reader()
+
+
 def _stop_fallback_tree(task_id: str, nonce: str):
     """Stop the processes a Popen-fallback supervisor started, once; a scan that cannot be read is not ok."""
     from lu_machinery.orchestration import worker_leftovers
 
-    reader = worker_leftovers.ProcFsReader()
+    reader = _fallback_tree_reader()
     try:
         scope = worker_leftovers.worker_scope_at_exit(
             task_id=task_id, launch_mode="popen-fallback", launch_unit=None, run_nonce=nonce, reader=reader)
