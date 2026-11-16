@@ -41,6 +41,11 @@ _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
+# Unreleased is empty when the next non-blank text starts a release (its anchor, then its heading)
+# or is the trailing block of link definitions; anything else is hand-written content.
+_UNRELEASED = "## [Unreleased]\n\n"
+_RELEASE_START = re.compile(r'<a id="v(\d+\.\d+\.\d+)"></a>\n## \[\1\] - ')
+_LINK_DEFINITION = re.compile(r"\[[^\]\n]+\]: \S+")
 _REMOVAL_WORDS = frozenset({"remove", "removes", "retire", "retires", "delete", "deletes", "drop", "drops"})
 SECTIONS = ("Added", "Changed", "Fixed", "Removed")
 VERSION_FILES = ("pyproject.toml", "package.json", "package-lock.json")
@@ -127,6 +132,7 @@ def preflight(
     versions: Mapping[str, str],
     tags: Iterable[str],
     runs: Iterable[Mapping[str, object]],
+    changelog: str,
 ) -> Decision:
     """Decide whether main's HEAD may be tagged as the next version.
 
@@ -134,7 +140,8 @@ def preflight(
     a withdrawn pre-release shipped nothing, so its changes are still unreleased.
     Unchanged (HEAD is the last tag, or only post-release PRs merged since the
     baseline) skips. Otherwise every version file must hold the version after
-    the last tag, that version's tag must be absent and the CI Gate on HEAD must
+    the last tag, that version's tag must be absent, ``changelog`` (CHANGELOG.md
+    at HEAD) must have an empty Unreleased section and the CI Gate on HEAD must
     have succeeded.
     """
     expected = next_version(last_tag.removeprefix("v"))
@@ -148,6 +155,10 @@ def preflight(
         return Decision("refuse", f"version files must hold {expected}; found {found}", expected)
     if f"v{expected}" in set(tags):
         return Decision("refuse", f"tag v{expected} already exists", expected)
+    try:
+        unreleased_must_be_empty(changelog)
+    except CutError as exc:
+        return Decision("refuse", str(exc), expected)
     green, detail = ci_gate_state(runs, head)
     if not green:
         return Decision("refuse", detail, expected)
@@ -190,6 +201,22 @@ def release_notes(titles: Sequence[str], repo: str) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
+def unreleased_must_be_empty(text: str) -> None:
+    """Refuse a CHANGELOG.md whose Unreleased section holds anything.
+
+    The release command is the file's only writer and inserts each release below the
+    Unreleased heading, so hand-written lines there would be filed under that release.
+    """
+    if text.count(_UNRELEASED) != 1:
+        raise CutError("CHANGELOG.md lacks one Unreleased heading")
+    rest = text.split(_UNRELEASED, 1)[1].lstrip()
+    lines = [line for line in rest.splitlines() if line.strip()]
+    if not _RELEASE_START.match(rest) and not all(_LINK_DEFINITION.fullmatch(line) for line in lines):
+        first = lines[0][:120]
+        raise CutError(f"CHANGELOG.md Unreleased is not empty (starts {first!r}); the release command is its only "
+                       "writer, so remove those lines on main first (docs/release.md, Changelog)")
+
+
 def record_changelog(
     text: str, *, version: str, previous: str, date: str, notes: str, repo: str, yanked: bool = False,
     since: str | None = None,
@@ -201,10 +228,11 @@ def record_changelog(
     """
     if f"\n## [{version}]" in text:
         return text
-    unreleased = "## [Unreleased]\n\n"
+    unreleased = _UNRELEASED
     link = f"[Unreleased]: https://github.com/{repo}/compare/v{previous}...HEAD\n"
     if text.count(unreleased) != 1 or text.count(link) != 1:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
+    unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"
     links = (
@@ -383,6 +411,7 @@ class Cut:
         for name in VERSION_FILES:
             versions.update(version_of(name, self.git(clone, "show", f"{self.head}:{name}")))
         tags = self.git(clone, "tag", "--list", "v*").splitlines()
+        changelog = self.run(["git", "-C", clone, "show", f"{self.head}:CHANGELOG.md"]).stdout
         runs = self.run(
             ["gh", "run", "list", "-R", self.machinery_repo, "--commit", self.head, "--workflow", CI_WORKFLOW,
              "--json", "headSha,conclusion,status,event,databaseId", "--limit", "20"],
@@ -396,7 +425,7 @@ class Cut:
             self.say(f"CI Gate unverified here: gh run list exited {runs.returncode}")
         self.ci = ci_gate_state(run_rows, self.head)[1]
         decision = preflight(head=self.head, last_tag=last_tag, last_tag_commit=tag_commit, baseline=baseline,
-                             titles=titles, versions=versions, tags=tags, runs=run_rows)
+                             titles=titles, versions=versions, tags=tags, runs=run_rows, changelog=changelog)
         self.version = decision.version
         return decision, titles, versions["pyproject.toml"]
 
