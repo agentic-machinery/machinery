@@ -185,7 +185,7 @@ def test_shell_resolver_matrix(tmp_path: Path, home: Path) -> None:
 
 
 def _installed_layout(base: Path, log: Path, *, code: int = 0) -> tuple[Path, Path]:
-    """A virtual environment with the agent shims installed in site-packages, as a wheel installs them.
+    """A virtual environment with the agent shims and push hook installed in site-packages, as a wheel does.
 
     Its ``bin/python3.12`` only records that it ran and exits with ``code``.
     """
@@ -194,7 +194,7 @@ def _installed_layout(base: Path, log: Path, *, code: int = 0) -> tuple[Path, Pa
     package = site / "lu_machinery"
     for relative in (
         "agent_runtime/shims/gh", "agent_runtime/shims/git", "agent_runtime/shims/npm", "agent_runtime/shims/npx",
-        "agent_runtime/npm_guard.py", "lib/project_interpreter.sh",
+        "agent_runtime/npm_guard.py", "lib/project_interpreter.sh", "opsec/push_hooks/pre-push", "opsec/git_push.py",
     ):
         (package / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(machinery_root() / relative, package / relative)
@@ -794,26 +794,33 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
     assert refused([str(SOURCE / "lu_machinery/agent_runtime/shims/gh"), "auth", "status"], cwd=worktree, extra=gh_env).returncode != 0
     assert log.read_text(encoding="utf-8") == ""
 
-    # Installed from a wheel with no interpreter configured, each agent shim runs its own virtual
-    # environment's interpreter, never one named by the working directory; outside a venv it refuses.
+    # Installed from a wheel with no interpreter configured, each agent shim (and the push hook the git
+    # shim pins) runs its own virtual environment's interpreter, never one named by the working
+    # directory; outside a virtual environment it refuses.
     installed_log = tmp_path / "installed.log"
     installed_venv, installed_site = _installed_layout(tmp_path / "wheel", installed_log, code=2)
-    installed_shims = installed_site / "lu_machinery/agent_runtime/shims"
+    installed_package = installed_site / "lu_machinery"
     installed_env = {**base, "AGENT_NO_MERGE": "1", "AGENT_REAL_GH": str(fake_gh)}
-    installed_calls = (["gh", "auth", "status"], ["git", "checkout", "topic"], ["npm", "--version"], ["npx", "--version"])
-    for call in installed_calls:
+    installed_calls = (
+        (["agent_runtime/shims/gh", "auth", "status"], ""),
+        (["agent_runtime/shims/git", "checkout", "topic"], ""),
+        (["agent_runtime/shims/npm", "--version"], ""),
+        (["agent_runtime/shims/npx", "--version"], ""),
+        (["opsec/push_hooks/pre-push", "origin", "unused"], "a b c d\n"),
+    )
+    for call, stdin in installed_calls:
         installed_log.write_text("", encoding="utf-8")
         log.write_text("", encoding="utf-8")
-        run = _run([str(installed_shims / call[0]), *call[1:]], cwd=worktree, env=installed_env)
+        run = _run([str(installed_package / call[0]), *call[1:]], cwd=worktree, env=installed_env, stdin=stdin)
         assert run.returncode != 0, (call, run.stderr)
         assert str(installed_venv / "bin/python3.12") in installed_log.read_text(encoding="utf-8"), (call, run.stderr)
         assert log.read_text(encoding="utf-8") == "", call
     (installed_venv / "pyvenv.cfg").unlink()
-    for call in installed_calls:
+    for call, stdin in installed_calls:
         installed_log.write_text("", encoding="utf-8")
-        run = _run([str(installed_shims / call[0]), *call[1:]], cwd=worktree, env=installed_env)
-        assert run.returncode == 127, (call, run.stderr)
-        assert "refusing to run" in run.stderr, (call, run.stderr)
+        run = _run([str(installed_package / call[0]), *call[1:]], cwd=worktree, env=installed_env, stdin=stdin)
+        assert run.returncode != 0, (call, run.stderr)
+        assert "is not <venv>/lib/pythonX.Y/site-packages of a virtual environment" in run.stderr, (call, run.stderr)
         assert installed_log.read_text(encoding="utf-8") == "", call
         assert log.read_text(encoding="utf-8") == "", call
 
