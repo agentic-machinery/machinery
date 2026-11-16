@@ -486,7 +486,7 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
     # Dispatch receipts and JSON without a task identity are not records: they shadow their name only.
     receipt = {"schema": "receipt", "task_id": "impl-1", "scratch": "/tmp/boundary-held"}
     (tmp_path / "impl-1.write-boundary.json").write_text(json.dumps(receipt))
-    (tmp_path / "impl-1.sandbox.json").write_text(json.dumps({"task_id": "impl-1"}))
+    (tmp_path / "impl-1.sandbox.json").write_text(json.dumps({"schema": "sandbox", "task_id": "impl-1"}))
     (tmp_path / "impl-1.review.json").write_text(json.dumps({"findings": [], "target": "/tmp/held"}))
     (tmp_path / "result.json").write_text(json.dumps({"schema_version": "findings.v1", "overall": {}}))
     (tmp_path / "notes.json").write_text("not json")
@@ -520,6 +520,7 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
         # Record-shaped damage under a receipt name: unknown schema and a misnamed v2 record.
         ("impl-1.write-boundary.json", json.dumps({"task_id": "impl-1", "schema_version": 9})),
         ("impl-1.tool-results.json", json.dumps({"task_id": "impl-1", "schema_version": 2, "status": "running"})),
+        ("impl-1.sandbox.json", json.dumps({"task_id": "impl-1", "agent": "codex", "status": "running"})),
     ):
         (tmp_path / name).write_text(raw)
         inventory = sweep.load_tasks(tmp_path)

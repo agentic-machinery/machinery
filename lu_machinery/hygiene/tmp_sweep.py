@@ -176,9 +176,9 @@ def _reference_forms(value: str) -> set[Path]:
 def _receipt_owner(path: Path, stem: str, raw: bytes) -> str | None:
     """The task a dispatch receipt under a receipt file name belongs to, or ``None``.
 
-    A receipt names its owner in ``task_id``. A file under a receipt name whose
-    ``task_id`` is its own stem is a record of a task whose ID ends in that
-    suffix, so it is read as a record. Undecodable JSON raises.
+    Called only for JSON the shared reader calls foreign: a receipt carries a
+    ``schema`` field and names its owner, another task, in ``task_id``.
+    Undecodable JSON raises.
     """
     if not _is_dispatcher_sidecar(path):
         return None
@@ -226,9 +226,10 @@ def load_tasks(root: Path) -> TaskInventory:
     that carries no task identity (no ``task_id`` and no record markers) is
     evidence, not a record: it shadows its name and leaves the inventory
     complete. A receipt dispatch writes beside its owner's record
-    (``.write-boundary.json``, ``.sandbox.json``, ``.tool-results.json``) is
-    not a record either; its paths are references while the owner's record is
-    missing or unsettled. A damaged file (undecodable, truncated, blank under a
+    (``.write-boundary.json``, ``.sandbox.json``, ``.tool-results.json``) that
+    the reader calls foreign is not a record either; its paths are references
+    while the owner's record is missing or unsettled. A record-shaped file under
+    a receipt name is read as a record. A damaged file (undecodable, truncated, blank under a
     record name, unknown schema, wrong identity), receipt names included, and
     any other task claim whose ``task_id`` is not its file name still make the
     inventory incomplete.
@@ -254,13 +255,14 @@ def load_tasks(root: Path) -> TaskInventory:
                 raise ValueError("symlinked task record")
             raw = path.read_bytes()
             # The shared reader validates every file first, so record-shaped damage under
-            # a receipt name (unknown schema, misnamed v2 record) still fails closed.
+            # a receipt name (unknown schema, misnamed v2 record) still fails closed, and a
+            # record-shaped file under a receipt name meets the identity check below.
             data = parse_task_record(path, raw)
-            owner = _receipt_owner(path, stem, raw)
-            if owner is not None:
-                receipts.append((owner, json.loads(raw)))
-                continue
             if data is None:
+                owner = _receipt_owner(path, stem, raw)
+                if owner is not None:
+                    receipts.append((owner, json.loads(raw)))
+                    continue
                 if _carries_task_identity(path, raw):
                     raise ValueError("task claim without a record shape")
                 continue  # Evidence JSON: claims nothing and hides no record.
