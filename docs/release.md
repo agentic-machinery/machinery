@@ -205,11 +205,20 @@ can land fixes first. The command does these steps in order:
 11. **Notice.** One Fleet message tells `claude-cto` that both PRs are open.
     Each still needs a review of record and a green CI Gate.
 
-If a step fails before the tag is pushed, nothing is published. If a step
-fails after the tag is pushed, the pre-release keeps its files, its notes
-start with **Withdrawn**, and the adopt PR is closed. The post-release PR then
-records `[$V] [YANKED]` and moves `main` on, so the next window cuts the next
-version. The host installs only versions the product has adopted.
+If a step fails before the tag push, nothing is published. If a step fails
+after the tag push, the command first reads what GitHub holds: the tag, the
+release and the open adopt PRs. It never trusts its own record of which calls
+succeeded, because a lost reply can hide an applied change. A full release, or
+any state it cannot read, is never withdrawn; the alert names the remaining
+steps instead. When the tag is on the remote and its release is absent or
+still a pre-release, the version is consumed. In that case the command marks
+the pre-release **Withdrawn** (it keeps its files), closes the open adopt PRs
+and opens the post-release PR, which records `[$V] [YANKED]` and moves `main`
+on so the next window cuts the next version. Each of these steps runs even if
+an earlier one fails. The host installs only versions the product has adopted.
+
+Commits in the command's fresh clones use the `user.name` and `user.email` of
+the registered machinery checkout.
 
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by

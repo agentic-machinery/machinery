@@ -260,8 +260,9 @@ class Cut:
     ci: str = ""
     section: str = ""
     notes: str = ""
-    published: bool = False
-    promoted: bool = False
+    # Fresh clones carry no identity; commits use the registered machinery checkout's user.name/user.email.
+    git_identity: tuple[str, ...] = ()
+    tag_pushed: bool = False  # the tag push was attempted; only the remote says whether it landed
     adopt_pr: int | None = None
 
     # Plumbing
@@ -307,6 +308,11 @@ class Cut:
 
     def git(self, repo: Path, *args: str, **kwargs) -> str:
         return self.run(["git", "-C", repo, *args], **kwargs).stdout.strip()
+
+    def committer(self) -> tuple[str, ...]:
+        if not self.git_identity:
+            raise CutError("no git user.name and user.email in the registered machinery checkout")
+        return self.git_identity
 
     def alert_cto(self, body: str, key: str) -> None:
         if not self.alert:
@@ -422,9 +428,9 @@ class Cut:
         tag = f"v{self.version}"
         clone = self.work / "machinery"
         self.git(clone, "tag", "-a", tag, self.head, "-m", f"lu-machinery {self.version}")
-        self.run(["git", "-C", clone, "push", self.machinery_remote, f"refs/tags/{tag}"], timeout=300)
-        self.published = True
         self.notes = notes
+        self.tag_pushed = True
+        self.run(["git", "-C", clone, "push", self.machinery_remote, f"refs/tags/{tag}"], timeout=300)
         notes_file = self.work / "notes-prerelease.md"
         notes_file.write_text(notes, encoding="utf-8")
         self.publisher("release-create", "--repo", self.machinery_repo, "--tag", tag,
@@ -448,7 +454,7 @@ class Cut:
         self.git(product, "switch", "--quiet", "-c", branch)
         shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
         self.git(product, "add", "requirements-machinery.lock")
-        self.git(product, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
+        self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: release-cut/v{self.version}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
@@ -655,20 +661,67 @@ class Cut:
         notes_file.write_text(notes, encoding="utf-8")
         self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", f"v{self.version}",
                        "--notes-file", str(notes_file), "--no-prerelease")
-        self.promoted = True
         if self.adopt_pr is not None:
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
         self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")
 
-    def withdraw(self, cause: str) -> None:
-        """Keep the pre-release and its files; say it is withdrawn and close its adopt PR."""
-        notes_file = self.work / "notes-withdrawn.md"
-        notes_file.write_text(f"**Withdrawn:** release acceptance failed ({cause}). Do not adopt this "
-                              "version; the next version replaces it.\n\n" + self.notes, encoding="utf-8")
-        self.publisher("release-edit", "--repo", self.machinery_repo, "--tag", f"v{self.version}",
-                       "--notes-file", str(notes_file))
-        if self.adopt_pr is not None:
-            self.publisher("pr-close", "--repo", self.product_repo, "--number", str(self.adopt_pr))
+    def remote_state(self) -> tuple[bool | None, str | None, list[int] | None]:
+        """What GitHub holds for this version: the tag, the release and the open adopt PRs; None is unknown."""
+        tag = f"v{self.version}"
+        listed = self.run(["git", "ls-remote", "--exit-code", "--tags", self.machinery_remote, f"refs/tags/{tag}"],
+                          check=False, timeout=120)
+        tagged = {0: True, 2: False}.get(listed.returncode)
+        viewed = self.run(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"],
+                          check=False, timeout=120)
+        release: str | None = None
+        if viewed.returncode == 0:
+            release = "prerelease" if json.loads(viewed.stdout)["isPrerelease"] else "released"
+        elif "release not found" in viewed.stderr.lower():
+            release = "absent"
+        prs = self.run(["gh", "pr", "list", "-R", self.product_repo, "--head", f"release/lu-machinery-{self.version}",
+                        "--state", "open", "--json", "number"], check=False, timeout=120)
+        adopt = [row["number"] for row in json.loads(prs.stdout)] if prs.returncode == 0 else None
+        return tagged, release, adopt
+
+    def clean_up(self, cause: str) -> str:
+        """After a failure past the tag push: act only on confirmed remote state, each step on its own.
+
+        A full release or an unknown state is never withdrawn. A pushed tag whose release is absent or still a
+        pre-release consumed the version: the pre-release is marked withdrawn, open adopt PRs are closed and the
+        post-release PR records the version as yanked so the next cut tags the next one.
+        """
+        tagged, release, adopt = self.remote_state()
+        tag = f"v{self.version}"
+        if tagged is False:
+            return f"{tag} is not on the remote; nothing was published"
+        if tagged is None or release is None:
+            return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
+        if release == "released":
+            return (f"{tag} is a full release; nothing withdrawn. Remaining: mark the adopt PR "
+                    f"{adopt if adopt is not None else 'unknown'} ready, then run release_cut post-release")
+        done: list[str] = []
+
+        def attempt(label: str, action) -> None:
+            try:
+                action()
+                done.append(f"{label}: done")
+            except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+                done.append(f"{label}: FAILED ({str(exc).splitlines()[0][:200]})")
+
+        if release == "prerelease":
+            notes_file = self.work / "notes-withdrawn.md"
+            notes_file.write_text(f"**Withdrawn:** release acceptance failed ({cause}). Do not adopt this "
+                                  "version; the next version replaces it.\n\n" + self.notes, encoding="utf-8")
+            attempt("mark the pre-release withdrawn", lambda: self.publisher(
+                "release-edit", "--repo", self.machinery_repo, "--tag", tag, "--notes-file", str(notes_file)))
+        for number in adopt or []:
+            attempt(f"close adopt PR #{number}", lambda number=number: self.publisher(
+                "pr-close", "--repo", self.product_repo, "--number", str(number)))
+        if adopt is None:
+            done.append("adopt PRs: unknown, none closed")
+        attempt("post-release PR (yanked)", lambda: self.post_release(
+            f"Withdrawn: release acceptance failed at {cause}.\n\n" + self.section, yanked=True))
+        return f"{tag} {release}: " + "; ".join(done)
 
     def post_release(self, section: str, *, yanked: bool = False) -> int:
         """One PR: record the released section in CHANGELOG.md and move main to the next version."""
@@ -689,7 +742,7 @@ class Cut:
                             encoding="utf-8")
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *VERSION_FILES)
-        self.git(clone, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
+        self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"{title}\n\nX-Agent: release-cut/v{self.version}")
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
@@ -841,7 +894,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     from lu_machinery.common.repo_root import primary_root, project_interpreter
     from lu_machinery.dispatcher.git import resolve_repo
 
-    machinery_repo = resolve_repo("machinery")[1]["github"]
+    machinery_checkout, machinery = resolve_repo("machinery")
+    machinery_repo = machinery["github"]
     product_repo = resolve_repo()[1]["github"]
     work = args.work or Path(tempfile.mkdtemp(prefix=".lu-release-cut-", dir=Path.home()))
     work.mkdir(parents=True, exist_ok=True)
@@ -860,6 +914,9 @@ def main(argv: Sequence[str] | None = None) -> int:
               product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
               machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
               primary=primary_root(), alert=not args.no_alert)
+    name, email = (cut.git(machinery_checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
+    if name and email:
+        cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
     cut.say(f"work directory {work}")
     try:
         if args.command == "post-release":
@@ -869,16 +926,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         failed_step = cut.step
         cause = f"{failed_step}: {exc}"
         cut.say(f"FAILED at {cause}")
-        try:
-            # Only a pre-release that has not passed acceptance is withdrawn.
-            if cut.published and not cut.promoted:
-                cut.withdraw(failed_step)
-                cut.say(f"v{cut.version} marked withdrawn; opening its post-release PR")
-                post = cut.post_release(f"Withdrawn: release acceptance failed at {failed_step}.\n\n"
-                                        + cut.section, yanked=True)
-                cause += f"; v{cut.version} withdrawn, adopt PR closed, post-release PR #{post} open"
-        except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as cleanup:
-            cause += f"; withdrawal incomplete: {cleanup}"
+        if cut.tag_pushed and not cut.dry_run:
+            try:
+                cleanup = cut.clean_up(failed_step)
+            except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+                cleanup = f"remote state unreadable ({error}); nothing withdrawn"
+            cut.say(f"cleanup: {cleanup}")
+            cause += f"; {cleanup}"
         try:
             cut.alert_cto(f"release-cut FAILED ({'dry run' if cut.dry_run else 'cut'}) at {cause}\n"
                           f"main {cut.head or 'unknown'}; work directory {work} (cut.log).",
