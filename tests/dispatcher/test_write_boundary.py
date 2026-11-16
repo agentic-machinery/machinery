@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -365,6 +366,82 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
         assert ("cursor_permissions" in result) == (mode == "read-only")
     else:
         assert "sources_mcp" not in result
+
+
+_LOGIN_REFRESH = """
+import json, os, sys, time
+login, real_directory, ready, seen = sys.argv[1:5]
+
+def read():
+    with open(login, encoding="utf-8") as handle:
+        return json.load(handle)
+
+start = read()
+with open(ready, "w") as handle:  # in place: the declared output is a bind
+    handle.write("ready")
+deadline = time.monotonic() + 15
+while read() == start and time.monotonic() < deadline:
+    time.sleep(0.05)
+view = read()
+# The CLI's own refresh, as Claude Code writes it: a new file renamed over the login.
+with open(login + ".refresh", "w", encoding="utf-8") as handle:
+    json.dump({"token": "refreshed-inside"}, handle)
+try:
+    os.replace(login + ".refresh", login)
+    replaced = "ok"
+except OSError as exc:
+    replaced = exc.strerror
+siblings = [os.path.exists(os.path.join(directory, "sibling-state"))
+            for directory in (os.path.dirname(login), real_directory)]
+with open(seen, "w", encoding="utf-8") as handle:
+    json.dump({"start": start, "view": view, "replaced": replaced, "siblings": siblings}, handle)
+"""
+
+
+@pytest.mark.parametrize("route", ["claude", "codex"])
+def test_a_login_the_host_replaces_reaches_the_run_and_its_refresh_reaches_the_host(primary, tmp_path, route):
+    """Defect class (#635): a single-file bind pins the login's inode at launch. The host CLI refreshes by renaming
+    a new file over its login, so the run keeps reading the stale login whose refresh token the host has spent and
+    dies with "OAuth session expired and could not be refreshed"; and the run's own refresh, renamed over the bind,
+    fails or lands in a file the host never reads. Nothing else of the real login directory may become visible."""
+    _, worktree, receipt = primary
+    home = Path(os.environ["HOME"])
+    credential = home / (".claude/.credentials.json" if route == "claude" else ".codex/auth.json")
+    credential.parent.mkdir(parents=True)
+    credential.write_text(json.dumps({"token": "issued"}))
+    (credential.parent / "sibling-state").write_text("private")
+    extra = ["--credential", str(credential)]
+    extra += ["--claude-login", str(credential.parent)] if route == "claude" else ["--codex-auth", str(credential)]
+    inside = str(credential) if route == "claude" else '"$CODEX_HOME/auth.json"'
+    probe, ready, seen = tmp_path / "login-probe.py", tmp_path / "ready", tmp_path / "seen.json"
+    probe.write_text(_LOGIN_REFRESH)
+    ready.write_text("")
+    seen.write_text("")
+
+    def refresh_on_host():
+        deadline = time.monotonic() + 60
+        while ready.read_text() != "ready" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        replacement = credential.with_name(credential.name + ".host-refresh")
+        replacement.write_text(json.dumps({"token": "refreshed-on-host"}))
+        os.replace(replacement, credential)
+
+    host = threading.Thread(target=refresh_on_host, daemon=True)
+    host.start()
+    code = write_boundary.main([
+        "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
+        "--receipt", str(receipt), "--mode", "read-only", "--output", str(ready), "--output", str(seen), *extra,
+        "--", "/bin/sh", "-c", f"{sys.executable} -I {probe} {inside} {credential.parent} {ready} {seen}",
+    ])
+    host.join(timeout=60)
+    result = json.loads(receipt.read_text())
+    assert code == 0 and result["status"] == "ran", result
+    view = json.loads(seen.read_text())
+    assert view == {"start": {"token": "issued"}, "view": {"token": "refreshed-on-host"}, "replaced": "ok",
+                    "siblings": [False, False]}, view
+    assert json.loads(credential.read_text()) == {"token": "refreshed-inside"}
+    # The host's login directory holds what it held: no temporary file of the copy is left beside the login.
+    assert sorted(path.name for path in credential.parent.iterdir()) == sorted([credential.name, "sibling-state"])
 
 
 class _Launch:
