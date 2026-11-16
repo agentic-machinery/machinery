@@ -1,6 +1,7 @@
 """Merge rescue of a write task whose remote branch was deleted after its pull request merged (machinery #118)."""
 
 import json
+import os
 import subprocess
 from contextlib import contextmanager
 from functools import partial
@@ -270,3 +271,98 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         assert "delivery_pr" not in record
         if tree == "clean":
             assert record["merged_delivery_lookup"] == "no_match"
+
+
+def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, monkeypatch):
+    """Defect class: a stacked worker settled no_deliverable after its pull request merged.
+
+    The recorded base was a parent branch (``origin/claude/stacked-base``) while GitHub merged
+    the pull request into the default branch and both refs were then deleted. Lookup stayed
+    ``no_match`` because the base names differed, and the rescue walk fetched the deleted
+    base ref. The default branch also moved on its own, so a depth-limited fetch of the
+    squash commit left its parent as a shallow boundary and ``merge-base`` failed. The shape
+    is the cto-9069-handoffreq2-opus and cto-9069-packet5-opus records: commits ahead, a
+    clean tree, ``push_state`` unpushed, ``remote_branch_missing``.
+    """
+    remote, work = tmp_path / "remote.git", tmp_path / "work"
+    parent, branch = "claude/stacked-base", "claude/rescue-stacked"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(remote))
+    _git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+    _git(tmp_path, "clone", str(remote), str(work))
+    for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+        _git(work, "config", key, value)
+    # Older than the ownership walk's one-day shallow window, so the rescue fetch stays shallow
+    # until it has the squash commit. A depth limit then hides the shared ancestor.
+    old = {**os.environ, "GIT_AUTHOR_DATE": "2026-10-01T00:00:00+00:00",
+           "GIT_COMMITTER_DATE": "2026-10-01T00:00:00+00:00"}
+    subprocess.run(["git", "-C", str(work), "commit", "--allow-empty", "-m", "root"], check=True, env=old)
+    _git(work, "push", "origin", "main")
+    _git(work, "switch", "-c", parent)
+    (work / "parent.md").write_text("parent\n")
+    _git(work, "add", "parent.md")
+    _git(work, "commit", "-m", "parent")
+    start = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", parent)
+    _git(work, "switch", "main")
+    (work / "main.md").write_text("advanced\n")
+    _git(work, "add", "main.md")
+    _git(work, "commit", "-m", "main moved")
+    _git(work, "push", "origin", "main")
+    _git(work, "switch", parent)
+    _git(work, "switch", "-c", branch)
+    (work / "docs").mkdir()
+    (work / "docs" / "owned.md").write_text("delivered\n")
+    _git(work, "add", "docs/owned.md")
+    _git(work, "commit", "-m", "deliver", "--trailer", "X-Agent: claude/rescue-stacked")
+    head = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", branch)
+    _git(work, "switch", "main")
+    _git(work, "merge", "--squash", branch)
+    _git(work, "commit", "-m", "deliver (#1250)")
+    merge = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", "main", f":{parent}", f":{branch}")
+    _git(work, "switch", branch)
+    _git(work, "remote", "set-url", "origin", "https://github.com/org/repo.git")
+    assert not _git(remote, "for-each-ref", f"refs/heads/{parent}", f"refs/heads/{branch}")
+    assert _git(remote, "rev-parse", "refs/heads/main") == merge
+
+    @contextmanager
+    def private_remote(task_id, url):
+        namespace = tmp_path / f"ns-{task_id}-{len(list(tmp_path.glob('ns-*')))}"
+        namespace.mkdir()
+        run = partial(git._verification_git, namespace, git_dir=namespace)
+        run("init", "--bare", "--template=")
+        run("config", "remote.origin.url", str(remote))
+        yield run, namespace
+
+    def gh(args, **_kwargs):
+        words = args[1:]
+        if words[:2] == ["pr", "list"]:
+            out = json.dumps([{"number": 1250, "isCrossRepository": False, "headRefName": branch}])
+        elif words[:2] == ["pr", "view"]:
+            out = json.dumps({"state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-16T08:18:10Z",
+                              "headRefOid": head, "mergeCommit": {"oid": merge}, "isCrossRepository": False})
+        elif words[2].endswith("/commits"):
+            out = json.dumps("deliver\n\nX-Agent: claude/rescue-stacked\n")
+        else:
+            assert words[2].endswith("/files")
+            out = json.dumps("docs/owned.md")
+        return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+    monkeypatch.setattr(git, "_private_remote_git", private_remote)
+    monkeypatch.setattr(github_client, "run", gh)
+    monkeypatch.setattr(pr_ownership, "state_path", lambda: tmp_path / "ownership.json")
+    record = {
+        "task_id": "rescue-stacked", "agent": "claude", "mode": "workspace-write", "status": "done",
+        "error": None, "owned_paths": ["docs/owned.md"],
+        "worktree_remote_url": "https://github.com/org/repo.git",
+        "worktree_base_ref": f"origin/{parent}", "worktree_branch": branch, "publish_branch": None,
+        "started_at": "2026-11-16T07:55:45+00:00", "worktree_base_sha": start, "worktree_start_sha": start,
+        "worktree_path": str(work), "head_sha": head, "remote_head_sha": None, "commits_ahead": 1,
+        "push_state": "unpushed", "push_state_reason": "remote_branch_missing",
+        "worktree_dirty_on_exit": False, "worktree_untracked_only_on_exit": False,
+    }
+    worker._enforce_delivery(record)
+    assert (record["status"], record["error"], record.get("delivery_pr")) == ("done", None, "org/repo#1250")
+    assert record["delivery_merge_sha"] == merge
+    assert "merged_delivery_lookup" not in record
