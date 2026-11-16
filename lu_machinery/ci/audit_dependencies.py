@@ -133,8 +133,10 @@ def _path_requirement(repo_root: Path, line: str) -> Path | None:
     """Local path a requirements line installs, relative to the consumer root.
 
     Pip treats a separator or a leading dot as a path, including ``packages/runtime``
-    and ``./packages/runtime[extra]``. Editable forms include ``-e ./path`` and
-    ``-e./path``. ``name @ file://`` and a bare ``file:`` URL point at the same tree.
+    and ``./packages/runtime[extra]``. Editable forms include ``-e ./path``,
+    ``-e./path`` and ``-epath`` (the argument may be a relative path, an extra
+    or a ``file:`` URL). ``name @ file://`` and a bare ``file:`` URL point at the
+    same tree.
     """
     body = line.split(";", 1)[0].strip()
     if body.startswith("--editable="):
@@ -143,7 +145,7 @@ def _path_requirement(repo_root: Path, line: str) -> Path | None:
         body = body[len("--editable ") :].strip()
     elif body.startswith("-e "):
         body = body[3:].strip()
-    elif body.startswith("-e") and len(body) > 2 and body[2] in "./~":
+    elif body.startswith("-e") and len(body) > 2 and body[2] != "-":
         body = body[2:].strip()
     if not body or body.startswith("-"):
         return None
@@ -343,7 +345,8 @@ def audit_python(repo_root: Path, ignore_file: Path) -> int:
             if process_env is None:
                 res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=300)
             else:
-                res = subprocess.run(
+                # Fixed pip-audit argv. env only adds the checked wheel's find-links and constraint.
+                res = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                     cmd, cwd=repo_root, capture_output=True, text=True, timeout=300, env=process_env
                 )
     except LuMachineryAuditWheelError as exc:

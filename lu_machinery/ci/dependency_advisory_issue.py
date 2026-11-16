@@ -148,7 +148,10 @@ def _run_json_command(
     label: str,
     env: dict[str, str] | None = None,
 ) -> tuple[dict, int]:
-    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    # Fixed pip-audit or npm argv. env is unset, or the checked wheel's find-links and constraint.
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
+    )
     try:
         data = json.loads(result.stdout)
     except (ValueError, TypeError) as exc:

@@ -271,6 +271,10 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
         runtime_uri,
         f"demo-runtime @ {runtime_uri}",
         "-e./packages/runtime",
+        "-epackages/runtime",
+        "-epackages/runtime[extra]",
+        f"-e{runtime.resolve()}",
+        f"-e{runtime_uri}",
         "lu-machinery(>=0.1.21)",
     ):
         (spelled / "requirements-lock.txt").write_text(spelled_line + "\n", encoding="utf-8")
