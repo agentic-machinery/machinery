@@ -551,11 +551,13 @@ def test_the_native_hook_contract_bytes_match_the_product_contract():
         "resolvers": hashlib.sha256(hooks._hook_resolvers().encode()).hexdigest(),
         "tail": hashlib.sha256(hooks._HOOK_TAIL.encode()).hexdigest(),
         "audit_tail": hashlib.sha256(hooks._AUDIT_HOOK_TAIL.encode()).hexdigest(),
+        "guard_tail": hashlib.sha256(hooks._GUARD_HOOK_TAIL.encode()).hexdigest(),
     }
     assert digest == {
         "resolvers": "14fd6464950653da6ec18ddc09445077532975999f1e54bdca8a6e109a34b0d5",
         "tail": "54569cfc49db1ec65191d713492a0e765cdc3b04b46ecba77b3dc8a39884c1a8",
         "audit_tail": "1924ef1b52e5de1eef216e8976048723e7a3ae58207c486dbde5db12447424a1",
+        "guard_tail": "bd53ab0788a15ae62dcfc2bdb1ab6b918b94a9dadc02e17526462bcce067f3a2",
     }
     # Product PR 13005 retains this audit extension until machinery owns it.
     assert "claude-audit-hook" in hooks.NATIVE_HOOK_MODES

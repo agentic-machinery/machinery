@@ -24,7 +24,18 @@ GUARD_TIMEOUT_FLOOR = 10
 PRIMARY_GUARD_NAME = "primary-checkout-write-guard"
 PRIMARY_GUARD_ENTRY = "agents_extensions/shared/hooks/guard-primary-checkout-write.py"
 GUARD_MODE = "agy-secret-print"
-# Every mode a product hook manifest may name, across the standard and audit tails.
+# Claude's Python guard delegators, by mode: ``claude-<stem>`` runs the installed
+# ``agents_extensions.shared.hooks.<stem>`` under the resolved interpreter.
+CLAUDE_GUARD_MODES = (
+    "claude-heal-core-bare",
+    "claude-guard-branch-switch-in-main",
+    "claude-guard-admin-merge",
+    "claude-guard-pr-merge",
+    "claude-guard-secret-print",
+    "claude-guard-primary-checkout-write",
+    "claude-guard-public-github-text",
+)
+# Every mode a product hook manifest may name, across the standard, audit and guard tails.
 NATIVE_HOOK_MODES = (
     GUARD_MODE,
     "agy-primary-write",
@@ -38,6 +49,7 @@ NATIVE_HOOK_MODES = (
     "codex-pre-tool-use",
     "codex-post-tool-use",
     "codex-user-prompt-submit",
+    *CLAUDE_GUARD_MODES,
 )
 # $0 of the generated command, so the contract version shows in process listings.
 NATIVE_HOOK_NAME = "lu-machinery-hook-v1"
@@ -98,6 +110,36 @@ _AUDIT_HOOK_TAIL = r"""project_hook_context_resolve 2>/dev/null || {
 }
 exec "$LEARN_UKRAINIAN_PYTHON" -I -m agents_extensions.shared.hooks.audit-primary-checkout-dirt
 """
+
+# Claude's guard delegators, in their own tail so the other modes keep their bytes.
+# Each runs the installed guard module under the interpreter the shell rule
+# resolves (never one found on PATH) and keeps the guard's own output and exit
+# status. An unknown mode, a bootstrap failure, an interpreter that cannot find
+# the installed guard module, or a failed exec exits 2, which Claude reads as a
+# refusal of the tool call.
+_GUARD_HOOK_TAIL = r"""case "$1" in
+    @MODES@) ;;
+    *) cat >/dev/null 2>&1
+       printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: unknown guard mode.' >&2
+       exit 2 ;;
+esac
+project_hook_context_resolve 2>/dev/null || {
+    cat >/dev/null 2>&1
+    printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}" >&2
+    exit 2
+}
+_lu_hook_guard="agents_extensions.shared.hooks.${1#claude-}"
+"$LEARN_UKRAINIAN_PYTHON" -I -c 'import importlib.util, sys
+raise SystemExit(0 if importlib.util.find_spec(sys.argv[1]) is not None else 1)' "$_lu_hook_guard" </dev/null >/dev/null 2>&1 || {
+    cat >/dev/null 2>&1
+    printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: the project interpreter cannot load the installed guard.' >&2
+    exit 2
+}
+shopt -s execfail
+exec "$LEARN_UKRAINIAN_PYTHON" -I -m "$_lu_hook_guard"
+printf '%s\n' 'HOOK-BOOTSTRAP-FAILED: guard interpreter did not start.' >&2
+exit 2
+""".replace("@MODES@", "|".join(CLAUDE_GUARD_MODES))
 
 
 @dataclass(frozen=True)
@@ -170,7 +212,12 @@ def native_hook_command(mode: str) -> str:
     """
     if mode not in NATIVE_HOOK_MODES:
         raise AgyHookConfigError("unsupported_hook_mode")
-    tail = _AUDIT_HOOK_TAIL if mode == "claude-audit-hook" else _HOOK_TAIL
+    if mode == "claude-audit-hook":
+        tail = _AUDIT_HOOK_TAIL
+    elif mode in CLAUDE_GUARD_MODES:
+        tail = _GUARD_HOOK_TAIL
+    else:
+        tail = _HOOK_TAIL
     body = "set -u\n" + _hook_resolvers() + tail
     return shlex.join(["/bin/bash", "-c", body, NATIVE_HOOK_NAME, mode])
 
