@@ -756,15 +756,6 @@ def release_inventory():
     return plan.decode(plan.resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
 
 
-def release_hook():
-    """One release-owned Python output the Claude provider deploys, from the packaged inventory.
-
-    Hook modules are not among them: they run from the installed release, never a deployed copy.
-    """
-    return next(target for name, record in sorted(release_inventory()["files"].items()) if name.endswith(".py")
-                for target in record["targets"].get("claude", []))
-
-
 def test_release_requires_each_claude_python_guard_as_its_native_command():
     """Defect class: a mandatory Claude Python delegator run by the interpreter PATH selects,
     or release bytes drifting from the installed native hook command they must equal."""
@@ -815,17 +806,22 @@ def forge_manifest_listing(root, extra):
 
 
 def test_installed_deploy_outputs_verified_by_check_are_not_untracked_inputs(deployed, monkeypatch):
-    """The #22 refusal: release- and product-owned hook copies the session runs from block every push."""
+    """The #22 refusal: product-owned hook copies the session runs from block every push.
+
+    The release itself deploys no Python: its modules run from the installed release, never a copy
+    importable from the consumer tree."""
     gate = load_gate(monkeypatch)
     listed = subprocess.run(["git", "-C", str(deployed), "ls-files", "--others", "--", "*.py"], capture_output=True,
                             text=True, check=True, env=git_environment()).stdout.split()
-    assert {".claude/hooks/product.py", release_hook()} <= set(listed)
+    assert set(listed) == {".claude/hooks/product.py"}
+    assert [name for name, record in release_inventory()["files"].items()
+            if name.endswith(".py") and record["targets"]] == []
     manifest, error = gate_verdict(gate, deployed)
     assert error is None
     assert manifest == hashlib.sha256((deployed / plan.STATE).read_bytes()).hexdigest()
 
 
-@pytest.mark.parametrize("change", ["product-copy", "release-copy", "source-committed-after-deploy",
+@pytest.mark.parametrize("change", ["product-copy", "source-committed-after-deploy",
                                     "mode-changed-after-deploy", "source-edited-during-check"])
 def test_deployed_output_edited_after_deploy_is_refused(deployed, monkeypatch, change):
     """A stale or edited copy, or one deployed from an uncommitted source, is not a verified output."""
@@ -843,8 +839,6 @@ def test_deployed_output_edited_after_deploy_is_refused(deployed, monkeypatch, c
         source.write_bytes(GATE_PRODUCT_HOOK + b"print('uncommitted')\n")
         deploy_cli(deployed)
     else:
-        changed = changed if change == "product-copy" else release_hook()
-        cause = f"output drift: {changed}"
         with (deployed / changed).open("ab") as handle:
             handle.write(b"print('edited')\n")
     _, error = gate_verdict(gate, deployed)

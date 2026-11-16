@@ -188,7 +188,11 @@ def test_real_launcher_deploy_is_confined_to_temporary_checkout(tmp_path: Path) 
     print(f"Deployment child toolchain: {executed}", flush=True)
     sources = machinery_path("agents_extensions/shared/skills")
     deployed = checkout / ".agents/skills"
-    expected = {path.relative_to(sources) for path in sources.rglob("*") if path.is_file() and "__pycache__" not in path.parts}
+    # A packaged skill file whose release record has no targets is never deployed.
+    undeployed = {Path(name).relative_to("skills") for name, record in inventory["files"].items()
+                  if name.startswith("skills/") and not record["targets"]}
+    expected = {path.relative_to(sources) for path in sources.rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts} - undeployed
     actual = {path.relative_to(deployed) for path in deployed.rglob("*") if path.is_file()}
     assert actual == expected
     assert any(path.name == "SKILL.md" for path in actual)
