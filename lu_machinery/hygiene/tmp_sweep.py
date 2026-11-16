@@ -17,6 +17,15 @@ instead of deleting it. Each step is recorded in the append-only ledger of
 leaves its path. ``restore <ledger-id>`` puts an entry back; the purge pass
 at the start of a later run deletes it only once the window (7 days by
 default) has passed and the same checks still hold.
+
+Privileged holder probe (TMPSWEEP-PRIVILEGE-1116): an unprivileged process
+scan cannot read root's or non-dumpable processes, so it is never complete on
+a normal host. When ``LU_TMP_SWEEP_HOLDER_PROBE`` names a command (the unit
+sets ``sudo -n /usr/local/libexec/lu-tmp-holders``), every liveness check
+also runs it. Exit 0 with well-formed records makes the check complete and
+counts each printed path, with its ancestors, as in use. Any other result
+leaves the check as it was; it covers only locations below the helper's
+areas. Deletion itself always runs unprivileged.
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -349,6 +359,134 @@ def process_snapshot(proc_root: Path = Path("/proc")) -> tuple[list[tuple[int, P
             if target.startswith("/"):
                 references.append((int(entry.name), Path(target.removesuffix(" (deleted)"))))
     return references, complete
+
+
+# The privileged holder probe (TMPSWEEP-PRIVILEGE-1116): a root-owned helper that reads every
+# process and prints the in-use paths below the areas it covers. Deletion stays unprivileged.
+HOLDER_PROBE_ENV = "LU_TMP_SWEEP_HOLDER_PROBE"
+# The helper stops itself after 60 seconds; the margin lets it report that itself.
+HOLDER_PROBE_TIMEOUT_S = 90.0
+# The helper reports only paths below these areas, so it proves nothing about any other location.
+HOLDER_PROBE_AREAS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
+HOLDER_KINDS = frozenset({b"cwd", b"root", b"exe", b"fd", b"map"})
+
+
+@dataclass(frozen=True)
+class HolderProbe:
+    """One holder-probe run: ``unset``, ``out_of_scope``, ``failed`` (with ``reason``) or ``complete``.
+
+    Only ``complete`` carries references; every other outcome leaves the
+    sweep's own, unprivileged process snapshot as the only evidence.
+    """
+
+    outcome: str
+    reason: str | None = None
+    references: tuple[tuple[int, Path], ...] = ()
+    records: int = 0
+
+    def report(self) -> dict[str, Any]:
+        """The privacy-safe report fields: no paths, only the outcome, reason and record count."""
+        return {"outcome": self.outcome, "reason": self.reason, "records": self.records}
+
+
+def _probe_covers(location: Path) -> bool:
+    """Whether the helper's areas contain ``location``, judged by its real directory.
+
+    The helper matches the kernel's resolved paths against the literal area
+    names, so an area reached through a symlink is not covered.
+    """
+    real = Path(os.path.realpath(location.parent)) / location.name if location.name else location
+    return any(real == area or area in real.parents for area in HOLDER_PROBE_AREAS)
+
+
+def _holder_records(stdout: bytes) -> tuple[tuple[int, Path], ...] | None:
+    """Parse ``<pid>\\t<kind>\\t<path>\\0`` records strictly; ``None`` when any record is malformed.
+
+    A record splits on its first two tabs only, since a path may hold tabs and
+    newlines. The pid is a positive decimal, the kind a known one and the path
+    an absolute, normalized path inside a covered area. A path the kernel shows
+    as deleted is held both as printed and without the marker.
+    """
+    if not stdout:
+        return ()
+    if not stdout.endswith(b"\0"):
+        return None
+    references: list[tuple[int, Path]] = []
+    for record in stdout[:-1].split(b"\0"):
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3:
+            return None
+        pid_field, kind, raw = fields
+        if not pid_field.isdigit() or kind not in HOLDER_KINDS:
+            return None
+        try:
+            pid = int(pid_field)
+        except ValueError:  # beyond the interpreter's integer-string digit limit
+            return None
+        text = os.fsdecode(raw)
+        if pid <= 0 or not text.startswith("/") or os.path.normpath(text) != text:
+            return None
+        path = Path(text)
+        if not any(path == area or area in path.parents for area in HOLDER_PROBE_AREAS):
+            return None
+        references.append((pid, path))
+        if text.endswith(" (deleted)"):
+            references.append((pid, Path(text.removesuffix(" (deleted)"))))
+    return tuple(references)
+
+
+def holder_probe(location: Path) -> HolderProbe:
+    """Run the configured holder probe for ``location``; anything short of a clean run fails closed.
+
+    The command comes from ``LU_TMP_SWEEP_HOLDER_PROBE``, split like a shell
+    word list and run without a shell, with no input, under a timeout. Only
+    exit status 0 with well-formed output is ``complete``.
+    """
+    command = os.environ.get(HOLDER_PROBE_ENV)
+    if command is None:
+        return HolderProbe("unset")
+    if not _probe_covers(location):
+        return HolderProbe("out_of_scope", "location_outside_probe_areas")
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if not argv:
+        return HolderProbe("failed", "invalid_command")
+    try:
+        # The unit's own configured command as a fixed argv, never a shell; its output is only parsed.
+        # Whoever sets this environment already controls the sweep's interpreter, so it adds no trust.
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            argv,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=HOLDER_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return HolderProbe("failed", "timeout")
+    except (OSError, subprocess.SubprocessError):
+        return HolderProbe("failed", "spawn_error")
+    if result.returncode != 0:
+        return HolderProbe("failed", f"exit_status_{result.returncode}")
+    references = _holder_records(result.stdout)
+    if references is None:
+        return HolderProbe("failed", "malformed_output")
+    return HolderProbe("complete", references=references, records=result.stdout.count(b"\0"))
+
+
+def liveness_snapshot(location: Path) -> tuple[list[tuple[int, Path]], bool, HolderProbe]:
+    """The sweep's own process snapshot, merged with a complete holder probe for ``location``.
+
+    A complete probe adds every path it printed as held (so each printed path
+    and its ancestors count as in use) and makes the snapshot complete. Any
+    other probe outcome leaves the own snapshot exactly as it was.
+    """
+    references, complete = process_snapshot()
+    probe = holder_probe(location)
+    if probe.outcome == "complete":
+        return [*references, *probe.references], True, probe
+    return references, complete, probe
 
 
 def registered_worktrees(repo_root: Path) -> set[Path] | None:
@@ -957,7 +1095,7 @@ def quarantined_problem(
         task_referenced(path, inventory.references) for path in (origin, quarantined)
     ):
         return "quarantine_task_reference"
-    references, complete = process_snapshot()
+    references, complete, _probe = liveness_snapshot(quarantined)
     if any(ref == quarantined or quarantined in ref.parents for _, ref in references):
         return "quarantine_live_process"
     if not complete:
@@ -1064,7 +1202,7 @@ def purge_problem(entry: Entry, task_root: Path) -> str | None:
         if (record != entry.intent.get("task_record") or record is None
                 or record["status"] not in REAPABLE_STATES):
             return "purge_task_owner_changed"
-    references, complete = process_snapshot()
+    references, complete, _probe = liveness_snapshot(location)
     if any(ref == location or location in ref.parents for _, ref in references):
         return "purge_live_process"
     if not complete:
@@ -1308,7 +1446,7 @@ def _sweep_locked(
         rows += purged
         errors += purge_errors
         inventory = load_tasks(tasks)
-        references, complete = process_snapshot()
+        references, complete, probe = liveness_snapshot(root)
         worktrees = registered_worktrees(worktree_root)
         managed = protected_roots()
         for path in sorted(root.iterdir()):
@@ -1333,7 +1471,7 @@ def _sweep_locked(
                     # The pre-rename snapshot is taken before the fresh proof, so
                     # any write after it differs at the post-rename comparison.
                     before = tree_fingerprint(path)
-                    fresh_refs, fresh_complete = process_snapshot()
+                    fresh_refs, fresh_complete, _probe = liveness_snapshot(root)
                     fresh = classify_path(
                         path,
                         tasks=load_tasks(tasks),
@@ -1395,6 +1533,7 @@ def _sweep_locked(
         "errors": errors,
         "quarantine_restored": restored,
         "process_probe_complete": complete,
+        "holder_probe": probe.report(),
         "task_inventory_complete": inventory.complete,
         "quarantined_entries": len(quarantined),
         "bytes_quarantined": sum(row["bytes"] for row in quarantined),
