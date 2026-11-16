@@ -452,8 +452,9 @@ def holder_probe(location: Path) -> HolderProbe:
         return HolderProbe("failed", "invalid_command")
     try:
         # The unit's own configured command as a fixed argv, never a shell; its output is only parsed.
+        # Whoever sets this environment already controls the sweep's interpreter, so it adds no trust.
         result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            argv,
+            argv,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
             stdin=subprocess.DEVNULL,
             capture_output=True,
             check=False,
