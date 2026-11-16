@@ -28,7 +28,7 @@ import textwrap
 import threading
 import time
 import tomllib
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -700,7 +700,7 @@ class Cut:
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
         self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")
 
-    def probe(self, argv: Sequence[str | Path], parse):
+    def probe[T](self, argv: Sequence[str | Path], parse: Callable[[subprocess.CompletedProcess[str]], T]) -> T | None:
         """One read of remote state. Any failure, a timeout included, is unknown (None), never an exception."""
         try:
             return parse(self.run(argv, check=False, timeout=120))
