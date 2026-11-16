@@ -1154,21 +1154,7 @@
     "skills/drive-epic/scripts/render_catalog_tables.py": {
       "mode": 420,
       "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/skills/drive-epic/scripts/render_catalog_tables.py",
-          ".agents/skills/drive-epic/scripts/render_catalog_tables.py"
-        ],
-        "claude": [
-          ".claude/skills/drive-epic/scripts/render_catalog_tables.py"
-        ],
-        "codex": [
-          ".agents/skills/drive-epic/scripts/render_catalog_tables.py"
-        ],
-        "cursor": [
-          ".cursor/skills/drive-epic/scripts/render_catalog_tables.py"
-        ]
-      }
+      "targets": {}
     },
     "skills/full-send/SKILL.md": {
       "mode": 420,
