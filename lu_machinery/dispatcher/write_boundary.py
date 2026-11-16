@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -434,25 +435,34 @@ def _git(cwd: Path, *args: str, git_dir: Path | None = None, network: bool = Fal
     return result.stdout
 
 
-def _writable_tracked_file(repository: Path) -> Path:
+def _owner_writable(path: Path, kind: Callable[[int], bool]) -> bool:
+    """Whether ``path`` (not followed) is of ``kind`` and is one the host user owns and may write on disk."""
+    try:
+        status = path.lstat()
+    except OSError:
+        return False
+    return kind(status.st_mode) and status.st_uid == os.geteuid() and os.access(path, os.W_OK)
+
+
+def _writable_tracked_file(repository: Path) -> Path | None:
     """The first tracked regular file the host user owns and may write, for the canary's read-only bind probe.
 
     The kernel checks file permissions before the mount's read-only flag, so a tracked file that is read-only
     on disk gives EACCES under any mount and would test its mode, not the bind. The sandbox maps only the host
     user, so a file writable only through its group or another owner gives EACCES inside it as well.
+
+    None when no tracked file is writable, the primary write guard's intended steady state: the canary's
+    absent-path probes (create, mkdir, rename, unlink in the repository root) then prove the bind alone, which
+    holds only while the root directory is one the host user owns and may write on disk, so an EROFS there can
+    come from the mount and not from the directory's mode. A root that is not refuses.
     """
     for name in _git(repository, "ls-files", "-z").split("\0"):
-        if not name:
-            continue
-        path = repository / name
-        try:
-            status = path.lstat()
-        except OSError:
-            continue
-        if stat.S_ISREG(status.st_mode) and status.st_uid == os.geteuid() and os.access(path, os.W_OK):
-            return path
-    raise Refused("the primary has no tracked regular file the host user may write, so the canary cannot "
-                  "tell its read-only bind from file permissions")
+        if name and _owner_writable(repository / name, stat.S_ISREG):
+            return repository / name
+    if _owner_writable(repository, stat.S_ISDIR):
+        return None
+    raise Refused("the primary has no tracked regular file and no repository root directory the host user may "
+                  "write, so the canary cannot tell its read-only bind from file permissions")
 
 
 def _listening_socket_paths() -> list[Path]:
@@ -1443,10 +1453,10 @@ class _Boundary:
         def expect(op: str, path: Path | str, *outcomes: str, port: int | None = None) -> None:
             probes.append({"op": op, "path": str(path), "expect_any": list(outcomes), **({"port": port} if port else {})})
 
-        tracked = _writable_tracked_file(repository)
         absent = repository / f".write-boundary-canary-{nonce}"
-        expect("write_open", tracked, "EROFS")
-        expect("chmod", tracked, "EROFS")
+        if (tracked := _writable_tracked_file(repository)) is not None:
+            expect("write_open", tracked, "EROFS")
+            expect("chmod", tracked, "EROFS")
         for op in ("create", "mkdir", "rename", "unlink"):
             expect(op, absent, "EROFS")
         for name in self.protected:
