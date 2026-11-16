@@ -40,7 +40,11 @@ release is fixed by a new version, never by rebuilding or replacing assets.
 `CHANGELOG.md` at the repository root follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/). It has one
 section per release and an `Unreleased` section on top. The release command is
-the only writer; worker PRs do not edit `CHANGELOG.md`.
+the only writer; worker PRs do not edit `CHANGELOG.md`. `Unreleased` stays
+empty: the preflight and the post-release PR refuse while it holds any line,
+because the new section goes directly below its heading and would absorb
+them. Remove such lines on `main` (each change reaches the notes from its PR
+title), then run the command again.
 
 Each section is generated from the squash titles of the PRs merged in
 `v<full>..v<version>` (`git log --first-parent --format=%s`), oldest first,
@@ -130,10 +134,11 @@ order:
    `$SHA` is that tag's commit, or when only post-release PRs merged since the
    last full release `v<full>` (see Changelog). It refuses when it cannot read
    the release state of a tag it must check. Otherwise it refuses unless all
-   three of these hold:
+   four of these hold:
    - `pyproject.toml`, `package.json` and both versions in
      `package-lock.json` hold `$V`, the next patch version after `<previous>`;
    - the tag `v$V` is absent;
+   - the `Unreleased` section of `CHANGELOG.md` at `$SHA` is empty;
    - the newest `CI Gate` push run on `$SHA`
      (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
      `success`.

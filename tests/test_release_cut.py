@@ -14,7 +14,7 @@ from lu_machinery import release_cut
 from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
 from lu_machinery.common import repo_root
 from lu_machinery.dispatcher import git as git_module
-from lu_machinery.release_cut import Cut, CutError, main, preflight, release_notes, x_agent_value
+from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes, x_agent_value
 
 HEAD = "a" * 40
 TAG_COMMIT = "b" * 40
@@ -22,11 +22,19 @@ NEXT = {"pyproject.toml": "0.1.22", "package.json": "0.1.22", "package-lock.json
         'package-lock.json packages[""]': "0.1.22"}
 GREEN = [{"headSha": HEAD, "event": "push", "status": "completed", "conclusion": "success", "databaseId": 7}]
 TITLES = ["fix(review): count a shared branch's review rounds per pull request (#627)"]
+REPO = "learn-ukrainian/machinery"
+CHANGELOG = (
+    "# Changelog\n\n## [Unreleased]\n\n"
+    '<a id="v0.1.21"></a>\n## [0.1.21] - 2026-11-15\n\n### Fixed\n\n- Earlier fix\n\n'
+    f"[Unreleased]: https://github.com/{REPO}/compare/v0.1.21...HEAD\n"
+    f"[0.1.21]: https://github.com/{REPO}/compare/v0.1.20...v0.1.21\n"
+)
+HAND_WRITTEN = CHANGELOG.replace("## [Unreleased]\n\n", "## [Unreleased]\n\n### Fixed\n\n- Hand-written line\n\n")
 
 
 def decide(**changes):
     inputs = {"head": HEAD, "last_tag": "v0.1.21", "last_tag_commit": TAG_COMMIT, "baseline": "v0.1.21", "titles": TITLES,
-              "versions": NEXT, "tags": ["v0.1.20", "v0.1.21"], "runs": GREEN}
+              "versions": NEXT, "tags": ["v0.1.20", "v0.1.21"], "runs": GREEN, "changelog": CHANGELOG}
     return preflight(**{**inputs, **changes})
 
 
@@ -82,6 +90,30 @@ def test_ci_gate_not_green_on_the_exact_commit_refuses(runs, expected):
     decision = decide(runs=runs)
     assert decision.action == "refuse"
     assert expected in decision.reason
+
+
+def test_hand_written_unreleased_lines_refuse_instead_of_joining_the_release():
+    """Defect class: lines a worker PR wrote under Unreleased are filed under the next release, as on #655."""
+    decision = decide(changelog=HAND_WRITTEN)
+    assert decision.action == "refuse"
+    assert "Unreleased is not empty (starts '### Fixed')" in decision.reason
+    with pytest.raises(CutError, match="Unreleased is not empty"):
+        record_changelog(HAND_WRITTEN, version="0.1.22", previous="0.1.21", date="2026-11-16",
+                         notes="### Fixed\n\n- Generated\n", repo=REPO)
+
+
+def test_an_empty_unreleased_section_records_the_release_below_it():
+    """Defect class: the empty-Unreleased guard changes the generated section, anchor or compare links."""
+    assert decide().action == "cut"
+    assert record_changelog(CHANGELOG, version="0.1.22", previous="0.1.21", date="2026-11-16",
+                            notes="### Fixed\n\n- Generated\n", repo=REPO) == (
+        "# Changelog\n\n## [Unreleased]\n\n"
+        '<a id="v0.1.22"></a>\n## [0.1.22] - 2026-11-16\n\n### Fixed\n\n- Generated\n\n'
+        '<a id="v0.1.21"></a>\n## [0.1.21] - 2026-11-15\n\n### Fixed\n\n- Earlier fix\n\n'
+        f"[Unreleased]: https://github.com/{REPO}/compare/v0.1.22...HEAD\n"
+        f"[0.1.22]: https://github.com/{REPO}/compare/v0.1.21...v0.1.22\n"
+        f"[0.1.21]: https://github.com/{REPO}/compare/v0.1.20...v0.1.21\n"
+    )
 
 
 def test_notes_are_generated_from_every_merged_title_except_the_bump():
@@ -209,6 +241,7 @@ def _released_history(tmp_path, commits, releases):
     """
     seed = tmp_path / "seed"
     _init_repo(seed)
+    (seed / "CHANGELOG.md").write_text(CHANGELOG, encoding="utf-8")
     for title, version, tag in commits:
         (seed / "pyproject.toml").write_text(f'[project]\nname = "lu-machinery"\nversion = "{version}"\n', encoding="utf-8")
         package = {"name": "lu-machinery-acp", "version": version}
