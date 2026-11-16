@@ -201,6 +201,17 @@ order:
      to the candidate, then runs
      `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$P" -m pytest --collect-only -q tests`.
      A non-zero exit or any collection error stops the cut.
+
+     The same step already runs on every PR and merge group, so a change that
+     breaks it fails before merge. The `Installed wheel` job of CI Gate runs
+     `release_cut consumer-collection` with the wheel built from the tested
+     head, against the product commit in `.github/workflows/product-consumer.pin`.
+     The product environment is built from that commit's
+     `requirements-lock.txt`, and `LEARN_UKRAINIAN_PYTHON` names the candidate
+     interpreter. The job then runs the pin's key consumer tests and reports
+     the pin and the wheel's SHA-256. The pin never follows product `main`.
+     Bump it in its own PR to a product commit whose CI Gate passed, and update
+     its test list there.
    - **Review-contract canary** once on `$SHA`, regardless of which paths
      changed. This replaces the per-PR canary gate; independent PR review and
      CI remain required. It is the candidate's own orchestration (the

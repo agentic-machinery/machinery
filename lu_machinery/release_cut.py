@@ -905,9 +905,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "  .venv/bin/python -I -m lu_machinery.release_cut cut --x-agent claude/claude-cto\n"
         "  .venv/bin/python -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-cto\n"
         "  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto\n"
+        "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
+        "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
         "Outputs: step lines on stdout; the work directory keeps cut.log, dist, wheelhouse and npm cache.\n"
-        "Exit codes: 0 released, skipped as unchanged, or dry run passed; 1 refused or failed (claude-cto\n"
-        "alerted); 2 invalid input.\n"
+        "Exit codes: 0 released, skipped as unchanged, dry run passed or consumer collection passed; 1 refused\n"
+        "or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
         "Related: docs/release.md#cut-a-release.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -923,6 +925,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if name == "cut":
             command.add_argument("--dry-run", action="store_true",
                                  help="Build, install, notes, Node, resources and collection; no tag, publish or PR")
+    text = "Run the cut's consumer test collection step alone, against a given product checkout (CI Gate)"
+    collect = sub.add_parser("consumer-collection", help=text, description=text)
+    collect.add_argument("--python", type=Path, required=True,
+                         help="Candidate interpreter: a clean environment that holds the wheel under test")
+    collect.add_argument("--product", type=Path, required=True, help="Product checkout whose tests are collected")
+    collect.add_argument("--product-python", type=Path, required=True,
+                         help="Product environment's interpreter; its site-packages follow the candidate's")
+    collect.add_argument("--version", required=True, help="lu-machinery version the candidate must resolve to")
+    collect.add_argument("--work", type=Path, help="Empty work directory (default: a new temporary directory)")
     args = parser.parse_args(argv)
     # Runtime admission refuses group- or other-writable Node and agent artifacts, and every path the cut
     # writes (venvs, pip and npm installs, the prepared Node prefix) is made by this process or a child that
@@ -930,9 +941,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     previous_umask = os.umask(0o022)
     os.umask(previous_umask | 0o022)
     try:
+        if args.command == "consumer-collection":
+            return _consumer_collection(args)
         return _run(args)
     finally:
         os.umask(previous_umask)
+
+
+def _consumer_collection(args: argparse.Namespace) -> int:
+    """The cut's consumer_collection, unchanged, for CI: the product environment stands in for the host's."""
+    work = (args.work or Path(tempfile.mkdtemp(prefix="lu-consumer-collection-"))).absolute()
+    work.mkdir(parents=True, exist_ok=True)
+    if any(work.iterdir()):
+        print(f"--work {work} must be empty", file=sys.stderr)
+        return 2
+    for name in ("home", "tmp"):
+        (work / name).mkdir()
+    product = args.product.absolute()
+    # Not resolved: a venv interpreter is a symlink, and resolving it leaves the venv.
+    cut = Cut(work=work, dry_run=True, machinery_remote="", product_remote="", machinery_repo="", product_repo="",
+              host_python=args.product_python.absolute(), primary=product, alert=False, x_agent="",
+              built=args.version)
+    try:
+        cut.consumer_collection(args.python.absolute(), product)
+    except (CutError, OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        cut.say(f"FAILED at {cut.step}: {exc}")
+        return 1
+    return 0
 
 
 def _run(args: argparse.Namespace) -> int:
