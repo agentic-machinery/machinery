@@ -13,6 +13,28 @@ this file.
 
 - The dependency audit resolves a consumer's `lu-machinery` requirement from the hash-checked wheel in `LU_MACHINERY_WHEELHOUSE` instead of PyPI. The constraint names that staged wheel by file URL, so another build of the same version on an index cannot replace it. Path requirements pip accepts, including a compact `-e` with no separator, reach that check. A missing pin, a hash mismatch, or a missing wheel fails the audit before pip-audit runs.
 
+<a id="v0.1.24"></a>
+## [0.1.24] - 2026-11-16
+
+### Added
+
+- Cut, publish and adopt a release with one command ([#631](https://github.com/learn-ukrainian/machinery/pull/631))
+
+### Fixed
+
+- Stamp a caller-supplied X-Agent trailer on release commits ([#634](https://github.com/learn-ukrainian/machinery/pull/634))
+- Run shared lu_machinery commands as modules ([#637](https://github.com/learn-ukrainian/machinery/pull/637))
+- An unreadable stranger no longer voids the fallback settlement stop ([#632](https://github.com/learn-ukrainian/machinery/pull/632))
+- Name the Sources transport on Codex workspace-write ([#640](https://github.com/learn-ukrainian/machinery/pull/640))
+- Name the model-stats store without a transcript filename ([#641](https://github.com/learn-ukrainian/machinery/pull/641))
+- Admit the cut's Node prefix under a 0002 umask and alert from the primary (#642) ([#643](https://github.com/learn-ukrainian/machinery/pull/643))
+- Release everything since the last full release after a withdrawn pre-release ([#645](https://github.com/learn-ukrainian/machinery/pull/645))
+- Model-stats counts parsed reviews of record and splits author from reviewer (#581) ([#646](https://github.com/learn-ukrainian/machinery/pull/646))
+
+### Removed
+
+- Remove the retired write-worker boundary ([#629](https://github.com/learn-ukrainian/machinery/pull/629))
+
 <a id="v0.1.23"></a>
 ## [0.1.23] - 2026-11-16 [YANKED]
 
@@ -581,7 +603,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.23...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...HEAD
+[0.1.24]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.24
 [0.1.23]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.23
 [0.1.22]: https://github.com/learn-ukrainian/machinery/compare/v0.1.21...v0.1.22
 [0.1.21]: https://github.com/learn-ukrainian/machinery/compare/v0.1.20...v0.1.21
