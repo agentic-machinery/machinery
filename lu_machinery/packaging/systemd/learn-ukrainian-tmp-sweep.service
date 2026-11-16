@@ -6,6 +6,8 @@ Type=oneshot
 WorkingDirectory=@REPO_ROOT@
 Environment=LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=@REPO_ROOT@
 Environment=LU_PRODUCT_ROOT=@REPO_ROOT@
+# Quoted: systemd splits Environment= at spaces.
+Environment="LU_TMP_SWEEP_HOLDER_PROBE=sudo -n /usr/local/libexec/lu-tmp-holders"
 # Read-only report first; then reap quiet, unreferenced scratch (#9737).
 ExecStart=@PYTHON@ -m lu_machinery.hygiene.batch_state_retention
 ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary
@@ -14,7 +16,7 @@ TimeoutStartSec=3600
 TimeoutStopSec=300
 Nice=15
 IOSchedulingClass=idle
-# No network. A user manager accepts PrivateNetwork= and IPAddressDeny=
-# without enforcing them; the seccomp address-family filter is enforced.
-RestrictAddressFamilies=AF_UNIX
+# No RestrictAddressFamilies= here: in a user manager every seccomp-based
+# setting forces NoNewPrivileges, and sudo then refuses to run the probe.
+# A user manager accepts PrivateNetwork= and IPAddressDeny= without enforcing them.
 IPAddressDeny=any

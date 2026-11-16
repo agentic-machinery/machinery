@@ -26,10 +26,17 @@ with up to 10 minutes of random delay. Missed runs catch up. It starts
    byte totals only, never entry names; the ledger holds the quarantined
    names.
 
-The service has no network: `RestrictAddressFamilies=AF_UNIX` refuses every
-IPv4 and IPv6 socket. `PrivateNetwork=yes` is not used, because the user
-manager accepts it without isolating anything. `IPAddressDeny=any` is set as
-well, but a user manager does not enforce it either.
+The unit does not set `RestrictAddressFamilies=`. In a user manager every
+seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
+The holder-probe assignment is one quoted line,
+`Environment="LU_TMP_SWEEP_HOLDER_PROBE=sudo -n /usr/local/libexec/lu-tmp-holders"`,
+because systemd splits an unquoted `Environment=` value at spaces. This
+package's sweep still reads `/proc` as the invoking user; the line keeps
+that assignment across a reinstall. The process probe stays incomplete
+until one that can read every process exists, as described below.
+`PrivateNetwork=` is not set: a user manager accepts it without isolating
+anything. `IPAddressDeny=any` is set, and a user manager does not enforce it
+either.
 
 Install the units after merge, from the primary checkout:
 
