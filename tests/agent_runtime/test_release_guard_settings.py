@@ -71,6 +71,28 @@ def test_native_guard_commands_run_the_release_guard_and_stale_bytes_refuse(tmp_
         claude._worker_guard_settings()
 
 
+def test_unknown_blocking_hook_refuses_instead_of_vanishing_from_worker_settings(tmp_path, monkeypatch):
+    """Defect class: a blocking product guard in an untranslated form silently dropped from worker settings."""
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
+    settings = tmp_path / "agents_extensions/shared/settings.json"
+    settings.parent.mkdir(parents=True)
+    unknown = "$CLAUDE_PROJECT_DIR/scripts/hooks/enforce-venv.sh"
+
+    def write(**extra):
+        hooks = [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-venv.sh"},
+                 {"type": "command", "command": unknown, **extra}]
+        settings.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": hooks}]}}))
+
+    write()
+    hooks = Path(claude.__file__).absolute().parents[3] / "agents_extensions/shared/hooks"
+    # A non-blocking hook that is no fleet guard is still dropped.
+    assert json.loads(claude._worker_guard_settings()) == {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": shlex.quote(str(hooks / "enforce-venv.sh"))}]}]}}
+    write(onFailure="block")
+    with pytest.raises(RuntimeError, match=r"blocking hook has no release guard \(matcher 'Bash'\): .*scripts/hooks/enforce-venv\.sh"):
+        claude._worker_guard_settings()
+
+
 def test_missing_product_settings_refuses_without_filesystem_traceback(tmp_path, monkeypatch):
     """A missing consumer setting must refuse explicitly instead of FileNotFoundError."""
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
