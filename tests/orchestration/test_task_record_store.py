@@ -19,11 +19,16 @@ def test_iter_task_records_yields_hot_then_archive(tmp_path):
         path.write_text(json.dumps({"task_id": path.stem, "schema_version": 2}), encoding="utf-8")
     (tasks / "a.result").write_text("reply", encoding="utf-8")
     (tasks / "nested.json").mkdir()  # a directory is never a record
+    # Dispatcher receipts sit beside records and are not candidates. A foreign JSON file still is.
+    for name in ("a.write-boundary.json", "a.sandbox.json", "a.tool-results.json"):
+        (tasks / name).write_text("{}", encoding="utf-8")
+    (tasks / "archive" / "c.write-boundary.json").write_text("{}", encoding="utf-8")
+    (tasks / "receipt.json").write_text("[]", encoding="utf-8")
 
     names = [str(path.relative_to(tasks)) for path in store.iter_task_records(tasks, include_archive=True)]
-    assert names == ["a.json", "b.json", "archive/a.json", "archive/c.json"]
+    assert names == ["a.json", "b.json", "receipt.json", "archive/a.json", "archive/c.json"]
     hot = [path.name for path in store.iter_task_records(tasks, include_archive=False)]
-    assert hot == ["a.json", "b.json"]
+    assert hot == ["a.json", "b.json", "receipt.json"]
     assert list(store.iter_task_records(tmp_path / "missing", include_archive=True)) == []
 
 
@@ -124,3 +129,36 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
         assert message == f"NON_RECORD_FILE: {str(path)!r}"
         assert not any(sep in message for sep in ("\n", "\r", "\u0085", "\u2028", "\u2029", "\x1b"))
         assert "\n" not in formatter.format(caplog.records[-1])
+
+    # Dispatcher sidecars are not foreign. The receipt suffixes come from the writers, not a guessed pattern.
+    from lu_machinery.dispatcher.agy_sandbox import RECEIPT_SUFFIX as sandbox_suffix
+    from lu_machinery.dispatcher.agy_sandbox import tool_results_file
+    from lu_machinery.dispatcher.write_boundary import RECEIPT_SUFFIX as boundary_suffix
+
+    record = tmp_path / "task.json"
+    sidecars = (
+        record.with_suffix(boundary_suffix),
+        record.with_suffix(sandbox_suffix),
+        tool_results_file(record.with_suffix(".result")),
+        record.with_suffix(".prompt"),
+        record.with_suffix(".result"),
+        record.with_suffix(record.suffix + ".lock"),
+        record.with_suffix(".rules-core"),
+        record.with_suffix(".launch-prompt"),
+        record.with_suffix(".log"),
+        record.with_suffix(".diag"),
+        Path(str(record.with_suffix(".diag")) + ".prev"),
+        record.with_suffix(".snapshots"),
+        tmp_path / "task.inputs",
+        tmp_path / "task.artifacts",
+        tmp_path / "task.evidence",
+    )
+    payload = b'{"schema": 1, "task_id": "task", "status": "ran"}'
+    for path in sidecars:
+        before = len(caplog.records)
+        assert store.parse_task_record(path, payload) is None
+        assert len(caplog.records) == before
+    before = len(caplog.records)
+    assert store.parse_task_record(tmp_path / "receipt.json", payload) is None
+    assert len(caplog.records) == before + 1
+    assert "receipt.json" in caplog.records[-1].getMessage()

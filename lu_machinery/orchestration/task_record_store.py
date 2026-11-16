@@ -44,10 +44,42 @@ _LOG = logging.getLogger(__name__)
 # Foreign-file fingerprints this process has already reported; scans repeat, the warning does not.
 _REPORTED_FOREIGN: set[tuple[str, int, int]] = set()
 _REPORTED_FOREIGN_LIMIT = 65536
+# Literal suffixes of files and directories the dispatcher writes beside ``<task_id>.json``.
+# Each string is the suffix that writer passes to ``Path.with_suffix`` or appends to the task id,
+# not a pattern. A record name ``<task_id>.json`` matches one only when the id itself ends in
+# ``.write-boundary``, ``.sandbox`` or ``.tool-results``, which is another task's receipt name.
+_DISPATCHER_SIDECAR_SUFFIXES = (
+    ".write-boundary.json",  # dispatcher/write_boundary.py RECEIPT_SUFFIX
+    ".sandbox.json",  # dispatcher/agy_sandbox.py RECEIPT_SUFFIX
+    ".tool-results.json",  # dispatcher/agy_sandbox.py tool_results_file
+    ".prompt",  # dispatcher/cli.py prompt path
+    ".result",  # dispatcher/cli.py final_file
+    ".json.lock",  # task_state_lock: path.suffix + ".lock"
+    ".rules-core",  # dispatcher/runtime_context.py
+    ".launch-prompt",  # dispatcher/runtime_context.py
+    ".log",  # dispatcher/worker.py, write_boundary.py and providers/agy.py on final_file
+    ".diag.prev",  # orchestration/task_record_causes.py rotated diagnostic
+    ".diag",  # orchestration/task_record_causes.py
+    ".snapshots",  # orchestration/stale_task_records.py _SNAPSHOT_SUFFIX
+    ".inputs",  # dispatcher/runtime_context.py _OWN_RECORDS
+    ".artifacts",  # dispatcher/worker.py cache directory
+    ".evidence",  # dispatcher/worker.py cache directory
+)
+
+
+def _is_dispatcher_sidecar(path: Path) -> bool:
+    """Whether ``path`` is a sidecar the dispatcher writes beside a task record."""
+    name = path.name
+    return any(name.endswith(suffix) for suffix in _DISPATCHER_SIDECAR_SUFFIXES)
 
 
 def _report_foreign(path: Path, raw: bytes) -> None:
-    """Warn once per process for each foreign file's path and content; a rewritten file is reported again."""
+    """Warn once per process for each foreign file's path and content; a rewritten file is reported again.
+
+    Dispatcher sidecars are not foreign. A file whose name is not one of those suffixes still warns.
+    """
+    if _is_dispatcher_sidecar(path):
+        return
     fingerprint = (str(path), len(raw), hash(raw))
     if fingerprint in _REPORTED_FOREIGN:
         return
@@ -225,11 +257,16 @@ def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Pat
     one record in each place; both are yielded because they are two runs. A
     directory that is missing or unreadable yields nothing. Readers classify at
     their own read, after their mtime, status-byte or fingerprint prefilters.
+    Dispatcher sidecars that end in ``.json`` (boundary and sandbox receipts, and saved
+    tool results) are not candidates.
     """
     directories = [tasks_dir, tasks_dir / ARCHIVE_DIR_NAME] if include_archive else [tasks_dir]
     for directory in directories:
         try:
-            paths = sorted(path for path in directory.glob("*.json") if path.is_file())
+            paths = sorted(
+                path for path in directory.glob("*.json")
+                if path.is_file() and not _is_dispatcher_sidecar(path)
+            )
         except OSError:
             continue
         yield from paths
