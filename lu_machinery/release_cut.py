@@ -28,7 +28,7 @@ import textwrap
 import threading
 import time
 import tomllib
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +38,7 @@ _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.
 _VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
 _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
+_TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
 _REMOVAL_WORDS = frozenset({"remove", "removes", "retire", "retires", "delete", "deletes", "drop", "drops"})
@@ -121,6 +122,7 @@ def preflight(
     head: str,
     last_tag: str,
     last_tag_commit: str,
+    baseline: str,
     titles: Sequence[str],
     versions: Mapping[str, str],
     tags: Iterable[str],
@@ -128,13 +130,18 @@ def preflight(
 ) -> Decision:
     """Decide whether main's HEAD may be tagged as the next version.
 
-    Unchanged (HEAD is the last tag, or only the post-release PR merged since)
-    skips. Otherwise every version file must hold the expected next version,
-    its tag must be absent and the CI Gate on HEAD must have succeeded.
+    ``baseline`` is the last full release and ``titles`` are the merges since it:
+    a withdrawn pre-release shipped nothing, so its changes are still unreleased.
+    Unchanged (HEAD is the last tag, or only post-release PRs merged since the
+    baseline) skips. Otherwise every version file must hold the version after
+    the last tag, that version's tag must be absent and the CI Gate on HEAD must
+    have succeeded.
     """
     expected = next_version(last_tag.removeprefix("v"))
-    if head == last_tag_commit or all(is_bump_title(title) for title in titles):
-        return Decision("skip", f"unchanged: nothing but the version bump merged since {last_tag}", expected)
+    if head == last_tag_commit:
+        return Decision("skip", f"unchanged: HEAD is {last_tag}", expected)
+    if all(is_bump_title(title) for title in titles):
+        return Decision("skip", f"unchanged: nothing but the version bump merged since {baseline}", expected)
     wrong = {name: value for name, value in sorted(versions.items()) if value != expected}
     if wrong:
         found = ", ".join(f"{name} {value}" for name, value in wrong.items())
@@ -144,7 +151,7 @@ def preflight(
     green, detail = ci_gate_state(runs, head)
     if not green:
         return Decision("refuse", detail, expected)
-    return Decision("cut", f"{detail}; {len(titles)} commit(s) since {last_tag}", expected)
+    return Decision("cut", f"{detail}; {len(titles)} commit(s) since {baseline}", expected)
 
 
 def release_notes(titles: Sequence[str], repo: str) -> str:
@@ -185,8 +192,13 @@ def release_notes(titles: Sequence[str], repo: str) -> str:
 
 def record_changelog(
     text: str, *, version: str, previous: str, date: str, notes: str, repo: str, yanked: bool = False,
+    since: str | None = None,
 ) -> str:
-    """Add the release's section under Unreleased and its compare link; idempotent per version."""
+    """Add the release's section under Unreleased and its compare link; idempotent per version.
+
+    ``previous`` is the last tag, which the Unreleased link names. ``since`` (default ``previous``) is
+    the release the notes start from, which the version's compare link starts from.
+    """
     if f"\n## [{version}]" in text:
         return text
     unreleased = "## [Unreleased]\n\n"
@@ -197,7 +209,7 @@ def record_changelog(
     section = f"{heading}\n\n{notes.rstrip()}\n\n"
     links = (
         f"[Unreleased]: https://github.com/{repo}/compare/v{version}...HEAD\n"
-        f"[{version}]: https://github.com/{repo}/compare/v{previous}...v{version}\n"
+        f"[{version}]: https://github.com/{repo}/compare/v{since or previous}...v{version}\n"
     )
     return text.replace(unreleased, unreleased + section, 1).replace(link, links, 1)
 
@@ -266,6 +278,7 @@ class Cut:
     head: str = ""
     version: str = ""
     previous: str = ""
+    baseline: str = ""  # the last full release, where the notes start; previous unless that was withdrawn
     step: str = "start"
     built: str = ""
     ci: str = ""
@@ -360,10 +373,12 @@ class Cut:
         clone = self.work / "machinery"
         self.run(["git", "clone", "--quiet", "--no-checkout", self.machinery_remote, clone], timeout=900)
         self.head = self.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")
-        last_tag = self.git(clone, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*.[0-9]*.[0-9]*", self.head)
+        last_tag = self.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, self.head)
         self.previous = last_tag.removeprefix("v")
         tag_commit = self.git(clone, "rev-parse", f"{last_tag}^{{commit}}")
-        titles = self.git(clone, "log", "--first-parent", "--format=%s", f"{last_tag}..{self.head}").splitlines()
+        baseline = self.last_full_release(clone, last_tag)
+        self.baseline = baseline.removeprefix("v")
+        titles = self.git(clone, "log", "--first-parent", "--format=%s", f"{baseline}..{self.head}").splitlines()
         versions: dict[str, str] = {}
         for name in VERSION_FILES:
             versions.update(version_of(name, self.git(clone, "show", f"{self.head}:{name}")))
@@ -380,8 +395,8 @@ class Cut:
         if runs.returncode:
             self.say(f"CI Gate unverified here: gh run list exited {runs.returncode}")
         self.ci = ci_gate_state(run_rows, self.head)[1]
-        decision = preflight(head=self.head, last_tag=last_tag, last_tag_commit=tag_commit, titles=titles,
-                             versions=versions, tags=tags, runs=run_rows)
+        decision = preflight(head=self.head, last_tag=last_tag, last_tag_commit=tag_commit, baseline=baseline,
+                             titles=titles, versions=versions, tags=tags, runs=run_rows)
         self.version = decision.version
         return decision, titles, versions["pyproject.toml"]
 
@@ -685,26 +700,41 @@ class Cut:
             self.publisher("pr-ready", "--repo", self.product_repo, "--number", str(self.adopt_pr))
         self.say(f"v{self.version} is a full release; adopt PR #{self.adopt_pr} is ready for review")
 
-    def probe(self, argv: Sequence[str | Path], parse):
+    def probe[T](self, argv: Sequence[str | Path], parse: Callable[[subprocess.CompletedProcess[str]], T]) -> T | None:
         """One read of remote state. Any failure, a timeout included, is unknown (None), never an exception."""
         try:
             return parse(self.run(argv, check=False, timeout=120))
         except Exception:  # an unreadable probe leaves only its own value unknown
             return None
 
-    def remote_state(self) -> tuple[bool | None, str | None, list[int] | None]:
-        """What GitHub holds for this version: the tag, the release and the open adopt PRs; None is unknown."""
-        tag = f"v{self.version}"
+    def release_state(self, tag: str) -> str | None:
+        """GitHub's release for ``tag``: ``released``, ``prerelease`` (withdrawn ones too), ``absent`` or None."""
 
-        def release_state(viewed: subprocess.CompletedProcess[str]) -> str | None:
+        def parse(viewed: subprocess.CompletedProcess[str]) -> str | None:
             if viewed.returncode == 0:
                 return "prerelease" if json.loads(viewed.stdout)["isPrerelease"] else "released"
             return "absent" if "release not found" in viewed.stderr.lower() else None
 
+        return self.probe(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"], parse)
+
+    def last_full_release(self, clone: Path, tag: str) -> str:
+        """The newest tag at or before ``tag`` whose release is a full release.
+
+        A pre-release (withdrawn or still in acceptance) or a tag without a release shipped nothing, so the
+        walk passes over it. An unknown state refuses rather than guess which changes have shipped.
+        """
+        while (state := self.release_state(tag)) != "released":
+            if state is None:
+                raise CutError(f"release state of {tag} unknown; cannot tell which changes have shipped")
+            tag = self.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, f"{tag}^")
+        return tag
+
+    def remote_state(self) -> tuple[bool | None, str | None, list[int] | None]:
+        """What GitHub holds for this version: the tag, the release and the open adopt PRs; None is unknown."""
+        tag = f"v{self.version}"
         tagged = self.probe(["git", "ls-remote", "--exit-code", "--tags", self.machinery_remote, f"refs/tags/{tag}"],
                             lambda listed: {0: True, 2: False}.get(listed.returncode))
-        release = self.probe(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"],
-                             release_state)
+        release = self.release_state(tag)
         adopt = self.probe(["gh", "pr", "list", "-R", self.product_repo, "--head", f"release/lu-machinery-{self.version}",
                             "--state", "open", "--json", "number"],
                            lambda prs: [int(row["number"]) for row in json.loads(prs.stdout)] if prs.returncode == 0 else None)
@@ -766,7 +796,8 @@ class Cut:
         changelog = clone / "CHANGELOG.md"
         changelog.write_text(record_changelog(changelog.read_text(encoding="utf-8"), version=self.version,
                                               previous=self.previous, date=utc_date(), notes=section,
-                                              repo=self.machinery_repo, yanked=yanked), encoding="utf-8")
+                                              repo=self.machinery_repo, yanked=yanked, since=self.baseline),
+                             encoding="utf-8")
         for name in VERSION_FILES:
             path = clone / name
             path.write_text(bump_version_file(name, path.read_text(encoding="utf-8"), self.version, upcoming),
@@ -779,7 +810,7 @@ class Cut:
         body = self.work / "post-release-body.md"
         body.write_text(
             f"Records the {self.version} section of `CHANGELOG.md`, generated from the merged PR titles in "
-            f"`v{self.previous}..v{self.version}`, and moves `pyproject.toml`, `package.json` and "
+            f"`v{self.baseline}..v{self.version}`, and moves `pyproject.toml`, `package.json` and "
             f"`package-lock.json` to {upcoming}, the version the next release cut tags.\n\n"
             "Opened by the release cut (`docs/release.md`). It needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
@@ -828,7 +859,7 @@ def execute(cut: Cut) -> int:
     if cut.dry_run:
         cut.version = built
     section = cut.section = release_notes(titles, cut.machinery_repo)
-    cut.say(f"release notes: {len(titles)} title(s) since v{cut.previous}")
+    cut.say(f"release notes: {len(titles)} title(s) since v{cut.baseline}")
     files = cut.build(built)
     consumer_lock = cut.wheelhouse(files, built)
     python = cut.install(consumer_lock, built)
@@ -1027,11 +1058,13 @@ def open_post_release(cut: Cut) -> int:
     clone = cut.work / "machinery"
     cut.run(["git", "clone", "--quiet", "--no-checkout", cut.machinery_remote, clone], timeout=900)
     head = cut.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")
-    tag = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*.[0-9]*.[0-9]*", head)
+    tag = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, head)
     cut.version = tag.removeprefix("v")
-    cut.previous = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*.[0-9]*.[0-9]*",
-                           f"{tag}^").removeprefix("v")
-    titles = cut.git(clone, "log", "--first-parent", "--format=%s", f"v{cut.previous}..{tag}").splitlines()
+    previous = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, f"{tag}^")
+    cut.previous = previous.removeprefix("v")
+    baseline = cut.last_full_release(clone, previous)
+    cut.baseline = baseline.removeprefix("v")
+    titles = cut.git(clone, "log", "--first-parent", "--format=%s", f"{baseline}..{tag}").splitlines()
     cut.post_release(release_notes(titles, cut.machinery_repo))
     return 0
 

@@ -13,7 +13,7 @@ release) that a host timer or an agent runs. It tags `main`'s HEAD; there is
 no release PR. `main` already carries the next version, because each release
 ends by opening the post-release PR that records its changelog and moves the
 version files on. A window is skipped when nothing but that PR has merged
-since the last tag. An urgent bug gets an immediate hotfix release: the same
+since the last full release. An urgent bug gets an immediate hotfix release: the same
 command, as soon as the fix is on a green `main`, without waiting for the next
 window. Any other bug is fixed in a follow-up PR and rides the next train. Do
 not rebuild or replace a version that was already published, and do not move
@@ -43,15 +43,19 @@ section per release and an `Unreleased` section on top. The release command is
 the only writer; worker PRs do not edit `CHANGELOG.md`.
 
 Each section is generated from the squash titles of the PRs merged in
-`v<previous>..v<version>` (`git log --first-parent --format=%s`), oldest first,
+`v<full>..v<version>` (`git log --first-parent --format=%s`), oldest first,
 each ending with its PR link. `feat` titles go under Added, `fix` under Fixed,
 other titles whose description starts with remove, retire, delete or drop under
 Removed, and the rest under Changed. The post-release PR is left out. The
 section is the start of the GitHub release notes, and the post-release PR adds
 it under `## [$V] - YYYY-MM-DD` (the UTC release date) with the
 `<a id="v$V"></a>` anchor line above it, leaves `Unreleased` empty and adds the
-`[$V]` compare link (`compare/v<previous>...v$V`; `Unreleased` compares
+`[$V]` compare link (`compare/v<full>...v$V`; `Unreleased` compares
 `v$V...HEAD`). A withdrawn version's heading ends with `[YANKED]`.
+`<full>` is the last full release before `v$V`: the newest earlier tag whose
+GitHub release is not a pre-release. A withdrawn pre-release, or a tag with no
+release, shipped nothing, so the PRs it held are listed again under the next
+version. `<full>` is the previous tag unless that tag was withdrawn.
 
 The `/machinery` page links the installed version to
 `CHANGELOG.md#v<version>` on `main`, so the anchor line is required.
@@ -123,8 +127,10 @@ order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
    and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when
-   `$SHA` is that tag's commit or only the post-release PR merged since. It
-   refuses unless all three of these hold:
+   `$SHA` is that tag's commit, or when only post-release PRs merged since the
+   last full release `v<full>` (see Changelog). It refuses when it cannot read
+   the release state of a tag it must check. Otherwise it refuses unless all
+   three of these hold:
    - `pyproject.toml`, `package.json` and both versions in
      `package-lock.json` hold `$V`, the next patch version after `<previous>`;
    - the tag `v$V` is absent;
