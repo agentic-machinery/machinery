@@ -35,6 +35,8 @@ from pathlib import Path
 BUMP_TITLE = "chore(release): record {released} and start {next}"
 _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.\d+( \(#\d+\))?")
 _VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+# Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
+_X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
 _REMOVAL_WORDS = frozenset({"remove", "removes", "retire", "retires", "delete", "deletes", "drop", "drops"})
@@ -76,6 +78,13 @@ class Decision:
 
 
 # --- Pure decisions -------------------------------------------------------------------------
+
+
+def x_agent_value(value: str) -> str:
+    """Refuse an empty or malformed ``--x-agent``. There is no default."""
+    if not _X_AGENT.fullmatch(value):
+        raise argparse.ArgumentTypeError("--x-agent must be <agent>/<task-or-seat>, for example claude/claude-cto")
+    return value
 
 
 def next_version(version: str) -> str:
@@ -251,6 +260,7 @@ class Cut:
     host_python: Path
     primary: Path
     alert: bool
+    x_agent: str
     started: float = field(default_factory=time.monotonic)
     head: str = ""
     version: str = ""
@@ -455,7 +465,7 @@ class Cut:
         shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
         self.git(product, "add", "requirements-machinery.lock")
         self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
-                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: release-cut/v{self.version}")
+                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
         body.write_text(
@@ -754,7 +764,7 @@ class Cut:
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *VERSION_FILES)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
-                 f"{title}\n\nX-Agent: release-cut/v{self.version}")
+                 f"{title}\n\nX-Agent: {self.x_agent}")
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
         body.write_text(
@@ -882,9 +892,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__.splitlines()[0] + "\nRun on the host with gh and push credentials, outside a worker.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut cut\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut cut --dry-run\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut post-release\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut cut --x-agent claude/claude-cto\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-cto\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto\n"
         "Outputs: step lines on stdout; the work directory keeps cut.log, dist, wheelhouse and npm cache.\n"
         "Exit codes: 0 released, skipped as unchanged, or dry run passed; 1 refused or failed (claude-cto\n"
         "alerted); 2 invalid input.\n"
@@ -894,6 +904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, text in (("cut", "Tag main's HEAD as the next version, publish, accept and open adoption"),
                        ("post-release", "Open the post-release PR for the last tag (record changelog, bump)")):
         command = sub.add_parser(name, help=text, description=text)
+        command.add_argument("--x-agent", required=True, type=x_agent_value,
+                             help="<agent>/<task-or-seat> trailer, for example claude/claude-cto; required, no default")
         command.add_argument("--work", type=Path, help="Empty work directory (default: a new ~/.lu-release-cut-*)")
         command.add_argument("--machinery-remote", help="Machinery Git remote (default: its GitHub URL)")
         command.add_argument("--product-remote", help="Product Git remote or local path (default: its GitHub URL)")
@@ -924,7 +936,7 @@ def main(argv: Sequence[str] | None = None) -> int:
               machinery_remote=args.machinery_remote or f"https://github.com/{machinery_repo}.git",
               product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
               machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
-              primary=primary_root(), alert=not args.no_alert)
+              primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent)
     name, email = (cut.git(machinery_checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
     if name and email:
         cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
