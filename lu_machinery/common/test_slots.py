@@ -25,9 +25,9 @@ A sandbox that shows the pool's root-owned ancestors under an unmapped owner and
 the pool, so a Codex read-only review takes ``review`` slots in its trusted dispatch worker before the sandbox
 starts (#11230, #10744). There, a process in a user namespace that maps only part of the id range, as a sandbox
 does, may not choose the pool (:data:`DIR_ENV`, :data:`SCRATCH_ROOT_ENV`) and may join only a ``review`` hold.
-The write boundary instead binds the host's pool, verified on the host, writable at the default location (#557):
-there a sandboxed run queues in the host-wide pool like any other run (:func:`launcher_bound`), and its xdist
-workers join the hold it took in that same user namespace.
+Dispatched write workers use the ordinary host pool without a boundary or pool bind. The existing
+launcher-bound pool recognition (:func:`launcher_bound`) also accepts a trusted writable mount, and its
+xdist descendants join a hold taken in that same user namespace.
 
 A review's governed test runs take turns: one run holds the hold's session lock, and only that run's own
 descendants join its turn. They prove it through :data:`SESSION_ENV`, which names the turn's process, its start
@@ -216,7 +216,7 @@ def _unescape_mount_path(value: str) -> str:
 def launcher_bound(path: Path) -> bool:
     """Whether ``path`` is, in this process's view, a writable mount exactly at that path (#557).
 
-    The write boundary's launcher binds the host's pool, verified on the host, at the default location. A process in
+    A trusted launcher may bind the host's verified pool at the default location. A process in
     the sandbox cannot create a mount (it has no capabilities and no new user namespace), so the kernel's mount table
     tells the launcher's pool from a directory the sandbox made itself. A read-only view, as Codex's review sandbox
     mounts it, is not one: there a run joins only its launcher's review hold.
@@ -238,7 +238,7 @@ def pool_dir(environ: Mapping[str, str] | None = None) -> Path:
 
     A sandboxed process (:func:`user_namespaced`) gets only the default location: a pool it could point at, such as
     one it built in a writable directory, would let it count slots no launcher issued (#11230). There
-    :data:`SCRATCH_ROOT_ENV`, which the write boundary's launcher sets to the run's private scratch, does not select
+    :data:`SCRATCH_ROOT_ENV`, when it names a run's private scratch, does not select
     the pool when the launcher bound the host's pool at the default location (:func:`launcher_bound`); otherwise it
     refuses as a choice of pool.
     """

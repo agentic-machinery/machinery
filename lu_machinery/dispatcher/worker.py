@@ -1158,6 +1158,29 @@ def _stop_task_services(record: dict) -> None:
         record["task_service_stops"] = stops
 
 
+def _run_merge_closeout(request: dict) -> dict:
+    """``merge_closeout --apply`` for a merged delivery, after the supervisor removes its worktree.
+
+    The target comes from the verified merged delivery, not a boundary broker.
+    """
+    pr, repo, root = request.get("pr"), request.get("repo"), request.get("repo_root")
+    if not (type(pr) is int and pr > 0 and isinstance(repo, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}", repo)
+            and isinstance(root, str) and Path(root).is_absolute() and Path(root).is_dir()):
+        return {"pr": pr, "returncode": None, "reason": "the closeout request is malformed"}
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from lu_machinery.orchestration.merge_closeout "
+            "import main; raise SystemExit(main(sys.argv[2:]))")
+    argv = [sys.executable, "-I", "-c", code, str(machinery_path("orchestration/merge_closeout.py").parents[2]),
+            str(pr), "--repo", repo, "--repo-root", root, "--apply", "--json"]
+    try:
+        # A fixed argv: this interpreter, the package's own closeout module and checked request fields.
+        result = subprocess.run(argv, cwd=root, capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                                timeout=900)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"pr": pr, "returncode": None, "reason": f"{type(exc).__name__}"}
+    return {"pr": pr, "returncode": result.returncode, "stdout": result.stdout[-4000:], "stderr": result.stderr[-2000:]}
+
+
 def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> None:
     """Settle services and the worktree, close out merged delivery, then remove scratch.
 
@@ -1179,7 +1202,7 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
             except (OSError, ValueError) as exc:
                 record["closeout"] = {"pr": merged["number"], "returncode": None, "reason": type(exc).__name__}
         if request and "closeout" not in record:
-            record["closeout"] = write_boundary.run_closeout(request)
+            record["closeout"] = _run_merge_closeout(request)
         if "closeout" in record and record["closeout"].get("returncode") != 0:
             record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
                                                  f"{record['closeout'].get('returncode')}")

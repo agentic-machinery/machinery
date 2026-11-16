@@ -279,6 +279,10 @@ LU_PRIMARY="$(dirname "$(git -C /path/to/learn-ukrainian rev-parse --path-format
 `--worktree` only). Reaper three-repo sweeps and history migration are later
 P2 slices — not this v1.
 
+Write workers run directly in their dispatch worktrees with normal provider logins and host test slots.
+Native read-only reviews retain the OS boundary and GitHub read relays described in
+[read-only review boundary](write-worker-boundary.md); they cannot publish or record verdicts.
+
 ### GPT-6 Codex role routing
 
 For bounded implementation or investigation, read the machine-readable

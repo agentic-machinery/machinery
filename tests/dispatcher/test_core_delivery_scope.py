@@ -229,7 +229,7 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
 
     monkeypatch.setattr(worker, "_reap_worktree", reap)
     runner = Mock(side_effect=closeout)
-    monkeypatch.setattr(worker.write_boundary, "run_closeout", runner)
+    monkeypatch.setattr(worker, "_run_merge_closeout", runner)
     # A temporarily retained tree must not poison the receipt before the existing reap pass removes it.
     worker._reap_settled(record)
     assert events == ["retained"]

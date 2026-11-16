@@ -88,8 +88,7 @@ outside the sandbox, with the full ownership walk:
    only read the marked ticket and the slot files and check their locks, so they need no write access to
    the pool. A sandboxed process, one whose user namespace maps only part of the id range, cannot choose
    the pool: `LU_TEST_SLOTS_DIR` or `LU_SCRATCH_ROOT` there is refused with
-   `test_slots_pool_override_refused`, and it may join only a `review` hold (a write-boundary worker's
-   own hold is the exception; see below).
+   `test_slots_pool_override_refused`, and it may join only its launcher's `review` hold.
 3. The review's governed test runs take turns on the hold's session lock, a `.session` file beside its
    ticket. Concurrent runs of one review therefore never add up past its 2 slots. The run that holds the
    turn passes `LU_TEST_SLOTS_SESSION` to its own descendants, such as a pytest a test starts or the
@@ -104,62 +103,15 @@ outside the sandbox, with the full ownership walk:
 5. The worker gives its own hold back when the runtime returns: on success, on failure, on a timeout and
    on cancellation. New runs are refused from then on, because the marker's holder is gone.
 
-The slots stay reserved while the reviewer reads. The dispatch hard timeout bounds that time. Other
-routes are unchanged: a Claude read-only seat has no OS sandbox and takes its own slots, and a write
-worker takes slots for each test run (see "Write-boundary workers" below).
+The slots stay reserved while the reviewer reads. The dispatch hard timeout bounds that time.
+Native read-only reviews keep their existing boundary and review-slot admission.
 
-## Write-boundary workers
+## Write workers
 
-Every dispatched write worker runs inside the write boundary
-([write-worker-boundary](write-worker-boundary.md)), which also maps only the current user, empties
-`/var/tmp` and sets `LU_SCRATCH_ROOT` to the run's private scratch (#557). Its launcher therefore
-prepares the host's pool on the host, with the full ownership walk, and binds that directory writable
-where it resolves, when that is the default location, `/var/tmp/lu/test-slots-<uid>` (a host whose
-pool lives elsewhere, through `LU_SCRATCH_ROOT` or `LU_TEST_SLOTS_DIR`, gets no bind). Inside:
-
-- A sandboxed process uses that pool only when `/proc/self/mountinfo` shows a writable mount exactly at
-  the default location. The worker cannot create or move a mount, so a directory it made itself is never
-  one. Then `LU_SCRATCH_ROOT` does not select the pool. Without that mount, `LU_SCRATCH_ROOT` and
-  `LU_TEST_SLOTS_DIR` are still refused with `test_slots_pool_override_refused`.
-- Only the pool directory itself is checked there (a private directory of this user), because the
-  launcher verified its path on the host where owners are real, and the bind pins the directory.
-- A governed run queues in the host-wide FIFO with every host run, so the governor stays active.
-  Its xdist workers join its hold: a non-`review` hold counts in a sandbox only when it was taken in the
-  same user namespace, recorded as `userns` in its ticket. A hold issued outside, such as a launcher's,
-  still serves a sandbox only as a `review` turn.
-- The boundary receipt's `test_slots` shows `bound`, or why nothing was bound (`disabled`,
-  `pool_not_at_default_location`, or the refusal reason when the host pool cannot be prepared). Without a bind the run still starts, and its
-  governed tests are refused with a typed reason.
-
-- The worker's runs use the host's pool size, wait limit and switch: the launcher reads
-  `LU_TEST_SLOTS`, `LU_TEST_SLOTS_DIR`, `LU_TEST_SLOTS_COUNT` and `LU_TEST_SLOTS_WAIT_S` from the
-  dispatcher's environment, selects the pool with them, and passes the size, wait and `on` to the
-  worker (never the directory). A selection away from the default location is not bound.
-
-Host runs resolve the pool's `queue` and `holders` directories by name. Inside, the pool and both of
-those directories are mount points, so a worker cannot rename or replace any directory a host run
-passes through (`EBUSY`), and the boundary canary checks this before the provider starts. Every file
-the governor opens in them is opened without following a link. A worker can still lock, create and
-remove pool files, as any host process of this user can, so it can deny or stall other runs' tests
-(for example by holding slots or filling the queue); the governor is a shared courtesy among this
-user's runs, not a security boundary. Read-only dispatches get no bind.
-
-Every hold keeps its slot files locked shared once issued. xdist starts a governed run's workers with
-their inherited descriptors closed, so each worker joins the hold itself and keeps its slots locked until
-it exits. Killing the governed run while its workers still run tests therefore frees nothing early: the
-slots stay taken, and a review's next turn waits, until the last worker exits.
-
-A worker that its run's live hold names (the checked marker, and for a review its turn token) must keep
-those slots before it runs a test. When it cannot (a slot file cannot be opened, or the hold or turn ended
-while it joined), it is refused before its session with a typed error such as `test_slots_pool_unavailable`
-or `test_slots_hold_ended`. xdist reports this as the worker going down, with that error, and the run fails
-without running tests. Otherwise the worker would hold no slot, and killing its run would admit other work
-beside it. A worker that no live hold names (no marker, a stale or forged one, or a review marker without
-a turn token) runs as before and is never refused.
-
-Other commands a test starts without the governor are not counted on their own. They run inside their
-governed run's slots and end with it in the normal case. If their governed run is killed first, they can
-outlive it until they end.
+Dispatched write workers run directly as the dispatching user in their own worktrees
+([read-only review boundary](write-worker-boundary.md)). They take slots for each local test run
+through the ordinary host-wide pool. There is no write-worker boundary, pool bind or boundary
+`test_slots` receipt. The governor remains active for write workers and their xdist descendants.
 
 ## Settings
 

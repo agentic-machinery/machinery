@@ -128,7 +128,7 @@ def run_git(repo, *args):
     ).stdout.strip()
 
 
-# A test double for the write boundary (#423). The sandbox's stub providers mark their progress beside
+# A test double for the native read-only review boundary (#423). The sandbox's stub providers mark their progress beside
 # their prompt in the task store and some run in the primary itself, both of which the real boundary
 # refuses; these tests' subject is delivery, scope and supervision, not containment, which
 # tests/dispatcher/test_write_boundary.py covers with real bubblewrap.
@@ -147,7 +147,7 @@ def launcher(spec, invocation, task_file):
     return list(invocation.argv)
 
 
-def verify(task_file, task_id, mode="workspace-write"):
+def verify(task_file, task_id, mode="read-only"):
     return {"status": "test-double", "mode": mode}, None
 
 

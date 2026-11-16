@@ -188,11 +188,11 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     if spec.effort is not None:
         argv += ["-c", f"model_reasoning_effort={spec.effort}"]
     # Hosted connectors run on the provider's side, out of the egress proxy's sight (#7181). Sources is the
-    # write boundary's relay, defined in the task-local CODEX_HOME it projects; its readers only are enabled.
+    # read-only boundary's relay for reviews; only Sources readers are enabled in either mode.
     argv += ["--disable", "apps", *_sources_read_only_flags(sources_tool_sets()[0])]
     if spec.mode in {"read-only", "workspace-write"}:
-        # supervise always supplies the OS boundary. Read-only worktree/Git mounts hold the review
-        # policy; Codex's nested bubblewrap sandbox cannot start under --disable-userns.
+        # Read-only reviews use the supervisor's worktree/Git mounts; an inner sandbox cannot
+        # start under --disable-userns. Write workers run directly, as the dispatching seat.
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         raise ValueError(f"codex: unsupported mode {spec.mode!r}")

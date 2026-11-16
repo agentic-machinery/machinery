@@ -523,7 +523,6 @@ def test_dismissal_worker_and_reviewer_cli_and_direct_api_refuse_before_transpor
     if source == "process":
         assert pub.main(["code-scanning-dismiss", "--repo", "unit/public", "--number", "1", "--reason", "false positive", "--comment", comment], runner=sender) == 2
     assert calls == [] and writes == []
-    assert "code-scanning-dismiss" not in pub.BROKER_FORWARDED
 
 
 def test_dismissal_cli_verifies_the_final_state(dismissal_transport, capsys):
@@ -815,7 +814,6 @@ def test_delete_verbs_require_an_explicit_repository_and_appear_in_help(delete_t
         pub.main(["--help"])
     listing = capsys.readouterr().out
     assert "code-scanning-analysis-delete" in listing and "branch-delete" in listing
-    assert "branch-delete" not in pub.BROKER_FORWARDED and "code-scanning-analysis-delete" not in pub.BROKER_FORWARDED
 
 
 @pytest.mark.parametrize("verb,fields,before", [

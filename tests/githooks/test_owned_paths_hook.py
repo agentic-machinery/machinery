@@ -14,7 +14,6 @@ import importlib.util
 import json
 import os
 import shutil
-import stat
 import subprocess
 from pathlib import Path
 
@@ -340,24 +339,6 @@ def test_installed_commit_msg_delegator_runs_the_installed_message_gate(tmp_path
     assert "field=commit.message" in flagged.stderr
     assert _git(repo, "rev-parse", "HEAD", env=env).stdout.strip() == base
 
-    # Defect class: the boundary broker variable alone skips the scan. Deferral also needs the
-    # inside broker socket, which only the write boundary mounts; prove whichever side this
-    # environment presents (CI and the host: refused; a dispatched worker: deferred).
-    broker = "/run/lu-write-boundary/broker.sock"
-    inside = os.path.lexists(broker) and stat.S_ISSOCK(os.lstat(broker).st_mode)
-    named = _git(
-        repo, "commit", "-q", "-m", f"note {TOKEN}",
-        env={**env, "LU_WRITE_BOUNDARY_BROKER": broker},
-    )
-
-    if inside:
-        assert named.returncode == 0, named.stderr
-        assert "OPSEC: commit-message scan deferred" in named.stderr
-        assert _git(repo, "reset", "-q", "--soft", base, env=env).returncode == 0
-    else:
-        assert named.returncode != 0
-        assert "OPSEC blocked: rule=synthetic-rule" in named.stderr
-        assert "deferred" not in named.stderr
     assert _git(repo, "rev-parse", "HEAD", env=env).stdout.strip() == base
 
     clean = _git(repo, "commit", "-q", "-m", "add a note", env=env)

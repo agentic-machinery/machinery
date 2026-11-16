@@ -1,4 +1,4 @@
-# Write-worker boundary (#423)
+# Read-only review boundary (#423)
 
 A dispatched `workspace-write` worker runs like the CTO seat (operator order NO-WORKER-SANDBOX-1115):
 as the dispatching user, in its own dispatch worktree, with its provider's normal login, normal
@@ -36,7 +36,7 @@ Both paths withhold the host's GitHub login and refuse direct GitHub egress. The
 own listed flags read at that form's arity (a flag that is a boolean in one form and takes a value in another
 cannot hide a later `-R`); any other flag, arbitrary `gh api` requests, including repository permission
 queries, and search queries (`--search`/`-S`, whose `repo:` qualifiers would widen a listing) are refused.
-Named reads also use `github-read`.
+Native read-only Claude, Codex, Cursor and OpenCode use `publish read` through `github-read`.
 The host login reads only a registered repository with a `public-` role in `config/fleet_repos.yaml`
 (decision A6): the relay resolves the repository on the host (`--repo`/`-R` in any form and the shell's
 `GH_REPO`, which must all agree, else the worktree's `origin`; a `GH_HOST` other than github.com, `-R` inside
@@ -45,13 +45,12 @@ repository first, so `gh` never chooses one itself. A bare `--` is refused.
 The launcher's broker (one Unix socket bound inside at `/run/lu-write-boundary/broker.sock`, named by
 `LU_WRITE_BOUNDARY_BROKER`) serves a read-only seat `github-read` only: one of the publisher's fixed GET
 templates (`pull`, `pr-files`, `commits`, `commit`, `comments`, `reviews`, `timeline`, `issue`, `checks`,
-`check-annotations`, `run`, `jobs`) of the registered public repository, never security alerts. Every other
-verb is refused for a read-only seat, including `push`, `pr-create`, `pr-edit`, `pr-comment`, `pr-merge`
-and `record-verdict`. A connection is served only when its peer descends from this run's bubblewrap, and
+`check-annotations`, `run`, `jobs`) of the registered repository, never security alerts. For a registered
+private repository the existing scope is only the authorized PR and its head checks. Every write verb is
+absent, including `push`, `pr-create`, `pr-edit`, `pr-comment`, `pr-merge` and `record-verdict`. A connection is served only when its peer descends from this run's bubblewrap, and
 each request id is accepted once per run.
 
-Review-loop records the finished review from the owning worker through its existing `record-verdict`
-path. The reviewer supplies its structured result and cannot publish a verdict or act for a child task.
+The owning write worker records the finished review through `record_cf_verdict.py`. The reviewer supplies its structured result and cannot publish a verdict or act for a child task.
 The boundary receipt includes the launch mode and GitHub read-relay outcomes. Setup or canary failure
 refuses the run, with no uncontained fallback.
 
@@ -61,7 +60,7 @@ prefix on every build, marked or not, because that prefix is gone. Every such di
 through the mandatory outer launcher; setup or canary failure prevents provider start. Interactive
 sessions remain outside this boundary.
 
-## What the write boundary is
+## What the read-only boundary is
 
 One bubblewrap invocation per launch, built in full by the launcher:
 
@@ -97,10 +96,9 @@ One bubblewrap invocation per launch, built in full by the launcher:
   `/srv`, `/mnt`, `/media`, `/opt` and `/var/tmp`, which holds every task's scratch. Each
   `/opt/<package>` that an executable on the provider's `PATH` resolves into (a Node install, for
   example) is restored read-only.
-- The primary checkout is a read-only bind. Its `.git` is an overlay with a private upper directory,
-  so commits, fetches and pushes work, while the host's objects, refs and metadata never change. The
-  primary's `HEAD`, `index`, `config`, `packed-refs`, `hooks` and its checked-out branch ref are also
-  read-only binds inside, and so is the worktree's `.git` link file.
+- The primary checkout, its `.git`, the review worktree and its `.git` link file are read-only
+  binds. Commits, fetches and pushes cannot change their objects, refs or metadata. There is no
+  Git overlay, branch import or broker write verb.
 - Public checkouts: the primary and the product checkout are read-only binds, so a write there fails
   instead of vanishing with the overlay. Their private runtime state is emptied inside: `batch_state`,
   `.agent`, `.secrets`, `.runtime`, `.deploy-state`, `.pids`, `.codex`, `.gemini`, `.mcp`, `.env`,
@@ -162,16 +160,15 @@ Settlement requires the named branch to be the worktree's current branch, one or
 push URL, and a fast-forward update. After publication it records the tracking ref and
 upstream with hooks disabled. Cleanup deletions use the same transport and an exact
 lease, with the scanner's native deletion record. No caller hook runs after a clean scan.
-Registered GitHub SSH origins resolve through the broker's existing `_remote` resolver
-to scoped HTTPS publication; the clone's configured origin is unchanged.
+Registered GitHub SSH origins resolve through `verification_credentials` to scoped HTTPS
+publication; the clone's configured origin is unchanged.
 
 The host push/fetch inventory is reproducible with
 `rg -n '"(push|fetch)"' lu_machinery --glob '*.py'` and inspection of each runner and cwd:
 
 | Call sites | Execution contract |
 | --- | --- |
-| `orchestration/dispatch_settle.push_and_maybe_open_pr`; `dispatcher/write_boundary._Broker._push` | Shared hook-disabled transport and explicit exact-update scan. |
-| `dispatcher/write_boundary._Broker._fetch_base`; `_Boundary.fetch_objects` | Existing `_git` transport disables hooks, including local imports. |
+| `orchestration/dispatch_settle.push_and_maybe_open_pr` | Shared hook-disabled `_git` transport and explicit exact-update scan. |
 | `hygiene/branch_sweep._git`; `orchestration/scheduled_worktree_cleanup._run_git` | These accept worker checkouts. Fetches disable hooks; leased deletion pushes use the shared scanner and transport. |
 | `ai_agent_bridge/_agy.list_commit_changed_paths` and `list_branch_changed_paths` | Both fetch invocations pin `core.hooksPath=/dev/null`. |
 | `review/target_resolution._ensure_commit_available`; `review/record_cf_verdict.default_branch_review_base` | Their Git runners pin `core.hooksPath=/dev/null`. |
@@ -190,6 +187,10 @@ and worker-authored `pre-push` and `reference-transaction` marker hooks. It veri
 file and SSH-form origins, new and existing branch updates, and that a secret-bearing commit message is refused
 without changing the remote or executing either hook.
 
+The provider keep-list retains `sources_mcp_config` and `_SOURCES_MCP_HOME`, including their AGY and
+OpenCode shapes and the associated projection branches. Only Cursor's projection is reached by native
+read-only dispatches. These retained definitions do not re-enable a write-mode boundary.
+
 ## Sources inside the boundary
 
 Sources goes through the read-only AGY boundary's `SourcesRelay` (read-only tools only). The launcher
@@ -207,7 +208,7 @@ real Codex configuration reaches the run. The checkout's untrusted `.codex/` lay
 Dispatched Codex therefore omits their hooks, agents settings and context-window overrides, as well as
 MCP servers, connectors and loopback Sources URLs. Codex uses its model defaults. `mcp_optional_startup_grace_ms = 0` waits for the optional server to
 finish startup or reach its existing timeout before the first model turn. The default one-second grace
-can omit the still-starting relay's tools from that turn. Sources stays optional if startup fails. Its argv enables only the Sources readers and passes `--disable apps` in both modes. The tools that persist
+can omit the still-starting relay's tools from that turn. Sources stays optional if startup fails. The read-only Codex argv enables only Sources readers and passes `--disable apps`. The tools that persist
 fetched entries stay refused by the relay. The receipt's `sources` holds the relay's call counts, or why
 it was unavailable, and `codex_home` the config digest and whether the login was linked. Sources is
 optional: without the relay the server fails to start and the run goes on.
@@ -223,8 +224,8 @@ These apply to the read-only review dispatches the boundary still contains.
 - Decision A4 changes what a reviewer sees. It no longer reads the real provider configuration beyond the
   selected login's guard-bound state (no plugins, session history or other account), other tasks' records
   (stage a brief's inputs in `<task>.inputs`), private data roots such as `LU_SENSE_PROOF_DIR`, or driver
-  files under `/var/tmp`. The read-only `gh` relay and read-only AGY refuse a private repository, so a
-  review there reads nothing from GitHub.
+  files under `/var/tmp`. The raw `gh` relay and read-only AGY refuse a private repository. Native named
+  `github-read` requests retain their authorized private-PR scope.
 - The emptied checkout state is a named list, not every ignored path: an ignored private file a
   checkout keeps outside those names stays readable. Read-only AGY keeps its own boundary
   (`agy_sandbox`), which still binds the whole task store.
@@ -301,8 +302,6 @@ removing that directory; never remove a
 mounted tree. A fresh invocation uses new task identities and retains prior
 canonical receipts until a successful route replaces them.
 
-Workers cannot perform the live run from their boundary. Unit tests exercise
-orchestration and failure paths with fakes, and workers can exercise dry-run.
-The CTO runs the first live use on the host and attaches its exact-head table
-to the PR before enqueueing. The write-boundary tables elsewhere in this
-runbook retain their own acceptance procedure.
+Read-only reviewers cannot perform the live run from their boundary. Unit tests exercise
+orchestration and failure paths with fakes. The release owner runs live acceptance on the host
+and attaches the exact-head table before enqueueing.
