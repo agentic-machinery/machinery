@@ -328,11 +328,12 @@ class Cut:
         if not self.alert:
             self.say("alert suppressed (--no-alert): " + body.splitlines()[0])
             return
+        # The plane root resolves from cwd; the work directory is not a checkout, so anchor at the primary.
         self.run(
             [self.host_python, "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish", "cto", "-",
              "--sender", "release-cut", "--source", "release", "--recipient", ALERT_RECIPIENT,
              "--idempotency-key", key],
-            stdin=body.encode(), timeout=120,
+            cwd=self.primary, stdin=body.encode(), timeout=120,
         )
 
     def publisher(self, *args: str) -> str:
@@ -495,14 +496,11 @@ class Cut:
                              env=env).stdout.split()
             cache = self.work / "npm-cache"
             cache.mkdir()
-            old = os.umask(0o022)
-            try:
-                self.run([tools[0], tools[1], "ci", "--ignore-scripts", "--no-audit", "--no-fund",
-                          f"--prefix={prefix}", f"--cache={cache}"],
-                         env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
-                self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
-            finally:
-                os.umask(old)
+            # main() holds the 022 umask for the whole cut, so the prefix copy above is covered too.
+            self.run([tools[0], tools[1], "ci", "--ignore-scripts", "--no-audit", "--no-fund",
+                      f"--prefix={prefix}", f"--cache={cache}"],
+                     env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
+            self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
         info: dict[str, str] = json.loads(self.run([python, "-I", "-c", _NODE_INFO], env=env).stdout)
         info["node_version"] = self.run([info["node"], "--version"], env=env).stdout.strip()
         info["npm_version"] = self.run([info["node"], info["npm"], "--version"], env=env).stdout.strip()
@@ -914,6 +912,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             command.add_argument("--dry-run", action="store_true",
                                  help="Build, install, notes, Node, resources and collection; no tag, publish or PR")
     args = parser.parse_args(argv)
+    # Runtime admission refuses group- or other-writable Node and agent artifacts, and every path the cut
+    # writes (venvs, pip and npm installs, the prepared Node prefix) is made by this process or a child that
+    # inherits its umask. Add 022 to the caller's mask for the whole run; a stricter mask is kept.
+    previous_umask = os.umask(0o022)
+    os.umask(previous_umask | 0o022)
+    try:
+        return _run(args)
+    finally:
+        os.umask(previous_umask)
+
+
+def _run(args: argparse.Namespace) -> int:
     from lu_machinery.common.repo_root import primary_root, project_interpreter
     from lu_machinery.dispatcher.git import resolve_repo
 

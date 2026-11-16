@@ -1,13 +1,20 @@
-"""The release cut's pure decisions: skip, refuse or cut, the generated release notes, and the X-Agent trailer."""
+"""The release cut's pure decisions, notes and X-Agent trailer; its umask for created paths and its alert's plane root."""
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from lu_machinery.release_cut import Cut, main, preflight, release_notes, x_agent_value
+from lu_machinery import release_cut
+from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
+from lu_machinery.common import repo_root
+from lu_machinery.dispatcher import git as git_module
+from lu_machinery.release_cut import Cut, CutError, main, preflight, release_notes, x_agent_value
 
 HEAD = "a" * 40
 TAG_COMMIT = "b" * 40
@@ -193,3 +200,79 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         ["git", "-C", str(product), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
     assert adopt.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+
+
+@pytest.fixture
+def group_writable_umask():
+    """The host's umask: 0002, under which the first 0.1.23 dry run wrote a 664 .nvmrc."""
+    previous = os.umask(0o002)
+    yield
+    os.umask(previous)
+
+
+def _host(monkeypatch, tmp_path, interpreter):
+    """Point main() at a fixture primary checkout and interpreter instead of the registered repositories."""
+    primary = tmp_path / "primary"
+    _init_repo(primary)
+    monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (primary, {"github": f"learn-ukrainian/{name or 'learn-ukrainian'}"}))
+    monkeypatch.setattr(repo_root, "primary_root", lambda: primary)
+    monkeypatch.setattr(repo_root, "project_interpreter", lambda: interpreter)
+    return primary
+
+
+# prepare_node_dependencies, in the accept interpreter: parents, the 0755 prefix, then the contract copies.
+_PREPARE_PREFIX = (
+    "import pathlib, shutil, sys; work = pathlib.Path(sys.argv[1]); contract = work / 'contract'; contract.mkdir(); "
+    "(contract / '.nvmrc').write_text('22\\n'); prefix = work / 'accept/share/lu-machinery/node/0.1.23-lock'; "
+    "prefix.parent.mkdir(parents=True); prefix.mkdir(mode=0o755); shutil.copyfile(contract / '.nvmrc', prefix / '.nvmrc')"
+)
+
+
+def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeypatch, tmp_path, group_writable_umask):
+    """Defect class: under a 0002 umask the cut's Node prefix is group-writable and Node admission refuses it."""
+    _host(monkeypatch, tmp_path, Path(sys.executable))
+    work = tmp_path / "work"
+
+    def execute(cut):
+        cut.run([sys.executable, "-I", "-c", _PREPARE_PREFIX, cut.work])
+        return 0
+
+    monkeypatch.setattr(release_cut, "execute", execute)
+    assert main(["cut", "--dry-run", "--no-alert", "--work", str(work), "--x-agent", "claude/claude-cto"]) == 0
+    prefix = work / "accept/share/lu-machinery/node/0.1.23-lock"
+    _check_node_artifact(prefix / ".nvmrc")
+    for directory in (prefix, prefix.parent):
+        _check_node_artifact(directory, directory=True)
+    writable = {str(path.relative_to(tmp_path)): oct(path.lstat().st_mode & 0o777)
+                for path in (work, *work.rglob("*")) if path.lstat().st_mode & 0o022}
+    assert writable == {}
+    assert os.umask(0o002) == 0o002, "main() must restore the caller's umask"
+
+
+def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_path, capsys):
+    """Defect class: the failure alert runs in the non-Git work directory, so Fleet Comms refuses to anchor the plane."""
+    record = tmp_path / "alert.txt"
+    publisher = tmp_path / "bin/python"
+    publisher.parent.mkdir()
+    # Fleet Comms resolves the plane root from its cwd's checkout and exits 3 outside one.
+    publisher.write_text(
+        "#!/bin/sh\n"
+        f"git rev-parse --show-toplevel > '{record}' || exit 3\n"
+        f"printf '%s\\n' \"$*\" >> '{record}'\n"
+        f"cat >> '{record}'\n",
+        encoding="utf-8",
+    )
+    publisher.chmod(0o755)
+    primary = _host(monkeypatch, tmp_path, publisher)
+
+    def execute(cut):
+        cut.step = "Node provisioning"
+        raise CutError("Unsafe Node dependency artifact")
+
+    monkeypatch.setattr(release_cut, "execute", execute)
+    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
+    assert "alert to claude-cto failed" not in capsys.readouterr().err
+    toplevel, argv, body = record.read_text(encoding="utf-8").split("\n", 2)
+    assert Path(toplevel).resolve() == primary.resolve()
+    assert "channel publish cto - --sender release-cut --source release --recipient claude-cto" in argv
+    assert body.startswith("release-cut FAILED (dry run) at Node provisioning: Unsafe Node dependency artifact")
