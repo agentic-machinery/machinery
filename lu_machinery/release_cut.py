@@ -50,6 +50,16 @@ _LAZY_CJS = (
     " 'bare-stream', 'express']) require(name);"
 )
 _LAZY_ESM = "await import('@modelcontextprotocol/sdk/validation/cfworker');"
+# Python snippets run inside the candidate environments.
+_SHOW_LU = ("import importlib.metadata as m, lu_machinery; "
+            "print(m.version('lu-machinery')); print(lu_machinery.__file__)")
+_ACPX = "from lu_machinery.agent_runtime.adapters.acpx import "
+_NODE_INFO = (f"import json; {_ACPX}validate_node_dependencies as v, node_toolchain as t; p = v(); n, m = t(); "
+              "print(json.dumps({'prefix': str(p), 'node': str(n), 'npm': str(m)}))")
+_RELEASE_INVENTORY = ("from importlib.resources import files; "
+                      "print(files('lu_machinery').joinpath('agent_deploy/release.v1.json').read_text())")
+_NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))"
+_SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
 
 
 class CutError(Exception):
@@ -268,7 +278,8 @@ class Cut:
         command = [str(part) for part in argv]
         with (self.work / "cut.log").open("a", encoding="utf-8") as handle:
             handle.write(f"$ {shlex.join(command)}\n")
-            result = subprocess.run(
+            # An argv list built in this module from fixed verbs and checked values; no shell runs.
+            result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                 command, cwd=cwd or self.work, env=dict(env) if env is not None else self.env(),
                 input=stdin.decode() if stdin is not None else None, capture_output=True, text=True,
                 timeout=timeout, check=False,
@@ -398,9 +409,7 @@ class Cut:
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "-r", consumer_lock])
         self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"])
-        shown = self.run([python, "-I", "-c", "import importlib.metadata as m, lu_machinery; "
-                          "print(m.version('lu-machinery')); print(lu_machinery.__file__)"],
-                         env=self.scratch_env()).stdout.split()
+        shown = self.run([python, "-I", "-c", _SHOW_LU], env=self.scratch_env()).stdout.split()
         if shown[0] != built_version or not Path(shown[1]).resolve().is_relative_to(venv.resolve()):
             raise CutError(f"clean environment imported {shown}, not {built_version} from {venv}")
         self.say(f"clean install and import: lu-machinery {shown[0]}")
@@ -462,12 +471,11 @@ class Cut:
     def node_provision(self, python: Path) -> dict[str, str]:
         """docs/release.md's install-and-seal block, then admission of the sealed prefix."""
         self.step = "Node provisioning"
-        acpx = "from lu_machinery.agent_runtime.adapters.acpx import "
         env = self.scratch_env()
-        prefix = self.run([python, "-I", "-c", acpx + "prepare_node_dependencies as p; print(p() or '')"],
+        prefix = self.run([python, "-I", "-c", f"{_ACPX}prepare_node_dependencies as p; print(p() or '')"],
                           env=env).stdout.strip()
         if prefix:
-            tools = self.run([python, "-I", "-c", acpx + "node_toolchain as t; n, m = t(); print(n); print(m)"],
+            tools = self.run([python, "-I", "-c", f"{_ACPX}node_toolchain as t; n, m = t(); print(n); print(m)"],
                              env=env).stdout.split()
             cache = self.work / "npm-cache"
             cache.mkdir()
@@ -476,14 +484,10 @@ class Cut:
                 self.run([tools[0], tools[1], "ci", "--ignore-scripts", "--no-audit", "--no-fund",
                           f"--prefix={prefix}", f"--cache={cache}"],
                          env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
-                self.run([python, "-I", "-c", "from pathlib import Path; import sys; " + acpx
-                          + "seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))", cache], env=env)
+                self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
             finally:
                 os.umask(old)
-        info: dict[str, str] = json.loads(self.run([python, "-I", "-c", "import json; " + acpx
-                                    + "validate_node_dependencies as v, node_toolchain as t; p = v(); n, m = t(); "
-                                    "print(json.dumps({'prefix': str(p), 'node': str(n), 'npm': str(m)}))"],
-                                   env=env).stdout)
+        info: dict[str, str] = json.loads(self.run([python, "-I", "-c", _NODE_INFO], env=env).stdout)
         info["node_version"] = self.run([info["node"], "--version"], env=env).stdout.strip()
         info["npm_version"] = self.run([info["node"], info["npm"], "--version"], env=env).stdout.strip()
         self.say(f"Node prefix sealed and admitted: node {info['node_version']}, npm {info['npm_version']}")
@@ -580,8 +584,7 @@ class Cut:
         finally:
             shutil.rmtree(parent_modules, ignore_errors=True)
             shutil.rmtree(node_path, ignore_errors=True)
-        self.run([python, "-I", "-c", "from lu_machinery.agent_runtime.adapters.acpx import "
-                  "validate_node_dependencies as v; v()"], env=self.scratch_env())
+        self.run([python, "-I", "-c", f"{_ACPX}validate_node_dependencies as v; v()"], env=self.scratch_env())
         self.say(f"Node isolation: {len(markers)} marker(s) ran only from outside; prefix still admitted")
 
     def resources(self, python: Path) -> None:
@@ -597,10 +600,7 @@ class Cut:
         shared = consumer / "agents_extensions/shared"
         shared.mkdir(parents=True)
         self.run(["git", "init", "--quiet", consumer])
-        inventory = json.loads(self.run(
-            [python, "-I", "-c", "from importlib.resources import files; "
-             "print(files('lu_machinery').joinpath('agent_deploy/release.v1.json').read_text())"],
-            env=self.scratch_env()).stdout)
+        inventory = json.loads(self.run([python, "-I", "-c", _RELEASE_INVENTORY], env=self.scratch_env()).stdout)
         descriptor = {"providers": ["claude", "codex", "agy"], "preserve": [], "sources": {
             "shared": {"path": "agents_extensions/shared", "required": True},
             "codex": {"path": "agents_extensions/codex", "required": True}}}
@@ -625,14 +625,11 @@ class Cut:
     def consumer_collection(self, python: Path, product: Path) -> str:
         """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
         self.step = "consumer test collection"
-        paths = self.run([self.host_python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib')); "
-                          "print(sysconfig.get_path('platlib'))"]).stdout.split()
+        paths = self.run([self.host_python, "-I", "-c", _SITE_PATHS]).stdout.split()
         site = self.run([python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"]).stdout.strip()
         lines = "".join(f"import site; site.addsitedir({path!r})\n" for path in dict.fromkeys(paths))
         Path(site, "zz-release-cut-consumer.pth").write_text(lines, encoding="utf-8")
-        shown = self.run([python, "-c", "import importlib.metadata as m, lu_machinery; "
-                          "print(m.version('lu-machinery')); print(lu_machinery.__file__)"],
-                         cwd=product, env=self.scratch_env()).stdout.split()
+        shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
         if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
             raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
         result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
@@ -792,17 +789,17 @@ def execute(cut: Cut) -> int:
         cut.say(f"dry run complete; notes preview at {cut.work / 'notes-dry-run.md'}")
         return 0
     prefix = Path(info["prefix"])
-    acceptance = "\n".join([
-        f"- Clean machinery-only install of the consumer lock: `pip check` and isolated import of {cut.version}.",
+    acceptance = (
+        f"- Clean machinery-only install of the consumer lock: `pip check` and isolated import of {cut.version}.\n"
         f"- Node {info['node_version']}, npm {info['npm_version']}; prefix "
         f"`share/lu-machinery/node/{prefix.name}` sealed and admitted; a removed package, an incompatible "
         "version and a tampered executable each refused; planted markers ran only from outside the prefix "
-        "(react-native-b4a positive control included).",
+        "(react-native-b4a positive control included).\n"
         "- Every module imports from the installed wheel; agent deployer apply and `--check` pass on a scratch "
-        "consumer.",
-        f"- Product test collection from a fresh `main` with the candidate first: {collected}.",
-        f"- Review-contract canary at `{cut.head}`: " + "; ".join(table) + "; receipt check passed.",
-    ])
+        "consumer.\n"
+        f"- Product test collection from a fresh `main` with the candidate first: {collected}.\n"
+        f"- Review-contract canary at `{cut.head}`: {'; '.join(table)}; receipt check passed."
+    )
     cut.promote(release_body(cut, section, files, consumer_lock, ci, acceptance))
     post = cut.post_release(section)
     cut.alert_cto(
