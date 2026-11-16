@@ -517,6 +517,9 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
         ("shaped.json", json.dumps({"schema": "task.v1", "task_id": "live", "status": "running", "runtime_tmp_root": "/x"})),
         ("legacy.json", json.dumps({"schema_version": "9", "agent": "codex", "status": "running", "cwd": "/tmp/x"})),
         ("impl-1.sandbox.json", "{not json"),
+        # Record-shaped damage under a receipt name: unknown schema and a misnamed v2 record.
+        ("impl-1.write-boundary.json", json.dumps({"task_id": "impl-1", "schema_version": 9})),
+        ("impl-1.tool-results.json", json.dumps({"task_id": "impl-1", "schema_version": 2, "status": "running"})),
     ):
         (tmp_path / name).write_text(raw)
         inventory = sweep.load_tasks(tmp_path)

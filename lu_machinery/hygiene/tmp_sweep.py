@@ -229,8 +229,9 @@ def load_tasks(root: Path) -> TaskInventory:
     (``.write-boundary.json``, ``.sandbox.json``, ``.tool-results.json``) is
     not a record either; its paths are references while the owner's record is
     missing or unsettled. A damaged file (undecodable, truncated, blank under a
-    record name, unknown schema, wrong identity) and any other task claim whose
-    ``task_id`` is not its file name still make the inventory incomplete.
+    record name, unknown schema, wrong identity), receipt names included, and
+    any other task claim whose ``task_id`` is not its file name still make the
+    inventory incomplete.
     """
     records: dict[str, dict[str, Any]] = {}
     references: set[Path] = set()
@@ -252,11 +253,13 @@ def load_tasks(root: Path) -> TaskInventory:
             if path.is_symlink():
                 raise ValueError("symlinked task record")
             raw = path.read_bytes()
+            # The shared reader validates every file first, so record-shaped damage under
+            # a receipt name (unknown schema, misnamed v2 record) still fails closed.
+            data = parse_task_record(path, raw)
             owner = _receipt_owner(path, stem, raw)
             if owner is not None:
                 receipts.append((owner, json.loads(raw)))
                 continue
-            data = parse_task_record(path, raw)
             if data is None:
                 if _carries_task_identity(path, raw):
                     raise ValueError("task claim without a record shape")
