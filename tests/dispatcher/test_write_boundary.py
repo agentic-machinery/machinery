@@ -106,33 +106,44 @@ def test_setup_or_canary_failure_refuses_and_never_starts_the_provider(primary, 
     assert not write_boundary.scratch("wb-test").exists()
 
 
-@pytest.mark.parametrize("writable_file", [True, False])
-def test_canary_probes_the_bind_with_a_writable_tracked_file_not_a_read_only_first_one(primary, writable_file):
+@pytest.mark.parametrize("disk", ["writable-file", "read-only-files", "read-only-files-and-root"])
+def test_canary_probes_the_bind_with_a_writable_tracked_file_not_a_read_only_first_one(primary, disk):
     """Defect class: the canary probes the first tracked file even when it is read-only on disk, so the kernel's
-    permission check (EACCES) answers before the read-only bind (EROFS) and every reviewer is refused; or,
-    with no tracked file the host user may write, the canary passes or runs without having tested the bind."""
+    permission check (EACCES) answers before the read-only bind (EROFS) and every reviewer is refused; or it
+    refuses every run once the primary write guard has made each tracked file read-only, its intended steady
+    state, although the absent-path probes in the owner-writable repository root still prove the bind; or, with
+    neither a tracked file nor the root writable, the canary passes or runs without having tested the bind."""
     repo, worktree, _ = primary
     first = repo / ".first.txt"  # git ls-files lists it before a.txt
     first.write_text("read-only on disk\n")
     _git(repo, "add", first.name)
     _git(repo, "commit", "-qm", "read-only first file")
     first.chmod(0o444)
-    if not writable_file:
+    if disk != "writable-file":
         (repo / "a.txt").chmod(0o444)
-    marker = worktree / "provider-started"
     marker = repo.parent / "provider-started"
-    code, receipt = _run(primary, f"echo started > {marker}", "--output", str(marker))
-    if writable_file:
-        assert code == 0 and receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
-        tracked = [probe for probe in receipt["canary"]["probes"] if probe["op"] in ("write_open", "chmod")
-                   and Path(probe["path"]).parent == repo]
-        assert {(probe["op"], probe["path"], probe["outcome"]) for probe in tracked} == {
-            ("write_open", str(repo / "a.txt"), "EROFS"), ("chmod", str(repo / "a.txt"), "EROFS")}
-        assert marker.exists()
-    else:
+    root_mode = repo.stat().st_mode
+    if disk == "read-only-files-and-root":
+        repo.chmod(root_mode & ~0o222)
+    try:
+        code, receipt = _run(primary, f"echo started > {marker}", "--output", str(marker))
+    finally:
+        repo.chmod(root_mode)
+    if disk == "read-only-files-and-root":
         assert code == write_boundary.REFUSED and receipt["status"] == "refused"
-        assert "no tracked regular file the host user may write" in receipt["reason"]
+        assert "no tracked regular file and no repository root directory the host user may write" in receipt["reason"]
         assert not marker.exists()
+        return
+    assert code == 0 and receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
+    tracked = [probe for probe in receipt["canary"]["probes"] if probe["op"] in ("write_open", "chmod")
+               and Path(probe["path"]).parent == repo]
+    assert {(probe["op"], probe["path"], probe["outcome"]) for probe in tracked} == (
+        {("write_open", str(repo / "a.txt"), "EROFS"), ("chmod", str(repo / "a.txt"), "EROFS")}
+        if disk == "writable-file" else set())
+    absent = {(probe["op"], probe["outcome"]) for probe in receipt["canary"]["probes"]
+              if Path(probe["path"]).parent == repo and Path(probe["path"]).name.startswith(".write-boundary-canary-")}
+    assert absent == {(op, "EROFS") for op in ("create", "mkdir", "rename", "unlink")}
+    assert marker.exists()
 
 
 def test_protected_primary_git_state_cannot_be_changed(primary):
