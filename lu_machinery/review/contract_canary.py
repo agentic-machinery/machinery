@@ -75,6 +75,7 @@ CONTRACT_PATHS: tuple[str, ...] = (
 REASON = "needs-contract-canary"
 SCHEMA = "review-contract-canary.v1"
 RECEIPT_DIR = "review-contract-canary"
+WHEELHOUSE_ENV = "LU_MACHINERY_WHEELHOUSE"  # the name product CI and the dependency audit use
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 ROUTE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 
@@ -370,22 +371,30 @@ def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bo
 
 def _run_steps(
     work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
-    hard_timeout: int, env: Mapping[str, str],
+    hard_timeout: int, env: Mapping[str, str], wheelhouse: str,
 ) -> tuple[list[list[str]], list[tuple[str, list[str]]], list[str]]:
-    """Build the exact argv plan without creating files, units, mounts or tasks."""
+    """Build the exact argv plan without creating files, units, mounts or tasks.
+
+    The checkout holds only the candidate commit (a depth-1 fetch, never the repository's
+    history), and ``run`` removes it once the image is built. With a wheelhouse, the consumer
+    venv also finds wheels there; the lock's hashes still decide which bytes install.
+    """
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
+    url = f"https://github.com/{repo}.git"
     setup = [
-        ["git", "clone", "--no-hardlinks", "--no-checkout", str(source), str(clone)],
-        ["git", "-C", str(clone), "fetch", "--no-tags", f"https://github.com/{repo}.git", head],
-        ["git", "-C", str(clone), "-c", "core.hooksPath=/dev/null", "checkout", "--detach", head],
+        ["git", "init", "--quiet", str(clone)],
+        ["git", "-C", str(clone), "fetch", "--quiet", "--no-tags", "--depth", "1", url, head],
+        ["git", "-C", str(clone), "-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", head],
         # Dispatch creates its review worktrees in the registered primary; give it this exact object too.
-        ["git", "-C", str(source), "fetch", "--no-tags", str(clone), head],
+        # Not from the shallow checkout: Git rejects a shallow root with only a warning and exit 0.
+        ["git", "-C", str(source), "fetch", "--quiet", "--no-tags", url, head],
         ["mksquashfs", str(clone), str(work / "candidate.squashfs"), "-noappend", "-processors", "1"],
         ["snapfuse", str(work / "candidate.squashfs"), str(mount), "-o", "ro"],
         [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
         [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
-         "--require-hashes", "--only-binary=:all:", "-r", str(mount / "requirements-machinery.lock")],
+         "--require-hashes", "--only-binary=:all:", *(["--find-links", wheelhouse] if wheelhouse else []),
+         "-r", str(mount / "requirements-machinery.lock")],
         [python, "-I", "-c", "import pathlib, sys, sysconfig; pathlib.Path(sysconfig.get_path('purelib'), 'contract-canary.pth').write_text(sys.argv[1] + '\\n')",
          str(mount)],
         [python, "-I", "-B", "-c", "from lu_machinery.dispatcher.worker import _dispatcher_code; import sys; c = _dispatcher_code(); assert c['head'] == sys.argv[1] and c['clean'] and c['read_only'], c", head],
@@ -418,6 +427,43 @@ def _run_steps(
     return setup, commands, unmount
 
 
+# The work directory peaks while the image is built: the depth-1 checkout (its tree plus a
+# compressed pack) and the image beside it, at most twice the tree's blob bytes. The checkout
+# is then removed; the consumer venv (about 110 MiB) and file-system slack fit the allowance.
+# Measured 2026-11-16 on a 747 MB product tree: 962 MiB checkout, 331 MiB image, 108 MiB venv.
+_TREE_PEAK_FACTOR = 2
+_VENV_ALLOWANCE = 512 * 2**20
+
+
+def _space_refusal(home: Path, source: Path, env: Mapping[str, str]) -> str | None:
+    """Why the work directory's file system cannot take this run, or None.
+
+    A run that would leave the file system at or above the dispatch admission's refuse level
+    (``df`` percent used) would stop every dispatch on the host, so it never starts. The need
+    is estimated from the registered checkout's current tree; an unreadable disk refuses.
+    """
+    from lu_machinery.orchestration.dispatch_admission import load_thresholds, read_disk
+
+    limit = load_thresholds().disk_refuse_used_percent
+    listing = _invoke(["git", "-C", str(source), "ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD"],
+                      cwd=home, env=env).stdout
+    tree = 0
+    for entry in filter(None, listing.split("\0")):
+        _mode, kind, _oid, size = entry.partition("\t")[0].split()  # a malformed line raises: refuse
+        if kind == "blob":
+            tree += int(size)
+    need = _TREE_PEAK_FACTOR * tree + _VENV_ALLOWANCE
+    disk = read_disk(home, shutil.disk_usage)
+    if disk.used_bytes is None or disk.free_bytes is None:
+        return f"cannot read free space under {home}: {disk.text()}"
+    after = 100.0 * (disk.used_bytes + need) / (disk.used_bytes + disk.free_bytes)
+    if after >= limit:
+        return (f"refusing to start: the canary needs about {need / 2**30:.1f} GiB under {home}, which would "
+                f"take its file system from {disk.text()} to {after:.1f}% used; dispatch admission refuses "
+                f"at {limit:g}%. Free space first.")
+    return None
+
+
 def run(args: argparse.Namespace) -> int:
     """Host-only orchestration of the established sealed-checkout canary procedure."""
     from lu_machinery.common.git_context import sanitized_git_env
@@ -431,6 +477,11 @@ def run(args: argparse.Namespace) -> int:
     if not args.dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
         raise CanaryError("run must execute on the host, outside a dispatched worker; use --dry-run here")
     source, repository = resolve_repo(args.repo)
+    if repository["key"] != "machinery":
+        # A consumer tree has no lu_machinery package: the installed wheel, not the candidate, would
+        # supervise its routes, and the attestation step refuses that before any provider call.
+        raise CanaryError(f"--repo {args.repo}: only machinery heads can be canaried; this runner cannot attest "
+                          f"the dispatcher of a {repository['key']} head")
     env = sanitized_git_env(strip_config_injection=True)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
@@ -450,11 +501,18 @@ def run(args: argparse.Namespace) -> int:
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
     interpreter = project_interpreter()
-    work = Path.home() / ".lu-contract-canary-DRY-RUN"
-    if not args.dry_run:
+    wheelhouse = os.environ.get(WHEELHOUSE_ENV, "")
+    if wheelhouse and not (os.path.isabs(wheelhouse) and os.path.isdir(wheelhouse)):
+        raise CanaryError(f"{WHEELHOUSE_ENV} must be the absolute path of an existing wheelhouse directory")
+    if args.dry_run:
+        work = Path.home() / ".lu-contract-canary-DRY-RUN"
+    elif refused := _space_refusal(Path.home(), source, env):
+        raise CanaryError(refused)  # before anything is created
+    else:
         work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
     setup, route_commands, unmount = _run_steps(
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
+        wheelhouse,
     )
     # Force a full score even if this head's changed files do not touch the contract.
     # Isolated host imports select the installed gate used by the keeper, not the candidate.
@@ -462,8 +520,16 @@ def run(args: argparse.Namespace) -> int:
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
+        print(f"refuse unless {Path.home()} has room for about twice the registered checkout's tree plus "
+              f"{_VENV_ALLOWANCE // 2**20} MiB below the dispatch admission's disk refuse level")
+        if not wheelhouse:
+            print(f"{WHEELHOUSE_ENV} is unset: pip uses the package index only")
         print(f"mkdir {work / 'mount'} (temporary directory under home; fusermount refuses /var/tmp)")
-        for command in [*setup, *(argv for _, argv in route_commands), check, unmount]:
+        for command in setup:
+            print(shlex.join(command))
+            if command[0] == "mksquashfs":
+                print(f"remove {work / 'source'} (the image holds the candidate)")
+        for command in [*(argv for _, argv in route_commands), check, unmount]:
             print(shlex.join(command))
         print(f"remove temporary directory {work} after successful unmount")
         return 0
@@ -476,6 +542,9 @@ def run(args: argparse.Namespace) -> int:
             if command[0] == "snapfuse":
                 mount_attempted = True
             _invoke(command, cwd=work, env=env)
+            if command[0] == "mksquashfs":
+                # The image holds the candidate; keeping the checkout would only raise the peak.
+                shutil.rmtree(work / "source")
         with (work / "candidate.squashfs").open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
         print(f"head {head}; squashfs sha256:{digest}", flush=True)
@@ -548,17 +617,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = sub.add_parser(
         "run", help="Build, run, record and score the sealed-checkout canary on the host",
         description="Orchestrate the four-route review-contract canary at an exact head.\n"
-        "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.",
+        "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.\n"
+        f"Only machinery heads are supported. {WHEELHOUSE_ENV}, when set, is an absolute wheelhouse\n"
+        "path pip also searches. A run refuses before creating\n"
+        "anything when its estimated disk need would reach the dispatch admission's disk refuse level.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-        "  .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"
+        f"  {WHEELHOUSE_ENV}=<wheelhouse> .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"
         "  .venv/bin/python -m lu_machinery.review.contract_canary run --head <40-hex-sha> --dry-run\n"
-        "Outputs: temporary SquashFS/venv under home; live read-only tasks and shared canary receipts.\n"
+        "Outputs: temporary SquashFS/venv under home (the depth-1 checkout is removed once the image is built);\n"
+        "live read-only tasks and shared canary receipts.\n"
         "The mount and temporary directory are removed; failed unmount retains the directory for recovery.\n"
-        "Exit codes: 0 all routes and check pass, or dry-run plan; 1 route/check failure; 2 setup/cleanup failure.\n"
+        "Exit codes: 0 all routes and check pass, or dry-run plan; 1 route/check failure;\n"
+        "2 invalid input, too little disk, setup or cleanup failure.\n"
         "Related: docs/runbooks/write-worker-boundary.md#review-contract-canary.",
     )
-    runner.add_argument("--repo", default="machinery", help="Fleet registry key holding the candidate code (default: machinery)")
+    runner.add_argument("--repo", default="machinery",
+                        help="Fleet registry key holding the candidate code; only machinery is supported (default: machinery)")
     target = runner.add_mutually_exclusive_group(required=True)
     target.add_argument("--head", help="Exact candidate commit, 40 lowercase hex characters (default: from --pr)")
     target.add_argument("--pr", type=int, help="PR whose head to resolve once, e.g. 585 (default: use --head)")

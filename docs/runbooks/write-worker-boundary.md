@@ -240,7 +240,7 @@ regardless of which paths changed. Contract-path PRs do not need per-PR
 canary receipts:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha>
+LU_MACHINERY_WHEELHOUSE=<host-wheelhouse> .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha>
 # Inspect the complete command plan from a worker or host:
 .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha> --dry-run
 ```
@@ -248,20 +248,37 @@ canary receipts:
 The host needs the existing provider credentials and account bindings, a working
 systemd user bus, `git`, `mksquashfs`, `snapfuse` and `fusermount3` (or
 `fusermount`). Use the configured project interpreter and primary/product roots.
-The command does not install host tools or change host configuration.
+An optional `LU_MACHINERY_WHEELHOUSE` (the host wheelhouse's absolute path) is a
+local wheel source for the consumer install; a machinery lock pins only
+dependencies and also installs without it. The command does not install host
+tools or change host configuration.
+
+Only machinery heads are supported: `--repo` naming any other repository is
+refused up front. A consumer tree such as the product has no `lu_machinery`
+package, so the installed wheel rather than the candidate would supervise its
+routes, and the dispatcher attestation cannot pass.
+
+Before creating anything, the runner estimates its disk need as twice the
+registered checkout's tree plus 512 MiB. It refuses when that need would take the
+home file system to the dispatch admission's disk refuse level (90% by
+default), because every dispatch on the host would then be refused. For scale,
+a 750 MB tree peaked near 1.3 GiB while its image was built; the machinery tree
+is about 40 MB.
 
 The runner uses the supplied head (or resolves a PR head once with `--pr`),
-clones the registered repository, fetches and checks out that exact commit, and builds a SquashFS image. It also fetches
-the candidate object into the registered primary's Git object store so the
+fetches only that exact commit (depth 1) into a new checkout, and builds a SquashFS
+image. It removes the checkout once the image exists. It also fetches
+the candidate object from GitHub into the registered primary's Git object store so the
 existing dispatcher can create its pinned review worktrees there. It mounts
 the image read-only beneath the home directory, where fusermount permits
 unmounting, and creates a disposable venv with the candidate's hash-locked
-`requirements-machinery.lock` dependencies. A `.pth` file names the mount;
+`requirements-machinery.lock` dependencies. With a wheelhouse set, pip also finds
+wheels there; the lock's hashes decide which bytes install. A `.pth` file names the mount;
 `lu-machinery` itself is loaded from the sealed checkout. Before spending any
 provider calls it checks the candidate dispatcher's head, clean bytes and
 read-only mount attestation.
 
-Each route runs sequentially in a `systemd-run --user` unit with explicit
+All routes run at once, each in its own `systemd-run --user` unit with explicit
 `PATH`, primary/product roots and configured state/interpreter context. The
 candidate's `dispatcher.cli.main` dispatches a read-only, receipt-bound task
 pinned to the same commit, waits for its terminal status and records its
@@ -288,7 +305,8 @@ and candidate head in the release's Acceptance section; a failing route or an
 incomplete receipt check blocks the release.
 
 Exit 0 means all routes and the existing receipt check passed. Exit 1 names a
-route/check failure; exit 2 means invalid input, setup or cleanup failed.
+route/check failure; exit 2 means invalid input, too little disk, or a setup or
+cleanup failure.
 `--dry-run` prints the same argv plan and exits 0 without creating an image,
 venv, mount, unit, task or receipt; it supplies no live canary proof. Resolving
 `--pr` still performs a read-only GitHub query; `--head` avoids that query.
