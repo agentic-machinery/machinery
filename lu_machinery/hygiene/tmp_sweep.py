@@ -419,7 +419,10 @@ def _holder_records(stdout: bytes) -> tuple[tuple[int, Path], ...] | None:
         pid_field, kind, raw = fields
         if not pid_field.isdigit() or kind not in HOLDER_KINDS:
             return None
-        pid = int(pid_field)
+        try:
+            pid = int(pid_field)
+        except ValueError:  # beyond the interpreter's integer-string digit limit
+            return None
         text = os.fsdecode(raw)
         if pid <= 0 or not text.startswith("/") or os.path.normpath(text) != text:
             return None

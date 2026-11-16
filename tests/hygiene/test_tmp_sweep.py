@@ -752,6 +752,7 @@ def test_holder_probe_completes_liveness_only_on_a_clean_run(inventory, tmp_path
         b"4242\tsocket\t/tmp/x\0",
         b"+42\tfd\t/tmp/x\0",
         b"0\tfd\t/tmp/x\0",
+        b"9" * 5000 + b"\tfd\t/tmp/x\0",
         b"4242\tfd\ttmp/x\0",
         b"4242\tfd\t/tmp/../etc\0",
         b"4242\tfd\t/home/x\0",
