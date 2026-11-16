@@ -5,6 +5,8 @@ PR events run admission checks: file-content secret scanning, the large-file
 guard, attribution, lint and content contracts, dependency-audit scoping,
 `pytest --collect-only` and Frontend. They run no pytest shards; the gate summary
 states plainly that full pytest was not run (operator decision, 2026-10-29).
+The exception is a PR that changes pytest infrastructure (see CI Gate below): it
+runs and requires the shards too.
 The parallel required `pr-affected` job executes literal changed existing
 `tests/**/test_*.py` files, every entry in `lu_machinery/ci/pr-affected-guards.txt` (a whole test path, or a pinned `path::test` id that runs only that test and costs nothing extra when its file is already selected), and
 the tests that directly import, load, read or run a changed non-test file.
@@ -76,7 +78,8 @@ first, so they never displace a test that would run without them; the rest defer
 `text_reading_test_files` and `deferred_files`, and run in merge-group pytest. When text readers
 run, the pytest timeout grows to the estimate times 1.18, at most 550 seconds. Infrastructure
 includes conftest, pytest configuration, dependency locks, the CI workflow, CI Python setup,
-CI helpers and quarantine inputs. The summary and `pr-affected-proof` artifact
+CI helpers and quarantine inputs; such a PR also runs and requires the pytest
+shards (see CI Gate). The summary and `pr-affected-proof` artifact
 record the candidate, requested files, deferred files and reason, recorded
 estimate, reported cases, skips and failures. Deferred test-case counts stay
 UNKNOWN because the deferred files were not collected by this job. Workflow
@@ -215,10 +218,31 @@ This Python gate aggregates the product workflow's jobs. Machinery's own
 
 The gate requires Secret scan, Hydrate release assets, Checks, Dependency audit, Frontend and PR changed tests and guards to
 succeed on every event. Duration refresh, pytest and pytest report must succeed on the
-full tier and be skipped on PR admission. Queue commit metadata scanning must
+full tier and be skipped on PR admission, except on a PR that changes pytest
+infrastructure, where they must succeed. PR pytest scope (`pr-scope`), when the
+workflow has it, must succeed on PR events and be skipped elsewhere. Queue commit metadata scanning must
 succeed on merge-group events and be skipped elsewhere. Every other result,
 including cancellation or unknown status, blocks the gate. `always()` ensures
 it reports after failed or cancelled dependencies.
+
+A PR changes pytest infrastructure when the PR selector
+(`lu_machinery/ci/pr_affected_tests.py`, `infrastructure_changed`) reports "pytest
+infrastructure changed" for it (the infrastructure paths are listed under the PR
+selector above). The selector then runs the guards only, so before this rule such a PR
+reached the merge queue without running the tests it could break: 15 of the last
+48 failed merge-group runs (2026-11-16 classification). The decision uses the
+selector's own rule on the diff from the tested merge's first parent.
+The `pr-scope` job runs `python -m lu_machinery.ci.gate --pr-scope`, which appends
+`full-suite=true` or `full-suite=false` to `GITHUB_OUTPUT`; the job exposes it as its
+`full-suite` output. The conditions of Duration refresh and pytest read that output,
+and so does the aggregating gate, from `NEEDS_JSON`: a successful `pr-scope` without a
+`true` or `false` output fails the gate, and a condition that disagrees with the output
+leaves a job result the gate rejects.
+A workflow without a `pr-scope` job keeps the previous PR tier (shards skipped), so a
+consumer still adopts a release by changing its lock alone; the job is added to
+`ci.yml` afterwards. Once every consumer has it, a later release can make it mandatory.
+The rule is reverted if PR CI p50 exceeds 12 minutes over the next 50
+merge-group runs after adoption (three-way decision, 2026-11-16).
 
 Queue runs never reuse PR results. The tested-tree artifact remains an audit
 record of the candidate and its partition results.

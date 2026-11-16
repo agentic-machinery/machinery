@@ -336,17 +336,41 @@ def manifest_run_files(candidate: str, entries: dict[str, str]) -> set[str] | No
     return run
 
 
+def changed_files(base: str, candidate: str) -> list[str]:
+    """Every path the candidate changes from ``base``, renames as delete plus add."""
+    return [
+        safe_path(p.decode("utf-8"))
+        for p in git("diff", "--no-renames", "--name-only", "-z", base, candidate, "--").split(b"\0")
+        if p
+    ]
+
+
+def infrastructure_changed(changed: list[str]) -> bool:
+    """Whether a changed path is pytest infrastructure: the PR then runs guards only.
+
+    ``lu_machinery.ci.gate`` applies the same rule, so such a PR runs and requires the
+    full pytest shards.
+    """
+    return any(
+        p in INFRA
+        or Path(p).name == "conftest.py"
+        or p.startswith((
+            f"{_checkout_relative('ci').as_posix()}/",
+            _checkout_relative("common", "flake_quarantine").as_posix(),
+            ".github/actions/python-ci-env/",
+        ))
+        or p == "tests/flake_quarantine.yaml"
+        for p in changed
+    )
+
+
 def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     entries = {}
     for row in git("ls-tree", "-rz", candidate, "--", "tests").split(b"\0"):
         if row:
             meta, name = row.decode("utf-8").split("\t", 1)
             entries[name] = meta.split()[0]
-    changed = [
-        safe_path(p.decode("utf-8"))
-        for p in git("diff", "--no-renames", "--name-only", "-z", base, candidate, "--").split(b"\0")
-        if p
-    ]
+    changed = changed_files(base, candidate)
     guards = [safe_path(line, node=True) for line in product_tree_path(*GUARDS.parts).read_text(encoding="utf-8").splitlines()]
     if not guards or len(set(guards)) != len(guards):
         raise ValueError("empty or duplicate guard list")
@@ -396,17 +420,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         return durations.get(p, default)
 
     estimate = 60 + sum(cost(p) for p in selected)
-    infrastructure = any(
-        p in INFRA
-        or Path(p).name == "conftest.py"
-        or p.startswith((
-            f"{_checkout_relative('ci').as_posix()}/",
-            _checkout_relative("common", "flake_quarantine").as_posix(),
-            ".github/actions/python-ci-env/",
-        ))
-        or p == "tests/flake_quarantine.yaml"
-        for p in changed
-    )
+    infrastructure = infrastructure_changed(changed)
     guard_estimate = 60 + sum(cost(p, set(guards)) for p in guards)
     reason = (
         "pytest infrastructure changed"
