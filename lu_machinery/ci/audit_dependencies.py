@@ -63,6 +63,8 @@ _SAFE_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
 _LOCAL_PATH = re.compile(r"(?P<path>\.\.?/[A-Za-z0-9._/-]+)(?:\[[A-Za-z0-9._,-]+\])?\Z")
 # The one accepted direct reference: a git URL pinned to a full commit, with no user info.
 _PINNED_GIT_URL = re.compile(r"git\+https://[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]+@[0-9a-f]{40}\Z")
+# pip's ``strip_extras``: a trailing ``[...]`` is removed before the path check.
+_PIP_EXTRAS_SUFFIX = re.compile(r"^(.+)(\[[^\]]+\])$")
 # pip installs a requirement ending in an archive suffix as a file (pip's ARCHIVE_EXTENSIONS).
 _ARCHIVE_SUFFIXES = (
     ".zip",
@@ -115,6 +117,13 @@ def _logical_lines(text: str) -> list[tuple[int, str]]:
         if joined:
             logical.append((first, joined))
     return logical
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LuMachineryAuditWheelError(f"cannot read {path.name}: {exc}") from exc
 
 
 def _split_options(line: str) -> tuple[str, list[str]]:
@@ -173,12 +182,14 @@ def _path_project_names(package_dir: Path) -> set[str]:
 def _line_names(repo_root: Path, line: str) -> set[str]:
     """PEP 503 names one requirements line can install; refuse every unrecognized form.
 
-    Accepted: ``name[extras]==version`` or ``===version`` (markers allowed), a
+    Accepted: ``name[extras]==version`` (markers allowed), a
     ``name @ git+https://host/path@<40-hex commit>`` reference to anything but
     ``lu-machinery``, and a ``./dir`` or ``../dir`` project whose pyproject.toml
-    is read. The only accepted option is ``--hash=sha256:``. Everything else
-    pip would also accept (editables in any spelling, URLs, includes,
-    constraints, index options, unpinned names, environment variables) raises.
+    is read. The only accepted option is ``--hash=sha256:``. A pin or git
+    reference whose text names an existing local path is refused, because pip
+    would install that path instead. Everything else pip would also accept
+    (editables in any spelling, URLs, includes, constraints, index options,
+    unpinned names, ``===``, environment variables) raises.
     """
     if "${" in line:
         raise LuMachineryAuditWheelError("environment variable reference")
@@ -195,8 +206,15 @@ def _line_names(repo_root: Path, line: str) -> set[str]:
         return _path_project_names(repo_root / path.group("path"))
     if requirement.startswith((".", "/", "~")):
         raise LuMachineryAuditWheelError("local path outside the ./dir or ../dir form")
-    if requirement.split(";", 1)[0].strip().lower().endswith(_ARCHIVE_SUFFIXES):
+    # pip tries the text before ";" as a local path first: an existing directory
+    # (extras stripped) or an archive name wins over the requirement it spells.
+    pip_name = requirement.split(";", 1)[0].strip()
+    if pip_name.lower().endswith(_ARCHIVE_SUFFIXES):
         raise LuMachineryAuditWheelError("pip reads a requirement with an archive suffix as a file")
+    pip_path = os.path.normpath(os.path.join(repo_root, pip_name))
+    stripped = _PIP_EXTRAS_SUFFIX.match(pip_path)
+    if os.path.lexists(pip_path) or (stripped is not None and os.path.lexists(stripped.group(1))):
+        raise LuMachineryAuditWheelError("names an existing local path, which pip would install instead")
     try:
         parsed = Requirement(requirement)
     except InvalidRequirement as exc:
@@ -209,8 +227,9 @@ def _line_names(repo_root: Path, line: str) -> set[str]:
             raise LuMachineryAuditWheelError("direct reference that is not a git URL pinned to a full commit")
         return {name}
     specifiers = list(parsed.specifier)
-    if len(specifiers) != 1 or specifiers[0].operator not in ("==", "===") or "*" in specifiers[0].version:
-        raise LuMachineryAuditWheelError("requirement not pinned to one exact version")
+    # Not ``===``: arbitrary equality admits any text, including path separators.
+    if len(specifiers) != 1 or specifiers[0].operator != "==" or "*" in specifiers[0].version:
+        raise LuMachineryAuditWheelError("requirement not pinned to one exact == version")
     return {name}
 
 
@@ -222,7 +241,7 @@ def _requirements_need_lu_machinery(repo_root: Path, requirements_file: Path) ->
     different distribution and does not count.
     """
     need = False
-    for number, line in _logical_lines(requirements_file.read_text(encoding="utf-8")):
+    for number, line in _logical_lines(_read_text(requirements_file)):
         try:
             need |= _LU_MACHINERY_NAME in _line_names(repo_root, line)
         except LuMachineryAuditWheelError as exc:
@@ -236,7 +255,7 @@ def _lock_names_lu_machinery(lock: Path) -> bool:
     """True when any line of the consumer's machinery lock starts with the name ``lu-machinery``."""
     if not lock.is_file():
         return False
-    for _, line in _logical_lines(lock.read_text(encoding="utf-8")):
+    for _, line in _logical_lines(_read_text(lock)):
         match = _LEADING_NAME.match(line)
         if match is not None and _pep503_name(match.group(1)) == _LU_MACHINERY_NAME:
             return True
@@ -255,7 +274,7 @@ def _lu_machinery_pin(lock: Path) -> _LuMachineryPin:
         raise LuMachineryAuditWheelError(f"{lock.name} does not pin lu-machinery")
     pins: list[_LuMachineryPin] = []
     named = 0
-    for _, line in _logical_lines(lock.read_text(encoding="utf-8")):
+    for _, line in _logical_lines(_read_text(lock)):
         leading = _LEADING_NAME.match(line)
         if leading is None or _pep503_name(leading.group(1)) != _LU_MACHINERY_NAME:
             continue
@@ -317,10 +336,12 @@ def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Itera
     When the consumer's ``requirements-machinery.lock`` names ``lu-machinery``,
     this always yields ``PIP_FIND_LINKS`` (a directory containing only the
     hash-checked wheel) and ``PIP_CONSTRAINT`` (an unhashed ``lu-machinery @
-    file:`` URL of that staged wheel). pip applies a constraint wherever the
-    name appears in the resolution, so ``lu-machinery`` required by a pinned
-    package, a git reference or a local project, directly or transitively,
-    resolves only from that wheel. When the lock does not name it but a line or
+    file:`` URL of that staged wheel), plus the same file as
+    ``PIP_BUILD_CONSTRAINT``, because since pip 26.2 isolated builds ignore
+    ``PIP_CONSTRAINT``. pip applies a constraint wherever the name appears in
+    the resolution, so ``lu-machinery`` required by a pinned package, a git
+    reference or a local project, directly, transitively or as a build
+    dependency, resolves only from that wheel. When the lock does not name it but a line or
     a local project does, this raises. Otherwise it yields an empty mapping and
     the audit command stays exactly as before.
 
@@ -353,7 +374,13 @@ def pip_audit_requirement_env(repo_root: Path, requirements_file: Path) -> Itera
         # File URL, not ``==version``: an index can offer another build of the
         # same version. No ``--hash``, so the unhashed consumer lock still resolves.
         constraint.write_text(f"lu-machinery @ {staged.resolve().as_uri()}\n", encoding="utf-8")
-        yield {"PIP_FIND_LINKS": str(links), "PIP_CONSTRAINT": str(constraint)}
+        # Since pip 26.2 an isolated build ignores PIP_CONSTRAINT and takes only
+        # build constraints, so the same file binds build dependencies too.
+        yield {
+            "PIP_FIND_LINKS": str(links),
+            "PIP_CONSTRAINT": str(constraint),
+            "PIP_BUILD_CONSTRAINT": str(constraint),
+        }
 
 
 def audit_python(repo_root: Path, ignore_file: Path) -> int:

@@ -203,6 +203,8 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
         assert staged == [links / wheel_name]
         captured["wheel_hash"] = hashlib.sha256(staged[0].read_bytes()).hexdigest()
         captured["constraint"] = Path(env["PIP_CONSTRAINT"]).read_text(encoding="utf-8")
+        # pip 26.2+ isolated builds read only build constraints.
+        assert env["PIP_BUILD_CONSTRAINT"] == env["PIP_CONSTRAINT"]
         captured["cmd"] = _cmd
         return MagicMock(returncode=0, stdout="", stderr="")
 
@@ -307,6 +309,7 @@ def test_lu_machinery_requirement_resolves_from_machinery_lock_not_pypi(tmp_path
     assert str(captured["constraint"]).startswith("lu-machinery @ file:")
 
 
+_SHADOWED_GIT_REFERENCE = "shadow @ git+https://example.invalid/shadow.git@" + "a" * 40
 _REFUSED_REQUIREMENT_FORMS = (
     "-eruntime",
     "-eruntime[extra]",
@@ -339,6 +342,9 @@ _REFUSED_REQUIREMENT_FORMS = (
     "requests==2.32.0 --config-settings=x=y",
     "requests==1.0+x.whl",
     "${RUNTIME}",
+    "demo===1.0",
+    "safe===x/runtime",
+    _SHADOWED_GIT_REFERENCE,
 )
 
 
@@ -357,6 +363,10 @@ def test_unrecognized_requirement_line_fails_closed(line: str, tmp_path: Path, m
         encoding="utf-8",
     )
     (tmp_path / "empty").mkdir()
+    for shadow in (tmp_path / "safe===x" / "runtime", tmp_path / _SHADOWED_GIT_REFERENCE):
+        # pip installs an existing directory spelled like the requirement instead.
+        shadow.mkdir(parents=True)
+        (shadow / "pyproject.toml").write_bytes((runtime / "pyproject.toml").read_bytes())
     payload = b"fake-lu-machinery-9.9.9"
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
