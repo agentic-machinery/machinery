@@ -104,6 +104,13 @@ def decode(blob: bytes) -> Any:
         raise Invalid("invalid JSON") from exc
 
 
+# Python's bytecode cache directory. Importing a deployed or product script writes one beside it;
+# it is never a deployment input or output, so both inventories skip it (a symlink of that name still
+# refuses). Python uses a cached file only for a source beside it; a loose ``*.pyc`` outside one can be
+# imported without its source, so it stays visible.
+BYTECODE_CACHE = "__pycache__"
+
+
 class Tree:
     """All filesystem operations remain below a held, no-follow root fd."""
 
@@ -164,6 +171,8 @@ class Tree:
                     continue
                 relative(name)
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode) and name == BYTECODE_CACHE:
+                    continue
                 if stat.S_ISDIR(info.st_mode):
                     child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     try:
@@ -340,6 +349,8 @@ class CommitInputs:
             for (prefix, _), entries in zip(level, listed, strict=True):
                 for name, (mode, child) in sorted(entries.items()):
                     relative(name)  # only names the deployment reads; a lookup checks its own path
+                    if mode == self.TREE_MODE and name == BYTECODE_CACHE:
+                        continue
                     if mode == self.TREE_MODE:
                         following.append((prefix + name + "/", child))
                     else:

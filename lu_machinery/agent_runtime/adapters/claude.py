@@ -252,6 +252,7 @@ from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
 from lu_machinery.common.repo_root import machinery_path, product_root
 
 from ..env_sanitize import (
@@ -621,12 +622,20 @@ _PROJECT_PYTHON_HOOK_WRAPPER = "run-project-python-hook.sh"
 # namespace package ahead of the release.
 PROJECT_PYTHON_GUARDS = frozenset({"guard-pr-merge.py", "guard-admin-merge.py", "guard-branch-switch-in-main.py"})
 # A command whose raw text or shell words contain any of these is a fleet guard
-# and must take one of the two supported forms.
-_FLEET_GUARD_MARKERS = (".claude/hooks/", _PROJECT_PYTHON_HOOK_WRAPPER, *sorted(PROJECT_PYTHON_GUARDS))
+# and must take one of the supported forms; a native guard command whose bytes
+# differ from this release's is refused, never dropped.
+_FLEET_GUARD_MARKERS = (".claude/hooks/", _PROJECT_PYTHON_HOOK_WRAPPER, *sorted(PROJECT_PYTHON_GUARDS),
+                        *CLAUDE_GUARD_MODES)
 # PreToolUse halves of observational pre/post pairs. Worker settings carry no
 # PostToolUse hooks, so the pre-call snapshot of the primary-checkout dirt
 # audit (#11253) would never be compared; workers write in their own worktree.
 _WORKER_UNPAIRED_HOOKS = frozenset({_DEPLOYED_HOOKS_PREFIX + "audit-primary-checkout-dirt.py"})
+
+
+@cache
+def _native_guard_files() -> dict[str, str]:
+    """Each native Claude guard command, by its exact bytes, to the guard file it runs."""
+    return {native_hook_command(mode): mode.removeprefix("claude-") + ".py" for mode in CLAUDE_GUARD_MODES}
 
 
 def _worker_guard_invocation(command: str) -> str | None:
@@ -639,19 +648,27 @@ def _worker_guard_invocation(command: str) -> str | None:
     by its shebang) for a shell guard. The words ``bash
     $CLAUDE_PROJECT_DIR/.claude/hooks/run-project-python-hook.sh <guard>``
     become ``<this interpreter> -I <guard>``, for the guards in
-    ``PROJECT_PYTHON_GUARDS`` only. The tracked guard path is always the last
+    ``PROJECT_PYTHON_GUARDS`` only. A native Claude guard command (exactly
+    ``native_hook_command("claude-<guard>")``) becomes ``<this interpreter> -I
+    <guard>.py`` too. The tracked guard path is always the last
     shell word, which the Grok hook bridge relies on. Any other command naming
     the hooks directory, the wrapper or one of those guards raises, so a guard
     is never silently dropped. Commands naming none of them are not fleet guards and
     return ``None``.
     """
+    hooks_dir = machinery_path("agents_extensions/shared/hooks")
+    native = _native_guard_files().get(command)
+    if native is not None:
+        tracked = hooks_dir / native
+        if not tracked.is_file():
+            raise RuntimeError(f"Claude worker guard unavailable: {tracked}")
+        return shlex.join([sys.executable, "-I", str(tracked)])
     try:
         argv = shlex.split(command)
     except ValueError as exc:
         raise RuntimeError(f"Claude worker hook command is unreadable: {command}") from exc
     if not any(marker in text for text in (command, *argv) for marker in _FLEET_GUARD_MARKERS):
         return None
-    hooks_dir = machinery_path("agents_extensions/shared/hooks")
     wrapper = _DEPLOYED_HOOKS_PREFIX + _PROJECT_PYTHON_HOOK_WRAPPER
     if len(argv) == 3 and argv[:2] == ["bash", wrapper] and argv[2] in PROJECT_PYTHON_GUARDS:
         tracked = hooks_dir / argv[2]
