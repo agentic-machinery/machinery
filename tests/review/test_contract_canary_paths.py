@@ -5,12 +5,16 @@
 from lu_machinery.review.contract_canary import CONTRACT_PATHS, touches_contract
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 import pytest
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.review import contract_canary as canary
 from tests.helpers.product_tree import configured_roots as configured_roots
+
+GIB = 2**30
 
 def test_contract_paths_match_product_layout() -> None:
     """Prevent installed keepers from missing product review-contract changes."""
@@ -264,7 +268,22 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
     ))
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
+    # The space check reads the default refuse level and a roomy disk, never the host's.
+    monkeypatch.setenv("DISPATCH_ADMISSION_ENV_FILE", "")
+    monkeypatch.delenv("DISPATCH_DISK_REFUSE_USED_PERCENT", raising=False)
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(used=GIB, free=1000 * GIB))
     return home
+
+
+def fake_setup(argv, cwd) -> None:
+    """The files the setup commands leave that the runner reads or removes."""
+    if argv[:2] == ["git", "init"]:
+        Path(argv[-1]).mkdir()
+    if argv[0] == "mksquashfs":
+        Path(argv[2]).write_bytes(b"candidate image")
+    if argv[0] == "snapfuse":
+        # Only the image may remain: the checkout is gone before anything runs from the mount.
+        assert not (cwd / "source").exists()
 
 
 def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypatch, capsys):
@@ -277,6 +296,10 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     output = capsys.readouterr().out
     assert "no live proof" in output
     assert "mksquashfs" in output and "snapfuse" in output and "fusermount" in output
+    # Only the candidate commit is fetched, and its checkout goes before the mount is used.
+    assert "git clone" not in output and "fetch --quiet --no-tags --depth 1 " in output
+    assert output.index("mksquashfs") < output.index("/source (the image holds") < output.index("snapfuse")
+    assert "dispatch admission's disk refuse level" in output
     assert "--codex-account b-sub" in output and "--claude-account b" in output
     assert "--codex-account a" not in output
     assert "--require-hashes" in output and "contract-canary.pth" in output
@@ -306,8 +329,7 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
         commands.append(argv)
         assert "PYTHONPATH" not in env
         code, output = 0, ""
-        if argv[0] == "mksquashfs":
-            Path(argv[2]).write_bytes(b"candidate image")
+        fake_setup(argv, cwd)
         if argv[0] == "snapfuse":
             mounted = True
             if failure == "mount":
@@ -389,8 +411,7 @@ def test_runner_starts_all_routes_before_waiting_for_settlement(runner_roots, mo
 
     def invoke(argv, *, cwd, env, check=True):
         output = ""
-        if argv[0] == "mksquashfs":
-            Path(argv[2]).write_bytes(b"candidate image")
+        fake_setup(argv, cwd)
         if argv[0] == "systemd-run":
             route = argv[argv.index("--agent") + 1]
             started.append(route)
@@ -418,6 +439,42 @@ def test_runner_rejects_unpinned_or_unbounded_runs(runner_roots, monkeypatch, ba
     """No task or image may be created for a ref or an unlimited provider run."""
     monkeypatch.setattr(canary, "_invoke", lambda *a, **kw: pytest.fail("invalid run executed"))
     assert canary.main(["run", *bad_args]) == 2
+    assert list(runner_roots.iterdir()) == []
+
+
+@pytest.mark.parametrize(("tree_gib", "used_gib", "free_gib", "starts"), [
+    (1, 85, 15, True),  # 2 GiB tree + 0.5 GiB venv allowance: 87.5% used afterwards
+    (3, 85, 15, False),  # 6.5 GiB would end at 91.5%
+    (0, 90, 10, False),  # already at the refuse level
+    (None, 0, 0, False),  # an unreadable disk is unknown, never room
+])
+def test_runner_never_starts_a_run_that_would_fill_the_disk_past_dispatch_refusal(
+    runner_roots, monkeypatch, capsys, tree_gib, used_gib, free_gib, starts,
+):
+    """Defect class: a canary whose clone and image push the host disk to the level where every dispatch is refused."""
+    def usage(path):
+        if tree_gib is None:
+            raise PermissionError("statvfs denied")
+        return SimpleNamespace(used=used_gib * GIB, free=free_gib * GIB)
+
+    commands = []
+
+    def invoke(argv, *, cwd, env, check=True):
+        commands.append(argv)
+        if "ls-tree" in argv:
+            assert argv[argv.index("-C") + 1] == str(runner_roots.parent / "registered-source")
+            tree = f"100644 blob {'e' * 40} {2 * (tree_gib or 0) * GIB // 4}\tbig.bin\0"
+            return subprocess.CompletedProcess(argv, 0, tree * 2 + f"160000 commit {'f' * 40}       -\tsub\0", "")
+        raise canary.CanaryError("setup reached")
+
+    monkeypatch.setattr(shutil, "disk_usage", usage)
+    monkeypatch.setattr(canary, "_invoke", invoke)
+    assert canary.main(["run", "--head", "b" * 40]) == 2
+    err = capsys.readouterr().err
+    assert ("setup reached" in err) is starts
+    assert ("dispatch admission refuses at 90%" in err) is (tree_gib is not None and not starts)
+    assert ("cannot read free space" in err) is (tree_gib is None)
+    assert len(commands) == (2 if starts else 1)  # the tree listing, then the first setup step
     assert list(runner_roots.iterdir()) == []
 
 

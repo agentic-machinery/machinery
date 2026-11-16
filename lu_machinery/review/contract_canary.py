@@ -372,15 +372,21 @@ def _run_steps(
     work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
     hard_timeout: int, env: Mapping[str, str],
 ) -> tuple[list[list[str]], list[tuple[str, list[str]]], list[str]]:
-    """Build the exact argv plan without creating files, units, mounts or tasks."""
+    """Build the exact argv plan without creating files, units, mounts or tasks.
+
+    The checkout holds only the candidate commit (a depth-1 fetch, never the repository's
+    history), and ``run`` removes it once the image is built.
+    """
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
+    url = f"https://github.com/{repo}.git"
     setup = [
-        ["git", "clone", "--no-hardlinks", "--no-checkout", str(source), str(clone)],
-        ["git", "-C", str(clone), "fetch", "--no-tags", f"https://github.com/{repo}.git", head],
-        ["git", "-C", str(clone), "-c", "core.hooksPath=/dev/null", "checkout", "--detach", head],
+        ["git", "init", "--quiet", str(clone)],
+        ["git", "-C", str(clone), "fetch", "--quiet", "--no-tags", "--depth", "1", url, head],
+        ["git", "-C", str(clone), "-c", "core.hooksPath=/dev/null", "checkout", "--quiet", "--detach", head],
         # Dispatch creates its review worktrees in the registered primary; give it this exact object too.
-        ["git", "-C", str(source), "fetch", "--no-tags", str(clone), head],
+        # Not from the shallow checkout: Git rejects a shallow root with only a warning and exit 0.
+        ["git", "-C", str(source), "fetch", "--quiet", "--no-tags", url, head],
         ["mksquashfs", str(clone), str(work / "candidate.squashfs"), "-noappend", "-processors", "1"],
         ["snapfuse", str(work / "candidate.squashfs"), str(mount), "-o", "ro"],
         [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
@@ -418,6 +424,43 @@ def _run_steps(
     return setup, commands, unmount
 
 
+# The work directory peaks while the image is built: the depth-1 checkout (its tree plus a
+# compressed pack) and the image beside it, at most twice the tree's blob bytes. The checkout
+# is then removed; the consumer venv (about 110 MiB) and file-system slack fit the allowance.
+# Measured 2026-11-16 on a 747 MB product tree: 962 MiB checkout, 331 MiB image, 108 MiB venv.
+_TREE_PEAK_FACTOR = 2
+_VENV_ALLOWANCE = 512 * 2**20
+
+
+def _space_refusal(home: Path, source: Path, env: Mapping[str, str]) -> str | None:
+    """Why the work directory's file system cannot take this run, or None.
+
+    A run that would leave the file system at or above the dispatch admission's refuse level
+    (``df`` percent used) would stop every dispatch on the host, so it never starts. The need
+    is estimated from the registered checkout's current tree; an unreadable disk refuses.
+    """
+    from lu_machinery.orchestration.dispatch_admission import load_thresholds, read_disk
+
+    limit = load_thresholds().disk_refuse_used_percent
+    listing = _invoke(["git", "-C", str(source), "ls-tree", "-r", "-l", "-z", "--full-tree", "HEAD"],
+                      cwd=home, env=env).stdout
+    tree = 0
+    for entry in filter(None, listing.split("\0")):
+        _mode, kind, _oid, size = entry.partition("\t")[0].split()  # a malformed line raises: refuse
+        if kind == "blob":
+            tree += int(size)
+    need = _TREE_PEAK_FACTOR * tree + _VENV_ALLOWANCE
+    disk = read_disk(home, shutil.disk_usage)
+    if disk.used_bytes is None or disk.free_bytes is None:
+        return f"cannot read free space under {home}: {disk.text()}"
+    after = 100.0 * (disk.used_bytes + need) / (disk.used_bytes + disk.free_bytes)
+    if after >= limit:
+        return (f"refusing to start: the canary needs about {need / 2**30:.1f} GiB under {home}, which would "
+                f"take its file system from {disk.text()} to {after:.1f}% used; dispatch admission refuses "
+                f"at {limit:g}%. Free space first.")
+    return None
+
+
 def run(args: argparse.Namespace) -> int:
     """Host-only orchestration of the established sealed-checkout canary procedure."""
     from lu_machinery.common.git_context import sanitized_git_env
@@ -450,8 +493,11 @@ def run(args: argparse.Namespace) -> int:
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
     interpreter = project_interpreter()
-    work = Path.home() / ".lu-contract-canary-DRY-RUN"
-    if not args.dry_run:
+    if args.dry_run:
+        work = Path.home() / ".lu-contract-canary-DRY-RUN"
+    elif refused := _space_refusal(Path.home(), source, env):
+        raise CanaryError(refused)  # before anything is created
+    else:
         work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
     setup, route_commands, unmount = _run_steps(
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
@@ -462,8 +508,14 @@ def run(args: argparse.Namespace) -> int:
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
+        print(f"refuse unless {Path.home()} has room for about twice the registered checkout's tree plus "
+              f"{_VENV_ALLOWANCE // 2**20} MiB below the dispatch admission's disk refuse level")
         print(f"mkdir {work / 'mount'} (temporary directory under home; fusermount refuses /var/tmp)")
-        for command in [*setup, *(argv for _, argv in route_commands), check, unmount]:
+        for command in setup:
+            print(shlex.join(command))
+            if command[0] == "mksquashfs":
+                print(f"remove {work / 'source'} (the image holds the candidate)")
+        for command in [*(argv for _, argv in route_commands), check, unmount]:
             print(shlex.join(command))
         print(f"remove temporary directory {work} after successful unmount")
         return 0
@@ -476,6 +528,9 @@ def run(args: argparse.Namespace) -> int:
             if command[0] == "snapfuse":
                 mount_attempted = True
             _invoke(command, cwd=work, env=env)
+            if command[0] == "mksquashfs":
+                # The image holds the candidate; keeping the checkout would only raise the peak.
+                shutil.rmtree(work / "source")
         with (work / "candidate.squashfs").open("rb") as handle:
             digest = hashlib.file_digest(handle, "sha256").hexdigest()
         print(f"head {head}; squashfs sha256:{digest}", flush=True)
