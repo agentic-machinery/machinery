@@ -9,6 +9,22 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.26"></a>
+## [0.1.26] - 2026-11-16
+
+### Changed
+
+- Name the release hygiene modules in tmp retention ([#656](https://github.com/learn-ukrainian/machinery/pull/656))
+- Council-then-discussion order and Grok advice on Ukrainian questions ([#660](https://github.com/learn-ukrainian/machinery/pull/660))
+
+### Fixed
+
+- Settle a stacked worker whose pull request merged onto the default branch ([#654](https://github.com/learn-ukrainian/machinery/pull/654))
+- Refuse hand-written Unreleased lines, record 0.1.25 and start 0.1.26 ([#657](https://github.com/learn-ukrainian/machinery/pull/657))
+- Skip dispatcher sidecars in task-record scans ([#658](https://github.com/learn-ukrainian/machinery/pull/658))
+- Read task records with the shared reader in the tmp sweep ([#659](https://github.com/learn-ukrainian/machinery/pull/659))
+- Prove the read-only bind when every tracked primary file is read-only ([#661](https://github.com/learn-ukrainian/machinery/pull/661))
+
 <a id="v0.1.25"></a>
 ## [0.1.25] - 2026-11-16
 
@@ -613,7 +629,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.25...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.26...HEAD
+[0.1.26]: https://github.com/learn-ukrainian/machinery/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...v0.1.25
 [0.1.24]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.24
 [0.1.23]: https://github.com/learn-ukrainian/machinery/compare/v0.1.22...v0.1.23
