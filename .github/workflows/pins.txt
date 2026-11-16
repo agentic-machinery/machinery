@@ -167,6 +167,19 @@ PIP_AUDIT_WHEEL_PY3_NONE_ANY_SHA256=99ef3f600a317c1945f1e89e227ef26e1c2d618429b8
 #   PyPI JSON API (OSV data). npm audit uses the hosted runner's npm and the npm
 #   registry's advisory database.
 
+# Product consumer check (installed-wheel job of ci-gate.yml). The product
+# commit it tests is product-consumer.pin beside this file, not a tool pin.
+# Upstream checks below were made on 2026-11-16.
+UV_VERSION=0.12.9
+#   https://pypi.org/project/uv/0.12.9/ (uploaded 2026-09-01), the version the
+#   product's .github/actions/python-ci-env pins, so the product environment is
+#   installed the way product CI installs it. The latest release, 0.13.8, is a
+#   separate change.
+UV_WHEEL_MANYLINUX_2_17_X86_64_SHA256=5badfd805fd88bf99b4b4f044f6e8f762f1892cab27477f4427bb473e93dd049
+#   uv-0.12.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl; the
+#   wheel has no dependencies. It installs the product's requirements-lock.txt,
+#   which carries no hashes; the product commit pins which lock is read.
+
 # Pre-publication gate (prepublication-gate.sh beside this file)
 #   Run once on the rewritten clone before the first content push, with the
 #   exact refs to be pushed, then verify the clearance immediately before the
