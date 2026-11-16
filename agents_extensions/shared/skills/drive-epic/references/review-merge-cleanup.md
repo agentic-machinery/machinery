@@ -139,7 +139,7 @@ shared bot identity when it also authored the PR; `gh pr review --approve`
 cannot publish this review of record. Bind the completed independent review:
 
 ```bash
-"$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py" --task-id "$REVIEW_TASK" --pr "$PR_NUMBER"
+"$PY" -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR_NUMBER"
 ```
 
 Require same-SHA CI before merge; the publisher checks task, reviewer, branch,

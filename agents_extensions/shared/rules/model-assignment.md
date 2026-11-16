@@ -213,7 +213,7 @@ The catalog expires after 30 days. Refresh means re-enumerating the live catalog
 official model documentation, checking local bakeoff deltas, updating `reviewed_on`, and running:
 
 ```bash
-.venv/bin/python lu_machinery/lint/lint_model_catalog.py
+.venv/bin/python -m lu_machinery.lint.lint_model_catalog
 ```
 
 Selection order is binding: **independence and hard gates → primary before last resort → semantic suitability → review quality tier → health/quota within

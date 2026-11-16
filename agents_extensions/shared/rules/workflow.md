@@ -78,7 +78,7 @@ one of these outcomes in the brief or orchestration note:
 Example scoped dispatch fragment:
 
 ```bash
-.venv/bin/python lu_machinery/dispatch.py dispatch --model <catalog-model> \
+.venv/bin/python -m lu_machinery.dispatch dispatch --model <catalog-model> \
   --agent codex --task-id quality-4952 \
   --prompt-file docs/dispatch-briefs/quality-4952.md --worktree \
   --mode workspace-write \
@@ -191,7 +191,7 @@ with `review-loop` for review rounds and the budget.
 1. Independent exact-head review **APPROVE** on the tip you intend to land, at the tier the
    [review policy](../skills/review-loop/references/policy.md#2-risk-tier-is-set-by-the-change)
    sets: cross-family, except any qualified non-author reviewer at Low tier.
-2. Open the PR if it is not already open, then run `"$PY" "$PRIMARY_REPO/lu_machinery/review/record_cf_verdict.py"` to bind the completed
+2. Open the PR if it is not already open, then run `"$PY" -m lu_machinery.review.record_cf_verdict` to bind the completed
    review, reviewed head, and author qualification in a **PR comment bound to the head SHA**,
    with reviewer model/family/harness provenance. Resolve `PRIMARY_REPO` and `PY` with the
    [review-loop setup](../skills/review-loop/SKILL.md#review-loop) to use current recorder rules
