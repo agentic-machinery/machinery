@@ -20,6 +20,9 @@ only when its log shows the successor live.
 5. Prepare the rollover with the `thread-rollover` skill. Add one `handoff_note` item with
    `lu-driver-state add --lane cto --kind handoff_note`, an owner and a done condition.
    Include the details below in its statement and cite the work item IDs it names.
+   The keeper restarts the seat only when the lane has a `handoff_note` newer than the keeper's
+   handoff prompt (or the seat's own request-handoff call), so a note written earlier does not
+   count: write a fresh, full `handoff_note` after the prompt arrives.
    If the handoff names the Claude account the next seat must run on, set the CTO launcher's saved
    default Claude account to it (see the private operations doc) before the seat restarts, so a
    relaunch with no account argument starts on it. That setting is separate from the dispatch
