@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -316,6 +317,19 @@ class Cut:
         env.update(extra)
         return env
 
+    def venv(self, path: Path) -> Path:
+        """A venv with no group- or other-writable file; returns its interpreter.
+
+        venv copies its activate scripts with the source's mode (shutil.copymode), which the umask
+        does not mask, and some Python installs ship them 0664.
+        """
+        self.run([self.host_python, "-I", "-m", "venv", path])
+        for script in (path / "bin").iterdir():
+            mode = script.lstat().st_mode
+            if stat.S_ISREG(mode) and mode & 0o022:
+                script.chmod(stat.S_IMODE(mode) & ~0o022)
+        return path / "bin/python"
+
     def git(self, repo: Path, *args: str, **kwargs) -> str:
         return self.run(["git", "-C", repo, *args], **kwargs).stdout.strip()
 
@@ -328,11 +342,12 @@ class Cut:
         if not self.alert:
             self.say("alert suppressed (--no-alert): " + body.splitlines()[0])
             return
+        # The plane root resolves from cwd; the work directory is not a checkout, so anchor at the primary.
         self.run(
             [self.host_python, "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish", "cto", "-",
              "--sender", "release-cut", "--source", "release", "--recipient", ALERT_RECIPIENT,
              "--idempotency-key", key],
-            stdin=body.encode(), timeout=120,
+            cwd=self.primary, stdin=body.encode(), timeout=120,
         )
 
     def publisher(self, *args: str) -> str:
@@ -382,12 +397,11 @@ class Cut:
         workflow = (src / ".github/workflows/ci-gate.yml").read_text(encoding="utf-8")
         pins = self.work / "build-requirements.txt"
         pins.write_text(heredoc(workflow, "cat > build-requirements.txt <<'REQUIREMENTS'"), encoding="utf-8")
-        build_venv = self.work / "build-venv"
-        self.run([self.host_python, "-I", "-m", "venv", build_venv])
-        self.run([build_venv / "bin/python", "-I", "-m", "pip", "install", "--no-cache-dir",
+        build_python = self.venv(self.work / "build-venv")
+        self.run([build_python, "-I", "-m", "pip", "install", "--no-cache-dir",
                   "--disable-pip-version-check", "--no-input", "--require-hashes", "--only-binary=:all:",
                   "--requirement", pins])
-        self.run([build_venv / "bin/python", "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
+        self.run([build_python, "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
                   "--outdir", dist, src], env=self.scratch_env())
         files = {"wheel": dist / f"lu_machinery-{built_version}-py3-none-any.whl",
                  "sdist": dist / f"lu_machinery-{built_version}.tar.gz"}
@@ -420,8 +434,7 @@ class Cut:
         """Clean machinery-only environment: install, pip check and isolated import."""
         self.step = "clean install"
         venv = self.work / "accept"
-        self.run([self.host_python, "-I", "-m", "venv", venv])
-        python = venv / "bin/python"
+        python = self.venv(venv)
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "-r", consumer_lock])
         self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"])
@@ -495,14 +508,11 @@ class Cut:
                              env=env).stdout.split()
             cache = self.work / "npm-cache"
             cache.mkdir()
-            old = os.umask(0o022)
-            try:
-                self.run([tools[0], tools[1], "ci", "--ignore-scripts", "--no-audit", "--no-fund",
-                          f"--prefix={prefix}", f"--cache={cache}"],
-                         env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
-                self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
-            finally:
-                os.umask(old)
+            # main() holds the 022 umask for the whole cut, so the prefix copy above is covered too.
+            self.run([tools[0], tools[1], "ci", "--ignore-scripts", "--no-audit", "--no-fund",
+                      f"--prefix={prefix}", f"--cache={cache}"],
+                     env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
+            self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
         info: dict[str, str] = json.loads(self.run([python, "-I", "-c", _NODE_INFO], env=env).stdout)
         info["node_version"] = self.run([info["node"], "--version"], env=env).stdout.strip()
         info["npm_version"] = self.run([info["node"], info["npm"], "--version"], env=env).stdout.strip()
@@ -914,6 +924,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             command.add_argument("--dry-run", action="store_true",
                                  help="Build, install, notes, Node, resources and collection; no tag, publish or PR")
     args = parser.parse_args(argv)
+    # Runtime admission refuses group- or other-writable Node and agent artifacts, and every path the cut
+    # writes (venvs, pip and npm installs, the prepared Node prefix) is made by this process or a child that
+    # inherits its umask. Add 022 to the caller's mask for the whole run; a stricter mask is kept.
+    previous_umask = os.umask(0o022)
+    os.umask(previous_umask | 0o022)
+    try:
+        return _run(args)
+    finally:
+        os.umask(previous_umask)
+
+
+def _run(args: argparse.Namespace) -> int:
     from lu_machinery.common.repo_root import primary_root, project_interpreter
     from lu_machinery.dispatcher.git import resolve_repo
 

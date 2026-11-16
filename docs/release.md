@@ -102,8 +102,11 @@ command without `-I` and with `PYTHONPATH` set to a machinery `main` checkout.
 
 Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
 the command stops at that step and sends a Fleet alert to `claude-cto` that
-names the step. Its work directory (`~/.lu-release-cut-*`) is kept, holding
-`cut.log`, the built files, the wheelhouse and the npm cache. `cut` and
+names the step. The alert is published from `$PRIMARY`, so it reaches the
+primary checkout's Fleet plane. Its work directory (`~/.lu-release-cut-*`) is kept, holding
+`cut.log`, the built files, the wheelhouse and the npm cache. The command adds
+022 to the caller's umask for the whole run, so nothing it creates is group- or
+other-writable and Node admission accepts the prefix it provisions. `cut` and
 `post-release` require `--x-agent <agent>/<task-or-seat>`. The value is the
 `X-Agent` trailer on the adopt commit and the post-release commit. An empty
 or malformed value is refused, and there is no default. Examples:
