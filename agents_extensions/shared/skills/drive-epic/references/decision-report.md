@@ -50,11 +50,15 @@ Use it for a consequential design decision, when the operator asks for a second 
   ([review-merge-cleanup](review-merge-cleanup.md)) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
 - **Members:** live eligible routes only: Opus 5.5 via Claude, Sol 6.1 via Codex, Grok 4.7
-  via Cursor (`model-assignment.md`). AGY read-only dispatch runs inside the dispatcher's
-  bubblewrap boundary (C-3027) and is refused only on a host that cannot start it. Grok also
-  advises on Ukrainian language, culture and heritage questions, in the council and the
-  discussion only (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment). An
-  unavailable member is reported, never substituted, and the panel is then not called complete.
+  via Cursor (`model-assignment.md`). On Ukrainian language, culture and heritage questions,
+  Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment), and
+  Gemini 4 Hydrogen via AGY (`--agent agy --model gemini-4-hydrogen-medium`) joins as a fourth
+  member (operator order 2026-11-16). Both advise in the council and the discussion only, never
+  as review of record or designated approval. AGY read-only dispatch runs inside the
+  dispatcher's bubblewrap boundary (C-3027) and is refused only on a host that cannot start it;
+  Hydrogen is then unavailable, and an ACP seat on the agy route may join the discussion round
+  only. An unavailable member is reported, never substituted, and the panel is then not called
+  complete.
 - **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
