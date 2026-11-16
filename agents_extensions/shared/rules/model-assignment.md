@@ -10,7 +10,8 @@ It codes and reviews through Cursor: `dispatch.py dispatch --agent cursor --mode
 them by name and recorded verdicts still resolve. `dispatch.py` has no `grok` agent and rejects
 `--agent grok`. The native runtime supports coding, and the read-only canary attests `grok-4.7-build`.
 Grok holds no driver, Ukrainian, advisory, or high/critical final-signoff seat, and it does not
-review xAI-authored work. Cursor's approved pin is `grok-4.7-high`. `cursor:auto` is never a
+review xAI-authored work. Its one exception, council and discussion advice on Ukrainian
+questions, is the LANGUAGE-LANES RULE amendment (2026-11-16). Cursor's approved pin is `grok-4.7-high`. `cursor:auto` is never a
 formal-review identity. GROK-CANCEL-1110 (2026-11-10) is superseded for `grok-4.7` only.
 The resolver chooses an eligible, healthy Sol 6.1 first at low,
 medium and high risk; Sonnet is chosen at medium and low risk only when Sol is excluded (for example a
@@ -739,7 +740,7 @@ Typical live driver count (names rotate; count is the constraint):
    Recheck live health and headroom at that time before returning it to rotation.
 4. Verify delivery against **git/PR state**, not only task `no_deliverable` flags (#6426 class
    false negatives poison utilization metrics).
-5. Route Cursor coding and code/infra review to `--agent cursor --model grok-4.7-high` (C-5307). Do not send a driver, Ukrainian, or high/critical final-signoff task there.
+5. Route Cursor coding and code/infra review to `--agent cursor --model grok-4.7-high` (C-5307). Do not send a driver, Ukrainian (except a council or discussion question under the LANGUAGE-LANES RULE amendment), or high/critical final-signoff task there.
 
 **Before every dispatch / CF spend**, read live headroom (do not cache percentages into policy):
 
@@ -816,7 +817,7 @@ lane's current strengths/caveats live in the catalog, the per-task table, and th
 
 **LANGUAGE-LANES RULE (HARD, operator order 2026-09-27): “only claude, gpt and gemini should be invlved in ukrainina content. no other models allowed if it is about ukrainina lang. culture, heritage.” Every seat that authors Ukrainian language, culture, or heritage content routes ONLY to claude, codex (GPT), or agy (Gemini).** **Grok holds no language seat (C-5307); its former measurement exception has no route.** deepseek, glm, kimi, grok, cursor, pool, gemma, and every other model family stay excluded from every language seat (DeepSeek review-of-record needs measured evidence; Gemma is live for hramatka only through OpenCode and stays excluded from Ukrainian language seats). Standing carve-outs still bind on top: NO deepseek for folk (moot under this rule, kept for history), Ukrainian review uses the review-loop ukrainian seats, with no Claude seat. `dispatch.py` rejects `--agent grok`. The reviewer resolver does not admit Cursor Grok for Ukrainian work.
 
-**LANGUAGE-LANES RULE amendment (operator order 2026-11-16, C-5718):** Grok 4.7 may give advice on Ukrainian language, culture and heritage questions in councils and ACP discussions (`drive-epic` skill, `references/decision-report.md` § Council), so that its upstream gains Ukrainian data to improve on. That advice is not a seat: Grok still holds no language seat (no authoring, no review of record, no designated approval), and the reviewer resolver still does not admit it for Ukrainian review.
+**LANGUAGE-LANES RULE amendment (operator order 2026-11-16, C-5718):** Grok 4.7 may give advice on Ukrainian language, culture and heritage questions in councils and ACP discussions (`drive-epic` skill, `references/decision-report.md` § Council), so that its upstream gains Ukrainian data to improve on. This is the one narrow exception to every Grok exclusion in this file from Ukrainian tasks, advisory seats and advisor pools (the Grok paragraph at the top, the provider notes, the Cursor routing step and rows, and the Ukrainian advisor pool); those exclusions hold for every other purpose. That advice is not a seat: Grok still holds no language seat (no authoring, no review of record, no designated approval), and the reviewer resolver still does not admit it for Ukrainian review.
 
 **Sources MCP by dispatch mode (checked 2026-09-22).** A language review that names `mcp__sources__*` has to run in a mode that can call that server. Codex `read-only` keeps the filesystem sandbox and sets `mcp_servers.sources.default_tools_approval_mode="approve"`. Without that approval, `approval_policy=never` cancels the stdio call (`MCP tool call requires approval, but approval policy is never`) before the tool runs. Codex `workspace-write` and `danger` already pass `--dangerously-bypass-approvals-and-sandbox`; the dispatch worktree is the write boundary. The sources server marks every tool `readOnlyHint`, so Codex does not treat a lookup as a destructive approval. Claude `read-only` and `workspace-write` share one invocation and can call sources when the seat's MCP config includes the server. AGY `workspace-write` sees sources when the AGY catalog lists the server. AGY `read-only` runs inside the dispatcher's bubblewrap boundary (`lu_machinery/dispatcher/agy_sandbox.py`, C-3027), which provisions a private home whose only MCP server is a dispatcher-owned Sources relay: it forwards only the tools the server annotates read-only and counts completed calls for the task record. On a host where that boundary cannot start, dispatch refuses AGY read-only (`read_only_unenforceable`). A Codex plan that names `mcp__sources__*` and can neither approve nor bypass those calls fails before spawn.
 
