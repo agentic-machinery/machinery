@@ -24,14 +24,14 @@ notices them.
 - Releases run manually every twelve hours at 06:00 and 18:00 UTC when main has changed and its CI Gate is green; urgent hotfixes ship immediately. Review-contract canaries run once per release cut instead of blocking each PR. ([#621](https://github.com/learn-ukrainian/machinery/pull/621))
 - Release acceptance collects consumer tests against the candidate before publishing, and the release tags the release PR's merge commit after checking the changelog against that exact range. ([#613](https://github.com/learn-ukrainian/machinery/pull/613))
 - The four review-contract canary routes run concurrently, keeping their individual deadlines and waiting for every route to settle before cleanup. ([#624](https://github.com/learn-ukrainian/machinery/pull/624))
-- Worker delivery instructions document the own-PR review-budget check, queue check and closeout paths. ([#612](https://github.com/learn-ukrainian/machinery/pull/612), [#618](https://github.com/learn-ukrainian/machinery/pull/618))
+- Review rounds, including the first, run the recorder’s `budget-check` before dispatch and stop when it refuses. The write-boundary queue-check, closeout and budget-relay instructions added during this release were superseded by the removal of the write boundary for write workers. ([#612](https://github.com/learn-ukrainian/machinery/pull/612), [#618](https://github.com/learn-ukrainian/machinery/pull/618))
 
 ### Fixed
 
 - Dispatch admission waits up to 75 seconds for Monitor headroom readings during a restart before refusing, instead of stopping after 30 seconds. ([#611](https://github.com/learn-ukrainian/machinery/pull/611))
 - Read-only Cursor reviews can use the shell inside their sandbox and retain a private writable login profile so startup succeeds. ([#615](https://github.com/learn-ukrainian/machinery/pull/615))
 - Monitor UI: recent successful usage readings stay fresh when a balance key is missing; routing readings no longer become stale solely because their refresh timer expired or the task set changed. Failed probes and readings past their age limit remain stale. ([#617](https://github.com/learn-ukrainian/machinery/pull/617))
-- The sandbox broker wakes its accept loop during cleanup instead of waiting five seconds, and serves connections concurrently so a pending review wait does not hold other worker calls. ([#608](https://github.com/learn-ukrainian/machinery/pull/608), [#614](https://github.com/learn-ukrainian/machinery/pull/614))
+- The sandbox broker wakes its accept loop during cleanup instead of waiting five seconds, and serves connections concurrently. Read-only reviews retain this broker after the write boundary is removed for write workers. ([#608](https://github.com/learn-ukrainian/machinery/pull/608), [#614](https://github.com/learn-ukrainian/machinery/pull/614))
 - Review budgets count runs for the current pull request when several pull requests share a branch, while still counting unattributed runs on that branch. ([#627](https://github.com/learn-ukrainian/machinery/pull/627))
 - The 0.1.21 changelog now records the removal of the unused liveness probe. ([#610](https://github.com/learn-ukrainian/machinery/pull/610))
 
