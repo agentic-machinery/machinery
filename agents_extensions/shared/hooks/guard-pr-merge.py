@@ -1593,7 +1593,7 @@ _FOOTER = (
     "GitHub will merge a draft or a red PR without complaint — branch protection stops only\n"
     "what it was configured to require. That is the gap this hook covers. If the merge is genuinely intended, a human can\n"
     "run it directly, outside the agent harness.\n\n"
-    "Hook source: .claude/hooks/guard-pr-merge.py\n"
+    "Hook source: agents_extensions/shared/hooks/guard-pr-merge.py\n"
 )
 
 

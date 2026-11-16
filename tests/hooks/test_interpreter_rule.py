@@ -323,13 +323,17 @@ def test_deployed_guards_do_not_import_a_planted_stdlib_module(tmp_path: Path) -
 
 
 def test_deploy_inventory_uses_installed_hook_modules() -> None:
-    """Deployed guards import shared code from the wheel without a path loader (R72)."""
+    """Guards import shared code from the wheel without a path loader (R72), and no hook module is
+    copied into a consumer: a deployed copy is importable from the product tree, so a run could
+    resolve to it instead of the pinned release."""
     inventory = json.loads((machinery_root() / "agent_deploy/release.v1.json").read_text(encoding="utf-8"))
     assert "hooks/load_hook_package.py" not in inventory["files"]
     for name in ("shell_shlex.py", "shell_redirects.py", "tool_names.py"):
         record = inventory["files"]["hooks/" + name]
         assert record["owner"] == "fleet"
-        assert set(record["targets"]) == {"agy", "claude", "codex", "cursor"}
+    python_hooks = {name: record for name, record in inventory["files"].items()
+                    if name.startswith("hooks/") and name.endswith(".py")}
+    assert {name for name, record in python_hooks.items() if record["targets"]} == set()
 
 
 def test_deployed_probe_does_not_execute_a_worktree_venv_when_git_cannot_name_the_primary(tmp_path: Path) -> None:

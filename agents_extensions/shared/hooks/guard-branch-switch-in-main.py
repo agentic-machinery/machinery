@@ -742,7 +742,7 @@ def main() -> int:
             "  # ...edits, commits, push, PR...\n"
             "  # back in the main project dir:\n"
             "  git worktree remove .worktrees/<purpose>/<branch-name>\n\n"
-            "Hook source: .claude/hooks/guard-branch-switch-in-main.py\n"
+            "Hook source: agents_extensions/shared/hooks/guard-branch-switch-in-main.py\n"
         )
         return 2
 

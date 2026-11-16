@@ -757,7 +757,10 @@ def release_inventory():
 
 
 def release_hook():
-    """One release-owned Python hook the Claude provider deploys, from the packaged inventory."""
+    """One release-owned Python output the Claude provider deploys, from the packaged inventory.
+
+    Hook modules are not among them: they run from the installed release, never a deployed copy.
+    """
     return next(target for name, record in sorted(release_inventory()["files"].items()) if name.endswith(".py")
                 for target in record["targets"].get("claude", []))
 
