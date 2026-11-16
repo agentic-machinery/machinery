@@ -334,6 +334,7 @@ tests/ci/test_data_tier_in_place.py
 tests/ci/test_dependency_advisory_issue.py
 tests/ci/test_dispatch_xdist_cap.py
 tests/ci/test_flake_ledger.py
+tests/ci/test_gate.py
 tests/ci/test_gh_merge_queue_status.py
 tests/ci/test_junit_results.py
 tests/ci/test_opsec_fixtures.py

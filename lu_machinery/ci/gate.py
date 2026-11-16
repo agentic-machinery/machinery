@@ -13,6 +13,8 @@ from pathlib import Path
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMMON = frozenset({"secret-scan", "hydrate-release-assets", "checks", "dependency-audit", "pr-affected", "frontend"})
 FULL = frozenset({"refresh-pytest-durations", "pytest", "pytest-report"})
+# The product job that runs --pr-scope; the FULL jobs' PR conditions read its output.
+SCOPE = "pr-scope"
 
 
 def event_tier(event: str, payload: dict, sha: str, ref: str, actual: str) -> str:
@@ -60,6 +62,23 @@ def event_tier(event: str, payload: dict, sha: str, ref: str, actual: str) -> st
     raise ValueError("unsupported CI event")
 
 
+def pr_full_suite(payload: dict, actual: str) -> bool:
+    """Whether the PR selector reports "pytest infrastructure changed" for this candidate.
+
+    The selector then runs the guards only, so the PR runs the full-tier pytest jobs
+    and they are required. Like the selector, the diff starts at the tested merge's
+    first parent, never the event's base metadata.
+    """
+    from lu_machinery.ci.pr_affected_tests import changed_files, infrastructure_changed
+
+    parents = subprocess.run(
+        ["git", "show", "-s", "--format=%P", actual], capture_output=True, text=True, check=True, timeout=30
+    ).stdout.split()
+    if len(parents) != 2 or parents[1] != payload["pull_request"]["head"]["sha"]:
+        raise ValueError("PR merge candidate must have two parents and match event head")
+    return infrastructure_changed(changed_files(parents[0], actual))
+
+
 def main() -> int:
     if __package__ in (None, ""):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -73,15 +92,21 @@ def main() -> int:
             "Examples:\n"
             f"  .venv/bin/python -m {module_name(__spec__, __file__)}\n"
             f"  .venv/bin/python -m {module_name(__spec__, __file__)} --record-queue\n"
+            f"  .venv/bin/python -m {module_name(__spec__, __file__)} --pr-scope\n"
         "Inputs: EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_SHA, GITHUB_REF; NEEDS_JSON for aggregation.\n"
-        "Queue recording also needs QUEUE_RECORD, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT.\n"
-        "Outputs: job results and GITHUB_STEP_SUMMARY, or QUEUE_RECORD JSON; no network or Git writes.\n"
+        "Queue recording also needs QUEUE_RECORD, GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT; PR scope needs GITHUB_OUTPUT.\n"
+        "Outputs: job results and GITHUB_STEP_SUMMARY, QUEUE_RECORD JSON, or full-suite=true|false\n"
+        "in GITHUB_OUTPUT; no network or Git writes.\n"
         "Exit codes: 0 valid proof; 1 missing/invalid proof; 2 invalid arguments.\n"
             "Related: .github/workflows/ci.yml; docs/runbooks/ci-gate.md; OO-98."
         ),
     )
-    parser.add_argument("--record-queue", action="store_true", default=False,
-                        help="Write original queue identity to QUEUE_RECORD, e.g. queue-candidate.json; default: validate job results.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--record-queue", action="store_true", default=False,
+                      help="Write original queue identity to QUEUE_RECORD, e.g. queue-candidate.json; default: validate job results.")
+    mode.add_argument("--pr-scope", action="store_true", default=False,
+                      help="Append full-suite=true to GITHUB_OUTPUT when the PR changes pytest infrastructure, "
+                      "else full-suite=false; default: validate job results.")
     args = parser.parse_args()
     try:
         event = os.environ["EVENT_NAME"]
@@ -99,22 +124,36 @@ def main() -> int:
                 raise ValueError("invalid queue run identity")
             Path(os.environ["QUEUE_RECORD"]).write_text(json.dumps(record) + "\n", encoding="utf-8")
             return 0
+        if args.pr_scope:
+            if tier != "admission":
+                raise ValueError("PR scope requires a pull_request event")
+            decision = "true" if pr_full_suite(payload, actual) else "false"
+            with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as stream:
+                stream.write(f"full-suite={decision}\n")
+            print(f"full-suite={decision}")
+            return 0
         results = json.loads(os.environ["NEEDS_JSON"])
-        if set(results) != COMMON | FULL | {"queue-metadata-scan"}:
+        if set(results) != COMMON | FULL | {"queue-metadata-scan", SCOPE}:
             raise ValueError("missing or unexpected CI dependencies")
+        # A PR runs the affected tests instead of the shards, unless it changes pytest
+        # infrastructure: the selector then runs guards only, so the shards run and are
+        # required. The full tier runs both.
+        full_pr = tier == "admission" and pr_full_suite(payload, actual)
         failed = False
         for name, result in sorted(results.items()):
-            # A PR runs the affected tests instead of the shards; the full tier runs both.
-            expected = "success" if name in COMMON or (name in FULL and tier == "full") or (
+            expected = "success" if name in COMMON or (name in FULL and (tier == "full" or full_pr)) or (
                 name == "queue-metadata-scan" and event == "merge_group"
-            ) else "skipped"
+            ) or (name == SCOPE and tier == "admission") else "skipped"
             value = result.get("result")
             print(f"{name}: {value}, expected {expected}")
             if value != expected:
                 if value == "cancelled":
                     print(f"::error::required job was cancelled: {name}")
                 failed = True
-        summary = ("PR CI: affected tests, guards, repository invariants and Frontend ran on this head; "
+        summary = ("PR CI: pytest infrastructure changed, so the full pytest suite, guards, repository invariants "
+                   "and Frontend ran on this head. Full green merge-group CI is required before landing."
+                   if full_pr else
+                   "PR CI: affected tests, guards, repository invariants and Frontend ran on this head; "
                    "the full pytest suite was not run. Full green merge-group CI is required before landing."
                    if tier == "admission" else "Full supported pytest suite and partition audits are required.")
         print(summary)
