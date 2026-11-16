@@ -50,12 +50,14 @@ window; every coarser figure, and the `/metrics` copy with bounded labels, is a 
 scan of eight repositories 0.5 s, the aggregation 2.2 s (3.3 s before this layout). A warm request serves the
 stored snapshot in about 10 ms (7d, about 650 KB) to 20 ms (`all`, about 1.5 MB).
 
-The snapshot is refreshed off the event loop every 300 s while the route or `/metrics` is read. A request that
-finds no snapshot (a Monitor that just started) joins that single flight and is answered as soon as it finishes,
-waiting at most 15 s; only past that does it answer `pending` with `Retry-After: 1`, and the page asks again
-after that many seconds. Measured end to end on the same store, a cold request got its data after 2.5 s (5.2 s
-before, when it answered `pending` with `Retry-After: 5` and the page polled every 5 s). A failed collect answers
-503 and the page shows it; it never polls a failure.
+The snapshot is refreshed off the event loop every 300 s while the route or `/metrics` is read. That refresh is
+a TTL read of the shared single flight, never a forced one, so a refresh that runs after another caller stored a
+snapshot finds it fresh and collects nothing. A request that finds no snapshot (a Monitor that just started)
+starts or joins the flight itself, schedules no background refresh beside it, and is answered as soon as the
+collect finishes, waiting at most 15 s; only when that wait expires does it answer `pending` with
+`Retry-After: 1`, and the page asks again after that many seconds. Measured end to end on the same store, a cold request got its data after 2.5 s (5.2 s
+before, when it answered `pending` with `Retry-After: 5` and the page polled every 5 s). A failed collect, whatever
+it raised (a timeout inside the collect included), answers 503 and the page shows it; it never polls a failure.
 
 ## Definitions
 

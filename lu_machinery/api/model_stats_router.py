@@ -20,9 +20,11 @@ model, effort, class, pool and repository labels leave this module: no prompt, b
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import subprocess
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -43,7 +45,7 @@ from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
-from .state_helpers import cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
+from .state_helpers import cache_get_or_compute, cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key
 
 SCHEMA_VERSION = "model-stats.v2"
 REFRESH_SECONDS = 300.0
@@ -637,12 +639,41 @@ def _compute(ctx: MonitorContext) -> Callable[[], dict[str, Any]]:
     return lambda: collect(ctx.roots.batch_state_dir, ctx.roots.live_repo_root)
 
 
+_log = logging.getLogger(__name__)
+_refreshing: set[str] = set()
+_refreshing_lock = threading.Lock()
+
+
+def _refresh_off_loop(key: str, compute: Callable[[], dict[str, Any]]) -> None:
+    """Start at most one background refresh per key, through the shared single flight.
+
+    The refresh is a TTL read, never a forced one: whichever caller starts the collect, a refresh that runs after
+    that collect stored its snapshot finds it fresh and collects nothing (the helper stores the value before it
+    releases the flight, so a caller sees either the running flight or the stored snapshot).
+    """
+    with _refreshing_lock:
+        if key in _refreshing:
+            return
+        _refreshing.add(key)
+
+    def run() -> None:
+        try:
+            cache_get_or_compute(key, REFRESH_SECONDS, compute)
+        except Exception:  # a failed collect leaves the previous snapshot; the next read schedules another
+            _log.debug("model-stats refresh failed", exc_info=True)
+        finally:
+            with _refreshing_lock:
+                _refreshing.discard(key)
+
+    threading.Thread(target=run, name="model-stats-refresh", daemon=True).start()
+
+
 def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
-    """The stored snapshot and its age; schedules the single-flight refresh when absent or older than 300 s."""
+    """The stored snapshot and its age; starts the single-flight refresh when absent or older than 300 s."""
     key = _cache_key(ctx)
     stored = cache_get_stored(key)
     if stored is None or stored[1] >= REFRESH_SECONDS:
-        schedule_cache_refresh(key, REFRESH_SECONDS, _compute(ctx))
+        _refresh_off_loop(key, _compute(ctx))
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
@@ -653,25 +684,31 @@ async def model_stats(
 ) -> JSONResponse:
     """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
 
-    With no snapshot yet (a fresh Monitor), the request joins that flight for up to ``COLD_WAIT_SECONDS`` and is
-    answered as soon as it finishes, so the first page load waits for the collect itself, never a poll interval.
+    With no snapshot yet (a fresh Monitor), the request itself starts or joins that flight (and schedules no
+    background refresh beside it), waits for it up to ``COLD_WAIT_SECONDS`` and is answered as soon as it finishes,
+    so the first page load waits for the collect itself, never a poll interval.
     """
-    stored = cached_snapshot(ctx)
+    key = _cache_key(ctx)
+    stored = cache_get_stored(key)
+    if stored is not None and stored[1] >= REFRESH_SECONDS:
+        _refresh_off_loop(key, _compute(ctx))
     if stored is None:
-        try:
-            computed = await asyncio.wait_for(
-                cache_get_or_compute_async(_cache_key(ctx), REFRESH_SECONDS, _compute(ctx)), COLD_WAIT_SECONDS)
-        except TimeoutError:  # the flight keeps running; the page asks again
+        flight = asyncio.ensure_future(cache_get_or_compute_async(key, REFRESH_SECONDS, _compute(ctx)))
+        done, _ = await asyncio.wait({flight}, timeout=COLD_WAIT_SECONDS)
+        if not done:  # only the wait expired: the shared flight keeps running and the page asks again
+            flight.cancel()
             return JSONResponse({"status": "pending", "schema_version": SCHEMA_VERSION},
                                 headers={**snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True),
                                          "Retry-After": "1"})
-        except Exception as exc:  # a failed collect is reported, never retried in a loop by the page
+        try:
+            computed = flight.result()
+        except Exception as exc:  # the collect itself failed (any type): reported, never polled by the page
             return JSONResponse({"status": "unavailable", "schema_version": SCHEMA_VERSION,
                                  "error": type(exc).__name__}, status_code=503,
                                 headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
         stored = (computed, 0.0)
-    snapshot, age = stored
-    body = {key: value for key, value in snapshot.items() if key not in ("windows", "metrics")}
+    snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
+    body = {name: value for name, value in snapshot.items() if name not in ("windows", "metrics")}
     return JSONResponse({**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)},
                         headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
 

@@ -442,16 +442,32 @@ def test_aliases_map_to_the_model_they_ran_only_when_unambiguous(tmp_path):
 
 def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypatch):
     """Defect class: a fresh Monitor answering pending so the page waits a fixed poll interval although the collect
-    finishes sooner, a second collect for one cold start, or a slow collect holding the request without bound."""
-    release, calls = threading.Event(), []
+    finishes sooner; a second collect for one cold start (a background refresh that runs after the cold request's
+    collect stored its snapshot); a slow collect holding the request without bound; or a failed collect, even one
+    that raises TimeoutError itself, answered as pending so the page keeps polling a failure."""
+    release, background, calls, failures = threading.Event(), threading.Event(), [], []
 
     def fake_collect(*_args, **_kwargs):
         calls.append(1)
+        if failures:
+            raise failures.pop()
         if len(calls) == 2:
             release.wait(10)
         return {"schema_version": stats.SCHEMA_VERSION, "windows": {"7d": {"records": len(calls)}}, "metrics": {}}
 
+    real_refresh = stats.cache_get_or_compute
+
+    def late_refresh(*args, **kwargs):  # the background refresh thread runs only once the test lets it
+        background.wait(10)
+        return real_refresh(*args, **kwargs)
+
+    def settled() -> None:
+        deadline = time.monotonic() + 5
+        while stats._refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+
     monkeypatch.setattr(stats, "collect", fake_collect)
+    monkeypatch.setattr(stats, "cache_get_or_compute", late_refresh)
     ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=tmp_path,
                                                 live_repo_root=tmp_path))
     app = FastAPI()
@@ -459,8 +475,12 @@ def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypa
     app.dependency_overrides[get_ctx] = lambda: ctx
     try:
         with TestClient(app) as client:
+            assert stats.cached_snapshot(ctx) is None  # a /metrics scrape first: its refresh thread waits
             cold = client.get("/model-stats")
             assert cold.json()["status"] == "ok" and cold.json()["records"] == 1 and calls == [1]
+            background.set()
+            settled()
+            assert calls == [1]  # the late background refresh found the stored snapshot fresh
 
             cache_invalidate(str(tmp_path.resolve()))
             monkeypatch.setattr(stats, "COLD_WAIT_SECONDS", 0.05)
@@ -471,6 +491,17 @@ def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypa
             while (body := client.get("/model-stats").json())["status"] != "ok" and time.monotonic() < deadline:
                 time.sleep(0.02)
             assert body["records"] == 2 and calls == [1, 1]
+            settled()
+
+            cache_invalidate(str(tmp_path.resolve()))
+            monkeypatch.setattr(stats, "COLD_WAIT_SECONDS", 5.0)
+            failures.append(TimeoutError("the collect itself timed out"))
+            failed = client.get("/model-stats")
+            assert failed.status_code == 503 and "Retry-After" not in failed.headers
+            assert failed.json()["status"] == "unavailable" and failed.json()["error"] == "TimeoutError"
+            assert calls == [1, 1, 1]
+            settled()
     finally:
         release.set()
+        background.set()
         cache_invalidate(str(tmp_path.resolve()))
