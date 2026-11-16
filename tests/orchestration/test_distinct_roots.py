@@ -501,11 +501,19 @@ def test_unset_configuration_keeps_todays_systemd_exec_start() -> None:
     unit = _unit_lines()
     assert unit["ExecStart"] == [
         "%h/projects/learn-ukrainian/.venv/bin/python -c 'import os,sys; from importlib.resources import files; "
-        'os.execvp("bash", ["bash", str(files("lu_machinery.orchestration")'
+        'os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration")'
         '.joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])\''
     ]
     assert unit["WorkingDirectory"] == ["%h/projects/learn-ukrainian"]
     assert unit["EnvironmentFile"] == ["-%h/.config/learn-ukrainian/machinery.env"]
+    assert [
+        line
+        for line in unit["Environment"]
+        if line.startswith(("LU_PRODUCT_ROOT=", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="))
+    ] == [
+        "LU_PRODUCT_ROOT=%h/projects/learn-ukrainian",
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=%h/projects/learn-ukrainian",
+    ]
 
 
 def test_machinery_path_refuses_absolute_traversal_and_escaping_symlink_inputs(monkeypatch, tmp_path: Path) -> None:

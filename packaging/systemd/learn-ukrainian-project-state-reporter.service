@@ -6,13 +6,15 @@ After=network.target
 Type=oneshot
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=LU_PRODUCT_ROOT=%h/projects/learn-ukrainian
-# Machinery roots (scripts/common/repo_root.py): LEARN_UKRAINIAN_PRIMARY_REPO_ROOT,
+Environment=LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=%h/projects/learn-ukrainian
+# Machinery roots (lu_machinery.common.repo_root): LEARN_UKRAINIAN_PRIMARY_REPO_ROOT,
 # LEARN_UKRAINIAN_GITHUB_SLUG, LEARN_UKRAINIAN_STATE_ROOT and
 # LEARN_UKRAINIAN_PYTHON. The wrapper and the reporter read them from this optional file;
-# LU_PRODUCT_ROOT defaults to WorkingDirectory and can be overridden in that file.
+# LU_PRODUCT_ROOT and LEARN_UKRAINIAN_PRIMARY_REPO_ROOT default to WorkingDirectory and can be
+# overridden in that file.
 EnvironmentFile=-%h/.config/learn-ukrainian/machinery.env
 # The wrapper is the installed package resource, not a path under WorkingDirectory.
-ExecStart=%h/projects/learn-ukrainian/.venv/bin/python -c 'import os,sys; from importlib.resources import files; os.execvp("bash", ["bash", str(files("lu_machinery.orchestration").joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])'
+ExecStart=%h/projects/learn-ukrainian/.venv/bin/python -c 'import os,sys; from importlib.resources import files; os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration").joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])'
 WorkingDirectory=%h/projects/learn-ukrainian
 
 [Install]
