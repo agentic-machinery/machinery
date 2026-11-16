@@ -104,7 +104,9 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   fourth head, and council consensus never clears a recorded rejection. `review-loop` keeps the
   single exact-head review of record, so the panel adds no second review path. Designated
   approval and `full-send` are unchanged.
-  Before a panel round, bring the head up to date as `review-loop` step 0 says.
+  Before a panel round, bring the head up to date as `review-loop` step 0 says, except for
+  the council after round 2: it reads the unchanged second head and the open ledger before
+  any fix, and step 0 then applies to the third head's review of record.
 
 Learned from t3dotgg/tstack's `council` skill (MIT, Theo Browne), including its 2026-11-11
 rules on acting on each delegate's result (commit 11e37a74); the text is our own.
