@@ -272,6 +272,8 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
     monkeypatch.setenv("DISPATCH_ADMISSION_ENV_FILE", "")
     monkeypatch.delenv("DISPATCH_DISK_REFUSE_USED_PERCENT", raising=False)
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(used=GIB, free=1000 * GIB))
+    (tmp_path / "wheelhouse").mkdir()
+    monkeypatch.setenv(canary.WHEELHOUSE_ENV, str(tmp_path / "wheelhouse"))
     return home
 
 
@@ -300,6 +302,8 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "git clone" not in output and "fetch --quiet --no-tags --depth 1 " in output
     assert output.index("mksquashfs") < output.index("/source (the image holds") < output.index("snapfuse")
     assert "dispatch admission's disk refuse level" in output
+    # lu-machinery is on no package index: the host wheelhouse supplies it, the lock's hashes pick the bytes.
+    assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
     assert "--codex-account b-sub" in output and "--claude-account b" in output
     assert "--codex-account a" not in output
     assert "--require-hashes" in output and "contract-canary.pth" in output
@@ -310,6 +314,14 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert list(runner_roots.iterdir()) == []
     assert canary.main(["run", "--head", "a" * 40]) == 2
     assert "outside a dispatched worker" in capsys.readouterr().err
+    monkeypatch.setenv(canary.WHEELHOUSE_ENV, "relative/wheelhouse")
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 2
+    assert "must be the absolute path of an existing wheelhouse" in capsys.readouterr().err
+    monkeypatch.delenv(canary.WHEELHOUSE_ENV)
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "--only-binary=:all: -r " in output and f"{canary.WHEELHOUSE_ENV} is unset" in output
+    assert list(runner_roots.iterdir()) == []
 
 
 @pytest.mark.parametrize("failure", [

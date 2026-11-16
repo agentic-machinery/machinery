@@ -75,6 +75,7 @@ CONTRACT_PATHS: tuple[str, ...] = (
 REASON = "needs-contract-canary"
 SCHEMA = "review-contract-canary.v1"
 RECEIPT_DIR = "review-contract-canary"
+WHEELHOUSE_ENV = "LU_MACHINERY_WHEELHOUSE"  # the name product CI and the dependency audit use
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 ROUTE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 
@@ -370,12 +371,15 @@ def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bo
 
 def _run_steps(
     work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
-    hard_timeout: int, env: Mapping[str, str],
+    hard_timeout: int, env: Mapping[str, str], wheelhouse: str,
 ) -> tuple[list[list[str]], list[tuple[str, list[str]]], list[str]]:
     """Build the exact argv plan without creating files, units, mounts or tasks.
 
     The checkout holds only the candidate commit (a depth-1 fetch, never the repository's
-    history), and ``run`` removes it once the image is built.
+    history), and ``run`` removes it once the image is built. The locked ``lu-machinery`` wheel
+    a consumer lock pins is on no package index, so with a wheelhouse the consumer venv also
+    finds wheels there; the lock's hashes still decide which bytes install. A machinery lock
+    pins only dependencies and needs none.
     """
     clone, mount = work / "source", work / "mount"
     python = str(work / "consumer/bin/python")
@@ -391,7 +395,8 @@ def _run_steps(
         ["snapfuse", str(work / "candidate.squashfs"), str(mount), "-o", "ro"],
         [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
         [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
-         "--require-hashes", "--only-binary=:all:", "-r", str(mount / "requirements-machinery.lock")],
+         "--require-hashes", "--only-binary=:all:", *(["--find-links", wheelhouse] if wheelhouse else []),
+         "-r", str(mount / "requirements-machinery.lock")],
         [python, "-I", "-c", "import pathlib, sys, sysconfig; pathlib.Path(sysconfig.get_path('purelib'), 'contract-canary.pth').write_text(sys.argv[1] + '\\n')",
          str(mount)],
         [python, "-I", "-B", "-c", "from lu_machinery.dispatcher.worker import _dispatcher_code; import sys; c = _dispatcher_code(); assert c['head'] == sys.argv[1] and c['clean'] and c['read_only'], c", head],
@@ -493,6 +498,9 @@ def run(args: argparse.Namespace) -> int:
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
     interpreter = project_interpreter()
+    wheelhouse = os.environ.get(WHEELHOUSE_ENV, "")
+    if wheelhouse and not (os.path.isabs(wheelhouse) and os.path.isdir(wheelhouse)):
+        raise CanaryError(f"{WHEELHOUSE_ENV} must be the absolute path of an existing wheelhouse directory")
     if args.dry_run:
         work = Path.home() / ".lu-contract-canary-DRY-RUN"
     elif refused := _space_refusal(Path.home(), source, env):
@@ -501,6 +509,7 @@ def run(args: argparse.Namespace) -> int:
         work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
     setup, route_commands, unmount = _run_steps(
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
+        wheelhouse,
     )
     # Force a full score even if this head's changed files do not touch the contract.
     # Isolated host imports select the installed gate used by the keeper, not the candidate.
@@ -510,6 +519,8 @@ def run(args: argparse.Namespace) -> int:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
         print(f"refuse unless {Path.home()} has room for about twice the registered checkout's tree plus "
               f"{_VENV_ALLOWANCE // 2**20} MiB below the dispatch admission's disk refuse level")
+        if not wheelhouse:
+            print(f"{WHEELHOUSE_ENV} is unset: no --find-links, so a lock that pins lu-machinery cannot install")
         print(f"mkdir {work / 'mount'} (temporary directory under home; fusermount refuses /var/tmp)")
         for command in setup:
             print(shlex.join(command))
@@ -603,14 +614,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = sub.add_parser(
         "run", help="Build, run, record and score the sealed-checkout canary on the host",
         description="Orchestrate the four-route review-contract canary at an exact head.\n"
-        "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.",
+        "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.\n"
+        f"{WHEELHOUSE_ENV}, when set, is an absolute wheelhouse path pip also searches (needed when the\n"
+        "candidate lock pins lu-machinery itself). A run refuses before creating\n"
+        "anything when its estimated disk need would reach the dispatch admission's disk refuse level.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-        "  .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"
+        f"  {WHEELHOUSE_ENV}=<wheelhouse> .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"
         "  .venv/bin/python -m lu_machinery.review.contract_canary run --head <40-hex-sha> --dry-run\n"
-        "Outputs: temporary SquashFS/venv under home; live read-only tasks and shared canary receipts.\n"
+        "Outputs: temporary SquashFS/venv under home (the depth-1 checkout is removed once the image is built);\n"
+        "live read-only tasks and shared canary receipts.\n"
         "The mount and temporary directory are removed; failed unmount retains the directory for recovery.\n"
-        "Exit codes: 0 all routes and check pass, or dry-run plan; 1 route/check failure; 2 setup/cleanup failure.\n"
+        "Exit codes: 0 all routes and check pass, or dry-run plan; 1 route/check failure;\n"
+        "2 invalid input, too little disk, setup or cleanup failure.\n"
         "Related: docs/runbooks/write-worker-boundary.md#review-contract-canary.",
     )
     runner.add_argument("--repo", default="machinery", help="Fleet registry key holding the candidate code (default: machinery)")

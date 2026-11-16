@@ -240,7 +240,7 @@ regardless of which paths changed. Contract-path PRs do not need per-PR
 canary receipts:
 
 ```bash
-.venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha>
+LU_MACHINERY_WHEELHOUSE=<host-wheelhouse> .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha>
 # Inspect the complete command plan from a worker or host:
 .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --head <40-hex-release-candidate-sha> --dry-run
 ```
@@ -248,20 +248,32 @@ canary receipts:
 The host needs the existing provider credentials and account bindings, a working
 systemd user bus, `git`, `mksquashfs`, `snapfuse` and `fusermount3` (or
 `fusermount`). Use the configured project interpreter and primary/product roots.
-The command does not install host tools or change host configuration.
+Set `LU_MACHINERY_WHEELHOUSE` to the host wheelhouse's absolute path when the
+candidate's lock pins `lu-machinery` itself (a consumer lock); a machinery lock
+pins only dependencies and installs without it. The command does not install
+host tools or change host configuration.
+
+Before creating anything, the runner estimates its disk need as twice the
+registered checkout's tree plus 512 MiB. It refuses when that need would take the
+home file system to the dispatch admission's disk refuse level (90% by
+default), because every dispatch on the host would then be refused. A product
+tree of about 750 MB peaks near 1.3 GiB while the image is built.
 
 The runner uses the supplied head (or resolves a PR head once with `--pr`),
-clones the registered repository, fetches and checks out that exact commit, and builds a SquashFS image. It also fetches
-the candidate object into the registered primary's Git object store so the
+fetches only that exact commit (depth 1) into a new checkout, and builds a SquashFS
+image. It removes the checkout once the image exists. It also fetches
+the candidate object from GitHub into the registered primary's Git object store so the
 existing dispatcher can create its pinned review worktrees there. It mounts
 the image read-only beneath the home directory, where fusermount permits
 unmounting, and creates a disposable venv with the candidate's hash-locked
-`requirements-machinery.lock` dependencies. A `.pth` file names the mount;
+`requirements-machinery.lock` dependencies. A locked `lu-machinery` wheel is on
+no package index, so with a wheelhouse set pip also finds wheels there; the lock's
+hashes decide which bytes install. A `.pth` file names the mount;
 `lu-machinery` itself is loaded from the sealed checkout. Before spending any
 provider calls it checks the candidate dispatcher's head, clean bytes and
 read-only mount attestation.
 
-Each route runs sequentially in a `systemd-run --user` unit with explicit
+All routes run at once, each in its own `systemd-run --user` unit with explicit
 `PATH`, primary/product roots and configured state/interpreter context. The
 candidate's `dispatcher.cli.main` dispatches a read-only, receipt-bound task
 pinned to the same commit, waits for its terminal status and records its
@@ -288,7 +300,8 @@ and candidate head in the release's Acceptance section; a failing route or an
 incomplete receipt check blocks the release.
 
 Exit 0 means all routes and the existing receipt check passed. Exit 1 names a
-route/check failure; exit 2 means invalid input, setup or cleanup failed.
+route/check failure; exit 2 means invalid input, too little disk, or a setup or
+cleanup failure.
 `--dry-run` prints the same argv plan and exits 0 without creating an image,
 venv, mount, unit, task or receipt; it supplies no live canary proof. Resolving
 `--pr` still performs a read-only GitHub query; `--head` avoids that query.
