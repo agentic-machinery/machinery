@@ -1,6 +1,7 @@
 """Merge rescue of a write task whose remote branch was deleted after its pull request merged (machinery #118)."""
 
 import json
+import os
 import subprocess
 from contextlib import contextmanager
 from functools import partial
@@ -278,8 +279,10 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     The recorded base was a parent branch (``origin/claude/stacked-base``) while GitHub merged
     the pull request into the default branch and both refs were then deleted. Lookup stayed
     ``no_match`` because the base names differed, and the rescue walk fetched the deleted
-    base ref. The shape is the cto-9069-handoffreq2-opus and cto-9069-packet5-opus records:
-    commits ahead, a clean tree, ``push_state`` unpushed, ``remote_branch_missing``.
+    base ref. The default branch also moved on its own, so a depth-limited fetch of the
+    squash commit left its parent as a shallow boundary and ``merge-base`` failed. The shape
+    is the cto-9069-handoffreq2-opus and cto-9069-packet5-opus records: commits ahead, a
+    clean tree, ``push_state`` unpushed, ``remote_branch_missing``.
     """
     remote, work = tmp_path / "remote.git", tmp_path / "work"
     parent, branch = "claude/stacked-base", "claude/rescue-stacked"
@@ -288,7 +291,11 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     _git(tmp_path, "clone", str(remote), str(work))
     for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
         _git(work, "config", key, value)
-    _git(work, "commit", "--allow-empty", "-m", "base")
+    # Older than the ownership walk's one-day shallow window, so the rescue fetch stays shallow
+    # until it has the squash commit. A depth limit then hides the shared ancestor.
+    old = {**os.environ, "GIT_AUTHOR_DATE": "2026-10-01T00:00:00+00:00",
+           "GIT_COMMITTER_DATE": "2026-10-01T00:00:00+00:00"}
+    subprocess.run(["git", "-C", str(work), "commit", "--allow-empty", "-m", "root"], check=True, env=old)
     _git(work, "push", "origin", "main")
     _git(work, "switch", "-c", parent)
     (work / "parent.md").write_text("parent\n")
@@ -296,6 +303,12 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     _git(work, "commit", "-m", "parent")
     start = _git(work, "rev-parse", "HEAD")
     _git(work, "push", "origin", parent)
+    _git(work, "switch", "main")
+    (work / "main.md").write_text("advanced\n")
+    _git(work, "add", "main.md")
+    _git(work, "commit", "-m", "main moved")
+    _git(work, "push", "origin", "main")
+    _git(work, "switch", parent)
     _git(work, "switch", "-c", branch)
     (work / "docs").mkdir()
     (work / "docs" / "owned.md").write_text("delivered\n")

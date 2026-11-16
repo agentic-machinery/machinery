@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from datetime import datetime
 from functools import partial
@@ -1018,14 +1018,16 @@ def _remote_default_branch(record: dict) -> str:
     raise ValueError("remote default branch is not advertised")
 
 
-def _fetch_merged_parent(run, merge: str) -> str:
-    """The first parent of ``merge``, fetched by id from the same remote the walk uses.
+def _fetch_merged_parent(run: Callable[..., str], merge: str) -> str:
+    """The first parent of ``merge``, with the ancestry ``merge-base`` needs.
 
-    A squash onto the default branch is not contained in the recorded base commit, and a
-    ``--depth`` fetch into an already-complete repository would cut history back to shallow.
+    A depth-limited fetch records that parent as a shallow boundary, and it cuts a
+    complete repository back to shallow. ``merge-base`` with the task head then fails
+    when the default branch has moved on its own, and a merged delivery is refused.
+    A shallow repository is unshallowed; a complete one stays complete.
     """
-    depth = ("--depth=2",) if run("rev-parse", "--is-shallow-repository") == "true" else ()
-    run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *depth, "--", "origin", merge,
+    shallow = ("--unshallow",) if run("rev-parse", "--is-shallow-repository") == "true" else ()
+    run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *shallow, "--", "origin", merge,
         timeout=VERIFICATION_FETCH_TIMEOUT)
     return run("rev-parse", "--verify", merge + "^1")
 
