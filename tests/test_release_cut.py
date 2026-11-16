@@ -428,3 +428,93 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
     assert Path(toplevel).resolve() == primary.resolve()
     assert "channel publish cto - --sender release-cut --source release --recipient claude-cto" in argv
     assert body.startswith("release-cut FAILED (dry run) at Node provisioning: Unsafe Node dependency artifact")
+
+
+def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeypatch, tmp_path):
+    """Defect class: finished cuts accumulate scratch, or failed cuts lose diagnostic files."""
+    removed = {"accept", "product", "npm-cache", "build-venv", "agent-consumer", "src", "src.tar", "home", "tmp"}
+    kept = {"cut.log", "dist", "wheelhouse", "notes-prerelease.md", "notes-release.md",
+            "adopt-body.md", "post-release-body.md", "markers.log", "published"}
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("untouched")
+    outside.chmod(0o555)
+    for scenario in ("success", "acceptance failure", "post-release failure", "interrupted", "dry run"):
+        work = tmp_path / scenario
+        work.mkdir()
+        for name in kept | removed:
+            path = work / name
+            if name in {"dist", "wheelhouse", "published"} or name in removed - {"src.tar"}:
+                leaf = path / "nested"
+                leaf.mkdir(parents=True)
+                (leaf / "payload").write_text(name)
+                (leaf / "outside-link").symlink_to(outside, target_is_directory=True)
+                if name in removed:
+                    leaf.chmod(0o555)
+                    path.chmod(0o555)
+            else:
+                path.write_text(name)
+        sums, lock = work / "dist/SHA256SUMS", work / "wheelhouse/consumer.lock"
+        sums.write_text("checksums\n")
+        lock.write_text("consumer lock\n")
+        cut = Cut(work=work, dry_run=scenario == "dry run", machinery_remote="", product_remote="",
+                  machinery_repo=REPO, product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python",
+                  primary=tmp_path, alert=False, x_agent="codex/cto-45ff-cutclean-sol")
+        monkeypatch.setattr(cut, "preflight", lambda: (decide(), TITLES, "0.1.22"))
+        monkeypatch.setattr(cut, "build", lambda *_: {"sums": sums})
+        monkeypatch.setattr(cut, "wheelhouse", lambda *_: lock)
+        monkeypatch.setattr(cut, "install", lambda *_: work / "accept/bin/python")
+        monkeypatch.setattr(cut, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 0, "", ""))
+        for step in ("publish", "open_adopt_pr", "node_refusals", "node_isolation", "resources", "alert_cto", "promote"):
+            monkeypatch.setattr(cut, step, lambda *_a: None)
+        monkeypatch.setattr(cut, "node_provision", lambda *_: {
+            "prefix": str(work / "accept/node"), "node_version": "22", "npm_version": "10"})
+        monkeypatch.setattr(cut, "consumer_collection", lambda *_: "1 test collected")
+        monkeypatch.setattr(cut, "contract_canary", lambda: subprocess.CompletedProcess([], 0, "code: PASS", ""))
+        monkeypatch.setattr(cut, "post_release", lambda *_: 1)
+
+        def fail(*_):
+            raise CutError("fixture failure")
+
+        def interrupt(*_):
+            raise KeyboardInterrupt
+
+        if scenario == "acceptance failure":
+            monkeypatch.setattr(cut, "resources", fail)
+        elif scenario == "post-release failure":
+            monkeypatch.setattr(cut, "post_release", fail)
+        elif scenario == "interrupted":
+            monkeypatch.setattr(cut, "resources", interrupt)
+        if "failure" in scenario:
+            with pytest.raises(CutError, match="fixture failure"):
+                release_cut.execute(cut)
+        elif scenario == "interrupted":
+            with pytest.raises(KeyboardInterrupt):
+                release_cut.execute(cut)
+        else:
+            assert release_cut.execute(cut) == 0
+        expected = kept if scenario == "success" else kept | removed
+        if scenario == "dry run":
+            expected |= {"notes-dry-run.md"}
+        assert {path.name for path in work.iterdir()} == expected
+        assert sentinel.read_text() == "untouched"
+        assert outside.stat().st_mode & 0o777 == 0o555
+        if scenario == "success":
+            (work / "unlisted").write_text("retained")
+            cut.remove_rebuildable_scratch()
+            assert (work / "unlisted").read_text() == "retained"
+        else:
+            for name in removed - {"src.tar"}:
+                assert (work / name / "nested/payload").read_text() == name
+
+    boundary = tmp_path / "boundary"
+    boundary.mkdir()
+    (boundary / "accept").write_text("retain on refusal")
+    (boundary / "product").symlink_to(outside, target_is_directory=True)
+    cut.work = boundary
+    with pytest.raises(CutError, match="outside the work directory"):
+        cut.remove_rebuildable_scratch()
+    assert (boundary / "accept").read_text() == "retain on refusal"
+    assert sentinel.read_text() == "untouched"
+    assert outside.stat().st_mode & 0o777 == 0o555
