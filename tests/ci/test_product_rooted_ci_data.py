@@ -301,8 +301,8 @@ def test_deleted_product_data_never_uses_wheel_defaults(
     assert diagnostic in result.stdout + result.stderr
 
 
-def test_lock_only_diff_selects_machinery_consumers(tmp_path: Path, installed: tuple[Path, Path]) -> None:
-    """Defect class: a machinery lock bump selects no test that imports the installed package."""
+def test_lock_only_diff_requires_full_suite(tmp_path: Path, installed: tuple[Path, Path]) -> None:
+    """Defect class: a machinery lock bump misses consumers of packaged data in PR CI."""
     python, _wheel = installed
     consumer = "from lu_machinery.ci import gate\n\ndef test_ok():\n    assert gate\n"
     root, env = _product(tmp_path, "alpha", extra={
@@ -318,8 +318,17 @@ def test_lock_only_diff_selects_machinery_consumers(tmp_path: Path, installed: t
     assert result.returncode == 0, result.stderr
     selected = json.loads(result.stdout)
     assert selected["changed_test_files"] == []
-    assert selected["importing_test_files"] == ["tests/test_beta.py"]
-    assert "tests/test_beta.py" in selected["run_files"]
+    assert selected["importing_test_files"] == []
+    assert selected["reason"] == "pytest infrastructure changed"
+    event = Path(env["GITHUB_EVENT_PATH"])
+    payload = json.loads(event.read_text())
+    payload["pull_request"]["head"]["sha"] = _git(root, "rev-parse", "lock")
+    event.write_text(json.dumps(payload))
+    env["GITHUB_SHA"] = _git(root, "rev-parse", "HEAD")
+    scope = _run(python, root, {**env, "GITHUB_OUTPUT": str(tmp_path / "scope-output")},
+                 "-m", "lu_machinery.ci.gate", "--pr-scope")
+    assert scope.returncode == 0, scope.stderr
+    assert scope.stdout == "full-suite=true\n"
 
 
 def test_lu12914_f1_guard_list_names_the_stub_provider_dispatcher_module() -> None:
@@ -336,19 +345,22 @@ def test_lu12914_f1_guard_list_names_the_stub_provider_dispatcher_module() -> No
     assert "tests/dispatcher/test_task_store_records.py" in text.splitlines()
 
 
-def test_lock_only_diff_fails_closed_without_the_distribution(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defect class: an absent lu-machinery distribution escapes as an uncaught PackageNotFoundError."""
+def test_lock_only_diff_needs_no_distribution_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: lock classification unnecessarily depends on distribution metadata."""
+    import importlib.metadata
     from importlib.metadata import PackageNotFoundError
 
-    from lu_machinery.ci import components, pr_affected_tests as affected
+    from lu_machinery.ci import components
+    from lu_machinery.ci import pr_affected_tests as affected
 
     def absent(_name: str) -> None:
         raise PackageNotFoundError(_name)
 
     monkeypatch.setattr(components, "python_sources", dict)
-    monkeypatch.setattr(affected, "files", absent)
-    with pytest.raises(ValueError, match="lu-machinery distribution is not installed"):
-        affected.importing_tests({"requirements-machinery.lock"}, set(), "HEAD", {})
+    monkeypatch.setattr(components, "tracked_paths", list)
+    monkeypatch.setattr(importlib.metadata, "files", absent)
+    assert affected.infrastructure_changed(["requirements-machinery.lock"])
+    assert affected.importing_tests({"requirements-machinery.lock"}, set(), "HEAD", {}) == ([], [])
 
 
 @pytest.fixture
