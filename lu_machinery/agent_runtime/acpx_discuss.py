@@ -1261,7 +1261,8 @@ def refuse_kimi_discussion(participants: Sequence[str], models: Mapping[str, str
 def run_discussion(**kwargs: Any) -> dict[str, Any]:
     refuse_kimi_discussion(kwargs.get("participants") or PARTICIPANTS, kwargs.get("models"))
     root_arg = kwargs.pop("root", None)
-    root = Path(root_arg) if root_arg is not None else default_plane_root(repo_root=Path(kwargs["cwd"]))
+    # The plane is the shared-state anchor's, never the discussion's working directory.
+    root = Path(root_arg) if root_arg is not None else default_plane_root()
     controller = AcpxDiscussionController(root=root)
     try:
         result = controller.run(**kwargs)

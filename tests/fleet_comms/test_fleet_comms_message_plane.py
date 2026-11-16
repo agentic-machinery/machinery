@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from lu_machinery.common.repo_root import PRIMARY_ROOT_ENV, StateRootError
 from lu_machinery.fleet_comms.contracts import CompletionState
 from lu_machinery.fleet_comms.message_plane import (
     MAX_CONTINUATIONS,
@@ -39,7 +40,10 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
 ) -> None:
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
     primary = tmp_path / "primary"
-    (primary / ".git").mkdir(parents=True)
+    # A primary Git layout, so the shared-state anchor accepts it.
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     worktree = primary / ".worktrees" / "dispatch" / "codex" / "proof"
     worktree.mkdir(parents=True)
     (worktree / ".git").write_text(
@@ -50,6 +54,20 @@ def test_default_plane_root_anchors_linked_worktree_to_primary(
     expected = primary / "batch_state" / "fleet-comms" / "v1"
     assert default_plane_root(repo_root=primary) == expected
     assert default_plane_root(repo_root=worktree) == expected
+
+    # Defect class: a cwd-derived plane root selects a rival authority store. A
+    # process in another repository's checkout still resolves the configured
+    # anchor's plane, and with no anchor it refuses instead of using its cwd.
+    rival = tmp_path / "rival-checkout"
+    (rival / ".git").mkdir(parents=True)
+    monkeypatch.chdir(rival)
+    monkeypatch.setenv(PRIMARY_ROOT_ENV, str(primary))
+    assert default_plane_root() == expected
+    monkeypatch.delenv(PRIMARY_ROOT_ENV)
+    with pytest.raises(StateRootError, match=PRIMARY_ROOT_ENV):
+        default_plane_root()
+    assert not (rival / "batch_state").exists()
+    monkeypatch.setenv(PRIMARY_ROOT_ENV, str(primary))
 
     # A dedicated default directory is valid; the checkout itself is never storage.
     assert read_plane_status(repo_root=worktree)["read_only"] is True
