@@ -483,16 +483,25 @@ def test_reference_forms_follow_a_symlink_before_a_later_dotdot(tmp_path):
 
 def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
     """Defect classes: a damaged or misnamed record read as complete, or non-record JSON read as damaged."""
-    # Dispatch receipts and JSON without record markers are not records: they shadow their name only.
-    (tmp_path / "impl-1.write-boundary.json").write_text(json.dumps({"schema": "receipt", "task_id": "impl-1"}))
+    # Dispatch receipts and JSON without a task identity are not records: they shadow their name only.
+    receipt = {"schema": "receipt", "task_id": "impl-1", "scratch": "/tmp/boundary-held"}
+    (tmp_path / "impl-1.write-boundary.json").write_text(json.dumps(receipt))
     (tmp_path / "impl-1.sandbox.json").write_text(json.dumps({"task_id": "impl-1"}))
     (tmp_path / "impl-1.review.json").write_text(json.dumps({"findings": [], "target": "/tmp/held"}))
+    (tmp_path / "result.json").write_text(json.dumps({"schema_version": "findings.v1", "overall": {}}))
     (tmp_path / "notes.json").write_text("not json")
     (tmp_path / "list.json").write_text("[]")
     inventory = sweep.load_tasks(tmp_path)
-    assert inventory.complete is True and not inventory.references
-    assert set(inventory.records) == {"impl-1.write-boundary", "impl-1.sandbox", "impl-1.review", "notes", "list"}
+    # A receipt's paths protect while its owner's record is missing or unsettled, never after it settles.
+    assert inventory.complete is True and Path("/tmp/boundary-held") in inventory.references
+    assert Path("/tmp/held") not in inventory.references
+    names = {"impl-1.write-boundary", "impl-1.sandbox", "impl-1.review", "result", "notes", "list"}
+    assert set(inventory.records) == names
     assert all(record["status"] is None for record in inventory.records.values())
+    (tmp_path / "impl-1.json").write_text(json.dumps({"task_id": "impl-1", "status": "done"}))
+    inventory = sweep.load_tasks(tmp_path)
+    assert inventory.complete is True and not inventory.references
+    (tmp_path / "impl-1.json").unlink()
     # A task whose own ID ends in a receipt suffix is a record, and its paths still protect.
     own = {"task_id": "own.sandbox", "status": "running", "cwd": "/tmp/own-held"}
     (tmp_path / "own.sandbox.json").write_text(json.dumps(own))
@@ -504,6 +513,10 @@ def test_task_loader_rejects_malformed_or_mismatched_records(tmp_path):
         ("cut.json", '{"task_id": "cut", "status": "runn'),
         ("blank.json", "\0\0"),
         ("future.json", json.dumps({"task_id": "future", "schema_version": 9})),
+        # Task claims the shared reader calls foreign: a receipt-shaped record and a damaged legacy one.
+        ("shaped.json", json.dumps({"schema": "task.v1", "task_id": "live", "status": "running", "runtime_tmp_root": "/x"})),
+        ("legacy.json", json.dumps({"schema_version": "9", "agent": "codex", "status": "running", "cwd": "/tmp/x"})),
+        ("impl-1.sandbox.json", "{not json"),
     ):
         (tmp_path / name).write_text(raw)
         inventory = sweep.load_tasks(tmp_path)

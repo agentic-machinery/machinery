@@ -79,7 +79,7 @@ from lu_machinery.hygiene.tmp_sweep_ledger import (
     utc_iso,
     validate_state_dir,
 )
-from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record
+from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record, task_record_path
 from lu_machinery.orchestration.tmp_leak_sweep import (
     _process_state,
     _process_vanished,
@@ -173,6 +173,46 @@ def _reference_forms(value: str) -> set[Path]:
     return forms
 
 
+def _receipt_owner(path: Path, stem: str, raw: bytes) -> str | None:
+    """The task a dispatch receipt under a receipt file name belongs to, or ``None``.
+
+    A receipt names its owner in ``task_id``. A file under a receipt name whose
+    ``task_id`` is its own stem is a record of a task whose ID ends in that
+    suffix, so it is read as a record. Undecodable JSON raises.
+    """
+    if not _is_dispatcher_sidecar(path):
+        return None
+    data = json.loads(raw)
+    owner = data.get("task_id") if isinstance(data, dict) else None
+    return owner if isinstance(owner, str) and owner and owner != stem else None
+
+
+def _carries_task_identity(path: Path, raw: bytes) -> bool:
+    """Whether JSON the shared reader calls foreign still identifies a task.
+
+    The reader drops an object with a ``schema`` field as a receipt and reads
+    no legacy markers beside a ``schema_version``. That suits its scans, but
+    here a misnamed, forged or damaged record must not pass as evidence JSON.
+    An object with a ``task_id``, or one the reader takes for a record once
+    those two fields are dropped, is a task claim.
+    """
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return False  # Not JSON: the reader already refused every record-shaped damage.
+    if not isinstance(data, dict):
+        return False
+    if "task_id" in data:
+        return True
+    if "schema" not in data and "schema_version" not in data:
+        return False
+    bare = {key: value for key, value in data.items() if key not in {"schema", "schema_version"}}
+    try:
+        return parse_task_record(path, json.dumps(bare).encode()) is not None
+    except ValueError:
+        return True
+
+
 def load_tasks(root: Path) -> TaskInventory:
     """Read current task records and every absolute path an unsettled record names.
 
@@ -182,17 +222,19 @@ def load_tasks(root: Path) -> TaskInventory:
     status is not settled (``runtime_tmp_root``, ``worktree_path``, ``cwd``,
     environment and argument values) is a reference.
 
-    Records are told from other JSON by the shared task-record reader: the
-    receipts dispatch writes beside a record (``.write-boundary.json``,
-    ``.sandbox.json``, ``.tool-results.json``) when they name another task, and
-    JSON that carries no record markers, are not records: they shadow their
-    name but leave the inventory complete. A damaged file (truncated, blank
-    under a record name, unknown schema, wrong identity), receipt names
-    included, still makes it incomplete, and so does any other record whose
-    ``task_id`` is not its file name.
+    Records are told from other JSON by the shared task-record reader. JSON
+    that carries no task identity (no ``task_id`` and no record markers) is
+    evidence, not a record: it shadows its name and leaves the inventory
+    complete. A receipt dispatch writes beside its owner's record
+    (``.write-boundary.json``, ``.sandbox.json``, ``.tool-results.json``) is
+    not a record either; its paths are references while the owner's record is
+    missing or unsettled. A damaged file (undecodable, truncated, blank under a
+    record name, unknown schema, wrong identity) and any other task claim whose
+    ``task_id`` is not its file name still make the inventory incomplete.
     """
     records: dict[str, dict[str, Any]] = {}
     references: set[Path] = set()
+    receipts: list[tuple[str, Any]] = []
     try:
         with os.scandir(root) as entries:
             names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
@@ -210,14 +252,16 @@ def load_tasks(root: Path) -> TaskInventory:
             if path.is_symlink():
                 raise ValueError("symlinked task record")
             raw = path.read_bytes()
+            owner = _receipt_owner(path, stem, raw)
+            if owner is not None:
+                receipts.append((owner, json.loads(raw)))
+                continue
             data = parse_task_record(path, raw)
             if data is None:
-                continue  # Not a task record: claims nothing and hides no record.
+                if _carries_task_identity(path, raw):
+                    raise ValueError("task claim without a record shape")
+                continue  # Evidence JSON: claims nothing and hides no record.
             if "task_id" in data and data["task_id"] != stem:
-                # A receipt dispatch writes beside its owner's record names that owner.
-                # A task whose own ID ends in a receipt suffix is still read as a record.
-                if _is_dispatcher_sidecar(path):
-                    continue
                 raise ValueError("not a current task record")
         except (OSError, ValueError, RecursionError):
             complete = False
@@ -229,6 +273,11 @@ def load_tasks(root: Path) -> TaskInventory:
         }
         if data.get("status") not in REAPABLE_STATES:
             for value in _absolute_paths(data):
+                references.update(_reference_forms(value))
+    for owner, receipt in receipts:
+        record = records.get(task_record_path(root, owner).stem)
+        if record is None or record["status"] not in REAPABLE_STATES:
+            for value in _absolute_paths(receipt):
                 references.update(_reference_forms(value))
     return TaskInventory(records, frozenset(references), complete)
 
