@@ -79,13 +79,13 @@ from lu_machinery.hygiene.tmp_sweep_ledger import (
     utc_iso,
     validate_state_dir,
 )
+from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record
 from lu_machinery.orchestration.tmp_leak_sweep import (
     _process_state,
     _process_vanished,
     listening_socket_paths,
     socket_node_listening,
 )
-from lu_machinery.orchestration.task_record_store import _is_dispatcher_sidecar, parse_task_record
 from lu_machinery.orchestration.worktree_claims import _SUPERSEDED_RECORD_RE
 
 
