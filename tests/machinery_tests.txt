@@ -623,6 +623,7 @@ tests/test_fleet_repos.py
 tests/test_installed_root_contract.py
 tests/test_merged_delivery.py
 tests/test_record_cf_verdict.py
+tests/test_release_cut.py
 tests/test_repo_root.py
 tests/test_session_supervisor.py
 tests/test_agent_github_identity.py

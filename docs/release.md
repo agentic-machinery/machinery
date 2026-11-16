@@ -7,34 +7,17 @@ install and no machinery checkout on `PYTHONPATH`.
 ## Release train
 
 Owner decisions C-5345 (ONE-REVIEW-FAST-RELEASE-1112, 2026-11-12) and
-RELEASE-8H-CANARY-AT-CUT-1115 (2026-11-15, revised to 12 hours). Cut a
-machinery release every 12 hours, at 06:00 and 18:00 UTC. The person cutting
-the release runs this runbook by hand. Cut from `main` only when `main` has moved since the last
-tag and that commit's CI Gate is green. Skip a window when nothing has merged
-since the last tag. An urgent bug gets an immediate
-hotfix release: the same commands, as soon as the fix is on a green `main`,
-without waiting for the next window. Any other bug is fixed in a follow-up PR
-and rides the next train that meets the conditions. Do not rebuild or replace a version
-that was already published, and do not move a tag.
-
-There is no scheduled release job. Build, wheelhouse, acceptance, tag and
-`release-create` are separate commands, not one script. A scheduler would
-need one command that refuses to publish unless `main` differs from the last
-tag and the CI Gate on that commit is green, then runs the cut below.
-
-Confirm the two conditions before tagging:
-
-```bash
-git fetch origin main --tags
-git rev-parse origin/main
-git rev-list -n 1 "$(git describe --tags --abbrev=0 origin/main)"
-gh run list -R learn-ukrainian/machinery --branch main --workflow "CI Gate" --limit 5 \
-  --json headSha,conclusion,status,databaseId,event
-```
-
-The two SHAs must differ. The CI Gate row for `$SHA`, the commit being
-tagged (Changelog, last step), must be `conclusion: success`. If either is
-not, do not cut.
+RELEASE-8H-CANARY-AT-CUT-1115 (2026-11-15, revised to 12 hours). A machinery
+release is cut every 12 hours, at 06:00 and 18:00 UTC, by one command (Cut a
+release) that a host timer or an agent runs. It tags `main`'s HEAD; there is
+no release PR. `main` already carries the next version, because each release
+ends by opening the post-release PR that records its changelog and moves the
+version files on. A window is skipped when nothing but that PR has merged
+since the last tag. An urgent bug gets an immediate hotfix release: the same
+command, as soon as the fix is on a green `main`, without waiting for the next
+window. Any other bug is fixed in a follow-up PR and rides the next train. Do
+not rebuild or replace a version that was already published, and do not move
+a tag.
 
 ## Rollback
 
@@ -56,31 +39,19 @@ release is fixed by a new version, never by rebuilding or replacing assets.
 
 `CHANGELOG.md` at the repository root follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/). It has one
-section per release and an `Unreleased` section on top. Each entry is one
-plain-English line saying what changed for the operator or the fleet, under
-Added, Changed, Fixed, Removed or Security, and ends with its PR link.
-Monitor UI changes are named as such.
+section per release and an `Unreleased` section on top. The release command is
+the only writer; worker PRs do not edit `CHANGELOG.md`.
 
-The release worker is the only writer. Worker PRs do not edit
-`CHANGELOG.md`. The release PR, the one that sets the new version in
-`pyproject.toml`, also writes the changelog:
-
-1. List every PR since the last tag:
-   `git log --first-parent --format='%s' "$(git describe --tags --abbrev=0 origin/main)..origin/main"`,
-   and read each PR's title and body with `gh pr view`.
-2. Write their entries under `Unreleased`, leaving out the release PR itself
-   and changes nobody outside the repository's tests and CI notices.
-3. Move them into a new `## [$V] - YYYY-MM-DD` section (the UTC release
-   date) with the `<a id="v$V"></a>` anchor line above it, leave
-   `Unreleased` empty, and add the `[$V]` compare link at the bottom
-   (`compare/v<previous>...v$V`; `Unreleased` compares `v$V...HEAD`).
-4. The release PR is the last PR in the release: `$SHA` is its merge commit,
-   and PRs merged after it ride the next train. It was written against an
-   earlier `main`, so at cut time list the exact range being tagged,
-   `git log --first-parent --format='%s' "v<previous>..$SHA"`. Every PR it
-   lists, other than the release PR, must have an entry or have been left out
-   under step 2. If one is missing, land a changelog-only PR that adds it,
-   set `$SHA` to that PR's merge commit, and repeat this step.
+Each section is generated from the squash titles of the PRs merged in
+`v<previous>..v<version>` (`git log --first-parent --format=%s`), oldest first,
+each ending with its PR link. `feat` titles go under Added, `fix` under Fixed,
+other titles whose description starts with remove, retire, delete or drop under
+Removed, and the rest under Changed. The post-release PR is left out. The
+section is the start of the GitHub release notes, and the post-release PR adds
+it under `## [$V] - YYYY-MM-DD` (the UTC release date) with the
+`<a id="v$V"></a>` anchor line above it, leaves `Unreleased` empty and adds the
+`[$V]` compare link (`compare/v<previous>...v$V`; `Unreleased` compares
+`v$V...HEAD`). A withdrawn version's heading ends with `[YANKED]`.
 
 The `/machinery` page links the installed version to
 `CHANGELOG.md#v<version>` on `main`, so the anchor line is required.
@@ -115,19 +86,44 @@ It fails when a dependency in `pyproject.toml` has no pin.
 
 ## Cut a release
 
-From `$SHA`, the commit identified under Changelog, with `$V` the version in
-`pyproject.toml` and `$SHA` the full commit:
+Run one command on the host, outside a dispatched worker. It needs `gh` and
+Git push credentials for both repositories, and the provider credentials and
+user bus that the review-contract canary uses. `$PRIMARY` is the primary
+product checkout:
 
-1. Build once, outside any checkout, with the build pins of the
-   `Installed wheel` job (`build-requirements.txt` in `ci-gate.yml`):
+```bash
+LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+  "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut
+```
 
-   ```bash
-   git archive --format=tar "$SHA" | tar -x -C "$WORK/src"
-   "$BUILD_VENV/bin/python" -I -m build --sdist --wheel --no-isolation --outdir "$WORK/dist" "$WORK/src"
-   (cd "$WORK/dist" && sha256sum lu_machinery-"$V"-py3-none-any.whl lu_machinery-"$V".tar.gz > SHA256SUMS)
-   ```
+If the installed release predates `lu_machinery.release_cut`, run the same
+command without `-I` and with `PYTHONPATH` set to a machinery `main` checkout.
 
-2. Assemble a wheelhouse: the wheel plus
+Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
+the command stops at that step and sends a Fleet alert to `claude-cto` that
+names the step. Its work directory (`~/.lu-release-cut-*`) is kept, holding
+`cut.log`, the built files, the wheelhouse and the npm cache. `cut --dry-run`
+runs everything except the tag, the publish, the two PRs and the live canary
+(it prints the canary's plan). Run it two hours before a window so the product
+can land fixes first. The command does these steps in order:
+
+1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
+   and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when
+   `$SHA` is that tag's commit or only the post-release PR merged since. It
+   refuses unless all three of these hold:
+   - `pyproject.toml`, `package.json` and both versions in
+     `package-lock.json` hold `$V`, the next patch version after `<previous>`;
+   - the tag `v$V` is absent;
+   - the newest `CI Gate` push run on `$SHA`
+     (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
+     `success`.
+2. **Release notes**, generated as described under Changelog.
+3. **Build** once from `git archive "$SHA"`, outside any checkout, with the
+   build pins of the `Installed wheel` job (the `build-requirements.txt`
+   heredoc in `ci-gate.yml` at `$SHA`):
+   `python -I -m build --sdist --wheel --no-isolation`. It writes `SHA256SUMS`
+   for the wheel and sdist.
+4. **Wheelhouse and consumer lock.** The wheelhouse is the wheel plus
    `pip download --require-hashes --only-binary=:all: --no-deps -r requirements-machinery.lock`.
    The consumer lock is the release line followed by the dependency lock:
 
@@ -137,177 +133,174 @@ From `$SHA`, the commit identified under Changelog, with `$V` the version in
    <requirements-machinery.lock at $SHA>
    ```
 
-3. Accept it in a clean, machinery-only virtual environment outside any checkout.
-   This proves the candidate lock installs and imports without consumer packages.
-   `$CANDIDATE_LOCK` is the lock assembled in step 2; `$P` is the clean
-   environment's absolute interpreter:
+5. **Clean install** into a new machinery-only environment created from the
+   consumer's interpreter, outside any checkout. This proves the lock installs
+   and imports without consumer packages. `$P` is that environment's
+   interpreter:
 
    ```bash
-   "$CONSUMER_PYTHON" -m venv "$ACCEPTANCE_VENV"
-   P="$ACCEPTANCE_VENV/bin/python"
    "$P" -m pip install --force-reinstall --no-index --find-links "$WHEELHOUSE" --require-hashes -r "$CANDIDATE_LOCK"
    "$P" -m pip check
    env -u PYTHONPATH "$P" -I -c 'import importlib.metadata as m, lu_machinery; print(m.version("lu-machinery")); print(lu_machinery.__file__)'
    ```
 
-   Provision the wheel's Node dependencies under the runtime user and umask
-   022. Set `$NPM_CACHE` to an absolute, empty release-owned cache for the
-   first install. The release prepares its version-and-lock-derived prefix,
-   selects Node matching that prefix's `.nvmrc`, and resolves the npm CLI
-   inside that Node installation. Python never executes npm. Selection takes
-   the highest matching-major Node among `PATH`, `/opt/homebrew/bin` and
-   `/usr/local/bin`; `PATH` order breaks only ties. A minimal `PATH` that omits
-   the host's pinned Node selects a distro Node of the same major. Put the
-   pinned Node's directory on `PATH`, make sure no higher matching-major Node
-   is also there, and check that `node --version` prints the pinned version.
-   Afterwards confirm that `"$NODE" --version` and `"$NPM" --version` match
-   the pinned versions; if not, discard that prefix and cache and rerun with
-   a corrected `PATH`. Run this exact block after the wheel install:
+   The version must be `$V`, imported from that environment.
+6. **Tag and publish a pre-release.** The command pushes the annotated tag
+   `v$V` on `$SHA`. Then it runs `lu_machinery.publish release-create --prerelease`
+   with the wheel, the sdist and `SHA256SUMS` in one call. The notes are the
+   changelog section, then the build commit, the CI Gate run, the Identity
+   section (`SHA256SUMS` and the consumer lock) and a pending Acceptance
+   section. The command downloads the published assets and compares them with
+   `SHA256SUMS` and with the built files.
+7. **Draft adopt PR** in the product. It replaces `requirements-machinery.lock`
+   with the consumer lock and changes nothing else. Product CI runs on drafts,
+   and the merge-queue keeper refuses them.
+8. **Acceptance.** The review-contract canary runs alongside these checks:
+   - **Node dependencies:** the install-and-seal block below, then admission
+     of the sealed prefix.
+   - **Refusals:** each case runs in its own restored copy of the environment,
+     with registry access disabled. A removed package, an incompatible version
+     and a tampered executable must each be refused by admission, which runs
+     before any provider is spawned. An unchanged copy must still be admitted.
+   - **Isolation:** the command plants a marker package, which records its own
+     execution, for every lock peer name and every lock package absent from the
+     prefix. The markers go in the prefix's parent `node_modules` and in a
+     `NODE_PATH` directory. As positive controls, each marker must run when
+     required from outside the prefix. Then the command runs the lazy require
+     sites from the prefix: `debug` with colours enabled (which reads
+     `supports-color`), `@modelcontextprotocol/sdk/validation/cfworker` in both
+     CommonJS and ESM, and `b4a`, `bare-events`, `bare-stream` and `express`.
+     It also runs the prefix's ACPX shim with `--version` under
+     `PATH=/usr/bin:/bin`. Each must succeed and execute zero markers. A direct
+     `node` run that loads `b4a` with `NODE_OPTIONS=--conditions=react-native`
+     must execute the `react-native-b4a` marker. The markers are then removed,
+     and the prefix must still validate.
+   - **Packaged resources:** the `Installed wheel` job's import-every-module
+     script at `$SHA` runs against the installed wheel. Then the agent deployer
+     applies to a scratch consumer, and `--check` must verify it. Import alone
+     is not acceptance.
+   - **Consumer test collection** from a fresh shallow clone of product `main`.
+     The command adds one `.pth` file to the clean environment. It runs
+     `site.addsitedir` on the product environment's site-packages, so the
+     candidate's own packages come first and product-only packages come from
+     the product environment. The command checks that `lu-machinery` resolves
+     to the candidate, then runs
+     `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$P" -m pytest --collect-only -q tests`.
+     A non-zero exit or any collection error stops the cut.
+   - **Review-contract canary** once on `$SHA`, regardless of which paths
+     changed. This replaces the per-PR canary gate; independent PR review and
+     CI remain required. It is the candidate's own orchestration (the
+     candidate source on `PYTHONPATH`):
+     `"$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"`.
+     Every required route must pass, and the final receipt check, which uses
+     the installed gate, must succeed. A failing route or an incomplete run
+     blocks the release. PR merge does not require these receipts.
+9. **Promote.** `release-edit --no-prerelease` replaces the notes with the
+   final Acceptance section: the per-route canary table, the Node and npm
+   versions, the prefix and the collection summary. The command then marks the
+   adopt PR ready for review.
+10. **Post-release PR.** One machinery PR, titled
+    `chore(release): record $V and start <next>`, records the changelog
+    section and moves the version files to the next patch version.
+11. **Notice.** One Fleet message tells `claude-cto` that both PRs are open.
+    Each still needs a review of record and a green CI Gate.
 
-   ```bash
-   set -eu
-   umask 022
-   PREFIX="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import prepare_node_dependencies; print(prepare_node_dependencies() or "")')"
-   if [ -n "$PREFIX" ]; then
-     NODE="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[0])')"
-     NPM="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[1])')"
-     PATH="$(dirname "$NODE"):$PATH" "$NODE" "$NPM" ci --ignore-scripts --no-audit --no-fund --prefix="$PREFIX" --cache="$NPM_CACHE"
-     env -u PYTHONPATH "$P" -I -c 'from pathlib import Path; import sys; from lu_machinery.agent_runtime.adapters.acpx import seal_node_dependencies; print(seal_node_dependencies(cache=Path(sys.argv[1])))' "$NPM_CACHE"
-   fi
-   ```
+If a step fails before the tag is pushed, nothing is published. If a step
+fails after the tag is pushed, the pre-release keeps its files, its notes
+start with **Withdrawn**, and the adopt PR is closed. The post-release PR then
+records `[$V] [YANKED]` and moves `main` on, so the next window cuts the next
+version. The host installs only versions the product has adopted.
 
-   The prefix is `$VENV/share/lu-machinery/node/<version>-<lock-sha256>`.
-   Its version must match the wheel, and the full lock digest distinguishes
-   dependency sets. Sealing retains integrity-addressed archives from npm's
-   cache. Runtime admission verifies the copied contract, package versions,
-   archive integrity, installed bytes, executable targets, owners and writable
-   modes before any provider is spawned. Every applicable optional package is
-   required: only lock OS/CPU/libc constraints excluding this host permit an
-   optional package to be absent. Unknown host targets refuse admission.
-   Every peer a present package declares, including names listed only under
-   `peerDependenciesMeta`, must resolve from that package's own location to
-   the nearest lock entry, and that entry must apply to the host. Otherwise
-   Node would search ancestor and global module directories that admission
-   does not authenticate. The one exemption is `b4a`'s `react-native-b4a`,
-   which Node selects only under the `react-native` export condition. It is
-   pinned to the exact lock entry in `acpx.py`, and any change to that entry
-   refuses admission until the exemption is reviewed again.
-   Python and Node must use the same host architecture. A missing, mismatched or unsealed
-   prefix refuses and names this install-and-seal step. An ACP request never
-   installs or repairs dependencies.
+`post-release` opens the post-release PR for the newest tag on `main`. It
+keeps a changelog section that already exists, which covers a release cut by
+hand.
 
-   An intact existing prefix is validated and reused: preparation prints an
-   empty value, so the block skips npm. A failed or partial installation is
-   retained for diagnosis and refuses reuse. Restore it from the retained
-   release set before retrying; never run npm against an active prefix.
+Installing the wheelhouse files on the host is a host operation, outside this
+repository.
 
-   Accept Node provisioning in a clean environment with no product checkout,
-   ancestor `node_modules`, global ACP packages or npm cache. Record the wheel
-   SHA-256, lock SHA-256, Node version and resolved prefix/module/executable
-   paths. For every enabled ACP route, including the text server, complete
-   initialization, session creation, a known-answer prompt and a terminal
-   response with deterministic peers, then run a bounded authenticated canary
-   for each enabled provider. Authenticated provider canaries run with the
-   account HOME (the runtime user's real HOME). A scratch HOME is used only
-   for the deterministic, tamper and marker-static steps. The deterministic
-   Claude run is in the host namespace, not a synthetic root. Run the Claude
-   canary in the host PID namespace, not a synthetic-root one, while the
-   caller has same-account processes whose `/proc` entries it cannot read; it
-   must return the known answer with `ok` true and leave no new launcher
-   copy. Agent CLI lookup without an explicit search path (such as codex and
-   grok) uses only `$HOME/.local/bin` and `$HOME/.opencode/bin`, not `PATH`.
-   Claude is looked up on `PATH` first, then `$HOME/.local/bin/claude`;
-   control `PATH` so the intended Claude is the one tested. The Claude
-   launcher refuses any world-writable ancestor, so the canary venv and
-   scratch `$HOME` must live outside `/tmp`. With registry access disabled, remove
-   a package, introduce an incompatible version and tamper with an executable
-   in separate restored copies. Each must refuse before prompt delivery. Import success
-   is insufficient.
+### Residual hand checks
 
-   Prove the prefix is the only module source. Plant a marker package, which
-   records its own execution, in the prefix's parent `node_modules` and in a
-   `NODE_PATH` directory. Plant one for every lock peer name and every lock
-   package absent from the prefix. As positive controls, each marker must run
-   when required from outside the prefix. Then run every enabled route
-   through a terminal response, and the lazy require sites: `debug` with
-   colours enabled, which reads `supports-color`, and
-   `@modelcontextprotocol/sdk/validation/cfworker` in both CommonJS and ESM.
-   Also run `b4a`, `bare-events`, `bare-stream` and `express`. Run the
-   prefix's ACPX shim with `--version` under `PATH=/usr/bin:/bin`. It must
-   succeed. Each route and each lazy site must execute zero markers. Repeat
-   the routes with `NODE_OPTIONS=--conditions=react-native` and `NODE_PATH`
-   set in the caller's environment. ACP Node processes never receive either
-   variable, so the markers stay at zero, while a direct `node` run with that
-   `NODE_OPTIONS` loading `b4a` must execute the `react-native-b4a` marker as
-   the positive control. Remove the markers and confirm the prefix still
-   validates.
+Owner: `claude-cto`. These checks are not yet in the command. They stay
+required until a designated approval removes them; until then, run them before
+the adopt PR's review of record.
 
-   Run the review-contract canary once per release cut on `$SHA`, the release
-   candidate head, regardless of which paths changed. This replaces the per-PR
-   canary gate; independent PR review and CI remain required. Run on the host
-   with its provider credentials and user bus, outside a dispatched worker.
-   `$PRIMARY` is the primary product checkout and `$HOST_PYTHON` is its
-   `.venv/bin/python`:
+For every enabled ACP route, including the text server, complete
+initialization, session creation, a known-answer prompt and a terminal
+response with deterministic peers. Then run a bounded authenticated canary for
+each enabled provider. The review-contract canary covers the four review
+routes; OpenCode keeps its short known-answer check. Authenticated provider
+canaries run with the account HOME (the runtime user's real HOME). A scratch
+HOME is used only for the deterministic, tamper and marker-static steps. The
+deterministic Claude run is in the host namespace, not a synthetic root. Run
+the Claude canary in the host PID namespace, not a synthetic-root one, while
+the caller has same-account processes whose `/proc` entries it cannot read. It
+must return the known answer with `ok` true and leave no new launcher copy.
+Agent CLI lookup without an explicit search path (such as codex and grok) uses
+only `$HOME/.local/bin` and `$HOME/.opencode/bin`, not `PATH`. Claude is
+looked up on `PATH` first, then `$HOME/.local/bin/claude`; control `PATH` so
+the intended Claude is the one tested. The Claude launcher refuses any
+world-writable ancestor, so the canary venv and scratch `$HOME` must live
+outside `/tmp`. With the isolation markers planted, run every enabled route
+through a terminal response. Repeat the routes with
+`NODE_OPTIONS=--conditions=react-native` and `NODE_PATH` set in the caller's
+environment. ACP Node processes never receive either variable, so the markers
+stay at zero.
 
-   ```bash
-   LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
-     "$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"
-   ```
+### Node dependencies
 
-   If the installed version lacks `run`, use the exact candidate checkout
-   (`$CANDIDATE_CHECKOUT`, checked out at `$SHA`) for this host command:
+The wheel's Node dependencies are provisioned under the runtime user and umask
+022, with `$NPM_CACHE` an absolute, empty, release-owned cache for the first
+install. The release prepares its version-and-lock-derived prefix, selects
+Node matching that prefix's `.nvmrc`, and resolves the npm CLI inside that Node
+installation. Python never executes npm. Selection takes the highest
+matching-major Node among `PATH`, `/opt/homebrew/bin` and `/usr/local/bin`;
+`PATH` order breaks only ties. A minimal `PATH` that omits the host's pinned
+Node selects a distro Node of the same major. Put the pinned Node's directory
+on `PATH`, make sure no higher matching-major Node is also there, and check
+that `node --version` prints the pinned version. The command records the
+`"$NODE" --version` and `"$NPM" --version` it used; if they are not the pinned
+versions, discard that prefix and cache and rerun with a corrected `PATH`. The
+command runs this block after the wheel install:
 
-   ```bash
-   LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
-     PYTHONPATH="$CANDIDATE_CHECKOUT" \
-     "$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"
-   ```
+```bash
+set -eu
+umask 022
+PREFIX="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import prepare_node_dependencies; print(prepare_node_dependencies() or "")')"
+if [ -n "$PREFIX" ]; then
+  NODE="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[0])')"
+  NPM="$(env -u PYTHONPATH "$P" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[1])')"
+  PATH="$(dirname "$NODE"):$PATH" "$NODE" "$NPM" ci --ignore-scripts --no-audit --no-fund --prefix="$PREFIX" --cache="$NPM_CACHE"
+  env -u PYTHONPATH "$P" -I -c 'from pathlib import Path; import sys; from lu_machinery.agent_runtime.adapters.acpx import seal_node_dependencies; print(seal_node_dependencies(cache=Path(sys.argv[1])))' "$NPM_CACHE"
+fi
+```
 
-   Record the command's per-route PASS/FAIL table and candidate head in the
-   release's Acceptance section. Every required route must pass and the final
-   receipt check must succeed. A failing route or an incomplete run blocks the
-   release; PR merge does not require these receipts.
+The prefix is `$VENV/share/lu-machinery/node/<version>-<lock-sha256>`.
+Its version must match the wheel, and the full lock digest distinguishes
+dependency sets. Sealing retains integrity-addressed archives from npm's
+cache. Runtime admission verifies the copied contract, package versions,
+archive integrity, installed bytes, executable targets, owners and writable
+modes before any provider is spawned. Every applicable optional package is
+required: only lock OS/CPU/libc constraints excluding this host permit an
+optional package to be absent. Unknown host targets refuse admission.
+Every peer a present package declares, including names listed only under
+`peerDependenciesMeta`, must resolve from that package's own location to
+the nearest lock entry, and that entry must apply to the host. Otherwise
+Node would search ancestor and global module directories that admission
+does not authenticate. The one exemption is `b4a`'s `react-native-b4a`,
+which Node selects only under the `react-native` export condition. It is
+pinned to the exact lock entry in `acpx.py`, and any change to that entry
+refuses admission until the exemption is reviewed again.
+Python and Node must use the same host architecture. A missing, mismatched or unsealed
+prefix refuses and names this install-and-seal step. An ACP request never
+installs or repairs dependencies.
 
-   Then check that every packaged resource resolves from the installed wheel
-   and exercise lazy runtime paths. Running the agent deployer's plan and apply
-   against a scratch consumer is one such path. Import alone is not
-   acceptance.
+An intact existing prefix is validated and reused: preparation prints an
+empty value, so the block skips npm. A failed or partial installation is
+retained for diagnosis and refuses reuse. Restore it from the retained
+release set before retrying; never run npm against an active prefix.
 
-   Last, collect the consumer's tests against the candidate. Copy the
-   consumer's live environment (`$CONSUMER_VENV`, the product's `.venv`),
-   install the candidate lock over the copy with the install command above,
-   and collect from a fresh checkout of product `main`. A non-zero exit or
-   any collection error stops the cut:
-
-   ```bash
-   cp -a "$CONSUMER_VENV" "$WORK/consumer-venv"
-   C="$WORK/consumer-venv/bin/python"
-   "$C" -m pip install --force-reinstall --no-index --find-links "$WHEELHOUSE" --require-hashes -r "$CANDIDATE_LOCK"
-   git clone --depth 1 --branch main https://github.com/learn-ukrainian/learn-ukrainian.github.io "$WORK/product"
-   (cd "$WORK/product" && env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$C" -m pytest --collect-only -q tests)
-   ```
-
-4. Tag and publish. Push the annotated tag `v$V` on `$SHA`, then create the
-   release with all three assets in one call. `$NOTES` starts with the
-   release's `CHANGELOG.md` section (its heading and entries). The build
-   commit, CI evidence and the Identity (`SHA256SUMS` and consumer lock) and
-   Acceptance sections follow it unchanged. The installed publisher resolves
-   its repository context from the environment, so set
-   `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` to the absolute primary git checkout
-   that holds `batch_state/`; without it the command refuses:
-
-   ```bash
-   "$P" -m lu_machinery.publish release-create --repo learn-ukrainian/machinery --tag "v$V" \
-     --title "lu-machinery $V" --notes-file "$NOTES" \
-     --assets "$WORK/dist/lu_machinery-$V-py3-none-any.whl" \
-     --assets "$WORK/dist/lu_machinery-$V.tar.gz" --assets "$WORK/dist/SHA256SUMS"
-   ```
-
-   Download the published assets and compare them with `SHA256SUMS` before
-   reporting the release.
-
-5. Install the wheelhouse files on the host (host operation, outside this
-   repository).
+The command provisions in its clean environment, with no product checkout,
+ancestor `node_modules`, global ACP packages or npm cache.
 
 ## Consumers
 
