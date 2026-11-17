@@ -79,7 +79,7 @@ permissions:
 
 concurrency:
   group: ci-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 # setup-python prefers the runner tool cache with check-latest disabled. The
 # previous patch pins mirrored a source environment, not a patch-specific check.
@@ -110,7 +110,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 2
-    # An unavailable optimization falls back to the full required checks.
+    # An unavailable reuse optimization falls back to the full required checks.
+    # History checks independently refuse a missing history-base output.
     continue-on-error: true
     permissions:
       contents: read
@@ -118,7 +119,50 @@ jobs:
     outputs:
       reuse: ${{ steps.proof.outputs.reuse }}
       source: ${{ steps.proof.outputs.source }}
+      history-base: ${{ steps.history.outputs.base }}
     steps:
+      - name: Find the last successful main history checks
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # event.before can belong to a cancelled run. A successful earlier
+          # main run is a conservative checkpoint: both history jobs finished.
+          # No checkpoint or API error fails closed, never back to event.before.
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci-gate.yml/runs?event=push&branch=main&status=success&per_page=100")"
+          source="$(jq -ec --arg repo "$GITHUB_REPOSITORY" --argjson number "$GITHUB_RUN_NUMBER" '
+            [.workflow_runs[]
+             | select(.event == "push" and .head_branch == "main")
+             | select(.status == "completed" and .conclusion == "success")
+             | select(.repository.full_name == $repo and .head_repository.full_name == $repo)
+             | select(.path == ".github/workflows/ci-gate.yml")
+             | select((.run_number | type) == "number" and .run_number < $number)
+             | select((.id | type) == "number" and .id > 0)
+             | select((.run_attempt | type) == "number" and .run_attempt > 0)
+             | select(.head_sha | test("^[0-9a-f]{40}$"))]
+            | sort_by(.run_number) | last
+            | select(. != null)
+            | {run_id: .id, run_attempt: .run_attempt, commit: .head_sha}' <<< "$runs")"
+          run_id="$(jq -r .run_id <<< "$source")"
+          attempt="$(jq -r .run_attempt <<< "$source")"
+          scanned="$(jq -r .commit <<< "$source")"
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100")"
+          jq -e --arg sha "$scanned" '
+            . as $jobs | ["Secret scan (TruffleHog)", "Verified trailer"] | all(.[];
+              . as $name | $jobs.jobs | any(.[];
+                .name == $name and .head_sha == $sha
+                and .status == "completed" and .conclusion == "success"))
+            ' <<< "$jobs" > /dev/null
+          # Merge-base also covers every commit reachable only from this head
+          # after a divergent push. Only immutable SHAs go to the compare API.
+          base="$(gh api "repos/$GITHUB_REPOSITORY/compare/$scanned...$GITHUB_SHA" --jq '.merge_base_commit.sha')"
+          [[ "$base" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$base" != "$GITHUB_SHA" ]]
+          jq -nc --arg base "$base" --arg head "$GITHUB_SHA" --argjson source "$source" \
+            '{history_base: $base, head: $head, source: $source}' >> "$GITHUB_STEP_SUMMARY"
+          printf 'base=%s\n' "$base" >> "$GITHUB_OUTPUT"
+
       - name: Find successful CI Gate for this tree
         id: match
         env:
@@ -725,6 +769,8 @@ jobs:
   # - The job also fails when the range holds no commit, or when the root
   #   .trufflehogignore is missing or leaves no Python or workflow file in scope.
   secret-scan:
+    needs: [main-proof]
+    if: always() && !cancelled()
     name: Secret scan (TruffleHog)
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 20 }}
@@ -768,14 +814,17 @@ jobs:
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           MQ_BASE: ${{ github.event.merge_group.base_sha }}
           MQ_HEAD: ${{ github.event.merge_group.head_sha }}
-          PUSH_BASE: ${{ github.event.before }}
+          PUSH_BASE: ${{ needs.main-proof.outputs.history-base }}
           PUSH_HEAD: ${{ github.event.after }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
             pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
             merge_group) base="$MQ_BASE"; head="$MQ_HEAD" ;;
-            push) base="$PUSH_BASE"; head="$PUSH_HEAD" ;;
+            push)
+              base="$PUSH_BASE"; head="$PUSH_HEAD"
+              [[ "$base" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Missing successful main history checkpoint'; exit 1; }
+              ;;
             workflow_dispatch) base=""; head="$(git rev-parse HEAD)" ;;
             *) echo "::error::Unsupported event ${EVENT_NAME}"; exit 1 ;;
           esac
@@ -1734,6 +1783,8 @@ jobs:
   # X-Verified in observe mode. The CI Gate job has no checkout, so this check
   # is its own required job. Observe logs a missing line and does not fail.
   verified-trailer:
+    needs: [main-proof]
+    if: always() && !cancelled()
     name: Verified trailer
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1768,7 +1819,7 @@ jobs:
       - name: Check the verification line
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && needs.main-proof.outputs.history-base || '' }}
           HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           ZERO_SHA: "0000000000000000000000000000000000000000"
           PYTHONPATH: ${{ github.workspace }}
@@ -1784,10 +1835,9 @@ jobs:
               mode=(--merge-group)
               ;;
             push)
-              if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "$ZERO_SHA" ]; then
-                echo "verified-trailer: push has no prior SHA; nothing to check"
-                exit 0
-              fi
+              [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && [ "$BASE_SHA" != "$ZERO_SHA" ] || {
+                echo '::error::Missing successful main history checkpoint'; exit 1;
+              }
               mode=(--pr)
               ;;
             workflow_dispatch)
