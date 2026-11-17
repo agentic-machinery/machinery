@@ -6,8 +6,12 @@ reads the same set, so every code the runtime emits stays visible (#9532).
 
 from __future__ import annotations
 
-import json
 import re
+
+from lu_machinery.common import json_depth
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 RUNTIME_FAILURE_CODES = frozenset(
     {
@@ -201,7 +205,7 @@ def provider_stderr_error(stderr: str) -> str:
                 start = offset + line.index("[API Error:") + len("[API Error:")
                 payload = stderr[start:].lstrip()
                 try:
-                    _, end = json.JSONDecoder().raw_decode(payload)
+                    _, end = json_depth.raw_decode(payload, max_depth=_JSON_MAX_DEPTH)
                 except (ValueError, RecursionError):
                     pass
                 else:
@@ -216,7 +220,7 @@ def opencode_provider_error(stdout: str) -> tuple[str, str | None]:
     errors: list[tuple[str, str]] = []
     for line in stdout.split("\n"):
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
         except (ValueError, RecursionError):
             continue
         if not isinstance(event, dict) or event.get("type") != "error":

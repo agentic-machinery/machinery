@@ -193,6 +193,13 @@ try:
 except Exception as exc:
     print(f"guard dependency unavailable: tool_names ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
+try:
+    from lu_machinery.common import json_depth
+except Exception as exc:
+    print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
+    raise SystemExit(2) from exc
+# Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+_PAYLOAD_MAX_DEPTH = 512
 
 # ---------------------------------------------------------------------------
 # shared containment predicate (issue #4444) — imported, never re-derived
@@ -276,7 +283,7 @@ def _evaluate_write(target: Path, wc, main_root: Path) -> object:
 
 def _read_payload() -> dict | None:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json_depth.loads(sys.stdin.read() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
     except (ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None

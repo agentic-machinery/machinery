@@ -31,6 +31,11 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
+# Deepest JSON this module reads (json_depth): dispatcher task records.
+_JSON_MAX_DEPTH = 128
+
 ARCHIVE_DIR_NAME = "archive"
 REVIEW_TASK_FLAG_FIELDS = (
     "pr", "review_attempt", "require_review_verdict", "review_profile", "review_author_model", "review_risk",
@@ -112,7 +117,7 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
     """
     try:
         decoded = raw.decode("utf-8")
-        record = json.loads(decoded)
+        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH)
     except RecursionError as exc:
         raise ValueError(f"task record {path} exceeds JSON parser nesting") from exc
     except ValueError as exc:

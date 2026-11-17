@@ -28,11 +28,15 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
 from lu_machinery.orchestration import worktree_artifacts as artifacts
 from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
 from lu_machinery.orchestration.task_record_store import parse_task_record, task_record_path
+
+# Deepest JSON this module reads (json_depth): its own identity cache.
+_JSON_MAX_DEPTH = 128
 
 # Bound automatic disk duplication. Larger outputs require owner disposition;
 # the complete source checkout survives rather than receiving a partial copy.
@@ -238,14 +242,15 @@ def _identity_decoder_context() -> dict[str, Any]:
     return {
         "python": list(sys.version_info[:3]),
         "int_max_str_digits": getattr(sys, "get_int_max_str_digits", lambda: 0)(),
-        "task_record_classifier": 1,
+        # 2: parse_task_record refuses JSON nested past its explicit depth limit (json_depth).
+        "task_record_classifier": 2,
     }
 
 
 def _read_identity_cache(path: Path) -> dict[str, Any]:
     """A missing, stale-format or damaged accelerator supplies no evidence."""
     try:
-        cache = json.loads(path.read_bytes())
+        cache = json_depth.loads(path.read_bytes(), max_depth=_JSON_MAX_DEPTH)
         entries = cache["entries"]
         if (
             cache["schema"] == _IDENTITY_CACHE_SCHEMA

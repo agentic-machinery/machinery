@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.acp_runtime_lock import owner_alive, process_start_time
 from lu_machinery.common.scratch import (
     DEFAULT_SCRATCH_ROOT,
@@ -69,6 +70,9 @@ from lu_machinery.common.scratch import (
     fallback_scratch_root,
     resolve_scratch_root,
 )
+
+# Deepest JSON this module reads (json_depth): task scratch leases.
+_JSON_MAX_DEPTH = 128
 
 NAMESPACE_DIRNAME = "task-scratch"
 LEASE_FILENAME = "lease.json"
@@ -354,7 +358,7 @@ def parse_lease(raw: bytes | None) -> dict[str, Any] | None:
     if not raw:
         return None
     try:
-        payload = json.loads(raw.decode("utf-8"))
+        payload = json_depth.loads(raw.decode("utf-8"), max_depth=_JSON_MAX_DEPTH)
     except (UnicodeDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):

@@ -355,7 +355,10 @@ def test_import_audit_keeps_child_arcs_without_allowing_source_writes(tmp_path, 
     data.read()
     child = str(tmp_path / "scripts/child.py")
     assert data.lines(child) == [1, 2]
-    assert data.arcs(child) == [(-1, 1), (1, 2), (2, -1)]
+    # Branch data survived for every executed line. The arc encoding is the interpreter's:
+    # coverage reads 3.12 through a trace function and 3.14 through sys.monitoring.
+    assert data.has_arcs()
+    assert {line for arc in data.arcs(child) or () for line in arc if line > 0} == {1, 2}
     assert not (tmp_path / "forbidden").exists()
     assert not (tmp_path / "raw/.coverage.forged").exists()
 

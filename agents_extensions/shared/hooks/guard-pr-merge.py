@@ -50,9 +50,21 @@ from pathlib import Path
 from typing import NamedTuple
 
 
+# Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+_PAYLOAD_MAX_DEPTH = 512
+
+
 def _read_payload() -> dict | None:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        text = sys.stdin.read() or "{}"
+        try:
+            from lu_machinery.common import json_depth
+        except ImportError:
+            # Only the dependency-free fast path below can run without the helper: it passes
+            # ordinary commands, and the dependency imports then refuse merge commands.
+            payload = json.loads(text)
+        else:
+            payload = json_depth.loads(text, max_depth=_PAYLOAD_MAX_DEPTH)
     except (ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -115,6 +127,11 @@ try:
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
+    raise SystemExit(2) from exc
+try:
+    from lu_machinery.common import json_depth as json_depth
+except Exception as exc:
+    print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
 
 try:

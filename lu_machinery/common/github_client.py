@@ -47,8 +47,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, quote_plus, urlencode, urlsplit
 
-from lu_machinery.common import github_usage
+from lu_machinery.common import github_usage, json_depth
 from lu_machinery.common.repo_root import machinery_path, state_root
+
+# Deepest JSON this module reads (json_depth): request and response bodies.
+_JSON_MAX_DEPTH = 512
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 CACHE_MAX_BYTES = 64 * 1024 * 1024
@@ -672,7 +675,7 @@ def _reject_constant(name):
 def _json_body(data):
     """The JSON value a request body's exact bytes encode (strict UTF-8, no NaN or Infinity), else ``None``."""
     try:
-        return json.loads(data.decode("utf-8"), parse_constant=_reject_constant)
+        return json_depth.loads(data.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
         return None
 
@@ -3392,7 +3395,7 @@ def _gh_reported(response, report):
     """
     message, status = report[0], int(report[1] or report[2])
     try:
-        body = json.loads(response.body)
+        body = json_depth.loads(response.body, max_depth=_JSON_MAX_DEPTH)
     except (ValueError, RecursionError):
         body = None
     stated = body.get("message") if isinstance(body, dict) and isinstance(body.get("message"), str) else ""

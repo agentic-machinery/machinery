@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import os
 import re
@@ -14,11 +13,15 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.fleet_comms.efficiency_metrics import _parse_timestamp, _read_task_record, _task_record_paths
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.review.model_catalog import ModelCatalogError, load_model_catalog, model_aliases
 from lu_machinery.review.record_cf_verdict import RecordError, normalize_verdict
 from lu_machinery.review.verdict_parser import _commonmark_lines, _without_code_fences, review_score
+
+# Deepest JSON this module reads (json_depth): reviewer replies.
+_JSON_MAX_DEPTH = 512
 
 STATUSES = (
     "done",
@@ -177,7 +180,7 @@ def _review(path: Path, record: dict) -> dict | None:
                 verdict = "unknown"
             score = review_score(text) if verdict != "unknown" else None
             try:
-                payload = json.loads(text)
+                payload = json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
             except (ValueError, RecursionError):
                 payload = None
             if isinstance(payload, dict) and isinstance(payload.get("findings"), list) and verdict != "unknown":

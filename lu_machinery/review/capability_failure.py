@@ -50,10 +50,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.opsec.prepublish import check_texts, normalize_repository, publication_boundary, publication_cli
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.language_lane import is_ukrainian_review
 from lu_machinery.review.verdict_parser import MISSING_CAPABILITIES_FIELD, REVIEW_CAPABILITIES, recognized_verdicts
+
+# Deepest JSON this module reads (json_depth): reviewer replies.
+_JSON_MAX_DEPTH = 512
 
 EVENT_PREFIX = "<!-- review-capability-failure"
 SOURCES_MCP = "sources-mcp"
@@ -151,7 +155,12 @@ def obstruction_refusal(reply: str) -> str | None:
     (``P0`` to ``P3``) or a security verdict whose value is not exactly PASS.
     """
     try:
-        payload = json.loads(reply, object_pairs_hook=recorder._unique_keys, parse_constant=recorder._not_json_constant)
+        payload = json_depth.loads(
+            reply,
+            max_depth=_JSON_MAX_DEPTH,
+            object_pairs_hook=recorder._unique_keys,
+            parse_constant=recorder._not_json_constant,
+        )
     except (ValueError, RecursionError):
         return "the reply is not one structured findings object"
     texts = list(recorder._strings(payload))

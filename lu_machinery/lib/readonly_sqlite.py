@@ -24,7 +24,11 @@ from types import ModuleType
 from typing import Any, Protocol, Self
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import in_tree_source, machinery_path, machinery_root
+
+# Deepest JSON this module reads (json_depth): the product's read-only declaration.
+_JSON_MAX_DEPTH = 128
 
 
 class SQLiteConnection(Protocol):
@@ -409,7 +413,9 @@ def product_declaration_rows(product: str) -> list[dict[str, Any]]:
         raise ValueError(f"non-finite number {literal}")
 
     try:
-        rows = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys, parse_constant=no_constant)
+        rows = json_depth.loads(
+            data.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_unique_keys, parse_constant=no_constant
+        )
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise _DeclarationUnusable("product_declaration_malformed") from None
     if not isinstance(rows, list):

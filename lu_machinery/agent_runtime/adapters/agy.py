@@ -104,6 +104,7 @@ from lu_machinery.agent_runtime.attempt_safe_read import (
     safe_attempt_file_size,
     safe_read_attempt_file,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.review.model_catalog import load_model_catalog, retired_model_refusal
 from lu_machinery.secret_redactor import redact_text
 
@@ -113,6 +114,9 @@ from ..result import AgyAttempt, AgyProviderFault, ParseResult
 from ..tool_calls import summarize_tool_output
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 _logger = logging.getLogger(__name__)
 
@@ -3538,7 +3542,7 @@ def _decode_jsonish(value: Any) -> Any:
     if not stripped:
         return ""
     try:
-        return json.loads(stripped)
+        return json_depth.loads(stripped, max_depth=_JSON_MAX_DEPTH)
     except (ValueError, RecursionError):
         return stripped.strip('"')
 

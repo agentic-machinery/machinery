@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
+from lu_machinery.common import json_depth
 from lu_machinery.review.product_hooks import attempt_hooks
 from lu_machinery.secret_redactor import redact_text
 
@@ -62,6 +63,9 @@ from .codex_events import (
     parse_exec_stream,
     tool_calls_from_items,
 )
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 if TYPE_CHECKING:
     from lu_machinery.review.isolation import SandboxCapability
@@ -825,7 +829,7 @@ class CodexAdapter:
         lines = list(stdout_lines)
         last_line = next((line for line in reversed(lines) if line.strip()), "")
         try:
-            last_event = _json.loads(last_line)
+            last_event = json_depth.loads(last_line, max_depth=_JSON_MAX_DEPTH)
         except (ValueError, RecursionError):
             return False
         if not isinstance(last_event, dict) or last_event.get("type") != "turn.completed":

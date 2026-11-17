@@ -249,11 +249,11 @@ def test_refuses_unusable_input_before_spawn(tmp_path, monkeypatch, capsys):
 
     def failed_identity_stat(path, *args, **kwargs):
         nonlocal stat_calls
-        if path == packet:
+        # Fail the bind's identity stat, the one that follows symlinks. A no-follow stat is an
+        # lstat: Python 3.12's Path.is_symlink() makes one through os.stat, 3.13 and later through os.lstat.
+        if path == packet and kwargs.get("follow_symlinks", True):
             stat_calls += 1
-            # Path.resolve(strict=True) performs the first stat; the bind performs the second.
-            if stat_calls == 2:
-                raise OSError("unavailable")
+            raise OSError("unavailable")
         return original_stat(path, *args, **kwargs)
 
     with monkeypatch.context() as branch:
@@ -262,7 +262,7 @@ def test_refuses_unusable_input_before_spawn(tmp_path, monkeypatch, capsys):
         branch.setattr(os, "stat", failed_identity_stat)
         with pytest.raises(ValueError, match="agy_input_refused: not a readable regular file"):
             agy_sandbox.bind_inputs([str(packet)], repo_root=checkout)
-        assert stat_calls == 2
+        assert stat_calls == 1
         read.assert_not_called()
 
     original_readlink = os.readlink

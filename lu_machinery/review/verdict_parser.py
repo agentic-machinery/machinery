@@ -11,6 +11,11 @@ from collections.abc import Iterator
 from itertools import accumulate
 from typing import Any
 
+from lu_machinery.common import json_depth
+
+# Deepest JSON this module reads (json_depth): reviewer replies.
+_JSON_MAX_DEPTH = 512
+
 ACCEPTED_VERDICT_TOKENS = (
     "APPROVE",
     "APPROVED",
@@ -241,7 +246,7 @@ def _findings_json_verdicts(response: str, *, stated: str | None = None) -> list
     verdicts: list[str] = []
     for candidate in candidates:
         try:
-            payload = json.loads(candidate)
+            payload = json_depth.loads(candidate, max_depth=_JSON_MAX_DEPTH)
         except ValueError:
             continue
         if not isinstance(payload, dict):
@@ -277,7 +282,7 @@ def _looks_like_findings(source: str) -> bool:
     while position < len(source):
         position += len(source[position:]) - len(source[position:].lstrip(" \t\r\n"))
         try:
-            key, position = decoder.raw_decode(source, position)
+            key, position = json_depth.raw_decode(source, position, max_depth=_JSON_MAX_DEPTH, decoder=decoder)
         except json.JSONDecodeError as exc:
             if exc.msg.startswith("Unterminated string"):
                 # A cut inside the key itself may still name the whole field.
@@ -299,7 +304,7 @@ def _looks_like_findings(source: str) -> bool:
         position += 1
         position += len(source[position:]) - len(source[position:].lstrip(" \t\r\n"))
         try:
-            _, position = decoder.raw_decode(source, position)
+            _, position = json_depth.raw_decode(source, position, max_depth=_JSON_MAX_DEPTH, decoder=decoder)
         except ValueError:
             return False
         position += len(source[position:]) - len(source[position:].lstrip(" \t\r\n"))
@@ -327,7 +332,7 @@ def _top_level_json_values(response: str) -> Iterator[Any]:
             continue
         if token.type == "fence" and token.info.strip() in {"", "json"}:
             try:
-                value = json.loads(token.content)
+                value = json_depth.loads(token.content, max_depth=_JSON_MAX_DEPTH)
             except ValueError:
                 if _looks_like_findings(token.content):
                     raise _UnreadableFindings("inconclusive: findings JSON cannot be decoded") from None
@@ -343,7 +348,9 @@ def _top_level_json_values(response: str) -> Iterator[Any]:
                 if match is None or starts[number] < consumed:
                     continue
                 try:
-                    value, consumed = decoder.raw_decode(text, starts[number] + match.end() - 1)
+                    value, consumed = json_depth.raw_decode(
+                        text, starts[number] + match.end() - 1, max_depth=_JSON_MAX_DEPTH, decoder=decoder
+                    )
                 except ValueError:
                     if _looks_like_findings(text[starts[number] + match.end() - 1 :]):
                         raise _UnreadableFindings("inconclusive: findings JSON cannot be decoded") from None
@@ -401,7 +408,7 @@ def _without_inline_json(text: str) -> str:
         if match is None or start < cursor:
             continue
         try:
-            _, end = json.JSONDecoder().raw_decode(text, start)
+            _, end = json_depth.raw_decode(text, start, max_depth=_JSON_MAX_DEPTH)
         except ValueError:
             continue
         parts.extend((text[cursor:start], "\n"))
@@ -523,7 +530,7 @@ def _structured_explanation(response: str) -> str | None:
     from lu_machinery.fleet_comms.review_publication import REVIEW_SCHEMA_VERSION
 
     try:
-        payload = json.loads(response)
+        payload = json_depth.loads(response, max_depth=_JSON_MAX_DEPTH)
     except (ValueError, RecursionError):
         return None
     if not isinstance(payload, dict) or payload.get("schema_version") != REVIEW_SCHEMA_VERSION:
@@ -632,8 +639,11 @@ def structured_finding_entries(reply: str, finding_id: str) -> list[tuple[str, s
     from lu_machinery.review.review_contract import ContractError, _whole_reply_fence
 
     try:
-        payload = json.loads(
-            _whole_reply_fence(reply.strip()), object_pairs_hook=_unique_object, parse_constant=_not_json_constant
+        payload = json_depth.loads(
+            _whole_reply_fence(reply.strip()),
+            max_depth=_JSON_MAX_DEPTH,
+            object_pairs_hook=_unique_object,
+            parse_constant=_not_json_constant,
         )
         if not isinstance(payload, dict):
             return None

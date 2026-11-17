@@ -46,6 +46,7 @@ import yaml
 
 from lu_machinery.agent_identity import normalize_seat
 from lu_machinery.ci.deploy_paths import DeployPathsError
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, account_from_record
@@ -191,6 +192,8 @@ class RecordError(RuntimeError):
 
 
 NESTED_TOO_DEEPLY = "review reply is nested too deeply to read its verdict"
+# Deepest JSON this module reads (json_depth): reviewer replies.
+_JSON_MAX_DEPTH = 512
 
 
 def normalize_verdict(reply: str) -> str:
@@ -224,7 +227,7 @@ def _normalize_verdict(reply: str) -> str:
                 continue
             start = line_start + match.end() - 1
             try:
-                _, end = json.JSONDecoder().raw_decode(visible, start)
+                _, end = json_depth.raw_decode(visible, start, max_depth=_JSON_MAX_DEPTH)
             except ValueError:
                 continue
             findings.update(NORMALIZED[token] for token in _findings_json_verdicts(visible[start:end], stated=stated))
@@ -244,7 +247,7 @@ def _normalize_verdict(reply: str) -> str:
 def _review_verdict_and_count(reply: str) -> tuple[str, int | Literal["unknown"]]:
     """Use canonical validated findings; prose supplies no reliable count."""
     try:
-        payload = json.loads(reply)
+        payload = json_depth.loads(reply, max_depth=_JSON_MAX_DEPTH)
     except ValueError:
         payload = None
     except RecursionError:
@@ -377,7 +380,9 @@ def p3_reading(reply: str) -> P3Reading:
     if not isinstance(reply, str):
         return P3Reading(reason=P3_NOT_ONE_OBJECT)
     try:
-        payload = json.loads(reply, object_pairs_hook=_unique_keys, parse_constant=_not_json_constant)
+        payload = json_depth.loads(
+            reply, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_unique_keys, parse_constant=_not_json_constant
+        )
     except _DuplicateKey:
         return P3Reading(reason=P3_DUPLICATE_KEY)
     except (ValueError, RecursionError):

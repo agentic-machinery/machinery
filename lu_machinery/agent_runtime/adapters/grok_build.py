@@ -86,6 +86,7 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
 
+from lu_machinery.common import json_depth
 from lu_machinery.secret_redactor import redact_text
 
 from ..failure_codes import provider_failure_code, provider_stderr_error
@@ -101,6 +102,9 @@ from ..trail_isolation import (
 )
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 _logger = logging.getLogger(__name__)
 
@@ -469,7 +473,7 @@ def _permission_cancellation(envelope: dict | None, plan: InvocationPlan | None,
             for line in stream:
                 if not line.strip():
                     continue
-                event = json.loads(line)
+                event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
                 if not isinstance(event, dict):
                     return False
                 if event.get("type") == "turn_ended":

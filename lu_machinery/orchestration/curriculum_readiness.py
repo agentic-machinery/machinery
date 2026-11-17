@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError
 from lu_machinery.common.repo_root import product_root as resolve_product_root
 from lu_machinery.common.schema_check import check_schema as check_schema_memoised
@@ -30,6 +31,9 @@ from lu_machinery.orchestration.preparation_evidence import (
     load_yaml_mapping,
 )
 from lu_machinery.research import research_quality
+
+# Deepest JSON this module reads (json_depth): its product configuration file.
+_JSON_MAX_DEPTH = 128
 
 # The product data file that names the readiness gates module, relative to the product root.
 READINESS_GATES_FILE = Path("scripts/curriculum/readiness_gates.v1.json")
@@ -78,7 +82,9 @@ def _gates_module_name(path: Path) -> str:
         raise ValueError(f"non-finite number {token}")
 
     try:
-        document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys, parse_constant=no_constants)
+        document = json_depth.loads(
+            raw.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, object_pairs_hook=unique_keys, parse_constant=no_constants
+        )
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ImportError("readiness gates configuration must be strict UTF-8 JSON") from exc
     if not isinstance(document, dict) or set(document) != {"schema", "schema_version", "origin", "module"}:

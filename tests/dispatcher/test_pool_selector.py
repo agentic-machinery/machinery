@@ -137,7 +137,9 @@ def test_selector_acceptance_table(case, expected, chosen, rejection):
     assert rejection in {r.reason for r in decision.rejected}
     # Candidate iteration order never affects either the decision or its explanation.
     assert s.choose_pool(route, task, meters, replace(policy, pools=tuple(reversed(pools))), NOW) == decision
-    assert (route, task, meters, policy) == original
+    # The selector mutates no input. Compared by repr, which names every field: a NaN window is
+    # unequal to itself, and from 3.13 dataclass equality compares fields without an identity check.
+    assert repr((route, task, meters, policy)) == repr(original)
 
 
 def test_dispatch_records_shadow_without_changing_account(tmp_path, monkeypatch):

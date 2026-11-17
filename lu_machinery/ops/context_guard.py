@@ -96,6 +96,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.ops.driver_lanes import (
@@ -111,6 +112,9 @@ from lu_machinery.ops.driver_lanes import (
     load_registry,
 )
 from lu_machinery.secret_redactor import redact_text
+
+# Deepest JSON this module reads (json_depth): Codex rollout records.
+_JSON_MAX_DEPTH = 512
 
 # The machinery package's directory name, which is also its import name. Taken from this file's
 # unresolved location, so a short import spelling does not change it.
@@ -425,7 +429,7 @@ class Tmux:
                 for index, line in enumerate(handle):
                     if not line.endswith("\n"):
                         raise ValueError("incomplete rollout record")
-                    record = json.loads(line)
+                    record = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
                     if not isinstance(record, dict):
                         raise ValueError("rollout record is not an object")
                     if index == 0:
