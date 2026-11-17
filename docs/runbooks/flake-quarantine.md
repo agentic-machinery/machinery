@@ -1,9 +1,17 @@
 # Flake quarantine admission
 
+**Closed and scheduled for removal.** A failing test is never rerun (rules core P4): it is
+fixed, or deleted with the reason in the commit and a note on its issue. Admit no entry;
+the registry stays empty. The product's follow-up change removes its quarantine marker,
+registry, CI admission step and nightly rerun-free step; machinery then deletes
+`lu_machinery/common/flake_quarantine.py` and its readers. The text below describes the
+mechanism until then.
+
 Issue #10608 uses the existing `tests/flake_quarantine.yaml` registry and
 `pytest-rerunfailures`. Admission never skips a test or changes its assertions.
-An eligible first failure gets one rerun. A second failure and pytest timeouts
-fail the job. Scheduled runs and `LU_FLAKE_DISABLE_RERUN=1` disable reruns.
+It reruns a listed node once after its first failure; no entry is admitted, so
+no node is rerun. A second failure and pytest timeouts fail the job. Scheduled
+runs and `LU_FLAKE_DISABLE_RERUN=1` disable reruns.
 Recovered failures remain visible in the terminal, JUnit `flake.reruns`
 property, Actions summary and existing nightly flake ledger.
 

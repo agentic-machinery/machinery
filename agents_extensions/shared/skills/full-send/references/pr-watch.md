@@ -41,13 +41,20 @@ the accountable driver's cycle.
 
 - Diagnose from the failed job, or from the pytest JUnit artifact when the run has one
   (drive-epic §7).
-- Classify every failed job before acting. It is either a failure of the change's own
-  checks, an evidenced infrastructure failure, or unknown.
+- Classify every failed job before acting. It is either a failing test node, a failure of
+  the change's own checks, an evidenced infrastructure failure, or unknown.
+- A **failing test node** (a JUnit failure or error, or a pytest `FAILED` or `ERROR` line) is
+  never infrastructure, even when the diff does not touch the test (rules core P4). Fix the
+  test or the code, or delete the test with the reason in the commit and a note on its issue.
+  Never rerun, re-enqueue or quarantine it. When the test is outside the brief's owned paths,
+  report the defect to the CTO with the run and node IDs and ask for the grant or a fix owner
+  (`full-send`, Ask the CTO). It counts as a failure of the change's own checks.
 - A failure of the change's own checks gets a fix through the authoring lane. A second such
   failure on this PR means stop and report, whatever the head: fix commits and owner changes
   do not reset the count. These are the only failures counted as "CI fails a second time".
-- An **evidenced infrastructure failure** names its cause from the job log: a runner lost or
-  shut down, a checkout or network failure before the change's code ran, or a provider
+- An **evidenced infrastructure failure** has no failing test node and names its cause from
+  the job log: a runner lost or shut down, an empty job list (a required job GitHub never
+  created), a checkout or network fetch failure before the change's code ran, or a provider
   capacity or outage error. A cancelled job alone is not evidence. Treat an evidenced
   infrastructure failure as a service problem. Write the evidence on the PR first (rules
   core P4), then use the head's one evidenced rerun, `"$PY" -m lu_machinery.publish run-rerun`,
@@ -88,7 +95,8 @@ from the receipt (delivery.md, hand-off record); it never restarts them.
 
 After enqueue, a CI Gate comment on the PR with a run URL means the queue ejected it. Read the
 failed jobs, fix or rebase, re-run the exact-head review if the head moved, and re-queue in the
-same hour (drive-epic §7).
+same hour (drive-epic §7). An ejection on a failing test node is fixed first. The keeper never
+re-queues an ejected head: the one re-queue after an infrastructure ejection is the owner's.
 
 ## Queue custody
 

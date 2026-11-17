@@ -44,9 +44,13 @@ unable to see or restart the seat for 13 hours.
 
 ## CI recovery
 
-Before a rerun, identify the first failing step and its terminal error. Verify that passing
-comparison runs executed that step. Compare failed paths with the full applicable diff;
-follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
+Before a rerun, identify the first failing step and its terminal error. A failing test node
+(a JUnit failure or error) is never infrastructure (rules core P4): fix the test or the code,
+or delete the test with the reason in the commit and a note on its issue, and never rerun,
+re-enqueue or quarantine it. Only a failure with no failing test node (a lost runner, an empty
+job list, a network fetch that failed before the change's code ran) may be recovered. Verify
+that passing comparison runs executed that step. Compare failed paths with the full applicable
+diff; follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
 
 ## Reviews
 

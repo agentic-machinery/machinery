@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
-import heapq
 import json
 import os
 import re
@@ -14,7 +13,6 @@ import sys
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -73,11 +71,22 @@ SLOW_FLAG_ENV = "MQ_KEEPER_SLOW_FLAG"
 SLOW_INTERVAL_SECONDS = 300
 # Timer jitter allowance so a throttled minute timer still runs on the fifth minute.
 INTERVAL_SLACK_SECONDS = 15
-# Per ``"<pr>:<head>"`` state for the P4 limit of one re-enqueue per head (#12728):
-# when the keeper re-enqueued it, every observed queue exit with the failing
-# merge_group runs found for it, and when a second removal was alerted.
-REQUEUE_STATE = ("keeper_requeues", "ejections", "ejection_alerts")
+# Per ``"<pr>:<head>"`` state for queue exits (rules core P4): every exit a pass saw, with the
+# merge_group runs found for it, and when the exit was alerted.
+REQUEUE_STATE = ("ejections", "ejection_alerts")
 AGGREGATE_JOBS = frozenset({"CI Gate"})
+# A failed job with this in its name runs pytest; its log is read for failing test nodes.
+TEST_JOB_MARKER = "pytest"
+# A test node that failed merge_group runs of this many distinct PRs within 24 hours is
+# reported to the CTO as a defect.
+REPEATED_FAILURE_PRS = 2
+EJECTED_NOTE = (
+    " The keeper enqueues only a pull request that has never been in the merge queue; every later"
+    " enqueue is the owner's own pr-merge (rules core P4). A failing test is fixed, or the test is"
+    " deleted with the reason in the commit and a note on its issue, before the owner re-enqueues."
+    " A failure with no failing test node is re-enqueued once by the owner, with the recovery"
+    " evidence recorded on the PR first."
+)
 # Job and check names and failed-test identifiers come from workflow files and CI
 # logs, so any PR author controls them; gate reasons embed check names, and
 # GitHub error text is unvetted. They reach public issue titles, issue bodies and
@@ -172,7 +181,7 @@ class GitHub:
         self.queue_jump = False
 
     @publication_boundary(KeeperError)
-    def call(self, *args: str) -> str:
+    def call(self, *args: str | Request) -> str:
         try:
             result = request_run(
                 args[0] if len(args) == 1 and isinstance(args[0], Request) else ["gh", *args],
@@ -195,7 +204,7 @@ class GitHub:
         self.queue_jump = getattr(result, "queue_jump", False) is True
         return result.stdout
 
-    def json(self, *args: str) -> Any:
+    def json(self, *args: str | Request) -> Any:
         try:
             return json.loads(self.call(*args))
         except ValueError as exc:
@@ -419,10 +428,11 @@ class GitHub:
         return data["jobs"]
 
     def failed_tests(self, job_id: int) -> list[str]:
-        """Extract only a test's relative source identifier, never log values."""
+        """Extract only a failing test node's relative source identifier (pytest ``FAILED`` or
+        ``ERROR``), never log values."""
         log = self.call("run", "view", "-R", self.repository, "--job", str(job_id), "--log")
         tests: list[str] = []
-        for match in re.finditer(r"\bFAILED\s+(tests/[^\r\n]+?)(?:\s+-\s|\r?$)", log, re.M):
+        for match in re.finditer(r"\b(?:FAILED|ERROR)\s+(tests/[^\r\n]+?)(?:\s+-\s|\r?$)", log, re.M):
             # Pytest parameter IDs can contain arbitrary private runtime data.
             # Project only the source path and Python identifiers; decline any
             # unrecognized text instead of forwarding it into a public comment.
@@ -434,15 +444,6 @@ class GitHub:
             ) and identifier not in tests:
                 tests.append(identifier)
         return tests
-
-    def issue_comment(self, number: int, body: str) -> None:
-        self.call(Request("issue-comment", repo=self.repository, number=number, body=body))
-
-    def issues(self, title: str) -> list[dict[str, Any]]:
-        return self.paged(Request("read-issues", repo=self.repository))
-
-    def create_issue(self, title: str, body: str) -> int:
-        raise KeeperError("automatic flaky-test issue creation is disabled; report finding to CTO")
 
 
 def _hold(row: Mapping[str, Any]) -> bool | None:
@@ -491,15 +492,15 @@ def _reason(
     row: Mapping[str, Any],
     verdict: Verdict,
     check_state: str,
-    drops: int,
+    ejected: bool,
     queue_enabled: bool | None,
-    requeued: bool = False,
 ) -> str:
     """Why the head may not enter the queue, or ``ready``.
 
-    P4 allows one re-enqueue per unchanged approved head after an ejection (#12728):
-    a second removal of the head is ``second-drop``, and a head the keeper already
-    re-enqueued (``requeued``) stays out even before that removal is counted.
+    The keeper enqueues only a PR that has never been in the merge queue (``ejected``
+    otherwise; rules core P4): whether a test failed is the owner's diagnosis, and every
+    later enqueue, including the one P4 allows after a failure with no failing test node,
+    is the owner's, with the recovery evidence recorded on the PR first.
     """
     if queue_enabled is not True:
         return "no-merge-queue" if queue_enabled is False else "queue-unknown"
@@ -516,10 +517,8 @@ def _reason(
         return check_state
     if row.get("mergeStateStatus") in {"DIRTY", "UNKNOWN"} or not isinstance(row.get("mergeStateStatus"), str):
         return "merge-state-unknown" if row.get("mergeStateStatus") != "DIRTY" else "merge-conflict"
-    if drops >= 2:
-        return "second-drop"
-    if requeued:
-        return "requeue-spent"
+    if ejected:
+        return "ejected"
     return "ready"
 
 
@@ -574,7 +573,7 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("undiagnosed", {}), dict)
         or not isinstance(data.get("squash_revoked", {}), dict)
         or not isinstance(data.get("pending_comments", {}), dict)
-        or not isinstance(data.get("flake_issue_updates", {}), dict)
+        or not isinstance(data.get("defect_reports", {}), dict)
         or not isinstance(data.get("last_removal", {}), dict)
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
@@ -582,8 +581,9 @@ def _load(path: Path) -> dict[str, Any]:
         raise KeeperError("keeper state malformed")
     # Records of the deleted recovery-evidence and grant ceremony (#11648). They
     # carried that ceremony's "spent" reasons, so loading them would hold heads
-    # nothing can clear. The P4 count lives in ``keeper_requeues`` instead.
-    for name in ("requeued", "shared_pass", "shared_requeues"):
+    # nothing can clear. ``keeper_requeues`` recorded the retired one keeper re-enqueue per
+    # head, and ``flake_issue_updates`` paced the retired flaky-test issue comments.
+    for name in ("requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates"):
         data.pop(name, None)
     return data
 
@@ -703,23 +703,38 @@ def _run_ids(runs: Sequence[int]) -> str:
 
 
 def _queue_cto_alert(previous: dict[str, Any], number: int, head: str, runs: Sequence[int]) -> None:
-    """Freeze one CTO inbox request for a second removal of ``head`` in the keeper state.
+    """Freeze one CTO inbox request for an ejection of ``head`` in the keeper state.
 
     ``_deliver_alerts`` sends it after the queue pass through the ownership alert's
     ``pr_ownership.deliver``. The key is minted only here, from the PR and head, so a
     retry is the same request and is never a second alert.
     """
-    key = f"merge-queue-keeper:second-drop:{number}:{head}"
+    key = f"merge-queue-keeper:ejected:{number}:{head}"
     body = (
-        f"Merge queue keeper: #{number} head {head[:12]} left the merge queue a second time "
-        f"(merge_group runs found: {_run_ids(runs)}; a run still finishing may be missing). P4 allows one "
-        "re-enqueue per unchanged approved head, "
-        "so the keeper left it out of the queue. The owner diagnoses and pushes a fix, which starts a "
-        "fresh count, or requests direction."
+        f"Merge queue keeper: #{number} head {head[:12]} left the merge queue without merging "
+        f"(merge_group runs found: {_run_ids(runs)}; a run still finishing may be missing), so the keeper "
+        "holds it out of the queue (rules core P4). A failing test is fixed, or the test is deleted with "
+        "the reason in the commit and a note on its issue, and a new head starts afresh. A failure with no "
+        "failing test node is re-enqueued once by the owner, with the recovery evidence on the PR first."
     )
+    _queue_cto_report(previous, "queue-ejection", key, body)
+
+
+def _queue_cto_report(previous: dict[str, Any], kind: str, key: str, body: str) -> None:
+    """Freeze one CTO inbox request; ``key`` is its idempotency key, so a retry is never a second report."""
     outbox = previous.setdefault("cto_outbox", [])
     if all(entry.get("key") != key for entry in outbox):
-        outbox.append({"kind": "queue-ejection", "key": key, "body": body})
+        outbox.append({"kind": kind, "key": key, "body": body})
+
+
+def _ever_queued(gh: GitHub, number: int) -> bool:
+    """Whether the PR's timeline shows any merge-queue entry, by anyone, at any head.
+
+    GitHub binds no queue stay to a PR head (a merge_group ref names the base commit), so
+    the keeper makes no per-head judgement: a PR that was ever queued is the owner's to
+    re-enqueue. An unreadable timeline raises.
+    """
+    return any(isinstance(item, dict) and item.get("event") == "added_to_merge_queue" for item in gh.timeline(number))
 
 
 def _alert_service() -> Any:
@@ -789,7 +804,8 @@ def _drop_detail(
     gh: GitHub, number: int, head: str, since: str
 ) -> tuple[str, list[str], dict[str, list[str]], int | None, list[int]]:
     """Return the diagnosis text, the failed job names and all failed tests per job, the latest
-    run ID, and the IDs of every matching failed run, oldest first."""
+    run ID, and the IDs of every matching failed run, oldest first. The PR comment and the
+    repeated-failure records use it."""
     timeline = gh.timeline(number)
     events = [
         item
@@ -834,7 +850,7 @@ def _drop_detail(
     detail = f"{run_detail}; failing jobs: {names}."
     tests: dict[str, list[str]] = {}
     for job in jobs:
-        if job.get("conclusion") != "failure" or "pytest" not in str(job.get("name", "")) or type(job.get("id")) is not int:
+        if job.get("conclusion") != "failure" or TEST_JOB_MARKER not in str(job.get("name", "")) or type(job.get("id")) is not int:
             continue
         try:
             nodes = gh.failed_tests(job["id"])
@@ -846,8 +862,9 @@ def _drop_detail(
     return detail, failed, tests, run["id"], run_ids
 
 
-def _flaky_jobs(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
-    """Group by failed node ID, falling back to the job only without a node."""
+def _repeated_failures(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
+    """Group by failed node ID, falling back to the job only without a node; keep the keys
+    that failed on at least ``REPEATED_FAILURE_PRS`` distinct PRs."""
     prs: dict[str, set[int]] = defaultdict(set)
     tests: dict[str, set[str]] = defaultdict(set)
     for item in failures if isinstance(failures, list) else []:
@@ -858,253 +875,11 @@ def _flaky_jobs(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
             continue
         key = test if isinstance(test, str) and test else job
         prs[key].add(number)
-        if key != job:
+        if isinstance(test, str) and test:  # Node evidence, even when a job is named like its node.
             tests[key].add(test)
-    return {job: (sorted(numbers), sorted(tests[job])) for job, numbers in prs.items() if len(numbers) >= 2}
-
-
-def _identity_spellings(key: str) -> frozenset[str]:
-    return frozenset({key, display_text(key), display_text(key, DISPLAY_TEST_LIMIT)})
-
-
-@dataclass(frozen=True)
-class _ProseRun:
-    text: str
-    at_start: bool
-    at_end: bool
-    emphasis: frozenset[int]
-
-
-def _markdown_references(source: str) -> tuple[list[_ProseRun], list[str], str | None]:
-    """Rebuild prose once, keeping non-prose barriers and real line boundaries.
-
-    Run edges carry source-boundary flags, so a barrier never supplies a line
-    ending. Code values remain literal and link labels never become prose.
-    """
-    try:
-        from markdown_it import MarkdownIt
-
-        parser = MarkdownIt("commonmark")
-        source = source.replace("\r\n", "\n").replace("\r", "\n")
-        tokens = parser.parse(source)
-        for scope in [tokens, *(token.children for token in tokens if token.children is not None)]:
-            stack = []
-            for token in scope:
-                if token.type in {"list_item_open", "blockquote_open"} and token.level + 1 >= parser.options["maxNesting"]:
-                    raise ValueError("CommonMark nesting limit reached")
-                if token.nesting == 1:
-                    stack.append((token.tag, token.markup))
-                elif token.nesting == -1 and (not stack or stack.pop() != (token.tag, token.markup)):
-                    raise ValueError("unbalanced CommonMark tokens")
-            if stack:
-                raise ValueError("unclosed CommonMark tokens")
-        source_lines = source.split("\n")
-        references = []
-        codes = []
-        legacy = None
-        for token in tokens:
-            if token.type != "inline":
-                continue
-            if token.children is None or token.map is None:
-                raise ValueError("CommonMark inline source unavailable")
-            # Block wrappers can strip heading suffixes and indentation. Keep
-            # their neighboring source syntax instead of inventing boundaries.
-            content_lines = token.content.split("\n")
-            raw_lines = source_lines[token.map[0]:token.map[1]]
-            cursor = 0
-            contexts = []
-            for line in content_lines:
-                while cursor < len(raw_lines) and line not in raw_lines[cursor]:
-                    cursor += 1
-                if cursor == len(raw_lines):
-                    raise ValueError("CommonMark source boundaries unavailable")
-                offset = raw_lines[cursor].index(line)
-                contexts.append((raw_lines[cursor][:offset], raw_lines[cursor][offset + len(line):]))
-                cursor += 1
-            stream = ""
-            emphasis: set[int] = set()
-            prefix, suffix = contexts[0][0], contexts[-1][1]
-            at_start = not prefix or prefix[-1].isspace()
-            link_depth = 0
-            for child in token.children:
-                if child.type == "link_open":
-                    link_depth += 1
-                elif child.type == "link_close":
-                    link_depth -= 1
-                elif link_depth:
-                    continue
-                elif child.type == "text":
-                    stream += child.content
-                    continue
-                elif child.type in {"em_open", "em_close", "strong_open", "strong_close"}:
-                    emphasis.update(range(len(stream), len(stream) + len(child.markup)))
-                    stream += child.markup
-                    continue
-                elif child.type in {"softbreak", "hardbreak"}:
-                    stream += "\n"
-                    continue
-                if child.type == "code_inline" and (stream[-1].isspace() if stream else at_start):
-                    codes.append(child.content)
-                references.append(_ProseRun(stream, at_start, False, frozenset(emphasis)))
-                stream, at_start = "", False
-                emphasis = set()
-            references.append(_ProseRun(stream, at_start, not suffix or suffix.isspace(), frozenset(emphasis)))
-            first = token.children[0] if token.children else None
-            if token.map[0] == 0 and first is not None and first.type == "code_inline" and source.startswith(first.markup):
-                closer = re.search(r"(?<!`)" + re.escape(first.markup) + r"(?!`)", source[len(first.markup):])
-                if closer and source[len(first.markup) + closer.end():].startswith(" failed merge_group runs on distinct PRs "):
-                    legacy = first.content
-        return references, codes, legacy
-    except Exception as exc:
-        raise KeeperError(f"CommonMark identity parsing failed ({type(exc).__name__})") from exc
-
-
-def _reference_eligible(prose: _ProseRun, start: int, end: int) -> bool:
-    """Check literal content, allowing one balanced pair outside its span."""
-    text = prose.text
-    boundaries = [(start, end)]
-    if start and end < len(text) and text[start - 1] == "(" and text[end] == ")":
-        boundaries.append((start - 1, end + 1))
-    for begin, finish in boundaries:
-        if not (text[begin - 1].isspace() if begin else prose.at_start):
-            continue
-        if finish == len(text):
-            if prose.at_end:
-                return True
-        elif text[finish] == "\n" or (text[finish] in ".,;!?" and (
-            text[finish + 1].isspace() if finish + 1 < len(text) else prose.at_end
-        )):
-            return True
-    return False
-
-
-def _whitespace_view(text: str) -> tuple[str, list[tuple[int, int]]]:
-    """Collapse maximal whitespace runs, retaining their complete intervals."""
-    chars: list[str] = []
-    positions: list[tuple[int, int]] = []
-    for index, char in enumerate(text):
-        if char.isspace():
-            if chars and chars[-1] == " ":
-                positions[-1] = (positions[-1][0], index + 1)
-                continue
-            char = " "
-        chars.append(char)
-        positions.append((index, index + 1))
-    return "".join(chars), positions
-
-
-def _spelling_occurrences(
-    text: str, known: Mapping[str, frozenset[str]], positions: list[tuple[int, int]],
-) -> list[tuple[int, int, str]]:
-    occurrences = []
-    for owner, spellings in known.items():
-        for spelling in spellings:
-            if not spelling:
-                continue
-            offset = text.find(spelling)
-            while offset != -1:
-                occurrences.append((positions[offset][0], positions[offset + len(spelling) - 1][1], owner))
-                offset = text.find(spelling, offset + 1)
-    return occurrences
-
-
-def _prose_identities(
-    prose: _ProseRun, known: Mapping[str, frozenset[str]],
-) -> tuple[set[str], set[str]]:
-    """Literal eligibility plus conflict-only W/E interval sweeps.
-
-    Every spelling and overlapping occurrence retains its raw owner. Active
-    intervals all intersect the current interval; each pair is visited once.
-    """
-    literal = _spelling_occurrences(prose.text, known, [(i, i + 1) for i in range(len(prose.text))])
-    eligible = {(start, end, owner) for start, end, owner in literal if _reference_eligible(prose, start, end)}
-    whitespace, positions = _whitespace_view(prose.text)
-    normalized = {owner: frozenset(_whitespace_view(value)[0] for value in values)
-                  for owner, values in known.items()}
-    without_emphasis = [(char, span) for char, span in zip(whitespace, positions, strict=True)
-                        if span[0] not in prose.emphasis]
-    # Keep literal candidate spans even when a collapsed whitespace interval
-    # covers more source characters than that candidate's own spelling.
-    views = [(literal, eligible)]
-    for text, spans in ((whitespace, positions),
-                        ("".join(char for char, _ in without_emphasis), [span for _, span in without_emphasis])):
-        view = _ProseRun(text, prose.at_start, prose.at_end, frozenset())
-        occurrences = _spelling_occurrences(text, normalized, [(i, i + 1) for i in range(len(text))])
-        mapped = [(spans[start][0], spans[end - 1][1], owner) for start, end, owner in occurrences]
-        crossing_eligible = {
-            (spans[start][0], spans[end - 1][1], owner) for start, end, owner in occurrences
-            if _reference_eligible(view, start, end)
-        }
-        views.append((literal + mapped, eligible | crossing_eligible))
-    contested: set[str] = set()
-    for occurrences, crossing_eligible in views:
-        active: dict[int, tuple[int, int, str]] = {}
-        endings: list[tuple[int, int]] = []
-        for index, current in enumerate(sorted(set(occurrences))):
-            start, end, owner = current
-            while endings and endings[0][0] <= start:
-                _, expired = heapq.heappop(endings)
-                del active[expired]
-            for other in active.values():
-                left, right, other_owner = other
-                if owner == other_owner:
-                    continue
-                if left <= start and end <= right and right - left > end - start:
-                    if current in eligible:
-                        contested.add(owner)
-                elif start <= left and right <= end and end - start > right - left:
-                    if other in eligible:
-                        contested.add(other_owner)
-                elif (left < start < right < end or start < left < end < right) and (
-                    current in crossing_eligible and other in crossing_eligible
-                ):
-                    contested.update(item[2] for item in (current, other) if item in eligible)
-            active[index] = current
-            heapq.heappush(endings, (end, index))
-    return {owner for _, _, owner in eligible}, contested
-
-
-def _canonical_flake_issue(
-    key: str, node: bool, issues: list[dict[str, Any]], known: Mapping[str, frozenset[str]]
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Resolve without publication or state writes; ambiguity overrides reuse."""
-    identities = known[key]
-    display_suffix = rf" \\?\(id:[0-9a-f]{{{DISPLAY_ID_LENGTH}}}\\?\)"
-    if re.search(display_suffix + r"\Z", key):
-        return None, "digest-shaped raw identity"
-    if any(identities & values for other, values in known.items() if other != key):
-        return None, "raw/rendered identity collision"
-    title_patterns = [re.escape(value) for value in sorted(identities)]
-    title_patterns.extend(
-        "".join((r"\\?" if char in r"\`*_{}[]()#+.!>~-" else "") + re.escape(char) for char in value)
-        for value in sorted(identities - {key})
-    )
-    title_pattern = "(?:" + "|".join(title_patterns) + ")"
-    matches = []
-    ambiguous = False
-    for item in issues:
-        if "pull_request" in item or item.get("state", "open") != "open":
-            continue
-        title, body = (str(item.get(field) or "") for field in ("title", "body"))
-        if title.startswith("Merge queue flaky test: "):
-            matched = re.fullmatch("Merge queue flaky test: " + title_pattern, title) is not None
-        else:
-            body_references, body_codes, legacy = _markdown_references(body)
-            if not (node or "<!-- mq-keeper-flake -->" in body or legacy in identities):
-                continue
-            title_references, title_codes, _ = _markdown_references(title)
-            matched = any(code in identities for code in [*title_codes, *body_codes])
-            for prose in [*title_references, *body_references]:
-                eligible, contested = _prose_identities(prose, known)
-                matched |= key in eligible
-                ambiguous |= key in contested
-        if matched:
-            matches.append(item)
-    if any(type(item.get("number")) is not int or item["number"] <= 0 for item in matches):
-        raise KeeperError("matching flaky-test issue has no valid number")
-    if ambiguous:
-        return None, "known longer identity in prose"
-    return (min(matches, key=lambda item: item["number"]) if matches else None), None
+    return {
+        job: (sorted(numbers), sorted(tests[job])) for job, numbers in prs.items() if len(numbers) >= REPEATED_FAILURE_PRS
+    }
 
 
 def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str], bool]:
@@ -1166,7 +941,6 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             _count_removals(gh, number, head, previous)
         except KeeperError as exc:
             removal_error = display_text(str(exc), DISPLAY_REASON_LIMIT)
-        drops = int(previous["drops"].get(drop_key, 0))
         dropped = key in previous["queued"] and queued is False
         detail = ""
         failed_jobs: list[str] = []
@@ -1197,9 +971,27 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     detail = " Queue removal diagnosis unknown."
             except KeeperError as exc:
                 detail = f" Queue removal diagnosis lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}."
-        # The keeper's one re-enqueue of this head is spent; a queued head is left alone.
-        requeued = queued is not True and drop_key in previous.get("keeper_requeues", {})
-        reason = _reason(pr, verdict, checks, drops, queue_enabled, requeued)
+        # P4: the keeper enqueues only a PR that was never in the merge queue; a queued PR is
+        # left alone. An exit a pass saw is on record here; any other shows on the timeline.
+        exited = queued is not True and (
+            drop_key in previous.get("ejections", {}) or drop_key in previous.get("undiagnosed", {})
+        )
+        ejected = exited
+        # An unread queue history cannot show that this PR was never queued.
+        ejection_unknown = bool(removal_error)
+        if queued is not True and not ejected and not ejection_unknown:
+            # Read on every pass, whatever holds the head, so no later readiness read skips it.
+            try:
+                ejected = _ever_queued(gh, number)
+            except KeeperError:
+                ejection_unknown = True
+        # ``ejected`` names an exit of this head a pass saw; ``queued-before`` any other PR stay.
+        held_as = "ejected" if exited else "queued-before"
+        reason = _reason(pr, verdict, checks, ejected, queue_enabled)
+        if reason == "ejected":
+            reason = held_as
+        if reason == "ready" and queued is not True and ejection_unknown:
+            reason = "ejection-unknown"
         if reason == "ready" and queued is not True and not armed:
             try:
                 reason = _gate_hold(gh, number, head, previous) or reason
@@ -1285,12 +1077,19 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 except KeeperError:
                     current_checks = "CI-unknown"
                 reason = (
-                    _reason(current, current_verdict, current_checks, drops, queue_enabled, requeued)
+                    _reason(current, current_verdict, current_checks, ejected, queue_enabled)
                     if verdict_lookup_ok
                     else "fresh-evidence-unknown"
                 )
+                if reason == "ejected":
+                    reason = held_as
+                if reason == "ready" and queued is not True and ejection_unknown:
+                    reason = "ejection-unknown"
                 if reason == "ready" and queued is not True and not armed:
                     reason = _gate_hold(gh, number, head, previous) or reason
+            if queued is not True and not armed and current_head == head and _auto_merge_armed(current):
+                # GitHub queues an armed head by itself, so a head armed since the snapshot is guarded too.
+                armed = True
             if queued is True or armed:
                 fresh = bool(
                     current
@@ -1310,6 +1109,12 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     if fresh
                     else None
                 )
+                if (
+                    revoke is None and fresh and queued is not True and armed and (ejected or ejection_unknown)
+                    and not gh.membership(number)  # A PR GitHub queued since the snapshot is left alone.
+                ):
+                    # GitHub would queue an armed head by itself; an ejected head is disarmed.
+                    revoke = reason = held_as if ejected else "ejection-unknown"
                 if revoke is None and fresh and queued is True:
                     blocked = gh.squash_blocked(number, head)
                     if blocked:
@@ -1330,11 +1135,9 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                         queued_now.pop(key, None)
                     if revoke == "squash-text-blocked":
                         previous.setdefault("squash_revoked", {})[drop_key] = observed
-                    if queued is True and verdict_lookup_ok and current_verdict.state in MISSING_CF_STATES:
-                        # Count the removal even when another blocker is the stated reason.
-                        previous["drops"][drop_key] = int(previous["drops"].get(drop_key, 0)) + 1
-                        if revoke == "needs-CF":
-                            previous.setdefault("pending_comments", {})[drop_key] = revoke
+                    if queued is True and revoke == "needs-CF":
+                        # A keeper dequeue is not an ejection: no merge_group run removed the head.
+                        previous.setdefault("pending_comments", {})[drop_key] = revoke
                     estimated_remaining -= 30
                 elif reason == "ready" and queued is True:
                     lines.append(f"#{number} remains queued")
@@ -1343,11 +1146,6 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 else:
                     lines.append(f"#{number} armed: requirement unmet")
             elif reason == "ready":
-                if drops >= 1 or drop_key in previous.get("ejections", {}):
-                    # Spend the one re-enqueue on disk before the mutation, so neither a
-                    # later tick nor a restart after a crash can enqueue this head again.
-                    previous.setdefault("keeper_requeues", {})[drop_key] = observed
-                    _save(state_path, previous)
                 jumped = gh.enqueue(number, head)
                 if not gh.membership(number):
                     after_enqueue = gh.current(number)
@@ -1360,37 +1158,38 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     lines.append(f"#{number} enqueued" + (" at the front (priority)" if jumped else ""))
                 estimated_remaining -= 30
             _flush_pending_comments(gh, number, comments, login, previous, comment_safe=can_comment)
-            # A second removal is announced once, whatever else holds the head, while the PR
-            # is out of the queue, with the runs found by then. GitHub does not link a removal
-            # to its run, so a run still finishing is named as possibly missing, never awaited.
+            # An ejection is announced once, whatever else holds the head, while the PR is out
+            # of the queue, with the runs found by then. GitHub does not link a removal to its
+            # run, so a run still finishing is named as possibly missing, never awaited.
             if (
-                drops >= 2
+                exited
                 and queued is False
                 and comment_safe
                 and drop_key not in previous.get("ejection_alerts", {})
             ):
                 runs = previous.get("ejections", {}).get(drop_key, [])
-                _comment_once(gh, number, head, "second-drop", comments, login, (
+                _comment_once(gh, number, head, "ejected", comments, login, (
                     f" Merge_group runs found for its removals: {_run_ids(runs)} (a run still finishing may be"
-                    " missing). P4 allows one re-enqueue per"
-                    " unchanged approved head; push a fix (a new head starts a fresh count) or request direction."
+                    " missing)." + EJECTED_NOTE
                 ))
                 _queue_cto_alert(previous, number, head, runs)
                 previous.setdefault("ejection_alerts", {})[drop_key] = observed
-                lines.append(f"#{number} second-drop alerted to the CTO: runs={_run_ids(runs)}")
+                lines.append(f"#{number} ejection alerted to the CTO: runs={_run_ids(runs)}")
             if (
                 reason not in {
-                    "ready", "second-drop", "needs-CF", "CF-unknown", "fresh-evidence-unknown", "fresh-read-unknown",
+                    "ready", "ejected", "needs-CF", "CF-unknown", "fresh-evidence-unknown", "fresh-read-unknown",
                 }
                 and comment_safe
                 and (_ever_approved(comments, login) or dropped)
             ):
-                _comment_once(gh, number, head, reason, comments, login, detail)
+                _comment_once(
+                    gh, number, head, reason, comments, login, detail + (EJECTED_NOTE if reason == "queued-before" else "")
+                )
             elif dropped and dropped_head == head and detail and comment_safe:
                 _comment_once(gh, number, head, "queue-drop", comments, login, detail)
             for job in failed_jobs:
                 if job in AGGREGATE_JOBS:
-                    continue  # The aggregate gate fails whenever any job fails; it is never a flaky test.
+                    continue  # The aggregate gate fails whenever any job fails; it names no test.
                 for test in failed_tests.get(job, [""]):
                     record: dict[str, Any] = {"job": job, "pr": number, "at": observed}
                     if failed_run is not None:
@@ -1411,76 +1210,39 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 previous[name] = {
                     item: value for item, value in previous[name].items() if item.split(":", 1)[0] in open_numbers
                 }
-    # Freeze before pruning, including singleton and old loaded records. Issue
-    # update keys and PR/head bookkeeping are never source identities.
-    known_keys = set()
-    for item in previous.get("failures", []):
-        if not isinstance(item, dict):
-            continue
-        job, test = item.get("job"), item.get("test")
-        if isinstance(job, str) and job and job not in AGGREGATE_JOBS:
-            known_keys.add(job)
-        if isinstance(test, str) and test and test not in AGGREGATE_JOBS:
-            known_keys.add(test)
-    cutoff = datetime.now(UTC) - timedelta(hours=24)
+    cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
     failures = [
         item for item in previous.get("failures", [])
-        if isinstance(item, dict) and isinstance(item.get("at"), str) and item["at"] >= cutoff.isoformat()
+        if isinstance(item, dict) and isinstance(item.get("at"), str) and item["at"] >= cutoff
     ]
     previous["failures"] = failures
-    issue_updates = previous.setdefault("flake_issue_updates", {})
-    flaky = _flaky_jobs(failures)
-    known = {key: _identity_spellings(key) for key in frozenset(known_keys | flaky.keys())}
-    issues = None
-    if flaky and budget:
-        try:
-            issues = list(gh.issues(""))
-        except KeeperError as exc:
-            failed = True
-            lines.append(f"flaky-test issue listing FAILED: {exc}")
-    for key, (numbers, tests) in sorted(flaky.items()):
-        if not budget or issues is None:
-            continue
+    # A test failing merge_group runs of distinct PRs is a defect, never infrastructure (rules
+    # core P4). It goes to the CTO inbox once per test and set of PRs; the CTO assigns the fix.
+    reports = previous.setdefault("defect_reports", {})
+    for report_key, stamp in list(reports.items()):
+        if not isinstance(stamp, str) or stamp < cutoff:
+            reports.pop(report_key)
+    for key, (numbers, tests) in sorted(_repeated_failures(failures).items()):
         matching = [item for item in failures if (item.get("test") or item.get("job")) == key]
         run_ids = sorted({item["run_id"] for item in matching if type(item.get("run_id")) is int})
-        body = (
-            f"{code_span(key, DISPLAY_TEST_LIMIT)} failed merge_group runs on distinct PRs "
-            f"{', '.join(f'#{n}' for n in numbers)} within 24 hours."
-            f" Run IDs: {', '.join(map(str, run_ids)) or 'unknown (legacy record)'}."
-        )
-        if tests:
-            body += f" Failed test: {code_span(tests[0], DISPLAY_TEST_LIMIT)}."
-        try:
-            marker = "<!-- mq-keeper-flake -->"
-            issue, ambiguity = _canonical_flake_issue(key, bool(tests), issues, known)
-            lines.append(f"flaky record: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
-                         f"runs={','.join(map(str, run_ids)) or 'unknown'}; issue={issue.get('number', 'unknown') if issue else 'none'}")
-            if ambiguity:
-                lines.append(f"CTO finding: ambiguous identity for {display_text(key, DISPLAY_TEST_LIMIT)}; "
-                             f"{display_text(ambiguity)}; automatic issue creation disabled")
-                continue
-            if issue is None:
-                lines.append(f"CTO finding: no canonical open issue for {display_text(key, DISPLAY_TEST_LIMIT)}; "
-                             "automatic issue creation disabled")
-                continue
-            if not apply:
-                continue
-            issue_number = issue.get("number")
-            if type(issue_number) is not int:
-                raise KeeperError("matching flaky-test issue has no number")
-            comments = gh.comments(issue_number)
-            recent = any(
-                marker in str(comment.get("body", ""))
-                and (comment.get("user") or {}).get("login") == login
-                and str(comment.get("created_at", "")) >= cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
-                for comment in comments
+        lines.append(f"repeated test failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
+                     f"runs={','.join(map(str, run_ids)) or 'unknown'}")
+        digest = hashlib.sha256(f"{key}\n{numbers}".encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
+        report_key = f"merge-queue-keeper:test-defect:{digest}"
+        if not apply or report_key in reports:
+            continue
+        _queue_cto_report(previous, "queue-test-defect", report_key, (
+            f"Merge queue keeper: {code_span(key, DISPLAY_TEST_LIMIT)} failed merge_group runs of distinct PRs "
+            f"{', '.join(f'#{n}' for n in numbers)} within 24 hours (run IDs: {', '.join(map(str, run_ids)) or 'unknown'}). "
+            + (
+                "A failing test is never infrastructure and is never rerun (rules core P4): assign a fix, or delete "
+                "the test with the reason in the commit and a note on its issue."
+                if tests else
+                "No failing test node was read for it: diagnose the job. A failing test node is fixed, never rerun "
+                "(rules core P4); a failure with no failing test node is infrastructure."
             )
-            if not recent and issue_updates.get(str(issue_number), "") < cutoff.isoformat():
-                gh.issue_comment(issue_number, body + "\n\n" + marker)
-                issue_updates[str(issue_number)] = observed
-        except KeeperError as exc:
-            failed = True
-            lines.append(f"flaky-test issue FAILED: {exc}")
+        ))
+        reports[report_key] = observed
     if apply:
         _save(state_path, previous)
     return lines, failed
@@ -1490,7 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Guard and replenish approved, green pull requests in configured merge queues.\nUse --report to inspect and --apply only for authorized local scheduling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states; --apply also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nAn ejected head is re-enqueued at most once (P4); a second removal holds it and alerts the PR and the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
+        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states; --apply also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nThe keeper enqueues only a PR that was never in the merge queue (P4); every later enqueue is the owner's pr-merge. It\nholds such a PR, comments once per head and reports it to the CTO inbox once per head; an unread timeline holds a PR\nuntil a later pass reads it. A test failing merge_group runs of two PRs within 24 hours is reported to the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--report", action="store_true", help="Read-only report (default).")

@@ -82,7 +82,8 @@ never fine.
    `accept --pr <N> --reason "<why>" --decision-owner "<who>"`. The alert clears on that
    acceptance or custody, or when the PR closes; `--release` ends recorded custody, and
    `pr_ownership status` lists the alerts still outstanding. The successor inherits the PR's
-   review budget and the head's rerun allowance.
+   review budget and the head's rerun allowance (infrastructure failures only, never a failing
+   test node).
    A queue custodian also covers ejection, stale approval, merge confirmation and closeout for
    the owners it releases ([pr-watch](../../full-send/references/pr-watch.md#queue-custody)).
 5. **Live workers.** Active dispatches from the Monitor API, then
