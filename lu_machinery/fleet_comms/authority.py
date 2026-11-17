@@ -220,11 +220,13 @@ _LOG = logging.getLogger(__name__)
 
 
 def _load_roster() -> tuple[frozenset[str], bool]:
-    """The durable CTO, registered slots and driver lanes, and whether both sources loaded.
+    """The durable CTO, registered slots, external recipients and driver lanes, and whether both sources loaded.
 
     Slots come from ``config/area_assignments.yaml`` (the roster every slot
-    reader uses) and lane senders from ``config/driver_lanes.json`` (the lanes
-    the context guard hands off). The roster is complete only when the slot
+    reader uses), external drain recipients from that file's
+    ``external_recipients`` list (agents outside the launcher fleet whose inbox
+    an external bridge drains), and lane senders from ``config/driver_lanes.json``
+    (the lanes the context guard hands off). The roster is complete only when the slot
     roster names at least one slot and the lane file loads with at least one
     lane; an incomplete roster proves no name unregistered. The result is
     cached per file identity (path, mtime, size), so every claim does not
@@ -245,6 +247,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     if cached is not None:
         return cached
     slots = _channels._load_registry_slots(paths[0])
+    external = _load_external_recipients(paths[0])
     lanes: tuple[str, ...] = ()
     with contextlib.suppress(Exception):
         lanes = tuple(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
@@ -255,14 +258,35 @@ def _load_roster() -> tuple[frozenset[str], bool]:
             "unregistered names are admitted and no subscription or delivery is ended",
             len(slots), len(lanes),
         )
-    roster = (frozenset({DURABLE_CTO_RECIPIENT, *slots, *lanes}), complete)
+    roster = (frozenset({DURABLE_CTO_RECIPIENT, *slots, *external, *lanes}), complete)
     _ROSTER_CACHE.clear()
     _ROSTER_CACHE[tuple(key)] = roster
     return roster
 
 
+def _load_external_recipients(path: Path) -> tuple[str, ...]:
+    """The ``external_recipients`` names declared in the slot roster file; empty when absent or unreadable.
+
+    These agents are not launcher slots, so ``_load_registry_slots`` never
+    reads them; only recipient admission does. They add names and never decide
+    whether the roster is complete.
+    """
+    try:
+        import yaml
+    except ImportError:
+        return ()
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return ()
+    names = data.get("external_recipients") if isinstance(data, dict) else None
+    if not isinstance(names, list):
+        return ()
+    return tuple(name.strip() for name in names if isinstance(name, str) and name.strip())
+
+
 def _registered_recipients() -> frozenset[str]:
-    """Recipients a drain reads besides live tasks: the durable CTO, registered slots and driver lanes."""
+    """Recipients a drain reads besides live tasks: the durable CTO, registered slots, external recipients and driver lanes."""
     return _load_roster()[0]
 
 
