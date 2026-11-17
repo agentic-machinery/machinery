@@ -1025,32 +1025,43 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
 
 
 def _delivery_prs(record: dict, repo: str) -> list[int]:
-    """Numbers of the ``repo`` pull requests that may carry the task's delivery.
+    """Candidate PRs from acceptance, exact branches and the non-search closed-PR listing.
 
-    They are the ones it accepted and the merged ones opened from its own or its publish branch.
+    The updated-time order bounds the family scan at task start: a PR merged during
+    the task must have been updated then. Branch names discover candidates, never attribution.
     """
     numbers = set(_accepted_prs(record["task_id"], repo))
-    for branch in sorted({record["worktree_branch"], record.get("publish_branch")} - {None}):
+    branches = sorted({record["worktree_branch"], record.get("publish_branch")} - {None})
+    for branch in branches:
         listed = json.loads(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "merged",
                                 "--json", "number,isCrossRepository,headRefName"))
         numbers.update(pr["number"] for pr in listed if pr["headRefName"] == branch and not pr["isCrossRepository"])
+    started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
+    page = 1
+    while True:
+        listed = json.loads(_gh("api", f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"))
+        if not listed:
+            break
+        updated = [datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00")) for pr in listed]
+        numbers.update(pr["number"] for pr, at in zip(listed, updated, strict=True)
+                       if at >= started and pr["merged_at"] and any(
+                           pr["head"]["ref"] == branch or pr["head"]["ref"].startswith((branch + "-", branch + "/"))
+                           for branch in branches))
+        if len(listed) < 100 or min(updated) < started:
+            break
+        page += 1
     return sorted(numbers)
 
 
 def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
-    """Try known candidates before exact-head association, without using the issue-search index."""
+    """Try recorded-branch candidates before exact-head association; neither is attribution by itself."""
     seen = set()
-    try:
-        for number in _delivery_prs(record, repo):
-            seen.add(number)
-            yield number
-    except GitHubRefused:
-        raise
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
-        record["merged_delivery_lookup"] = f"error:{type(exc).__name__}"
+    for number in _delivery_prs(record, repo):
+        seen.add(number)
+        yield number
     head = record.get("head_sha")
-    # A task that added no commit of its own has nothing to attribute: its head is where it started, which another
-    # task's merged pull request can share.
+    # A zero-commit snapshot cannot attribute a PR by head association alone: another task's
+    # merged PR can share that starting head. Branch candidates still require a task trailer or acceptance.
     commits = record.get("commits_ahead")
     if head and isinstance(commits, int) and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         listed = _gh("api", "--paginate", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
@@ -1093,12 +1104,13 @@ def merged_delivery(record: dict) -> dict | None:
     """The merged pull request that carries this task's delivery, or None when none is proven.
 
     A task that ends with its work merged has nothing left on its own branch to inspect: the
-    PR it accepted, or the one opened from its branch, is the delivery, and a worker may have
+    PRs it accepted, or those opened from its branch family, carry the delivery, and a worker may have
     reset or deleted the branch after the merge. A candidate counts only when GitHub reports
     it MERGED after the task started into the task's recorded base branch or the remote's
     default branch (a stacked task's base is the parent branch, and the pull request is
     retargeted onto the default branch once that parent is gone), with a merge commit and a
-    task-authored commit (or an explicit task acceptance when it added no commits). Any lookup
+    task-authored commit (or an explicit task acceptance when it added no commits). All attributed
+    candidates contribute paths, so an earlier valid split cannot hide a later ownership violation. Any lookup
     failure is None, so the caller falls back to refusing on the local evidence. ``paths`` is
     every path the PR changed, rename sources included, plus every path any commit of the task's
     touched, as the settlement walk reads them from the PR's final head (a reverted change still
@@ -1109,12 +1121,19 @@ def merged_delivery(record: dict) -> dict | None:
     from lu_machinery.dispatcher import ownership
 
     record["merged_delivery_lookup"] = "no_match"
+    record.pop("merged_delivery_exclusions", None)
     try:
         repo, base = _repo_and_base(record)
         if repo is None:
             return None
         started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
         accepted_default = None
+        deliveries = []
+        paths: set[str] = set()
+        primary = None
+        strong_delivery = False
+        snapshot_published = record.get("commits_ahead") == 0
+        accepted = set(_accepted_prs(record["task_id"], repo))
 
         def accepted_base(name: str) -> bool:
             nonlocal accepted_default
@@ -1128,29 +1147,31 @@ def merged_delivery(record: dict) -> dict | None:
 
         for number in _merged_delivery_candidates(record, repo):
             pr = json.loads(_gh("pr", "view", str(number), "--repo", repo, "--json",
-                                "state,baseRefName,mergedAt,headRefOid,mergeCommit,isCrossRepository"))
+                                "state,baseRefName,mergedAt,headRefOid,headRefName,mergeCommit,isCrossRepository"))
             if (pr["state"] != "MERGED" or pr["isCrossRepository"] or not pr["mergeCommit"]
                     or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pr["mergeCommit"]["oid"])
                     or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started
                     or not accepted_base(pr["baseRefName"])):
                 continue
+            strong = (number in accepted or pr["headRefName"] in {
+                record["worktree_branch"], record.get("publish_branch")} or pr["headRefOid"] == record["head_sha"])
             # An accepted pull request is the task's whatever it committed; otherwise a commit of its own must carry
             # its trailer, and a matching branch name alone never attributes another task's work.
-            if number not in _accepted_prs(record["task_id"], repo):
-                if record.get("commits_ahead") == 0:
-                    continue
+            if number not in accepted:
                 messages = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/commits", "--jq",
                                ".[] | .commit.message | @json")
                 trailer = f"X-Agent: {record['agent']}/{record['task_id']}"
-                if not any(trailer in json.loads(line).splitlines() for line in messages.splitlines()):
+                trailers = [line for message in messages.splitlines() for line in json.loads(message).splitlines()
+                            if line.startswith("X-Agent:")]
+                if trailer not in trailers:
                     continue
-            # A merged PR whose final head is the task's head proves the push, even once its branch and its
-            # refs/pull/N/head are gone from the remote and a squash merge left that head out of the base.
-            if record.get("commits_ahead") != 0 and pr["headRefOid"] != record["head_sha"]:
-                tip, merged = _canonical_publication(
-                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])
-                if not (merged or tip == record["head_sha"]):
-                    continue  # this candidate does not prove the push; a later one may
+                if not strong and any(line != trailer for line in trailers):
+                    record["merged_delivery_lookup"] = "ambiguous_task_attribution"
+                    record.setdefault("merged_delivery_exclusions", []).append(
+                        {"repo": repo, "number": number, "reason": "ambiguous_task_attribution"})
+                    continue  # inherited task commits do not establish custody of a successor's PR
+            # Any exact merged head proves the snapshot's publication, even after branch deletion.
+            snapshot_published = snapshot_published or pr["headRefOid"] == record["head_sha"]
             # One JSON string per line keeps a name with a newline or quote whole.
             changed = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/files",
                           "--jq", ".[] | (.filename, (.previous_filename // empty)) | @json")
@@ -1163,10 +1184,23 @@ def merged_delivery(record: dict) -> dict | None:
                 commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
                 history = ownership.delivered_paths(
                     run, pr["headRefOid"], parent, start, commits_expected=commits_expected)
+            paths.update(json.loads(line) for line in changed.splitlines() if line)
+            paths.update(history)
+            delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=pr["mergeCommit"]["oid"])
+            deliveries.append(delivery)
+            strong_delivery = strong_delivery or strong
+            if pr["headRefOid"] == record["head_sha"]:
+                primary = delivery
+        if deliveries:
+            if record.get("merged_delivery_exclusions") and not strong_delivery:
+                return None  # only family-prefix evidence cannot resolve the mixed-task ambiguity
+            if not snapshot_published:
+                tip, merged = _canonical_publication(
+                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])
+                if not (merged or tip == record["head_sha"]):
+                    return None  # merged splits cannot conceal further unpublished work
             record.pop("merged_delivery_lookup", None)
-            return dict(repo=repo, number=number, merged_at=pr["mergedAt"],
-                        merge_sha=pr["mergeCommit"]["oid"],
-                        paths=sorted({json.loads(line) for line in changed.split("\n") if line} | set(history) - {""}))
+            return {**(primary or deliveries[0]), "pull_requests": deliveries, "paths": sorted(paths - {""})}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
         # The refusal remains fail-closed, but a later investigation can distinguish an empty lookup
         # from an exception. Exception text can contain credentials or private paths, so keep only its type.

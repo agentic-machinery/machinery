@@ -46,7 +46,7 @@ from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.common.scratch import ScratchScanRootError, ensure_scratch_root, scratch_scan_roots
-from lu_machinery.orchestration.thread_handoff import (
+from lu_machinery.orchestration.process_identity import (
     _default_machine_id,
     _default_process_snapshot,
     _process_is_alive,

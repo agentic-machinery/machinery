@@ -150,11 +150,6 @@
    "sha256": "8dba4bf8585a7d9c54e4f45910c2c546a802198656049bc894829ca1a2753cb0"
   },
   {
-   "path": "lu_machinery/session_canary/glm_lane.py",
-   "rule": "generic.secrets.gitleaks.generic-api-key",
-   "sha256": "5ca7b324a5cbf5ce338e18fbf32e0e790da642cdce0c5ae82eca695bab318bd1"
-  },
-  {
    "path": ".githooks/pre_push_gate.py",
    "rule": "python.lang.best-practice.arbitrary-sleep",
    "sha256": "8a0911c9823648049150892dc195447e40f4d5beb9ecf9415323cd33ffaabe16"
@@ -1928,11 +1923,6 @@
    "path": "lu_machinery/review/snapshot.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "e1adebee74ed01880ffdb4e14ab178b10c70baa8228e6dd0b7ce779c1c0303cc"
-  },
-  {
-   "path": "lu_machinery/session_canary/glm_lane.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "b8b6e7e04a51268d023ef90dd994947700e5b64939561fc9f334925d787e3291"
   },
   {
    "path": "lu_machinery/session_canary/grok_lane.py",

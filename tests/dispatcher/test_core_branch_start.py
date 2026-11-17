@@ -28,6 +28,7 @@ def test_accepted_merged_pr_without_new_commits_is_delivered(merged_delivery_wor
 def test_branch_reset_or_deleted_after_merge_is_delivered(merged_delivery_world):
     """Defect class: the task's own PR merged, then the branch was reset or deleted, so the check read a git error."""
     world = merged_delivery_world
+    world.search_listed = []  # a just-merged PR is not yet visible in the issue-search index
     world.record["commits_ahead"] = 2
     world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe"}]
     world.prs[78], world.files[78] = {**MERGED, "headRefOid": world.record["head_sha"]}, ["docs/owned.md"]
@@ -118,6 +119,133 @@ def test_unpushed_change_without_a_provable_merged_delivery_is_still_refused(mer
         world.record.update(status="done", owned_paths=None)
         worker._enforce_delivery(world.record)
         assert world.record["error"] == "work_not_pushed_or_unknown"
+
+
+@pytest.mark.parametrize(("commits", "closeout_code", "separator"), [(0, 0, "-"), (3, 0, "-"), (3, 0, "/"), (3, 1, "-")])
+def test_additional_task_prs_recover_split_branch_delivery(
+    merged_delivery_world, monkeypatch, tmp_path, commits, closeout_code, separator,
+):
+    """Defect class: merged split branches are invisible after the task resets onto the merged base (#522)."""
+    world = merged_delivery_world
+    world.record["commits_ahead"] = commits
+    world.listed = [
+        {"number": 78, "isCrossRepository": False, "headRefName": f"claude/merge-probe{separator}layout",
+         "headRefOid": "d" * 40},
+        {"number": 79, "isCrossRepository": False, "headRefName": f"claude/merge-probe{separator}alerts",
+         "headRefOid": "e" * 40},
+    ]
+    world.prs = {78: dict(MERGED), 79: {**MERGED, "headRefOid": "e" * 40}}
+    world.files = {78: ["docs/owned.md"], 79: ["docs/second.md"]}
+    world.record["owned_paths"].append("docs/second.md")
+    world.search_listed = []
+    if separator == "/":
+        # The second page must still contribute both splits when the first page is full.
+        filler = {"number": 90, "head": {"ref": "other/task"}, "merged_at": None,
+                  "updated_at": "2026-10-29T09:00:00Z"}
+        world.closed_pages = {1: [filler] * 100, 2: [
+            {"number": pr["number"], "head": {"ref": pr["headRefName"]},
+             "merged_at": "2026-10-29T09:00:00Z", "updated_at": "2026-10-29T09:00:00Z"}
+            for pr in world.listed]}
+    worker._enforce_delivery(world.record)
+    assert (world.record["status"], world.record["error"]) == ("done", None)
+    assert world.record["delivery_prs"] == ["org/repo#78", "org/repo#79"]
+    assert "no_deliverable_reason" not in world.record
+
+    # The existing closeout chain owns every merged split, after worktree removal.
+    root = tmp_path / "checkout"
+    root.mkdir()
+    world.record["repo"] = "fixture"
+    monkeypatch.setattr(git, "resolve_repo", lambda _: (root, {}))
+    monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
+    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
+    monkeypatch.setattr(worker, "_reap_worktree", lambda record, **_: record.update(worktree_disposition="removed"))
+    calls = []
+
+    def closeout(request):
+        assert world.record["worktree_disposition"] == "removed"
+        calls.append(request["pr"])
+        return {"pr": request["pr"], "returncode": closeout_code if request["pr"] == 79 else 0}
+
+    monkeypatch.setattr(worker, "_run_merge_closeout", closeout)
+    worker._reap_settled(world.record)
+    assert calls == [78, 79]
+    assert world.record["closeout"]["returncode"] == closeout_code
+    assert world.record["status"] == ("failed" if closeout_code else "done")
+    worker._reap_settled(world.record)
+    assert calls == [78, 79]
+
+
+@pytest.mark.parametrize("fault", ["outside-path", "reverted-outside-path", "foreign-trailer", "branch-collision", "invalid-family-page", "mixed-trailers", "own-exact-with-mixed-successor"])
+def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypatch, fault):
+    """Defect class: accepting the first merged split hides an unowned path or credits another task's split."""
+    world = merged_delivery_world
+    world.record["commits_ahead"] = 2
+    world.listed = [
+        {"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"},
+        {"number": 79, "isCrossRepository": False, "headRefName": "claude/merge-probe-alerts"},
+    ]
+    world.prs = {78: dict(MERGED), 79: dict(MERGED)}
+    world.files = {78: ["docs/owned.md"], 79: ["outside.txt"]}
+    if fault == "reverted-outside-path":
+        world.files[79] = ["docs/owned.md"]
+        monkeypatch.setattr(worker.ownership, "delivered_paths", lambda *_args, **_kwargs: ["outside.txt"])
+    elif fault == "foreign-trailer":
+        world.messages[78] = world.messages[79] = "X-Agent: claude/other-task"
+    elif fault == "branch-collision":
+        world.listed[0]["headRefName"] = world.listed[1]["headRefName"] = "claude/merge-probeother"
+    elif fault == "invalid-family-page":
+        world.closed_pages = {1: [{"updated_at": "not-a-timestamp"}]}
+    elif fault in {"mixed-trailers", "own-exact-with-mixed-successor"}:
+        world.files[79] = ["docs/owned.md"]
+        world.messages[79] = "X-Agent: claude/merge-probe\nX-Agent: claude/successor-task"
+        if fault == "own-exact-with-mixed-successor":
+            world.listed[0]["headRefName"] = "claude/merge-probe"
+            world.prs[78]["headRefOid"] = world.record["head_sha"]
+            world.files[79] = ["foreign-task.txt"]
+    worker._enforce_delivery(world.record)
+    if fault == "own-exact-with-mixed-successor":
+        assert (world.record["status"], world.record["error"]) == ("done", None)
+        assert world.record["delivery_prs"] == ["org/repo#78"]
+        assert world.record["merged_delivery_exclusions"] == [
+            {"repo": "org/repo", "number": 79, "reason": "ambiguous_task_attribution"}]
+        proof = git.merged_delivery(world.record)
+        assert [pr["number"] for pr in proof["pull_requests"]] == [78]
+        return
+    assert world.record["status"] == "no_deliverable"
+    if fault in {"outside-path", "reverted-outside-path"}:
+        assert world.record["error"] == "outside_owned_paths: outside.txt"
+    else:
+        assert "delivery_pr" not in world.record
+    if fault == "mixed-trailers":
+        assert world.record["merged_delivery_lookup"] == "ambiguous_task_attribution"
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+def test_split_delivery_rejects_unpublished_snapshot(merged_delivery_world, dirty):
+    """Defect class: a merged split must never conceal a later unpushed commit or tracked edit."""
+    world = merged_delivery_world
+    world.record.update(commits_ahead=2, worktree_dirty_on_exit=dirty)
+    world.published = (None, False)
+    world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"}]
+    world.prs[78], world.files[78] = dict(MERGED), ["docs/owned.md"]
+    worker._enforce_delivery(world.record)
+    assert world.record["status"] == "no_deliverable"
+    assert "delivery_pr" not in world.record
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_split_delivery_preserves_provider_failure_evidence(merged_delivery_world, merged):
+    """Defect class: delivery recovery must retain the provider's original failure and require merged proof."""
+    world = merged_delivery_world
+    world.record.update(status="failed", error="provider exited unsuccessfully", provider_terminal_failure=True,
+                        commits_ahead=2, returncode=17)
+    world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"}]
+    world.prs[78], world.files[78] = {**MERGED, "state": "MERGED" if merged else "OPEN"}, ["docs/owned.md"]
+    worker._enforce_delivery(world.record)
+    assert world.record["status"] == ("done" if merged else "failed")
+    assert world.record["provider_terminal_error"] == "provider exited unsuccessfully"
+    assert world.record["returncode"] == 17
+    assert world.record["error"] == (None if merged else "provider exited unsuccessfully")
 
 
 @pytest.mark.parametrize("reuse_cwd", [False, True])

@@ -655,7 +655,9 @@ def _enforce_delivery(record: dict) -> None:
         cause = _outside_cause(paths, owned) if owned else None
         record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
         record["delivery_merge_sha"] = merged["merge_sha"]
+        record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in merged.get("pull_requests", [merged])]
         record.update(status="done", error=None)
+        record.pop("no_deliverable_reason", None)
     elif provider_failed and rescuable:
         return  # absent merged proof, a provider failure keeps its original status and error
     record["owned_path_grants_used"] = ownership.grants_used(record, paths)
@@ -1221,13 +1223,18 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
         if merged:
             record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
             record["delivery_merge_sha"] = merged["merge_sha"]
+            deliveries = merged.get("pull_requests", [merged])
+            record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in deliveries]
             try:
                 root, _repository = git.resolve_repo(record.get("repo"))
-                request = {"pr": merged["number"], "repo": merged["repo"], "repo_root": str(root)}
+                request = [{"pr": pr["number"], "repo": pr["repo"], "repo_root": str(root)} for pr in deliveries]
             except (OSError, ValueError) as exc:
                 record["closeout"] = {"pr": merged["number"], "returncode": None, "reason": type(exc).__name__}
         if request and "closeout" not in record:
-            record["closeout"] = _run_merge_closeout(request)
+            receipts = [_run_merge_closeout(pr) for pr in request]
+            record["closeout"] = next((r for r in receipts if r.get("returncode") != 0), receipts[0])
+            if len(receipts) > 1:
+                record["closeouts"] = receipts
         if "closeout" in record and record["closeout"].get("returncode") != 0:
             record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
                                                  f"{record['closeout'].get('returncode')}")

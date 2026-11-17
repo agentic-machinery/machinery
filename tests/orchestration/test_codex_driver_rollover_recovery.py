@@ -15,6 +15,7 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.hooks import session_start_gate as gate
+from lu_machinery.orchestration import process_identity
 from lu_machinery.orchestration import thread_handoff as th
 from tests.launcher_sandbox import launcher_environment
 from tests.orchestration.test_thread_handoff import sample_snapshot
@@ -142,7 +143,7 @@ def test_handoff_git_probe_is_bounded_and_ignores_inherited_git_redirect(tmp_pat
 
     def timed_out(_args, *, cwd, timeout_s, env):
         calls.append((cwd, timeout_s, env))
-        return th.CommandResult(returncode=124, stdout="", stderr="synthetic timeout")
+        return process_identity.CommandResult(returncode=124, stdout="", stderr="synthetic timeout")
 
     monkeypatch.setattr(th, "run_command", timed_out)
     with pytest.raises(ValueError, match="whether the lane handoff is tracked"):
@@ -270,7 +271,7 @@ def test_2026_11_02_relaunch_resumes_the_lane_packet_and_mints_ten_anchors(tmp_p
         "source_ref": "message_663911947591427db15cc10b3d612fe5",
     }
     reads = []
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_a, **_k: list(stream))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_a, **_k: list(stream))
     monkeypatch.setattr(grok_lane.subprocess, "run", lambda command, **_k: subprocess.CompletedProcess(command, 0, "", ""))
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
     monkeypatch.setattr(handoff_select, "codex_lane_slot", lambda epic_name: "codex-core")

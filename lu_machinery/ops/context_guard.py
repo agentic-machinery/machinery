@@ -17,7 +17,7 @@ handoff
     ``HANDOFF NOW`` is re-sent every ``handoff_renudge_seconds`` until
     ``HANDOFF-DONE`` arrives; once it has, and the pane is idle, the guard checks
     a Codex lane's handoff with the launcher's own anchor selector
-    (:func:`scripts.session_canary.grok_lane.check_handoff_anchors`) and only
+    (:func:`lu_machinery.session_canary.handoff_select.check_handoff_anchors`) and only
     then types ``/exit`` (Claude) or ``/quit`` (Codex). Claude retries on the next
     tick; Codex retries every ``quit_retry_seconds``. After Claude's ``/exit``, it
     re-captures the pane for
@@ -601,23 +601,23 @@ class Guard:
         ``handoff_select.load_codex_mint_candidates`` (the lane's newest
         driver-state ``handoff_note`` first, then the markdown handoffs under
         ``.claude/<epic>-epic/``; #12567), with the registry sender as the
-        lane slot, the stream from ``grok_lane.launcher_stream_id``, and entries from
-        ``grok_lane._load_stream_entries``. Only the Codex launcher mints
+        lane slot, the stream from ``handoff_select.launcher_stream_id``, and entries from
+        ``handoff_select.load_stream_entries``. Only the Codex launcher mints
         anchors (the Claude adapter canary is a no-op), so other kinds are not
         checked.
 
-        The stream comes from ``grok_lane.launcher_stream_id``, which is the
+        The stream comes from ``handoff_select.launcher_stream_id``, which is the
         shell SSOT the launcher itself passes as ``--stream``, not
         ``resolve_stream_id``: one guard process watches every lane, so an
         ambient ``SESSION_STREAM_ID`` from the guard's own shell must never be
         applied to another lane's handoff.
         """
-        from lu_machinery.session_canary import grok_lane, handoff_select
+        from lu_machinery.session_canary import handoff_select
 
         candidates = handoff_select.load_codex_mint_candidates(self.repo_root, lane.epic, slot=lane.sender)
-        stream_id = grok_lane.launcher_stream_id(lane.epic)
-        stream_entries = grok_lane._load_stream_entries(stream_id)
-        return grok_lane.check_handoff_anchors(
+        stream_id = handoff_select.launcher_stream_id(lane.epic)
+        stream_entries = handoff_select.load_stream_entries(stream_id)
+        return handoff_select.check_handoff_anchors(
             repo=self.repo_root,
             epic=lane.epic,
             candidates=candidates,

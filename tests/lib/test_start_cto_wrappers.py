@@ -593,6 +593,7 @@ _LAUNCH_PATH_MINTS = (
     _HANDOFF_IDENTITY,
     machinery_path("lib/launcher_core.sh"),
     machinery_path("session_canary/grok_lane.py"),
+    machinery_path("session_canary/handoff_select.py"),
 )
 
 

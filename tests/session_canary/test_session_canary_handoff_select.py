@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from lu_machinery.session_canary import codex_lane, diary, gemini_lane, glm_lane, grok_lane, handoff_select
+from lu_machinery.session_canary import codex_lane, diary, gemini_lane, grok_lane, handoff_select
 
 _STREAM = [
     {"type": "binding_order", "body": f"Binding order {i} forbids shortcuts in this lane."} for i in range(1, 5)
@@ -22,7 +22,6 @@ _STREAM = [
 _LANES = (
     (codex_lane, "CODEX-DRIVER-HANDOFF.md"),
     (gemini_lane, "GEMINI-DRIVER-HANDOFF.md"),
-    (glm_lane, "GLM-DRIVER-HANDOFF.md"),
     (grok_lane, "GROK-DRIVER-HANDOFF.md"),
 )
 
@@ -59,7 +58,7 @@ def _existing(paths: list[Path]) -> list[str]:
 
 
 def _patch_mint(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_args, **_kwargs: list(_STREAM))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_STREAM))
 
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
@@ -167,19 +166,6 @@ def test_ranker_drops_a_listed_superseded_file(tmp_path: Path) -> None:
     assert [path.name for path in ranked] == ["CLAUDE-DRIVER-HANDOFF.md"]
 
 
-def test_glm_bootstrap_candidates_match_the_mint_preference(tmp_path: Path) -> None:
-    epic = _epic(tmp_path)
-    _write(epic / "GLM-DRIVER-HANDOFF.md", "glm\n", mtime=1_000)
-    _write(epic / "CLAUDE-DRIVER-HANDOFF.md", "claude\n", mtime=8_000)
-    direct = [path.name for path in glm_lane._handoff_candidates(tmp_path, "atlas")]
-    via_mint = [
-        path.name
-        for path in grok_lane._handoff_candidates(tmp_path, "atlas", preferred=["GLM-DRIVER-HANDOFF.md"])
-    ]
-    assert direct == via_mint
-    assert direct[0] == "GLM-DRIVER-HANDOFF.md"
-
-
 def test_mint_picks_fresh_claude_over_stale_interim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_mint(monkeypatch)
     epic = _epic(tmp_path)
@@ -246,7 +232,6 @@ def test_explicit_shortfall_falls_through_before_failing(
     [
         (codex_lane, "CODEX-COLD-START.md"),
         (gemini_lane, "GEMINI-COLD-START.md"),
-        (glm_lane, "GLM-COLD-START.md"),
     ],
 )
 def test_cold_start_board_uses_the_recorded_mint_file(tmp_path: Path, lane, board_name: str) -> None:
@@ -256,7 +241,6 @@ def test_cold_start_board_uses_the_recorded_mint_file(tmp_path: Path, lane, boar
     own = {
         codex_lane: "CODEX-DRIVER-HANDOFF.md",
         gemini_lane: "GEMINI-DRIVER-HANDOFF.md",
-        glm_lane: "GLM-DRIVER-HANDOFF.md",
     }[lane]
     _write(epic / own, "## Session 2026-09-23\n\nown\n", mtime=9_000)
     claude_text = "## Session 2026-09-23\n\nclaude\n"
@@ -387,7 +371,7 @@ def _stream_alone() -> list[dict[str, str]]:
 
 
 def _patch_stream(monkeypatch: pytest.MonkeyPatch, entries: list[dict[str, str]]) -> None:
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_args, **_kwargs: list(entries))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(entries))
 
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
@@ -670,7 +654,7 @@ def test_board_and_mint_share_a_custom_stream_limit(
     def _load(_stream_id: str, *, limit: int = 40) -> list[dict[str, str]]:
         return [dict(item) for item in entries[: int(limit)]]
 
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", _load)
+    monkeypatch.setattr(handoff_select, "load_stream_entries", _load)
 
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
@@ -843,7 +827,7 @@ def test_codex_mint_derives_anchors_from_the_newest_db_handoff_note(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_mint(monkeypatch)
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
     epic = _epic(tmp_path)
     _write(epic / "INTERIM-DRIVER-HANDOFF.md", _EMPTY_SECTIONS, mtime=9_000)
     reads = _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00"))
@@ -866,7 +850,7 @@ def test_codex_mint_without_a_db_note_keeps_the_markdown_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _patch_mint(monkeypatch)
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
     _write(_epic(tmp_path) / "INTERIM-DRIVER-HANDOFF.md", _EMPTY_SECTIONS, mtime=9_000)
     _lane_note(monkeypatch, None)
 
@@ -880,7 +864,7 @@ def test_codex_mint_falls_back_to_markdown_when_the_db_note_is_short(
     _patch_mint(monkeypatch)
     # Identity plus three stream entries: the full markdown reaches 10, the
     # note without next actions reaches 7.
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM[:3]))
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM[:3]))
     epic = _epic(tmp_path)
     _write(epic / "INTERIM-DRIVER-HANDOFF.md", _full("interim-sentinel", session="2026-11-01"), mtime=9_000)
     _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00", statement="No numbered list."))
