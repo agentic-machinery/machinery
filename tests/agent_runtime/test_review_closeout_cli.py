@@ -1265,3 +1265,115 @@ def test_load_pull_request_comments_reads_identity_and_flattens_pages(tmp_path, 
     assert login == "fleet"
     assert [row["html_url"] for row in rows] == ["https://example.test/1", "https://example.test/2"]
     assert seen == ["read-identity", "read-comments"]
+
+
+_BASE_CHECKLIST = (
+    "version: 1\nitems:\n"
+    "  - id: base-item\n    area: rules-skills-policy\n    check: Does the base question get asked?\n"
+    "    incident: base\n"
+    "    triggers:\n      - paths: [app.py]\n"
+)
+
+
+def _commit_judge_inputs(repo: Path) -> Path:
+    """Commit a one-item checklist and its ownership map to ``repo``; return the checklist path."""
+    checklist = repo / "lu_machinery" / "config" / "reliability_checklist.yaml"
+    checklist.parent.mkdir(parents=True)
+    checklist.write_text(_BASE_CHECKLIST, encoding="utf-8")
+    (checklist.parent / "code_owners.yaml").write_text(
+        "version: 1\nmain_owner: cto\nareas:\n"
+        "  - area: rules-skills-policy\n    owner: policy-owner\n    paths: [lu_machinery/config/**]\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "checklist")
+    return checklist
+
+
+def test_checklist_edit_is_judged_with_the_merge_base_copy(tmp_path):
+    """Defect class: a PR edits the reliability checklist that selects its own review items.
+
+    The head drops the base's item and adds its own; the brief must still carry the base item,
+    name the merge-base as the checklist source, and add the judge-change item.
+    """
+    repo = _init_repo(tmp_path)
+    checklist = _commit_judge_inputs(repo)
+    base_text = _BASE_CHECKLIST
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "-b", "feature")
+    checklist.write_text(base_text.replace("base-item", "head-item").replace("app.py", "other.py"), encoding="utf-8")
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "edit the checklist and app.py")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    state_file = tmp_path / "state.json"
+
+    result = _run_cli(state_file, "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["merge_base"] == base
+    assert report["checklist_source"]["kind"] == "merge-base"
+    assert report["checklist_source"]["commit"] == base
+    assert report["judge_files_changed"] == ["lu_machinery/config/reliability_checklist.yaml"]
+    assert [item["id"] for item in report["matched"]] == ["judge-change", "base-item"]
+    assert "head-item" not in report["brief_section"]
+    assert "**base-item**" in report["brief_section"]
+    assert report["code_owners"]["source"]["kind"] == "merge-base"
+    assert report["code_owners"]["unmapped"] == ["app.py"]
+    assert not state_file.exists()
+
+
+def test_checklist_sees_a_gitlink_the_head_gitmodules_ignores(tmp_path):
+    """Defect class: the change under review hides one of its changed paths from the checklist.
+
+    The head moves a gitlink at a judge path and adds a `.gitmodules` entry with `ignore = all`,
+    and the checkout sets `diff.submodule = diff`; the gitlink must still count as a judge change.
+    """
+    repo = _init_repo(tmp_path)
+    _commit_judge_inputs(repo)
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},lu_machinery/review_sub")
+    _git(repo, "commit", "-q", "-m", "gitlink")
+    _git(repo, "checkout", "-q", "-b", "feature")
+    _git(repo, "update-index", "--cacheinfo", f"160000,{'2' * 40},lu_machinery/review_sub")
+    (repo / ".gitmodules").write_text(
+        '[submodule "sub"]\n\tpath = lu_machinery/review_sub\n'
+        "\turl = https://example.invalid/sub.git\n\tignore = all\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".gitmodules")
+    _git(repo, "commit", "-q", "-m", "move the gitlink and ignore it")
+    _git(repo, "config", "diff.submodule", "diff")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    result = _run_cli(tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["judge_files_changed"] == ["lu_machinery/review_sub"]
+    assert report["matched"][0]["id"] == "judge-change"
+
+
+def test_checklist_refuses_the_checkout_copy_from_a_subdirectory(tmp_path, monkeypatch):
+    """Defect class: a judge input read from the checkout under review is reported as the installed package.
+
+    The merge-base lacks the judge files and the only package copy is the checkout's own; naming a
+    subdirectory as --repo-root must not hide that the copy is inside the checkout.
+    """
+    from lu_machinery.common import repo_root as repo_root_module
+
+    repo = _init_repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "docs").mkdir()
+    (repo / "docs" / "note.md").write_text("note\n", encoding="utf-8")
+    (repo / "lu_machinery" / "schemas").mkdir(parents=True)
+    (repo / "lu_machinery" / "schemas" / "code-review-findings.v1.schema.json").write_text("{}\n", encoding="utf-8")
+    _commit_judge_inputs(repo)
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    monkeypatch.setattr(repo_root_module, "machinery_path", lambda relative: repo / "lu_machinery" / relative)
+
+    result = _run_cli(
+        tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo / "docs")
+    )
+
+    assert result.returncode == 1
+    assert "the only other copy is in the checkout under review" in result.stdout + result.stderr

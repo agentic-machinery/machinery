@@ -109,6 +109,12 @@ tiers:
     - 'scripts/config/agent_runtime*.yaml'
     - 'lu_machinery/config/agent_fallback_substitutions.yaml'
     - 'scripts/config/agent_fallback_substitutions.yaml'
+    - 'lu_machinery/config/reliability_checklist.yaml'
+    - 'scripts/config/reliability_checklist.yaml'
+    - 'lu_machinery/config/code_owners.yaml'
+    - 'scripts/config/code_owners.yaml'
+    - 'lu_machinery/schemas/code-review-findings.v1.schema.json'
+    - 'scripts/schemas/code-review-findings.v1.schema.json'
     - scripts/build/cf_preflight.py
     - scripts/lexical_sandbox.py
     - scripts/delegate.py

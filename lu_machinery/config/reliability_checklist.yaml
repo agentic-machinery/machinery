@@ -1,0 +1,273 @@
+# Diff-triggered reliability checklist (VERIFY-ADOPT-1117 item 2).
+#
+# `closeout_cli checklist --base <ref> --head <sha>` reads this file from the merge-base of the
+# change under review (never from its head), matches every item's triggers against the diff, and
+# prints the matching items for the review brief. A change to this file is judged with the copy
+# its merge-base holds, and always gets the built-in judge-change item.
+#
+# Item keys (all required): id (kebab-case, unique), area (the owning area in code_owners.yaml,
+# whose owner keeps the item current), check (a question the reviewer answers with evidence),
+# incident (the issue, PR or lesson the item comes from), triggers (a list; any one firing fires
+# the item).
+# Trigger keys (at least one of paths, added, removed):
+#   paths:   full-path globs; `**` spans directories, `*` and `?` stay within one. A renamed
+#            file matches on its old or new path.
+#   change:  added | modified | deleted | renamed | copied | type_changed (default: any).
+#   added:   regexes searched in each added line of a matching file.
+#   removed: regexes searched in each removed line of a matching file.
+# With paths alone, any matching file fires; with added or removed, a matching line must exist.
+version: 1
+items:
+  - id: gate-input-coverage
+    area: ci-release-deps
+    check: >-
+      The diff changes test selection, path filters or a gate's inputs. Does every input the gate
+      guarded before stay covered after it (no file class silently drops out of the selection)?
+    incident: "product #5766, #5351 (gate inputs dropped by selection changes)"
+    triggers:
+      - paths: [".github/workflows/**", "**/ci/pr_affected*", "**/ci/*-tests.txt", "**/ci/*-guards.txt", "**/ci/ci_split*", "**/ci/pr_scope*"]
+      - paths: ["**/conftest.py", "**/pytest.ini", "**/pyproject.toml", "**/setup.cfg"]
+        added: ['\b(testpaths|collect_ignore\w*|deselect|addopts|norecursedirs)\b', '-k\s', 'pytest_collection_modifyitems']
+      - paths: [".github/workflows/**"]
+        added: ['\bpaths(-ignore)?:']
+
+  - id: subprocess-timeout
+    area: ci-release-deps
+    check: >-
+      A subprocess call or CI job is added. Does every one have a timeout (`timeout=` on the call,
+      `timeout-minutes` on the job), and is the expiry handled as a failure rather than a hang?
+    incident: "product #5740 (job hung without a timeout)"
+    triggers:
+      - paths: ["**/*.py"]
+        added: ['\bsubprocess\.(run|Popen|call|check_call|check_output)\(', 'create_subprocess_(exec|shell)\(', '\bos\.(system|popen)\(']
+      - paths: [".github/workflows/**"]
+        added: ['^\s*runs-on:']
+
+  - id: checkout-interpreter
+    area: ci-release-deps
+    check: >-
+      An interpreter path is spelled out. Does production code use the project interpreter
+      resolver, and test code `sys.executable`, rather than a checkout-relative `.venv/bin/python`
+      or a bare `python`/`python3` that resolves differently in CI, worktrees and the release?
+    incident: "product #6858 (checkout-relative interpreter); lesson test-guard-gotchas (no .venv/bin/python existence gates in helpers)"
+    triggers:
+      - paths: ["**/*.py", "**/*.sh", "**/*.bash"]
+        added: ['\.venv/bin/python', "[\"']python3?[\"']", '^\s*python3?\s']
+
+  - id: hook-mode-and-exit
+    area: review-and-dispatch
+    check: >-
+      A hook, launcher or deploy script changes. Is its executable bit right in Git (`git ls-files -s`
+      shows 100755 where it is run directly), and does every refusal exit non-zero while a pass exits 0?
+    incident: "product #5324, #3039 (hook lost its mode; refusal exited 0)"
+    triggers:
+      - paths: ["**/hooks/**", ".githooks/**", "**/*deploy*.sh", "**/agent_deploy/**", "**/start-*.sh", "**/launch*.sh"]
+
+  - id: restore-never-destroys-more
+    area: storage-and-sources
+    check: >-
+      The diff restores, hydrates, syncs or replaces data. Can it ever delete or overwrite more than it
+      replaces (a partial source, an empty source, an interrupted run), and does it fail closed then?
+    incident: "product #4220 (restore destroyed more than it replaced)"
+    triggers:
+      - paths: ["**/*restore*", "**/*hydrat*", "**/*rsync*", "**/*sync*.py", "**/*sync*.sh"]
+      - paths: ["**/*.py", "**/*.sh"]
+        added: ['\b(re)?hydrat\w*\(', '\brestore\w*\(', 'rmtree\(', '--delete\b']
+
+  - id: batch-validator-good-items
+    area: ci-release-deps
+    check: >-
+      A batch validator or classifier changes. Do the known-good items still pass, so one bad item
+      neither fails the whole batch nor hides behind it?
+    incident: "product #5021 (batch validator rejected good items)"
+    triggers:
+      - paths: ["**/*validat*.py", "**/*classif*.py", "**/*_lint*.py", "**/lint/**/*.py"]
+
+  - id: pytest-fanout-leased
+    area: ci-release-deps
+    check: >-
+      The diff starts pytest from code or fans it out (xdist, `-n`, a pytest child process). Is that
+      run leased through the shared pytest lease so it cannot oversubscribe the host?
+    incident: "product #11179 (unleased pytest fan-out)"
+    triggers:
+      - paths: ["**/*.py", "**/*.sh", ".github/workflows/**"]
+        added: ['\bxdist\b', '\s-n\s+(auto|\d+)\b', "[\"']-m[\"'],\\s*[\"']pytest[\"']", '\bpytest\.main\(']
+
+  - id: consumer-of-removed-module
+    area: ci-release-deps
+    check: >-
+      A module, package or dependency pin is removed or renamed, or the package boundary changes. Does
+      any consumer still import or run it? `git grep` the consumer repository (product and machinery)
+      for the name, and start the Sources MCP server once, since it imports shared modules.
+    incident: "product PR 13149 (dropped dependency pins; shared-module package consumers)"
+    triggers:
+      - paths: ["**/*.py"]
+        change: [deleted, renamed]
+      - paths: ["**/package_boundary.yaml", "MANIFEST.in"]
+      - paths: ["**/requirements*.txt", "**/requirements*.lock", "**/*.lock", "**/pyproject.toml"]
+        removed: ['^\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*(\[[^\]]*\]\s*)?([<>=!~]=?|@|;|#|$)']
+
+  - id: python-314-fail-closed
+    area: ci-release-deps
+    check: >-
+      Interpreter-sensitive code changes. Does it behave identically and fail closed on CPython 3.12
+      and 3.14? On 3.13+ `ast.dump` omits empty lists, and `Path.resolve()` raises OSError (not
+      RuntimeError) on a symlink loop, so an `except` around `resolve()` or recursion may stop catching.
+    incident: "machinery PR 690 (ast.dump fingerprints diverged on 3.14)"
+    triggers:
+      - paths: ["**/*.py"]
+        added: ['\bsys\.version_info\b', '\bast\.(dump|unparse)\(', '\.resolve\(', '\bRecursionError\b', 'except\s*\(?[^:]*\bRuntimeError\b', 'setrecursionlimit']
+
+  - id: nightly-group-tests
+    area: ci-release-deps
+    check: >-
+      A test under a nightly-only group changes (`NIGHTLY_GROUPS` in product `tests/conftest.py`:
+      tests/projects/, tests/audit/, tests/test_open*). PR CI never runs it. Did the PR run that group
+      and cite its output?
+    incident: "product tests/conftest.py NIGHTLY_GROUPS; lesson nightly-group-tests-skip-pr-ci"
+    triggers:
+      - paths: ["tests/projects/**", "tests/audit/**", "tests/test_open*"]
+
+  - id: env-export-full-suite
+    area: ci-release-deps
+    check: >-
+      The diff exports environment variables or binds a root at import time. Has the full suite run in
+      the CI layout? PR CI runs only affected tests; import-time env binding broke 225 sandbox tests that
+      only the merge group ran.
+    incident: "lesson env-exporting-change-needs-full-suite"
+    triggers:
+      - paths: ["**/*.py"]
+        added: ['os\.environ\[[^\]]+\]\s*=', 'os\.environ\.(setdefault|update)\(', '\bos\.putenv\(']
+      - paths: ["**/*.sh", "**/*.bash"]
+        added: ['^\s*export\s+[A-Z_]']
+
+  - id: text-reader-tests
+    area: ci-release-deps
+    check: >-
+      A data, rules, config or script file changes. Tests that read it as text are not import-selected
+      by PR CI. Did the PR `git grep` tests/ for its path and basename and run the tests that name it?
+    incident: "lessons source-text-tests-escape-pr-ci, run-indirect-tests-before-enqueue"
+    triggers:
+      - paths: ["**/*.md", "**/*.yaml", "**/*.yml", "**/*.json", "**/*.toml", "**/*.sh", "**/*.txt", "**/*.tsv"]
+        change: [modified, deleted, renamed]
+
+  - id: shared-resource-registration
+    area: ci-release-deps
+    check: >-
+      A file under agents_extensions/shared is added, removed or renamed. Is it registered in
+      MANIFEST.in, lu_machinery/lint/rename-map.json (with its .sha256 regenerated) and, if deployed,
+      agent_deploy/release.v1.json? The wheel census test runs only in the merge group.
+    incident: "tests/packaging/test_release_resources.py (wheel omission census); lesson launcher test pins skills deploy set (merge group only)"
+    triggers:
+      - paths: ["agents_extensions/shared/**"]
+        change: [added, deleted, renamed, copied]
+
+  - id: file-move-hidden-pins
+    area: ci-release-deps
+    check: >-
+      A file or symbol moves. Are the bare imports, sha fingerprints, docs fixtures, blob pins and the
+      mypy ratchet baseline (type-fix at the old path first, shrink by deletion only) all updated?
+    incident: "lessons symbol-move-hidden-pins, mypy-ratchet-blocks-file-moves"
+    triggers:
+      - paths: ["**/*.py"]
+        change: [renamed, copied]
+
+  - id: deleted-test-manifests
+    area: ci-release-deps
+    check: >-
+      A test file is deleted or renamed. Is every list naming it (shard manifests, history-tests.txt,
+      pr-affected-guards.txt) updated, so the selection does not point at a missing file?
+    incident: "lesson deleted test needs its shard manifest rows (MEMORY index)"
+    triggers:
+      - paths: ["tests/**/test_*.py", "tests/test_*.py"]
+        change: [deleted, renamed]
+
+  - id: tests-read-origin-main
+    area: ci-release-deps
+    check: >-
+      A test reads `origin/main` or Git history. Is it listed in the history-tests list, so shard
+      placement cannot run it in a shallow checkout?
+    incident: "lesson history-tests-shard-luck"
+    triggers:
+      - paths: ["tests/**"]
+        added: ['origin/main', '\bgit\b.*\b(log|merge-base|rev-list)\b']
+
+  - id: json-type-checks
+    area: review-and-dispatch
+    check: >-
+      Parsed JSON or YAML is used. Is the parsed value's type checked (a dict where a dict is expected,
+      a list of strings where strings are expected) before indexing, so a malformed file fails closed
+      with a typed error instead of a traceback?
+    incident: "lesson malformed-JSON type checks + parser fuzz before review (MEMORY index)"
+    triggers:
+      - paths: ["**/*.py"]
+        added: ['\bjson\.loads?\(', '\byaml\.(safe_)?load\(', '\btomllib\.loads?\(']
+
+  - id: dynamic-import-guard
+    area: storage-and-sources
+    check: >-
+      A module is imported dynamically. Does it go through `readonly_sqlite.import_named_module` (or
+      find_spec plus exec_module), so the SQLite write guard does not trip?
+    incident: "lesson dynamic-import-sqlite-guard"
+    triggers:
+      - paths: ["**/*.py"]
+        added: ['\bimportlib\.import_module\(', '\b__import__\(']
+
+  - id: catalog-routing-receipts
+    area: review-and-dispatch
+    check: >-
+      The model catalog's routing changes. Do frozen routing receipts still hold, and does the PR add
+      the tests/review overlay fixture the change needs?
+    incident: "lesson catalog-routing-frozen-receipts"
+    triggers:
+      - paths: ["**/config/model_catalog.yaml", "**/config/agent_fallback_substitutions.yaml", "**/config/routing_defaults.yaml"]
+
+  - id: monitor-route-denominator
+    area: api-and-ui
+    check: >-
+      A Monitor API route is added or removed. Is the frozen route count and digest in the OPSEC sweep
+      registry updated, and does no page text name a local port?
+    incident: "lessons monitor-route-removal-opsec-denominator, monitor-product-pages-gotchas"
+    triggers:
+      - paths: ["**/api/**/*.py"]
+        added: ['@\w*router\.(get|post|put|patch|delete)\(', '\badd_api_route\(']
+        removed: ['@\w*router\.(get|post|put|patch|delete)\(', '\badd_api_route\(']
+
+  - id: launcher-export-identity
+    area: review-and-dispatch
+    check: >-
+      A launcher exports a new variable. Is it in the conftest `SESSION_IDENTITY_ENV_VARS`, so tests do
+      not leak the outer session's value?
+    incident: "lesson launcher-new-export-needs-conftest-entry"
+    triggers:
+      - paths: ["**/start-*.sh", "**/launch*.sh", "**/launcher*/**"]
+        added: ['^\s*export\s']
+
+  - id: sparse-workflow-imports
+    area: ci-release-deps
+    check: >-
+      A module that sparse-checkout workflows import gains an import. Do the workflows that sparse-check
+      it out still include every module it now imports?
+    incident: "lesson sparse-workflow-import-closures"
+    triggers:
+      - paths: ["**/github_client*.py", "**/github_usage*.py"]
+        added: ['^\s*(from\s+\S+\s+)?import\s']
+
+  - id: credential-shaped-test-values
+    area: ci-release-deps
+    check: >-
+      A test value looks like a credential. The PR secret scan reads every commit, so does the change
+      use the synthetic OPSEC fixtures instead of credential-shaped literals?
+    incident: "lessons pr-secret-scan-scans-every-commit, opsec-tests-pass-locally-fail-ci"
+    triggers:
+      - paths: ["tests/**"]
+        added: ['\b(ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{8,}', '\bsk-[A-Za-z0-9-]{16,}', '\bAKIA[0-9A-Z]{12,}', '-----BEGIN [A-Z ]*PRIVATE KEY']
+
+  - id: rules-core-byte-ceiling
+    area: rules-skills-policy
+    check: >-
+      The rules core changes. Does it stay under its byte ceilings (core and content), measured on the
+      head before review?
+    incident: "lesson rules-core-byte-ceiling"
+    triggers:
+      - paths: ["agents_extensions/shared/rules/core.md", "agents_extensions/shared/rules/core-*.md"]
