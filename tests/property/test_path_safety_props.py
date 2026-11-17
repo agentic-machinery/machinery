@@ -1,10 +1,6 @@
-"""Catch guard bypass by unusual characters or traversal.
+"""Catch guard bypass by unusual characters or traversal."""
 
-The existing character gap is quarantined per exact minimal input, never by
-xfailing an entire generated property. Each strict xfail becomes an XPASS when
-that character is rejected and must then be removed by the guard's owner.
-"""
-
+import unicodedata
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -12,25 +8,34 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from lu_machinery.path_safety import safe_join
+from lu_machinery.path_safety import safe_join, trusted_join
 
 COMPONENT = st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789_-", min_size=1, max_size=16)
-# C0/C1 controls, Unicode bidi controls, and Unicode line/paragraph separators.
-UNSAFE_CHARACTERS = tuple(dict.fromkeys(
-    [chr(n) for n in (*range(32), *range(127, 160))]
-    + list("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u2028\u2029")
-))
+# Every code point in the refused class, derived from the Unicode database so a
+# guard narrowed to a hand-written subset fails: controls (Cc), format
+# characters such as bidi controls and zero-width characters (Cf), and
+# line/paragraph separators (Zl, Zp).
+UNSAFE_CHARACTERS = tuple(
+    chr(n) for n in range(0x110000) if unicodedata.category(chr(n)) in {"Cc", "Cf", "Zl", "Zp"}
+)
+# Ukrainian and other legitimate non-ASCII names: Cyrillic, the U+02BC
+# apostrophe, the U+0301 combining stress mark, NBSP and an emoji.
+LEGITIMATE_COMPONENTS = ("урок-01", "м\u02bcята", "на\u0301голос", "a\u00a0b", "emoji-\U0001f600")
 
 
-@pytest.mark.parametrize("character", [
-    pytest.param(c, id=ascii(c), marks=() if c == "\0" else pytest.mark.xfail(
-        strict=True, reason=f"Pre-existing safe_join character bypass: {c!a}", raises=pytest.fail.Exception,
-    ))
-    for c in UNSAFE_CHARACTERS
-])
+@pytest.mark.parametrize("character", [pytest.param(c, id=ascii(c)) for c in UNSAFE_CHARACTERS])
 def test_unusual_character_bypass_is_refused(character: str) -> None:
     with TemporaryDirectory() as directory, pytest.raises(ValueError):
         safe_join(Path(directory), character)
+
+
+@pytest.mark.parametrize("join", [safe_join, trusted_join])
+@pytest.mark.parametrize("component", LEGITIMATE_COMPONENTS, ids=ascii)
+def test_legitimate_non_ascii_component_is_accepted(join, component: str) -> None:
+    """Catch an over-broad character refusal that would reject Ukrainian paths."""
+    with TemporaryDirectory() as directory:
+        root = Path(directory).resolve()
+        assert join(root, component) == root / component
 
 
 @given(prefix=COMPONENT, suffix=COMPONENT)
