@@ -124,6 +124,45 @@ def ci_gate_state(runs: Iterable[Mapping[str, object]], sha: str) -> tuple[bool,
     return True, f"{CI_WORKFLOW} run {run_id} on {sha} succeeded"
 
 
+def validate_ci_receipt(
+    receipt: object, *, repository: str, target: Mapping[str, object], commit: str, tree: str,
+    source: Mapping[str, object] | None = None, source_jobs: Sequence[Mapping[str, object]] = (),
+) -> None:
+    """Bind main's full/reused CI proof to live run attempts and the release tree."""
+    workflow = ".github/workflows/ci-gate.yml"
+    if not isinstance(receipt, dict) or set(receipt) != {"schema", "repository", "workflow", "mode", "target", "source"}:
+        raise CutError("CI evidence receipt is missing or malformed")
+    if (receipt["schema"], receipt["repository"], receipt["workflow"]) != ("ci-gate-evidence.v1", repository, workflow):
+        raise CutError("CI evidence receipt schema, repository or workflow mismatch")
+    subjects = [(receipt["target"], target, "push")]
+    if receipt["mode"] == "reuse":
+        if source is None:
+            raise CutError("CI evidence receipt has no live merge-group source")
+        subjects.append((receipt["source"], source, "merge_group"))
+        if not any(job.get("name") == "CI Gate" and job.get("status") == "completed"
+                   and job.get("conclusion") == "success" for job in source_jobs):
+            raise CutError("CI evidence source attempt has no successful CI Gate job")
+    elif receipt["mode"] != "full" or receipt["source"] is not None:
+        raise CutError("CI evidence receipt mode or source is invalid")
+    for binding, run, event in subjects:
+        expected = {"run_id": run.get("id"), "run_attempt": run.get("run_attempt"),
+                    "commit": commit, "tree": tree}
+        if (not isinstance(binding, dict) or binding != expected
+                or any(type(binding.get(key)) is not int or binding[key] < 1 for key in ("run_id", "run_attempt"))):
+            raise CutError(f"CI evidence {event} run, attempt, commit or tree mismatch")
+        origin, head_origin, head_commit = run.get("repository"), run.get("head_repository"), run.get("head_commit")
+        branch = run.get("head_branch")
+        if (run.get("path") != workflow or run.get("event") != event
+                or run.get("status") != "completed" or run.get("conclusion") != "success"
+                or run.get("head_sha") != commit
+                or not isinstance(origin, dict) or origin.get("full_name") != repository
+                or not isinstance(head_origin, dict) or head_origin.get("full_name") != repository
+                or not isinstance(head_commit, dict) or head_commit.get("tree_id") != tree
+                or not isinstance(branch, str)
+                or (branch != "main" if event == "push" else not branch.startswith("gh-readonly-queue/main/"))):
+            raise CutError(f"CI evidence {event} live run does not prove this repository, workflow and tree")
+
+
 def preflight(
     *,
     head: str,
@@ -430,7 +469,47 @@ class Cut:
         decision = preflight(head=self.head, last_tag=last_tag, last_tag_commit=tag_commit, baseline=baseline,
                              titles=titles, versions=versions, tags=tags, runs=run_rows, changelog=changelog)
         self.version = decision.version
+        if decision.action == "cut":
+            self.verify_ci_receipt(clone, run_rows)
         return decision, titles, versions["pyproject.toml"]
+
+    def verify_ci_receipt(self, clone: Path, run_rows: Sequence[Mapping[str, object]]) -> None:
+        """Read only the newest successful main push's attempt-specific artifact."""
+        newest = max((run for run in run_rows if run.get("headSha") == self.head and run.get("event") == "push"),
+                     key=lambda run: int(str(run.get("databaseId", 0))))
+        run_id = str(newest["databaseId"])
+        target = json.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", run_id))
+        if not isinstance(target, dict) or str(target.get("id")) != run_id:
+            raise CutError("CI evidence target run id mismatch")
+        attempt = target.get("run_attempt")
+        if type(attempt) is not int or attempt < 1:
+            raise CutError("CI evidence target run attempt is unavailable")
+        destination = self.work / "ci-evidence"
+        self.run(["gh", "run", "download", run_id, "-R", self.machinery_repo,
+                  "--name", f"ci-gate-evidence-{attempt}", "--dir", destination], timeout=120)
+        try:
+            receipt = json.loads((destination / "ci-gate-evidence.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CutError("CI evidence receipt is missing or malformed") from exc
+        source, source_jobs = None, []
+        if isinstance(receipt, dict) and receipt.get("mode") == "reuse":
+            binding = receipt.get("source")
+            if not isinstance(binding, dict) or type(binding.get("run_id")) is not int or binding["run_id"] < 1:
+                raise CutError("CI evidence source run id is invalid")
+            source_id = str(binding["run_id"])
+            source = json.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", source_id))
+            source_attempt = binding.get("run_attempt")
+            if type(source_attempt) is not int or source_attempt < 1:
+                raise CutError("CI evidence source run attempt is invalid")
+            jobs = json.loads(self.run(["gh", "run", "view", source_id, "-R", self.machinery_repo,
+                                       "--attempt", str(source_attempt), "--json", "jobs"], timeout=120).stdout)
+            source_jobs = jobs.get("jobs", [])
+            if not isinstance(source_jobs, list) or not all(isinstance(job, dict) for job in source_jobs):
+                raise CutError("CI evidence source jobs are malformed")
+        tree = self.git(clone, "rev-parse", f"{self.head}^{{tree}}")
+        validate_ci_receipt(receipt, repository=self.machinery_repo, target=target, commit=self.head, tree=tree,
+                            source=source, source_jobs=source_jobs)
+        self.ci += f"; {receipt['mode']} receipt verified on tree {tree}"
 
     def build(self, built_version: str) -> dict[str, Path]:
         self.step = "build"

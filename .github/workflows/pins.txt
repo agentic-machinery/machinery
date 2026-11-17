@@ -79,8 +79,8 @@ ACTIONS_SETUP_PYTHON=6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
 #   actions/setup-python tag v7.1.0 (the latest release; rechecked 2026-11-05)
 
 # Bootstrap CI Gate (ci-gate.yml). Its secret-scan and sast jobs run the
-# TruffleHog and Semgrep pins above, and it uses no actions besides the two
-# above plus the cache action below.
+# TruffleHog and Semgrep pins above, plus the checkout, setup, cache and
+# receipt-upload actions recorded here.
 # Upstream checks below were made on 2026-11-05.
 CI_GATE_RUNNER=ubuntu-24.04
 #   GitHub-hosted Ubuntu 24.04 x64 image, https://github.com/actions/runner-images
@@ -191,3 +191,9 @@ UV_WHEEL_MANYLINUX_2_17_X86_64_SHA256=5badfd805fd88bf99b4b4f044f6e8f762f1892cab2
 #   It uses the TruffleHog flags, Semgrep version, rules commit and configs
 #   above, checks the two executable pins, and blocks on any finding or
 #   scanner error. --help lists every check, output and exit code.
+
+# Main CI evidence receipt artifact (checked 2026-11-17 via git ls-remote).
+ACTIONS_UPLOAD_ARTIFACT=cf430e030ddbb5b0abf93d22962f4752f3646cd9
+#   actions/upload-artifact tag v7.0.2, Node 24 on hosted ubuntu-24.04.
+#   https://github.com/actions/upload-artifact/releases/tag/v7.0.2
+#   Default ZIP archive; attempt-specific name prevents stale re-run evidence.
