@@ -210,7 +210,10 @@ def transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_opsec, 
 
 def ejected(subject: Subject, path: Path, jobs: list[str], **state: Any) -> None:
     """PR 42 was queued at ``HEAD`` on the last run and has since left the queue after a failed merge_group run."""
-    subject.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
+    subject.events = [
+        {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:00Z"},
+        {"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"},
+    ]
     subject.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "failed_checks", "commit": "c" * 40}]
     subject.run_rows = [
         {

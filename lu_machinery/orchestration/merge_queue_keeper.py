@@ -833,9 +833,10 @@ def _head_since(previous: dict[str, Any], key: str, head: str, observed: str) ->
 def _ejection_evidence(gh: GitHub, number: int, since: str, observed_exit: bool) -> tuple[str, dict[str, Any]]:
     """Whether the queue removals charged to a head prove that no test node failed (rules core P4).
 
-    Removals at or after ``since`` (``_head_since``) are charged to the head; one whose time is
-    unreadable is charged too. ``observed_exit`` says a pass saw this head leave the queue,
-    so its removal must be on record. Each removal's queue commit is the ``head_sha`` of the
+    Removals and queue entries at or after ``since`` (``_head_since``) are charged to the head;
+    a removal whose time is unreadable is charged too. The latest charged queue entry must have
+    a removal recorded after it, and ``observed_exit`` (a pass saw this head leave the queue)
+    needs a charged entry. Each removal's queue commit is the ``head_sha`` of the
     merge_group runs behind it, listed by that commit over the PR's whole life. Every failed or
     timed-out job of every such run is read, whatever its name: a failing node, or a failed
     pytest job, is a failing test. Returns ``("test-failed", {"runs", "tests"})``,
@@ -849,14 +850,27 @@ def _ejection_evidence(gh: GitHub, number: int, since: str, observed_exit: bool)
 
     start = _stamp(since)
     try:
-        removals = [
-            item for item in gh.queue_removals(number)
-            if item["reason"] != "merged" and (start is None or (_stamp(item["at"]) or start) >= start)
+        history = gh.queue_removals(number)
+        entries = [
+            item.get("created_at") for item in gh.timeline(number)
+            if isinstance(item, dict) and item.get("event") == "added_to_merge_queue"
         ]
     except KeeperError as exc:
-        return unknown(f"queue removal history unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
-    if observed_exit and not removals:
-        return unknown("the queue exit this keeper saw has no removal record yet")
+        return unknown(f"queue history unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
+    removals = [
+        item for item in history
+        if item["reason"] != "merged" and (start is None or (_stamp(item["at"]) or start) >= start)
+    ]
+    # Every queue entry charged to the head needs a removal recorded after it, both on GitHub's
+    # clock: an older removal never accounts for a later exit, seen by a pass or not.
+    entered = [_stamp(stamp) for stamp in entries]
+    if any(when is None for when in entered):
+        return unknown("a queue entry time is unreadable")
+    charged = [when for when in entered if when is not None and (start is None or when >= start)]
+    if observed_exit and not charged:
+        return unknown("the queue exit this keeper saw has no queue entry on record yet")
+    if charged and not any((_stamp(item["at"]) or datetime.min.replace(tzinfo=UTC)) >= max(charged) for item in history):
+        return unknown("the latest queue entry has no removal record yet")
     reasons: dict[str, set[str]] = defaultdict(set)
     for item in removals:
         if item["commit"] is not None:

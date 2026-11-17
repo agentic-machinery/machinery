@@ -816,6 +816,7 @@ def _eject(fake: FakeGitHub, event_id: int, run_id: int | None) -> None:
 def _conclude(fake: FakeGitHub, run_id: int, stamp: str = "2099-01-01T00:00:00Z") -> None:
     """A concluded failed merge_group run with no failed job (infrastructure) and its removal record."""
     commit = format(run_id, "040x")
+    fake.events.append({"event": "added_to_merge_queue", "created_at": stamp})
     fake.removals.append({"at": stamp, "reason": "failed_checks", "commit": commit})
     fake.run_rows.append({
         "id": run_id, "event": "merge_group", "status": "completed", "head_sha": commit,
@@ -892,7 +893,8 @@ def test_second_ejection_stays_out_and_alerts_once_with_run_ids(
         path.write_text(json.dumps({**json.loads(path.read_text()), "drops": {}, "ejections": {}}))
         fake.events.insert(0, {"id": 1, "event": "removed_from_merge_queue", "created_at": "2099-01-01T00:00:01Z"})
     if timeline_lags:  # The exit is seen before GitHub's timeline shows the second removal.
-        removal = fake.events.pop()
+        removal = next(event for event in reversed(fake.events) if event["event"] == "removed_from_merge_queue")
+        fake.events.remove(removal)
         lines, failed = run(fake, path, monkeypatch)
         assert not failed and "reason=requeue-spent" in lines[0]
         assert "cto_outbox" not in json.loads(path.read_text())
@@ -1124,6 +1126,7 @@ QUEUE_COMMIT = "c" * 40
 
 def _removed(fake: FakeGitHub, jobs: list[dict[str, Any]], *, at: str = "2026-09-23T00:00:01Z", **run: Any) -> None:
     """One failed_checks removal of PR 42 whose queue commit's merge_group run 123 had these jobs."""
+    fake.events = [{"event": "added_to_merge_queue", "created_at": at}]
     fake.removals = [{"at": at, "reason": "failed_checks", "commit": QUEUE_COMMIT}]
     fake.run_rows = [{
         "id": 123, "event": "merge_group", "status": "completed", "conclusion": "failure", "head_sha": QUEUE_COMMIT,
@@ -1171,6 +1174,31 @@ def test_ejection_on_a_failing_test_is_never_requeued(tmp_path, monkeypatch, job
     assert "enqueue" not in mutations(fake)
     assert len([kind for kind, _ in fake.actions if kind == "comment"]) == 1
     assert len(_defect_reports(path, "queue-test-failure")) == 1
+
+
+@pytest.mark.parametrize("seen", [True, False], ids=["exit-seen-by-a-pass", "unsampled-exit"])
+def test_an_older_removal_never_accounts_for_a_later_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, seen: bool) -> None:
+    """The latest queue entry needs its own removal record; an earlier manual one does not cover it."""
+    fake = FakeGitHub()
+    fake.events = [
+        {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:00Z"},
+        {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:05Z"},
+    ]
+    fake.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "manual", "commit": None}]
+    path = tmp_path / "state.json"
+    if seen:
+        _ejected_state(path)
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed and "reason=ejection-undiagnosed" in lines[0], lines
+    assert "enqueue" not in mutations(fake)
+    # The record of the exit arrives: its run failed a test.
+    fake.removals.append({"at": "2026-09-23T00:00:20Z", "reason": "failed_checks", "commit": QUEUE_COMMIT})
+    fake.run_rows = [{"id": 123, "event": "merge_group", "status": "completed", "conclusion": "failure",
+                      "head_sha": QUEUE_COMMIT, "created_at": "2026-09-23T00:00:05Z",
+                      "head_branch": "gh-readonly-queue/main/pr-42-deadbeef"}]
+    fake.job_rows = [{"id": 7, "name": "pytest", "conclusion": "failure"}]
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed and "reason=test-failed" in lines[0] and "enqueue" not in mutations(fake)
 
 
 def test_a_returning_head_keeps_the_removals_of_its_earlier_stay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1846,7 +1874,10 @@ def test_keeper_timer_runs_every_minute() -> None:
 
 def _ejected(fake: FakeGitHub, path: Path, jobs: list[str], **state: Any) -> None:
     since = "2026-09-23T00:00:00Z"
-    fake.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
+    fake.events = [
+        {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:00Z"},
+        {"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"},
+    ]
     fake.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "failed_checks", "commit": QUEUE_COMMIT}]
     fake.run_rows = [
         {
