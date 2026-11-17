@@ -1044,9 +1044,13 @@ def _judge_input(repo_root: Path, merge_base: str, relative: str) -> tuple[bytes
         }
     from lu_machinery.common.repo_root import machinery_path
 
-    package_file = machinery_path(relative)
-    root = repo_root.resolve()
-    if package_file.resolve() == root or root in package_file.resolve().parents:
+    try:
+        package_file = machinery_path(relative)
+        resolved = package_file.resolve(strict=True)
+        root = repo_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError: a symlink loop before 3.13
+        raise CloseoutStateError(f"{checkout_path} unavailable in the installed package") from exc
+    if resolved == root or root in resolved.parents:
         raise CloseoutStateError(
             f"{checkout_path} is missing at the merge-base and the only other copy is in the checkout "
             "under review; run this command from the installed release"
