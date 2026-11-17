@@ -1,4 +1,9 @@
-"""Validate the bounded flake quarantine and select exact pytest node IDs."""
+"""Validate the bounded flake quarantine and select exact pytest node IDs.
+
+Scheduled for removal. A failing test is never rerun (rules core P4), so no entry may be
+admitted. The module stays only while the product's conftest and CI still import it; it is
+deleted, with its machinery readers, once the product's follow-up change drops them.
+"""
 
 from __future__ import annotations
 

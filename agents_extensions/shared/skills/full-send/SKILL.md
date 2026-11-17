@@ -98,7 +98,9 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    a running author has no settlement usage list yet, so include all grants.
 6. **Watch it** ([pr-watch](references/pr-watch.md)): fix real findings and CI failures
    through the authoring lane, prove each fix, and run a `review-loop` delta for every new
-   head. One evidenced rerun for an unrelated CI failure, never more.
+   head. A failing test node is never rerun: fix it, or delete the test with the reason in the
+   commit and a note on its issue. One evidenced rerun for an infrastructure failure (no test
+   node failed), never more.
 7. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)):
 
    ```bash
@@ -185,7 +187,8 @@ Stop, and report `BLOCKED <reason>`, when: the proof cannot be obtained; the rec
 (`review-loop`; a base merge, a CI fix or a conflict resolution after approval is not a stop
 while `budget-check` admits it); a breaker trips; ownership
 or stream membership is lost; the change's own checks fail a second time, or CI fails for an
-unclear reason (an evidenced infrastructure failure uses the head's one rerun and then escalates,
+unclear reason (a failing test node is fixed, never rerun; an evidenced infrastructure failure
+with no failing test node uses the head's one rerun and then escalates,
 [pr-watch](references/pr-watch.md#failing-ci)); another PR makes
 this one obsolete; or the next step is outside your authority or your brief. Escalate to the
 CTO and, for decisions in rules core P6, to the advisors. Reach the operator only for the

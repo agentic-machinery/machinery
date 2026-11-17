@@ -111,7 +111,6 @@ class FakeGitHub:
         self.events: list[dict[str, Any]] = []
         self.run_rows: list[dict[str, Any]] = []
         self.job_rows: list[dict[str, Any]] = []
-        self.issue_rows: list[dict[str, Any]] = []
         self.squash: bool | None = False
         self.files = ["scripts/example.py"]
 
@@ -180,18 +179,6 @@ class FakeGitHub:
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
-
-    def issues(self, title: str) -> list[dict[str, Any]]:
-        return self.issue_rows
-
-    def issue_comment(self, number: int, body: str) -> None:
-        self.actions.append(("issue-comment", (number, body)))
-
-    def create_issue(self, title: str, body: str) -> int:
-        self.actions.append(("issue", title))
-        number = 1000 + len(self.issue_rows)
-        self.issue_rows.append({"title": title, "body": body, "number": number})
-        return number
 
 
 def run(

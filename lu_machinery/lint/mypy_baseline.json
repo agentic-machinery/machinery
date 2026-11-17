@@ -7099,11 +7099,6 @@
     },
     {
       "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"str\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"bool\""
     },

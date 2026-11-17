@@ -223,7 +223,8 @@ ejection, and re-establish the gates before re-enqueueing.
 machinery fix, after the exact-head approval is recorded; `pr-merge` (and so the keeper)
 then enqueues that head at the front of the queue, while every gate, including the
 merge-group CI Gate, still applies, and a label applied before that head's approval does nothing. The rules core's
-unchanged-head CI recovery allowance and evidence requirements still bind.
+unchanged-head CI recovery allowance and evidence requirements still bind; that allowance
+covers only infrastructure failures, never a failing test node.
 
 **Small batches (size signal).** One outcome per PR. About 1000 changed lines,
 excluding tests, test fixtures, generated files and whole-file deletions, is a
@@ -610,8 +611,10 @@ Every task follows this workflow. No exceptions for non-trivial changes.
    pytest shards. Merge-group CI Gate runs the full supported pytest suite on the real
    queue candidate. Nightly and opt-in manual runs also run the full suite.
    Operator decision, 2026-10-29.
-   Queue failure recovery must diagnose the whole group's original event base-to-candidate
-   diff, including renamed paths, before attributing a failure to a service.
+   A failing test node is never a service failure: fix the test or the code, or delete the
+   test with the reason in the commit and a note on its issue (rules core P4). For a failure
+   with no failing test node, queue failure recovery must diagnose the whole group's original
+   event base-to-candidate diff, including renamed paths, before attributing it to a service.
    A single PR diff or matching failed jobs does not establish that diagnosis.
 7. **Reach the explicit terminal goal** — `merge`, `deploy`, and `certify` are
    distinct and cannot substitute for one another.

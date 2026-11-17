@@ -48,8 +48,9 @@ in every model call, plus instructions to run `lu-driver-state render --lane cto
 
 - `agents_extensions/shared/rules/core.md` binds. CTO-specific there: only the CTO opens
   issues; lanes report findings through Fleet Comms; a task card is the CTO's issue or a
-  CTO-ordered brief; the CTO approves each new test; one evidenced rerun for an unrelated
-  CI failure (P3, P4).
+  CTO-ordered brief; the CTO approves each new test; a failing test node is fixed or
+  deleted, never rerun; one evidenced rerun for an infrastructure failure with no failing
+  test node (P3, P4).
 - Every statement is a fact with its source (command, file:line, run ID, SHA) or is
   labelled NOT CHECKED with the command that would settle it. A documented limitation is a
   claim to probe. One observation is not a finding.
