@@ -22,20 +22,25 @@ def _record_stamp(info: os.stat_result) -> _RecordStamp:
     return info.st_mtime_ns, info.st_size, info.st_ctime_ns, info.st_dev, info.st_ino
 
 
-def read_cached_task_record(path: Path, *, display_unknown_schema: bool = False) -> dict[str, Any] | None:
+def read_cached_task_record(
+    path: Path, *, display_unknown_schema: bool = False, read_path: Path | None = None,
+) -> dict[str, Any] | None:
     """Read a task once per file version across Monitor collectors.
 
     Stat and read failures propagate; invalid JSON is never served from an older
     version. ctime and inode also invalidate same-size rewrites and replacements
     whose mtime was restored. The lock coalesces concurrent misses. Returned
     records have a private top-level mapping; nested values are read-only to callers.
+    A caller that resolved containment passes ``read_path`` for the actual open
+    while ``path`` retains the filename used by task-identity classification.
     """
     from lu_machinery.orchestration.task_record_store import parse_task_record
 
     path = Path(os.path.abspath(path))
+    source = path if read_path is None else read_path
     key = os.fspath(path)
     with _record_cache_lock:
-        stamp = _record_stamp(path.stat())
+        stamp = _record_stamp(source.stat())
         cached = _record_cache.get(key)
         if cached is not None and cached[0] == stamp:
             record = cached[1]
@@ -43,7 +48,7 @@ def read_cached_task_record(path: Path, *, display_unknown_schema: bool = False)
         else:
             # Drop stale bytes before attempting a read, including failed reads.
             _record_cache.pop(key, None)
-            with path.open("rb") as handle:
+            with source.open("rb") as handle:
                 opened_stamp = _record_stamp(os.fstat(handle.fileno()))
                 raw = handle.read()
                 finished_stamp = _record_stamp(os.fstat(handle.fileno()))

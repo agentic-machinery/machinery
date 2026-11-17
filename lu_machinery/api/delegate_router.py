@@ -158,7 +158,7 @@ def _read_task_state(
         return None
     for attempt in range(TASK_READ_RETRIES):
         try:
-            data = read_cached_task_record(Path(fullpath), display_unknown_schema=True)
+            data = read_cached_task_record(Path(path), display_unknown_schema=True, read_path=Path(fullpath))
         except (OSError, ValueError) as exc:
             if attempt + 1 == TASK_READ_RETRIES:
                 if raise_read_errors and isinstance(exc, OSError):
