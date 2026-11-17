@@ -115,7 +115,10 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert [row["alertname"] for row in body["alerts"]] == [
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
     ]
-    assert all(set(row) == {"alertname", "severity", "starts_at"} for row in body["alerts"])
+    assert all(set(row) == {"alertname", "severity", "starts_at", "summary"} for row in body["alerts"])
+    # The rule's own summary shows for a recognised name only; an unrecognised alert has none.
+    assert [row["summary"] for row in body["alerts"]] == [None, "An approved PR has not merged", None]
+    assert body["stale_after_s"] == 60.0
     assert "leak" not in response.text and "ForeignAlert" not in response.text
     # One malformed item makes the whole reading unknown, never a healthy "nothing firing".
     for bad in ({}, None, {"labels": {"alertname": "X"}}, {"labels": {"alertname": "X"}, "status": {}},

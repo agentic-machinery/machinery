@@ -15,6 +15,7 @@ from lu_machinery.common import test_slots
 
 from . import load_samples, panel_values
 from .monitor_context import MonitorContext, get_ctx
+from .opsec_scan import scan_text
 from .state_helpers import cache_get_or_compute_async, ctx_scoped_ttl_key
 
 logger = logging.getLogger(__name__)
@@ -107,13 +108,17 @@ ALERTMANAGER_PORT = 9093
 ALERTMANAGER_ALERTS_PATH = "/api/v2/alerts?active=true&silenced=false&inhibited=false"
 ALERTS_TTL_S = 15.0
 ALERTS_TIMEOUT_S = 3.0
+# A second reader may keep a cache hit 15 s old. Include the 3 s collector, 30 s page cycle,
+# 8 s HTTP budget and 4 s margin.
+ALERTS_STALE_AFTER_S = 60.0
 # The dead-man heartbeat fires all the time by design; it proves Alertmanager
 # is evaluating, so it is reported as a flag and not listed as a firing alert.
 HEARTBEAT_ALERTNAMES = frozenset({"Watchdog"})
 # Alertmanager v2 alert states; anything else is a malformed reading.
 ALERT_STATES = frozenset({"active", "suppressed", "unprocessed"})
 # Names our own alerting rules define. Anything else stays UnrecognizedAlert;
-# labels are never passed through.
+# labels are never passed through. A rule added without a name here reads as
+# UnrecognizedAlert with no description, so a new rule adds its name in the same change.
 _ALERT_NAMES = frozenset({
     "ApprovedNotLanded30m",
     "BackupSuccessOverdue",
@@ -139,6 +144,7 @@ _ALERT_NAMES = frozenset({
     "LuApiProbeSlow",
     "LuPaceStale",
     "MergeQueueStalled",
+    "MonitorApiSlowRoute",
     "NonLoopbackListener",
     "OffsiteBackupFreshnessUnknown",
     "OffsiteBackupOverdue",
@@ -153,6 +159,7 @@ _ALERT_NAMES = frozenset({
     "ShutDownUnitBecameActive",
     "SreWatchTimerMissed",
     "StalePRsIdleOver24h",
+    "SubscriptionPoolRunsOutBeforeReset",
     "SystemdUnitCrashLooping",
     "SystemdUnitFailed",
     "TeacherApiProbeDown",
@@ -165,6 +172,25 @@ _ALERT_NAMES = frozenset({
     "UsagePoolRestored",
     "Watchdog",
 })
+
+
+ALERT_SUMMARY_MAX_CHARS = 200
+
+
+def _alert_summary(annotations: dict, labels: dict) -> str | None:
+    """The rule's own one-line summary, or None when it is not plainly safe to show.
+
+    Only a single printable line is admitted, one the OPSEC scanner finds nothing in
+    and that does not echo the alert's host or scrape-target labels. The caller offers
+    it for allow-listed rule names only, whose templates are ours.
+    """
+    value = annotations.get("summary")
+    if not isinstance(value, str) or not 0 < len(value) <= ALERT_SUMMARY_MAX_CHARS or not value.isprintable():
+        return None
+    targets = [labels[key] for key in ("instance", "job") if isinstance(labels.get(key), str) and labels[key]]
+    if any(target in value for target in targets) or scan_text(value, canaries=targets):
+        return None
+    return value
 
 
 def _alerts_reading() -> dict:
@@ -214,10 +240,12 @@ def _alerts_reading() -> dict:
         if labels["alertname"] in HEARTBEAT_ALERTNAMES:
             heartbeat = True
             continue
+        known = labels["alertname"] in _ALERT_NAMES
         row = {
-            "alertname": panel_values.choice(labels.get("alertname"), _ALERT_NAMES, "UnrecognizedAlert"),
+            "alertname": labels["alertname"] if known else "UnrecognizedAlert",
             "severity": panel_values.choice(labels.get("severity"), {"critical", "warning", "info", "none"}, "unknown"),
             "starts_at": panel_values.timestamp(item.get("startsAt")),
+            "summary": _alert_summary(annotations, labels) if known else None,
         }
         alerts.append(row)
     alerts.sort(key=lambda row: (row.get("severity") != "critical", row.get("starts_at") or ""))
@@ -234,11 +262,11 @@ async def firing_alerts(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     key = ctx_scoped_ttl_key(ctx, "ops", "alerts")
     # This loopback read is cheap. Waiting for it on expiry avoids serving the
     # previous page refresh's reading on every 30-second UI cycle.
-    payload = await cache_get_or_compute_async(key, ALERTS_TTL_S, _alerts_reading)
+    reading = await cache_get_or_compute_async(key, ALERTS_TTL_S, _alerts_reading)
+    # The bound travels in the body too, so a reader that loses the headers still judges the age.
+    payload = {**reading, "stale_after_s": ALERTS_STALE_AFTER_S}
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
-        # A second reader may keep a cache hit 15 s old. Include the 3 s
-        # collector, 30 s page cycle, 8 s HTTP budget and 4 s margin.
-        panel_values.observation_age_s(payload.get("observed_at")), 60.0,
+        panel_values.observation_age_s(payload.get("observed_at")), ALERTS_STALE_AFTER_S,
         unavailable=payload.get("status") != "ok",
     ))
 

@@ -457,3 +457,51 @@ assert.match(clear, /<b>0<\/b> accounts run out before reset</);
 assert.doesNotMatch(clear, /unknown|chip bad|chip warn/);
 """
     )
+
+
+def test_home_freshness_is_read_from_the_payload_so_heading_and_rows_agree():
+    """Defect class: a heading judged from transport headers (stripped or rewritten in transit) says fresh or unavailable while the payload and its rows say stale or populated."""
+    code = _script("index.html", "function escapeHtml", "function updatePanelAge")
+    _node(_DOM + code + r"""
+const now = Date.now();
+const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false);
+// The body says stale at 817 s while rewritten headers claim a young, fresh reading: the body wins.
+const milestones = {url: '/api/milestones', age: 40, bound: 420, state: 'fresh', data: {status: 'ok', age_seconds: 817, stale: true}};
+assert.match(line(milestones).text, /· STALE · source age 817s · bound 420s$/);
+assert.equal(line(milestones).bad, true);
+// With every header stripped, the same body still judges itself.
+assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false}}).text, /· fresh · source age 12s · bound unknown$/);
+// Subscriptions: the heading and each row come from the same reading, with no header at all.
+const claudeRow = age => ({account: 'Claude a', reading: {status: 'fresh', age_s: age, read_at: '2030-01-01T00:00:00Z'}, plan: {status: 'ok'}});
+for (const [age, heading, row] of [[51, /fresh · source age 51s · bound 900s/, /fresh, 51s old/], [1800, /STALE · source age 1800s · bound 900s/, /STALE, 30m old/]]) {
+  const subs = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(age)]}]};
+  assert.match(line({url: '/api/runtime/subscriptions', data: subs}).text, heading);
+  assert.match(subscriptionRows(subs, null).groups, row);
+}
+// A source whose payload has no age falls back to its headers; with neither it is unjudged, never "unavailable".
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text, /· fresh · source age 27s · bound 60s$/);
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text, /· freshness unknown · source age unknown · bound unknown$/);
+assert.match(line({data: null, age: null, snapshot: false}).text, /· unavailable · source age unknown/);
+// Alerts carry their own bound in the body.
+const observed = new Date(now - 5000).toISOString();
+assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);
+""")
+
+
+def test_home_alerts_show_their_summary_and_keep_same_named_alerts_apart():
+    """Defect class: alerts of one rule collapse into a single anonymous row because the summary that tells them apart is dropped."""
+    code = _script("index.html", "function escapeHtml", "// ---- Summary chips ----")
+    _node(_DOM + code + r"""
+const pool = (name, extra = {}) => ({alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning',
+  starts_at: '2026-11-01T00:00:00Z', summary: `Subscription pool ${name} is projected to run out before reset`, ...extra});
+const html = renderAlerts({status: 'ok', heartbeat: true, alerts: [pool('a'), pool('b'), pool('a'),
+  {alertname: 'UnrecognizedAlert', severity: 'warning', starts_at: '2026-11-01T00:00:00Z', summary: null},
+  pool('<script>x</script>')]});
+assert.equal((html.match(/SubscriptionPoolRunsOutBeforeReset/g) || []).length, 3, 'one row per distinct summary');
+assert.match(html, /<span class="muted summary">Subscription pool a is projected to run out before reset<\/span>/);
+assert.match(html, /Subscription pool b is projected/);
+assert.doesNotMatch(html, /<script>/);
+assert.match(html, /&lt;script&gt;/);
+assert.doesNotMatch(html, /\(summary |summary Subscription/);
+assert.match(html, /Unrecognised alert<\/td>/);
+""")

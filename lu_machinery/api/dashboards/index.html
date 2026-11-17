@@ -40,6 +40,7 @@
   h2 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
   h2 .age { font-weight: normal; font-size: 12px; color: var(--muted); }
   h2 .age.bad { color: var(--bad); }
+  h2 .age.warn { color: var(--warn); }
   h3 { margin: 10px 0 4px; font-size: 13px; color: var(--muted); font-weight: 600; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -48,6 +49,7 @@
   p { margin: 6px 0; }
   details { margin: 8px 0; } summary { cursor: pointer; }
   .muted { color: var(--muted); }
+  .summary { display: block; font-size: 13px; }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); font-weight: 600; }
   .error { color: var(--bad); }
   .bar { display: inline-block; width: 64px; height: 8px; background: var(--line); border-radius: 4px; vertical-align: middle; margin-right: 6px; }
@@ -56,24 +58,22 @@
   table.subs { border-collapse: separate; border-spacing: 0; }
   table.subs td { min-width: 4.5em; }
   table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
-  .scroll-cue { display: none; margin: 0 0 6px; }
   @media (max-width: 640px) {
     header { padding: 8px 10px; } main { padding: 10px; gap: 10px; } section { padding: 8px 10px; }
     .refresh { margin-left: 0; }
-    /* One line per row; each card scrolls sideways instead of the page growing tall. */
+    /* One line per row; each table scrolls sideways inside its card instead of the page growing tall. */
     th, td { white-space: nowrap; }
     td br { display: none; }
-    .scroll-cue { display: block; }
-    /* The heading and the scroll hint stay put; only the tables move. */
-    #subs { overflow: hidden; }
-    .table-scroll {
-      overflow-x: auto;
-      background-image: linear-gradient(to left, color-mix(in srgb, var(--fg) 18%, transparent), transparent 18px);
-      background-repeat: no-repeat; background-position: right top; background-size: 18px 100%;
-    }
-    table.subs th:first-child, table.subs td:first-child {
-      position: sticky; left: 0; background: var(--card); z-index: 1; box-shadow: 1px 0 0 var(--line);
-    }
+    /* The subscriptions table stacks instead: every account is a card, so no column sits off-screen. */
+    #subs table, #subs tbody, #subs tr, #subs td, #subs th { display: block; white-space: normal; }
+    #subs thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    #subs tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
+    #subs tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
+    #subs th[colspan] { border: 0; padding: 0; }
+    #subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
+    #subs td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
+    #subs td:first-child { font-weight: 600; }
+    #subs td:first-child::before { display: none; }
   }
 </style>
 </head>
@@ -93,7 +93,7 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section class="wide" id="subs"><h2>Subscriptions: usage, pace, resets and sign-in <span class="age" id="usage-age">Loading…</span></h2><p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><p class="muted scroll-cue">Scroll sideways for the other columns. The account name stays visible.</p><div id="usage-content">Loading…</div></section>
+  <section class="wide" id="subs"><h2>Subscriptions: usage, pace, resets and sign-in <span class="age" id="usage-age">Loading…</span></h2><p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="usage-content">Loading…</div></section>
   <section class="wide" id="fleet"><h2>Agent fleet <span class="age" id="workers-age">Loading…</span></h2>
     <p id="workers-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="workers-content">Loading…</div>
@@ -132,7 +132,7 @@ async function fetchJson(url) {
     const state = response.headers.get("X-Snapshot-State");
     return {data, age: age !== null && Number.isFinite(age) && age >= 0 ? age : null,
       bound: bound !== null && Number.isFinite(bound) && bound > 0 ? bound : null,
-      state, snapshot: true, receivedAt: Date.now()};
+      state, snapshot: true, receivedAt: Date.now(), url};
   } finally {
     clearTimeout(timer);
   }
@@ -177,10 +177,14 @@ function bar(left) {
   return `<span class="bar"><span style="width:${left}%;background:${color}"></span></span>`;
 }
 
-function table(headers, rows) {
+// A cell carries its column name, so a stacked (card) layout can show it beside the value.
+const labelled = (cells, headers) => cells.map((cell, index) => headers[index]
+  ? cell.replace(/^<td/, `<td data-label="${escapeHtml(headers[index])}"`) : cell).join("");
+
+function table(headers, rows, stacked = false) {
   if (!rows.length) return '<p class="muted">None.</p>';
   return `<table><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>`
-    + rows.map(cells => `<tr>${cells.join("")}</tr>`).join("") + "</tbody></table>";
+    + rows.map(cells => `<tr>${stacked ? labelled(cells, headers) : cells.join("")}</tr>`).join("") + "</tbody></table>";
 }
 
 const td = (html, cls = "") => `<td${cls ? ` class="${cls}"` : ""}>${html}</td>`;
@@ -324,11 +328,11 @@ function subscriptionRows(subs, logins) {
       return true;
     });
     if (!accounts.length) return "";
-    return `<tr><th colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
+    return `<tr class="group"><th colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
       + accounts.map(row => {
         const usage = readingState(row.reading?.status, row.reading?.age_s, staleAfter) === "fresh" ? row : {};
         const weekly = usage.weekly || {};
-        return `<tr>${[
+        return `<tr>${labelled([
           text(row.account),
           weeklyResetCell(weekly),
           windowLeft(weekly),
@@ -340,7 +344,7 @@ function subscriptionRows(subs, logins) {
           planCell(row.plan),
           signInCell(row.account, logins),
           readingCell(row.reading, staleAfter),
-        ].join("")}</tr>`;
+        ], SUBSCRIPTION_HEADERS)}</tr>`;
       }).join("");
   }).join("");
   return {groups, hidden};
@@ -398,9 +402,9 @@ function renderUsage(subs, budget, logins) {
     + "The Codex API credits belong to Codex a and renew with its monthly turnover.");
   notes.push("Sign-in is read for Claude a, Claude b, Codex a and Codex b only. Any other account has no side-effect-free sign-in reader.");
   const head = `<thead><tr>${SUBSCRIPTION_HEADERS.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>`;
-  const api = budget ? `<div class="table-scroll">${table(["API account", "Balance / spend", "Reading", ""], apiRows(budget))}</div>`
+  const api = budget ? table(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
     : unknown("API account balances: the routing budget did not answer");
-  const subsTable = groups ? `<div class="table-scroll"><table class="subs">${head}<tbody>${groups}</tbody></table></div>`
+  const subsTable = groups ? `<table class="subs">${head}<tbody>${groups}</tbody></table>`
     : '<p class="muted">None.</p>';
   return subsTable + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api;
 }
@@ -552,7 +556,7 @@ function alertIdentity(alert) {
 
 function alertTitle(group) {
   const plain = group.alertname && group.alertname !== "UnrecognizedAlert" ? String(group.alertname) : "Unrecognised alert";
-  const skip = new Set(["alertname", "severity", "starts_at", "count", "oldest"]);
+  const skip = new Set(["alertname", "severity", "starts_at", "count", "oldest", "summary"]);
   const extra = [];
   for (const [key, value] of Object.entries(group)) {
     if (skip.has(key) || value === null || value === undefined || value === "") continue;
@@ -573,7 +577,8 @@ function renderAlerts(alerts) {
     groups.set(key, group);
   }
   const rows = [...groups.values()].map(group => [
-    text(alertTitle(group)),
+    td(escapeHtml(alertTitle(group)) + (typeof group.summary === "string" && group.summary
+      ? `<span class="muted summary">${escapeHtml(group.summary)}</span>` : "")),
     text(group.severity, group.severity === "critical" ? "bad" : group.severity === "warning" ? "warn" : ""),
     text(group.oldest ? span((Date.now() - toDate(group.oldest)) / 1000) : null, "num"),
     text(group.count, "num"),
@@ -652,7 +657,7 @@ function renderMilestones(data) {
   const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
   const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}GitHub data age ${age(data.age_seconds)}. ${escapeHtml(data.freshness)} Private repositories show counts only.</p>`];
   for (const repo of repos) {
-    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}</h3>`);
+    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
     if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);
     const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
     if (!milestones.length && repo.status === "ok") out.push('<p class="muted">No open milestones.</p>');
@@ -710,33 +715,100 @@ function clockUtc(moment = Date.now()) {
   return new Date(moment).toISOString().slice(11, 19) + " UTC";
 }
 
+// ---- Freshness: one reading of "how old, and is it stale" per source ----
+//
+// The panel heading and the rows below it both come from the payload fields the API returns.
+// The X-Snapshot-* headers are only the fallback for a payload that carries no age of its own
+// (a gateway or cache between the page and the API can strip or rewrite headers, never the body).
+
+const finiteAge = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+// Rows of one source -> {age, flag}: the oldest reading, and the worst state any row shows,
+// by the same readingState() the rows use.
+function rowsFreshness(rows, bound) {
+  const ages = rows.map(row => finiteAge(row.age)).filter(age => age !== null);
+  const flag = rows.some(row => row.state === "stale") ? "stale" : rows.some(row => row.state === "last_good") ? "last_good"
+    : ages.length ? "fresh" : null;
+  return {age: ages.length ? Math.max(...ages) : null, bound, flag};
+}
+
+// Where each panel source keeps its own age. Returns null when the payload has none.
+function payloadFreshness(url, data, receivedAt) {
+  const since = value => {
+    const moment = toDate(value);
+    return moment ? Math.max(0, (receivedAt - moment.getTime()) / 1000) : null;
+  };
+  if (url === "/api/milestones") {
+    return {age: finiteAge(data.age_seconds), bound: null, flag: typeof data.stale === "boolean" ? (data.stale ? "stale" : "fresh") : null};
+  }
+  if (url === "/api/runtime/subscriptions") {
+    const bound = finiteAge(data.stale_after_s) || null;
+    return rowsFreshness(liveAccounts(data).map(row => ({age: row.reading?.age_s,
+      state: readingState(row.reading?.status, row.reading?.age_s, bound ?? undefined)})), bound);
+  }
+  if (url === "/api/state/routing-budget") {
+    const bound = finiteAge(data.diagnostics?.stale_threshold_s) || null;
+    const rows = Object.values(data.api_accounts || {}).map(row => ({age: row.age_s,
+      state: readingState(row.freshness, row.age_s, bound ?? undefined)}));
+    return rows.length ? rowsFreshness(rows, bound)
+      : {age: finiteAge(data.diagnostics?.data_age_s), bound, flag: typeof data.diagnostics?.stale === "boolean" ? (data.diagnostics.stale ? "stale" : "fresh") : null};
+  }
+  if (url === "/api/runtime/logins") return {age: since(data.read_at), bound: null, flag: null};
+  if (url === "/api/git/pull-requests") return {age: since(data.observed_at), bound: null, flag: null};
+  if (url === "/api/ops/v1/alerts") return {age: since(data.observed_at), bound: finiteAge(data.stale_after_s) || null, flag: null};
+  return null;
+}
+
+// The reading's freshness: its own payload first, then the snapshot headers, never a mix of both ages.
+function freshnessOf(reading) {
+  if (!reading || !reading.data) return {age: null, bound: null, flag: null, unavailable: true};
+  const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
+  const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
+  if (own && own.age !== null) return {...own, bound: own.bound ?? headerBound, unavailable: false};
+  const flag = reading.state === "stale" ? "stale" : null;
+  return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
+}
+
+// fresh | stale | last_good | unknown | unavailable; `elapsed` is the time since the reading was received.
+function freshnessState(fresh, elapsed = 0) {
+  if (fresh.unavailable && fresh.age === null) return "unavailable";
+  if (fresh.flag === "stale") return "stale";
+  const age = fresh.age === null ? null : fresh.age + elapsed;
+  if (age !== null && fresh.bound !== null && age > fresh.bound) return "stale";
+  if (fresh.flag === "last_good") return "last_good";
+  if (age === null) return fresh.unavailable ? "unavailable" : "unknown";
+  return fresh.flag === "fresh" || fresh.bound !== null ? "fresh" : "unknown";
+}
+
+const FRESHNESS_LABELS = {fresh: "fresh", stale: "STALE", last_good: "last good reading", unknown: "freshness unknown", unavailable: "unavailable"};
+
 function headingAge(readings, badOnFailure, attemptedAt = null) {
   const sources = Array.isArray(readings) ? readings : [];
   const moment = sources[0]?.receivedAt ?? attemptedAt;
   const label = sources.length ? "Fetched" : "Last attempt";
   const fetched = moment ? `${label} at ${clockUtc(moment)}` : `${label} time unknown`;
   if (!sources.length) return {text: `${fetched} · unavailable · source age unknown`, bad: Boolean(badOnFailure)};
-  let bad = false;
+  let bad = false, caution = false;
   const labels = sources.map((reading, index) => {
+    const fresh = freshnessOf(reading);
     const elapsed = reading?.receivedAt ? Math.max(0, Date.now() - reading.receivedAt) / 1000 : 0;
-    const age = typeof reading?.age === "number" ? reading.age + elapsed : null;
-    const bound = reading?.bound;
-    const unknown = age === null || !Number.isFinite(bound) || bound <= 0;
-    const state = reading?.state === "unavailable" || unknown ? "unavailable"
-      : reading.state === "stale" || age > bound ? "STALE" : "fresh";
-    bad ||= state !== "fresh";
+    const state = freshnessState(fresh, elapsed);
+    bad ||= state === "stale" || state === "unavailable";
+    caution ||= state === "last_good" || state === "unknown";
     const prefix = sources.length > 1 ? `${["Usage", "API balances", "Sign-in"][index] || "Source"}: ` : "";
-    return `${prefix}${state} · source age ${age === null ? "unknown" : `${Math.ceil(age)}s`}`
-      + ` · bound ${Number.isFinite(bound) && bound > 0 ? `${bound}s` : "unknown"}`;
+    // The age shown is the reading's own, as the rows show it; a stall since the fetch is named separately.
+    const overdue = state === "stale" && freshnessState(fresh) !== "stale" ? " · refresh overdue" : "";
+    return `${prefix}${FRESHNESS_LABELS[state]} · source age ${fresh.age === null ? "unknown" : `${Math.ceil(fresh.age)}s`}`
+      + ` · bound ${fresh.bound === null ? "unknown" : `${fresh.bound}s`}${overdue}`;
   });
-  return {text: `${fetched} · ${labels.join("; ")}`, bad};
+  return {text: `${fetched} · ${labels.join("; ")}`, bad, caution};
 }
 
 function updatePanelAge(panel) {
   const age = document.getElementById(`${panel.id}-age`);
   const line = headingAge(panel.readings, panel.ok === false && !panel.refusal, panel.attemptedAt);
   age.textContent = line.text;
-  age.className = line.bad ? "age bad" : "age";
+  age.className = line.bad ? "age bad" : line.caution ? "age warn" : "age";
 }
 
 // Announce only when the status changes, so a healthy 30 s refresh stays quiet.
@@ -819,7 +891,7 @@ async function loadPanel(panel) {
     const ageLine = headingAge(readings, false, panel.attemptedAt);
     panel.readings = readings;
     age.textContent = ageLine.text;
-    age.className = ageLine.bad ? "age bad" : "age";
+    age.className = ageLine.bad ? "age bad" : ageLine.caution ? "age warn" : "age";
     panel.ok = true;
     panel.refusal = false;
     announce(panel, "ready");

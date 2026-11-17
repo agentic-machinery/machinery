@@ -227,3 +227,21 @@ def test_panel_known_probe_reasons_remain_typed_codes(panel_client, monkeypatch)
     subscriptions = client.get("/api/runtime/subscriptions").json()
     assert subscriptions["providers"][0]["accounts"][0]["pace"]["reason_code"] == "too_early_in_window"
     assert client.get("/api/runtime/logins").json()["accounts"][0]["reason_code"] == "probe_timeout"
+
+
+@pytest.mark.parametrize("summary", ("/home/synthetic-private/data.json", "account@example.invalid", "192.0.2.17",
+                                     "line one\nline two", "X" * 4096, "down at fixture-host.invalid:9100"))
+def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_client, monkeypatch, summary):
+    """Defect class: a rule template echoes a path, address, scrape target or multi-line text through the public alert summary."""
+    client, _ctx = panel_client
+    raw = [{"labels": {"alertname": "PROpenOver60m", "severity": "warning", "instance": "fixture-host.invalid:9100"},
+            "annotations": {"summary": summary}, "startsAt": STAMP, "status": {"state": "active"}}]
+    connection = SimpleNamespace(request=lambda *_args, **_kwargs: None, close=lambda: None,
+                                 getresponse=lambda: SimpleNamespace(status=200, read=lambda _limit: json.dumps(raw).encode()))
+    monkeypatch.setattr(ops_router.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
+    state_helpers.cache_invalidate()
+    row = client.get("/api/ops/v1/alerts").json()["alerts"][0]
+    assert row["alertname"] == "PROpenOver60m" and row["summary"] is None
+    raw[0]["annotations"]["summary"] = "An unowned PR has had no activity for over 60 minutes"
+    state_helpers.cache_invalidate()
+    assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == raw[0]["annotations"]["summary"]
