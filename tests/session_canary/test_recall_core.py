@@ -1,50 +1,42 @@
-"""Operational Grok lane session canary (mint / score via context_canary)."""
+"""Lane-neutral recall canary core (mint / score via context_canary)."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 
-from lu_machinery.common.repo_root import machinery_path
-
 import pytest
-from lu_machinery.session_canary import diary
-from lu_machinery.session_canary import grok_lane as gl
-from lu_machinery.session_canary import handoff_select
+
+from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.session_canary import diary, handoff_select
+from lu_machinery.session_canary import recall_core as gl
 
 _REPO = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("epic", ["../x", "/absolute", "Harness", "bad_name", "harness\n", "інфра"])
-@pytest.mark.parametrize("command", ["status", "mint"])
-def test_cli_rejects_unsafe_epic_before_writing(tmp_path: Path, epic: str, command: str) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    if epic == "/absolute":
-        epic = str(tmp_path / "absolute")
-    extra = ["--stream", "epic:999999", "--out-dir", str(tmp_path / "out")] if command == "mint" else []
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "lu_machinery.session_canary.grok_lane",
-            "--repo",
-            str(repo),
-            command,
-            f"--epic={epic}",
-            *extra,
-        ],
-        cwd=_REPO,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
-    )
-    assert proc.returncode == 2
-    assert "error: epic must be a selector" in proc.stderr
-    assert list(tmp_path.rglob("*")) == [repo]
+def _score_ns(**overrides: object) -> argparse.Namespace:
+    """Score arguments the lane CLIs pass to the core (the Grok CLI was retired in #512)."""
+    values: dict[str, object] = {
+        "stream": None,
+        "out_dir": None,
+        "handoff": None,
+        "context_tokens": 0,
+        "model": "test-model",
+        "pass_ratio": gl.DEFAULT_PASS_RATIO,
+        "threshold": gl.DEFAULT_SIM_THRESHOLD,
+        "next_drive": "",
+        "pins": "",
+        "open_prs": "",
+        "hands_off": "",
+        "pending_user": "",
+        "worktrees": "",
+        "no_hydrate": False,
+        "preferred": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
 
 
 def test_build_facts_exactly_ten_from_stream_and_handoff() -> None:
@@ -128,20 +120,16 @@ def test_mint_score_roundtrip_pass_and_fail(tmp_path: Path, monkeypatch: pytest.
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, timeout=30)
-    rc = gl.main(
-        [
-            "--repo",
-            str(repo),
-            "mint",
-            "--epic",
-            "atlas",
-            "--stream",
-            "epic:4387",
-            "--handoff",
-            str(handoff),
-            "--out-dir",
-            str(canary_dir),
-        ]
+    rc = gl.cmd_mint(
+        argparse.Namespace(
+            repo=repo,
+            epic="atlas",
+            stream="epic:4387",
+            handoff=str(handoff),
+            out_dir=str(canary_dir),
+            stream_limit=40,
+            preferred=None,
+        )
     )
     assert rc == 0
     probe = json.loads((canary_dir / "probe.json").read_text(encoding="utf-8"))
@@ -152,24 +140,15 @@ def test_mint_score_roundtrip_pass_and_fail(tmp_path: Path, monkeypatch: pytest.
     answers = {a["id"]: a["a"] for a in anchors}
     answers_path = canary_dir / "answers-ok.json"
     answers_path.write_text(json.dumps(answers), encoding="utf-8")
-    rc = gl.main(
-        [
-            "--repo",
-            str(repo),
-            "score",
-            "--epic",
-            "atlas",
-            "--out-dir",
-            str(canary_dir),
-            "--answers",
-            str(answers_path),
-            "--context-tokens",
-            "100000",
-            "--model",
-            "test-model",
-            "--pass-ratio",
-            "0.8",
-        ]
+    rc = gl.cmd_score(
+        _score_ns(
+            repo=repo,
+            epic="atlas",
+            out_dir=str(canary_dir),
+            answers=str(answers_path),
+            context_tokens=100000,
+            pass_ratio=0.8,
+        )
     )
     assert rc == 0
     verdict = json.loads((canary_dir / "last_verdict.json").read_text(encoding="utf-8"))
@@ -181,24 +160,15 @@ def test_mint_score_roundtrip_pass_and_fail(tmp_path: Path, monkeypatch: pytest.
         broken[aid] = "I forgot this entirely"
     answers_path2 = canary_dir / "answers-bad.json"
     answers_path2.write_text(json.dumps(broken), encoding="utf-8")
-    rc = gl.main(
-        [
-            "--repo",
-            str(repo),
-            "score",
-            "--epic",
-            "atlas",
-            "--out-dir",
-            str(canary_dir),
-            "--answers",
-            str(answers_path2),
-            "--context-tokens",
-            "300000",
-            "--model",
-            "test-model",
-            "--pass-ratio",
-            "0.8",
-        ]
+    rc = gl.cmd_score(
+        _score_ns(
+            repo=repo,
+            epic="atlas",
+            out_dir=str(canary_dir),
+            answers=str(answers_path2),
+            context_tokens=300000,
+            pass_ratio=0.8,
+        )
     )
     assert rc == 2
     verdict2 = json.loads((canary_dir / "last_verdict.json").read_text(encoding="utf-8"))
@@ -219,7 +189,7 @@ def test_score_offline_preserves_handback_and_launcher_instructions(
     (canary / "probe.json").write_text("{}", encoding="utf-8")
     answers = canary / "answers.json"
     answers.write_text("{}", encoding="utf-8")
-    handoff = tmp_path / ".claude" / "harness-epic" / "GROK-DRIVER-HANDOFF.md"
+    handoff = tmp_path / ".claude" / "harness-epic" / "CODEX-DRIVER-HANDOFF.md"
     handoff.parent.mkdir(parents=True)
     handoff.write_text("## Next Drive\n1. Preserve synthetic task\n## Hands-off\n- Foreign lanes\n", encoding="utf-8")
     notes = []
@@ -234,13 +204,17 @@ def test_score_offline_preserves_handback_and_launcher_instructions(
         return subprocess.CompletedProcess(command, score_rc, score_line + "\n", "")
 
     monkeypatch.setattr(gl.subprocess, "run", offline_scorer)
-    rc = gl.main([
-        "--repo", str(tmp_path), "score", "--epic", "harness",
-        "--out-dir", str(canary),
-        "--answers", str(answers), "--handoff", str(handoff),
-        "--next-drive", "Preserve synthetic task",
-        "--context-tokens", "999", "--model", "test-model",
-    ])
+    rc = gl.cmd_score(
+        _score_ns(
+            repo=tmp_path,
+            epic="harness",
+            out_dir=str(canary),
+            answers=str(answers),
+            handoff=str(handoff),
+            next_drive="Preserve synthetic task",
+            context_tokens=999,
+        )
+    )
     assert rc == score_rc
     out = capsys.readouterr().out
     assert score_line in out

@@ -597,7 +597,7 @@ _ISSUE_STREAMS = machinery_path("config/issue_streams.yaml")
 _LAUNCH_PATH_MINTS = (
     _HANDOFF_IDENTITY,
     machinery_path("lib/launcher_core.sh"),
-    machinery_path("session_canary/grok_lane.py"),
+    machinery_path("session_canary/recall_core.py"),
     machinery_path("session_canary/handoff_select.py"),
 )
 
@@ -876,7 +876,7 @@ def test_launch_path_does_not_literal_mint_infra_epic() -> None:
 
 @pytest.mark.usefixtures('configured_roots')
 def test_fresh_infra_stream_capsule_is_registered(tmp_path: Path, monkeypatch) -> None:
-    """A successor infra epic gets registered dual-write + non-empty handoff paths."""
+    """A successor infra epic is registered and its capsule carries no handoff-file mirror."""
     from lu_machinery.session_streams.db import SessionStreamDatabase
     from lu_machinery.session_streams.model import LeaseHolder
     from lu_machinery.session_streams.receipts import register_manifest_inventory
@@ -926,9 +926,7 @@ def test_fresh_infra_stream_capsule_is_registered(tmp_path: Path, monkeypatch) -
     )
     capsule = supervisor.build_capsule(role=LaunchRole.DRIVER, stream_id=stream_id, lease=lease).as_dict()
     assert capsule["identity"]["stream_id"] == stream_id
-    assert capsule["dual_write"]["mode"] == "inventory"
-    assert capsule["dual_write"]["handoff_paths"]
-    assert any("harness-epic" in path for path in capsule["dual_write"]["handoff_paths"])
+    assert "dual_write" not in capsule
     supervisor.close_driver(role=LaunchRole.DRIVER, lease=lease)
 
 pytestmark = [pytest.mark.usefixtures('configured_roots'), pytest.mark.usefixtures('hermetic_monitor'), pytest.mark.usefixtures('isolated_monitor_state')]

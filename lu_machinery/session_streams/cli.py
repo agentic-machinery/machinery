@@ -11,23 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from .db import SessionStreamDatabase
-from .dual_write import (
-    ATLAS_HANDOFF_PATH,
-    list_handoff_candidates,
-    mirror_atlas_handoff,
-    mirror_handoff_file,
-    resolve_handoff_path,
-)
 from .hooks import clean_exit_hook, heartbeat_hook, lease_from_environment
-from .inventory import (
-    DEFAULT_STREAMS_YAML,
-    epic_handoff_map,
-    inventory_covers_issue_streams,
-    inventory_snapshot,
-    load_stream_epic_inventory,
-)
+from .inventory import DEFAULT_STREAMS_YAML, inventory_snapshot
 from .model import entry_as_dict
-from .projection import detect_projection_drift, project_inventory_streams
 from .receipts import (
     inventory_registration_summary,
     list_migration_state,
@@ -41,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="session-streams",
         description=(
             "Read agent-agnostic epic session streams and invoke their harness hook surface.\n"
-            "Use during phase-one shadow/dual-write operation; do not use it to cut over or retire file handoffs."
+            "A lane's handoff content is its DB note (lu-driver-state); these streams carry lease and lifecycle state."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
@@ -131,82 +117,6 @@ Related:
         help="Harness lifecycle action: heartbeat renews TTL; close performs idempotent clean-exit close.",
     )
 
-    mirror = subparsers.add_parser(
-        "mirror-atlas",
-        help="Mirror the Atlas file handoff into an explicit stream without cutover.",
-        description=(
-            "Read a stable Atlas handoff file, append it as state under the exact lease, and record its hash. "
-            "The source file remains authoritative and is never edited or deleted."
-        ),
-    )
-    mirror.add_argument(
-        "--stream",
-        required=True,
-        help="Explicit Atlas stream ID, for example epic:4700; no Atlas epic is guessed.",
-    )
-    mirror.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root containing the legacy handoff. Default: current working directory.",
-    )
-    mirror.add_argument(
-        "--source",
-        type=Path,
-        default=ATLAS_HANDOFF_PATH,
-        help=(
-            "Atlas handoff path relative to --repo-root. "
-            "Default: .claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md."
-        ),
-    )
-
-    mirror_handoff = subparsers.add_parser(
-        "mirror-handoff",
-        help="Mirror any registered epic file handoff into its stream (dual-write, no cutover).",
-        description=(
-            "Append a stable legacy handoff image under the exact lease. "
-            "Uses inventory-derived handoff candidates from issue_streams.yaml when "
-            "--source is omitted. Never edits or deletes the file."
-        ),
-    )
-    mirror_handoff.add_argument(
-        "--stream",
-        required=True,
-        help="Stream ID, for example epic:4387.",
-    )
-    mirror_handoff.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root. Default: current working directory.",
-    )
-    mirror_handoff.add_argument(
-        "--source",
-        type=Path,
-        default=None,
-        help="Optional handoff path (relative to --repo-root). Default: first existing registry path.",
-    )
-    mirror_handoff.add_argument(
-        "--profile",
-        default=None,
-        help="Mirror profile label (default: stream id without epic: prefix).",
-    )
-
-    status = subparsers.add_parser(
-        "dual-write-status",
-        help="List registered epic handoff paths and whether each file exists (no cutover).",
-        description=(
-            "Phase-2 dual-write inventory: which streams have on-disk handoffs ready to mirror. "
-            "Does not mutate the database."
-        ),
-    )
-    status.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root. Default: current working directory.",
-    )
-
     inventory = subparsers.add_parser(
         "inventory",
         help="List every epic from issue_streams.yaml (manifest authority; no hard-coded subset).",
@@ -235,84 +145,6 @@ Related:
             "Register every manifest epic into the session-stream DB with inventory "
             "and import receipts (mode stays inventory; cutover blocked)."
         ),
-    )
-
-    project = subparsers.add_parser(
-        "project",
-        help="Record DB-first projection receipts for inventoried epics (no file rewrite).",
-        description=(
-            "After inventory, write legacy_projection_receipts for each epic handoff path. "
-            "Detects unrecorded file mutation / dual-write projection failure as drift or "
-            "failed status. Does not open leases, rewrite handoffs, or advance cutover."
-        ),
-    )
-    project.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root. Default: current working directory.",
-    )
-    project.add_argument(
-        "--stream",
-        action="append",
-        default=None,
-        dest="streams",
-        help="Optional stream ID filter (repeatable), for example epic:1001.",
-    )
-    project.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output rendering. Default: json.",
-    )
-    project.add_argument(
-        "--no-register-inventory",
-        action="store_true",
-        help="Skip ensure-inventory step (fails closed if import receipts are missing).",
-    )
-    project.add_argument(
-        "--agent",
-        default="system",
-        help="Agent identity recorded on control events. Default: system.",
-    )
-
-    check_drift = subparsers.add_parser(
-        "check-drift",
-        help="Projection drift hook: record receipts and surface unrecorded file mutations.",
-        description=(
-            "Structure-only drift detection hook for dual-write. Same receipt path as "
-            "'project'; named for startup wiring later. Does not change SessionStart, "
-            "open leases, or flip cutover modes."
-        ),
-    )
-    check_drift.add_argument(
-        "--repo-root",
-        type=Path,
-        default=Path.cwd(),
-        help="Repository root. Default: current working directory.",
-    )
-    check_drift.add_argument(
-        "--stream",
-        action="append",
-        default=None,
-        dest="streams",
-        help="Optional stream ID filter (repeatable).",
-    )
-    check_drift.add_argument(
-        "--format",
-        choices=("json", "table"),
-        default="json",
-        help="Output rendering. Default: json.",
-    )
-    check_drift.add_argument(
-        "--register-inventory",
-        action="store_true",
-        help="Register inventory first when receipts are not yet seeded.",
-    )
-    check_drift.add_argument(
-        "--agent",
-        default="system",
-        help="Agent identity recorded on control events. Default: system.",
     )
 
     handoff_status = subparsers.add_parser(
@@ -391,18 +223,8 @@ def main(argv: list[str] | None = None) -> int:
             return _dump(store, args)
         if args.command == "hook":
             return _hook(store, args)
-        if args.command == "mirror-atlas":
-            return _mirror_atlas(store, args)
-        if args.command == "mirror-handoff":
-            return _mirror_handoff(store, args)
-        if args.command == "dual-write-status":
-            return _dual_write_status(args)
         if args.command == "inventory":
             return _inventory(store, args)
-        if args.command == "project":
-            return _project(store, args)
-        if args.command == "check-drift":
-            return _check_drift(store, args)
         if args.command == "handoff-status":
             return _handoff_status(store, args)
         if args.command == "handoff-claim":
@@ -515,93 +337,6 @@ def _hook(store: SessionStreamStore, args: argparse.Namespace) -> int:
     return 0
 
 
-def _mirror_atlas(store: SessionStreamStore, args: argparse.Namespace) -> int:
-    lease = lease_from_environment()
-    result = mirror_atlas_handoff(
-        store,
-        lease,
-        repo_root=args.repo_root,
-        stream_id=args.stream,
-        source_path=args.source,
-    )
-    print(
-        json.dumps(
-            {
-                "profile": result.profile,
-                "source_path": result.source_path,
-                "source_sha256": result.source_sha256,
-                "source_bytes": result.source_bytes,
-                "entry_id": result.entry.entry_id,
-                "mirror_id": result.mirror_id,
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def _mirror_handoff(store: SessionStreamStore, args: argparse.Namespace) -> int:
-    lease = lease_from_environment()
-    source = args.source
-    if source is None:
-        resolved = resolve_handoff_path(args.stream, args.repo_root)
-        if resolved is None:
-            known = ", ".join(epic_handoff_map(args.repo_root).get(args.stream, ())) or "(none registered)"
-            raise ValueError(
-                f"no existing handoff for {args.stream}; candidates: {known}; pass --source explicitly"
-            )
-        source = resolved
-    profile = args.profile or args.stream.removeprefix("epic:")
-    result = mirror_handoff_file(
-        store,
-        lease,
-        profile=profile,
-        repo_root=args.repo_root,
-        stream_id=args.stream,
-        source_path=source,
-    )
-    print(
-        json.dumps(
-            {
-                "profile": result.profile,
-                "source_path": result.source_path,
-                "source_sha256": result.source_sha256,
-                "source_bytes": result.source_bytes,
-                "entry_id": result.entry.entry_id,
-                "mirror_id": result.mirror_id,
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
-def _dual_write_status(args: argparse.Namespace) -> int:
-    rows = list_handoff_candidates(args.repo_root)
-    print("stream\tname\texists\tpath")
-    for row in rows:
-        print(f"{row.stream_id}\t{row.stream_name}\t{int(row.exists)}\t{row.path}")
-    inventory = load_stream_epic_inventory(args.repo_root)
-    registered = sorted(r.stream_id for r in inventory)
-    present = sorted({r.stream_id for r in rows if r.exists})
-    ok, missing = inventory_covers_issue_streams(args.repo_root)
-    print(
-        json.dumps(
-            {
-                "registered_streams": registered,
-                "epic_count": len(inventory),
-                "streams_with_file": present,
-                "inventory_covers_issue_streams": ok,
-                "missing_epics": missing,
-                "source": str(DEFAULT_STREAMS_YAML),
-                "cutover": "blocked — dual-write only; file handoffs remain authoritative",
-            },
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
 def _inventory(store: SessionStreamStore, args: argparse.Namespace) -> int:
     snap = inventory_snapshot(args.repo_root)
     registration: dict[str, Any] | None = None
@@ -639,54 +374,6 @@ def _inventory(store: SessionStreamStore, args: argparse.Namespace) -> int:
         payload["registration"] = registration
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
-
-
-def _print_projection_result(
-    store: SessionStreamStore,
-    result: Any,
-    *,
-    fmt: str,
-) -> int:
-    payload = result.as_dict()
-    payload["db_summary"] = inventory_registration_summary(store)
-    if fmt == "table":
-        print("stream_id\ttarget_path\tstatus\tunrecorded_mutation\tsource\terror")
-        for row in payload["streams"]:
-            print(
-                f"{row['stream_id']}\t{row['target_path']}\t{row['status']}\t"
-                f"{row['unrecorded_mutation']}\t{row['source']}\t{row['error']}"
-            )
-        print(
-            f"epic_count\t{payload['epic_count']}\tok\t{payload['ok']}\t"
-            f"drift\t{payload['drift']}\tfailed\t{payload['failed']}\t"
-            f"receipts_written\t{payload['receipts_written']}"
-        )
-        print(f"cutover\t{payload['cutover']}")
-        return 0
-    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
-
-
-def _project(store: SessionStreamStore, args: argparse.Namespace) -> int:
-    result = project_inventory_streams(
-        store,
-        args.repo_root,
-        stream_ids=args.streams,
-        ensure_inventory=not args.no_register_inventory,
-        agent=args.agent,
-    )
-    return _print_projection_result(store, result, fmt=args.format)
-
-
-def _check_drift(store: SessionStreamStore, args: argparse.Namespace) -> int:
-    result = detect_projection_drift(
-        store,
-        args.repo_root,
-        stream_ids=args.streams,
-        ensure_inventory=args.register_inventory,
-        agent=args.agent,
-    )
-    return _print_projection_result(store, result, fmt=args.format)
 
 
 def _dump_jsonl(payload: dict[str, Any]) -> str:

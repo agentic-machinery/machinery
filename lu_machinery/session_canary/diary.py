@@ -512,7 +512,7 @@ def format_handback_block(
         f"\n### Worktrees\n{bullets(worktrees)}"
         f"\n### Notes\n{bullets(notes)}"
         f"\n> Successor: load this block + stream tail, then "
-        f"`.venv/bin/python -m {_PACKAGE}.grok_lane mint --epic {epic}`.\n"
+        f"`.venv/bin/python -m {_PACKAGE}.<lane>_lane mint --epic {epic}` (codex, gemini or muse).\n"
         f"> Do **not** invent the queue from chat memory alone.\n"
     )
 

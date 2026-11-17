@@ -13,11 +13,11 @@ from pathlib import Path
 from lu_machinery.common.epic_selector import validate_epic
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.orchestration.launcher_aliases import load_launcher_aliases
-from lu_machinery.session_canary import grok_lane
+from lu_machinery.session_canary import recall_core
 from lu_machinery.session_streams.inventory import stream_anchor_id
 
-# This package's import name, as ``python -m`` names its modules (derived once, in grok_lane).
-_PACKAGE = grok_lane._PACKAGE
+# This package's import name, as ``python -m`` names its modules (derived once, in recall_core).
+_PACKAGE = recall_core._PACKAGE
 
 MODEL = "muse-wonder-full-1.0"
 
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-dir", default=None, help="Artifacts directory; default .claude/<canonical-stream>-epic/canary"
     )
     mint.add_argument("--stream-limit", type=int, default=40, help="Maximum stream entries read; default 40")
-    mint.set_defaults(func=grok_lane.cmd_mint)
+    mint.set_defaults(func=recall_core.cmd_mint)
     score = subparsers.add_parser("score", help="Score recall; below 8/10 requires handoff and exit")
     score.add_argument("--epic", required=True, help="devops or monitor, including their supported launcher aliases")
     score.add_argument("--stream", default=None, help="Optional canonical admitted stream; default from registry")
@@ -56,10 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--answers", required=True, help="JSON anchor-id to recalled answer map, e.g. answers.json")
     score.add_argument("--context-tokens", type=int, default=0, help="Observed context tokens; default 0 (unknown)")
     score.set_defaults(
-        func=grok_lane.cmd_score,
+        func=recall_core.cmd_score,
         model=MODEL,
-        pass_ratio=grok_lane.DEFAULT_PASS_RATIO,
-        threshold=grok_lane.DEFAULT_SIM_THRESHOLD,
+        pass_ratio=recall_core.DEFAULT_PASS_RATIO,
+        threshold=recall_core.DEFAULT_SIM_THRESHOLD,
         no_hydrate=False,
     )
     parser.set_defaults(preferred=["MUSE-DRIVER-HANDOFF.md", "INTERIM-DRIVER-HANDOFF.md"])

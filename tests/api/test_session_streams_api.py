@@ -25,7 +25,7 @@ def _client(ctx: MonitorContext | None = None) -> TestClient:
     return TestClient(app)
 
 
-def test_session_streams_health_and_dual_write() -> None:
+def test_session_streams_health_and_plane_continuity() -> None:
     client = _client()
     h = client.get("/api/session-streams/v1/health")
     assert h.status_code == 200
@@ -37,20 +37,12 @@ def test_session_streams_health_and_dual_write() -> None:
     assert body["repo"]["role"] in {"live", "release"}
     assert set(body["store"]) == {"reachable", "schema_versions"}
 
-    d = client.get("/api/session-streams/v1/dual-write-status")
-    assert d.status_code == 200
-    dual = d.json()
-    assert "repo_root" not in dual
-    assert "db_path" not in dual
-    assert set(dual["repo"]) == {"role", "sha"}
-    assert set(dual["store"]) == {"reachable", "schema_versions"}
-    assert "candidates" in dual
-    assert dual["total"] >= 0
-    assert all("path" not in candidate for candidate in dual["candidates"])
+    assert client.get("/api/session-streams/v1/dual-write-status").status_code == 404
 
     c = client.get("/api/session-streams/v1/plane-continuity")
     assert c.status_code == 200
     assert c.json()["cutover"] == "operator-gated"
+    assert "dual_write" not in c.json()
 
 
 def test_session_stream_status_and_digest_for_harness() -> None:
@@ -111,7 +103,7 @@ def test_session_streams_repo_root_uses_live_primary_under_release(
 
 
 def test_session_streams_missing_db_returns_404(tmp_path: Path) -> None:
-    """When the SQLite DB does not exist, status/digest/drift return 404 cleanly."""
+    """When the SQLite DB does not exist, status and digest return 404 cleanly."""
     ctx = fixture_context(tmp_path)
     client = _client(ctx)
 
@@ -122,10 +114,6 @@ def test_session_streams_missing_db_returns_404(tmp_path: Path) -> None:
     d = client.get("/api/session-streams/v1/digest/epic:4707")
     assert d.status_code == 404
     assert "session-stream database is unavailable" in d.json()["detail"]
-
-    drift = client.get("/api/session-streams/v1/drift")
-    assert drift.status_code == 404
-    assert "session-stream database is unavailable" in drift.json()["detail"]
 
     # Full app factory regression probe (mirrors reviewer live probe)
     @asynccontextmanager
@@ -141,7 +129,3 @@ def test_session_streams_missing_db_returns_404(tmp_path: Path) -> None:
         d = factory_client.get("/api/session-streams/v1/digest/epic:4707")
         assert d.status_code == 404
         assert "session-stream database is unavailable" in d.json()["detail"]
-
-        drift = factory_client.get("/api/session-streams/v1/drift")
-        assert drift.status_code == 404
-        assert "session-stream database is unavailable" in drift.json()["detail"]

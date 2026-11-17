@@ -201,7 +201,7 @@ def test_driver_open_heartbeat_close_and_capsule_are_fenced(tmp_path: Path) -> N
     assert capsule["identity"]["lease"]["lease_id"] == lease.lease_id
     assert capsule["identity"]["lease_credentials_exported"] is False
     assert capsule["diagnostics"]["lease_actions"] == "supervisor-only"
-    assert capsule["dual_write"]["handoff_paths"]
+    assert "dual_write" not in capsule
     assert len(capsule["capsule_sha256"]) == 64
 
     renewed = supervisor.heartbeat_driver(role="driver", lease=lease)

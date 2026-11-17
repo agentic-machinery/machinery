@@ -45,7 +45,7 @@ for reconciliation.
 
 Launch a driver with an exact numeric stream and an explicit role. The command
 returns a JSON capsule in the required order: identity, pending rollover slot,
-digest watermark, dual-write handoff status, then diagnostics.
+digest watermark, then diagnostics.
 
 ```bash
 .venv/bin/python -m lu_machinery.session_supervisor \

@@ -1,45 +1,22 @@
-#!/usr/bin/env python3
-"""Grok epic-lane session canary — mint / questions / score / protocol.
+"""Lane-neutral recall canary core: mint, questions, score and hydrate.
 
-Purpose
--------
-Auto-compact compresses **working context** (lossy for nuance). Disk logs and
-session-stream dual-writes survive; the model brain does not. This CLI freezes
-durable anchors at cold-start and scores recall later so we **end the session
-on measured rot**, not on compact count or a guessed token budget.
+Auto-compact compresses working context; disk state survives. Mint freezes ten
+durable anchors from the lane's handoff candidates and stream tail, and score
+measures recall later, so a session ends on measured rot rather than on a
+compact count. The Codex, Gemini and Muse lane CLIs (``codex_lane``,
+``gemini_lane``, ``muse_lane``) supply their candidate handoffs and call this
+core; it has no CLI of its own. The Grok lane CLI that used to live here was
+retired in #512: no launcher starts a Grok driver.
 
-Policy (operational, not production-rollover)
----------------------------------------------
-- Mint **10** anchors from stream + handoff dual-write only (no git/PR scrape).
-- Score with legacy ``context_canary``: ``--pass-ratio`` default **0.8** (8/10).
-- FAIL-HANDOFF (rc 2): write STATE AT HANDBACK, ``/quit``; launcher closes its fenced lease.
-- Run mint/score only within ``thread-rollover``; agents never claim, renew, release, or recover leases.
-- First auto-compact is a **re-score trigger**, not an end signal by itself.
-- ``score`` **auto-hydrates on PASS** (Sol Option D) so the operator never
-  has to remember hydrate/restart for diary load; use ``--no-hydrate`` only
-  for tests/debugging.
-- A driver handoff is a living document. Mint binds its path (or null for no
-  handoff) plus the selection inputs. ``handoff_sha256`` is informational.
-  Material edits after mint → re-mint to refresh facts. Score reports
-  ``handoff_changed_since_mint`` and does not fail for that edit.
+- Score with ``context_canary``: ``--pass-ratio`` default 0.8 (8/10).
+- FAIL-HANDOFF (rc 2): write STATE AT HANDBACK and exit; the launcher closes
+  its fenced lease. Lanes never claim, renew, release or recover leases.
+- ``score`` hydrates on PASS unless ``--no-hydrate``.
+- Mint binds its handoff path (or none) in ``mint_meta.json``; score and
+  hydrate read the bound path. ``handoff_sha256`` is informational.
 
-Paths (gitignored local; under ``.claude/<epic>-epic/canary/``)
----------------------------------------------------------------
-  probe.json       frozen ground truth (do not show answers to the scorer turn)
-  questions.json   id → question only (agent answers from memory)
-  answers.json     agent-written answers for score
-  log.csv          (context_tokens, score) time series
-  last_verdict.json  latest machine verdict
-
-Usage within thread-rollover only
---------------------------------
-  .venv/bin/python -m scripts.session_canary.grok_lane mint --epic atlas
-  .venv/bin/python -m scripts.session_canary.grok_lane questions
-  .venv/bin/python -m scripts.session_canary.grok_lane score \\
-      --answers .claude/atlas-epic/canary/answers.json \\
-      --context-tokens 250000 --model grok-4.7
-  .venv/bin/python -m scripts.session_canary.grok_lane protocol --epic atlas
-  .venv/bin/python -m scripts.session_canary.grok_lane status --epic atlas
+Artifacts live under ``.claude/<epic>-epic/canary/``: ``probe.json``,
+``questions.json``, ``answers.json``, ``log.csv``, ``last_verdict.json``.
 """
 
 from __future__ import annotations
@@ -54,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from lu_machinery.common.epic_selector import validate_epic
-from lu_machinery.common.repo_root import machinery_path, state_root
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.session_canary import handoff_select
 
 # The machinery package's import name, which is also the directory its files have in checkout paths:
@@ -74,6 +51,16 @@ _CANARY_TIMEOUT_SECONDS = 30
 _TIMEOUT_RETURN_CODE = 124
 
 
+def _timeout_stderr(exc: subprocess.TimeoutExpired, label: str) -> str:
+    """The timed-out child's partial stderr as text, or a timeout notice.
+
+    ``TimeoutExpired`` keeps partial output as bytes even under ``text=True``.
+    """
+    raw: bytes | str | None = exc.stderr
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    return text or f"context_canary {label} timed out after {exc.timeout}s"
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -83,12 +70,9 @@ def _canary_dir(repo: Path, epic: str) -> Path:
     return repo / ".claude" / f"{epic}-epic" / "canary"
 
 
-_OWN_HANDOFF = "GROK-DRIVER-HANDOFF.md"
-
-
 def _load_ranked(repo: Path, epic: str, preferred: list[str] | None = None) -> list[handoff_select.LoadedCandidate]:
     """One read per candidate, ranked. Mint and the pre-mint board share this."""
-    own = [_OWN_HANDOFF] if preferred is None else [name for name in preferred if name]
+    own = [name for name in preferred or () if name]
     return handoff_select.load_and_rank_candidates(
         repo,
         epic,
@@ -264,7 +248,7 @@ def cmd_mint(args: argparse.Namespace) -> int:
             command,
             _TIMEOUT_RETURN_CODE,
             stdout="",
-            stderr=exc.stderr or f"context_canary mint timed out after {exc.timeout}s",
+            stderr=_timeout_stderr(exc, "mint"),
         )
     if proc.returncode != 0:
         print(proc.stdout, end="")
@@ -374,7 +358,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             command,
             _TIMEOUT_RETURN_CODE,
             stdout="",
-            stderr=exc.stderr or f"context_canary score timed out after {exc.timeout}s",
+            stderr=_timeout_stderr(exc, "score"),
         )
     print(proc.stdout, end="")
     if proc.stderr:
@@ -470,7 +454,7 @@ def cmd_score(args: argparse.Namespace) -> int:
                 pending_user=_split_csv_lines(getattr(args, "pending_user", "") or ""),
                 worktrees=_split_csv_lines(getattr(args, "worktrees", "") or ""),
                 canary_line=canary_line,
-                notes=["Auto-written by grok_lane score on FAIL-HANDOFF"],
+                notes=["Auto-written by the recall canary score on FAIL-HANDOFF"],
                 recorded_meta=recorded_meta,
             )
             print(f"diary handback -> {handoff_path}")
@@ -661,396 +645,3 @@ def emit_hydrate_capsule(
         meta["receipt"] = str(out_path)
     rc = 2 if meta.get("visible_gap") else 0
     return rc, meta
-
-
-def cmd_hydrate(args: argparse.Namespace) -> int:
-    """Print a Sol Option-D post-compact hydrate capsule (bounded; stdout-first).
-
-    Prefer ``score`` (auto-hydrates on PASS) so the operator never has to
-    remember hydrate. Capsule is a recovery aid — diary + stream remain SSOT.
-    """
-    repo = Path(args.repo).resolve()
-    rc, _meta = emit_hydrate_capsule(
-        repo=repo,
-        epic=args.epic,
-        stream_id=getattr(args, "stream", None),
-        handoff=getattr(args, "handoff", None),
-        out_dir=Path(args.out_dir) if getattr(args, "out_dir", None) else None,
-        max_tokens=int(getattr(args, "max_tokens", 1400)),
-        max_stamps=int(getattr(args, "max_stamps", 3)),
-        stream_limit=int(getattr(args, "stream_limit", 5)),
-        no_stream=bool(getattr(args, "no_stream", False)),
-        write=bool(getattr(args, "write", False)),
-        print_stdout=True,
-        preferred=getattr(args, "preferred", None),
-    )
-    return rc
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    repo = Path(args.repo).resolve()
-    epic = args.epic.strip().lower()
-    out_dir = Path(args.out_dir) if args.out_dir else _canary_dir(repo, epic)
-    print(f"canary_dir: {out_dir}")
-    for name in ("probe.json", "questions.json", "mint_meta.json", "last_verdict.json", "log.csv"):
-        p = out_dir / name
-        print(f"  {'OK ' if p.is_file() else '—  '} {name}")
-    meta = out_dir / "mint_meta.json"
-    if meta.is_file():
-        print("mint_meta:", meta.read_text(encoding="utf-8").strip())
-    verdict = out_dir / "last_verdict.json"
-    if verdict.is_file():
-        print("last_verdict:", verdict.read_text(encoding="utf-8").strip())
-    return 0
-
-
-def cmd_protocol(args: argparse.Namespace) -> int:
-    """Print the agent-facing protocol (paste into cold-start / after compact)."""
-    epic = args.epic.strip().lower()
-    stream = _stream_id(args)
-    canary = f".claude/{epic}-epic/canary"
-    handoff = f".claude/{epic}-epic/INTERIM-DRIVER-HANDOFF.md"
-    text = f"""## Grok lane session canary + diary (operational)
-
-You are bound to epic **{epic}** / stream **{stream}**.
-
-**Operator is not the recovery driver.** After compact or rot risk, you score + auto-hydrate yourself. Do not ask whether to restart for diary load.
-
-### SSOT (survives compact) — chat does not
-- Session stream dual-write (typed entries)
-- Dual-write **diary handoff** (prefer `{handoff}` / CLAUDE-DRIVER-HANDOFF.md)
-- Canary probe under `{canary}/` — rot measurement only, **not** the board
-
-### Handoff = DIARY (required)
-The handoff is a living document. Mint binds its path; ``handoff_sha256`` is informational. Material edits after mint → re-mint to refresh facts.
-After every real batch (merge, issue close, dispatch start, advisor note, block):
-```bash
-.venv/bin/python -m {_PACKAGE}.grok_lane stamp --epic {epic} \\
-  --title "short what changed" \\
-  --bullet "fact 1" --bullet "fact 2" \\
-  --next "next action 1" --next "next action 2"
-```
-Keep **## Next Drive** as short numbered bullets (canary mints these). No secrets/PII.
-Keep **## Active Working Set** for load-bearing mid-flight facts (also mintable).
-**Promote before compact risk** (~60–70% context or before a big batch): if it is not in
-Next Drive / Active Working Set / a stamp, it is allowed to evaporate on compact.
-
-### End signal = canary score, NOT compact count
-- Auto-compact is lossy for working memory. Disk logs ≠ model brain.
-- **First auto-compact ⇒ re-score**, do not auto-quit solely because compact fired.
-- **Canary PASS = durable anchors only** — not proof the mid-flight working set survived.
-- **FAIL-HANDOFF (&lt; 8/10 at pass-ratio 0.8) ⇒ end now** regardless of token %.
-
-### Cold-start (order is load-bearing)
-1. The launcher supplies the fenced lease for `{stream}`; agents never claim, renew, release, or recover it.
-2. **Read diary handoff + stream tail first** (do not invent queue from chat)
-3. Only within `thread-rollover`, mint after reading continuity:
-```bash
-.venv/bin/python -m {_PACKAGE}.grok_lane mint --epic {epic} --stream {stream}
-.venv/bin/python -m {_PACKAGE}.grok_lane questions --epic {epic}
-```
-Do not open `probe.json` when later scoring from memory.
-
-### When to score
-Run mint/score only within `thread-rollover`; these signals do not authorize standalone canary execution.
-1. After **any** auto-compact notification
-2. Around **60–70%** context (`/session-info` or `/context`)
-3. After a big merge/gate wave if still long-running
-
-### Post-compact (automatic — operator is not involved)
-You own compact recovery. **Never ask the operator** whether to restart, hydrate, or re-load the diary.
-
-1. **Score canary FROM MEMORY** (do not open diary/stream/probe answers first):
-```bash
-.venv/bin/python -m {_PACKAGE}.grok_lane score --epic {epic} \
-  --answers .claude/{epic}-epic/canary/answers.json --context-tokens <N>
-```
-2. If FAIL-HANDOFF → handback is already written → `/quit`; launcher closes its fenced lease (new session via launcher).
-3. If PASS → **auto-hydrate is already printed** by `score` (bounded capsule + stream tail + **RE-GROUND checklist**).
-4. **RE-GROUND (mandatory after every compact, even on PASS):**
-   - Re-read Next Drive + Active Working Set from the capsule
-   - Open the active phase receipt named there (do not resume from vibe)
-   - If the open task is not spelled in dual-write: **STOP inventing** — stamp or hand off
-5. Only use standalone `hydrate` if you need a re-print; default path is score→auto-hydrate→re-ground.
-
-### Score procedure (from memory — no re-read of probe answers)
-1. `.venv/bin/python -m {_PACKAGE}.grok_lane questions --epic {epic}`
-2. Write answers **from memory only** to `{canary}/answers.json` as `{{"id": "answer", ...}}`
-3. Run:
-```bash
-.venv/bin/python -m {_PACKAGE}.grok_lane score \\
-  --epic {epic} \\
-  --answers {canary}/answers.json \\
-  --context-tokens <N> --model grok-4.7
-```
-4. rc 0 = PASS → auto diary stamp with canary line.
-   rc 2 = FAIL-HANDOFF → auto **STATE AT HANDBACK** block; `/quit`; launcher owns fenced lease close.
-
-### Clean close (optional while still PASS)
-```bash
-.venv/bin/python -m {_PACKAGE}.grok_lane handback --epic {epic} \\
-  --reason "clean end" --next "..." --bullet "..."
-```
-
-### Operator compact config (optional)
-In `~/.grok/config.toml`:
-```toml
-[session]
-auto_compact_threshold_percent = 85
-```
-Operator 2026-09-21: keep the product default of 85%. Do not raise it.
-"""
-    print(text)
-    return 0
-
-
-def cmd_stamp(args: argparse.Namespace) -> int:
-    """Append a diary stamp + optional Next Drive refresh."""
-    from lu_machinery.session_canary import diary as diary_mod
-
-    repo = Path(args.repo).resolve()
-    epic = args.epic.strip().lower()
-    stream = _stream_id(args)
-    preferred = getattr(args, "preferred", None)
-    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
-    path = _bound_handoff_path(
-        repo,
-        epic,
-        explicit=args.handoff,
-        preferred=preferred,
-        out_dir=out_dir,
-    )
-    if isinstance(path, handoff_select.NoHandoff):
-        print("error: (no handoff); re-mint to bind a handoff file", file=sys.stderr)
-        return 1
-    recorded_meta = _recorded_write_meta(repo, epic, out_dir, path, args.handoff)
-    bullets = list(args.bullet or [])
-    if args.title and not bullets:
-        bullets = [args.title]
-    if not bullets:
-        print("error: provide --bullet at least once (or a meaningful --title)", file=sys.stderr)
-        return 2
-    next_drive = list(args.next) if args.next else None
-    working_set = list(args.workset) if getattr(args, "workset", None) else None
-    stamp = diary_mod.append_diary_stamp(
-        path,
-        title=args.title or "batch",
-        bullets=bullets,
-        next_drive=next_drive,
-        working_set=working_set,
-        recorded_meta=recorded_meta,
-    )
-    print(f"diary stamp {stamp} -> {path}")
-    note = f"DIARY {stamp}: {args.title or 'batch'}; " + "; ".join(bullets[:5])
-    if diary_mod.try_stream_state_note(stream, note[:500], idempotency_key=f"diary-{stamp}-{epic}"):
-        print(f"stream state noted on {stream}")
-    return 0
-
-
-def cmd_handback(args: argparse.Namespace) -> int:
-    """Write STATE AT HANDBACK (clean close or manual FAIL close)."""
-    from lu_machinery.session_canary import diary as diary_mod
-
-    repo = Path(args.repo).resolve()
-    epic = args.epic.strip().lower()
-    stream = _stream_id(args)
-    preferred = getattr(args, "preferred", None)
-    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else None
-    path = _bound_handoff_path(
-        repo,
-        epic,
-        explicit=args.handoff,
-        preferred=preferred,
-        out_dir=out_dir,
-    )
-    if isinstance(path, handoff_select.NoHandoff):
-        print("error: (no handoff); re-mint to bind a handoff file", file=sys.stderr)
-        return 1
-    recorded_meta = _recorded_write_meta(repo, epic, out_dir, path, args.handoff)
-    next_drive = list(args.next or []) or ["Load STATE AT HANDBACK + stream; mint canary; resume"]
-    canary_line = args.canary_line or "canary not scored this close"
-    stamp = diary_mod.append_handback(
-        path,
-        epic=epic,
-        stream_id=stream,
-        reason=args.reason or "clean close",
-        pins=list(args.pin or []),
-        open_prs=list(args.open_pr or []),
-        next_drive=next_drive,
-        hands_off=list(args.hands_off or []) or ["Foreign lanes"],
-        pending_user=list(args.pending_user or []),
-        worktrees=list(args.worktree or []),
-        canary_line=canary_line,
-        notes=list(args.note or []),
-        recorded_meta=recorded_meta,
-    )
-    print(f"STATE AT HANDBACK {stamp} -> {path}")
-    diary_mod.try_stream_state_note(
-        stream,
-        f"STATE AT HANDBACK ({args.reason or 'clean close'}): {canary_line}",
-        idempotency_key=f"handback-cmd-{stamp}",
-    )
-    return 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog=f"python -m {_PACKAGE}.grok_lane",
-        description=(
-            "Operational Grok epic-lane session canary (8/10 rot gate). "
-            "A driver handoff is a living document: mint binds its path "
-            "(or null for no handoff) and the selection inputs. "
-            "handoff_sha256 is informational. "
-            "Material edits after mint → re-mint to refresh facts."
-        ),
-    )
-    p.add_argument("--repo", type=Path, default=None, help="State root; default is the shared-state anchor")
-    sub = p.add_subparsers(dest="command", required=True)
-
-    mint = sub.add_parser(
-        "mint",
-        help="Freeze 10 durable anchors from stream + handoff",
-        description=(
-            "Freeze 10 durable anchors. Records the selected handoff path "
-            "(or null) and the selection inputs. handoff_sha256 is informational. "
-            "Material edits after mint → re-mint to refresh facts."
-        ),
-    )
-    mint.add_argument("--epic", required=True, help="Epic slug (atlas, harness, …)")
-    mint.add_argument("--stream", default=None, help="Stream id (default from epic map)")
-    mint.add_argument(
-        "--handoff",
-        default=None,
-        help="Use this handoff for this mint only; recorded when it is the selection",
-    )
-    mint.add_argument("--out-dir", default=None, help="Canary directory override")
-    mint.add_argument("--stream-limit", type=int, default=40, help=handoff_select.STREAM_LIMIT_HELP)
-    mint.set_defaults(func=cmd_mint)
-
-    questions = sub.add_parser("questions", help="Print/write id→question map (no answers)")
-    questions.add_argument("--epic", default="atlas")
-    questions.add_argument("--out-dir", default=None)
-    questions.add_argument("--out", default=None, help="Questions JSON path")
-    questions.set_defaults(func=cmd_questions)
-
-    score = sub.add_parser("score", help="Score answers vs probe (rc 2 = FAIL-HANDOFF)")
-    score.add_argument("--epic", default="atlas")
-    score.add_argument("--out-dir", default=None)
-    score.add_argument("--answers", required=True, help="JSON map id→answer from memory")
-    score.add_argument("--context-tokens", type=int, default=0)
-    score.add_argument("--model", default="grok-4.7")
-    score.add_argument("--pass-ratio", type=float, default=DEFAULT_PASS_RATIO, help="Default 0.8 (8/10)")
-    score.add_argument("--threshold", type=float, default=DEFAULT_SIM_THRESHOLD, help="Per-anchor sim threshold")
-    score.add_argument("--handoff", default=None, help="Dual-write diary path override")
-    score.add_argument("--next-drive", default="", help="On FAIL: Next Drive bullets separated by ';'")
-    score.add_argument("--pins", default="", help="On FAIL: pin bullets separated by ';'")
-    score.add_argument("--open-prs", default="", help="On FAIL: open PR bullets separated by ';'")
-    score.add_argument("--hands-off", default="", help="On FAIL: hands-off bullets separated by ';'")
-    score.add_argument("--pending-user", default="", help="On FAIL: pending-user bullets separated by ';'")
-    score.add_argument("--worktrees", default="", help="On FAIL: worktree bullets separated by ';'")
-    score.add_argument(
-        "--no-hydrate",
-        action="store_true",
-        help="Skip automatic post-PASS hydrate capsule (default: hydrate on PASS)",
-    )
-    score.add_argument(
-        "--hydrate-write",
-        action="store_true",
-        help="Also write canary/hydrate.md receipt when auto-hydrating",
-    )
-    score.add_argument(
-        "--hydrate-max-tokens",
-        type=int,
-        default=1400,
-        help="Auto-hydrate capsule budget (default 1400; hard ceiling 1600)",
-    )
-    score.set_defaults(func=cmd_score)
-
-    status = sub.add_parser("status", help="Show canary artifact presence + last verdict")
-    status.add_argument("--epic", default="atlas")
-    status.add_argument("--out-dir", default=None)
-    status.set_defaults(func=cmd_status)
-
-    protocol = sub.add_parser("protocol", help="Print agent-facing lifecycle protocol")
-    protocol.add_argument("--epic", default="atlas")
-    protocol.add_argument("--stream", default=None)
-    protocol.set_defaults(func=cmd_protocol)
-
-    stamp = sub.add_parser("stamp", help="Append diary stamp (+ optional Next Drive refresh)")
-    stamp.add_argument("--epic", required=True)
-    stamp.add_argument("--stream", default=None)
-    stamp.add_argument("--handoff", default=None)
-    stamp.add_argument("--title", default="batch", help="Diary entry title")
-    stamp.add_argument("--bullet", action="append", default=[], help="Diary bullet (repeatable)")
-    stamp.add_argument("--next", action="append", default=[], help="Replace Next Drive bullets (repeatable)")
-    stamp.add_argument(
-        "--workset",
-        action="append",
-        default=[],
-        help="Replace Active Working Set bullets (repeatable; promote before compact)",
-    )
-    stamp.set_defaults(func=cmd_stamp)
-
-    hydrate = sub.add_parser(
-        "hydrate",
-        help="Print bounded post-compact hydrate capsule (Sol Option D; score first)",
-    )
-    hydrate.add_argument("--epic", required=True)
-    hydrate.add_argument("--stream", default=None, help="Stream id (default from epic map)")
-    hydrate.add_argument("--handoff", default=None, help="Override diary handoff path")
-    hydrate.add_argument("--out-dir", default=None, help="Canary dir for optional --write receipt")
-    hydrate.add_argument(
-        "--max-tokens",
-        type=int,
-        default=1400,
-        help="Capsule budget (default 1400; hard ceiling 1600)",
-    )
-    hydrate.add_argument("--max-stamps", type=int, default=3, help="Newest diary stamps to include")
-    hydrate.add_argument("--stream-limit", type=int, default=5, help="Max stream tail entries")
-    hydrate.add_argument(
-        "--no-stream",
-        action="store_true",
-        help="Skip stream tail (diary capsule only)",
-    )
-    hydrate.add_argument(
-        "--write",
-        action="store_true",
-        help="Also write canary/hydrate.md receipt (do not load receipt + stdout into chat)",
-    )
-    hydrate.set_defaults(func=cmd_hydrate)
-
-    handback = sub.add_parser("handback", help="Write STATE AT HANDBACK (clean close or manual fail)")
-    handback.add_argument("--epic", required=True)
-    handback.add_argument("--stream", default=None)
-    handback.add_argument("--handoff", default=None)
-    handback.add_argument("--reason", default="clean close")
-    handback.add_argument("--canary-line", default="")
-    handback.add_argument("--pin", action="append", default=[])
-    handback.add_argument("--open-pr", action="append", default=[])
-    handback.add_argument("--next", action="append", default=[])
-    handback.add_argument("--hands-off", action="append", default=[])
-    handback.add_argument("--pending-user", action="append", default=[])
-    handback.add_argument("--worktree", action="append", default=[])
-    handback.add_argument("--note", action="append", default=[])
-    handback.set_defaults(func=cmd_handback)
-
-    return p
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        if args.repo is None:
-            args.repo = state_root()
-        # Validate raw path selectors before handlers strip/lower them.
-        if args.command != "protocol":
-            validate_epic(args.epic)
-        return int(args.func(args))
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
