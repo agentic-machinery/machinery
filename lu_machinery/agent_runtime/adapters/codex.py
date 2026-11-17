@@ -276,12 +276,16 @@ def _discussion_readonly_requested(tool_config: dict | None) -> bool:
     )
 
 
+# Operator 2026-09-29 (#9230). GPT-6.1 Sol is the only Sol: it orchestrates and
+# holds the former Astra advisory seat. Luna scouts.
+CODEX_APPROVED_MODELS = frozenset({"gpt-6-luna", "gpt-6.1-sol"})
+
+
 class CodexAdapter:
     """Adapter for ``codex exec`` (OpenAI ChatGPT Codex CLI)."""
 
     name: str = "codex"
-    # Operator 2026-11-17: GPT-6.2 Sol is the only Sol (#9230 seat). Luna scouts.
-    default_model: str = "gpt-6.2-sol"
+    default_model: str = "gpt-6.1-sol"
     # Omitted effort is the orchestrator setting. Scouting passes Luna and its
     # own effort. An explicit --effort always wins.
     default_effort: str = "high"
@@ -327,11 +331,8 @@ class CodexAdapter:
         None, the lane default ``high`` is applied.
         See #1396.
         """
-        from lu_machinery.review.model_catalog import codex_dispatch_models
-
-        admitted = codex_dispatch_models()
-        if model is not None and model not in admitted:
-            approved = ", ".join(sorted(admitted))
+        if model is not None and model not in CODEX_APPROVED_MODELS:
+            approved = ", ".join(sorted(CODEX_APPROVED_MODELS))
             raise ValueError(f"CodexAdapter: model={model!r} rejected; approved models are {approved}")
 
         tc_early = tool_config or {}

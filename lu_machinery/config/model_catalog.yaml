@@ -381,11 +381,12 @@ models:
     tier: frontier_authority
     lifecycle: active
     # Request-only (operator 2026-11-17), like claude-fable-5-2: no seat, ladder,
-    # endpoint, council, substitution or default routes it. Work roles only, as for
-    # Gemini 4 Carbon; it holds no review, advisory or approval role, so it is never
-    # a review of record. Effort high only; xhigh and max are refused.
+    # endpoint, council, substitution or default routes it. Its one role is outside
+    # review_scheduler.activity_roles, so it holds no review, advisory, approval or
+    # implementation role and is never a review of record. Effort high only; xhigh
+    # and max are refused.
     efforts: [high]
-    roles: [implementation, agentic_coding, long_horizon_coding]
+    roles: [pinned_extra_security_review]
     transports: [native_codex]
     strengths: [frontier_technical_judgment, security_review_depth]
     weaknesses: [not_independent_from_openai_authors, four_times_sol_price, review_qualification_pending]
