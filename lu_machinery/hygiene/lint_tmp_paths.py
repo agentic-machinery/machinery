@@ -1721,9 +1721,10 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "42ca6352f956c0ddc6e49d2175d88445004b5b1a735ab87cdaa7308b3c1a9743:1",
     ),
     (
+        # 715563c2…: the fixture owns and cleans its private temporary directory; the match is an error-message string containing --basetemp.
         "tests/projects/open_model_data/_v4_shared_runtime_fixtures.py",
         "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
-        "2c21077af928cf8552623d6a3620a12311d8739bb22040adecf476a239f9e0ef:1 605fb8639928f90750b53bf5a571ef513c548afe9fc6b5626dd31fa252a4226a:1 2575f5bd4dcaf40d1565a693f0aecd71226f534dc467e5c666edd487537613a6:1 b332642766008f2ec2d731a2420d03a0e92e377d9d35b316cc5372352959f852:1",
+        "2c21077af928cf8552623d6a3620a12311d8739bb22040adecf476a239f9e0ef:1 605fb8639928f90750b53bf5a571ef513c548afe9fc6b5626dd31fa252a4226a:1 2575f5bd4dcaf40d1565a693f0aecd71226f534dc467e5c666edd487537613a6:1 b332642766008f2ec2d731a2420d03a0e92e377d9d35b316cc5372352959f852:1 715563c24839ee144b2eeeb946763d45d8d2f2864b8a4b08825615ba5e380582:1",
     ),
     (
         "tests/projects/open_model_data/test_v4_pg_fixture.py",
