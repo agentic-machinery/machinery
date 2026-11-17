@@ -350,7 +350,7 @@ def test_queued_without_cf_at_head_is_revoked(tmp_path: Path) -> None:
     )
     state = json.loads(path.read_text())
     assert "42" not in state["queued"]
-    assert f"42:{HEAD_A}" not in state["drops"]  # A keeper dequeue is not an ejection.
+    assert "drops" not in state
     assert f"42:{HEAD_A}" not in state.get("pending_comments", {})
     assert f"42:{HEAD_A}" not in state.get("squash_revoked", {})
 
@@ -405,7 +405,7 @@ def test_red_ci_with_missing_cf_revoke_is_not_an_ejection(tmp_path: Path) -> Non
     assert not failed
     assert ("dequeue", "PR_node_42") in queued.actions
     assert "#42 revoked: CI-red-CI Gate" in lines
-    assert f"42:{HEAD_A}" not in json.loads(path.read_text())["drops"]
+    assert "drops" not in json.loads(path.read_text())
 
     approved = FakeGitHub()
     approved.comments_rows = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00")]
@@ -429,7 +429,7 @@ def test_needs_cf_comment_is_retried_after_the_pull_request_leaves_the_queue(tmp
     assert ("dequeue", "PR_node_42") in queued.actions
     state = json.loads(path.read_text())
     assert state["pending_comments"][f"42:{HEAD_A}"] == "needs-CF"
-    assert f"42:{HEAD_A}" not in state["drops"]
+    assert "drops" not in state
     assert "42" not in state["queued"]
 
     again = FakeGitHub()
@@ -444,7 +444,7 @@ def test_needs_cf_comment_is_retried_after_the_pull_request_leaves_the_queue(tmp
     )
     saved = json.loads(path.read_text())
     assert f"42:{HEAD_A}" not in saved.get("pending_comments", {})
-    assert f"42:{HEAD_A}" not in saved["drops"]
+    assert "drops" not in saved
 
 
 def test_queued_missing_cf_dry_run_reports_only(tmp_path: Path) -> None:
@@ -716,14 +716,15 @@ def test_base_without_queue_is_report_only(tmp_path: Path, monkeypatch: pytest.M
     assert "reason=no-merge-queue" in lines[0]
 
 
-def test_new_head_resets_drop_count(tmp_path: Path) -> None:
+def test_legacy_drop_history_holds_new_head_for_owner(tmp_path: Path) -> None:
     fake = FakeGitHub(pr(headRefOid=HEAD_B))
     fake.check_rows = checks(HEAD_B)
     fake.comments_rows.append(recorded("CHANGES_REQUESTED", "2026-09-23T12:00:01.000001+00:00", HEAD_A))
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"queued": {}, "drops": {f"42:{HEAD_A}": 3}}))
     keeper.run(fake, path, apply=True)
-    assert mutations(fake) == ["enqueue"]
+    assert "enqueue" not in mutations(fake)
+    assert f"42:{HEAD_A}" in json.loads(path.read_text())["ejections"]
 
 
 def test_moved_head_before_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -912,7 +913,7 @@ def test_ejection_stays_out_and_alerts_once_with_run_ids(
     assert "cto_outbox" not in json.loads(path.read_text())
 
 
-def test_new_head_starts_afresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_new_head_preserves_pr_queue_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeGitHub(pr(headRefOid=HEAD_B))
     path = tmp_path / "state.json"
     spent = "2026-09-23T00:00:00+00:00"
@@ -921,8 +922,8 @@ def test_new_head_starts_afresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         "keeper_requeues": {f"42:{HEAD_A}": spent}, "ejection_alerts": {f"42:{HEAD_A}": spent},
     }))
     lines, failed = run(fake, path, monkeypatch)
-    assert not failed and "reason=ready" in lines[0]
-    assert mutations(fake) == ["enqueue"]
+    assert not failed and "reason=queued-before" in lines[0]
+    assert "enqueue" not in mutations(fake)
     state = json.loads(path.read_text())
     assert "keeper_requeues" not in state  # The retired one-re-enqueue record is dropped on load.
     assert "cto_outbox" not in state
@@ -1029,7 +1030,7 @@ def test_unknown_fresh_read_leaves_queued_untouched(tmp_path: Path, monkeypatch:
     assert any("fresh-read-unknown" in line for line in lines)
 
 
-def test_drop_at_old_head_does_not_block_new_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_drop_at_old_head_holds_new_head_for_its_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = FakeGitHub(pr(headRefOid=HEAD_B))
     fake.check_rows = checks(HEAD_B)
     fake.events = [{"id": 987, "event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
@@ -1038,10 +1039,10 @@ def test_drop_at_old_head_does_not_block_new_head(tmp_path: Path, monkeypatch: p
         json.dumps({"queued": {"42": HEAD_A}, "drops": {f"42:{HEAD_A}": 2}, "observed": "2026-09-23T00:00:00Z"})
     )
     run(fake, path, monkeypatch)
-    assert mutations(fake) == ["enqueue"]
+    assert "enqueue" not in mutations(fake)
     state = json.loads(path.read_text())
-    assert state["drops"][f"42:{HEAD_A}"] == 3
-    assert f"42:{HEAD_B}" not in state["drops"]
+    assert f"42:{HEAD_A}" in state["ejections"]
+    assert "drops" not in state
 
 
 def test_fresh_rejection_overrides_later_same_head_approval_in_keeper(tmp_path: Path) -> None:
@@ -1288,7 +1289,7 @@ def test_drop_lookup_error_is_not_reported_as_unknown(tmp_path, monkeypatch) -> 
     assert "diagnosis lookup failed: merge_group run page incomplete" in comments[0]
     assert "diagnosis unknown" not in comments[0]
     assert f"42:{HEAD_A}" in json.loads(path.read_text())["undiagnosed"]
-    assert json.loads(path.read_text())["drops"][f"42:{HEAD_A}"] == 1
+    assert "drops" not in json.loads(path.read_text())
 
 
 def test_drop_without_matching_run_is_unknown() -> None:
@@ -1652,13 +1653,13 @@ def test_observed_exit_holds_for_good(tmp_path, monkeypatch, diagnosis, seen):
     assert "enqueue" not in mutations(later)
 
 
-def test_undiagnosed_old_head_does_not_hold_new_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_undiagnosed_old_head_holds_new_head_for_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"queued": {"42": HEAD_A}, "drops": {}, "observed": "2026-09-23T00:00:00Z"}))
     fake = FakeGitHub(pr(headRefOid=HEAD_B))
     lines, failed = run(fake, path, monkeypatch)
-    assert not failed and "reason=ready" in lines[0]
-    assert mutations(fake) == ["enqueue"]
+    assert not failed and "reason=queued-before" in lines[0]
+    assert "enqueue" not in mutations(fake)
 
 
 def test_obsolete_gate_denial_does_not_block_or_comment(tmp_path, monkeypatch):
@@ -1692,16 +1693,16 @@ def test_gate_never_requeues_a_squash_text_revoke(tmp_path: Path, monkeypatch: p
     gated(queued, path, monkeypatch, gate)
     assert ("dequeue", "PR_node_42") in queued.actions
     assert f"42:{HEAD_A}" in json.loads(path.read_text())["squash_revoked"]
-    for squash, enqueued in ((True, False), (None, False), (False, True)):
+    for squash in (True, None, False):
         fake = FakeGitHub()
         fake.squash = squash
         lines, _ = gated(fake, path, monkeypatch, gate, apply=False)
-        assert ("squash-read", (42, HEAD_A)) in fake.actions
-        assert ("reason=ready" in lines[0]) is enqueued, (squash, lines)
+        assert ("squash-read", (42, HEAD_A)) not in fake.actions
+        assert "reason=queued-before" in lines[0], (squash, lines)
 
 
 @pytest.mark.parametrize("blocker", ["hold", "squash-text-blocked"])
-def test_keeper_manual_dequeue_then_fix_reenqueues_without_ci_failure_proof(tmp_path, monkeypatch, blocker):
+def test_keeper_manual_dequeue_then_fix_leaves_reentry_to_owner(tmp_path, monkeypatch, blocker):
     path = tmp_path / "state.json"
     gate_path = _gate(tmp_path, {})
     queued = FakeGitHub(pr(isInMergeQueue=True))
@@ -1724,11 +1725,11 @@ def test_keeper_manual_dequeue_then_fix_reenqueues_without_ci_failure_proof(tmp_
         }
     ]
     lines, failed = gated(fixed, path, monkeypatch, gate_path)
-    assert not failed and "#42 enqueued" in lines
-    assert ("enqueue", (42, HEAD_A)) in fixed.actions
+    assert not failed and "reason=queued-before" in lines[0]
+    assert ("enqueue", (42, HEAD_A)) not in fixed.actions
     assert not recovery.ledger_path(fixed.root).exists()
     assert not json.loads(path.read_text()).get("requeued")
-    assert json.loads(path.read_text())["drops"].get(f"42:{HEAD_A}", 0) == 0
+    assert "drops" not in json.loads(path.read_text())
 
 
 def test_gate_state_is_pruned_to_open_prs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1850,7 +1851,7 @@ def test_failure_new_to_the_window_still_counts_against_the_head(
     lines, failed = gated(fake, path, monkeypatch, _gate(tmp_path, {}))
     assert not failed and "enqueue" not in mutations(fake)
     assert "reason=ejected" in lines[0]
-    assert json.loads(path.read_text())["drops"][f"42:{HEAD_A}"] == 1
+    assert "drops" not in json.loads(path.read_text())
 
 
 def test_aggregate_job_alone_never_attributes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1945,12 +1946,12 @@ def test_multiple_removals_do_not_persist_obsolete_bindings(tmp_path: Path, monk
     run(fake, path, monkeypatch)
     state = json.loads(path.read_text())
     assert "drop_events" not in state
-    assert state["drops"][f"42:{HEAD_A}"] == 2
-    assert f"42:{HEAD_B}" not in state["drops"]
+    assert "drops" not in state
+    assert "last_removal" not in state
 
 
-def test_cycle_ejections_are_counted_once_and_never_readded(tmp_path: Path) -> None:
-    """Stale snapshots must neither re-add an ejected head nor hide repeated drops."""
+def test_cycle_ejections_are_never_readded_without_removal_counters(tmp_path: Path) -> None:
+    """Stale snapshots never re-add an ejected head or persist obsolete removal counts."""
     head = "7137d11c9eb84ed577f4f21b5da04fd88a48a64f"
     path = tmp_path / "state.json"
     initial = {"queued": {"12225": head}, "drops": {}, "observed": "2026-11-01T01:00:00Z"}
@@ -1965,12 +1966,12 @@ def test_cycle_ejections_are_counted_once_and_never_readded(tmp_path: Path) -> N
             (34809537764, "2026-11-01T02:17:13Z"),
         )
     ]
-    for count, removal in enumerate(removals, 1):
+    for removal in removals:
         fake.events.append(removal)
-        for _ in range(2):  # Reading the same timeline again must not add drops.
+        for _ in range(2):  # Reading the same timeline never re-adds the head.
             _lines, failed = keeper.run(fake, path, apply=True)
             assert not failed
-            assert json.loads(path.read_text())["drops"][f"12225:{head}"] == count
+            assert "drops" not in json.loads(path.read_text())
             assert not any(kind in {"enqueue", "cleanup"} for kind, _ in fake.actions)
     fake.row["isInMergeQueue"] = False
     lines, failed = keeper.run(fake, path, apply=True)
@@ -1981,7 +1982,7 @@ def test_cycle_ejections_are_counted_once_and_never_readded(tmp_path: Path) -> N
     path.write_text(json.dumps(initial))
     lines, failed = keeper.run(fake, path, apply=True)
     assert not failed and "reason=ejected" in lines[0]
-    assert json.loads(path.read_text())["drops"][f"12225:{head}"] == 3
+    assert "drops" not in json.loads(path.read_text())
     assert not any(kind in {"enqueue", "cleanup"} for kind, _ in fake.actions)
 
     queued = FakeGitHub(pr(isInMergeQueue=True))
@@ -1993,21 +1994,21 @@ def test_cycle_ejections_are_counted_once_and_never_readded(tmp_path: Path) -> N
     revoked_path = tmp_path / "revoked.json"
     queued.comments_rows = []
     keeper.run(queued, revoked_path, apply=True)
-    assert f"42:{HEAD_A}" not in json.loads(revoked_path.read_text())["drops"]
+    assert "drops" not in json.loads(revoked_path.read_text())
     revoked = FakeGitHub()
     revoked.events = [{"id": 1, "event": "removed_from_merge_queue", "created_at": datetime.now(UTC).isoformat()}]
     for _ in range(2):
         _lines, failed = keeper.run(revoked, revoked_path, apply=True)
         assert not failed
-        assert f"42:{HEAD_A}" not in json.loads(revoked_path.read_text())["drops"]
+        assert "drops" not in json.loads(revoked_path.read_text())
 
 
 @pytest.mark.parametrize(
     "cause",
     ["unbound", "manual-dequeue", "red-checks", "changed-verdict", "hold-label", "blocked-squash", "predates-deploy"],
 )
-def test_publisher_allows_new_head_after_unbound_or_revoked_removal(tmp_path, monkeypatch, cause):
-    """An earlier head's removal, revoked by the keeper or never bound to a head, does not hold a new head."""
+def test_keeper_leaves_new_head_after_any_removal_to_its_owner(tmp_path, monkeypatch, cause):
+    """An earlier queue stay is left to the owner, including after a head push."""
     path = tmp_path / "state.json"
     old = FakeGitHub(pr(isInMergeQueue=True))
     if cause in {"red-checks", "changed-verdict", "hold-label", "blocked-squash"}:
@@ -2035,11 +2036,11 @@ def test_publisher_allows_new_head_after_unbound_or_revoked_removal(tmp_path, mo
         }
     ]
     lines, failed = run(fresh, path, monkeypatch)
-    assert not failed and "reason=ready" in lines[0]
-    assert "enqueue" in mutations(fresh)
+    assert not failed and "reason=queued-before" in lines[0]
+    assert "enqueue" not in mutations(fresh)
     assert recovery.first_attempt(recovery.ledger_path(fresh.root), fresh.repository, 42, HEAD_B) is None
     if cause in {"red-checks", "changed-verdict", "hold-label", "blocked-squash"}:
-        assert json.loads(path.read_text())["drops"].get(f"42:{HEAD_B}", 0) == 0
+        assert "drops" not in json.loads(path.read_text())
 
 
 def test_unobserved_current_head_removal_holds_the_head(tmp_path, monkeypatch):
@@ -2052,7 +2053,7 @@ def test_unobserved_current_head_removal_holds_the_head(tmp_path, monkeypatch):
     lines, failed = run(fake, tmp_path / "state.json", monkeypatch)
     assert not failed and "reason=queued-before" in lines[0]
     assert "enqueue" not in mutations(fake)
-    assert json.loads((tmp_path / "state.json").read_text())["drops"][f"42:{HEAD_A}"] == 1
+    assert "drops" not in json.loads((tmp_path / "state.json").read_text())
 
 
 def test_removal_read_failure_does_not_block_initial_keeper_enqueue(tmp_path, monkeypatch):
@@ -2294,7 +2295,7 @@ def test_benign_names_pass_through_unchanged(job: str) -> None:
 
 def test_grouping_and_counting_use_the_raw_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     raw = {"job": HOSTILE_JOB, "pr": 5}
-    assert keeper._repeated_failures([raw, {**raw, "pr": 6}]) == {HOSTILE_JOB: ([5, 6], [])}
+    assert keeper._repeated_failures([raw, {**raw, "pr": 6}]) == {("job", HOSTILE_JOB): ([5, 6], [])}
     # Two names that sanitise to the same visible text but differ raw stay two groups.
     twin = HOSTILE_JOB.replace("@", "＠")
     assert keeper._repeated_failures([raw, {"job": twin, "pr": 6}]) == {}
@@ -2404,3 +2405,78 @@ def test_report_shows_node_records_without_writes(tmp_path, monkeypatch):
     assert not failed
     assert "repeated test failure: tests/a.py::test_one; PRs=41,42; runs=101,102" in lines
     assert mutations(fake) == [] and path.read_bytes() == before
+
+
+@pytest.mark.parametrize("history", ["removal-only", "old-queued-head", "old-ejection", "legacy-removal", "late-removal"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_queue_history_at_any_head_prevents_automatic_reentry(tmp_path, monkeypatch, history, apply):
+    """Removal-only timelines and lagging history after a push must never auto-requeue a PR."""
+    fake = FakeGitHub(pr(headRefOid=HEAD_B))
+    path = tmp_path / "state.json"
+    state = {"queued": {}, "drops": {}}
+    removal = {"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}
+    if history == "removal-only":
+        fake.events = [removal]
+    elif history == "old-queued-head":
+        state["queued"] = {"42": HEAD_A}
+    elif history == "old-ejection":
+        state["ejections"] = {f"42:{HEAD_A}": []}
+    elif history == "legacy-removal":
+        state["drops"] = {f"42:{HEAD_A}": 1}
+    else:
+        reads = iter([[], [removal]])
+        monkeypatch.setattr(fake, "timeline", lambda number: next(reads, [removal]))
+    path.write_text(json.dumps(state))
+    lines, failed = run(fake, path, monkeypatch, apply=apply)
+    assert not failed and "enqueue" not in mutations(fake), lines
+    if history != "late-removal":
+        assert "reason=queued-before" in lines[0], lines
+    if apply:
+        fake.actions.clear()
+        lines, failed = run(fake, path, monkeypatch)
+        assert not failed and "enqueue" not in mutations(fake), lines
+
+
+def test_job_named_like_test_node_does_not_borrow_node_evidence(tmp_path, monkeypatch):
+    """A job label must not collide with a node ID in grouping, run IDs or report wording."""
+    node = "tests/a.py::test_a"
+    path = tmp_path / "state.json"
+    fake = FakeGitHub()
+    failures = [{**_recent(node, 41), "run_id": 101},
+                {**_recent("pytest (1)", 42), "test": node, "run_id": 102}]
+    state = {"queued": {}, "drops": {}, "failures": failures}
+    path.write_text(json.dumps(state))
+    run(fake, path, monkeypatch)
+    assert _defect_reports(path) == []
+    failures.extend([{**_recent(node, 43), "run_id": 103},
+                     {**_recent("pytest (2)", 44), "test": node, "run_id": 104}])
+    path.write_text(json.dumps(state))
+    run(fake, path, monkeypatch)
+    reports = _defect_reports(path)
+    assert len(reports) == 2
+    [job_report] = [body for body in reports if "No failing test node was read" in body]
+    [node_report] = [body for body in reports if "A failing test is never infrastructure" in body]
+    assert "#41, #43" in job_report and "run IDs: 101, 103" in job_report
+    assert "#42, #44" in node_report and "run IDs: 102, 104" in node_report
+
+
+@pytest.mark.parametrize("failure", ["unreadable", "empty", "head-moved", "base-changed", "closed"])
+def test_unverified_armed_head_is_disarmed_in_the_same_pass(tmp_path, monkeypatch, failure):
+    """A failed fresh read must not leave an unqueued auto-merge armed for another pass."""
+    fake = FakeGitHub(pr(autoMergeRequest={"enabledAt": "now"}))
+    fake.membership_result = False
+    if failure == "unreadable":
+        def unreadable(number):
+            raise keeper.KeeperError("lookup failed")
+        monkeypatch.setattr(fake, "current", unreadable)
+    elif failure == "empty":
+        fake.fresh = {}
+    elif failure == "head-moved":
+        fake.fresh["headRefOid"] = HEAD_B
+    elif failure == "base-changed":
+        fake.fresh["baseRefName"] = "release"
+    else:
+        fake.fresh["state"] = "CLOSED"
+    lines, failed = run(fake, tmp_path / "state.json", monkeypatch)
+    assert not failed and ("disarm", 42) in fake.actions, lines
+    assert "enqueue" not in mutations(fake) and "dequeue" not in mutations(fake)

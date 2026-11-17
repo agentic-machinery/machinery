@@ -257,7 +257,7 @@ def test_queued_without_cf_at_head_is_revoked(tmp_path: Path) -> None:
     )
     state = json.loads(path.read_text())
     assert "42" not in state["queued"]
-    assert f"42:{HEAD_A}" not in state["drops"]  # A keeper dequeue is not an ejection.
+    assert "drops" not in state
     assert f"42:{HEAD_A}" not in state.get("pending_comments", {})
     assert f"42:{HEAD_A}" not in state.get("squash_revoked", {})
 
