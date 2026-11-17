@@ -121,7 +121,6 @@ tests/agent_runtime/test_env_sanitize.py
 tests/agent_runtime/test_gemini_adapter_auth.py
 tests/agent_runtime/test_gemini_retired_agy_alias.py
 tests/agent_runtime/test_git_shim_guard.py
-tests/agent_runtime/test_glm_lane_session_canary.py
 tests/agent_runtime/test_grok_build_adapter.py
 tests/agent_runtime/test_grok_hook_bridge_release.py
 tests/agent_runtime/test_grok_message_boundaries.py

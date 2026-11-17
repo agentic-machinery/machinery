@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from lu_machinery.session_canary import diary, grok_lane, muse_lane
+from lu_machinery.session_canary import diary, grok_lane, handoff_select, muse_lane
 
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
@@ -62,8 +62,8 @@ def test_mint_and_score_real_ten_anchor_pass_and_fail(
     monkeypatch.delenv("LU_RULES_SEAT", raising=False)
     monkeypatch.setattr(grok_lane, "_load_ranked", lambda *a, **kw: [])
     monkeypatch.setattr(
-        grok_lane,
-        "_load_stream_entries",
+        handoff_select,
+        "load_stream_entries",
         lambda *a, **kw: (
             [
                 {
@@ -135,7 +135,7 @@ def test_mint_and_score_real_ten_anchor_pass_and_fail(
 
 
 def test_missing_anchors_is_a_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(grok_lane, "_load_stream_entries", lambda *a, **kw: [])
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *a, **kw: [])
     monkeypatch.setattr(grok_lane, "_load_ranked", lambda *a, **kw: [])
     assert muse_lane.main(["--repo", str(tmp_path), "mint", "--epic", "devops"]) == 1
     assert list(tmp_path.iterdir()) == []
