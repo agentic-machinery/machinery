@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 
 # The post-release PR's title. A range holding only these PRs is unchanged.
@@ -287,7 +288,7 @@ def version_of(name: str, text: str) -> dict[str, str]:
     """The version fields a version file holds, keyed by a readable location."""
     if name == "pyproject.toml":
         return {name: tomllib.loads(text)["project"]["version"]}
-    data = json.loads(text)
+    data = json_depth.loads(text, max_depth=512)
     found = {name: data["version"]}
     if name == "package-lock.json":
         found[f'{name} packages[""]'] = data["packages"][""]["version"]
@@ -301,7 +302,7 @@ def bump_version_file(name: str, text: str, old: str, new: str) -> str:
         if len(line.findall(text)) != 1:
             raise CutError(f"{name}: expected one version = \"{old}\" line")
         return line.sub(f'version = "{new}"', text, count=1)
-    data = json.loads(text)
+    data = json_depth.loads(text, max_depth=512)
     if json.dumps(data, indent=2, ensure_ascii=False) + "\n" != text:
         raise CutError(f"{name}: not in npm's JSON layout; refusing to rewrite it")
     if data["version"] != old:
@@ -460,7 +461,7 @@ class Cut:
             check=not self.dry_run, timeout=120,
         )
         try:
-            run_rows = json.loads(runs.stdout) if runs.returncode == 0 else []
+            run_rows = json_depth.loads(runs.stdout, max_depth=512) if runs.returncode == 0 else []
         except json.JSONDecodeError:
             run_rows = []
         if runs.returncode:
@@ -478,7 +479,7 @@ class Cut:
         newest = max((run for run in run_rows if run.get("headSha") == self.head and run.get("event") == "push"),
                      key=lambda run: int(str(run.get("databaseId", 0))))
         run_id = str(newest["databaseId"])
-        target = json.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", run_id))
+        target = json_depth.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", run_id), max_depth=512)
         if not isinstance(target, dict) or str(target.get("id")) != run_id:
             raise CutError("CI evidence target run id mismatch")
         attempt = target.get("run_attempt")
@@ -488,7 +489,7 @@ class Cut:
         self.run(["gh", "run", "download", run_id, "-R", self.machinery_repo,
                   "--name", f"ci-gate-evidence-{attempt}", "--dir", destination], timeout=120)
         try:
-            receipt = json.loads((destination / "ci-gate-evidence.json").read_text(encoding="utf-8"))
+            receipt = json_depth.loads((destination / "ci-gate-evidence.json").read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError) as exc:
             raise CutError("CI evidence receipt is missing or malformed") from exc
         source, source_jobs = None, []
@@ -497,12 +498,12 @@ class Cut:
             if not isinstance(binding, dict) or type(binding.get("run_id")) is not int or binding["run_id"] < 1:
                 raise CutError("CI evidence source run id is invalid")
             source_id = str(binding["run_id"])
-            source = json.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", source_id))
+            source = json_depth.loads(self.publisher("read", "run", "--repo", self.machinery_repo, "--number", source_id), max_depth=512)
             source_attempt = binding.get("run_attempt")
             if type(source_attempt) is not int or source_attempt < 1:
                 raise CutError("CI evidence source run attempt is invalid")
-            jobs = json.loads(self.run(["gh", "run", "view", source_id, "-R", self.machinery_repo,
-                                       "--attempt", str(source_attempt), "--json", "jobs"], timeout=120).stdout)
+            jobs = json_depth.loads(self.run(["gh", "run", "view", source_id, "-R", self.machinery_repo,
+                                       "--attempt", str(source_attempt), "--json", "jobs"], timeout=120).stdout, max_depth=512)
             source_jobs = jobs.get("jobs", [])
             if not isinstance(source_jobs, list) or not all(isinstance(job, dict) for job in source_jobs):
                 raise CutError("CI evidence source jobs are malformed")
@@ -639,7 +640,7 @@ class Cut:
                       f"--prefix={prefix}", f"--cache={cache}"],
                      env=self.scratch_env(PATH=f"{Path(tools[0]).parent}:{env['PATH']}"))
             self.run([python, "-I", "-c", _NODE_SEAL, cache], env=env)
-        info: dict[str, str] = json.loads(self.run([python, "-I", "-c", _NODE_INFO], env=env).stdout)
+        info: dict[str, str] = json_depth.loads(self.run([python, "-I", "-c", _NODE_INFO], env=env).stdout, max_depth=512)
         info["node_version"] = self.run([info["node"], "--version"], env=env).stdout.strip()
         info["npm_version"] = self.run([info["node"], info["npm"], "--version"], env=env).stdout.strip()
         self.say(f"Node prefix sealed and admitted: node {info['node_version']}, npm {info['npm_version']}")
@@ -650,7 +651,7 @@ class Cut:
         self.step = "Node refusal checks"
         venv = venv.resolve()
         prefix = Path(info["prefix"]).resolve().relative_to(venv)
-        lock = json.loads((venv / prefix / "package-lock.json").read_text(encoding="utf-8"))
+        lock = json_depth.loads((venv / prefix / "package-lock.json").read_text(encoding="utf-8"), max_depth=512)
         direct = sorted(lock["packages"][""]["dependencies"])[0]
         shim = (venv / prefix / "node_modules/.bin/acpx").resolve(strict=True).relative_to(venv)
 
@@ -659,7 +660,7 @@ class Cut:
 
         def downgrade(root: Path) -> None:
             manifest = root / prefix / "node_modules" / direct / "package.json"
-            data = json.loads(manifest.read_text(encoding="utf-8"))
+            data = json_depth.loads(manifest.read_text(encoding="utf-8"), max_depth=512)
             data["version"] = "0.0.0"
             manifest.write_text(json.dumps(data), encoding="utf-8")
 
@@ -693,7 +694,7 @@ class Cut:
         """Planted marker packages run from outside the prefix and never from inside it."""
         self.step = "Node isolation checks"
         prefix, node = Path(info["prefix"]), info["node"]
-        lock = json.loads((prefix / "package-lock.json").read_text(encoding="utf-8"))["packages"]
+        lock = json_depth.loads((prefix / "package-lock.json").read_text(encoding="utf-8"), max_depth=512)["packages"]
         names = {location.rsplit("node_modules/", 1)[-1] for location in lock if location}
         present = {location.rsplit("node_modules/", 1)[-1] for location in lock if location and (prefix / location).exists()}
         peers = {name for package in lock.values()
@@ -752,7 +753,7 @@ class Cut:
         shared = consumer / "agents_extensions/shared"
         shared.mkdir(parents=True)
         self.run(["git", "init", "--quiet", consumer])
-        inventory = json.loads(self.run([python, "-I", "-c", _RELEASE_INVENTORY], env=self.scratch_env()).stdout)
+        inventory = json_depth.loads(self.run([python, "-I", "-c", _RELEASE_INVENTORY], env=self.scratch_env()).stdout, max_depth=512)
         descriptor = {"providers": ["claude", "codex", "agy"], "preserve": [], "sources": {
             "shared": {"path": "agents_extensions/shared", "required": True},
             "codex": {"path": "agents_extensions/codex", "required": True}}}
@@ -850,7 +851,7 @@ class Cut:
 
         def parse(viewed: subprocess.CompletedProcess[str]) -> str | None:
             if viewed.returncode == 0:
-                return "prerelease" if json.loads(viewed.stdout)["isPrerelease"] else "released"
+                return "prerelease" if json_depth.loads(viewed.stdout, max_depth=512)["isPrerelease"] else "released"
             return "absent" if "release not found" in viewed.stderr.lower() else None
 
         return self.probe(["gh", "release", "view", tag, "-R", self.machinery_repo, "--json", "isPrerelease"], parse)
@@ -875,7 +876,7 @@ class Cut:
         release = self.release_state(tag)
         adopt = self.probe(["gh", "pr", "list", "-R", self.product_repo, "--head", f"release/lu-machinery-{self.version}",
                             "--state", "open", "--json", "number"],
-                           lambda prs: [int(row["number"]) for row in json.loads(prs.stdout)] if prs.returncode == 0 else None)
+                           lambda prs: [int(row["number"]) for row in json_depth.loads(prs.stdout, max_depth=512)] if prs.returncode == 0 else None)
         return tagged, release, adopt
 
     def clean_up(self, cause: str) -> str:

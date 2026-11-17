@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import json
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,3 +63,29 @@ def test_bridge_without_a_product_runs_release_guards_only(tmp_path, monkeypatch
     assert guard_argv(release_guard) == shlex.split(release_guard)
     with pytest.raises(GuardInvocationError, match="only tracked fleet guards may run"):
         guard_argv(shlex.quote(str(stray_hooks / "enforce-venv.sh")))
+
+
+@pytest.mark.parametrize("depth", [0, 513, 20_000])
+def test_deep_input_denies_instead_of_failing_open(depth, monkeypatch, capsys):
+    """A bounded-reader refusal must be Grok's deny exit 2, never its fail-open exit 1."""
+    event = (
+        '{"hook_event_name":"PreToolUse","toolName":"run_terminal_command",'
+        '"toolInput":{"command":"echo safe"},"extra":'
+        + "[" * depth + "0" + "]" * depth + "}"
+    )
+    calls = []
+
+    def run(argv, **kwargs):
+        assert argv == [str(RELEASE_HOOKS / "enforce-venv.sh")]
+        calls.append(json.loads(kwargs["input"]))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(sys, "argv", ["bridge", str(RELEASE_HOOKS / "enforce-venv.sh")])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(event))
+    monkeypatch.setattr(grok_hook_bridge.subprocess, "run", run)
+    assert grok_hook_bridge.main() == (2 if depth else 0)
+    if depth:
+        assert calls == []
+        assert "RecursionError" in capsys.readouterr().err
+    else:
+        assert calls[0]["tool_name"] == "Bash"

@@ -31,7 +31,6 @@ the same arguments and input, and its status is the hook's status.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import signal
@@ -42,6 +41,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
+
+from lu_machinery.common import json_depth
 
 # Executed by the hook as a file, so imports do not depend on the hook's cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -211,7 +212,7 @@ class Transport(NamedTuple):
 
     @classmethod
     def from_json(cls, text: str) -> Transport:
-        value = json.loads(text)
+        value = json_depth.loads(text, max_depth=512)
         git, environment, options = value["git"], value["environment"], value["options"]
         if not (
             isinstance(git, str)
@@ -379,7 +380,7 @@ class CanonicalPublicRepository:
                 text=True,
                 timeout=self.timeout,
             )
-            body = json.loads(result.stdout)
+            body = json_depth.loads(result.stdout, max_depth=512)
             repository = body["data"]["repository"]
             branch = repository["defaultBranchRef"]
             oid = branch["target"]["oid"]

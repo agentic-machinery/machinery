@@ -48,6 +48,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 try:
     from lu_machinery.common.repo_root import product_root
     from lu_machinery.common.safe_unit_install import InstallError, install_unit, open_state_log
@@ -246,7 +248,7 @@ def _load_state(state_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        state: dict[str, Any] = json.loads(path.read_text())
+        state: dict[str, Any] = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError):
         return {}
     return state

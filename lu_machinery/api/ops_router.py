@@ -11,7 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 
-from lu_machinery.common import test_slots
+from lu_machinery.common import json_depth, test_slots
 
 from . import load_samples, panel_values
 from .monitor_context import MonitorContext, get_ctx
@@ -42,7 +42,7 @@ async def retention_latest(ctx: MonitorContext = Depends(get_ctx)) -> dict:
             ),
         }
     try:
-        payload = json.loads(latest.read_text(encoding="utf-8"))
+        payload = json_depth.loads(latest.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         # Do not return exception text to HTTP clients (CodeQL py/stack-trace-exposure).
         logger.exception("retention plan unreadable: %s", latest)
@@ -187,7 +187,7 @@ def _alerts_reading() -> dict:
             response = connection.getresponse()
             if response.status != 200:
                 raise ValueError(f"HTTP {response.status}")
-            raw = json.loads(response.read(2_000_000))
+            raw = json_depth.loads(response.read(2_000_000), max_depth=512)
         finally:
             connection.close()
     except (OSError, ValueError, http.client.HTTPException) as exc:

@@ -39,6 +39,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 # The machinery package's directory name, which is also its import name and the first component
 # of its files' checkout paths. Taken from this file's unresolved location, so neither a short
 # import spelling nor a symlinked directory changes it.
@@ -59,7 +61,7 @@ def _parse_protocol_payload(out: str, err: str) -> dict[str, Any] | None:
         if not candidate or not candidate.strip():
             continue
         try:
-            payload = json.loads(candidate)
+            payload = json_depth.loads(candidate, max_depth=512)
         except ValueError:
             continue
         if isinstance(payload, dict):

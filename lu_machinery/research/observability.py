@@ -30,7 +30,6 @@ Only ``generated_at``/``generated_ts`` carry wall-clock, by design.
 from __future__ import annotations
 
 import codecs
-import json
 import logging
 import re
 from collections import Counter
@@ -41,6 +40,7 @@ from typing import Any, NamedTuple, cast
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit as isa
 from lu_machinery.research import consumption
@@ -450,7 +450,7 @@ def _ingest_line(line: str, now: datetime, start: datetime, acc: _Accumulator) -
     (non-P3) event type is not malformed, just filtered. Never logs line content.
     """
     try:
-        evt = json.loads(line)
+        evt = json_depth.loads(line, max_depth=512)
     except ValueError:
         acc.malformed_lines += 1
         return

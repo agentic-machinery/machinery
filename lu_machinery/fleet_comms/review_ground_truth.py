@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.fleet_comms.review_publication import ReviewEvidence, ReviewPublicationError
 from lu_machinery.fleet_comms.review_publisher import ReviewPublisherError, split_repository
 
@@ -198,7 +198,7 @@ def fetch_pr_change_inventory(
             + (f" stderr={stderr[:200]}" if stderr else "")
         )
     try:
-        payload = json.loads(completed.stdout or "")
+        payload = json_depth.loads(completed.stdout or "", max_depth=512)
     except json.JSONDecodeError as exc:
         raise ReviewGroundTruthError(
             f"gh_pr_files_json_invalid: pr={pr_number}"

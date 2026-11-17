@@ -299,7 +299,7 @@ def _relative(path: Path, repo_root: Path) -> str:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+        value = json_depth.loads(path.read_text(encoding="utf-8", errors="strict"), max_depth=_JSON_MAX_DEPTH)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReadinessError(f"invalid JSON contract {path}: {exc}") from exc
     if not isinstance(value, dict):

@@ -20,6 +20,8 @@ import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 _SENSITIVE_NAME_RE = re.compile(
     r"TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE|CREDENTIALS?|API_?KEY|"
     r"ACCESS_?KEY|AUTH|COOKIE",
@@ -865,7 +867,7 @@ def _json_fingerprint(path: Path, select: Callable[[object], object]) -> str:
     if len(fingerprint) != 64:
         return fingerprint
     try:
-        data = json.loads(path.read_bytes())
+        data = json_depth.loads(path.read_bytes(), max_depth=512)
     except (OSError, ValueError):
         return "invalid"
     return _canonical_digest(select(data))

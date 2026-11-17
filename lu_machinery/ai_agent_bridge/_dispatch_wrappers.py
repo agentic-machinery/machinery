@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root, state_root
 from lu_machinery.review.verdict_parser import ACCEPTED_VERDICT_TOKENS, recognized_verdicts, unsupported_verdict_tokens
 from lu_machinery.secret_redactor import redact_text
@@ -79,7 +79,7 @@ def _run_json_command(
         text=True,
         timeout=timeout,
     )
-    return json.loads(proc.stdout or "{}")
+    return json_depth.loads(proc.stdout or "{}", max_depth=512)
 
 
 def _run_text_command(
@@ -505,7 +505,7 @@ def run_ask_review_dispatch(
                 f"Command: {' '.join(wait_command)}"
             ) from exc
         try:
-            state = json.loads(wait_proc.stdout or "{}")
+            state = json_depth.loads(wait_proc.stdout or "{}", max_depth=512)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"dispatch.py wait produced non-JSON output (rc={wait_proc.returncode}): "

@@ -67,6 +67,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 
 AGY_APP_DATA_ROOT = Path.home() / ".gemini" / "antigravity-cli"
@@ -125,7 +126,7 @@ def _read_transcript_events(thread_id: str | None) -> list[dict]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):
@@ -141,7 +142,7 @@ def _parse_stdout_events(stdout: str) -> list[dict]:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(event, dict):

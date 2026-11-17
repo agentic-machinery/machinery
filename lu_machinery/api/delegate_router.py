@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
 from lu_machinery.agent_runtime.codex_accounts import CODEX_ACCOUNT_ALIASES, CODEX_ACCOUNT_LABELS, DEFAULT_CODEX_ACCOUNT
+from lu_machinery.common import json_depth
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME as TASK_ARCHIVE_DIR_NAME
 from lu_machinery.orchestration.task_record_store import iter_task_records, parse_task_record
@@ -367,9 +368,9 @@ def _load_task_cache_from_db(
             if model_accounting_raw is None or fingerprint_raw is None or observations_raw is None:
                 continue
             try:
-                fingerprint = tuple(json.loads(fingerprint_raw))
-                model_accounting = json.loads(model_accounting_raw)
-                observations = json.loads(observations_raw)
+                fingerprint = tuple(json_depth.loads(fingerprint_raw, max_depth=512))
+                model_accounting = json_depth.loads(model_accounting_raw, max_depth=512)
+                observations = json_depth.loads(observations_raw, max_depth=512)
             except (json.JSONDecodeError, TypeError):
                 continue
             if not isinstance(model_accounting, dict) or not isinstance(observations, dict):
@@ -377,7 +378,7 @@ def _load_task_cache_from_db(
             subst = None
             if subst_str:
                 try:
-                    subst = json.loads(subst_str)
+                    subst = json_depth.loads(subst_str, max_depth=512)
                 except (json.JSONDecodeError, TypeError):
                     subst = subst_str
             summary = {
@@ -458,7 +459,7 @@ def _decode_linked_issues(raw: Any) -> list[dict[str, Any]] | None:
         payload = raw
     elif isinstance(raw, str):
         try:
-            payload = json.loads(raw)
+            payload = json_depth.loads(raw, max_depth=512)
         except (json.JSONDecodeError, TypeError):
             return None
     else:

@@ -20,6 +20,7 @@ from typing import Any
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 from .. import task_identity
@@ -34,8 +35,8 @@ ROLLOVER_ID_RE = re.compile(r"^rollover-[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 _REGISTRY_SCHEMA_PATH = machinery_path("schemas/rollover-registry.v1.schema.json")
 _TASK_IDENTITY_SCHEMA_PATH = machinery_path("schemas/task-identity.v1.schema.json")
-_REGISTRY_SCHEMA = json.loads(_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8"))
-_TASK_IDENTITY_SCHEMA = json.loads(_TASK_IDENTITY_SCHEMA_PATH.read_text(encoding="utf-8"))
+_REGISTRY_SCHEMA = json_depth.loads(_REGISTRY_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
+_TASK_IDENTITY_SCHEMA = json_depth.loads(_TASK_IDENTITY_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
 _SCHEMA_REGISTRY = Registry().with_resource(
     task_identity.IDENTITY_SCHEMA_VERSION,
     Resource.from_contents(_TASK_IDENTITY_SCHEMA),
@@ -203,7 +204,7 @@ def lineage_lock_path(state_root: Path, *, agent: str, lineage_id: str) -> Path:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read durable JSON {path}: {exc}") from exc
     if not isinstance(value, dict):

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -122,7 +124,7 @@ def post_observer_presence(
     try:
         with urlopen(request, timeout=5) as resp:
             raw_body = resp.read().decode("utf-8")
-        data = json.loads(raw_body)
+        data = json_depth.loads(raw_body, max_depth=512)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise urllib.error.URLError("unreachable") from exc
     except json.JSONDecodeError:

@@ -7,10 +7,11 @@ the hook must never block automatic compaction on an uncertain result.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
+
+from lu_machinery.common import json_depth
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -49,7 +50,7 @@ def has_prepared_handoff(state_root: Path, *, agent: str, session_id: str) -> bo
             return False
         with _BundleReconcileTree(state_root, agent, lineage_id_for(agent, session_id)) as tree:
             record = _validate_record(
-                json.loads(_read_text(tree, f".agent/sessions/{session_id}.json")),
+                json_depth.loads(_read_text(tree, f".agent/sessions/{session_id}.json"), max_depth=512),
                 expected_session_id=session_id,
             )
             if record.get("rollover_mode") != "operator_restart":
@@ -60,7 +61,7 @@ def has_prepared_handoff(state_root: Path, *, agent: str, session_id: str) -> bo
                 if not lineage.startswith("lineage-") or normalize_lineage_id(lineage) != lineage:
                     continue
                 state_path = default_state_path(agent, lineage)
-                state = json.loads(_read_text(tree, state_path.as_posix()))
+                state = json_depth.loads(_read_text(tree, state_path.as_posix()), max_depth=512)
                 if not isinstance(state, dict):
                     return False
                 active = state.get("active")
@@ -83,7 +84,7 @@ def main() -> int:
     parser.add_argument("--agent", default="claude")
     args = parser.parse_args()
     try:
-        payload = json.load(sys.stdin)
+        payload = json_depth.load(sys.stdin, max_depth=512)
         if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreCompact":
             return 0
         if payload.get("trigger") != "auto":

@@ -40,6 +40,8 @@ import os
 import sys
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 # Allow ``.venv/bin/python scripts/verify_review.py`` as well as ``-m``.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -98,7 +100,7 @@ def _read_review(issue: int | None, from_stdin: bool, review_file: Path | None) 
         return review_file.read_bytes().decode("utf-8")
     if issue is None:
         raise SystemExit("one of --from-stdin, --review-file, or --issue is required")
-    data = json.loads(_run(["gh", "issue", "view", str(issue), "--json", "comments"]))
+    data = json_depth.loads(_run(["gh", "issue", "view", str(issue), "--json", "comments"]), max_depth=512)
     comments = data.get("comments") or []
     return comments[-1]["body"] if comments else ""
 
@@ -120,7 +122,7 @@ def _load_json_arg(raw: str | None, *, label: str) -> dict:
             exit_code=EXIT_INVALID,
         ) from exc
     try:
-        value = json.loads(text)
+        value = json_depth.loads(text, max_depth=512)
     except json.JSONDecodeError as exc:
         raise ContractError(
             f"{label}_invalid_json:{exc.msg}",
@@ -154,7 +156,7 @@ def _load_behavior_proof_state(
 ) -> tuple[dict, str]:
     """Load proof and its claim from the canonical frozen closeout state."""
     try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state = json_depth.loads(state_file.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeDecodeError) as exc:
         raise ContractError(f"behavior_proof_state_unreadable:{exc}", exit_code=EXIT_INVALID) from exc
     except json.JSONDecodeError as exc:

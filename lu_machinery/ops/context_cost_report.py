@@ -401,7 +401,7 @@ def call_shape(name: Any, arguments: Any, cwd: str) -> tuple[str, str | None, st
             nested = re.findall(r"tools\.([A-Za-z0-9_]+)\s*\(", arguments)
             if name == "exec" and len(matches) == 1 and nested == ["exec_command"]:
                 try:
-                    return command_shape(json.loads(matches[0]), cwd)
+                    return command_shape(json_depth.loads(matches[0], max_depth=_JSON_MAX_DEPTH), cwd)
                 except ValueError:
                     pass
             return "other", None, None

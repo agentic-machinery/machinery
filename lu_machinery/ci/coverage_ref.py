@@ -27,6 +27,8 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 
 def _packaged_script(name: str) -> str:
     """Checkout-relative path of a sibling while this file is still in the package.
@@ -209,7 +211,7 @@ def combine(root: Path, output: Path, sha: str, shard_count: int, matrix_result:
         for shard in range(1, shard_count + 1):
             directory = root / f"coverage-shard-{shard}"
             try:
-                receipt = json.loads((directory / "receipt.json").read_text(encoding="utf-8"))
+                receipt = json_depth.loads((directory / "receipt.json").read_text(encoding="utf-8"), max_depth=512)
                 manifest["shards"].append(receipt)
                 if manifest["core"] is None:
                     manifest["core"] = receipt.get("core")
@@ -319,7 +321,7 @@ def combine(root: Path, output: Path, sha: str, shard_count: int, matrix_result:
             if reportable:
                 try:
                     cov.json_report(morfs=reportable, outfile=str(report_path), ignore_errors=True)
-                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                    report = json_depth.loads(report_path.read_text(encoding="utf-8"), max_depth=512)
                 except coverage.exceptions.NoDataError:
                     pass  # Every unreportable file is a completeness error below.
             # Keep a diagnostic report even if all paths or sources are unusable;

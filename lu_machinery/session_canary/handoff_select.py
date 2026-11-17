@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 # Every lane handoff the selector knows by name. A file of this shape that
@@ -379,7 +380,7 @@ def fetch_newest_handoff_note(lane: str, owner: str) -> dict[str, object] | None
         _warn(f"driver-state handoff_note unavailable (exit {result.returncode}); using markdown handoffs")
         return None
     try:
-        items = json.loads(result.stdout)
+        items = json_depth.loads(result.stdout, max_depth=512)
     except json.JSONDecodeError:
         _warn("driver-state handoff_note output is not JSON; using markdown handoffs")
         return None
@@ -710,7 +711,7 @@ def recorded_mint_handoff(
     if not meta_path.is_file():
         return None
     try:
-        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(meta_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise RecordedHandoffMissingError(
             f"recorded mint selection unreadable: {meta_path} ({exc}); "

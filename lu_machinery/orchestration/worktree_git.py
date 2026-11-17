@@ -20,7 +20,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.control_plane.storage import StoreId
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.orchestration import reaper_lifecycle, worktree_artifacts, worktree_claims
@@ -471,7 +471,7 @@ def _query_pr_states_rest(repo_root: Path, branch: str) -> tuple[list[PullReques
     if not proc.stdout:
         return [], "REST PR lookup returned empty output"
     try:
-        raw_items = json.loads(proc.stdout)
+        raw_items = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         return [], f"REST PR lookup returned invalid JSON: {exc}"
     if not isinstance(raw_items, list) or any(not isinstance(page, list) for page in raw_items):
@@ -531,7 +531,7 @@ def _query_pr_states_graphql(repo_root: Path, branch: str) -> tuple[list[PullReq
     if not proc.stdout:
         return [], "gh pr list returned empty output"
     try:
-        raw_items = json.loads(proc.stdout)
+        raw_items = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         return [], f"gh pr list returned invalid JSON: {exc}"
     if not isinstance(raw_items, list):
@@ -598,7 +598,7 @@ def _query_pr_by_number_rest(repo_root: Path, number: int) -> tuple[list[PullReq
     if proc.returncode != 0:
         return [], f"REST PR lookup failed: {_format_failure(proc)}"
     try:
-        item = json.loads(proc.stdout or "null")
+        item = json_depth.loads(proc.stdout or "null", max_depth=512)
     except json.JSONDecodeError as exc:
         return [], f"REST PR lookup returned invalid JSON: {exc}"
     rows, error = _scope_pr_rows([item], _pr_repository(repo_root), number=number)
@@ -790,7 +790,7 @@ def _has_active_rollover_lease(repo_root: Path, info: WorktreeInfo) -> str | Non
         try:
             for lease_file in candidate_dir.glob("*/*/lease.json"):
                 try:
-                    data = json.loads(lease_file.read_text(encoding="utf-8"))
+                    data = json_depth.loads(lease_file.read_text(encoding="utf-8"), max_depth=512)
                     if not isinstance(data, dict):
                         continue
                     cleanup_info = data.get("cleanup", {})
@@ -842,7 +842,7 @@ def _task_record(repo_root: Path, task_id: str | None) -> dict[str, Any] | None:
         return None
     task_file = control_plane_root(repo_root) / "batch_state" / "tasks" / f"{task_id}.json"
     try:
-        payload = json.loads(task_file.read_text(encoding="utf-8"))
+        payload = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
@@ -950,7 +950,7 @@ def _active_task_ids() -> set[str] | None:
     for attempt in range(2):
         try:
             with urllib.request.urlopen("http://127.0.0.1:8765/api/delegate/active", timeout=3) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                data = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
                 if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
                     raise ValueError("activity response must contain a tasks list")
                 tasks = data["tasks"]
@@ -1018,7 +1018,7 @@ def _resolve_activity_probe(
                 source="no_local_task_record",
             )
             return None, None
-        payload = json.loads(raw_payload)
+        payload = json_depth.loads(raw_payload, max_depth=512)
         if not isinstance(payload, dict) or payload.get("task_id") != task_id:
             return None, f"{probe.reason}; local_task_identity_mismatch"
         recorded_path = payload.get("worktree_path") or payload.get("cwd")

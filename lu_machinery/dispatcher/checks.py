@@ -1,6 +1,5 @@
 """Dispatch input, review independence and resource admission checks."""
 
-import json
 import re
 import shutil
 import subprocess
@@ -11,6 +10,7 @@ from urllib.parse import unquote
 import yaml
 
 from lu_machinery.agent_runtime import bounded_advisory as advisory
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import git, store
 from lu_machinery.dispatcher.types import TaskSpec
@@ -477,7 +477,7 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             repo = match.group(1) or repo
             if not (repo and _SLUG.fullmatch(repo)):
                 raise ValueError("no GitHub repository")
-            text = json.loads(git._gh("api", f"repos/{repo}/issues/{match.group(2)}"))["body"] or ""
+            text = json_depth.loads(git._gh("api", f"repos/{repo}/issues/{match.group(2)}"), max_depth=512)["body"] or ""
         else:
             text = Path(card).read_text(encoding="utf-8")
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -494,7 +494,7 @@ def check_task_card(card: str, allowed: list[str], repo: str | None) -> dict:
             state = "unreadable (no GitHub repository)"
         else:
             try:
-                issue = json.loads(git._gh("api", f"repos/{reference.group(1)}/issues/{reference.group(2)}"))
+                issue = json_depth.loads(git._gh("api", f"repos/{reference.group(1)}/issues/{reference.group(2)}"), max_depth=512)
                 state = str(issue["state"])
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
                 state = f"unreadable ({type(exc).__name__})"

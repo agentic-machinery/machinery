@@ -47,6 +47,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import (
     Authority,
     StoreId,
@@ -2268,7 +2269,7 @@ class ArtifactStore:
                 if footer is not None:
                     raise ArtifactStoreError(f"citation source {name}: line {number} follows the footer")
                 try:
-                    record = json.loads(line)
+                    record = json_depth.loads(line, max_depth=512)
                 except ValueError as exc:
                     raise ArtifactStoreError(
                         f"citation source {name}: line {number} is not JSON: {exc}"

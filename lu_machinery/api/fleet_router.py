@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import authority_collector_payload, read_failure_code
@@ -244,7 +245,7 @@ def _safe_metadata(value: Any) -> dict[str, Any]:
     if not isinstance(value, str) or not value:
         return {}
     try:
-        raw = json.loads(value)
+        raw = json_depth.loads(value, max_depth=512)
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     if not isinstance(raw, dict):
@@ -1403,7 +1404,7 @@ def _safe_authority_failure(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        event_metadata = json.loads(value)
+        event_metadata = json_depth.loads(value, max_depth=512)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
     if not isinstance(event_metadata, dict):

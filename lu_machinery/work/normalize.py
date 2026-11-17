@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.work import SOURCE_PUBLIC
 from lu_machinery.work.attention import _pr_check_state, apply_health_and_actions, attach_merge_evidence
 from lu_machinery.work.relations import (
@@ -1073,7 +1074,7 @@ def load_persisted_lifecycle_ledgers(repository_id: str) -> list[dict[str, Any]]
         ledgers: list[dict[str, Any]] = []
         for path in sorted(directory.glob("issue-*.json")):
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
             except (OSError, UnicodeError, json.JSONDecodeError):
                 continue
             if isinstance(payload, dict):

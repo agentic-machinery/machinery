@@ -218,7 +218,7 @@ def probe_health(url: str, timeout: float) -> tuple[bool, str]:
     if status != 200:
         return False, f"HTTP {status} after {elapsed:.1f}s"
     try:
-        payload = json.loads(body)
+        payload = json_depth.loads(body, max_depth=_JSON_MAX_DEPTH)
     except ValueError:
         return False, f"non-JSON body after {elapsed:.1f}s"
     if not isinstance(payload, dict) or payload.get("status") != "ok":
@@ -516,7 +516,7 @@ class Host:
 
 def read_state(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

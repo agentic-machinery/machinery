@@ -9,7 +9,6 @@ commands, and no shell tool is exposed to the reviewer.
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -109,7 +108,9 @@ def main() -> int:
             if exc.code == 0:  # argparse --help is a successful non-hook invocation.
                 return 0
             raise
-        allowed = reviewer_tool_allowed(json.load(sys.stdin), args.review_root)
+        from lu_machinery.common import json_depth
+
+        allowed = reviewer_tool_allowed(json_depth.load(sys.stdin, max_depth=512), args.review_root)
     except BaseException:
         allowed = False
     try:

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from lu_machinery.common import json_depth
+
 from .deepseek_admission import refuse_deepseek_if_disallowed
 from .redacted_env import RedactedEnv
 
@@ -277,7 +279,7 @@ def attachment_metadata(data: Any) -> dict[str, Any]:
         return {}
     if data.startswith("{"):
         try:
-            loaded = json.loads(data)
+            loaded = json_depth.loads(data, max_depth=512)
         except (json.JSONDecodeError, ValueError):
             return {"raw": data}
         if isinstance(loaded, dict):

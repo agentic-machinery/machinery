@@ -4,7 +4,6 @@ The canonical packaged review schema is read through ``importlib.resources``.
 Caller-supplied schema files stay on the attempt reader.
 """
 
-import json
 import os
 import re
 from json import JSONDecodeError
@@ -15,6 +14,7 @@ from jsonschema.exceptions import SchemaError
 
 from lu_machinery.agent_runtime.adapters._output_schema import load_output_schema
 from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
+from lu_machinery.common import json_depth
 from lu_machinery.dispatcher.store import digest
 from lu_machinery.review.review_contract import is_packaged_review_schema, packaged_review_schema_bytes
 
@@ -49,7 +49,7 @@ def _load_packaged_schema(options: dict) -> dict:
         raise ValueError("output schema is not a readable file") from exc
     if digest(payload) != digest_hex:
         raise ValueError("output schema SHA-256 changed after dispatch validation")
-    schema = json.loads(payload)
+    schema = json_depth.loads(payload, max_depth=512)
     if not isinstance(schema, dict):
         raise ValueError("output schema JSON must be an object")
     Draft202012Validator.check_schema(schema)

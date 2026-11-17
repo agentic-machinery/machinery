@@ -225,7 +225,7 @@ class _RolloutRecord:
                     # Decode bounded strings using JSON's escape grammar, then
                     # replace unpaired code units before passing them on. They
                     # cannot match the ASCII lifecycle keys or event names.
-                    output.extend(json.dumps(json.loads(self.string), ensure_ascii=False).encode("utf-8", errors="replace"))
+                    output.extend(json.dumps(json_depth.loads(self.string, max_depth=_JSON_MAX_DEPTH), ensure_ascii=False).encode("utf-8", errors="replace"))
                 else:
                     output.extend(self.string)
                 self.string.clear()
@@ -628,7 +628,7 @@ def send(
         if not line:
             continue
         try:
-            events.append(json.loads(line))
+            events.append(json_depth.loads(line, max_depth=_JSON_MAX_DEPTH))
         except json.JSONDecodeError:
             continue
 

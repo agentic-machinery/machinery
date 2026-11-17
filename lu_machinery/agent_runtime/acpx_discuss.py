@@ -40,6 +40,7 @@ from lu_machinery.agent_runtime.runner import (
     invoke_inter_agent,
     resolve_inter_agent_route,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.contracts import new_id
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.message_plane import default_plane_root
@@ -369,7 +370,7 @@ class AcpxDiscussionController:
             (conversation_id,),
         ).fetchone()
         try:
-            final_metadata = json.loads(str(final_event[0])) if final_event is not None else {}
+            final_metadata = json_depth.loads(str(final_event[0]), max_depth=512) if final_event is not None else {}
         except (TypeError, ValueError, json.JSONDecodeError):
             final_metadata = {}
         terminal_rows = self.conn.execute(
@@ -587,7 +588,7 @@ class AcpxDiscussionController:
         if row is None:
             raise AcpxDiscussionError("reserved ACP conversation was not found")
         try:
-            reserved_participants = tuple(json.loads(str(row[4])))
+            reserved_participants = tuple(json_depth.loads(str(row[4]), max_depth=512))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise AcpxDiscussionError("reserved ACP participants are invalid") from exc
         expected = (
@@ -1328,7 +1329,7 @@ def verify_discussion_receipt(
     if not events:
         raise AcpxDiscussionError("ACP conversation has no lifecycle events")
     try:
-        participants = json.loads(str(row["participants_json"]))
+        participants = json_depth.loads(str(row["participants_json"]), max_depth=512)
     except (TypeError, ValueError, json.JSONDecodeError):
         participants = None
     participants_valid = (

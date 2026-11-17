@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError
 from lu_machinery.common.repo_root import product_root as resolve_product_root
 
@@ -130,7 +131,7 @@ def load_deploy_paths(path: Path | None = None, *, product_root: Path | None = N
 @lru_cache(maxsize=4)
 def _load_deploy_paths(path: Path) -> DeployPaths:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        data = json_depth.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys, max_depth=512)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DeployPathsError(f"deploy path policy unreadable: {path}: {exc}") from exc
     if not isinstance(data, dict):

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.guardrails.delegate_ownership import TERMINAL_TASK_STATUSES, OwnershipLedger
 from lu_machinery.orchestration.task_record_store import task_state_lock as task_state_lock
 from lu_machinery.orchestration.task_record_store import write_record_unlocked
@@ -180,7 +180,7 @@ def _replace_if_unchanged(
 ) -> tuple[dict[str, Any], bool]:
     """Recheck the run before writing; terminal results take precedence."""
     try:
-        current = json.loads(path.read_text(encoding="utf-8"))
+        current = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return expected, False
     if not isinstance(current, dict):
@@ -216,7 +216,7 @@ def mark_dead_worker_terminal(
     """
     with task_state_lock(path):
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
+            current = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError):
             return observed, False
         if not isinstance(current, dict):
@@ -275,7 +275,7 @@ def _mark_orphaned_pidless_crashed(
     """Re-prove ``is_orphaned`` under the writer lock, then mark the record ``crashed`` (``write`` as above)."""
     with task_state_lock(path):
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
+            current = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError):
             return observed, False
         if (
@@ -366,7 +366,7 @@ def mark_missing_worktree_failed(
     """
     with task_state_lock(path):
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
+            current = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError):
             return observed, False
         if not isinstance(current, dict):

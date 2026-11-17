@@ -14,6 +14,7 @@ from lu_machinery.ci.advisory_checks import (
     is_external_advisory_run,
     load_advisory_checks,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.github_check_rollup import (
     bind_workflow_runs,
@@ -458,7 +459,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
             failed.append(f"{label}: {_read_failure(result)}")
             return None
         try:
-            value = json.loads(result.stdout)
+            value = json_depth.loads(result.stdout, max_depth=512)
         except (TypeError, ValueError):
             failed.append(f"{label}: malformed JSON")
             return None
@@ -512,7 +513,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
             states = bound_states(bound)
         else:
             try:
-                raw_checks = json.loads(checks.stdout)
+                raw_checks = json_depth.loads(checks.stdout, max_depth=512)
                 parsed = True
             except (json.JSONDecodeError, TypeError):
                 raw_checks, parsed = None, False

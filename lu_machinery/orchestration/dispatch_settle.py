@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -100,7 +102,7 @@ def _load_task(task_dir: Path, task_id: str) -> dict[str, Any]:
     path = task_dir / f"{task_id}.json"
     if not path.is_file():
         raise FileNotFoundError(f"task state missing: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(data, dict):
         raise ValueError(f"task state must be object: {path}")
     return data
@@ -279,7 +281,7 @@ def _find_pr(branch: str | None, cwd: Path) -> tuple[str | None, int | None]:
     if proc.returncode != 0 or not proc.stdout.strip():
         return None, None
     try:
-        data = json.loads(proc.stdout)
+        data = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError:
         return None, None
     if not isinstance(data, dict):
@@ -336,7 +338,7 @@ def push_and_maybe_open_pr(
     pr_body = body or (f"Auto-opened by `python -m {_MODULE}` after a worker left commits without a PR.\n")
     base_result = _run(["gh", "repo", "view", "--json", "defaultBranchRef"], cwd=worktree)
     try:
-        base = json.loads(base_result.stdout)["defaultBranchRef"]["name"]
+        base = json_depth.loads(base_result.stdout, max_depth=512)["defaultBranchRef"]["name"]
         if base_result.returncode or not isinstance(base, str) or not base:
             raise ValueError
     except (ValueError, KeyError, TypeError):
@@ -454,7 +456,7 @@ def _idle_snapshot_from_args(args: argparse.Namespace) -> idle_settle.Eligibilit
     raw = getattr(args, "idle_snapshot_json", None)
     if raw is None:
         return idle_settle.empty_snapshot()
-    payload = json.loads(Path(raw).read_text(encoding="utf-8"))
+    payload = json_depth.loads(Path(raw).read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(payload, dict):
         raise ValueError(f"idle snapshot must be a JSON object: {raw}")
     return idle_settle.parse_snapshot(payload)

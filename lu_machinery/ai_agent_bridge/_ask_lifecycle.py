@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.errors import AgentStalledError, AgentTimeoutError
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import project_interpreter, state_root
 
 from . import _config
@@ -91,7 +92,7 @@ def _write_ask_launch_record(
     metadata: dict[str, Any] = {}
     if row and row[4]:
         try:
-            decoded = json.loads(str(row[4]))
+            decoded = json_depth.loads(str(row[4]), max_depth=512)
             if isinstance(decoded, dict):
                 metadata = decoded
         except (TypeError, json.JSONDecodeError):
@@ -129,7 +130,7 @@ def _write_ask_launch_record(
 
 def _read_ask_record(message_id: int, name: str) -> dict[str, Any] | None:
     try:
-        value = json.loads((_ask_state_dir(message_id) / name).read_text(encoding="utf-8"))
+        value = json_depth.loads((_ask_state_dir(message_id) / name).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
@@ -989,7 +990,7 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
 
 def _background_options(message_id: int, target: str) -> dict[str, Any]:
     state_path = _config.PID_DIR / f"{_ASK_AGENT}-{message_id}.json"
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload = json_depth.loads(state_path.read_text(encoding="utf-8"), max_depth=512)
     if payload.get("target") != target:
         raise ValueError(f"background target mismatch for ask #{message_id}")
     options = payload.get("options")
@@ -1012,7 +1013,7 @@ def _ask_metadata(msg: dict[str, Any]) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        metadata = json.loads(raw)
+        metadata = json_depth.loads(raw, max_depth=512)
     except (TypeError, json.JSONDecodeError):
         return {}
     return metadata if isinstance(metadata, dict) else {}
@@ -1118,7 +1119,7 @@ def _plane_try_open_ask(message_id: int) -> None:
         task_id, from_llm, to_llm, content, data_raw = row
         model = None
         try:
-            meta = json.loads(data_raw) if data_raw else {}
+            meta = json_depth.loads(data_raw, max_depth=512) if data_raw else {}
             if isinstance(meta, dict):
                 model = meta.get("to_model")
                 if model is not None:
@@ -1192,7 +1193,7 @@ def _load_fleet_request_id(message_id: int) -> str | None:
         if not row or not row[0]:
             return None
         try:
-            meta = json.loads(str(row[0]))
+            meta = json_depth.loads(str(row[0]), max_depth=512)
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(meta, dict):
@@ -1210,7 +1211,7 @@ def _store_fleet_request_id(message_id: int, request_id: str) -> None:
         metadata: dict[str, Any] = {}
         if row and row[0]:
             try:
-                loaded = json.loads(str(row[0]))
+                loaded = json_depth.loads(str(row[0]), max_depth=512)
                 metadata = loaded if isinstance(loaded, dict) else {"raw": row[0]}
             except (TypeError, json.JSONDecodeError):
                 metadata = {"raw": row[0]}

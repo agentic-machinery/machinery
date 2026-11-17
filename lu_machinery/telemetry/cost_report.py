@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from lu_machinery.agent_runtime.usage import _iter_usage_records
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 
 COST_RATES_PATH = machinery_path("telemetry/cost_rates.yaml")
@@ -176,7 +177,7 @@ def _iter_dispatch_meta_files(
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None

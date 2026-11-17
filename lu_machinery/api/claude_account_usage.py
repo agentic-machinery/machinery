@@ -108,7 +108,7 @@ from lu_machinery.api.subscription_usage import (
     _private_usage,
     _routing_budget_state_dir,
 )
-from lu_machinery.common import scratch
+from lu_machinery.common import json_depth, scratch
 
 _log = logging.getLogger(__name__)
 
@@ -870,7 +870,7 @@ def probe_account(label: str, *, timeout_s: float = PROBE_TIMEOUT_S) -> tuple[di
             if after.generation != binding.generation:
                 raise ClaudeAccountRefused("claude_account_unverified")
     try:
-        payload = json.loads(raw)
+        payload = json_depth.loads(raw, max_depth=512)
     except ValueError:
         raise _ProbeFailed("bad_json") from None
     row = parse_codexbar_claude(payload)
@@ -938,7 +938,7 @@ def _is_probe_owner() -> bool:
 
 def _read_samples(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

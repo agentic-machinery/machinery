@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 # Direct file-path callers need this checkout on the import path before installation.
 # This selects code only; product and shared-state roots remain explicitly configured.
 if not __package__:
@@ -32,7 +34,7 @@ def _roots(repo_root: Path | None) -> tuple[Path, Path]:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"cannot read JSON evidence {path}: {exc}") from exc
     if not isinstance(value, dict):

@@ -18,6 +18,8 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 
+from lu_machinery.common import json_depth
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -204,7 +206,7 @@ def _repository_backed_file(repo_root: Path, path: Path) -> Path:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+        value = json_depth.loads(path.read_text(encoding="utf-8", errors="strict"), max_depth=512)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PilotError(f"invalid JSON document {path}: {exc}") from exc
     if not isinstance(value, dict):

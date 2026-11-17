@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 from lu_machinery.ci import check_issue_task_quality as checker
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.orchestration import fleet_repos
 from lu_machinery.orchestration import issue_stream_audit as audit
@@ -50,7 +50,7 @@ def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None
     """Keep exceptions and private issue data inside this read boundary."""
     issues, count, report, codes = None, None, None, []
     try:
-        issues = json.loads(
+        issues = json_depth.loads(
             github_client.check_output(
                 [
                     "gh",
@@ -67,7 +67,7 @@ def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None
                 ],
                 text=True,
                 timeout=60,
-            )
+            ), max_depth=512
         )
         if not isinstance(issues, list) or any(
             not isinstance(i, dict) or type(i.get("number")) is not int for i in issues
@@ -83,7 +83,7 @@ def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None
         result = read("issue-count", repo=repo.github, capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise ValueError
-        count = json.loads(result.stdout)["data"]["repository"]["issues"]["totalCount"]
+        count = json_depth.loads(result.stdout, max_depth=512)["data"]["repository"]["issues"]["totalCount"]
         if type(count) is not int or count < 0:
             raise ValueError
     except github_client.GitHubRateLimited:

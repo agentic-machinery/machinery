@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
+from lu_machinery.common import json_depth
 from lu_machinery.session_streams.model import (
     Entry,
     EntryRef,
@@ -117,7 +118,7 @@ class RemoteEpicClient:
                 raise RemoteUnavailableError(f"Monitor API temporarily unavailable ({exc.code})") from None
             try:
                 raw = exc.read().decode("utf-8")
-                detail = json.loads(raw).get("detail", "request refused")
+                detail = json_depth.loads(raw, max_depth=512).get("detail", "request refused")
             except (ValueError, json.JSONDecodeError, OSError):
                 detail = "request refused"
             if exc.code == 409 and not path.endswith("/claim"):
@@ -141,12 +142,12 @@ class RemoteEpicClient:
                     "deploy a Monitor build that includes /api/epics/v1"
                 )
             try:
-                detail = json.loads(raw).get("detail", "request refused")
+                detail = json_depth.loads(raw, max_depth=512).get("detail", "request refused")
             except (ValueError, json.JSONDecodeError, OSError):
                 detail = "request refused"
             raise RemoteSupervisorError(f"Monitor API returned an error ({status}): {detail}")
         try:
-            data = json.loads(raw)
+            data = json_depth.loads(raw, max_depth=512)
         except json.JSONDecodeError as exc:
             raise RemoteSupervisorError("Monitor API returned non-JSON data") from exc
         if not isinstance(data, dict):

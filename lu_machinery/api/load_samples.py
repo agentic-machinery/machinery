@@ -14,7 +14,7 @@ from pathlib import Path
 
 import psutil
 
-from lu_machinery.common import test_slots
+from lu_machinery.common import json_depth, test_slots
 
 THRESHOLD_ENV = "LU_LOAD_SAMPLE_THRESHOLD"
 DEFAULT_THRESHOLD = 20.0
@@ -68,7 +68,7 @@ def top_processes() -> list[dict]:
 def _read(path: Path) -> list[dict]:
     try:
         with path.open(encoding="utf-8") as stream:
-            return [json.loads(line) for line in deque(stream, maxlen=MAX_SAMPLES)]
+            return [json_depth.loads(line, max_depth=512) for line in deque(stream, maxlen=MAX_SAMPLES)]
     except FileNotFoundError:
         return []
 

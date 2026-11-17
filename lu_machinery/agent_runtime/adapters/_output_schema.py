@@ -16,6 +16,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from lu_machinery.agent_runtime.attempt_safe_read import safe_read_attempt_file
+from lu_machinery.common import json_depth
 
 from ..result import ParseResult
 from .base import InvocationPlan
@@ -41,7 +42,7 @@ def load_output_schema(tool_config: dict[str, Any] | None) -> dict[str, Any] | N
     payload = safe_read_attempt_file(schema_path, trusted_root=root)
     if hashlib.sha256(payload).hexdigest() != digest:
         raise ValueError("output schema SHA-256 changed after dispatch validation")
-    schema = json.loads(payload)
+    schema = json_depth.loads(payload, max_depth=512)
     if not isinstance(schema, dict):
         raise ValueError("output schema JSON must be an object")
     Draft202012Validator.check_schema(schema)
@@ -112,6 +113,6 @@ def json_value(text: str) -> Any:
         return result
 
     try:
-        return json.loads(text, parse_constant=reject_constant, parse_float=finite_float, object_pairs_hook=unique_object)
+        return json_depth.loads(text, parse_constant=reject_constant, parse_float=finite_float, object_pairs_hook=unique_object, max_depth=512)
     except (TypeError, ValueError):
         return INVALID_JSON

@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import re
 import subprocess
 import sys
@@ -41,6 +40,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from lu_machinery.common import json_depth
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -146,8 +147,8 @@ def list_caches(repo: str, gh_api: GhApi = _gh_api) -> list[CacheEntry]:
     entries: list[CacheEntry] = []
     totals: set[int] = set()
     for page in range(1, MAX_PAGES + 1):
-        body = json.loads(
-            gh_api([f"repos/{repo}/actions/caches?per_page={PER_PAGE}&page={page}&sort=created_at&direction=asc"])
+        body = json_depth.loads(
+            gh_api([f"repos/{repo}/actions/caches?per_page={PER_PAGE}&page={page}&sort=created_at&direction=asc"]), max_depth=512
         )
         totals.add(int(body["total_count"]))
         batch = body["actions_caches"]
@@ -168,8 +169,8 @@ def list_caches(repo: str, gh_api: GhApi = _gh_api) -> list[CacheEntry]:
 def open_pr_base_shas(repo: str, gh_api: GhApi = _gh_api) -> set[str]:
     """Protect every open PR base; compare REST pages with Search's count."""
     from urllib.parse import urlencode
-    rows = json.loads(gh_api(["--paginate", f"repos/{repo}/pulls?state=open&per_page=100"]))
-    count = json.loads(gh_api(["search/issues?" + urlencode({"q":f"repo:{repo} is:pr is:open", "per_page":1})]))
+    rows = json_depth.loads(gh_api(["--paginate", f"repos/{repo}/pulls?state=open&per_page=100"]), max_depth=512)
+    count = json_depth.loads(gh_api(["search/issues?" + urlencode({"q":f"repo:{repo} is:pr is:open", "per_page":1})]), max_depth=512)
     if not isinstance(rows, list) or count.get("incomplete_results") is not False or type(count.get("total_count")) is not int:
         raise IncompleteListingError("open PR base read is incomplete")
     shas, numbers = set(), set()

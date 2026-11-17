@@ -33,7 +33,6 @@ from __future__ import annotations
 import fnmatch
 import functools
 import http.client
-import json
 import math
 import os
 import re
@@ -45,6 +44,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lu_machinery.agent_runtime.mechanical_admission import MechanicalAdmissionRefused
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS
 
 if TYPE_CHECKING:
@@ -99,7 +99,7 @@ def load_role_policy(path: Path | None = None) -> dict[str, Any]:
     except OSError:
         raise ModelRoleRefused("MODEL_ROLE_POLICY_INVALID: role policy cannot be read") from None
     try:
-        return _validate_role_policy(json.loads(raw))
+        return _validate_role_policy(json_depth.loads(raw, max_depth=512))
     except (OSError, ValueError, TypeError, KeyError):
         raise ModelRoleRefused("MODEL_ROLE_POLICY_INVALID: role policy cannot be validated") from None
 
@@ -228,7 +228,7 @@ def policy_path() -> Path:
 
 def load_policy(path: Path | None = None) -> dict[str, Any]:
     try:
-        data = json.loads((path or policy_path()).read_text(encoding="utf-8"))
+        data = json_depth.loads((path or policy_path()).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -536,7 +536,7 @@ def _bound_routing_view(account: ClaudeAccount | None, *, ready_wait: bool = Tru
     while True:
         try:
             with urllib.request.urlopen(f"{base}/api/state/routing-budget", timeout=timeout) as resp:
-                data = json.load(resp)
+                data = json_depth.load(resp, max_depth=512)
             if ready_wait:
                 _monitor_wait_spent_at = None
             break

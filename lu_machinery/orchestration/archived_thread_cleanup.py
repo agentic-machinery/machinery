@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.task_family import codex_state, rollover_registry
 
 STATE_SCHEMA_VERSION = "archived-thread-cleanup-state.v1"
@@ -127,7 +128,7 @@ def _uuid_strings(value: Any) -> set[str]:
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise CleanupError(f"cannot read {label} {path}: {exc}") from exc
     if not isinstance(value, dict):

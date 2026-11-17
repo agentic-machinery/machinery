@@ -13,12 +13,12 @@ LOCAL-ONLY: prompt data egresses to China — forbidden in CI (guard in
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 import shutil
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.review.model_catalog import retired_model_refusal
 
 from ..failure_codes import opencode_provider_error, provider_failure_code, provider_stderr_error
@@ -54,7 +54,7 @@ def _is_flash_model_line(name: str) -> bool:
 def _cached_flash_name() -> str | None:
     """Read OpenCode's optional models.dev cache without refreshing it."""
     try:
-        cache = json.loads((Path.home() / ".cache" / "opencode" / "models.json").read_text(encoding="utf-8"))
+        cache = json_depth.loads((Path.home() / ".cache" / "opencode" / "models.json").read_text(encoding="utf-8"), max_depth=512)
         name = cache["deepseek"]["models"]["deepseek-flash"]["name"]
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -77,7 +77,7 @@ def _extract_text_from_stdout(stdout: str) -> str:
         return ""
     if text.startswith("{") and text.endswith("}"):
         try:
-            data = json.loads(text)
+            data = json_depth.loads(text, max_depth=512)
             if isinstance(data, dict):
                 if "text" in data and isinstance(data["text"], str):
                     return data["text"].strip()

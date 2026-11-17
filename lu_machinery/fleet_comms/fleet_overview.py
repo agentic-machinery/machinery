@@ -8,7 +8,6 @@ Never opens local session-stream SQLite.
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 import urllib.error
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.api.occupancy_sanitize import opaque_host_id, safe_field
+from lu_machinery.common import json_depth
 
 try:
     from lu_machinery.session_streams.db import (
@@ -228,7 +228,7 @@ def fetch_remote_fleet_overview(
                 return {"available": False, "streams": []}
             raw = resp.read()
             text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
-            data = json.loads(text)
+            data = json_depth.loads(text, max_depth=512)
     except Exception:
         return {"available": False, "streams": []}
 
