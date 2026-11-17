@@ -40,8 +40,10 @@ touches a judge file (the checklist, the ownership map, the reply schema, the re
 brief template or the rules). Its JSON output's `brief_section` is the text the brief carries.
 The reviewer answers each item with file:line or test evidence. It runs the installed release:
 `-P` keeps the working directory off `sys.path`, so a machinery checkout's own `lu_machinery`
-is not imported. It refuses to run from, or read a judge file from, the checkout under review
-(the work tree's top level, whichever subdirectory `--repo-root` names). Any other exit 1 (a
+is not imported. It refuses to run from, or read a judge file from, a file the checkout under
+review tracks (in the work tree's top level, whichever subdirectory `--repo-root` names); an
+installed release in an untracked virtual environment such as `<top>/.venv` is not checkout
+source and runs. Any other exit 1 (a
 malformed checklist or map at the merge-base, an unreadable diff) is fail-closed: escalate to
 the CTO, and never hand-write the section.
 

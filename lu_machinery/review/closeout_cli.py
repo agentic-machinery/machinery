@@ -1066,8 +1066,17 @@ def _checkout_top(repo_root: Path) -> Path:
         raise CloseoutStateError("the checkout's top level is unavailable") from exc
 
 
-def _inside(path: Path, top: Path) -> bool:
-    return path == top or top in path.parents
+def _checkout_source(path: Path, top: Path) -> bool:
+    """Whether ``path`` (resolved) is a file the checkout under review tracks, so it could be the change itself.
+
+    An installed release in an ignored or untracked virtual environment inside the work tree
+    (``<top>/.venv``) is not checkout source; the checkout's own files, an editable install of
+    them and a symlink into them are.
+    """
+    if path != top and top not in path.parents:
+        return False
+    relative = path.relative_to(top).as_posix() if path != top else "."
+    return bool(_checklist_git(top, "--literal-pathspecs", "ls-files", "-z", "--", relative))
 
 
 def _judge_input(repo_root: Path, top: Path, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
@@ -1093,7 +1102,7 @@ def _judge_input(repo_root: Path, top: Path, merge_base: str, relative: str) -> 
         resolved = package_file.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError: a symlink loop before 3.13
         raise CloseoutStateError(f"{checkout_path} unavailable in the installed package") from exc
-    if _inside(resolved, top):
+    if _checkout_source(resolved, top):
         raise CloseoutStateError(
             f"{checkout_path} is missing at the merge-base and the only other copy is in the checkout "
             "under review; run this command from the installed release"
@@ -1384,7 +1393,7 @@ def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, An
     top = _checkout_top(repo_root)
     # This code matches the change and reads the judge inputs, so a copy from the checkout under
     # review could be the change itself, whatever data it reads.
-    if _inside(Path(__file__).resolve(), top):
+    if _checkout_source(Path(__file__).resolve(), top):
         raise CloseoutStateError(
             "checklist is running from the checkout under review; run the installed release with "
             "python -P -m lu_machinery.review.closeout_cli"

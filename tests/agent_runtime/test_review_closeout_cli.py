@@ -1377,3 +1377,28 @@ def test_checklist_refuses_the_checkout_copy_from_a_subdirectory(tmp_path, monke
 
     assert result.returncode == 1
     assert "the only other copy is in the checkout under review" in result.stdout + result.stderr
+
+
+def test_checklist_admits_the_installed_release_in_an_untracked_venv(tmp_path, monkeypatch):
+    """Defect class: the checkout guard refuses the installed release because it sits inside the work tree.
+
+    A primary checkout can hold its virtual environment (`<top>/.venv`, untracked); the release
+    installed there is not checkout source, so the epilog's `.venv/bin/python -P ...` run works.
+    """
+    from lu_machinery.review import closeout_cli
+
+    repo = _init_repo(tmp_path)
+    _commit_judge_inputs(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "edit app.py")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    installed = repo / ".venv" / "lib" / "python3.12" / "site-packages" / "lu_machinery" / "review"
+    installed.mkdir(parents=True)
+    (installed / "closeout_cli.py").write_text("# installed release\n", encoding="utf-8")
+    monkeypatch.setattr(closeout_cli, "__file__", str(installed / "closeout_cli.py"))
+
+    result = _run_cli(tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["checklist_source"]["kind"] == "merge-base"
