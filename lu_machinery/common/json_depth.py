@@ -41,9 +41,11 @@ MAX_DEPTH_CEILING = 512
 # never rescans the rest (no quadratic backtracking).
 _TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 _OPENERS = "[{"
-# The bytes the token scan looks at outside escapes: brackets, folded to one pair, and quotes.
+# Bytes for the C-speed view of the same scan: brackets folded to one pair, quotes, and for
+# text with escaped quotes, backslashes plus the marker that replaces each escape pair.
 _FOLD = bytes.maketrans(b"{}", b"[]")
 _NOT_STRUCTURE = bytes(sorted(set(range(256)) - set(b'[]{}"')))
+_NOT_STRUCTURE_OR_ESCAPE = bytes(sorted(set(range(256)) - set(b'[]{}"\\\x00')))
 _STEP = {ord("["): 1, ord("]"): -1}.__getitem__
 # JSON whitespace, as json.loads skips it around a document (json.decoder.WHITESPACE).
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
@@ -72,6 +74,13 @@ def _first_too_deep(text: str, start: int, max_depth: int) -> int | None:
     decoder accepts; past the decoder's first error it may differ (an unterminated string
     hides every later bracket), which :func:`_decode` resolves by error position.
     """
+    # At most one bracket per level can be open, so a short text cannot be too deep.
+    if text.count("[", start) + text.count("{", start) <= max_depth:
+        return None
+    # A long text is usually shallow: confirm that at C speed before the per-match scan.
+    view = _structure_depth(text, start)
+    if view is not None and view <= max_depth:
+        return None
     depth = 0
     for match in _TOKEN.finditer(text, start):
         token = match.group()
@@ -84,53 +93,40 @@ def _first_too_deep(text: str, start: int, max_depth: int) -> int | None:
     return None
 
 
-def _structure_depth(text: str, start: int) -> int:
-    """Deepest bracket nesting outside strings in ``text[start:]``, with C-speed string operations.
+def _structure_depth(text: str, start: int) -> int | None:
+    """The scan's deepest nesting from ``start``, from C-speed bytes operations; None if unsure.
 
     UTF-8 keeps every ASCII character as one byte and puts no ASCII byte in a multi-byte
-    character. Within a string, backslashes pair from the left, so after deleting each
-    escaped backslash and then each escaped quote, every remaining quote opens or closes a
-    string. Splitting on quotes then leaves the text between strings at even indexes.
+    character. When no quote follows a backslash, every quote opens or closes a string, as
+    in the scan, so splitting on quotes leaves the text between strings at even indexes.
 
-    This tokenizes like :data:`_TOKEN` up to the first backslash outside a string. Past that
-    backslash the two can differ, but the decoder never reads past it: it is a syntax error,
-    or text after the decoded value. So the decoder meets no nesting deeper than the result.
+    Otherwise each escaped backslash and then each escaped quote becomes a NUL marker, which
+    leaves exactly the string delimiters as quotes up to the first backslash outside a
+    string. That backslash then stays outside a string as a backslash or a marker, so any
+    backslash or NUL found there returns None and the caller runs the scan itself.
     """
     data = text[start:].encode("utf-8", "surrogatepass")
-    if b'\\"' in data:
-        data = data.replace(b"\\\\", b"").replace(b'\\"', b"")
-    outside = b"".join(data.translate(_FOLD, _NOT_STRUCTURE).split(b'"')[::2])
+    if b'\\"' not in data:
+        outside = b"".join(data.translate(_FOLD, _NOT_STRUCTURE).split(b'"')[::2])
+    else:
+        data = data.replace(b"\\\\", b"\x00").replace(b'\\"', b"\x00")
+        outside = b"".join(data.translate(_FOLD, _NOT_STRUCTURE_OR_ESCAPE).split(b'"')[::2])
+        if b"\\" in outside or b"\x00" in outside:
+            return None
     return max(accumulate(map(_STEP, outside), initial=0))
 
 
 def _decode(text: str, idx: int, max_depth: int, decoder: json.JSONDecoder) -> tuple[Any, int]:
-    # At most one bracket per level can be open, so a text with few brackets cannot be too
-    # deep. Brackets inside strings only add to this count.
-    if text.count("[", idx) + text.count("{", idx) <= max_depth:
+    deep = _first_too_deep(text, idx, max_depth)
+    if deep is None:
+        # At most max_depth levels: no interpreter's decoder recursion limit is reachable.
         return decoder.raw_decode(text, idx)
-    if _structure_depth(text, idx) <= max_depth:
-        # Both checks run at C speed, so an ordinary document never pays the per-match scan.
-        # The scan could still find a too-deep bracket past a backslash outside a string, but
-        # the decoder never reads that far, so decoding the whole text reads what decoding
-        # through that bracket reads. Only an error needs the scan, to judge it as below.
-        deep = None
-        end = len(text)
-    else:
-        deep = _first_too_deep(text, idx, max_depth)
-        if deep is None:
-            # At most max_depth levels: no interpreter's decoder recursion limit is reachable.
-            return decoder.raw_decode(text, idx)
-        end = deep + 1
     # Decode only through the first too-deep bracket. The decoder then meets, in document
     # order, every syntax error and every hook call for a container closed before that
     # bracket, as 3.12 did before its recursion limit.
     try:
-        return decoder.raw_decode(text[:end], idx)
+        return decoder.raw_decode(text[: deep + 1], idx)
     except json.JSONDecodeError as exc:
-        if deep is None:
-            deep = _first_too_deep(text, idx, max_depth)
-            if deep is None:
-                raise
         if exc.pos <= deep:
             raise json.JSONDecodeError(exc.msg, text, exc.pos) from None
     # The decoder accepted the bracket and ran out of text inside it: too deep.

@@ -20,12 +20,13 @@ _DECOYS = ["[[[{{{", "]]]}}}", 'q"]]]]]]', "back\\", '\\"[{', "\\\\[", "\u0442[\
     ids=["under-the-bracket-count", "many-brackets-shallow"],
 )
 def test_shallow_documents_never_reach_the_per_token_scan(monkeypatch, document):
-    """Defect class: a slow path regression, where shallow documents fall back to the per-token Python scan (3x a plain decode)."""
+    """Defect class: a slow path regression, where shallow documents fall back to the per-match Python scan (3x a plain decode)."""
 
-    def scan(*args):
-        raise AssertionError("per-token scan reached")
+    class Scan:
+        def finditer(self, *args):
+            raise AssertionError("per-match scan reached")
 
-    monkeypatch.setattr(json_depth, "_first_too_deep", scan)
+    monkeypatch.setattr(json_depth, "_TOKEN", Scan())
     text = json.dumps(document)
     assert json_depth.loads(text, max_depth=128) == document
     assert json_depth.raw_decode(text, max_depth=128) == (document, len(text))
@@ -34,9 +35,10 @@ def test_shallow_documents_never_reach_the_per_token_scan(monkeypatch, document)
 
 @pytest.mark.parametrize("limit", [4, 128])
 @pytest.mark.parametrize("ensure_ascii", [True, False])
-def test_deep_document_with_brackets_inside_strings_is_refused_at_its_first_too_deep_bracket(limit, ensure_ascii):
+@pytest.mark.parametrize("decoys", [_DECOYS, ["]]]}}}", "т]"]], ids=["escapes", "no-escapes"])
+def test_deep_document_with_brackets_inside_strings_is_refused_at_its_first_too_deep_bracket(limit, ensure_ascii, decoys):
     """Defect class: fail-open depth check, where brackets, quotes or backslashes inside strings hide real nesting."""
-    opener = "[" + ", ".join(json.dumps(decoy, ensure_ascii=ensure_ascii) for decoy in _DECOYS) + ", "
+    opener = "[" + ", ".join(json.dumps(decoy, ensure_ascii=ensure_ascii) for decoy in decoys) + ", "
     text = opener * (limit + 1) + "0" + "]" * (limit + 1)
     message = f"JSON nesting exceeds {limit} levels at char {limit * len(opener)}"
 
