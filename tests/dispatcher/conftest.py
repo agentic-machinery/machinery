@@ -29,13 +29,31 @@ DOCTOR_NOT_FETCHED = "Managed settings (remote): not fetched — requires an Ent
 @pytest.fixture
 def sources_product_root(configured_roots, tmp_path_factory, monkeypatch):
     """Keep Sources MCP data local to these dispatcher cases, away from other tranches."""
+    from lu_machinery.review import product_hooks
+
     product = tmp_path_factory.getbasetemp() / "t5-sources-product"
     if not product.exists():
         shutil.copytree(configured_roots.product, product)
         source = Path(__file__).parent / "fixtures" / "product.mcp.json"
         (product / ".mcp.json").write_bytes(source.read_bytes())
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
-    return product
+    before_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "scripts" or name.startswith("scripts.")
+    }
+    before_path = list(sys.path)
+    for name in before_modules:
+        del sys.modules[name]
+    product_hooks._attempt_hooks_from.cache_clear()
+    try:
+        yield product
+    finally:
+        product_hooks._attempt_hooks_from.cache_clear()
+        for name in [n for n in sys.modules if n == "scripts" or n.startswith("scripts.")]:
+            del sys.modules[name]
+        sys.modules.update(before_modules)
+        sys.path[:] = before_path
 
 
 @pytest.fixture(scope="session", autouse=True)
