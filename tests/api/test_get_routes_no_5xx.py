@@ -149,9 +149,21 @@ class _OfflineSockets:
         self._create = socket.create_connection
 
     def install(self) -> None:
-        socket.socket.connect = self._refuse_connect  # type: ignore[method-assign]
-        socket.socket.connect_ex = self._refuse_connect_ex  # type: ignore[method-assign]
-        socket.create_connection = self._refuse_create  # type: ignore[method-assign]
+        guard = self
+
+        def connect(sock: socket.socket, address: object) -> object:
+            return guard._refuse_connect(sock, address)
+
+        def connect_ex(sock: socket.socket, address: object) -> int:
+            return guard._refuse_connect_ex(sock, address)
+
+        def create(address: object, *_args: object, **_kwargs: object) -> socket.socket:
+            return guard._refuse_create(address)
+
+        # Plain functions, not bound methods: a bound method would drop the socket.
+        socket.socket.connect = connect  # type: ignore[method-assign]
+        socket.socket.connect_ex = connect_ex  # type: ignore[method-assign]
+        socket.create_connection = create  # type: ignore[method-assign]
 
     def restore(self) -> None:
         socket.socket.connect = self._connect  # type: ignore[method-assign]
@@ -239,6 +251,11 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
         "SVC_LSOF_BIN": str(repo / "bin" / "lsof"),
         "AGENT_REAL_GH": str(repo / "bin" / "gh"),
         "PATH": str(repo / "bin") + os.pathsep + os.environ.get("PATH", ""),
+        # urllib sends localhost through an inherited proxy, so the guard would
+        # see the proxy port instead of the Monitor. Bypass the proxy for the
+        # hosts the handlers dial.
+        "NO_PROXY": "localhost,127.0.0.1",
+        "no_proxy": "localhost,127.0.0.1",
     }
     previous_env = {key: os.environ.get(key) for key in offline}
     os.environ.update(offline)
