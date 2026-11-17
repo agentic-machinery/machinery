@@ -168,3 +168,56 @@ def test_active_dispatch_worktree_is_protected(tmp_path: Path, monkeypatch) -> N
     protected = {worktree.branch: worktree for worktree in result.protected_worktrees}
     assert protected["codex/active-dispatch-merged"].reason == "active dispatch (matches .worktrees/dispatch/**)"
     assert "codex/active-dispatch-merged" not in {worktree.branch for worktree in result.removable_worktrees}
+
+
+def test_git_cleanup_reuses_cherry_answers_until_a_tip_moves(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: a stale ``fully_merged_to_main`` after ``main`` or a branch moves, ``git cherry``
+    re-run for every unchanged branch on each report, an answer filed under tips it was not
+    computed for, or a failed cherry (git error or ancestry fallback) remembered."""
+    main_tip = ["m1"]
+    asked: list[tuple[str, str, str | None]] = []
+    # branch -> (fully merged, cacheable); cacheable False is a failed cherry.
+    answers: dict[str, tuple[bool, bool]] = {"a": (True, True), "b": (False, True)}
+
+    def run_git(args: list[str], *, cwd: Path, **_kwargs: object) -> tuple[int, str, str]:
+        assert args[:1] == ["rev-parse"], args
+        return 0, f"{main_tip[0]}\n", ""
+
+    def answer(branch: str, cwd: Path, *, main: str, tip: str | None) -> tuple[bool, bool]:
+        asked.append((branch, main, tip))
+        return answers[branch]
+
+    monkeypatch.setattr(git_hygiene_router, "_run_git", run_git)
+    monkeypatch.setattr(git_hygiene_router, "_merged_to_main_answer", answer)
+    monkeypatch.setattr(git_hygiene_router, "_merged_memo", {})
+    branches = [{"name": "a", "_full_sha": "a1"}, {"name": "b", "_full_sha": "b1"}]
+
+    def merged() -> dict[str, bool]:
+        return git_hygiene_router._branches_merged_to_main(branches, tmp_path)
+
+    assert merged() == {"a": True, "b": False}
+    # Each answer is computed for the exact tips its memo key names.
+    assert sorted(asked) == [("a", "m1", "a1"), ("b", "m1", "b1")]
+    asked.clear()
+    assert merged() == {"a": True, "b": False}
+    assert asked == []
+
+    branches[1] = {"name": "b", "_full_sha": "b2"}
+    answers["b"] = (True, True)
+    assert merged() == {"a": True, "b": True}
+    assert asked == [("b", "m1", "b2")]
+    asked.clear()
+
+    main_tip[0] = "m2"
+    answers["a"] = (False, True)
+    assert merged() == {"a": False, "b": True}
+    assert sorted(asked) == [("a", "m2", "a1"), ("b", "m2", "b2")]
+    asked.clear()
+
+    # A failed cherry answers this report only and is asked again next time.
+    answers["a"] = (False, False)
+    branches[0] = {"name": "a", "_full_sha": "a2"}
+    assert merged() == {"a": False, "b": True}
+    answers["a"] = (True, True)
+    assert merged() == {"a": True, "b": True}
+    assert asked == [("a", "m2", "a2"), ("a", "m2", "a2")]

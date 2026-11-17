@@ -520,3 +520,118 @@ assert.match(line(budget({data_age_s: 5, stale: false, stale_threshold_s: 900}, 
 const observed = new Date(now - 5000).toISOString();
 assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);
 """)
+
+
+def _swr_app(monkeypatch, tmp_path, handler_factory, *, ttl: float = 10.0, vary: tuple[str, ...] = ()):
+    """A one-route app on ``state_helpers.swr_route`` with a fake cache clock."""
+    from types import SimpleNamespace
+
+    from fastapi import APIRouter, Depends, FastAPI
+
+    from lu_machinery.api import state_helpers
+
+    now = [1000.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path))
+    router = APIRouter()
+    router.get("/probe")(state_helpers.swr_route("probe", ttl, vary=vary)(handler_factory(Depends(lambda: ctx))))
+    probe_app = FastAPI()
+    probe_app.include_router(router)
+    key_prefix = state_helpers.ctx_scoped_ttl_key(ctx, "swr", "probe", repr(ctx.roots))
+    return TestClient(probe_app), now, key_prefix
+
+
+def test_swr_route_serves_stale_value_with_true_age_and_one_refresh(monkeypatch, tmp_path):
+    """Defect class: an expired value served without its age (or as fresh), a reader blocking on
+    the recompute, or several stale reads starting more than one refresh."""
+    import threading
+
+    from lu_machinery.api import state_helpers
+
+    calls: list[int] = []
+    refreshing, release = threading.Event(), threading.Event()
+
+    def factory(ctx_dependency):
+        def handler(ctx=ctx_dependency):
+            calls.append(len(calls) + 1)
+            if len(calls) > 1:
+                refreshing.set()
+                assert release.wait(5)
+            return {"n": len(calls)}
+
+        return handler
+
+    client, now, key = _swr_app(monkeypatch, tmp_path, factory)
+    first = client.get("/probe")
+    assert first.json() == {"n": 1}
+    assert first.headers["X-Snapshot-Age-S"] == "0.000"
+    assert first.headers["X-Snapshot-State"] == "fresh"
+
+    now[0] += 25.0
+    try:
+        for _ in range(3):  # the refresh is held open: none of these may wait for it
+            stale = client.get("/probe")
+            assert stale.json() == {"n": 1}
+            assert stale.headers["X-Snapshot-Age-S"] == "25.000"
+            assert stale.headers["X-Snapshot-State"] == "stale"
+        assert refreshing.wait(5)
+    finally:
+        release.set()
+    # Join the one refresh flight; a second collection would fail this read.
+    refreshed = state_helpers.cache_get_or_compute(key, 10.0, lambda: pytest.fail("second refresh"))
+    assert refreshed == {"n": 2}
+    assert calls == [1, 2]
+    fresh = client.get("/probe")
+    assert fresh.json() == {"n": 2}
+    assert fresh.headers["X-Snapshot-Age-S"] == "0.000"
+
+
+def test_swr_route_recomputes_a_dormant_value_instead_of_serving_it(monkeypatch, tmp_path):
+    """Defect class: a value nobody read for longer than ttl + DEMAND_WINDOW_S handed to a
+    one-shot caller (an hour-old board or task list) when a fresh computation fits the
+    bounded dormant wait."""
+    from lu_machinery.api import state_helpers
+
+    calls: list[int] = []
+
+    def factory(ctx_dependency):
+        def handler(ctx=ctx_dependency):
+            calls.append(1)
+            return {"n": len(calls)}
+
+        return handler
+
+    client, now, _key = _swr_app(monkeypatch, tmp_path, factory)
+    assert client.get("/probe").json() == {"n": 1}
+    now[0] += 10.0 + state_helpers.DEMAND_WINDOW_S + 1.0
+    dormant = client.get("/probe")
+    assert dormant.json() == {"n": 2}
+    assert dormant.headers["X-Snapshot-Age-S"] == "0.000"
+    assert len(calls) == 2
+
+
+def test_swr_route_caches_only_default_or_varied_parameters(monkeypatch, tmp_path):
+    """Defect class: a filtered query answered from another filter's cache entry."""
+    from fastapi import Query
+
+    calls: list[tuple[str, str | None]] = []
+
+    def factory(ctx_dependency):
+        def handler(status: str = Query("all"), agent: str | None = Query(None), ctx=ctx_dependency):
+            calls.append((status, agent))
+            return {"status": status, "agent": agent, "n": len(calls)}
+
+        return handler
+
+    client, _now, _key = _swr_app(monkeypatch, tmp_path, factory, vary=("status",))
+    assert client.get("/probe?status=done").json() == {"status": "done", "agent": None, "n": 1}
+    assert client.get("/probe?status=failed").json() == {"status": "failed", "agent": None, "n": 2}
+    cached = client.get("/probe?status=done")
+    assert cached.json() == {"status": "done", "agent": None, "n": 1}
+    assert "X-Snapshot-Age-S" in cached.headers
+    # A parameter outside ``vary`` is never cached: every call runs the handler.
+    for expected in (3, 4):
+        direct = client.get("/probe?status=done&agent=codex")
+        assert direct.json() == {"status": "done", "agent": "codex", "n": expected}
+        assert "X-Snapshot-Age-S" not in direct.headers
+    assert len(calls) == 4
