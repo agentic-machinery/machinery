@@ -63,7 +63,21 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    itself, a driver dispatches them (rules core P1). Fix the case that happened, not every case
    that could. Save command output (for example `dispatch.py wait` or `status`) only under
    `batch_state/tasks/<task-id>.artifacts/` or the session scratch, never as `*.json` beside the
-   task records, which every ledger scan reads as records.
+   task    records, which every ledger scan reads as records.
+
+   **X-Verified commit line.** Every commit adds one declaration line in the same
+   paragraph as `X-Agent`. It is not a Git trailer: `git log --format=%(trailers)`
+   does not show it.
+
+   ```text
+   X-Verified: <commands or receipt ids>
+   X-Verified: none (<reason>)
+   ```
+
+   Write the commands or receipt ids of the checks this commit ran. When there is
+   no runtime to exercise, write `none` and the reason in parentheses, for example
+   `X-Verified: none (docs only)`. Observe mode logs a missing line and does not
+   fail the run. Enforce mode blocks it.
 3. **Prove it** ([delivery](references/delivery.md#proof)): reproduce, fix, the same check
    passes; behaviour proof for a user-visible surface. Add a test only with the CTO's approval
    of that specific test.
