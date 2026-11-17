@@ -1,0 +1,388 @@
+# Clean controls for reviewer false-alarm rates (operator order VERIFY-ADOPT item 4). See README.md.
+# A control is a merged PR whose recorded review rounds all approved with no P0-P2 finding and
+# where, within 14 days of merge, no later commit on main cites the PR or reverts it, and no
+# commit whose subject starts with fix/revert/hotfix touched a file in which a line the PR added
+# was later changed (GitHub blame at clean_check.checked_tip). A control whose 14-day window is
+# still open (clean_window_ends in the future) must be re-checked before a paid run; the runner
+# refuses a paid run that would review one.
+schema_version: 1
+frozen_on: '2026-11-17'
+controls:
+- id: learn-ukrainian-12514
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12514
+  base_sha: 1d1d80bc8e531e0fd3946f1b56c7a87b469d6bcc
+  head_sha: d8f31b09a6086261c22798d619c55a83e9b46424
+  size_lines: 1573
+  merge_commit: 0af9070330f63c2e348b7d221d453844f5814f91
+  merged_at: '2026-11-02T12:55:26Z'
+  clean_window_ends: '2026-11-16T12:55:26Z'
+  clean_check:
+    checked_tip: d946187f58be710ed35d6793b6e75ae2c39a7d45
+    window_closed_at_check: true
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 2
+  source_review:
+    task: cto-f867-i12514-review1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12516
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12516
+  base_sha: 1d1d80bc8e531e0fd3946f1b56c7a87b469d6bcc
+  head_sha: 96cd13c0456d8128b79c6bde217dd8e7ec670890
+  size_lines: 88
+  merge_commit: feb5e4541d64b653006097ceca29b8c095a26947
+  merged_at: '2026-11-02T12:52:29Z'
+  clean_window_ends: '2026-11-16T12:52:29Z'
+  clean_check:
+    checked_tip: d946187f58be710ed35d6793b6e75ae2c39a7d45
+    window_closed_at_check: true
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-f867-i12256h-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12522
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12522
+  base_sha: 1d1d80bc8e531e0fd3946f1b56c7a87b469d6bcc
+  head_sha: 51d31da30f8ec0e4c5e7224076a8ee54046a21b6
+  size_lines: 115
+  merge_commit: 3641004753ca03503c559fb0d6147686187268e7
+  merged_at: '2026-11-02T13:19:42Z'
+  clean_window_ends: '2026-11-16T13:19:42Z'
+  clean_check:
+    checked_tip: 6e4ff4ad19494e29b8035645c74b53d196470003
+    window_closed_at_check: true
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 1
+  source_review:
+    task: rv-i12518-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12554
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12554
+  base_sha: aab9e78d2b20b675d759bc4b7c6bc2ef3063a22f
+  head_sha: 69d68a8bb2541134efa146d1b71eafa92ba6c3cd
+  size_lines: 112
+  merge_commit: 30dc0b34835bb2d19fdcfab99b4dc922f5046c9a
+  merged_at: '2026-11-02T16:43:56Z'
+  clean_window_ends: '2026-11-16T16:43:56Z'
+  clean_check:
+    checked_tip: ca77ce8b345d99cdcb3f3ff204e993b05ab94e4f
+    window_closed_at_check: true
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 1
+  source_review:
+    task: cto-f932-i12502c-review1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12629
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12629
+  base_sha: 0d8d66c807c90c9ddd74070c300c33d706d43f59
+  head_sha: 60ac8c49e79ffe7b8c4be25eda14e6095b0eca35
+  size_lines: 770
+  merge_commit: 2ee1b650696edc0c871684511233191b721ddff6
+  merged_at: '2026-11-03T18:18:52Z'
+  clean_window_ends: '2026-11-17T18:18:52Z'
+  clean_check:
+    checked_tip: bb04501ccc26205dfd10fad0d252f4cf1f14dbf3
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 1
+  source_review:
+    task: atlas-01a19ff6-i12596-source-cf-r1-opus
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12656
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12656
+  base_sha: 8788a5afec5bb649daf1415ba839ec1c6ed3dcda
+  head_sha: 0c0635dd7723b633a37bbbd414288de75b27abd9
+  size_lines: 257
+  merge_commit: cf8d16230ba77a2c695521b5afa5efb5d265a15f
+  merged_at: '2026-11-03T14:58:16Z'
+  clean_window_ends: '2026-11-17T14:58:16Z'
+  clean_check:
+    checked_tip: bb04501ccc26205dfd10fad0d252f4cf1f14dbf3
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 2
+  source_review:
+    task: cto-97ad-i12649b-grok-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-12676
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 12676
+  base_sha: 2ee1b650696edc0c871684511233191b721ddff6
+  head_sha: c91df05c20c1d54ce81b521d1e26fbc53ceb1c30
+  size_lines: 316
+  merge_commit: fae029c090b84862e38218692a4c97ffeb797ca1
+  merged_at: '2026-11-03T20:51:03Z'
+  clean_window_ends: '2026-11-17T20:51:03Z'
+  clean_check:
+    checked_tip: bb04501ccc26205dfd10fad0d252f4cf1f14dbf3
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 4
+  source_review:
+    task: cto-57ad-i12675-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-13139
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13139
+  base_sha: 7c9c4fae48147a7310e66ed0d2ba111955f30bf3
+  head_sha: 5b1f518be8f8de8fa9640f32b5554f5bb1a38b3c
+  size_lines: 14327
+  merge_commit: 4771ed684be705b54ed477a5c8513e34294e4eb7
+  merged_at: '2026-11-17T05:57:00Z'
+  clean_window_ends: '2026-12-01T05:57:00Z'
+  clean_check:
+    checked_tip: bb04501ccc26205dfd10fad0d252f4cf1f14dbf3
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-33f8-cleancode-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: learn-ukrainian-13142
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13142
+  base_sha: 4771ed684be705b54ed477a5c8513e34294e4eb7
+  head_sha: 9827c8229ce3be33c0645a06e11e20b6f4d79b85
+  size_lines: 122
+  merge_commit: b2ff1f8a60f919a7b32af0a1da75e9a5f6005385
+  merged_at: '2026-11-17T06:22:07Z'
+  clean_window_ends: '2026-12-01T06:22:07Z'
+  clean_check:
+    checked_tip: bb04501ccc26205dfd10fad0d252f4cf1f14dbf3
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-33f8-actionlint-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-138
+  repository: learn-ukrainian/machinery
+  pr: 138
+  base_sha: bd489d6344ddefa27c8ec02d97499cbfd27eeab6
+  head_sha: 9b01969e91e6d6decd11473fc000785a31581b60
+  size_lines: 113
+  merge_commit: 18ab370f0344c0311a92157fd642c9b134263a48
+  merged_at: '2026-11-08T17:23:22Z'
+  clean_window_ends: '2026-11-22T17:23:22Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: rev-mach-138-s15b-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-220
+  repository: learn-ukrainian/machinery
+  pr: 220
+  base_sha: 64a09b1456b2d6f70e98bc68c324912d9454f94c
+  head_sha: 9841067dd7a7a5074192c8bfebe8a37142dd9e06
+  size_lines: 102
+  merge_commit: 08e8a74da857327ab2bdea7fc0737f36f96875dc
+  merged_at: '2026-11-09T17:09:39Z'
+  clean_window_ends: '2026-11-23T17:09:39Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-2477-reqwfimpl-review1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-225
+  repository: learn-ukrainian/machinery
+  pr: 225
+  base_sha: 0c09b6026ff33c4f4716ec6f78ec678c07256f5c
+  head_sha: dfb93835ad6bccb6645017e9e642c3a6af08383d
+  size_lines: 353
+  merge_commit: 5c56c26d639df41f6da40a70bc777e6872025715
+  merged_at: '2026-11-09T18:54:28Z'
+  clean_window_ends: '2026-11-23T18:54:28Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-2477-crumbs-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-236
+  repository: learn-ukrainian/machinery
+  pr: 236
+  base_sha: 6fb2e74c22f82a1ffa19b38060cd65ab02bed46d
+  head_sha: eed911ae1374c8c766cb1d4737819b26220d5dbe
+  size_lines: 616
+  merge_commit: f9a83692954c6072f6b3593324b0a5629de8b4b4
+  merged_at: '2026-11-09T23:24:07Z'
+  clean_window_ends: '2026-11-23T23:24:07Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-931e-w33-rev1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-247
+  repository: learn-ukrainian/machinery
+  pr: 247
+  base_sha: fcf5f609ffa7ebab485d77d2eab28c95a990382b
+  head_sha: a70ed991b3f7beb086748124868126befb39851f
+  size_lines: 118
+  merge_commit: f3c984af7b607f735aeb910575df0ca21ce90eba
+  merged_at: '2026-11-10T01:32:17Z'
+  clean_window_ends: '2026-11-24T01:32:17Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-2173-r87-review1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-253
+  repository: learn-ukrainian/machinery
+  pr: 253
+  base_sha: 560f79f9b7e8189339053c1df3964c9ffaf245a6
+  head_sha: 54288dd7d74ea75f3f5c4c91e1b512ae0ab09639
+  size_lines: 497
+  merge_commit: e852d5695105e95c38084c72975e956f14273fbd
+  merged_at: '2026-11-10T03:23:35Z'
+  clean_window_ends: '2026-11-24T03:23:35Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-4414-cleanupraise-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-264
+  repository: learn-ukrainian/machinery
+  pr: 264
+  base_sha: a4789f0a607d33efff4bfe31601e5da6ea0cf1d7
+  head_sha: 562b389ef4b274168e089fa62d01b74aac13cad8
+  size_lines: 164
+  merge_commit: 86ae506b90d2fb6ca21e8685928fb36ba30fae2f
+  merged_at: '2026-11-10T06:29:31Z'
+  clean_window_ends: '2026-11-24T06:29:31Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-31af-revert262-grok-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-294
+  repository: learn-ukrainian/machinery
+  pr: 294
+  base_sha: 1c9175fa532dd61521e171f601bf116eb76e5b0d
+  head_sha: 30f5191f2e2e33d6fb4b88fa6f216888417e6476
+  size_lines: 72
+  merge_commit: 1d10cd191545a0fc7b701d36564921d903da55c6
+  merged_at: '2026-11-10T20:22:40Z'
+  clean_window_ends: '2026-11-24T20:22:40Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 0
+  source_review:
+    task: cto-b806-uvrun-opus-rv294-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
+- id: machinery-680
+  repository: learn-ukrainian/machinery
+  pr: 680
+  base_sha: 0ac588e81ef4a6a238338fd076d3fc01cd55cf65
+  head_sha: 8f8fb9630b7aac9cc03ae5581338c01982f3d81c
+  size_lines: 1159
+  merge_commit: e57c5906c4c08f3606b8d3989f5189d1fc55b668
+  merged_at: '2026-11-17T05:50:25Z'
+  clean_window_ends: '2026-12-01T05:50:25Z'
+  clean_check:
+    checked_tip: ae2290c153c8eed62fbc63d8c072944261b47180
+    window_closed_at_check: false
+    later_commits_citing_pr: 0
+    fix_commits_touching_lost_lines: 0
+    files_with_lines_changed_later: 1
+  source_review:
+    task: cto-33f8-machclean-opus-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: APPROVED
+    findings_p0_p2: 0
