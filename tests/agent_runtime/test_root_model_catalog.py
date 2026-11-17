@@ -297,6 +297,11 @@ def test_astra_6_2_is_pin_only():
             checks.check_model_admission("codex", astra, mode, {"effort": "high"}, b"")
     with pytest.raises(ValueError, match="holds no review"):
         checks.check_model_admission("codex", astra, "read-only", {"effort": "high", "risk": "medium"}, b"")
+    # A serialized empty selector does not type the run; a scalar review flag set to "[]" still does.
+    checks.check_model_admission("codex", astra, "read-only", {"effort": "high", "subject_seat": "[]"}, b"")
+    for flag in ("review_mode", "risk", "review_profile", "language_lane"):
+        with pytest.raises(ValueError, match="holds no review"):
+            checks.check_model_admission("codex", astra, "read-only", {"effort": "high", flag: "[]"}, b"")
 
 
 @pytest.mark.parametrize(

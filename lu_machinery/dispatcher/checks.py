@@ -158,6 +158,9 @@ def _normalize_native_claude_alias(agent: str, model: str) -> str:
     return resolved
 
 
+_REPEATABLE_SELECTORS = frozenset({"subject_seat", "subject_family", "review_subject_seats", "review_subject_families"})
+
+
 def check_model_admission(agent: str, model: str, mode: str, options: dict, prompt: bytes) -> None:
     """Refuse an unknown model, a reviewer without a review role, and keep the temporary reviewer exception closed.
 
@@ -208,8 +211,11 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         # Review typing is the one dispatch role admission infers: every review flag, --risk,
         # --review-mode, --language-lane, the subject selectors and a review research role.
         # Provider re-checks read the task's str()-serialized options, where an unused repeatable
-        # flag (--subject-seat) arrives as "[]"; that empty selector must not type the run as a review.
-        typed = {key: value for key, value in options.items() if value not in ([], "[]")}
+        # selector (--subject-seat, --subject-family) arrives as "[]"; that empty selector must not
+        # type the run as a review. Only those list fields are normalized: a scalar review flag
+        # given the literal value "[]" (--review-mode '[]') still types the run as a review.
+        typed = {key: value for key, value in options.items()
+                 if key not in _REPEATABLE_SELECTORS or value not in ([], "[]")}
         reviewed = identity is not None and "review" in dispatch_roles(typed)
         if reviewed and (refusal := activity_role_refusal(identity, REVIEW_ACTIVITY, catalog)):
             raise ValueError(refusal)
