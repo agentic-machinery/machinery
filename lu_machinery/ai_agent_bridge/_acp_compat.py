@@ -12,7 +12,9 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -143,17 +145,18 @@ def resolve_compat_model(command_target: str, model: str | None) -> str | None:
     return model
 
 
-# Per-seat default hard timeouts for compat asks (#6877). No compat seat
-# needs a profile today: the max-effort-only Kimi seat that had one takes web,
-# UI and backend coding only and is refused before any ask, and the remaining
-# seats are pinned at "high". ``--no-timeout`` (86400s) bypasses every profile.
-ASK_HARD_TIMEOUT_DEFAULT_S = 300
-ASK_HARD_TIMEOUT_PROFILES: dict[str, int] = {}
+# Provider queues can be silent for minutes. Ordinary asks and --no-timeout
+# share the runner's 24-hour leak guard, with no inactivity deadline.
+ASK_HARD_TIMEOUT_DEFAULT_S = 86400
+# The lease starts before reachability, cwd setup and runner admission; the
+# runner's timeout starts at spawn. Leave an hour for that work and teardown,
+# rather than letting the old 30-second margin expire during timeout cleanup.
+_ASK_LEASE_GRACE_S = 3600
 
 
 def ask_hard_timeout(command_target: str) -> int:
-    """Default hard timeout in seconds for one compat ask to this seat (#6877)."""
-    return ASK_HARD_TIMEOUT_PROFILES.get(command_target, ASK_HARD_TIMEOUT_DEFAULT_S)
+    """Absolute hang guard for every compat seat, in seconds."""
+    return ASK_HARD_TIMEOUT_DEFAULT_S
 
 
 _FALLBACK_SUBS_PATH = machinery_path("config/agent_fallback_substitutions.yaml")
@@ -344,6 +347,7 @@ def _result_receipt(
     effort_requested: str | None = None,
     seat_substitution: dict[str, str] | None = None,
     substitution_decision: dict[str, object] | None = None,
+    transcript_path: Path | None = None,
 ) -> bytes:
     actual_model = str(getattr(result, "model", ""))
     raw_effort = getattr(result, "effort", None)
@@ -375,6 +379,8 @@ def _result_receipt(
         payload["seat_substitution"] = seat_substitution
     if substitution_decision is not None:
         payload["substitution_decision"] = substitution_decision
+    if transcript_path is not None:
+        payload["transcript_path"] = str(transcript_path)
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -413,6 +419,8 @@ def _replay_result(raw: bytes) -> object:
         "harness": payload.get("harness") or "acp",
     }
     provenance.update({"replayed": True, "transport": "acp"})
+    if payload.get("transcript_path"):
+        provenance["transcript_path"] = payload["transcript_path"]
     decision = payload.get("substitution_decision")
     if isinstance(decision, dict) and "substitute" in decision:
         stored_reason = decision.get("reason")
@@ -657,6 +665,13 @@ def run_compat_ask(
     )
 
     telemetry_token = start_bridge_invocation_safely(participant, source)
+
+    def terminated(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("ACP ask terminated")
+
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.signal(signal.SIGTERM, terminated)
     try:
         result = _run_compat_ask_impl(
             command_target,
@@ -674,6 +689,9 @@ def run_compat_ask(
     except BaseException:
         finish_bridge_invocation_safely(telemetry_token, succeeded=False)
         raise
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     finish_bridge_invocation_safely(
         telemetry_token,
         succeeded=bool(getattr(result, "ok", False)),
@@ -703,8 +721,8 @@ def _run_compat_ask_impl(
     ``ask-<lane> --type review`` (headless dispatch) replaced the removed
     sealed ``review-pr`` path (removed in #8520).
 
-    ``hard_timeout=None`` resolves the seat's profile default (#6877); an
-    explicit value always wins.
+    ``hard_timeout=None`` uses the 24-hour hang guard; an explicit value
+    always wins. There is no inactivity deadline for provider-side delays.
 
     On a notebook whose local plane is retired (#7172), ordinary asks forward
     over SSH to the job-host plane instead of opening local sqlite.
@@ -833,6 +851,7 @@ def _run_single_acp_job(
     from lu_machinery.agent_runtime.runner import invoke_inter_agent
     from lu_machinery.agent_runtime.target_admission import require_admitted
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
+    from lu_machinery.fleet_comms.paths import default_plane_root
 
     # The target comes from resolve_and_admit (a quota substitute too): no seat is resolved here.
     target = require_admitted(target)
@@ -844,6 +863,7 @@ def _run_single_acp_job(
         model=model,
         effort=effort,
     )
+    transcript_path = default_plane_root() / "ask-transcripts" / f"{key.removeprefix('ask-acp:')}.jsonl"
     worker_id = f"acp-compat:{os.getpid()}"
     terminalization_error: Exception | None = None
     metadata: dict[str, object] = {
@@ -865,7 +885,7 @@ def _run_single_acp_job(
         terminal_states = {"complete", "failed", "expired", "dead_lettered"}
         if job.state not in terminal_states:
             try:
-                lease = authority.claim_job(job.job_id, worker_id, lease_seconds=hard_timeout + 30)
+                lease = authority.claim_job(job.job_id, worker_id, lease_seconds=hard_timeout + _ASK_LEASE_GRACE_S)
             except AuthorityServiceError:
                 # A concurrent terminalizer may win after enqueue_request() returns.
                 # Re-read before invoking a provider so an already-durable result is
@@ -881,10 +901,17 @@ def _run_single_acp_job(
             # Replay never recomputes: the receipt's stored decision field
             # (carried on the replayed result) is authoritative (#8499).
             decision = _substitution_decision(result=result)
+            saved_path = getattr(result, "usage_record", {}).get("transcript_path")
+            if saved_path:
+                print(f"ACP transcript: {saved_path}", file=sys.stderr)
         else:
             previous_transport = os.environ.get("LU_ACPX_TRANSPORT")
             os.environ["LU_ACPX_TRANSPORT"] = "active"
             try:
+                transcript_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd = os.open(transcript_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+                os.close(fd)
+                print(f"ACP transcript: {transcript_path}", file=sys.stderr, flush=True)
                 # Reachability preflight (#6805): probe only now that a real
                 # provider invocation is about to occur. Terminal-replay paths
                 # above never reach this probe, so a provider CLI missing from
@@ -913,7 +940,10 @@ def _run_single_acp_job(
                         model=model,
                         effort=effort,
                         hard_timeout=hard_timeout,
+                        transcript_path=transcript_path,
                     )
+                with transcript_path.open("a", encoding="utf-8") as transcript:
+                    transcript.write(json.dumps({"stream": "response", "text": str(getattr(result, "response", ""))}) + "\n")
             except BaseException as exc:
                 # Persist the substitution decision and the typed failure code
                 # on the receipt (#8499): a post-crash retry replays this
@@ -942,17 +972,23 @@ def _run_single_acp_job(
                     "substitution_decision": decision,
                     "transport_metadata": None,
                     "transport_outcome": "rate_limited" if decision["substitute"] else "error",
+                    "transcript_path": str(transcript_path),
                 }
                 if substitution is not None:
                     failure_receipt["seat_substitution"] = substitution
-                authority.finish_job(
-                    job.job_id,
-                    worker_id=worker_id,
-                    fence_token=lease.fence_token,
-                    state="failed",
-                    result=json.dumps(failure_receipt, sort_keys=True).encode("utf-8"),
-                    failure=failure,
-                )
+                print(f"ACP stopped; captured output retained: {transcript_path}", file=sys.stderr)
+                try:
+                    authority.finish_job(
+                        job.job_id,
+                        worker_id=worker_id,
+                        fence_token=lease.fence_token,
+                        state="failed",
+                        result=json.dumps(failure_receipt, sort_keys=True).encode("utf-8"),
+                        failure=failure,
+                    )
+                except Exception as bookkeeping_error:
+                    exc.add_note(f"ACP terminal bookkeeping failed: {bookkeeping_error}")
+                    print(f"ACP terminal bookkeeping failed: {bookkeeping_error}", file=sys.stderr)
                 raise
             finally:
                 if previous_transport is None:
@@ -979,6 +1015,7 @@ def _run_single_acp_job(
                         effort_requested=effort,
                         seat_substitution=substitution,
                         substitution_decision=decision,
+                        transcript_path=transcript_path,
                     ),
                     failure=(None if bool(getattr(result, "ok", False)) else _failure_metadata(result=result)),
                 )

@@ -2017,6 +2017,20 @@ def _execute_invocation_once(
     kill_reason: str | None = None
     escaped_primary: list[str] = []
     cwd_pin: _ChildCwdPin | None = None
+    transcript_path = (tool_config or {}).get("acp_transcript_path")
+    transcript = None
+    transcript_offsets = {"stdout": 0, "stderr": 0}
+
+    def save_transcript() -> None:
+        if transcript is None or watchdog_state is None:
+            return
+        for stream, lines in (("stdout", watchdog_state.stdout_lines), ("stderr", watchdog_state.stderr_lines)):
+            end = len(lines)
+            for line in lines[transcript_offsets[stream]:end]:
+                transcript.write(json.dumps({"stream": stream, "text": line}) + "\n")
+            transcript_offsets[stream] = end
+        transcript.flush()
+
     # Mid-dispatch primary-tree tripwire (#6818): the spawn-time guard above
     # proved cwd isolation, but a child can still resolve absolute paths into
     # the primary checkout while running (the agy escape class). Baseline is
@@ -2040,6 +2054,11 @@ def _execute_invocation_once(
     )
 
     try:
+        if transcript_path is not None:
+            # The caller owns this durable path. Append each captured chunk
+            # before parsing or temporary-file cleanup can discard it.
+            fd = os.open(transcript_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            transcript = os.fdopen(fd, "a", encoding="utf-8")
         try:
             if plan.stdin_payload:
                 if tool_config and tool_config.get("review_isolation"):
@@ -2124,6 +2143,7 @@ def _execute_invocation_once(
         early_reap_check = getattr(adapter, "check_early_reap", None)
         returncode: int | None = None
         while True:
+            save_transcript()
             if output_limit is not None:
                 new_stdout_lines = watchdog_state.stdout_lines[observed_output_stdout_lines:]
                 observed_output_stdout_lines = len(watchdog_state.stdout_lines)
@@ -2343,6 +2363,14 @@ def _execute_invocation_once(
             with contextlib.suppress(Exception):
                 tree_watch.final_check()
 
+        if transcript is not None:
+            # A cancelled child can leave a final unterminated pipe chunk.
+            # Let drainers consume EOF before stop_watchdog sets state.stop
+            # and closes their pipes, which would discard that paid output.
+            for thread in watchdog_threads:
+                if "stdout" in thread.name or "stderr" in thread.name:
+                    thread.join(timeout=5.0)
+
         if watchdog_state is not None:
             stop_watchdog(
                 watchdog_state,
@@ -2351,6 +2379,12 @@ def _execute_invocation_once(
                 stdout_master_fd=stdout_master_fd,
                 stderr_master_fd=stderr_master_fd,
             )
+
+        if transcript is not None:
+            try:
+                save_transcript()
+            finally:
+                transcript.close()
 
         if plan.output_file is not None and plan.output_file.exists() and _is_temp_file(plan.output_file):
             should_delete = False
@@ -4177,7 +4211,8 @@ def invoke_inter_agent(
     transport: str | None = None,
     metadata: Mapping[str, object] | None = None,
     sealed_review_mcp_config: Path | None = None,
-    hard_timeout: int = 300,
+    hard_timeout: int = 86400,
+    transcript_path: Path | None = None,
     rules_seat: str | None = None,
 ) -> Result:
     """Invoke one confined ACP participant through the normal communication seam.
@@ -4187,6 +4222,10 @@ def invoke_inter_agent(
     and never retries a failed ACP request through the legacy bridge.  The
     returned :class:`Result` carries runner-sealed ``transport_metadata``
     (Source, Agent, Via) and a normalized ``transport_outcome``.
+
+    ``hard_timeout`` is a 24-hour hang guard, with no inactivity deadline.
+    ``transcript_path`` retains captured stdout/stderr chunks as JSON lines,
+    including when a timeout, cancellation or parser error stops the call.
     """
     _require_acp_transport(transport)
     _validate_transport_metadata(metadata)
@@ -4242,6 +4281,7 @@ def invoke_inter_agent(
                     "target_agent": route.target_agent,
                     "correlation_id": validated_correlation_id,
                     "idempotency_key": validated_idempotency_key,
+                    **({"acp_transcript_path": str(transcript_path)} if transcript_path is not None else {}),
                     **({"sealed_review_mcp_config": sealed_config} if sealed_config is not None else {}),
                 },
                 hard_timeout=hard_timeout,

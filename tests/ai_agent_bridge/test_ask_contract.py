@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import sys
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 
 from lu_machinery.ai_agent_bridge import _acp_compat, _cli
 from lu_machinery.ai_agent_bridge._ask_contract import (
@@ -79,6 +82,7 @@ def test_effort_and_to_model_reach_every_enabled_acp_route(
     assert captured["args"][0] == target
     assert "requested-model" in forwarded
     assert captured["effort"] == "xhigh"
+    assert _acp_compat.ask_hard_timeout(target) == 86400
 
 
 def test_terminal_failure_replays_without_invoking_provider_again(
@@ -115,6 +119,8 @@ def test_terminal_failure_replays_without_invoking_provider_again(
 
     assert replay.ok is False
     assert replay.transport_outcome == "error"
+    transcript_path = replay.usage_record.pop("transcript_path")
+    assert Path(transcript_path).is_file()
     assert replay.usage_record == {
         "from_model": "gemini-3.8-flash-high",
         "model_requested": "gemini-3.8-flash-high",
@@ -784,6 +790,86 @@ def test_acp_failed_result_receipt_serializes_none_effort_as_unapplied() -> None
     assert payload["effort_applied"] is None
 
 
-# --- #6877: per-seat ask timeout profiles -------------------------------
+@pytest.mark.parametrize("stop", ["timeout", "cancel", "sigterm", "parser_error"])
+def test_stopped_ask_saves_partial_streams_and_terminalizes_without_stale_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stop: str
+) -> None:
+    """Timeout cleanup beyond the old 30s grace must not lose output or strand a running job."""
+    from lu_machinery.agent_runtime import runner
+    from lu_machinery.agent_runtime.adapters.acpx import AcpxAdapter
+    from lu_machinery.agent_runtime.adapters.base import InvocationPlan
+    from lu_machinery.agent_runtime.errors import AgentTimeoutError
+    from lu_machinery.fleet_comms.authority import AuthorityService
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
+    monkeypatch.setenv("DELEGATE_DISABLE_PTY", "1")
+    monkeypatch.setattr(runner, "write_record", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "lu_machinery.agent_runtime.adapters.acpx.probe_participant_reachability", lambda *_: None
+    )
+    clock = [datetime.now(UTC).replace(microsecond=0)]
+    monkeypatch.setattr(AuthorityService, "_now_string", lambda *_: clock[0].isoformat().replace("+00:00", "Z"))
+
+    @contextmanager
+    def execution_cwd(*_args, **_kwargs):
+        yield tmp_path
+
+    monkeypatch.setattr("lu_machinery.ai_agent_bridge._acp_execution.acp_execution_cwd", execution_cwd)
+    partial = json.dumps({"method": "session/update", "params": {"update": {
+        "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "paid partial answer"}
+    }}})
+    script = (
+        f"import sys,time; print({partial!r}, flush=True); "
+        "print('unterminated paid fragment', end='', flush=True); "
+        "print('provider progress', file=sys.stderr, flush=True); time.sleep(60)"
+    )
+    adapter = AcpxAdapter()
+    if stop == "parser_error":
+        monkeypatch.setattr(adapter, "parse_response", Mock(side_effect=ValueError("parser stopped")))
+    if stop in {"cancel", "sigterm"}:
+        def cancelled(state, *_args, **_kwargs):
+            if state.stdout_lines and state.stderr_lines:
+                if stop == "sigterm":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                raise KeyboardInterrupt("ask cancelled")
+            return None
+        monkeypatch.setattr(runner, "should_kill", cancelled)
+
+    def invoke(_agent, _prompt, **kwargs):
+        clock[0] += timedelta(seconds=331)  # Old lease: 300s timeout + 30s grace.
+        execution = runner._execute_invocation_plan(
+            agent_name="acpx-codex-shadow", adapter=adapter,
+            plan=InvocationPlan(cmd=[sys.executable, "-u", "-c", script], cwd=tmp_path),
+            prompt="question", mode="read-only", cwd=tmp_path, model="gpt-6.1-sol",
+            task_id="timeout-regression", session_id=None, entrypoint="acpx-transport",
+            hard_timeout=1, stall_timeout=0,
+            tool_config={"acp_transcript_path": str(kwargs["transcript_path"])},
+        )
+        assert execution.kill_reason == "hard_timeout"
+        raise AgentTimeoutError("codex", kwargs["hard_timeout"])
+
+    monkeypatch.setattr(runner, "invoke_inter_agent", invoke)
+    expected = {"timeout": AgentTimeoutError, "cancel": KeyboardInterrupt, "sigterm": KeyboardInterrupt, "parser_error": ValueError}[stop]
+    with pytest.raises(expected):
+        _acp_compat.run_compat_ask("codex", "question", task_id="timeout-regression", hard_timeout=300)
+
+    with AuthorityService() as authority:
+        rows = authority.store.connection.execute("SELECT job_id FROM authority_jobs").fetchall()
+        assert len(rows) == 1
+        job = authority.get_job(str(rows[0]["job_id"]))
+        assert job.state == "failed"
+        assert job.lease_owner is None
+        assert job.lease_expires_at is None
+        receipt = json.loads(authority.read_job_result(job.job_id))
+    transcript = Path(receipt["transcript_path"])
+    records = [json.loads(line) for line in transcript.read_text().splitlines()]
+    assert {record["stream"] for record in records} == {"stdout", "stderr"}
+    assert "paid partial answer" in "".join(record["text"] for record in records)
+    assert "unterminated paid fragment" in "".join(record["text"] for record in records)
+    assert "provider progress" in "".join(record["text"] for record in records)
+    assert str(transcript) in capsys.readouterr().err
+    assert transcript.stat().st_mode & 0o777 == 0o600
+    if stop == "timeout":
+        assert receipt["failure_code"] == "timeout"
 
 
