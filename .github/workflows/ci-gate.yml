@@ -208,7 +208,7 @@ jobs:
           SOURCE: ${{ steps.match.outputs.source }}
         run: |
           set -euo pipefail
-          printf 'Reused merge-group CI Gate run [%s](https://github.com/%s/actions/runs/%s), tree `%s`. Main-scope tool archives preserved; push history scans and trailers still required.\n' \
+          printf 'Reused merge-group CI Gate run [%s](https://github.com/%s/actions/runs/%s), tree %s. Main-scope tool archives preserved; push history scans and trailers still required.\n' \
             "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$TREE" >> "$GITHUB_STEP_SUMMARY"
           printf 'source=%s\nreuse=true\n' "$SOURCE" >> "$GITHUB_OUTPUT"
 
@@ -1926,7 +1926,7 @@ jobs:
           SOURCE: ${{ needs.main-proof.outputs.source }}
         run: |
           set -euo pipefail
-          tree="$(git rev-parse HEAD^{tree})"
+          tree="$(git rev-parse 'HEAD^{tree}')"
           mode=full
           if [ "$REUSE" = true ]; then mode=reuse; fi
           jq -n --arg repo "$GITHUB_REPOSITORY" --arg mode "$mode" \
