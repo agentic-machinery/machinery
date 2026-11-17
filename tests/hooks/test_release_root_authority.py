@@ -20,6 +20,17 @@ from lu_machinery.common.repo_root import machinery_root
 
 SOURCE = Path(__file__).resolve().parents[2]
 HOOKS = Path("agents_extensions/shared/hooks")
+# The product these tests name is the temporary checkout they build. The caller's
+# LU_PRODUCT_ROOT is a live product checkout and is never a root here.
+_CALLER_ROOTS = frozenset({"LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"})
+
+
+def _without_caller_roots() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key not in _CALLER_ROOTS}
+
+
+def _git_env() -> dict[str, str]:
+    return {key: value for key, value in _without_caller_roots().items() if not key.startswith("GIT_")}
 
 
 @pytest.fixture(scope="module")
@@ -36,10 +47,12 @@ def release(tmp_path_factory):
     )
     interpreter = site.parent / "venv/bin/python"
     subprocess.run(
-        [sys.executable, "-I", "-m", "venv", "--without-pip", str(interpreter.parent.parent)], check=True
+        [sys.executable, "-I", "-m", "venv", "--without-pip", str(interpreter.parent.parent)],
+        check=True, env=_without_caller_roots(),
     )
     purelib = subprocess.check_output(
-        [str(interpreter), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True
+        [str(interpreter), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        text=True, env=_without_caller_roots(),
     ).strip()
     dependencies = "\n".join(path for path in sys.path if path.endswith("site-packages"))
     Path(purelib, "release.pth").write_text(f"{site}\n{dependencies}\n")
@@ -50,7 +63,7 @@ def release(tmp_path_factory):
 def product(tmp_path):
     root = tmp_path / "product"
     root.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env = _git_env()
     for args in (
         ["init", "--initial-branch=main"],
         [
@@ -85,7 +98,7 @@ def run_hook(
     env = {
         k: v
         for k, v in os.environ.items()
-        if not k.startswith(("GIT_", "PYTHON", "LEARN_UKRAINIAN_"))
+        if k not in _CALLER_ROOTS and not k.startswith(("GIT_", "PYTHON", "LEARN_UKRAINIAN_"))
     }
     env.update(
         LU_PRODUCT_ROOT=str(product / "absent" if missing else product),
@@ -127,6 +140,7 @@ def test_branch_guard_does_not_protect_release_instead_of_product(release, produ
         ["git", "-C", str(product), "worktree", "add", str(worktree), "topic"],
         check=True,
         capture_output=True,
+        env=_git_env(),
     )
     assert (
         run_hook(
@@ -197,6 +211,7 @@ def test_dirt_audit_does_not_select_release_as_default_product(release, product,
         [sys.executable, "-I", "-S", str(release / HOOKS / name)],
         input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo safe"}}),
         text=True, capture_output=True, check=False, timeout=10,
+        env=_without_caller_roots(),
     )
     assert unavailable.returncode == 0
     assert "audit skipped" in unavailable.stderr
@@ -229,7 +244,10 @@ def test_native_claude_guard_takes_its_interpreter_from_the_primary_not_path(rel
     assert missing.returncode == 2 and "HOOK-BOOTSTRAP-FAILED" in missing.stderr, missing.stderr
     # A configured interpreter that runs but lacks the release refuses too, never exit 1.
     bare = tmp_path / "bare-venv"
-    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(bare)], check=True)
+    subprocess.run(
+        [sys.executable, "-I", "-m", "venv", "--without-pip", str(bare)],
+        check=True, env=_without_caller_roots(),
+    )
     unloadable = run("git status", LEARN_UKRAINIAN_PYTHON=str(bare / "bin/python"))
     assert unloadable.returncode == 2 and "cannot load the installed guard" in unloadable.stderr, unloadable.stderr
 
@@ -238,7 +256,7 @@ def test_bare_healer_does_not_heal_release_instead_of_product(release, product):
     name = "heal-core-bare.py"
     assert run_hook(release, product, name, "git status").returncode == 0
     subprocess.run(
-        ["git", "-C", str(product), "config", "core.bare", "true"], check=True
+        ["git", "-C", str(product), "config", "core.bare", "true"], check=True, env=_git_env()
     )
     alias = product.parent / "product-alias"
     alias.symlink_to(product, target_is_directory=True)
@@ -248,6 +266,7 @@ def test_bare_healer_does_not_heal_release_instead_of_product(release, product):
         capture_output=True,
         text=True,
         check=True,
+        env=_git_env(),
     )
     assert value.stdout.strip() == "false"
     result = run_hook(release, product, name, "git status", missing=True)
@@ -316,7 +335,7 @@ def test_shell_hook_refuses_location_derived_project(release, product, tmp_path,
         (cwd / ".git").mkdir()
     if layout in {"empty-git-planted", "relative-root"}:
         if layout == "relative-root":
-            subprocess.run(["git", "init", "-q", str(cwd / "relative")], check=True)
+            subprocess.run(["git", "init", "-q", str(cwd / "relative")], check=True, env=_git_env())
         planted = (cwd / "relative" if layout == "relative-root" else cwd) / ".venv/bin/python"
         planted.parent.mkdir(parents=True)
         planted.write_text(f"#!/bin/sh\nprintf ran > {shlex.quote(str(marker))}\nexit 1\n")
@@ -407,7 +426,7 @@ def test_deployed_session_setup_runs_installed_release_code(release, product):
     shutil.copy2(SOURCE / HOOKS / "context-rollover-lib.sh", hooks / "context-rollover-lib.sh")
     subprocess.run(
         [sys.executable, "-I", "-m", "venv", "--without-pip", str(product / ".venv")],
-        check=True,
+        check=True, env=_without_caller_roots(),
     )
     purelib = subprocess.run(
         [
@@ -419,6 +438,7 @@ def test_deployed_session_setup_runs_installed_release_code(release, product):
         check=True,
         capture_output=True,
         text=True,
+        env=_without_caller_roots(),
     ).stdout.strip()
     dependencies = "\n".join(path for path in sys.path if path.endswith("site-packages"))
     Path(purelib, "release.pth").write_text(f"{release}\n{dependencies}\n")
@@ -513,7 +533,7 @@ def consumer_with_decoy(product, release):
         path.write_text(_DECOY_SH if relative.endswith(".sh") else _DECOY_PY)
     subprocess.run(
         [sys.executable, "-I", "-m", "venv", "--without-pip", str(product / ".venv")],
-        check=True,
+        check=True, env=_without_caller_roots(),
     )
     purelib = subprocess.run(
         [
@@ -525,6 +545,7 @@ def consumer_with_decoy(product, release):
         check=True,
         capture_output=True,
         text=True,
+        env=_without_caller_roots(),
     ).stdout.strip()
     dependencies = subprocess.run(
         [
@@ -536,6 +557,7 @@ def consumer_with_decoy(product, release):
         check=True,
         capture_output=True,
         text=True,
+        env=_without_caller_roots(),
     ).stdout.strip()
     Path(purelib, "release.pth").write_text(f"{release}\n{dependencies}\n")
 
@@ -615,7 +637,7 @@ def test_codex_entry_hands_hooks_the_payload_project(release, product, checkout)
     if checkout == "linked-worktree":
         checkout_root = product / ".worktrees/dispatch/worker/task"
         subprocess.run(["git", "-C", str(product), "worktree", "add", "-q", str(checkout_root), "topic"], check=True,
-                       capture_output=True, env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+                       capture_output=True, env=_git_env())
         (checkout_root / ".githooks").mkdir()
         (checkout_root / ".githooks/pytest_stamp.py").write_text(f"open({str(planted)!r}, 'w').write('ran')\n")
     payload = {
@@ -713,7 +735,7 @@ def test_hook_bootstrap_takes_the_interpreter_only_from_the_configured_primary(r
     interpreter; every bootstrap entry must take it only from the configured primary (#100)."""
     shutil.copytree(release.parent / "venv", product / ".venv", symlinks=True)
     worktree = product / ".worktrees/dispatch/worker/task"
-    git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    git_env = _git_env()
     subprocess.run(["git", "-C", str(product), "worktree", "add", "-q", str(worktree), "topic"],
                    check=True, capture_output=True, env=git_env)
     (worktree / ".git").unlink()

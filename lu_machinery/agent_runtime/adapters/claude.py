@@ -253,6 +253,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lu_machinery.agent_runtime.agy_hook_config import CLAUDE_GUARD_MODES, native_hook_command
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root
 
 from ..env_sanitize import (
@@ -273,6 +274,9 @@ if TYPE_CHECKING:
     from lu_machinery.agent_runtime.attempt_boundary import ClaudeAccountBinding
 
 _logger = logging.getLogger(__name__)
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 # Rate-limit patterns (Claude/Anthropic-specific + generic fallbacks)
 _RATE_LIMIT_PATTERNS = (
@@ -556,12 +560,12 @@ def _mcp_server_names(path: Path) -> tuple[str, ...]:
     except OSError as exc:
         raise ValueError(f"ClaudeAdapter: MCP config {path} is unreadable: {exc}") from exc
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError as exc:
         raise ValueError(f"ClaudeAdapter: MCP config {path} is unreadable: {exc}") from exc
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"ClaudeAdapter: MCP config {path} is unreadable: {exc}") from exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, RecursionError) as exc:
         raise ValueError(f"ClaudeAdapter: MCP config {path} is invalid JSON: {exc}") from exc
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     if not isinstance(servers, dict):
@@ -705,7 +709,7 @@ def _worker_guard_settings(*, publish_guard: bool = False) -> str:
     worker-writable product tree instead of the release.
     """
     try:
-        source = json.loads((product_root() / "agents_extensions/shared/settings.json").read_text(encoding="utf-8"))
+        source = json_depth.loads((product_root() / "agents_extensions/shared/settings.json").read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError:
         raise RuntimeError("Claude worker product settings unavailable: agents_extensions/shared/settings.json") from None
     groups = []
@@ -741,7 +745,7 @@ def _worker_guard_settings(*, publish_guard: bool = False) -> str:
 
 def _headless_worker_settings(*, publish_guard: bool) -> str:
     """Guard hooks plus the background-tool denies every headless run receives."""
-    settings = json.loads(_worker_guard_settings(publish_guard=publish_guard))
+    settings = json_depth.loads(_worker_guard_settings(publish_guard=publish_guard), max_depth=_JSON_MAX_DEPTH)
     settings["permissions"] = {"deny": list(HEADLESS_BACKGROUND_TOOL_DENIES)}
     return json.dumps(settings, separators=(",", ":"))
 
@@ -1414,8 +1418,8 @@ def _verify_labelled_auth_method(
         return completed.stdout
 
     try:
-        parsed = json.loads(status("--json"))
-    except ValueError:
+        parsed = json_depth.loads(status("--json"), max_depth=_JSON_MAX_DEPTH)
+    except (ValueError, RecursionError):
         raise ClaudeAccountRefused("claude_account_auth_status_unavailable") from None
     if not isinstance(parsed, dict) or "loggedIn" not in parsed:
         raise ClaudeAccountRefused("claude_account_auth_status_unavailable")
@@ -1497,8 +1501,8 @@ def _tool_calls_from_claude_session_jsonl(path: Path) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(event, dict):
             events.append(event)

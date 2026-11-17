@@ -35,6 +35,10 @@ def _package(tmp_path: Path, source: str) -> Path:
     "import json\nd,e=json.JSONDecoder(),1\nd.decode(s)",
     "import json\njson._default_decoder.decode(s)",
     "import json\njson.scanner.make_scanner(json.JSONDecoder())(s,0)",
+    "from lu_machinery.common import json_depth\njson_depth.json.loads(text)",
+    "from lu_machinery.common import json_depth as j\nj.json.JSONDecoder().decode(text)",
+    'script = "from lu_machinery.common import json_depth\\njson_depth.json.loads(text)"',
+    "import json\nfrom lu_machinery.common import json_depth\ndef r(text):\n class D:\n  decoder=json.JSONDecoder()\n  value=json_depth.raw_decode(text, max_depth=512, decoder=decoder)\n return D.decoder.decode(text)",
 ])
 def test_new_bare_reader_and_aliases_fail_the_gate(tmp_path, capsys, source):
     root = _package(tmp_path, source)

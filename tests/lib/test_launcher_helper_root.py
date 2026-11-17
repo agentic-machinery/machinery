@@ -25,9 +25,12 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path, machinery_root
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.launcher_sandbox import launcher_environment, launcher_wrapper_source, sandbox_wrapper_text
+from tests.launcher_sandbox import launcher_environment, sandbox_wrapper_text
 
 REPO = Path(__file__).resolve().parents[2]
+# Root start-*.sh wrappers are product files. Read the owned fixture, never
+# product_checkout(), which follows the caller's LU_PRODUCT_ROOT.
+_PRODUCT_TREE = REPO / "tests" / "fixtures" / "product_tree"
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available"), pytest.mark.usefixtures("hermetic_monitor")]
 
@@ -64,6 +67,13 @@ _EXPECTED_HONEST = {
     "slot_registry": "lu_machinery.orchestration.handoff_slot_registry",
     "claude_profile": "lu_machinery/lib/context_profiles.py",
 }
+
+
+def _tracked_source(relative: str) -> Path:
+    """The file ``relative`` names: a product wrapper in the fixture tree, else this package."""
+    if "/" not in relative:
+        return _PRODUCT_TREE / relative
+    return machinery_root().parent / relative
 
 
 def _clean_env(**extra: str) -> dict[str, str]:
@@ -133,7 +143,7 @@ def layout(tmp_path: Path) -> Layout:
     for relative in _COPIED:
         destination = primary / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(launcher_wrapper_source(relative), destination)
+        shutil.copy2(_tracked_source(relative), destination)
         if relative.startswith("start-"):
             destination.write_text(sandbox_wrapper_text(destination.read_text()))
     _place_helper_scripts(primary)
@@ -559,7 +569,7 @@ def _separate_git_dir_layout(layout: Layout) -> Layout:
     for relative in _COPIED:
         destination = primary / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(launcher_wrapper_source(relative), destination)
+        shutil.copy2(_tracked_source(relative), destination)
         if relative.startswith("start-"):
             destination.write_text(sandbox_wrapper_text(destination.read_text()))
     _place_helper_scripts(primary)

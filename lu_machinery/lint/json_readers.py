@@ -22,16 +22,24 @@ _INTERNAL_READERS = (
 )
 
 
+def _canonical(name: str) -> str:
+    # The helper's stdlib import is still an unbounded JSON namespace.
+    prefix = f"{_BOUNDED}.json"
+    if name == prefix or name.startswith(prefix + "."):
+        name = "json" + name[len(prefix):]
+    return name.replace("json.decoder.JSONDecoder", "json.JSONDecoder")
+
+
 def _name(node: ast.AST, names: dict[str, str]) -> str:
     if isinstance(node, ast.Name):
-        return names.get(node.id, node.id).replace("json.decoder.JSONDecoder", "json.JSONDecoder")
+        return _canonical(names.get(node.id, node.id))
     if isinstance(node, ast.Attribute):
-        return f"{_name(node.value, names)}.{node.attr}".replace("json.decoder.JSONDecoder", "json.JSONDecoder")
+        return _canonical(f"{_name(node.value, names)}.{node.attr}")
     if isinstance(node, ast.Call):
         if _name(node.func, names) == "getattr" and len(node.args) >= 2:
             field = node.args[1]
             if isinstance(field, ast.Constant) and isinstance(field.value, str):
-                return f"{_name(node.args[0], names)}.{field.value}"
+                return _canonical(f"{_name(node.args[0], names)}.{field.value}")
         return f"{_name(node.func, names)}()"
     return ""
 
@@ -69,11 +77,10 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
 
     def bounded_decoder_argument(node: ast.AST) -> bool:
         keyword = parents.get(node)
+        if not isinstance(keyword, ast.keyword) or keyword.arg != "decoder":
+            return False
         call = parents.get(keyword)
-        return (
-            isinstance(keyword, ast.keyword) and keyword.arg == "decoder"
-            and isinstance(call, ast.Call) and _name(call.func, names) == f"{_BOUNDED}.raw_decode"
-        )
+        return isinstance(call, ast.Call) and _name(call.func, names) == f"{_BOUNDED}.raw_decode"
 
     allowed_constructors: set[ast.AST] = set()
     for node in ast.walk(tree):
@@ -90,7 +97,7 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
             continue
         name = targets[0].id
         scope: ast.AST = assignment
-        while scope in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+        while scope in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.Module)):
             scope = parents[scope]
         if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -114,12 +121,13 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
     }
     for node in ast.walk(tree):
         name = _name(node, names)
+        parent = parents.get(node)
         if isinstance(node, (ast.Attribute, ast.Name, ast.Call)) and (
             name in _READERS
             or (
                 name in {"json", "json.decoder", "_json"}
                 and (not isinstance(node, ast.Name) or node.id in names)
-                and not (isinstance(parents.get(node), ast.Attribute) and parents[node].value is node)
+                and not (isinstance(parent, ast.Attribute) and parent.value is node)
             )
             or (name == "json.JSONDecoder" and node not in allowed_constructors)
             or any(name == prefix or name.startswith(prefix + ".") for prefix in _INTERNAL_READERS)
