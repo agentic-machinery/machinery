@@ -875,7 +875,7 @@ def _repeated_failures(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
             continue
         key = test if isinstance(test, str) and test else job
         prs[key].add(number)
-        if key != job:
+        if isinstance(test, str) and test:  # Node evidence, even when a job is named like its node.
             tests[key].add(test)
     return {
         job: (sorted(numbers), sorted(tests[job])) for job, numbers in prs.items() if len(numbers) >= REPEATED_FAILURE_PRS
