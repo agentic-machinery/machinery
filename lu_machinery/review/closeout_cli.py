@@ -1072,12 +1072,9 @@ def _checkout_source(path: Path, top: Path, head: str) -> bool:
     Tracked means in the work tree's index or in the reviewed head's tree, and a file is matched by
     identity (device and inode), not by name, so a staged deletion, a case alias on a
     case-insensitive filesystem or a hard link still counts. An installed release in an untracked
-    virtual environment inside the work tree (``<top>/.venv``) is not checkout source.
+    virtual environment inside the work tree (``<top>/.venv``) is not checkout source. No path
+    comparison decides it: a case alias of the checkout directory names the same files.
     """
-    if path == top:
-        return True
-    if top not in path.parents:
-        return False
     try:
         target = path.lstat()
     except OSError as exc:
