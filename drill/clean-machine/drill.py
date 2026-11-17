@@ -1588,15 +1588,20 @@ def resolve_interpreter(choice: str | None) -> str:
         [os.path.abspath(found), "-I", "-c", script],
         check=False,
         capture_output=True,
-        text=True,
         timeout=60,
     )
+    if result.returncode != 0:
+        raise DrillError(f"--python {choice!r} exited {result.returncode}")
     try:
-        path, new_enough = json.loads(result.stdout)
-    except ValueError:
-        raise DrillError(
-            f"--python {choice!r} did not run: {result.stderr.strip()[-300:]}"
-        ) from None
+        path, new_enough = json.loads(result.stdout.decode("utf-8"))
+        if (
+            not isinstance(path, str)
+            or not os.path.isabs(path)
+            or not isinstance(new_enough, bool)
+        ):
+            raise ValueError("unexpected report")
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise DrillError(f"--python {choice!r} gave an unreadable report") from None
     if not new_enough:
         raise DrillError(f"--python {choice!r} is older than Python 3.12")
     return path
