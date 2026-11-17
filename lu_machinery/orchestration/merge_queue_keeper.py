@@ -1087,6 +1087,9 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     reason = "ejection-unknown"
                 if reason == "ready" and queued is not True and not armed:
                     reason = _gate_hold(gh, number, head, previous) or reason
+            if queued is not True and not armed and current_head == head and _auto_merge_armed(current):
+                # GitHub queues an armed head by itself, so a head armed since the snapshot is guarded too.
+                armed = True
             if queued is True or armed:
                 fresh = bool(
                     current
@@ -1106,7 +1109,10 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     if fresh
                     else None
                 )
-                if revoke is None and fresh and queued is not True and armed and (ejected or ejection_unknown):
+                if (
+                    revoke is None and fresh and queued is not True and armed and (ejected or ejection_unknown)
+                    and not gh.membership(number)  # A PR GitHub queued since the snapshot is left alone.
+                ):
                     # GitHub would queue an armed head by itself; an ejected head is disarmed.
                     revoke = reason = held_as if ejected else "ejection-unknown"
                 if revoke is None and fresh and queued is True:
@@ -1216,7 +1222,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
     for report_key, stamp in list(reports.items()):
         if not isinstance(stamp, str) or stamp < cutoff:
             reports.pop(report_key)
-    for key, (numbers, _tests) in sorted(_repeated_failures(failures).items()):
+    for key, (numbers, tests) in sorted(_repeated_failures(failures).items()):
         matching = [item for item in failures if (item.get("test") or item.get("job")) == key]
         run_ids = sorted({item["run_id"] for item in matching if type(item.get("run_id")) is int})
         lines.append(f"repeated test failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
@@ -1228,8 +1234,13 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         _queue_cto_report(previous, "queue-test-defect", report_key, (
             f"Merge queue keeper: {code_span(key, DISPLAY_TEST_LIMIT)} failed merge_group runs of distinct PRs "
             f"{', '.join(f'#{n}' for n in numbers)} within 24 hours (run IDs: {', '.join(map(str, run_ids)) or 'unknown'}). "
-            "A failing test is never infrastructure and is never rerun (rules core P4): assign a fix, or delete "
-            "the test with the reason in the commit and a note on its issue."
+            + (
+                "A failing test is never infrastructure and is never rerun (rules core P4): assign a fix, or delete "
+                "the test with the reason in the commit and a note on its issue."
+                if tests else
+                "No failing test node was read for it: diagnose the job. A failing test node is fixed, never rerun "
+                "(rules core P4); a failure with no failing test node is infrastructure."
+            )
         ))
         reports[report_key] = observed
     if apply:

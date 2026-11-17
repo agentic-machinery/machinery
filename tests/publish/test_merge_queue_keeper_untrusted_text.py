@@ -473,8 +473,8 @@ def test_plain_repeated_failure_is_a_cto_report_not_an_issue(tmp_path: Path, tra
     defect = [entry for entry in json.loads(path.read_text())["cto_outbox"] if entry["kind"] == "queue-test-defect"]
     assert [entry["body"] for entry in defect] == [
         "Merge queue keeper: `pytest (3)` failed merge_group runs of distinct PRs #7, #42 within 24 hours "
-        "(run IDs: 321). A failing test is never infrastructure and is never rerun (rules core P4): assign "
-        "a fix, or delete the test with the reason in the commit and a note on its issue."
+        "(run IDs: 321). No failing test node was read for it: diagnose the job. A failing test node is "
+        "fixed, never rerun (rules core P4); a failure with no failing test node is infrastructure."
     ]
     assert defect[0]["key"].startswith("merge-queue-keeper:test-defect:")
 

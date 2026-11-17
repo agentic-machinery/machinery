@@ -774,7 +774,13 @@ def test_enqueue_without_membership_but_armed_auto_merge_reports_armed(
 ) -> None:
     fake = FakeGitHub()
     fake.membership_result = False
-    fake.fresh["autoMergeRequest"] = {"enabledAt": "2026-09-23T13:00:00Z"}
+    enqueue = fake.enqueue
+
+    def enqueue_arms(number: int, head: str) -> None:  # GitHub armed auto-merge instead of queueing.
+        enqueue(number, head)
+        fake.fresh["autoMergeRequest"] = {"enabledAt": "2026-09-23T13:00:00Z"}
+
+    monkeypatch.setattr(fake, "enqueue", enqueue_arms)
     lines, failed = run(fake, tmp_path / "state.json", monkeypatch)
     assert not failed
     assert any(line == "#42 armed" for line in lines)
@@ -984,7 +990,7 @@ def test_defect_report_requires_two_distinct_prs_and_is_sent_once(tmp_path: Path
     assert not failed and "repeated test failure: pytest; PRs=42,43; runs=unknown" in lines
     [body] = _defect_reports(path)
     assert "`pytest` failed merge_group runs of distinct PRs #42, #43 within 24 hours" in body
-    assert "never infrastructure and is never rerun (rules core P4)" in body
+    assert "No failing test node was read for it: diagnose the job." in body
     run(fake, path, monkeypatch)
     assert len(_defect_reports(path)) == 1
 
@@ -1155,6 +1161,7 @@ def test_an_older_removal_never_accounts_for_a_later_exit(tmp_path: Path, monkey
 def test_armed_ejected_head_is_disarmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """GitHub queues an armed head by itself, so an ejected head is disarmed."""
     fake = FakeGitHub(pr(autoMergeRequest={"enabledAt": "now"}))
+    fake.membership_result = False
     _removed(fake, [{"id": 7, "name": "pytest", "conclusion": "failure"}])
     path = tmp_path / "state.json"
     lines, failed = run(fake, path, monkeypatch)
