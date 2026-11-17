@@ -582,11 +582,10 @@ def _load(path: Path) -> dict[str, Any]:
     # carried that ceremony's "spent" reasons, so loading them would hold heads
     # nothing can clear. ``keeper_requeues`` recorded the retired one keeper re-enqueue per
     # head, and ``flake_issue_updates`` paced the retired flaky-test issue comments.
-    # Preserve a legacy positive removal count as queue history, using the existing exit map.
+    # Preserve legacy queue history without claiming a diagnosed exit or a delivered alert.
     drops = data.get("drops")
     for key, count in drops.items() if isinstance(drops, dict) else ():
         if isinstance(key, str) and type(count) is int and count > 0:
-            data.setdefault("ejections", {}).setdefault(key, [])
             data.setdefault("ejection_alerts", {}).setdefault(key, data.get("observed", ""))
     for name in (
         "requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates", "last_removal", "drops",

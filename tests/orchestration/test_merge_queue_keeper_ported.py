@@ -724,7 +724,7 @@ def test_legacy_drop_history_holds_new_head_for_owner(tmp_path: Path) -> None:
     path.write_text(json.dumps({"queued": {}, "drops": {f"42:{HEAD_A}": 3}}))
     keeper.run(fake, path, apply=True)
     assert "enqueue" not in mutations(fake)
-    assert f"42:{HEAD_A}" in json.loads(path.read_text())["ejections"]
+    assert f"42:{HEAD_A}" in json.loads(path.read_text())["ejection_alerts"]
     assert _defect_reports(path, "queue-ejection") == []
 
 
@@ -2458,7 +2458,7 @@ def test_queue_history_at_any_head_prevents_automatic_reentry(tmp_path, monkeypa
         lines, failed = run(fake, path, monkeypatch)
         assert not failed and "enqueue" not in mutations(fake), lines
 
-        if history == "keeper-revoked":
+        if history in {"keeper-revoked", "legacy-removal"}:
             owner_queued = FakeGitHub(pr(isInMergeQueue=True))
             run(owner_queued, path, monkeypatch)
             owner_ejected = FakeGitHub()
