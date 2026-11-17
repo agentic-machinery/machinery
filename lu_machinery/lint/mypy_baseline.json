@@ -7170,7 +7170,7 @@
     {
       "path": "lu_machinery/orchestration/prompt_contracts.py",
       "code": "valid-type",
-      "message": "Variable \"scripts.orchestration.prompt_contracts._SafeLoaderBase\" is not valid as a type"
+      "message": "Variable \"lu_machinery.orchestration.prompt_contracts._SafeLoaderBase\" is not valid as a type"
     },
     {
       "path": "lu_machinery/orchestration/red_ci_known_failures.py",

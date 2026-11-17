@@ -17,6 +17,8 @@ Where the machinery package directory is not ``scripts`` (after the machinery
 move), the module slot of two exact baseline message forms is respelled with
 the pinned rename map, shipped as a package resource at
 lu_machinery/lint/rename-map.json with a verified .sha256 beside it.
+The shrink check reads each earlier baseline with the rename map committed
+beside it at that ref, so a map change that respells a message is not growth.
 
 Examples:
   .venv/bin/python -m scripts.lint.mypy_ratchet
@@ -493,9 +495,15 @@ def _load_rename_map(package_dir: Path) -> _RenameMap:
         recorded = digest_path.read_bytes().decode("ascii")
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"{prefix}: required for machinery package {package_dir.name!r}; unreadable: {exc}") from exc
+    return _parse_rename_map(raw, recorded, prefix, str(digest_path))
+
+
+def _parse_rename_map(raw: bytes, recorded: str, prefix: str, digest_name: str) -> _RenameMap:
+    """Verify the map bytes against their recorded digest and parse them (``_load_rename_map`` contract)."""
+
     line = _DIGEST_LINE.fullmatch(recorded)
     if line is None:
-        raise ValueError(f"{digest_path}: expected one line '<sha256>  {RENAME_MAP.name}'")
+        raise ValueError(f"{digest_name}: expected one line '<sha256>  {RENAME_MAP.name}'")
     actual = hashlib.sha256(raw).hexdigest()
     if actual != line.group("digest"):
         raise ValueError(f"{prefix}: sha256 {actual} does not match the recorded {line.group('digest')}")
@@ -789,10 +797,13 @@ def compare(current: Sequence[MypyError], baseline: Sequence[MypyError]) -> list
     return violations
 
 
-def _entries_from_rows(rows: object, where: str, root: Path | None = None) -> list[MypyError]:
+def _entries_from_rows(
+    rows: object, where: str, root: Path | None = None, spelling: _BaselineSpelling | None = None
+) -> list[MypyError]:
     if not isinstance(rows, list):
         raise ValueError(f"{where}: entries must be a list")
-    spelling = _baseline_spelling(root)
+    if spelling is None:
+        spelling = _baseline_spelling(root)
     entries: list[MypyError] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -815,10 +826,12 @@ def _entries_from_rows(rows: object, where: str, root: Path | None = None) -> li
     return entries
 
 
-def _payload_entries(payload: object, where: str, root: Path | None = None) -> list[MypyError]:
+def _payload_entries(
+    payload: object, where: str, root: Path | None = None, spelling: _BaselineSpelling | None = None
+) -> list[MypyError]:
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{where}: schema must be {SCHEMA}")
-    return _entries_from_rows(payload.get("entries"), where, root)
+    return _entries_from_rows(payload.get("entries"), where, root, spelling)
 
 
 def load_entries(path: Path, root: Path | None = None) -> list[MypyError]:
@@ -837,18 +850,46 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def _baseline_at(root: Path, ref: str, rel: str) -> list[MypyError] | None:
+def _git_show(root: Path, ref: str, rel: str) -> bytes | None:
     result = subprocess.run(
         ["git", "show", f"{ref}:{rel}"],
         cwd=root,
         capture_output=True,
-        text=True,
         timeout=_GIT_TIMEOUT_SECONDS,
         check=False,
     )
-    if result.returncode != 0:
+    return result.stdout if result.returncode == 0 else None
+
+
+def _spelling_at(root: Path, ref: str, rel: str) -> _BaselineSpelling:
+    """The spelling ``ref``'s baseline was written in: the rename map beside it at that ref.
+
+    A map change moves which slots are respelled, so reading an older baseline
+    with today's map would count a respelled message as growth. A ref without
+    the map keeps today's spelling; a map without its valid digest is an error.
+    """
+
+    spelling = _baseline_spelling(root)
+    if spelling.rename_map is None:
+        return spelling
+    map_rel = PurePosixPath(rel).with_name(RENAME_MAP.name).as_posix()
+    raw = _git_show(root, ref, map_rel)
+    if raw is None:
+        return spelling
+    recorded = _git_show(root, ref, map_rel + ".sha256")
+    if recorded is None:
+        raise ValueError(f"{ref}:{map_rel}.sha256: missing beside the rename map")
+    where = f"{ref}:{map_rel}"
+    return _BaselineSpelling(
+        spelling.package, _parse_rename_map(raw, recorded.decode("ascii"), f"rename map {where}", f"{where}.sha256")
+    )
+
+
+def _baseline_at(root: Path, ref: str, rel: str) -> list[MypyError] | None:
+    raw = _git_show(root, ref, rel)
+    if raw is None:
         return None
-    return _payload_entries(json.loads(result.stdout), f"{ref}:{rel}", root)
+    return _payload_entries(json.loads(raw), f"{ref}:{rel}", root, _spelling_at(root, ref, rel))
 
 
 def _is_subset(current: Sequence[MypyError], previous: Sequence[MypyError]) -> bool:
