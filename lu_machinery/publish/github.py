@@ -2876,7 +2876,7 @@ def main(argv=None, *, runner=None):
     read_parser.add_argument(
         "name",
         choices=sorted(
-            set(REST_READS) | set(GQL_READS) | REST_COMPAT_READS | {"queue-snapshot", "subissue-batch", "issue-states", "issue-count", "merge-facts"}
+            set(REST_READS) | set(GQL_READS) | set(REST_COMPAT_READS) | {"queue-snapshot", "issue-count"}
         ),
     )
     read_parser.add_argument(
@@ -3046,7 +3046,18 @@ DIAGNOSTIC_READS = {
             } else error("OPSEC: invalid or withdrawn Dependabot alert") end
         ) end""",
 }
-REST_COMPAT_READS = {'budget', 'issue-scope', 'subissues', 'subissues-next', 'default-head', 'pr-bases', 'issue-parent'}
+REST_COMPAT_READS = {
+    "budget": set(),
+    "default-head": set(),
+    "pr-bases": {"cursor"},
+    "issue-states": {"numbers"},
+    "merge-facts": {"batch"},
+    "issue-parent": {"number"},
+    "issue-scope": {"number"},
+    "subissues": {"number"},
+    "subissues-next": {"number", "cursor"},
+    "subissue-batch": {"cursors", "body_roots"},
+}
 GQL_READS = {
     "queue-removal": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid removals:timelineItems(first:100,after:$cursor,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){totalCount pageInfo{hasNextPage endCursor} nodes{... on RemovedFromMergeQueueEvent{beforeCommit{oid} createdAt reason}}} pushes:timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{afterCommit{oid} createdAt}}}}}}",
     "queue-status": "\nquery($owner: String!, $name: String!, $number: Int!, $branch: String!) {\n  repository(owner: $owner, name: $name) {\n    pullRequest(number: $number) {\n      number\n      title\n      state\n      merged\n      mergeable\n      mergeStateStatus\n      isInMergeQueue\n      isMergeQueueEnabled\n      headRefName\n      headRefOid\n      baseRefName\n      mergeQueueEntry {\n        id\n        position\n        state\n        enqueuedAt\n        estimatedTimeToMerge\n        jump\n        solo\n        headCommit {\n          oid\n          checkSuites(first: 20) {\n            nodes {\n              status\n              conclusion\n              createdAt\n              updatedAt\n              workflowRun {\n                id\n                url\n                event\n                createdAt\n                updatedAt\n                workflow {\n                  name\n                }\n              }\n            }\n          }\n        }\n      }\n    }\n    mergeQueue(branch: $branch) {\n      url\n      nextEntryEstimatedTimeToMerge\n      entries(first: 50) {\n        totalCount\n        nodes {\n          position\n          state\n          enqueuedAt\n          estimatedTimeToMerge\n          pullRequest {\n            number\n          }\n        }\n      }\n    }\n  }\n}\n",
@@ -3208,9 +3219,8 @@ def read(
     for key in ("number",):
         if key in fields and (type(fields[key]) is not int or fields[key] <= 0):
             raise gate.PublishBlocked("OPSEC: invalid read identifier.")
-    if operation in {"budget", "default-head", "pr-bases", "issue-states", "merge-facts", "issue-parent", "issue-scope", "subissues", "subissues-next", "subissue-batch"}:
-        expected = {"budget":set(), "default-head":set(), "pr-bases":{"cursor"}, "issue-states":{"numbers"}, "merge-facts":{"batch"}, "issue-parent":{"number"}, "issue-scope":{"number"}, "subissues":{"number"}, "subissues-next":{"number","cursor"}, "subissue-batch":{"cursors","body_roots"}}[operation]
-        if set(fields) != expected:
+    if operation in REST_COMPAT_READS:
+        if set(fields) != REST_COMPAT_READS[operation]:
             raise gate.PublishBlocked("OPSEC: invalid read fields.")
         if operation == "issue-states" and (not isinstance(fields["numbers"], (list, tuple)) or not 1 <= len(fields["numbers"]) <= 100 or any(type(n) is not int or n <= 0 for n in fields["numbers"])):
             raise gate.PublishBlocked("OPSEC: invalid issue batch.")
@@ -3267,16 +3277,8 @@ def read(
         variables = dict(zip(("owner", "name"), gh_repo.split("/", 1), strict=True)) if "/" in gh_repo else {}
         if operation in GQL_READS:
             expected = (
-                set()
-                if operation in {"budget", "default-head"}
-                else {"cursor"}
-                if operation == "pr-bases"
-                else {"number", "branch"}
-                if operation == "queue-status"
-                else {"number", "cursor"}
-                if operation == "subissues-next"
-                else {"number", "branch"}
-                if operation == "membership-head"
+                {"number", "branch"}
+                if operation in {"queue-status", "membership-head"}
                 else {"number"}
             )
             if operation == "queue-removal" and "cursor" in fields:
@@ -3286,7 +3288,6 @@ def read(
                 or (
                     "cursor" in fields
                     and not isinstance(fields["cursor"], str)
-                    and not (operation == "pr-bases" and fields["cursor"] is None)
                 )
                 or ("branch" in fields and not isinstance(fields["branch"], str))
             ):
