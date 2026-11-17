@@ -562,7 +562,7 @@ def _bad_attribution(attribution: Attribution, sha: str, pr: int | None) -> Viol
     return None
 
 
-def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repository: str | None = None) -> Report:
+def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repository: str | None = None) -> VerifiedReport:
     """Every non-merge commit in ``base..head`` carries a well-formed line or is a verified bot's."""
     report = VerifiedReport("pr")
     try:
@@ -612,7 +612,7 @@ def check_merge_group(
     remote: str = "origin",
     github_get: GitHubGet | None = None,
     repository: str | None = None,
-) -> Report:
+) -> VerifiedReport:
     """Each squash commit in the queue chain carries its PR's complete attribution."""
     report = VerifiedReport("merge-group")
     try:
@@ -798,7 +798,7 @@ def _github_get_from_env() -> GitHubGet | None:
     return get
 
 
-def check_verified_report(range_spec: str) -> Report:
+def check_verified_report(range_spec: str) -> VerifiedReport:
     """Classify ``X-Verified`` on each first-parent commit in ``range_spec``.
 
     A git error or an empty range is a hard failure of the query (``report.violations``),
@@ -830,7 +830,7 @@ def check_verified_report(range_spec: str) -> Report:
     return report
 
 
-def _print_verified_report(report: Report, mode: str) -> None:
+def _print_verified_report(report: VerifiedReport, mode: str) -> None:
     for violation in report.violations:
         print(f"::error title=verified-trailer::{violation.render()}")
     missing = 0
@@ -851,7 +851,7 @@ def _print_verified_report(report: Report, mode: str) -> None:
         print("verified-report: mode=off classifies only; it does not enforce")
 
 
-def _print_verified_findings(report: Report, mode: str) -> None:
+def _print_verified_findings(report: VerifiedReport, mode: str) -> None:
     if mode == "off":
         print(f"verified-trailer: mode=off commits={report.checked} findings=0")
         return
