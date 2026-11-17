@@ -65,6 +65,44 @@ VERIFICATION_FETCH_TIMEOUT = 60
 HISTORY_SLACK_SECONDS = 86400
 
 
+class VerificationFetchError(ValueError):
+    """A transport refusal with only allow-listed, non-sensitive diagnostics."""
+
+    def __init__(self, code: int, stderr: str):
+        reasons = (
+            ("couldn't find remote ref", "remote ref missing"),
+            ("not our ref", "remote object missing"),
+            ("Authentication failed", "authentication failed"),
+            ("could not read Username", "authentication unavailable"),
+            ("Could not resolve host", "host resolution failed"),
+            ("Failed to connect", "connection failed"),
+            ("no commits selected for shallow requests", "shallow request selected no commits"),
+        )
+        http = re.search(r"The requested URL returned error: ([45][0-9]{2})\b", stderr)
+        self.reason = (f"HTTP {http[1]}" if http else
+                       next((reason for marker, reason in reasons if marker in stderr), "unclassified transport error"))
+        self.returncode = code
+        super().__init__(f"git fetch failed (exit {code}; {self.reason})")
+
+
+def _ownership_fetch(run, record: dict, *args: str, phase: str) -> None:
+    """Retry one remote read; retain classified failures even when recovery succeeds."""
+    for attempt in (1, 2):
+        try:
+            run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *args,
+                timeout=VERIFICATION_FETCH_TIMEOUT)
+            return
+        except (VerificationFetchError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            record.setdefault("owned_paths_fetch_failures", []).append({
+                "phase": phase, "attempt": attempt,
+                "reason": (exc.reason if isinstance(exc, VerificationFetchError) else
+                           "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "unclassified transport error"),
+                "returncode": getattr(exc, "returncode", None)})
+            # A deleted branch needs a different source, not another request for the same ref.
+            if attempt == 2 or (isinstance(exc, VerificationFetchError) and exc.reason == "remote ref missing"):
+                raise
+
+
 def _verification_git(path: Path, *args: str, strip: bool = True, git_dir: Path | None = None,
                       timeout: float = 30, credential_remote: str | None = None) -> str:
     """Use the system Git with no inherited Git configuration or process redirects."""
@@ -86,6 +124,8 @@ def _verification_git(path: Path, *args: str, strip: bool = True, git_dir: Path 
     except subprocess.CalledProcessError as exc:
         # Neither transport/helper output nor a credential-bearing URL may
         # become a delivery error, traceback, or durable task record.
+        if args[0] == "fetch":
+            raise VerificationFetchError(exc.returncode, exc.stderr or "") from None
         raise subprocess.CalledProcessError(exc.returncode, [GIT_BINARY, args[0]],
                                             output="", stderr="isolated Git command failed") from None
     except subprocess.TimeoutExpired as exc:
@@ -171,7 +211,8 @@ def verifiable_origin_base(ref: str) -> str:
 def ownership_git(record: dict, head: str | None = None):
     """Walk trusted remote objects in a private config/ref namespace.
 
-    The delivery is the task's recorded branch, or ``head``, a full commit id fetched by id (a merged
+    The delivery is the task's recorded branch, falling back to its recorded head commit if the
+    branch was deleted, or ``head``, a full commit id fetched by id (a merged
     pull request's final head, which the remote still serves after its branch is deleted). With
     ``head`` set, the recorded base is fetched by its commit id too: that branch ref is deleted
     once the task's pull request has merged into the default branch instead of into it.
@@ -223,21 +264,29 @@ def ownership_git(record: dict, head: str | None = None):
     refspecs = (f"+{base_source}:refs/heads/base",
                 f"+{delivery_source}:refs/heads/delivery")
     with _private_remote_git(record["task_id"], remote) as (run, git_dir):
-        fetch = partial(run, "fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none",
-                        timeout=VERIFICATION_FETCH_TIMEOUT)
-        fetch("--depth=1", "--", "origin", task_base, *refspecs)
+        fetch = partial(_ownership_fetch, run, record)
+        try:
+            fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="initial")
+        except VerificationFetchError as exc:
+            if head is not None or exc.reason != "remote ref missing":
+                raise
+            snapshot = record["head_sha"]
+            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", snapshot):
+                raise ValueError("delivery head must be a full object name") from None
+            refspecs = (refspecs[0], f"+{snapshot}:refs/heads/delivery")
+            fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="recorded-head")
         since = int(run("show", "-s", "--format=%ct", task_base)) - HISTORY_SLACK_SECONDS
         # Git selects no history below a tip dated before the cutoff and aborts the
         # bounded fetch; its message does not reach HTTPS clients, so decide by date.
         bounded = min(map(int, run("show", "-s", "--format=%ct", "refs/heads/base",
                                    "refs/heads/delivery").split())) >= since
         if bounded:
-            fetch(f"--shallow-since=@{since}", "--", "origin", *refspecs)
+            fetch(f"--shallow-since=@{since}", "--", "origin", *refspecs, phase="bounded-history")
         shallow = git_dir / "shallow"
         if not (bounded and _complete_since_task_base(run, shallow, task_base)):
             if run("rev-parse", "--is-shallow-repository") == "false":
                 raise ValueError("task base is not reachable from the remote tips")
-            fetch("--unshallow", "--", "origin", *refspecs)
+            fetch("--unshallow", "--", "origin", *refspecs, phase="full-history")
             if run("rev-parse", "--is-shallow-repository") != "false":
                 raise ValueError("full history could not be fetched")
             if not _complete_since_task_base(run, shallow, task_base):
@@ -1018,7 +1067,7 @@ def _remote_default_branch(record: dict) -> str:
     raise ValueError("remote default branch is not advertised")
 
 
-def _fetch_merged_parent(run: Callable[..., str], merge: str) -> str:
+def _fetch_merged_parent(run: Callable[..., str], merge: str, record: dict) -> str:
     """The first parent of ``merge``, with the ancestry ``merge-base`` needs.
 
     A depth-limited fetch records that parent as a shallow boundary, and it cuts a
@@ -1027,8 +1076,7 @@ def _fetch_merged_parent(run: Callable[..., str], merge: str) -> str:
     A shallow repository is unshallowed; a complete one stays complete.
     """
     shallow = ("--unshallow",) if run("rev-parse", "--is-shallow-repository") == "true" else ()
-    run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *shallow, "--", "origin", merge,
-        timeout=VERIFICATION_FETCH_TIMEOUT)
+    _ownership_fetch(run, record, *shallow, "--", "origin", merge, phase="merged-parent")
     return run("rev-parse", "--verify", merge + "^1")
 
 
@@ -1101,7 +1149,7 @@ def merged_delivery(record: dict) -> dict | None:
             # every commit the PR's final head adds to the base it merged into (the merge's first parent).
             with ownership_git(record, head=pr["headRefOid"]) as run:
                 start = record.get("worktree_start_sha", record["worktree_base_sha"])
-                parent = _fetch_merged_parent(run, pr["mergeCommit"]["oid"])
+                parent = _fetch_merged_parent(run, pr["mergeCommit"]["oid"], record)
                 # The exit snapshot may be a reset to the squash merge. Count the PR head's own range.
                 commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
                 history = ownership.delivered_paths(
