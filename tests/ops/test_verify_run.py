@@ -139,6 +139,9 @@ def test_installed_wheel_ships_loopback_target_inside_the_package(tmp_path: Path
     )
     assert ran.returncode == 0, ran.stdout + ran.stderr
     located = json.loads(ran.stdout)
+    assert isinstance(located, dict)
+    units = located["units"]
+    assert isinstance(units, list) and all(isinstance(unit, str) for unit in units)
     assert located["is_file"] is True
     assert located["inside_package"] is True
     assert located["legacy_exists"] is False
