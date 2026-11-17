@@ -490,6 +490,17 @@ const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: 
   {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
 assert.match(line({url: '/api/runtime/subscriptions', data: partial}).text, /· STALE · source age 51s · bound 900s$/);
 assert.match(subscriptionRows(partial, null).groups, /NO READING/);
+// Other failed or degraded payloads keep their own verdict over a young header, even with no age to show.
+const young = {age: 5, bound: 900, state: 'fresh'};
+assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'unknown', read_at: new Date(now).toISOString()}}).text, /· unavailable ·/);
+assert.match(line({...young, url: '/api/git/pull-requests', data: {status: 'ok', observed_at: new Date(now).toISOString(),
+  repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text, /· STALE ·/);
+assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_seconds: null, stale: true}}).text, /· STALE ·/);
+assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
+// An old routing-budget snapshot is stale though its account rows read fresh; unavailable rows are not fresh.
+const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
+assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 1200s · bound 900s$/);
+assert.match(line(budget({data_age_s: 5, stale: false, stale_threshold_s: 900}, {x: {freshness: 'unavailable', age_s: null}})).text, /· STALE ·/);
 // Alerts carry their own bound in the body.
 const observed = new Date(now - 5000).toISOString();
 assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);

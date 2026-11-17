@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 
 from lu_machinery.common import test_slots
+from lu_machinery.secret_redactor import redact_text
 
 from . import load_samples, panel_values
 from .monitor_context import MonitorContext, get_ctx
@@ -177,11 +178,15 @@ _ALERT_NAMES = frozenset({
 
 ALERT_SUMMARY_MAX_CHARS = 200
 # A rule template may interpolate any label of its alert, so the summary is shown only when
-# every label value it contains is one of these vetted, public ones (stripped before the prose
-# check) and the rest is plain prose: no path, address, assignment or other label value.
-_SUMMARY_VETTED_LABELS = frozenset({"pool", "route", "owner_lane", "stack"})
-_SUMMARY_LABEL_VALUE = re.compile(r"[A-Za-z0-9:._/-]{1,80}")
+# every label value it contains is a vetted public one (stripped before the prose check) and the
+# rest is plain prose: no path, address, assignment or other label value. A vetted value is
+# checked by the shape its key allows, so an arbitrary value cannot hide text from the check.
+_SUMMARY_VETTED_LABELS = {
+    "pool": re.compile(r"[a-z]+(?::[a-z0-9]{1,16})?"),
+    "route": re.compile(r"/api(?:/[A-Za-z0-9_{}.-]{1,40}){1,8}"),
+}
 _SUMMARY_PROSE = re.compile(r"[A-Za-z0-9 .,;:()%'+-]*")
+_SEVERITIES = frozenset({"critical", "warning", "info", "none"})
 
 
 def _alert_summary(annotations: dict, labels: dict) -> str | None:
@@ -194,13 +199,21 @@ def _alert_summary(annotations: dict, labels: dict) -> str | None:
         return None
     prose, others = value, []
     for key, label in labels.items():
-        if key in {"alertname", "severity"} or not isinstance(label, str) or not label:
+        if not isinstance(label, str) or not label or key == "alertname" or (key == "severity" and label in _SEVERITIES):
             continue
-        if key in _SUMMARY_VETTED_LABELS and _SUMMARY_LABEL_VALUE.fullmatch(label) and ".." not in label:
+        shape = _SUMMARY_VETTED_LABELS.get(key)
+        if shape is not None and shape.fullmatch(label) and (key != "pool" or label.split(":")[0] in panel_values.AGENTS):
             prose = prose.replace(label, "")
         else:
+            # The whole value and its host, scheme-less and port-less stems: a template may print either.
             others.append(label)
-    if any(other in value for other in others) or not _SUMMARY_PROSE.fullmatch(prose) or scan_text(value):
+            others.extend(part for part in re.split(r"[:/]", label) if len(part) >= 4)
+    if (
+        any(other in value for other in others)
+        or not _SUMMARY_PROSE.fullmatch(prose)
+        or scan_text(value)
+        or redact_text(value) != value
+    ):
         return None
     return value
 
