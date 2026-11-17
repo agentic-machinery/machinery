@@ -95,6 +95,7 @@ _NOISE_RE = re.compile(
 )
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# nosemgrep: python.lang.security.audit.regex_dos -- every repeat is bounded; maximum match width is 39.
 _IPV6_RE = re.compile(r"\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b", re.IGNORECASE)
 _USER_HOST_RE = re.compile(r"\b[\w.-]+@[\w.-]+\b")
 _SSH_HINT_RE = re.compile(r"(?i)\b(?:ssh|scp)\s+\S+")

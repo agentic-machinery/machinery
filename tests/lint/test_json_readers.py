@@ -27,6 +27,14 @@ def _package(tmp_path: Path, source: str) -> Path:
     "import json.decoder as d\nd.JSONDecoder().decode(text)",
     'import json\ngetattr(json,"loads")(text)',
     'script = "import json\\njson.loads(text)"',
+    "import json\nself.d=json.JSONDecoder(); self.d.decode(s)",
+    "import json\ndef r(s, decoder=json.JSONDecoder()): return decoder.decode(s)",
+    "import json\nclass D(json.JSONDecoder): pass\nD().decode(s)",
+    "import json\njson.JSONDecoder.decode(json.JSONDecoder(), s)",
+    "import json\n(d := json.JSONDecoder()).decode(s)",
+    "import json\nd,e=json.JSONDecoder(),1\nd.decode(s)",
+    "import json\njson._default_decoder.decode(s)",
+    "import json\njson.scanner.make_scanner(json.JSONDecoder())(s,0)",
 ])
 def test_new_bare_reader_and_aliases_fail_the_gate(tmp_path, capsys, source):
     root = _package(tmp_path, source)
@@ -39,6 +47,8 @@ def test_new_bare_reader_and_aliases_fail_the_gate(tmp_path, capsys, source):
     "from lu_machinery.common import json_depth as j\nj.load(stream, max_depth=128)",
     "from lu_machinery.common.json_depth import raw_decode as read\nread(text, max_depth=512)",
     "from lu_machinery.common import json_depth\njson_depth.raw_decode(text, max_depth=512)",
+    "import json\nfrom lu_machinery.common import json_depth\njson_depth.raw_decode(text, max_depth=512, decoder=json.JSONDecoder())",
+    "import json\nfrom lu_machinery.common import json_depth\ndef r(text):\n d=json.JSONDecoder()\n return json_depth.raw_decode(text, max_depth=512, decoder=d)",
 ])
 def test_bounded_readers_and_only_the_helper_are_admitted(tmp_path, capsys, source):
     root = _package(tmp_path, source)

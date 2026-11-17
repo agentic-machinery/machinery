@@ -15,7 +15,11 @@ from pathlib import Path
 
 _HELPER = Path("common/json_depth.py")
 _BOUNDED = "lu_machinery.common.json_depth"
-_READERS = {"json.load", "json.loads", "json.JSONDecoder().decode", "json.JSONDecoder().raw_decode"}
+_READERS = {"json.load", "json.loads"}
+_INTERNAL_READERS = (
+    "json._default_decoder", "json.scanner", "json.decoder.scanstring",
+    "json.decoder.c_scanstring", "json.decoder.py_scanstring", "_json.make_scanner", "_json.scanstring",
+)
 
 
 def _name(node: ast.AST, names: dict[str, str]) -> str:
@@ -43,16 +47,17 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
         elif isinstance(node, ast.ImportFrom):
             for item in node.names:
                 names[item.asname or item.name] = f"{node.module}.{item.name}"
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    # Module aliases are safe to follow. Reader references and decoder classes
+    # cannot escape into aliases: the references themselves are checked below.
     assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
-    # Finite fixed point: each assignment can add a name once. No execution or
-    # inference of arbitrary function return values is needed for reader aliases.
     while True:
         added = False
         for node in assignments:
             if node.value is None:
                 continue
             value = _name(node.value, names)
-            if not value.startswith(("json.", "lu_machinery.common.json_depth")) and value != "json":
+            if value not in {"json", "json.decoder", _BOUNDED}:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
@@ -61,6 +66,43 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
                     added = True
         if not added:
             break
+
+    def bounded_decoder_argument(node: ast.AST) -> bool:
+        keyword = parents.get(node)
+        call = parents.get(keyword)
+        return (
+            isinstance(keyword, ast.keyword) and keyword.arg == "decoder"
+            and isinstance(call, ast.Call) and _name(call.func, names) == f"{_BOUNDED}.raw_decode"
+        )
+
+    allowed_constructors: set[ast.AST] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _name(node.func, names) != "json.JSONDecoder":
+            continue
+        if bounded_decoder_argument(node):
+            allowed_constructors.add(node.func)
+            continue
+        assignment = parents.get(node)
+        if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is not node:
+            continue
+        targets = assignment.targets if isinstance(assignment, ast.Assign) else [assignment.target]
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            continue
+        name = targets[0].id
+        scope: ast.AST = assignment
+        while scope in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            scope = parents[scope]
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(isinstance(binding, (ast.Global, ast.Nonlocal)) and name in binding.names
+               for binding in ast.walk(scope)):
+            continue
+        # Only the existing plain local binding idiom is admitted. A decoder
+        # may be consumed solely as decoder= on a bounded raw_decode call.
+        uses = [use for use in ast.walk(scope)
+                if isinstance(use, ast.Name) and use.id == name and isinstance(use.ctx, ast.Load)]
+        if uses and all(bounded_decoder_argument(use) for use in uses):
+            allowed_constructors.add(node.func)
     found: set[tuple[int, str]] = set()
     docstrings = {
         id(node.body[0].value)
@@ -74,6 +116,8 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
         name = _name(node, names)
         if isinstance(node, (ast.Attribute, ast.Name, ast.Call)) and (
             name in _READERS
+            or (name == "json.JSONDecoder" and node not in allowed_constructors)
+            or any(name == prefix or name.startswith(prefix + ".") for prefix in _INTERNAL_READERS)
             or (isinstance(node, ast.Attribute) and node.attr == "raw_decode" and name != f"{_BOUNDED}.raw_decode")
         ):
             found.add((node.lineno, "unbounded_json_reader: use lu_machinery.common.json_depth with max_depth"))

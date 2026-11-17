@@ -1131,7 +1131,7 @@ class _GhBroker:
         try:
             request = json_depth.loads(b"".join(chunks), max_depth=512)
             argv, environment = request["argv"], request.get("environment")
-        except (ValueError, KeyError, TypeError, AttributeError):
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
             argv = environment = None
         command, selected = gh_selection(argv, self.cwd, environment)
         refusal = (selected if command is None else None) or (None if self.gh else "gh is not installed on the host")

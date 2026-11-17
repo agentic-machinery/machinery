@@ -18,7 +18,6 @@ import sys
 import tempfile
 import time
 import zipfile
-from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
@@ -2580,6 +2579,14 @@ class StoreOnce(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+def loads(value: str) -> object:
+    """Bounded argparse JSON callback with the stdlib's stable diagnostic name."""
+    try:
+        return json_depth.loads(value, max_depth=512)
+    except RecursionError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def main(argv=None, *, runner=None):
     parser = PublisherParser(
         description="Publish GitHub changes through closed, scanned fields.\nUse for public writes; raw gh reads use native CLI arguments.",
@@ -2850,7 +2857,7 @@ def main(argv=None, *, runner=None):
             elif kind in {"number", "count"}:
                 kwargs["type"] = int
             if kind == "workflow_inputs":
-                kwargs["type"] = partial(json_depth.loads, max_depth=512)
+                kwargs["type"] = loads
             if kind in ENUMS:
                 kwargs["choices"] = sorted(ENUMS[kind])
             sub.add_argument("--" + key.replace("_", "-"), **kwargs)
@@ -2905,7 +2912,7 @@ def main(argv=None, *, runner=None):
     for key in ("branches", "cursors", "body_roots", "numbers", "batch"):
         read_parser.add_argument(
             "--" + key.replace("_", "-"),
-            type=partial(json_depth.loads, max_depth=512),
+            type=loads,
             default=argparse.SUPPRESS,
             help=f"{key} as JSON; omitted by default",
         )

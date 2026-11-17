@@ -163,6 +163,7 @@ KNOWLEDGE_MANIFEST_URL = "/api/knowledge/manifest"
 
 # Record-id shape — mirrors the JSON Schema ``slug`` pattern. Used to reject
 # traversal/slash/junk ids before any registry lookup.
+# nosemgrep: python.lang.security.audit.regex_dos -- hyphen separators are disjoint from the alphanumeric runs.
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 # Test/consumer seam: override the live repo root without importing the API config.
