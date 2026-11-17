@@ -14,6 +14,7 @@ and a short detail. It does not record response bodies.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.client
 import importlib.util
 import json
@@ -99,10 +100,8 @@ def _product_route_file() -> Path | None:
     configured = os.environ.get(PRODUCT_ROOT_ENV, "")
     if configured:
         candidates.append(Path(configured))
-    try:
+    with contextlib.suppress(ProductRootError):
         candidates.append(product_root())
-    except ProductRootError:
-        pass
     primary = os.environ.get(PRIMARY_ROOT_ENV, "")
     if primary:
         candidates.append(Path(primary))
