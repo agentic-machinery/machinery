@@ -11,10 +11,12 @@ from typing import Any
 
 from lu_machinery.common.repo_root import state_root
 
-# Keep one version per path, including foreign-file classifications. The bound
-# covers the historical inventory without retaining an unbounded number of runs.
+# Keep one version per path, including foreign-file classifications. Entry and
+# content caps bound retention; an evicted version is an ordinary cache miss.
 TASK_RECORD_CACHE_MAX_ENTRIES = 65_536
-TASK_RECORD_CACHE_MAX_BYTES = 64 * 1024 * 1024
+# Smallest power-of-two budget that retains the measured 163 MB working fixture.
+# Candidate-file bytes also include foreign data; do not size to that whole inventory.
+TASK_RECORD_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _RecordStamp = tuple[int, int, int, int, int]
 _record_cache: OrderedDict[str, tuple[_RecordStamp, dict[str, Any] | None | ValueError, int]] = OrderedDict()
 _record_cache_lock = threading.Lock()
