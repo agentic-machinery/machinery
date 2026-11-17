@@ -277,10 +277,14 @@ def registered_histories(tmp_path, monkeypatch, configured_roots):
     from tests.ai_agent_bridge.review_target_git import _git, _init_repo, _publish_pr_branch
 
     # The dispatcher resolves the default repository to the product checkout and every other
-    # repository to ``<local_name>`` beside the state primary (#107), so the sibling history is
-    # placed beside the configured primary, under a name unique to this test.
-    sibling = f"{tmp_path.name}-infra-private"
-    places = {"public": tmp_path / "public", "infra-private": configured_roots.primary.parent / sibling}
+    # repository to ``<local_name>`` beside the state primary (#107). The primary and the
+    # sibling live in this test's tmp: a name beside the shared primary survives retention
+    # and collides when the next case reuses the same numbered tmp directory.
+    state = tmp_path / "state-primary"
+    state.mkdir()
+    _git(state, "init", "-q", "-b", "trunk")
+    sibling = "infra-private"
+    places = {"public": tmp_path / "public", "infra-private": state.parent / sibling}
     roots, heads = {}, {}
     for key, slug in (("public", "example/public"), ("infra-private", "example/sibling")):
         seed = tmp_path / (key + "-seed")
@@ -311,7 +315,10 @@ def registered_histories(tmp_path, monkeypatch, configured_roots):
         lambda relative: config if relative == "config/fleet_repos.yaml" else packaged(relative),
     )
     # The PR target is the product checkout, as ``_cli.REPO_ROOT`` was in learn-ukrainian.
+    # The module fixture's shared primary is replaced for this test only.
+    assert state != configured_roots.primary
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(roots["public"]))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(state))
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     return roots, heads
 

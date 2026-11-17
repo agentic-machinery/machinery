@@ -471,13 +471,21 @@ def test_guard_resolves_from_release_without_product_copy(monkeypatch, capsys, s
 
 @pytest.fixture(autouse=True)
 def secret_print_product(tmp_path, monkeypatch):
-    """Select a product checkout that has no guard copy: the adapter must run the release's guard."""
+    """Select a product checkout that has no guard copy: the adapter must run the release's guard.
+
+    The checkout is also the primary and state root for this test. Both leave the
+    environment when the test ends, so retention can remove the directory.
+    """
     product = tmp_path / "guard-product"
     product.mkdir()
     # A primary checkout: the adapter validates its hook context by the shared root rule.
     # A minimal environment: pytest's PYTEST_CURRENT_TEST can exceed the per-argument limit.
     git_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"}
     subprocess.run(["git", "init", "-q", str(product)], check=True, capture_output=True, env=git_env)
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
-    monkeypatch.setitem(NATIVE_ENV, "LU_PRODUCT_ROOT", str(product))
+    # The hook resolver keeps a configured primary. Point it at this test's checkout and
+    # let monkeypatch remove it with the test: a previous passed test's tmp must not remain
+    # the process primary after retention deletes that directory.
+    for name in ("LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_STATE_ROOT"):
+        monkeypatch.setenv(name, str(product))
+        monkeypatch.setitem(NATIVE_ENV, name, str(product))
     return product
