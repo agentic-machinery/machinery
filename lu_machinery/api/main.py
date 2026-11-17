@@ -1866,15 +1866,39 @@ async def serve_static(path: str, request: Request, ctx: MonitorContext = Depend
 _HTTP_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
 
 
+def _route_label(path: object) -> str | None:
+    """A route template safe to use as one Prometheus label, or none."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        return None
+    if '"' in path or "\n" in path or "\r" in path:
+        return None
+    return path
+
+
 def _route_template(scope: Scope) -> str:
-    """Return the matched route template, never the request path or query."""
+    """Return the matched route template, never the request path or query.
+
+    ``scope["route"]`` is the route as declared on its own router. For an
+    included router that path is only the suffix, so ``/api/delegate/tasks/{task_id}``
+    and ``/api/coordination/tasks/{task_id}`` would share ``/tasks/{task_id}``.
+    FastAPI stores this match's prefixed template on
+    ``scope["fastapi"]["effective_route_context"]``. That object is the match,
+    not the first mount of the route: ``/artifacts`` and ``/files`` include the
+    same router. The request path is never a label; a path parameter would
+    make the series unbounded. A match with no usable template is ``unmatched``.
+    """
     metrics_path = PrometheusMetricsMiddleware.METRICS_PATH
     if scope.get("method") == "GET" and scope.get("path") == metrics_path:
         return metrics_path
-    route = scope.get("route")
-    path = getattr(route, "path", None)
-    if isinstance(path, str) and path.startswith("/") and '"' not in path and "\n" not in path and "\r" not in path:
-        return path
+    fastapi_scope = scope.get("fastapi")
+    if isinstance(fastapi_scope, dict):
+        effective = fastapi_scope.get("effective_route_context")
+        labeled = _route_label(getattr(effective, "path", None))
+        if labeled is not None:
+            return labeled
+    labeled = _route_label(getattr(scope.get("route"), "path", None))
+    if labeled is not None:
+        return labeled
     return "unmatched"
 
 
@@ -1907,9 +1931,10 @@ class PrometheusMetricsMiddleware:
     Exposition is pinned to Prometheus text 0.0.4
     (``text/plain; version=0.0.4; charset=utf-8``). ``Accept`` is removed
     before ``prometheus_client.make_asgi_app`` builds the body, so every
-    response uses that content type. Metric names, labels, and counting are
-    unchanged. The process still binds the existing loopback listener; this
-    adds no socket.
+    response uses that content type. Metric names and counting are unchanged.
+    The route label is the full matched template (router prefix included),
+    never the request path. The process still binds the existing loopback
+    listener; this adds no socket.
 
     ``METRICS_PATH`` is the path the route inventory records with FastAPI's
     framework routes. Those paths are served and are outside the OpenAPI
