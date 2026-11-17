@@ -1265,3 +1265,50 @@ def test_load_pull_request_comments_reads_identity_and_flattens_pages(tmp_path, 
     assert login == "fleet"
     assert [row["html_url"] for row in rows] == ["https://example.test/1", "https://example.test/2"]
     assert seen == ["read-identity", "read-comments"]
+
+
+def test_checklist_edit_is_judged_with_the_merge_base_copy(tmp_path):
+    """Defect class: a PR edits the reliability checklist that selects its own review items.
+
+    The head drops the base's item and adds its own; the brief must still carry the base item,
+    name the merge-base as the checklist source, and add the judge-change item.
+    """
+    repo = _init_repo(tmp_path)
+    checklist = repo / "lu_machinery" / "config" / "reliability_checklist.yaml"
+    checklist.parent.mkdir(parents=True)
+    base_text = (
+        "version: 1\nitems:\n"
+        "  - id: base-item\n    area: rules-skills-policy\n    check: Does the base question get asked?\n"
+        "    incident: base\n"
+        "    triggers:\n      - paths: [app.py]\n"
+    )
+    checklist.write_text(base_text, encoding="utf-8")
+    (checklist.parent / "code_owners.yaml").write_text(
+        "version: 1\nmain_owner: cto\nareas:\n"
+        "  - area: rules-skills-policy\n    owner: policy-owner\n    paths: [lu_machinery/config/**]\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "checklist")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "-b", "feature")
+    checklist.write_text(base_text.replace("base-item", "head-item").replace("app.py", "other.py"), encoding="utf-8")
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "edit the checklist and app.py")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    state_file = tmp_path / "state.json"
+
+    result = _run_cli(state_file, "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["merge_base"] == base
+    assert report["checklist_source"]["kind"] == "merge-base"
+    assert report["checklist_source"]["commit"] == base
+    assert report["judge_files_changed"] == ["lu_machinery/config/reliability_checklist.yaml"]
+    assert [item["id"] for item in report["matched"]] == ["judge-change", "base-item"]
+    assert "head-item" not in report["brief_section"]
+    assert "**base-item**" in report["brief_section"]
+    assert report["code_owners"]["source"]["kind"] == "merge-base"
+    assert report["code_owners"]["unmapped"] == ["app.py"]
+    assert not state_file.exists()

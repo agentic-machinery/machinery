@@ -203,6 +203,10 @@ read-only dispatch (#8703, above).
    [`review-loop`'s Reply format](../../review-loop/references/brief.md#reply-format),
    included verbatim in the brief. That section alone defines the literal reply lines and
    how a structured findings request refers to the canonical schema.
+8. **Reliability checklist** — the `brief_section` that `closeout_cli checklist` prints for
+   this round's exact head, verbatim: the checklist items the diff triggers, the owner of
+   every area it touches, and the rule that judge inputs are read from the merge-base
+   ([`review-loop` brief](../../review-loop/references/brief.md#judge-inputs-come-from-the-merge-base)).
 
 Every review brief requires the verdict and supporting evidence in the result text.
 Workers write additional artifacts under their own worktrees. Dispatch v2 does not
