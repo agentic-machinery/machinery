@@ -205,30 +205,18 @@
    }
   },
   "data-tier": {
-   "title": "Data-tier runner on one synthetic product test, no GitHub report",
+   "title": "Data-tier runner logic: audited selection, known-failure baseline and JUnit summary over a real pytest run",
    "mocks": [
-    "product-root",
-    "stub-systemctl"
+    "product-root"
    ],
    "argv": [
     "{py}",
     "-I",
-    "-m",
-    "lu_machinery.ci.data_tier",
-    "run",
-    "--no-report",
-    "--only",
-    "tests/test_drill_data.py"
+    "{kit}/probes.py",
+    "data-tier"
    ],
-   "cwd": "{product}",
    "expect": {
-    "rc": [
-     0,
-     1
-    ],
-    "stdout_re": [
-     "\"run_key\""
-    ],
+    "rc": 0,
     "machinery_loaded": true
    },
    "timeout": 300
@@ -536,23 +524,21 @@
    "timeout": 180
   },
   "tmp-sweep": {
-   "title": "Temp sweep and batch_state retention report over the mock state root",
+   "title": "Temp sweep (dry run) and batch_state retention report over the synthetic state root",
    "mocks": [
     "product-root"
    ],
    "argv": [
-    "bash",
-    "-c",
-    "set -e; '{py}' -I -m lu_machinery.hygiene.tmp_sweep --temp-root '{scratch}/tmp' --task-root '{product}/batch_state/tasks' --state-dir '{scratch}/sweep' --json; '{py}' -I -m lu_machinery.hygiene.batch_state_retention --batch-root '{product}/batch_state' --json"
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "tmp-sweep"
    ],
    "expect": {
     "rc": 0,
-    "stdout_re": [
-     "\"mode\": \"dry-run\"",
-     "batch-state-staleness.v1"
-    ],
     "machinery_loaded": true
-   }
+   },
+   "timeout": 180
   },
   "stale-records": {
    "title": "Stale task-record archive on a private copy: exactly the two old terminal records move",
@@ -1127,7 +1113,7 @@
    "kind": "scheduled-user-service",
    "class": "mock",
    "probe": "data-tier",
-   "summary": "Data-tier runner on one synthetic product test, no GitHub report"
+   "summary": "Data-tier runner logic: audited selection, known-failure baseline and JUnit summary over a real pytest run"
   },
   {
    "id": "R014",
@@ -2009,7 +1995,7 @@
    "kind": "scheduled-user-service",
    "class": "mock",
    "probe": "tmp-sweep",
-   "summary": "Temp sweep and batch_state retention report over the mock state root"
+   "summary": "Temp sweep (dry run) and batch_state retention report over the synthetic state root"
   },
   {
    "id": "R140",

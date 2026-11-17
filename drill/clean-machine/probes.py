@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 import uuid
@@ -627,7 +628,7 @@ def git_hooks(_: list[str]) -> tuple[bool, dict]:
         "    hooks:\n"
         "      - id: machinery-no-bare-python\n"
         "        name: machinery check_no_bare_python (release)\n"
-        f"        entry: {PY} -I -m lu_machinery.pre_commit.check_no_bare_python --files\n"
+        f"        entry: {json.dumps(shlex.quote(PY) + ' -I -m lu_machinery.pre_commit.check_no_bare_python --files')}\n"
         "        language: system\n"
         "        files: \\.(sh|md)$\n"
         "      - id: product-marker\n"
@@ -872,6 +873,91 @@ def no_machinery_checkout(_: list[str]) -> tuple[bool, dict]:
             if "site-packages" not in marker.parts:
                 found.append(str(marker))
     return not found, {"checkouts": found[:5]}
+
+
+@probe("data-tier")
+def data_tier(_: list[str]) -> tuple[bool, dict]:
+    """The data-tier runner's own selection, baseline and JUnit logic over a real pytest run.
+
+    The full runner needs a production host (a 6 GiB memory floor, the dispatch slice, real data
+    stores mounted read-only, systemd scopes); this probe drives the same functions the runner
+    uses on the synthetic product's audited selection: one passing test and one known failure.
+    """
+    from lu_machinery.ci import data_tier as runner
+
+    checkout = Path(product())
+    selection, _digest = runner.load_selection(checkout)
+    baseline = runner.load_known_failures(checkout)
+    junit = scratch() / "junit.xml"
+    result = run(
+        [
+            PY,
+            "-I",
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"--junitxml={junit}",
+            *selection["files"],
+        ],
+        cwd=product(),
+    )
+    summary = runner.junit_summary(junit) if junit.exists() else {}
+    summary["pytest_exit"] = result.returncode
+    failing = summary.get("failing_tests", [])
+    issues = [runner.known_issue(nodeid, baseline) for nodeid in failing]
+    ok = (
+        (summary.get("ran"), summary.get("passed"), summary.get("failed")) == (2, 1, 1)
+        and failing == [selection["nodeids"][1]]
+        and issues == [1]
+        and runner.run_failed(summary)
+    )
+    return ok, {
+        "summary": {
+            k: summary.get(k) for k in ("ran", "passed", "failed", "pytest_exit")
+        },
+        "failing": failing,
+        "known_issues": issues,
+    }
+
+
+@probe("tmp-sweep")
+def tmp_sweep(_: list[str]) -> tuple[bool, dict]:
+    """Temp sweep (dry run) and batch_state retention report over the synthetic state root."""
+    sweep = module(
+        "lu_machinery.hygiene.tmp_sweep",
+        "--temp-root",
+        str(scratch() / "tmp"),
+        "--task-root",
+        str(Path(product()) / "batch_state" / "tasks"),
+        "--state-dir",
+        str(scratch() / "sweep"),
+        "--json",
+    )
+    retention = module(
+        "lu_machinery.hygiene.batch_state_retention",
+        "--batch-root",
+        str(Path(product()) / "batch_state"),
+        "--json",
+    )
+    try:
+        mode = json.loads(sweep.stdout).get("mode")
+        schema = json.loads(retention.stdout).get("schema")
+    except ValueError:
+        mode = schema = None
+    ok = (
+        sweep.returncode == 0
+        and retention.returncode == 0
+        and mode == "dry-run"
+        and schema == "batch-state-staleness.v1"
+    )
+    return ok, {
+        "sweep_rc": sweep.returncode,
+        "mode": mode,
+        "retention_rc": retention.returncode,
+        "schema": schema,
+    }
 
 
 @probe("wake-watch")

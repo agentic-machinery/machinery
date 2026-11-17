@@ -37,6 +37,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -164,8 +165,12 @@ def base_env(home: Path) -> dict[str, str]:
     machine-wide one that could name another index or carry credentials.
     """
     tmp = home.parent / "setup-tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
+    scratch_root = home.parent / "scratchroot"
+    for path in (tmp, scratch_root):
+        path.mkdir(parents=True, exist_ok=True)
     return {
+        "LU_SCRATCH_ROOT": str(scratch_root),
+        "LU_RUNTIME_TMP_BASE_ROOT": str(scratch_root),
         "HOME": str(home),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "LANG": "C.UTF-8",
@@ -645,9 +650,16 @@ def write_stubs(world: Path, base_python: str) -> Path:
     bindir.mkdir(parents=True, exist_ok=True)
     state.mkdir(parents=True, exist_ok=True)
     (state / "answers.json").write_text(json.dumps(stub_answers(world), indent=1))
+    libdir = world / "stubs" / "lib"
+    libdir.mkdir(parents=True, exist_ok=True)
     for tool in STUB_TOOLS:
+        body = libdir / f"{tool}.py"
+        body.write_text(STUB_SOURCE.format(tool=tool))
+        # A POSIX sh launcher, not a shebang on the interpreter: any path, spaces included, works.
         path = bindir / tool
-        path.write_text(f"#!{base_python} -I\n" + STUB_SOURCE.format(tool=tool))
+        path.write_text(
+            f'#!/bin/sh\nexec {shlex.quote(base_python)} -I {shlex.quote(str(body))} "$@"\n'
+        )
         path.chmod(0o755)
     return bindir
 
@@ -775,7 +787,28 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
     )
     (product / "tests").mkdir()
     (product / "tests" / "test_drill_data.py").write_text(
-        "def test_drill_data_tier_runs():\n    assert 'мова'.isalpha()\n"
+        "def test_drill_data_tier_runs():\n    assert 'мова'.isalpha()\n\n\n"
+        "def test_drill_known_failure():\n    assert 'мова' == 'language', 'known failure, tracked as issue 1'\n"
+    )
+    (product / "scripts" / "ci").mkdir()
+    nodeids = [
+        "tests/test_drill_data.py::test_drill_data_tier_runs",
+        "tests/test_drill_data.py::test_drill_known_failure",
+    ]
+    (product / "scripts" / "ci" / "data_tier_selection.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "nodeids": nodeids,
+                "files": ["tests/test_drill_data.py"],
+                "class_c_merge_group": 2,
+            },
+            indent=1,
+        )
+        + "\n"
+    )
+    (product / "scripts" / "ci" / "data_tier_known_failures.json").write_text(
+        json.dumps({"known_failures": {nodeids[1]: 1}}, indent=1) + "\n"
     )
     tasks = product / "batch_state" / "tasks"
     tasks.mkdir(parents=True)
@@ -840,7 +873,7 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
         FIXTURES / "vesum-sample.tsv", world / "fixtures" / "vesum-standin.tsv"
     )
     (world / "tmp").mkdir()
-    (world / "scratchroot").mkdir()
+    (world / "scratchroot").mkdir(exist_ok=True)
     opencode = home / ".local" / "share" / "opencode"
     opencode.mkdir(parents=True)
     import sqlite3
@@ -1469,7 +1502,7 @@ def bwrap_usable() -> bool:
 
 def interpreter_roots(base_python: str) -> list[str]:
     """Directories the selected base interpreter needs: its executable's directory and its prefixes."""
-    script = "import os, sys; print(os.path.realpath(sys.base_prefix)); print(os.path.realpath(sys.base_exec_prefix))"
+    script = "import json, os, sys; print(json.dumps([os.path.realpath(sys.base_prefix), os.path.realpath(sys.base_exec_prefix)]))"
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         [
             base_python,
@@ -1482,7 +1515,10 @@ def interpreter_roots(base_python: str) -> list[str]:
         text=True,
         timeout=60,
     )
-    roots = {str(Path(os.path.realpath(base_python)).parent), *result.stdout.split()}
+    roots = {
+        str(Path(os.path.realpath(base_python)).parent),
+        *json.loads(result.stdout),
+    }
     return sorted(roots)
 
 
