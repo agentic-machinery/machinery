@@ -66,6 +66,7 @@ from .state_helpers import (
     cache_get_or_compute,
     cache_get_or_compute_async,
     cache_get_stored,
+    cache_read_swr,
     ctx_scoped_ttl_key,
     schedule_cache_refresh,
 )
@@ -2524,6 +2525,20 @@ async def routing_budget(
     return _routing_budget_response(payload)
 
 
+def dispatch_routing_budget(ctx: MonitorContext) -> dict[str, Any]:
+    """The dispatch routing budget from the route's own cache entry.
+
+    Orient's ``capacity`` section reads the value ``GET /api/state/routing-budget``
+    and its startup warmup store, so the budget is computed once for both.
+    """
+    _observed, value = cache_get_or_compute(
+        _ctx_cache_key(ctx, "routing-budget", "dispatch", 0),
+        ROUTING_BUDGET_TTL_S,
+        _routing_budget_compute(ctx, "dispatch", False),
+    )
+    return value
+
+
 def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
     diagnostics = payload.get("diagnostics", {})
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
@@ -2531,15 +2546,18 @@ def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
     ))
 
 
+GITHUB_BUDGET_TTL_S = 60.0
+
+
 @router.get("/github-budget")
 async def github_budget():
-    """Return a shared, one-minute cached GraphQL rateLimit observation."""
-    return await asyncio.to_thread(
-        cache_get_or_compute,
-        "github_graphql_budget",
-        60.0,
-        probe_graphql_budget,
-    )
+    """Return a shared, one-minute GraphQL rateLimit observation; ``checked_at`` names its time.
+
+    An expired reading is served at once with its true age (``X-Snapshot-Age-S``)
+    while one refresh asks GitHub again.
+    """
+    value, age = await cache_read_swr("github_graphql_budget", GITHUB_BUDGET_TTL_S, probe_graphql_budget)
+    return JSONResponse(content=value, headers=panel_values.snapshot_headers(age, GITHUB_BUDGET_TTL_S))
 
 
 _state_scan_warm_lock = threading.Lock()
@@ -2622,54 +2640,59 @@ async def manifest(request: Request, ctx: MonitorContext = Depends(get_ctx)):
     state to one tiny call.
     """
     session_id = session_id_from_request(request)
-    body = {
-        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "rules": {
-            "hash": rules_hash(project_root=ctx.roots.project_root),
-            "url": "/api/rules?format=markdown",
-            "format": "markdown",
-            "note": "Binding core (at most 40 KB). Load additional rules through task scopes.",
-        },
-        # Scoped rules carry their own hash; content = core + curriculum addendum.
-        "rules_core": {
-            "hash": rules_hash(project_root=ctx.roots.project_root, scope="core"),
-            "url": "/api/rules?scope=core&format=markdown",
-        },
-        "rules_content": {
-            "hash": rules_hash(project_root=ctx.roots.project_root, scope="content"),
-            "url": "/api/rules?scope=content&format=markdown",
-        },
-        "session": {
-            "hash": session_hash(project_root=ctx.roots.project_root),
-            "url": "/api/session/current?agent=orchestrator&format=markdown",
-            "format": "markdown",
-            "note": "Current.md + recent session-state handoff filenames.",
-        },
-        "orient": {
-            "url": "/api/orient",
-            "fresh_param": "?fresh=true",
-            "note": "Per-section TTL cache + meta. Most agents only need the sections whose TTL has elapsed.",
-        },
-        "inbox": {
-            "url_template": "/api/comms/inbox?agent={name}",
-            "note": "Read-only view of unread channel deliveries for one agent.",
-        },
-        "activity": {
-            "url": "/api/comms/agent-activity",
-            "note": "Compact channel delivery/event snapshot for orchestration.",
-        },
-        "capacity": {
-            "url": "/api/state/routing-budget",
-            "note": "Per-agent capacity burn, in-flight counts, health, and routing recommendations.",
-        },
-    }
-    # ADR-011 P2: compact {hash, url} research pointer, present only when the
-    # research-registry kill switch is on and the registry is exposable. Absent
-    # otherwise, preserving the exact pre-P2 manifest for existing clients.
-    research = research_manifest_component()
-    if research is not None:
-        body["research"] = research
-    # A session-bound manifest is the canonical context-discipline
-    # measurement path. Unlike cosmetic response footers, it must not depend
-    # on an environment variable inherited by the long-lived Monitor daemon.
-    return add_json_telemetry(body, session_id=session_id, force=session_id is not None)
+
+    # The hashes read the rules and session files; keep that disk work off the event loop.
+    def build() -> Any:
+        body = {
+            "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "rules": {
+                "hash": rules_hash(project_root=ctx.roots.project_root),
+                "url": "/api/rules?format=markdown",
+                "format": "markdown",
+                "note": "Binding core (at most 40 KB). Load additional rules through task scopes.",
+            },
+            # Scoped rules carry their own hash; content = core + curriculum addendum.
+            "rules_core": {
+                "hash": rules_hash(project_root=ctx.roots.project_root, scope="core"),
+                "url": "/api/rules?scope=core&format=markdown",
+            },
+            "rules_content": {
+                "hash": rules_hash(project_root=ctx.roots.project_root, scope="content"),
+                "url": "/api/rules?scope=content&format=markdown",
+            },
+            "session": {
+                "hash": session_hash(project_root=ctx.roots.project_root),
+                "url": "/api/session/current?agent=orchestrator&format=markdown",
+                "format": "markdown",
+                "note": "Current.md + recent session-state handoff filenames.",
+            },
+            "orient": {
+                "url": "/api/orient",
+                "fresh_param": "?fresh=true",
+                "note": "Per-section TTL cache + meta. Most agents only need the sections whose TTL has elapsed.",
+            },
+            "inbox": {
+                "url_template": "/api/comms/inbox?agent={name}",
+                "note": "Read-only view of unread channel deliveries for one agent.",
+            },
+            "activity": {
+                "url": "/api/comms/agent-activity",
+                "note": "Compact channel delivery/event snapshot for orchestration.",
+            },
+            "capacity": {
+                "url": "/api/state/routing-budget",
+                "note": "Per-agent capacity burn, in-flight counts, health, and routing recommendations.",
+            },
+        }
+        # ADR-011 P2: compact {hash, url} research pointer, present only when the
+        # research-registry kill switch is on and the registry is exposable. Absent
+        # otherwise, preserving the exact pre-P2 manifest for existing clients.
+        research = research_manifest_component()
+        if research is not None:
+            body["research"] = research
+        # A session-bound manifest is the canonical context-discipline
+        # measurement path. Unlike cosmetic response footers, it must not depend
+        # on an environment variable inherited by the long-lived Monitor daemon.
+        return add_json_telemetry(body, session_id=session_id, force=session_id is not None)
+
+    return await asyncio.to_thread(build)

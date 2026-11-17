@@ -39,6 +39,7 @@ from lu_machinery.orchestration import codex_transport_health
 from . import account_logins, panel_values, subscriptions
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
+from .state_helpers import swr_route
 
 router = APIRouter(tags=["runtime"])
 
@@ -780,6 +781,10 @@ def _routing_assignment_item(record: dict[str, Any]) -> dict[str, Any]:
 
 
 _ROUTING_ACTIVE_STATES = frozenset({"reserved", "running"})
+# Served stale-while-revalidate: a read gets the last projection at once and
+# an older one queues a single refresh (``state_helpers.swr_route``).
+ROUTING_ASSIGNMENTS_TTL_S = 15.0
+ACP_CONVERSATIONS_TTL_S = 15.0
 # Matches the dashboard's STALE_ACTIVITY_MS (45 minutes) so the API and the
 # page agree on when a loaded window no longer counts as recent.
 _ROUTING_WINDOW_STALE_AFTER_S = 45 * 60
@@ -1486,12 +1491,13 @@ async def runtime_usage(
 
 
 @router.get("/acp/conversations")
-async def runtime_acp_conversations(
+@swr_route("runtime-acp-conversations", ACP_CONVERSATIONS_TTL_S, vary=("limit",))
+def runtime_acp_conversations(
     limit: int = Query(50, ge=1, le=100),
     ctx: MonitorContext = Depends(get_ctx),
 ):
-    """Read only, allowlisted summaries of persisted ACP conversations."""
-    return await asyncio.to_thread(list_acp_conversations, limit=limit, ctx=ctx)
+    """Read only, allowlisted summaries of persisted ACP conversations, with their true age."""
+    return list_acp_conversations(limit=limit, ctx=ctx)
 
 
 @router.get("/acp/conversations/{conversation_id}")
@@ -1550,11 +1556,12 @@ async def runtime_recent(limit: int = Query(50, ge=1, le=500), ctx: MonitorConte
 
 
 @router.get("/routing-assignments")
-async def runtime_routing_assignments(
+@swr_route("runtime-routing-assignments", ROUTING_ASSIGNMENTS_TTL_S, vary=("limit",))
+def runtime_routing_assignments(
     limit: int = Query(100, ge=1, le=100), ctx: MonitorContext = Depends(get_ctx)
 ):
-    """Read-only routing authority decisions and their actual plane posture."""
-    return await asyncio.to_thread(list_routing_assignments, limit=limit, ctx=ctx)
+    """Read-only routing authority decisions and their actual plane posture, with their true age."""
+    return list_routing_assignments(limit=limit, ctx=ctx)
 
 
 @router.get("/transport-health")

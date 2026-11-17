@@ -168,3 +168,51 @@ def test_active_dispatch_worktree_is_protected(tmp_path: Path, monkeypatch) -> N
     protected = {worktree.branch: worktree for worktree in result.protected_worktrees}
     assert protected["codex/active-dispatch-merged"].reason == "active dispatch (matches .worktrees/dispatch/**)"
     assert "codex/active-dispatch-merged" not in {worktree.branch for worktree in result.removable_worktrees}
+
+
+def test_git_cleanup_reuses_cherry_answers_until_a_tip_moves(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: a stale ``fully_merged_to_main`` after ``main`` or a branch moves, ``git cherry``
+    re-run for every unchanged branch on each report, or a git failure remembered as "not merged"."""
+    main_tip = ["m1"]
+    asked: list[str] = []
+    answers: dict[str, bool | None] = {"a": True, "b": False}
+
+    def run_git(args: list[str], *, cwd: Path, **_kwargs: object) -> tuple[int, str, str]:
+        assert args[:1] == ["rev-parse"], args
+        return 0, f"{main_tip[0]}\n", ""
+
+    def answer(branch: str, cwd: Path) -> bool | None:
+        asked.append(branch)
+        return answers[branch]
+
+    monkeypatch.setattr(git_hygiene_router, "_run_git", run_git)
+    monkeypatch.setattr(git_hygiene_router, "_merged_to_main_answer", answer)
+    monkeypatch.setattr(git_hygiene_router, "_merged_memo", {})
+    branches = [{"name": "a", "_full_sha": "a1"}, {"name": "b", "_full_sha": "b1"}]
+
+    def merged() -> dict[str, bool]:
+        return git_hygiene_router._branches_merged_to_main(branches, tmp_path)
+
+    assert merged() == {"a": True, "b": False}
+    assert sorted(asked) == ["a", "b"]
+    asked.clear()
+    assert merged() == {"a": True, "b": False}
+    assert asked == []
+
+    branches[1] = {"name": "b", "_full_sha": "b2"}
+    answers["b"] = True
+    assert merged() == {"a": True, "b": True}
+    assert asked == ["b"]
+    asked.clear()
+
+    main_tip[0] = "m2"
+    answers["a"] = False
+    assert merged() == {"a": False, "b": True}
+    assert sorted(asked) == ["a", "b"]
+    asked.clear()
+
+    answers["a"] = None  # git could not answer: reported not merged, asked again next time
+    branches[0] = {"name": "a", "_full_sha": "a2"}
+    assert merged() == {"a": False, "b": True}
+    assert merged() == {"a": False, "b": True}
+    assert asked == ["a", "a"]

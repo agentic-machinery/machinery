@@ -38,7 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import lu_machinery.github_rest_cache as github_rest
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
-from lu_machinery.common.repo_root import ProductRootError, machinery_path
+from lu_machinery.common.repo_root import ProductRootError
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.guardrails import worktree_containment
@@ -317,7 +317,7 @@ def _machinery_version() -> str | None:
 # the sync collectors run via ``asyncio.to_thread`` the hard timeout is
 # advisory — Python threads are not cancellable once started. Real
 # protection per sync collector:
-#   - ``git``, ``issues``     — subprocess timeout 2 s (``_run_command``)
+#   - ``git``                — subprocess timeout 2 s (``_run_command``)
 #   - ``runtime``, ``wiki``, ``session_hints``
 #                            — pure-Python / filesystem, no inner
 #                              timeout; they rely on being cheap.
@@ -327,6 +327,8 @@ def _machinery_version() -> str | None:
 #                              / canaries never pin the lean gather.
 #   - ``delegate``, ``rollovers`` — cache-first detached worker (#10866); a hung
 #                              collector must not pin the lean gather.
+#   - ``issues``             — cache-first detached worker; a full orient after
+#                              the 120 s TTL no longer waits on ``gh``.
 # If a sync collector ever starts to block (e.g. a network FS hang), it
 # will tie up a threadpool slot past the hard timeout. See
 # MONITOR-API.md for the full breakdown.
@@ -416,13 +418,18 @@ _ORIENT_SYNC_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="orient-sync",
 )
 
-# Lean ``capacity``, ``health``, ``delegate``, and ``rollovers`` are cache-first
-# and detached: CodexBar, integrity canaries, and hung delegate/rollover
-# collectors must not pin ``asyncio.gather`` at the 5 s section wall
-# (#6983, #10866). A short join lets cheap (test) collectors populate the
-# same request; a live hang returns fallback immediately after this wait.
-DETACHED_ORIENT_SECTION_KEYS: frozenset[str] = frozenset({"capacity", "health", "delegate", "rollovers"})
+# Lean ``capacity``, ``health``, ``delegate``, ``rollovers`` and the full
+# orient's ``issues`` are cache-first and detached: CodexBar, integrity
+# canaries, GitHub, and hung delegate/rollover collectors must not pin
+# ``asyncio.gather`` at the 5 s section wall (#6983, #10866). A short join lets
+# cheap (test) collectors populate the same request; a live hang returns
+# fallback immediately after this wait.
+DETACHED_ORIENT_SECTION_KEYS: frozenset[str] = frozenset({"capacity", "health", "delegate", "rollovers", "issues"})
 DETACHED_ORIENT_INLINE_WAIT_S = 0.4
+# A full orient after a quiet spell wakes every detached section at once. At
+# most two collect at a time; together they would starve request threads of
+# the GIL (one cold health canary alone is ~14 s of CPU).
+_DETACHED_ORIENT_COLLECT_SLOTS = threading.BoundedSemaphore(2)
 ORIENT_REFRESH_INTERVAL_S = 10.0
 _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
@@ -842,7 +849,8 @@ def _run_detached_orient_refresh(
 ) -> None:
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     try:
-        value = collector()
+        with _DETACHED_ORIENT_COLLECT_SLOTS:
+            value = collector()
         generated_at = _isoformat_z(datetime.now(UTC))
         if ttl > 0:
             cache_set(cache_key, (value, generated_at))
@@ -990,14 +998,7 @@ def _collect_delegate_orient_data(ctx: MonitorContext | None = None) -> dict:
 
 
 def _collect_capacity_orient_data(ctx: MonitorContext | None = None) -> dict:
-    resolved_ctx = resolve_context(ctx)
-    budget = state_api.compute_routing_budget(
-        budget_config_path=machinery_path("config/agent_budgets.yaml"),
-        tasks_dir=resolved_ctx.roots.batch_state_dir / "tasks",
-        project_root=resolved_ctx.roots.project_root,
-        curriculum_root=resolved_ctx.roots.curriculum_root,
-        batch_state_dir=resolved_ctx.roots.batch_state_dir,
-    )
+    budget = state_api.dispatch_routing_budget(resolve_context(ctx))
     lanes_summary = {}
     agents = budget.get("agents", {})
     in_flight = budget.get("in_flight", {})

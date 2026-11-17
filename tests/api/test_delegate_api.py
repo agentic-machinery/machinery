@@ -265,7 +265,8 @@ def test_task_cache_drops_records_that_left_the_hot_directory(tmp_path, monkeypa
     archived_path = str(tasks_dir / "archive" / "gone.json")
 
     # The archived record keeps counting under its new path; the hot path leaves the cache.
-    assert client.get("/api/delegate/tasks?status=all").json()["total"] == 2
+    # The route serves its stored list until it ages out, so the next scan runs directly.
+    assert delegate_router.list_delegate_tasks(status="all")["total"] == 2
     assert gone_path not in delegate_router._TASK_STATE_CACHE
     assert archived_path in delegate_router._TASK_STATE_CACHE
     cached = delegate_router._load_task_cache_from_db(str(tasks_dir))
@@ -275,7 +276,7 @@ def test_task_cache_drops_records_that_left_the_hot_directory(tmp_path, monkeypa
     _active_get()
     assert archived_path in delegate_router._TASK_STATE_CACHE
     (tasks_dir / "archive" / "gone.json").unlink()
-    assert client.get("/api/delegate/tasks?status=all").json()["total"] == 1
+    assert delegate_router.list_delegate_tasks(status="all")["total"] == 1
     assert archived_path not in delegate_router._TASK_STATE_CACHE
 
 

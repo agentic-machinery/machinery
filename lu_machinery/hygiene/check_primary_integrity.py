@@ -209,30 +209,51 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+# The running/spawning fields of each record, keyed by the file's identity, so
+# a canary run re-reads only the records written since the last run, not all
+# ~15k. ``None`` marks a record that is unreadable or not running.
+_RecordIdentity = tuple[int, int, int, int]
+_dispatch_memo: dict[Path, tuple[_RecordIdentity, dict[str, Any] | None]] = {}
+
+
+def _dispatch_fields(path: Path) -> dict[str, Any] | None:
+    try:
+        state = read_task_record(path)
+    except (OSError, ValueError):
+        return None
+    if state is None or state.get("status") not in ("running", "spawning") or not state.get("pid"):
+        return None
+    return {
+        "task_id": state.get("task_id") or path.stem,
+        "agent": state.get("agent"),
+        "pid": state.get("pid"),
+        "status": state.get("status"),
+    }
+
+
 def _running_dispatches(tasks_dir: Path | None) -> list[dict[str, Any]]:
     """Dispatch tasks whose state says running/spawning with a live PID."""
     if tasks_dir is None or not tasks_dir.is_dir():
         return []
     running: list[dict[str, Any]] = []
+    seen: set[Path] = set()
     for path in sorted(tasks_dir.glob("*.json")):
         try:
-            state = read_task_record(path)
-            if state is None:
-                continue
-        except (OSError, ValueError):
+            st = path.stat()
+        except OSError:
             continue
-        if state.get("status") not in ("running", "spawning"):
-            continue
-        pid = state.get("pid")
-        if pid and _pid_alive(int(pid)):
-            running.append(
-                {
-                    "task_id": state.get("task_id") or path.stem,
-                    "agent": state.get("agent"),
-                    "pid": pid,
-                    "status": state.get("status"),
-                }
-            )
+        identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        seen.add(path)
+        cached = _dispatch_memo.get(path)
+        if cached is not None and cached[0] == identity:
+            fields = cached[1]
+        else:
+            fields = _dispatch_fields(path)
+            _dispatch_memo[path] = (identity, fields)
+        if fields is not None and _pid_alive(int(fields["pid"])):
+            running.append(dict(fields))
+    for path in [path for path in _dispatch_memo if path.parent == tasks_dir and path not in seen]:
+        _dispatch_memo.pop(path, None)
     return running
 
 

@@ -14,7 +14,7 @@ from lu_machinery.api.fleet_workers_collect import WORKERS_SCHEMA
 from lu_machinery.api.fleet_workers_collect import workers_payload as workers_payload
 from lu_machinery.api.monitor_context import MonitorContext, get_ctx
 from lu_machinery.api.project_state_router import LocalDocumentSnapshot, get_cached_local_document
-from lu_machinery.api.state_helpers import PeriodicSnapshot
+from lu_machinery.api.state_helpers import SWR_DORMANT_READ_WAIT_S, PeriodicSnapshot
 
 WORKERS_SNAPSHOT_REFRESH_S = 2.0
 
@@ -45,7 +45,11 @@ def _collect_snapshots(ctx: MonitorContext) -> dict[str | None, dict[str, Any]]:
 def workers_snapshot(ctx: MonitorContext) -> PeriodicSnapshot[dict[str | None, dict[str, Any]]]:
     snapshot: PeriodicSnapshot[dict[str | None, dict[str, Any]]] = ctx.runtime.get_or_create_derived(
         "fleet-workers-snapshot",
-        lambda: PeriodicSnapshot(lambda: _collect_snapshots(ctx), WORKERS_SNAPSHOT_REFRESH_S),
+        lambda: PeriodicSnapshot(
+            lambda: _collect_snapshots(ctx), WORKERS_SNAPSHOT_REFRESH_S,
+            # An informational panel: a read stays inside its 1 s budget.
+            dormant_wait_s=SWR_DORMANT_READ_WAIT_S,
+        ),
     )
     return snapshot
 

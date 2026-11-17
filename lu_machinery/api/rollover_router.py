@@ -12,8 +12,13 @@ from lu_machinery.orchestration import thread_handoff
 from lu_machinery.orchestration.task_family import rollover_registry as registry
 
 from .monitor_context import MonitorContext, get_ctx
+from .state_helpers import swr_route
 
 router = APIRouter(tags=["rollovers"])
+
+# One fleet audit validates every registry record (about 5 s of CPU) and
+# rollovers change rarely; the orient rollovers section uses the same window.
+ROLLOVER_AUDIT_TTL_S = 120.0
 
 
 def _client_registry_errors(errors: list | None) -> list[dict[str, str]]:
@@ -54,6 +59,7 @@ def collect_rollover_orient_data(live_repo_root: Path | None = None) -> dict:
 
 
 @router.get("")
+@swr_route("rollovers", ROLLOVER_AUDIT_TTL_S)
 def rollover_audit(
     agent: str | None = Query(None),
     source_thread_id: str | None = Query(None),
