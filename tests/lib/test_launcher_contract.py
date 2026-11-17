@@ -1450,9 +1450,9 @@ fi
 @pytest.mark.parametrize(
     ("name", "args", "env", "model", "code"),
     [
-        ("start-gemini.sh", [], {}, "gemini-4-carbon-medium", 0),
-        ("start-gemini.sh", ["--effort", "high"], {}, "gemini-4-carbon-high", 0),
-        ("start-gemini.sh", [], {"LAUNCHER_EFFORT": "low"}, "gemini-4-carbon-low", 0),
+        ("start-gemini.sh", [], {}, "gemini-4-hydrogen-medium", 0),
+        ("start-gemini.sh", ["--effort", "high"], {}, "gemini-4-hydrogen-high", 0),
+        ("start-gemini.sh", [], {"LAUNCHER_EFFORT": "low"}, "gemini-4-hydrogen-low", 0),
         # An effort never replaces a chosen model or names a variant AGY lacks.
         ("start-gemini.sh", ["--model", "gemini-4-carbon-high", "--effort", "high"], {}, "gemini-4-carbon-high", 0),
         ("start-gemini.sh", ["--model", "gemini-4-carbon-high"], {"LAUNCHER_EFFORT": "low"}, "", 2),

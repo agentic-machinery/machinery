@@ -37,7 +37,7 @@ Policy here; facts: `lu_machinery/config/model_catalog.yaml`; changes need `mode
 | Drive a stream | `gpt-6.1-sol` · `claude-opus-5-5` | `gemini-3.8-flash-high` |
 | Advice, new design | `claude-opus-5-5` · `gpt-6.1-sol` | — |
 | Hard or accountable code | `gpt-6.1-sol` · `claude-opus-5-5` | — |
-| Bounded code, recon (see below) | `gpt-6-luna` | `gemini-3.8-flash-high` |
+| Bounded code, recon (see below) | `gpt-6-luna` | `gemini-4-hydrogen-medium` |
 | Security code (hooks, launchers, credentials, admission, sandbox) | `claude-opus-5-5` · `gpt-6.1-sol`; review `--risk critical` | never written or reviewed on Sonnet |
 | Mechanical lockfile/pointer/smoke | `claude-haiku-5-5` | `claude-sonnet-5-5` |
 | Classification/triage; read-only recon/search | `claude-haiku-5-5` (recon peer: Luna) | — |

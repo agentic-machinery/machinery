@@ -1,8 +1,8 @@
 """AgyAdapter — wraps the Antigravity (`agy`) CLI for the agent runtime.
 
 Ported from `kubedojo/scripts/agent_runtime/adapters/agy.py` for the
-2026-05-20 seminar-writer evaluation. `agy` ships Gemini Flash
-("gemini-3.8-flash-high" default; was 3.7 Flash) on a separate meter from gemini-cli; the
+2026-05-20 seminar-writer evaluation. `agy` ships Gemini models
+("gemini-4-hydrogen-medium" work default; was 3.8 Flash) on a separate meter from gemini-cli; the
 seminar-track writer ADR at
 `docs/decisions/pending/2026-05-20-seminar-track-writer-assignment.md`
 adds it as candidate D pending empirical testing.
@@ -862,7 +862,7 @@ _AGY_MODEL_BY_NORMALIZED: dict[str, str] = _build_agy_model_map()
 def unknown_model_suggestion(model: str) -> str:
     """Return safe guidance for an unknown AGY model identifier."""
     if "pro" in model.casefold():
-        return "Gemini Pro is retired; use `--model gemini-3.8-flash-high`."
+        return "Gemini Pro is retired; use `--model gemini-4-hydrogen-medium`."
     accepted_ids = ", ".join(f"`{slug}`" for slug in _AGY_GENERAL_MODEL_SLUGS if not retired_model_refusal(slug))
     return f"Accepted AGY model ids: {accepted_ids}."
 
@@ -974,7 +974,7 @@ class AgyAdapter:
     """Adapter for the ``agy`` Antigravity CLI."""
 
     name: str = "agy"
-    default_model: str = os.environ.get("LEARN_UK_AGY_MODEL", "gemini-3.8-flash-high")
+    default_model: str = os.environ.get("LEARN_UK_AGY_MODEL", "gemini-4-hydrogen-medium")
     supported_modes: frozenset[str] = frozenset({"read-only", "workspace-write", "danger"})
     # Read-only is refused off the review route; the lane probe only runs the version prefix.
     probe_mode: str = "workspace-write"

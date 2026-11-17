@@ -25,14 +25,14 @@
 |---|---|---|---|---|
 | Ceiling advisor/designer | Claude Opus 5.5 / GPT-6.1 Sol | — | `high` | provisional |
 | Accountable orchestrator | GPT-6.1 Sol, Claude Opus 5.5 | — | `high` | provisional |
-| General implementer | GPT-6.1 Sol, Claude Sonnet 5.5 for well-scoped non-security code, Grok 4.7 | GPT-6 Luna for bounded work under a Sol advisory envelope; Gemini 3.8 Flash for well-defined work; Cursor (**pin family**). Kimi is retired (OO-58). Security-sensitive code authoring goes to Opus 5.5 or Codex Sol; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude). | `high` by task fit | provisional |
+| General implementer | GPT-6.1 Sol, Claude Sonnet 5.5 for well-scoped non-security code, Grok 4.7 | GPT-6 Luna for bounded work under a Sol advisory envelope; Gemini 4 Hydrogen for well-defined work; Cursor (**pin family**). Kimi is retired (OO-58). Security-sensitive code authoring goes to Opus 5.5 or Codex Sol; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude). | `high` by task fit | provisional |
 | Polished written deliverables in English | Claude Sonnet 5.5 | Reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, and design review of pages/artifacts | By task fit | provisional |
 | Hard implementer | GPT-6.1 Sol, Claude Opus 5.5 | Escalate hard design judgment to Opus 5.5 / Sol 6.1 | `high` | provisional |
 | UI / visual product design | Claude Opus 5.5 / GPT-6.1 Sol | Cursor or Sonnet implements the approved design. Kimi is retired (OO-58) and is not an implementer. | `high` | provisional |
 | Code/security CF review | **Author-family-conditional** (see §3); for security-sensitive diffs (hooks/guards, launchers, credential or secret handling, dispatch admission, sandbox/permission logic), the resolver raises the review to `--risk critical` whatever risk is passed (`lu_machinery/review/security_paths.py`, #9125), which excludes Sonnet 5.5 | — | `high`+ | provisional |
 | Critical CF review | GPT-6.1 Sol ↔ Opus 5.5 **cross-family** | — | `high` | provisional |
 | Ukrainian language | Gemini 3.8 Flash High (AGY) | LANGUAGE-LANES: GPT-6.1 Sol / Claude Opus 5.5 + sources | `high` | provisional (morphology remains VESUM-gated) |
-| Recon / triage | GPT-6 Luna, Claude Haiku, Gemini 3.8 Flash | — | Luna `high` with exact owned paths + objective scope ceiling, from a Sol advisory envelope (always required, #9275); others by task fit; never sole release | provisional |
+| Recon / triage | GPT-6 Luna, Claude Haiku, Gemini 4 Hydrogen | — | Luna `high` with exact owned paths + objective scope ceiling, from a Sol advisory envelope (always required, #9275); others by task fit; never sole release | provisional |
 
 **One orchestrator per stream.** Advisors recommend; orchestrator owns terminal disposition.
 
@@ -118,7 +118,7 @@ Store bakeoff notes under `docs/best-practices/fleet-bakeoffs/` (create when fir
 ## 5. Escalation ladder (implementation)
 
 ```
-GPT-6 Luna / Claude Haiku / Gemini 3.8 Flash recon
+GPT-6 Luna / Claude Haiku / Gemini 4 Hydrogen recon
   → GPT-6.1 Sol / Opus 5.5 / Sonnet 5.5 (well-scoped everyday work and polished English deliverables) / Grok 4.7 implement (worktree)
     → security-sensitive code (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions): Opus 5.5 or Codex Sol, never Sonnet 5.5
     → Ukrainian curriculum content: sanctioned language lanes (Opus 5.5 for Claude), never Sonnet 5.5
@@ -163,7 +163,7 @@ UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement 
 UA language                 → Gemini 3.8 Flash High (AGY) + VESUM/sources (3.1 Pro is retired, not subscribed, operator 2026-10-23)
 Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.1: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
-Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 3.8 Flash (Sol envelope)
+Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
 ```
 
 ---

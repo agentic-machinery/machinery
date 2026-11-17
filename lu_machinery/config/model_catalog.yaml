@@ -688,7 +688,13 @@ models:
     strengths: [token_efficient_agentic_loops, fast_tool_use, coding_benchmark_gains, low_cost]
     weaknesses: [not_default_critical_authority, deep_architecture_prefers_sol]
     notes: >-
-      Default AGY Flash pin (operator GO 2026-09-02). Live `agy models` probe
+      Operator order HYDROGEN-REPLACES-38 (2026-11-15): Google is retiring 3.8
+      Flash, and Gemini 4 Hydrogen at medium replaces it as the default AGY and
+      Gemini work model. This row stays selectable by explicit pin until Google
+      retires it, and it keeps the review, Ukrainian review, driver and ACP
+      consultation seats that Hydrogen does not hold, plus the legacy gemini
+      runtime lane's fallback ladder. Was the default AGY Flash
+      pin (operator GO 2026-09-02). Live `agy models` probe
       2026-09-02 lists gemini-3.8-flash-high/medium/low; older Flash
       generations are retired. Native AGY subscribed seat — never OpenRouter.
       Ukrainian-lane default is the Text Arena language-category jump vs 3.7
@@ -715,8 +721,8 @@ models:
     # selection only. They are not aliases: dispatch rewrites an alias to the wire
     # id, so an alias would run -medium.
     runtime_model_ids: [gemini-4-carbon-high, gemini-4-carbon-low]
-    # Work roles only. Review, Ukrainian review and advisory roles stay with the
-    # existing seats until a held-out review test reports.
+    # Gemini work defaults to gemini-4-hydrogen (operator 2026-11-17). Carbon
+    # holds no review-of-record seat or ladder entry.
     roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, terminal_bench_coding]
@@ -729,17 +735,17 @@ models:
       - cyber_scores_via_fairwind_program_access
       - agy_selector_thinking_level_mapping_unverified
     notes: >-
-      Operator decision 2026-11-10: Gemini 4 Carbon at medium is the Gemini work
-      route over AGY, preferred over Gemini 4 Argon, which is the second Gemini
-      option; both are used on medium and measured in use (hallucination, code
-      writing, pricing; Ukrainian later). Live `agy models` probes on 2026-11-10
-      (19:50Z and 20:03Z) list gemini-4-carbon-high, gemini-4-carbon-medium and
-      gemini-4-carbon-low. Dispatch: `python -m lu_machinery.dispatch dispatch --agent agy
-      --model gemini-4-carbon-medium`; -high and -low are explicit selections
-      only. Review ladders, review seats, the Ukrainian review route and advisory
-      roles are unchanged until the held-out review test reports; Carbon holds no
-      review role, so it is refused for any review of record. The certified
-      Gemini driver seat (orchestrator_seats.agy) is unchanged. Model card
+      Operator orders 2026-11-17: Gemini 4 Carbon is used for read-only review
+      and security-review dispatches outside the review-of-record ladders, and
+      not as a Gemini work route; Gemini work defaults to Gemini 4 Hydrogen at
+      medium. Review ladders, review seats, the Ukrainian review route and the
+      certified Gemini driver seat (orchestrator_seats.agy) are unchanged. Live
+      `agy models` probes on 2026-11-10 (19:50Z and 20:03Z) list
+      gemini-4-carbon-high, gemini-4-carbon-medium and gemini-4-carbon-low.
+      Dispatch: `python -m lu_machinery.dispatch dispatch --agent agy --model
+      gemini-4-carbon-medium --mode read-only`; -high and -low are explicit
+      selections only. History: operator decision 2026-11-10 made Carbon at
+      medium the Gemini work route ahead of Gemini 4 Argon. Model card
       (published November 2026): based on Gemini 4 Argon, one 1M-token window
       shared by input and output, knowledge cutoff March 2026, more thinking
       tokens than Argon with configurable thinking levels, occasional slowness or
@@ -749,8 +755,7 @@ models:
       generally available 2026-11-10, thinking levels low, medium and high
       (default medium). Google publishes no code-review benchmark and no
       Ukrainian result, and does not state how the AGY selectors map to API
-      thinking levels. A 2026-10-29 probe listed no Carbon selector; the earlier
-      leak-based sources are superseded by the official card.
+      thinking levels.
     sources:
       - https://storage.googleapis.com/deepmind-media/Model-Cards/Gemini-4-Carbon-Model-Card.pdf
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/
@@ -766,8 +771,7 @@ models:
     # -medium is the routing wire id; -low, -high and -xhigh are runtime ids for
     # explicit selection and identity attestation, not aliases.
     runtime_model_ids: [gemini-4-hydrogen-low, gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh]
-    # Work roles only, as Carbon. No review, Ukrainian review or advisory role
-    # until a held-out evaluation reports.
+    # Work roles only: no review, Ukrainian review or advisory role.
     roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels, lower_price_than_carbon]
@@ -779,17 +783,17 @@ models:
       - more_tokens_at_higher_thinking_levels
       - agy_selector_thinking_level_mapping_unverified
     notes: >-
-      Gemini work and comparative-evaluation route over AGY (#586), measured
-      against Gemini 4 Carbon; Carbon stays the preferred Gemini work route until
-      that comparison reports. Live `agy models` probe on 2026-11-15 (12:55Z,
-      agy 1.5.9) lists gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh,
-      gemini-4-hydrogen-medium and gemini-4-hydrogen-low; a 2026-11-12
-      evaluation ran -medium and -high through AGY. Dispatch: `python -m
-      lu_machinery.dispatch dispatch --agent agy --model
-      gemini-4-hydrogen-medium`; -low, -high and -xhigh are explicit selections
-      only. Hydrogen holds no review role, so it is refused for any review of
-      record; review ladders, the Ukrainian review route and the certified
-      Gemini driver seat are unchanged. Model card (2026-11-12):
+      Operator order HYDROGEN-REPLACES-38 (2026-11-15): Gemini 4 Hydrogen at
+      medium is the default AGY and Gemini work model, replacing Gemini 3.8
+      Flash, which Google is retiring; the AGY adapter, registry and interactive
+      Gemini launcher defaults use gemini-4-hydrogen-medium. Live `agy models`
+      probe on 2026-11-15 (12:55Z, agy 1.5.9) lists gemini-4-hydrogen-high,
+      gemini-4-hydrogen-xhigh, gemini-4-hydrogen-medium and
+      gemini-4-hydrogen-low. Dispatch: `python -m lu_machinery.dispatch dispatch
+      --agent agy --model gemini-4-hydrogen-medium`; -low, -high and -xhigh are
+      explicit selections only. Hydrogen holds no review role, so it is refused
+      for any review of record; review ladders, the Ukrainian review route and
+      the certified Gemini driver seat are unchanged. Model card (2026-11-12):
       adapted from Gemini 4 Carbon, one 1M-token window shared by input and
       output (64K synchronous output by default), knowledge cutoff March 2026,
       four thinking levels, occasional slowness or timeouts and higher token use

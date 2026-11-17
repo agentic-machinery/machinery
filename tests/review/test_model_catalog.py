@@ -984,7 +984,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "798d86044cd6ac4ded8e24b4a22a576c8421ac47eddfe764eed6368f54de4553",
+    "v2-baseline.json.gz": "fbd678439117f7694d4020e6e2274711516a4a2f040e621c1b291af4378d4fc2",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1037,7 +1037,7 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "798d86044cd6ac4ded8e24b4a22a576c8421ac47eddfe764eed6368f54de4553"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "fbd678439117f7694d4020e6e2274711516a4a2f040e621c1b291af4378d4fc2"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 def approved_hramatka_gemma_baseline(baseline):
     """Correct Gemma's use description without changing fleet routing or receipts."""
@@ -1147,7 +1147,7 @@ def assert_frozen_surfaces(actual, *, surfaces):
             # #586: Hydrogen is an AGY work model with no review or advisory role, so it joins
             # no seat, review route, ladder or ranking; its row is pinned and every other field stays frozen.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
-            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "d65beae8f847d7d054ff7fba403215567fd7da70817ae873d9c3fd637612e3d4"
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "f4dd14dfd1ae8f724e06e809d20bc7cedf47aa4f158299f8207c6687ba0cea6c"
         assert value == expected, f"current surface differs: {surface}"
 
 
