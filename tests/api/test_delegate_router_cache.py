@@ -6,7 +6,6 @@ import errno
 import json
 import os
 import sqlite3
-from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -109,7 +108,7 @@ def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path,
     delegate_router._TASK_STATE_CACHE.pop(str(valid))
     task_store_paths._record_cache.pop(str(valid))
     failures = []
-    original_open = Path.open
+    original_open = task_store_paths.os.open
 
     def flaky_open(path, *args, **kwargs):
         if path == valid and len(failures) < delegate_router.TASK_READ_RETRIES:
@@ -117,7 +116,7 @@ def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path,
             raise OSError("temporary read failure")
         return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", flaky_open)
+    monkeypatch.setattr(task_store_paths.os, "open", flaky_open)
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
     assert str(valid) not in delegate_router._TASK_STATE_CACHE
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 2

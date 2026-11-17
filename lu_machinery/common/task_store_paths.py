@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -22,8 +23,12 @@ def _record_stamp(info: os.stat_result) -> _RecordStamp:
     return info.st_mtime_ns, info.st_size, info.st_ctime_ns, info.st_dev, info.st_ino
 
 
+class TaskRecordReadRefusal(ValueError):
+    """Typed regular-file or byte-limit refusal for bounded collectors."""
+
+
 def read_cached_task_record(
-    path: Path, *, tasks_dir: Path, display_unknown_schema: bool = False,
+    path: Path, *, tasks_dir: Path, display_unknown_schema: bool = False, max_bytes: int | None = None,
 ) -> dict[str, Any] | None:
     """Read a task once per file version across Monitor collectors.
 
@@ -34,6 +39,8 @@ def read_cached_task_record(
     Containment is checked here, beside the stat/open sinks, while ``path``
     retains the filename used by task-identity classification. Structural
     failures are memoized as ValueError messages; transient I/O stays retryable.
+    Optional byte limits apply to cached versions too; non-regular files are
+    refused, and nonblocking opens prevent a concurrent FIFO swap from hanging.
     """
     from lu_machinery.orchestration.task_record_store import parse_task_record
 
@@ -45,7 +52,12 @@ def read_cached_task_record(
     source = Path(fullpath)
     key = os.fspath(path)
     with _record_cache_lock:
-        stamp = _record_stamp(source.stat())
+        info = source.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise TaskRecordReadRefusal("task_record_not_regular")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise TaskRecordReadRefusal("task_record_too_large")
+        stamp = _record_stamp(info)
         cached = _record_cache.get(key)
         if cached is not None and cached[0] == stamp:
             record = cached[1]
@@ -53,9 +65,17 @@ def read_cached_task_record(
         else:
             # Drop stale bytes before attempting a read, including failed reads.
             _record_cache.pop(key, None)
-            with source.open("rb") as handle:
-                opened_stamp = _record_stamp(os.fstat(handle.fileno()))
-                raw = handle.read()
+            fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise TaskRecordReadRefusal("task_record_not_regular")
+                if max_bytes is not None and opened.st_size > max_bytes:
+                    raise TaskRecordReadRefusal("task_record_too_large")
+                opened_stamp = _record_stamp(opened)
+                raw = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+                if max_bytes is not None and len(raw) > max_bytes:
+                    raise TaskRecordReadRefusal("task_record_too_large")
                 finished_stamp = _record_stamp(os.fstat(handle.fileno()))
             try:
                 record = parse_task_record(path, raw, display_unknown_schema=True)

@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common.task_store_paths import TaskRecordReadRefusal, read_cached_task_record
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneError,
@@ -34,7 +35,7 @@ from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
 from lu_machinery.fleet_comms.opsec_store import batch_tasks_store, comms_plane_store
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
-from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, parse_task_record
+from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
 
 # Alert thresholds are intentionally reported, not enforced here. #5646 owns
 # consuming them. Dispatch uses the delegate default floor of 7,200 seconds.
@@ -1018,32 +1019,33 @@ def _read_task_record(path: Path) -> tuple[object, str | None]:
     bytes are read, so an oversized or growing file is never loaded whole.
     """
     try:
-        if not stat.S_ISREG(os.stat(path).st_mode):
-            return None, "task_record_not_regular"
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode):
-                return None, "task_record_not_regular"
-            if info.st_size > _MAX_TASK_RECORD_BYTES:
-                return None, "task_record_too_large"
-            with os.fdopen(fd, "rb", closefd=False) as handle:
-                raw = handle.read(_MAX_TASK_RECORD_BYTES + 1)
-        finally:
-            os.close(fd)
-        if len(raw) > _MAX_TASK_RECORD_BYTES:
-            return None, "task_record_too_large"
-        record = parse_task_record(path, raw)
+        # This collector historically follows valid record symlinks. Its trusted
+        # target directory retains that contract; API callers supply their task root.
+        record = read_cached_task_record(
+            path, tasks_dir=path.resolve().parent, max_bytes=_MAX_TASK_RECORD_BYTES,
+        )
         if record is None:
             # Classification is shared; retain this collector's shape-only
             # diagnostics so every scanned source remains accounted for.
             try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+                with os.fdopen(fd, "rb") as handle:
+                    info = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        return None, "task_record_not_regular"
+                    if info.st_size > _MAX_TASK_RECORD_BYTES:
+                        return None, "task_record_too_large"
+                    raw = handle.read(_MAX_TASK_RECORD_BYTES + 1)
+                if len(raw) > _MAX_TASK_RECORD_BYTES:
+                    return None, "task_record_too_large"
                 is_object = isinstance(json.loads(raw.decode("utf-8")), dict)
             except ValueError:
                 return None, "task_record_unreadable"
             return None, "not_a_task_record" if is_object else "task_record_not_object"
         return record, None
-    except (OSError, ValueError, RecursionError, MemoryError):
+    except TaskRecordReadRefusal as exc:
+        return None, str(exc)
+    except (OSError, RuntimeError, ValueError, RecursionError, MemoryError):
         # ValueError covers JSONDecodeError, UnicodeDecodeError and the
         # integer-string-conversion limit; RecursionError covers deep nesting;
         # OSError covers vanished, dangling, looping and permission-denied files.
