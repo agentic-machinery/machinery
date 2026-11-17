@@ -27,6 +27,7 @@ from lu_machinery.review.model_catalog import (
     effort_refusal,
     is_cursor_auto_selector,
     load_model_catalog,
+    mode_refusal,
     retired_model_refusal,
     unknown_model_refusal,
 )
@@ -197,6 +198,8 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
                              f"{identity}; listed: {', '.join(names) or 'none'}")
     # Operator 2026-11-17: an effort outside the model's catalog list is refused, never mapped.
     if refusal := effort_refusal(identity, options.get("effort"), catalog):
+        raise ValueError(refusal)
+    if refusal := mode_refusal(identity, mode, catalog):
         raise ValueError(refusal)
     if not catalog["models"].get(identity, {}).get("red_team_only"):
         # Every role refuses a retired catalog model, not only review (product #12946).

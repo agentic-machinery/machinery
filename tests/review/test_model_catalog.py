@@ -984,7 +984,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "b0b42eadef7008d3295f6b48204b94ff4dba4cf8aebc0ba4be5c0a6f1ec0958c",
+    "v2-baseline.json.gz": "53d4fff929fa9c743024081e9040fa1815bcd02c175cf284c497ccf232433733",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1037,7 +1037,7 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "b0b42eadef7008d3295f6b48204b94ff4dba4cf8aebc0ba4be5c0a6f1ec0958c"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "53d4fff929fa9c743024081e9040fa1815bcd02c175cf284c497ccf232433733"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 # The Sol 6.2 recapture (2026-11-17) also carries the corrected hramatka Gemma text.
 CURRENT_BASELINE = _V2_BASELINE["baseline"]

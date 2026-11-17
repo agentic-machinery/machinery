@@ -384,8 +384,9 @@ models:
     # endpoint, council, substitution or default routes it. Its one role is outside
     # review_scheduler.activity_roles, so it holds no review, advisory, approval or
     # implementation role and is never a review of record. Effort high only; xhigh
-    # and max are refused.
+    # and max are refused. Read-only only: dispatch refuses workspace-write and danger.
     efforts: [high]
+    modes: [read-only]
     roles: [pinned_extra_security_review]
     transports: [native_codex]
     strengths: [frontier_technical_judgment, security_review_depth]

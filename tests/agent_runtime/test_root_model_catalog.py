@@ -287,10 +287,14 @@ def test_astra_6_2_is_pin_only():
     entry = catalog["models"][astra]
     assert entry["lifecycle"] == "active" and entry["transports"] == ["native_codex"]
     assert entry["efforts"] == ["high"]
+    assert entry["modes"] == ["read-only"]
     activity = catalog["review_scheduler"]["activity_roles"]
     assert not set(entry["roles"]) & {*activity["review"], *activity["consult"]}
     assert activity_role_refusal(astra, REVIEW_ACTIVITY, catalog) is not None
     checks.check_model_admission("codex", astra, "read-only", {"effort": "high"}, b"")
+    for mode in ("workspace-write", "danger"):
+        with pytest.raises(ValueError, match="does not run in mode"):
+            checks.check_model_admission("codex", astra, mode, {"effort": "high"}, b"")
     with pytest.raises(ValueError, match="holds no review"):
         checks.check_model_admission("codex", astra, "read-only", {"effort": "high", "risk": "medium"}, b"")
 

@@ -236,6 +236,8 @@ ladder, endpoint, council, substitution or default routes it, and it holds no re
 approval role. Its documented use is security review: an extra pinned read-only reviewer on a
 security-sensitive PR, next to the review of record (Carbon shape: its findings are real input,
 it is not recorded with `record_cf_verdict`). Councils and discussions use Sol 6.2, never Astra.
+Dispatch admits it only in `read-only` mode (catalog `models.gpt-6.2-astra.modes`); a
+`workspace-write` or `danger` request is refused.
 
 ```bash
 .venv/bin/python -m lu_machinery.dispatch dispatch --agent codex --model gpt-6.2-astra --effort high \
