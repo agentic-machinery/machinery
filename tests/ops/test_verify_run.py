@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from lu_machinery.api.route_contracts import RouteContract
 from lu_machinery.ops import verify_run
+from tests.helpers.wheel import install_release, release_wheel
+
+_REPO = Path(__file__).resolve().parents[2]
+_LOOPBACK = "lu_machinery/packaging/systemd/learn-ukrainian-loopback.target"
+_INSTALLED_PROBE = r"""
+import json
+from pathlib import Path
+
+import lu_machinery.ops.verify_run as verify_run
+from lu_machinery.common.repo_root import machinery_path, machinery_root
+
+path = machinery_path("packaging/systemd/learn-ukrainian-loopback.target")
+text = verify_run._loopback_text()
+module = Path(verify_run.__file__).resolve()
+legacy = module.parents[2] / "packaging" / "systemd" / "learn-ukrainian-loopback.target"
+root = machinery_root().resolve()
+print(json.dumps({
+    "path": str(path.resolve()),
+    "inside_package": path.resolve().is_relative_to(root),
+    "is_file": path.is_file(),
+    "legacy_exists": legacy.is_file(),
+    "units": verify_run.pinned_units(text),
+    "text": text,
+}))
+"""
 
 
 def _contract(pattern: str, match: str) -> RouteContract:
@@ -89,3 +117,45 @@ def test_a_5xx_route_fails_and_a_fast_200_does_not(monkeypatch, tmp_path) -> Non
     assert checks["/broken"]["ok"] is False
     assert checks["/broken"]["status"] == 500
     assert checks["/ok"]["ok"] is True
+
+
+def test_installed_wheel_ships_loopback_target_inside_the_package(tmp_path: Path) -> None:
+    """Defect class: an installed wheel omits the loopback target, so host verify reports it unreadable."""
+    wheel = release_wheel(_REPO, tmp_path)
+    with zipfile.ZipFile(wheel) as archive:
+        names = set(archive.namelist())
+        assert _LOOPBACK in names
+        assert "packaging/systemd/learn-ukrainian-loopback.target" not in names
+        shipped = archive.read(_LOOPBACK)
+    # The pytest job removes checkout lu_machinery before the test runs and
+    # points LU_TEST_WHEEL at the wheel built from that tree. Compare the
+    # installed text with the wheel bytes. When the checkout file is still
+    # present, it must be those same bytes.
+    checkout = _REPO / _LOOPBACK
+    if checkout.is_file():
+        assert shipped == checkout.read_bytes()
+    python = install_release(wheel, tmp_path / "consumer")
+    ran = subprocess.run(
+        [str(python), "-I", "-c", _INSTALLED_PROBE],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    located = json.loads(ran.stdout)
+    assert isinstance(located, dict)
+    units = located["units"]
+    assert isinstance(units, list) and all(isinstance(unit, str) for unit in units)
+    assert located["is_file"] is True
+    assert located["inside_package"] is True
+    assert located["legacy_exists"] is False
+    assert located["text"] == shipped.decode()
+    assert located["units"] == [
+        "learn-ukrainian-api.service",
+        "learn-ukrainian-sources.service",
+        "learn-ukrainian-work.service",
+        "learn-ukrainian-astro.service",
+    ]
+    assert located["path"].endswith("/lu_machinery/packaging/systemd/learn-ukrainian-loopback.target")

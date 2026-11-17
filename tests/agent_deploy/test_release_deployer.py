@@ -768,6 +768,30 @@ def test_release_requires_each_claude_python_guard_as_its_native_command():
     assert {command for command in commands if command.startswith("/bin/bash ")} == natives
 
 
+def test_claude_hook_commands_run_from_a_project_path_with_a_space(tmp_path):
+    """Defect class: a mandatory Claude hook command that leaves $CLAUDE_PROJECT_DIR unquoted is
+    split at a space in the project path, so the shell runs a truncated path and exits 127 (#722)."""
+    project = tmp_path / "project with space"
+    hooks = project / ".claude/hooks"
+    hooks.mkdir(parents=True)
+    ran = tmp_path / "ran"
+    prefix = "$CLAUDE_PROJECT_DIR/.claude/hooks/"
+    commands = [hook["command"] for requirement in release_inventory()["required_hooks"]["claude"][".claude/settings.json"]
+                for hook in requirement["hooks"] if hook["command"].replace('"', "").startswith(prefix)]
+    assert commands
+    expected = set()
+    for command in commands:
+        stub = hooks / command.replace('"', "").removeprefix(prefix)
+        stub.write_text('#!/bin/sh\nprintf "%s\\n" "$0" >> "$RAN"\n')
+        stub.chmod(0o755)
+        expected.add(str(stub))
+        result = subprocess.run(["/bin/bash", "-c", command], capture_output=True, text=True, timeout=30,
+                                stdin=subprocess.DEVNULL,
+                                env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(project), "RAN": str(ran)})
+        assert result.returncode == 0, (command, result.returncode, result.stderr)
+    assert set(ran.read_text().splitlines()) == expected
+
+
 @pytest.fixture
 def deployed(tmp_path):
     root = tmp_path / "gate-consumer"

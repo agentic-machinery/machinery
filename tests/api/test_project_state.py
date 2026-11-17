@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -13,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from lu_machinery.api import project_state_router as router_mod
 from lu_machinery.api.main import app
+from lu_machinery.api.project_state_collect import collect_local_document
 from lu_machinery.api.project_state_sanitize import ProjectStateValidationError, validate_report_document
 from lu_machinery.api.project_state_store import REPORT_TTL_SECONDS, reset_project_state_store, upsert_report
 from tests import _host_path_guard as guard
@@ -335,3 +338,31 @@ def test_in_process_self_host_is_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
     host = client.get("/api/fleet/projects/v1?host_id=host-worker").json()["hosts"]["host-worker"]
     assert host["freshness"] == "fresh"
     assert host["age_s"] == 0.0
+
+
+def test_never_fetched_checkout_serves_unknown_upstream_age(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """Defect class: a checkout with origin/main but no FETCH_HEAD (every fresh clone) made the
+    collector report origin_main_age_s as inf, which JSON cannot encode, so the projects read
+    answered HTTP 500 (#722). The unknown age is null, counts as stale, and still validates."""
+    repo = tmp_path / "fresh clone"
+    repo.mkdir()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    for command in (
+        ["init", "-q", "-b", "main"],
+        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"],
+        ["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *command], check=True, capture_output=True, env=env, timeout=30)
+    assert not (repo / ".git" / "FETCH_HEAD").exists()
+    document = collect_local_document("host-worker", repo_root=repo, service_state=lambda name: "stopped")
+    assert document is not None
+    validate_report_document(document)
+
+    monkeypatch.setenv("MONITOR_OCCUPANCY_HOST_IDS", _PLACEHOLDER_MAP)
+    monkeypatch.setenv("LU_MONITOR_HOST_ID", "host-worker")
+    monkeypatch.setattr(router_mod, "_live_local_document", lambda host_id: document)
+    response = client.get("/api/fleet/projects/v1?host_id=host-worker")
+    assert response.status_code == 200, response.text
+    host = response.json()["hosts"]["host-worker"]
+    assert host["primary"]["origin_main_age_s"] is None
+    assert "stale_upstream" in host["attention"]

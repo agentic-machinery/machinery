@@ -508,6 +508,7 @@ tests/ops/test_host_stack_drift.py
 tests/ops/test_lane_relaunch.py
 tests/ops/test_lu_slice_apply.py
 tests/ops/test_product_entry_confinement.py
+tests/ops/test_verify_run.py
 tests/orchestration/task_family/test_cli.py
 tests/orchestration/task_family/test_executor.py
 tests/orchestration/task_family/test_graph_planner.py

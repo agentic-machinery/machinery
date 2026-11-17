@@ -4,7 +4,8 @@
 covered by an HTTP route contract. Each must answer within the budget with no
 5xx. ``sources`` checks the Sources server the host unit actually runs
 (loopback ``/health``, then one ``verify_word``). ``host`` requires every unit
-named by ``Requires=`` in ``packaging/systemd/learn-ukrainian-loopback.target``
+named by ``Requires=`` in the packaged
+``lu_machinery/packaging/systemd/learn-ukrainian-loopback.target``
 to report ``active``.
 
 The JSON document on stdout is the receipt. It records status, elapsed time,
@@ -30,6 +31,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import machinery_path
 
 _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 AREAS = ("api", "sources", "host")
@@ -47,7 +49,7 @@ _UNIT = re.compile(r"^[a-zA-Z0-9@_.-]+\.service$")
 _UNIT_STATES = frozenset(
     {"active", "inactive", "failed", "activating", "deactivating", "reloading"}
 )
-_TARGET_NAME = "learn-ukrainian-loopback.target"
+_LOOPBACK_RELATIVE = "packaging/systemd/learn-ukrainian-loopback.target"
 
 
 class VerifyFailure(Exception):
@@ -437,12 +439,7 @@ def pinned_units(text: str) -> list[str]:
 
 
 def _loopback_text() -> str:
-    path = (
-        Path(os.path.abspath(__file__)).parents[2]
-        / "packaging"
-        / "systemd"
-        / _TARGET_NAME
-    )
+    path = machinery_path(_LOOPBACK_RELATIVE)
     if not path.is_file():
         raise VerifyFailure("loopback target unreadable")
     try:
@@ -616,7 +613,7 @@ def _parser() -> argparse.ArgumentParser:
             "  agents_extensions/shared/skills/verify/SKILL.md maps each area to this command.\n"
             "  Page and route contracts: lu_machinery/api/route_contracts.py "
             "(all_page_contracts, all_route_contracts).\n"
-            "  Pinned units: Requires= in packaging/systemd/learn-ukrainian-loopback.target.\n"
+            "  Pinned units: Requires= in lu_machinery/packaging/systemd/learn-ukrainian-loopback.target.\n"
             "  Sources: the learn-ukrainian-sources unit's loopback /health and /mcp verify_word."
         ),
     )

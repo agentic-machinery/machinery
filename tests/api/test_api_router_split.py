@@ -44,3 +44,19 @@ class TestStaticServing:
 
         assert r.status_code == 403
         assert r.json()["detail"] == "Path traversal not allowed"
+
+    def test_artifacts_page_that_no_one_ships_is_not_found(self, tmp_path, monkeypatch):
+        """Defect class: with no artifacts.html in the dashboards directory and none declared by
+        the product, /artifacts/ handed a missing file to FileResponse and answered HTTP 500 (#722)."""
+
+        import lu_machinery.api.main as api_main
+
+        dashboards_dir = tmp_path / "dashboards"
+        dashboards_dir.mkdir()
+        patched_ctx = api_main.app.state.ctx.with_roots(dashboards_dir=dashboards_dir)
+        monkeypatch.setattr(api_main.app.state, "ctx", patched_ctx)
+        monkeypatch.setattr(api_main.app.state, "product", None, raising=False)
+
+        r = TestClient(app, raise_server_exceptions=False).get("/artifacts/")
+
+        assert r.status_code == 404

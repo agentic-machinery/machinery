@@ -385,12 +385,18 @@ def collect_artifacts(
 collect_html_artifacts = collect_artifacts
 
 
-def _artifacts_page(request: Request, ctx: MonitorContext) -> Path:
-    """The artifact browser page: a machinery dashboard file, else the page the product declares."""
+def _artifacts_page(request: Request, ctx: MonitorContext) -> FileResponse:
+    """The artifact browser page: a machinery dashboard file, else the page the product declares.
+
+    The wheel ships no artifact page of its own, so a product that declares none gets a 404.
+    """
     machinery_page = ctx.roots.dashboards_dir / "artifacts.html"
     if machinery_page.is_file():
-        return machinery_page
-    return product_file(getattr(request.app.state, "product", None), "artifacts.html") or machinery_page
+        return FileResponse(machinery_page, media_type="text/html")
+    product_page = product_file(getattr(request.app.state, "product", None), "artifacts.html")
+    if product_page is None:
+        raise HTTPException(status_code=404, detail="No artifact browser page is installed")
+    return FileResponse(product_page, media_type="text/html")
 
 
 @router.get("/")
@@ -402,7 +408,7 @@ async def list_roots(
     """List all approved documentation roots."""
     resolved_ctx = resolve_context(ctx)
     if request.url.path.startswith("/artifacts") and format != "json":
-        return FileResponse(_artifacts_page(request, resolved_ctx), media_type="text/html")
+        return _artifacts_page(request, resolved_ctx)
     return {
         "roots": [
             {
@@ -447,7 +453,7 @@ async def serve_artifact(
     # codeql[py/path-injection] -- full_path validated via safe_join + _assert_under_root above. See #1860.
     if full_path.is_dir():
         if request.url.path.startswith("/artifacts") and format != "json":
-            return FileResponse(_artifacts_page(request, resolved_ctx), media_type="text/html")
+            return _artifacts_page(request, resolved_ctx)
         return _directory_listing(path, root_key, root_path, remainder)
 
     # File serving
