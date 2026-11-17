@@ -57,13 +57,19 @@ def test_forwarder_finishes_close_and_reaps_children_after_repeated_signal(
     os.mkfifo(gate)
     gate_fd = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
     # Bash runs a trap for a signal that arrives during a blocking read, but a
-    # signal that lands just before the read() call stays pending while the
-    # read blocks. The forwarder parks on its own FIFO, and the test writes it
-    # after each signal. Either the signal interrupts the read or the read
-    # returns the token, and in both cases Bash runs the trap.
+    # signal that lands after its last trap check and before the read() call
+    # stays pending while the read blocks (push CI run 44077062884). Every run
+    # delivers the first signal in that window: the forwarder writes `armed`
+    # and waits for `signalled` while it is still expanding the read's
+    # redirection. The forwarder then parks on its own FIFO, and the test
+    # writes a token to it after the signal. Bash runs the trap because the
+    # token completes the read.
     park = tmp_path / "park"
     os.mkfifo(park)
     park_fd = os.open(park, os.O_RDWR | os.O_NONBLOCK)
+    signalled = tmp_path / "signalled"
+    os.mkfifo(signalled)
+    signalled_fd = os.open(signalled, os.O_RDWR | os.O_NONBLOCK)
     ready = tmp_path / "ready"
     received = tmp_path / "received"
     attempts = tmp_path / "attempts"
@@ -101,10 +107,10 @@ LC_DRIVER_CHILD_PID=$!
 sleep 300 & LC_SUPERVISORY_WATCH_PID=$!
 sleep 300 & LC_DRIVER_RENEW_PID=$!
 trap 'launcher_forward_driver_signal {name} {expected}' {name}
-printf 'armed\\n' > armed
-IFS= read -r _ < "$TEST_PARK"
+IFS= read -r _ < "$(printf 'armed\\n' > armed; IFS= read -r _ < "$TEST_SIGNALLED"; printf '%s' "$TEST_PARK")"
 """)
-    env = {**launcher_environment(), "TEST_GATE": str(gate), "TEST_PARK": str(park), "TEST_ATTEMPTS": str(attempts),
+    env = {**launcher_environment(), "TEST_GATE": str(gate), "TEST_PARK": str(park),
+           "TEST_SIGNALLED": str(signalled), "TEST_ATTEMPTS": str(attempts),
            "TEST_CLOSED": str(closed), "TEST_CLIENT_PID": str(client_pid)}
     process = subprocess.Popen(["bash", str(launcher)], cwd=tmp_path, env=env, start_new_session=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -113,6 +119,7 @@ IFS= read -r _ < "$TEST_PARK"
                    message="provider and direct forwarder traps")
         sig = getattr(signal, f"SIG{name}")
         process.send_signal(sig)
+        os.write(signalled_fd, b"sent\n")
         os.write(park_fd, b"wake\n")
         wait_until(attempts.exists, timeout=DEADLINE_S, message="in-flight close client")
         assert not closed.exists()
@@ -154,6 +161,7 @@ IFS= read -r _ < "$TEST_PARK"
         process.communicate(timeout=10)
         os.close(gate_fd)
         os.close(park_fd)
+        os.close(signalled_fd)
 
 
 def manager_guard(directory: Path) -> Path:
