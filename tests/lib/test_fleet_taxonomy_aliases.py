@@ -331,12 +331,12 @@ def test_inventory_handoff_candidates_survive_missing_resolver(monkeypatch):
 @pytest.mark.parametrize(
     ("session_epic", "expected_mode", "expected_token", "handoff_path"),
     [
-        ("hramatka", "valid", "ASSIGNED EPIC: hramatka.epic", ".claude/hramatka-epic/CLAUDE-DRIVER-HANDOFF.md"),
+        ("hramatka", "valid", "ASSIGNED EPIC: hramatka.epic", "lu-driver-state render --lane hramatka"),
         (
             "curriculum-upgrade",
             "valid",
             "ASSIGNED EPIC: curriculum-upgrade.epic",
-            ".claude/curriculum-upgrade-epic/CLAUDE-DRIVER-HANDOFF.md",
+            "lu-driver-state render --lane curriculum-upgrade",
         ),
         ("invalid_selector_xyz", "unknown", "ERROR: unknown SESSION_EPIC 'invalid_selector_xyz'", ""),
         ("", "empty", "NO EPIC ASSIGNED (launcher had no --epic flag)", ""),
@@ -435,25 +435,28 @@ def _assert_epic_contract(context: str, expected_mode: str, expected_token: str,
 
     if expected_mode == "valid":
         assert handoff_path in context
-        assert "core-epic/CLAUDE-DRIVER-HANDOFF.md" not in context
+        assert "DRIVER-HANDOFF.md" not in context
         assert "ERROR: unknown SESSION_EPIC" not in context
     elif expected_mode == "unknown":
         assert "Valid lane selectors:" in context
         assert "infra | harness | infra.fleet-comms" in context
         assert "ASSIGNED EPIC: invalid_selector_xyz.epic" not in context
         assert ".claude/invalid_selector_xyz-epic" not in context
+        assert "lu-driver-state render --lane invalid_selector_xyz" not in context
     elif expected_mode == "empty":
         assert "ERROR: unknown SESSION_EPIC" not in context
         assert "ASSIGNED EPIC:" not in context
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not available")
-def test_session_setup_hook_names_driver_state_as_authoritative(tmp_path: Path) -> None:
-    """A lane DRIVER-STATE.md is surfaced as the authoritative goal file."""
+def test_session_setup_hook_names_the_db_note_as_handoff_authority(tmp_path: Path) -> None:
+    """The lane's DB note is the handoff authority; DRIVER-STATE.md is only a pointer (#511)."""
     context = _run_session_setup_hook(tmp_path, "curriculum-upgrade", "# state\n")
     assert "ASSIGNED EPIC: curriculum-upgrade.epic" in context
-    assert "Driver state (AUTHORITATIVE, read it FIRST" in context
-    assert ".claude/curriculum-upgrade-epic/DRIVER-STATE.md" in context
+    assert "Handoff content: the lane's DB note" in context
+    assert "lu-driver-state render --lane curriculum-upgrade" in context
+    assert "DRIVER-STATE.md is a pinned-facts pointer" in context
+    assert "AUTHORITATIVE" not in context
 
 
 @pytest.fixture

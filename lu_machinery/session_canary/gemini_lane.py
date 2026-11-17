@@ -74,11 +74,11 @@ def _cold_start_body(
 - **Epic:** `{epic}`
 - **Stream:** `{stream_id}`
 - **Lease:** {lease_summary}
-- **Handoff dual-write:** `{handoff_rel}`
+- **Canary recall input:** `{handoff_rel}`
 - {binding_line}
 
 ## Immediate steps
-1. Read the stream tail and this handoff.
+1. Read the lane's DB note first: `lu-driver-state render --lane {epic}`, then `lu-driver-state show <its ID>`. It is the only handoff content authority; the canary recall input above is not. Then read the stream tail.
 2. Mint a canary: `.venv/bin/python -m {_PACKAGE}.gemini_lane mint --epic {epic} --stream {stream_id}`.
 3. Score from memory. PASS auto-hydrates; FAIL-HANDOFF writes handback and closes the exact lease.
 4. Continue only when the hydration capsule has `execution_allowed: true`.

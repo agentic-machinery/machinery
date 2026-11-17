@@ -274,15 +274,14 @@ def test_2026_11_02_relaunch_resumes_the_lane_packet_and_mints_ten_anchors(tmp_p
     monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_a, **_k: list(stream))
     monkeypatch.setattr(grok_lane.subprocess, "run", lambda command, **_k: subprocess.CompletedProcess(command, 0, "", ""))
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
-    monkeypatch.setattr(handoff_select, "codex_lane_slot", lambda epic_name: "codex-core")
-    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane, owner: reads.append((lane, owner)))
+    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane))
     mint = ["--repo", str(tmp_path), "mint", "--epic", "curriculum-upgrade", "--stream", "epic:1001"]
     assert codex_lane.main(mint) == 1
     assert "could only derive 7/10 durable anchors" in capsys.readouterr().err
 
-    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane, owner: reads.append((lane, owner)) or note)
+    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane) or note)
     assert codex_lane.main(mint) == 0
-    assert reads == [("curriculum-upgrade", "codex-core")] * 2
+    assert reads == ["curriculum-upgrade"] * 2
     facts = json.loads((epic / "canary/facts.json").read_text())
     assert len(facts) == 10
     assert any("C-4170" in fact["a"] for fact in facts)

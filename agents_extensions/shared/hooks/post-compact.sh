@@ -96,9 +96,10 @@ if [ -n "${GROK_AGENT:-}" ] || [ "${SESSION_HANDOFF_AGENT:-}" = "grok" ] \
   - Heavy atlas compute on VPS (atlas-runner), not the Mac.
   - Tool-backed claims only; breadth report before handoff.
   - Epic=${SESSION_EPIC:-none}"
-  if [ -n "${SESSION_EPIC:-}" ]; then
+  if [ -n "$(context_handoff_note_lane)" ]; then
     _grok_ctx="${_grok_ctx}
-  - Continue from file handoff / fleet-comms for epic ${SESSION_EPIC}; do not re-scan curriculum state."
+$(context_handoff_authority "$(context_handoff_note_lane)")
+  - Continue from that note and fleet-comms; do not re-scan curriculum state."
   fi
   emit_context "$_grok_ctx"
   exit 0
@@ -122,23 +123,20 @@ case "$POST_COMPACT_AGENT" in
       exit 0
     else
       post_compact_bootstrap
-      # Reuse the canary's lightweight selector without importing lane runtimes.
-      # A first Codex launch may continue
-      # from the shared driver handoff; a fixed filename can select stale state.
-      DIARY_REL=""
-      HANDOFF_SELECT_MODULE=lu_machinery.session_canary.handoff_select
-      DIARY_REL=$(run_bounded_python 2 "$BOUNDED_PYTHON" -c '
+      # The handoff content is the lane's DB note (#511), read through the one
+      # machinery reader; markdown handoffs are never selected here.
+      NOTE_LANE="$(context_handoff_note_lane)"
+      NOTE_ID=""
+      if [ -n "$NOTE_LANE" ]; then
+        NOTE_ID=$(run_bounded_python 3 "$BOUNDED_PYTHON" -c '
 import importlib
 import sys
-from pathlib import Path
 
-load_codex_candidates = importlib.import_module(sys.argv[3]).load_codex_candidates
-
-repo = Path(sys.argv[1]).resolve()
-selected = next((item.path for item in load_codex_candidates(repo, sys.argv[2]) if item.path.is_file()), None)
-if selected is not None:
-    print(selected.resolve().relative_to(repo))
-' "$PROJECT_DIR" "$SESSION_EPIC" "$HANDOFF_SELECT_MODULE" 2>/dev/null) || DIARY_REL=""
+note = importlib.import_module(sys.argv[1]).fetch_newest_handoff_note(sys.argv[2])
+if note is not None:
+    print(note["id"])
+' lu_machinery.session_canary.handoff_select "$NOTE_LANE" 2>/dev/null) || NOTE_ID=""
+      fi
       HYDRATION_STREAM="${SESSION_STREAM_ID:-}"
       if [ -z "$HYDRATION_STREAM" ]; then
         # Positional arguments expand in the bounded child shell.
@@ -151,9 +149,9 @@ source "$1" && launcher_selector_stream "$2"
       if [ -z "$HYDRATION_STREAM" ]; then
         HYDRATION_RC=2
         HYDRATION="unresolved-stream-selector: $SESSION_EPIC. Repair the launcher selector before continuing."
-      elif [ -z "$DIARY_REL" ] || [ ! -f "$PROJECT_DIR/$DIARY_REL" ]; then
+      elif [ -z "$NOTE_ID" ]; then
         HYDRATION_RC=2
-        HYDRATION="No Codex/shared driver handoff selected by the Codex canary resolver. Repair the handoff before continuing."
+        HYDRATION="No readable DB note (driver-state handoff_note) for lane ${NOTE_LANE:-$SESSION_EPIC}. Repair the handoff before continuing."
       else
         HYDRATION_RC=0
         # Hydrate retries timeout-class failures up to 3 times (500 ms each plus
@@ -163,23 +161,17 @@ source "$1" && launcher_selector_stream "$2"
           || HYDRATION_RC=$?
       fi
       if [ "$HYDRATION_RC" -eq 0 ]; then
-        # The lane goal file is the operator-maintained state; a stream boundary
-        # can lag behind it, so the goal file wins when the two disagree.
-        GOAL_REL=".claude/${SESSION_EPIC}-epic/DRIVER-STATE.md"
-        if [ -f "$PROJECT_DIR/$GOAL_REL" ]; then
-          BOUNDARY_RULE="Lane goal file: $GOAL_REL. It outranks the capsule's next_drive_boundary: where they conflict, follow the goal file and record a corrected next_action in the stream. Native Codex still owns compaction."
-        else
-          BOUNDARY_RULE="Native Codex still owns compaction; continue only from the capsule's next_drive_boundary."
-        fi
+        # A stream boundary can lag behind the DB note, so the note wins when the two disagree.
         CONTEXT="CODEX FLEET-DRIVER HYDRATION
 $HYDRATION
-Shadow diary: $DIARY_REL
-$BOUNDARY_RULE"
+DB note: $NOTE_ID
+$(context_handoff_authority "$NOTE_LANE")
+The DB note outranks the capsule's next_drive_boundary: where they conflict, follow the note and record a corrected next_action in the stream. Native Codex still owns compaction."
       else
         CONTEXT="CODEX FLEET-DRIVER HYDRATION BLOCKED
 ${HYDRATION:-Hydration helper unavailable.}
-Shadow diary: $DIARY_REL
-Do not select the next queue action until the stream lease or diary is repaired."
+DB note: ${NOTE_ID:-unavailable}
+Do not select the next queue action until the stream lease or the DB note is repaired."
       fi
       emit_context "$CONTEXT"
       exit 0
@@ -233,10 +225,18 @@ fi
 # session-setup.sh resolves it (CANONICAL_ROOT, above), so a worktree session
 # names the same directory.
 CLAUDE_PROJECT_KEY=$(printf '%s' "$CANONICAL_ROOT" | sed 's/[^A-Za-z0-9-]/-/g')
+NOTE_LANE="$(context_handoff_note_lane)"
+if [ -n "$NOTE_LANE" ]; then
+  CONTEXT="$CONTEXT
+$(context_handoff_authority "$NOTE_LANE")"
+  PACKET_REMINDER="If a live packet is shown, SessionStart provides its lifecycle commands; read the DB note above, not the packet, as handoff content."
+else
+  PACKET_REMINDER="If a live packet is shown, read its handoff path; SessionStart provides the lifecycle commands."
+fi
 CONTEXT="$CONTEXT
 KEY REMINDERS:
   - Thread rollover health (read-only): $ROLLOVER_HEALTH
-  - If a live packet is shown, read its handoff path; SessionStart provides the lifecycle commands.
+  - $PACKET_REMINDER
   - Legacy module word targets are MINIMUMS (check config.py); core fresh-build lessons: non-negotiable-rules.md rule 4
   - Edit agents_extensions/shared/, not .claude/ directly
   - Project interpreter only: $BOUNDED_PYTHON
