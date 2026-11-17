@@ -1,8 +1,8 @@
 """AgyAdapter — wraps the Antigravity (`agy`) CLI for the agent runtime.
 
 Ported from `kubedojo/scripts/agent_runtime/adapters/agy.py` for the
-2026-05-20 seminar-writer evaluation. `agy` ships Gemini Flash
-("gemini-3.8-flash-high" default; was 3.7 Flash) on a separate meter from gemini-cli; the
+2026-05-20 seminar-writer evaluation. `agy` ships Gemini models
+("gemini-4-hydrogen-medium" work default; was 3.8 Flash) on a separate meter from gemini-cli; the
 seminar-track writer ADR at
 `docs/decisions/pending/2026-05-20-seminar-track-writer-assignment.md`
 adds it as candidate D pending empirical testing.
@@ -104,7 +104,6 @@ from lu_machinery.agent_runtime.attempt_safe_read import (
     safe_attempt_file_size,
     safe_read_attempt_file,
 )
-from lu_machinery.common import json_depth
 from lu_machinery.review.model_catalog import load_model_catalog, retired_model_refusal
 from lu_machinery.secret_redactor import redact_text
 
@@ -114,9 +113,6 @@ from ..result import AgyAttempt, AgyProviderFault, ParseResult
 from ..tool_calls import summarize_tool_output
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
-
-# Deepest JSON this module reads (json_depth): free-form provider output.
-_JSON_MAX_DEPTH = 512
 
 _logger = logging.getLogger(__name__)
 
@@ -866,7 +862,7 @@ _AGY_MODEL_BY_NORMALIZED: dict[str, str] = _build_agy_model_map()
 def unknown_model_suggestion(model: str) -> str:
     """Return safe guidance for an unknown AGY model identifier."""
     if "pro" in model.casefold():
-        return "Gemini Pro is retired; use `--model gemini-3.8-flash-high`."
+        return "Gemini Pro is retired; use `--model gemini-4-hydrogen-medium`."
     accepted_ids = ", ".join(f"`{slug}`" for slug in _AGY_GENERAL_MODEL_SLUGS if not retired_model_refusal(slug))
     return f"Accepted AGY model ids: {accepted_ids}."
 
@@ -978,7 +974,7 @@ class AgyAdapter:
     """Adapter for the ``agy`` Antigravity CLI."""
 
     name: str = "agy"
-    default_model: str = os.environ.get("LEARN_UK_AGY_MODEL", "gemini-3.8-flash-high")
+    default_model: str = os.environ.get("LEARN_UK_AGY_MODEL", "gemini-4-hydrogen-medium")
     supported_modes: frozenset[str] = frozenset({"read-only", "workspace-write", "danger"})
     # Read-only is refused off the review route; the lane probe only runs the version prefix.
     probe_mode: str = "workspace-write"
@@ -3542,7 +3538,7 @@ def _decode_jsonish(value: Any) -> Any:
     if not stripped:
         return ""
     try:
-        return json_depth.loads(stripped, max_depth=_JSON_MAX_DEPTH)
+        return json.loads(stripped)
     except (ValueError, RecursionError):
         return stripped.strip('"')
 
