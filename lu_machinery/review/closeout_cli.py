@@ -1057,12 +1057,25 @@ def _checklist_blob(repo_root: Path, commit: str, path: str) -> bytes | None:
     return _checklist_git(repo_root, "cat-file", "blob", oid.decode())
 
 
-def _judge_input(repo_root: Path, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
+def _checkout_top(repo_root: Path) -> Path:
+    """The work tree holding ``repo_root``: the checkout under review, whichever subdirectory names it."""
+    raw = _checklist_git(repo_root, "rev-parse", "--show-toplevel").decode("utf-8", "surrogateescape")
+    try:
+        return Path(raw[:-1] if raw.endswith("\n") else raw).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop before 3.13
+        raise CloseoutStateError("the checkout's top level is unavailable") from exc
+
+
+def _inside(path: Path, top: Path) -> bool:
+    return path == top or top in path.parents
+
+
+def _judge_input(repo_root: Path, top: Path, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
     """Machinery file ``relative`` as the merge-base holds it, else as the installed package holds it.
 
     A repository without the file at its merge-base (a consumer repository) cannot change the
-    package copy. A package copy inside the checkout under review could be the change itself, so
-    that read is refused.
+    package copy. A package copy inside the checkout under review (``top``) could be the change
+    itself, so that read is refused.
     """
     checkout_path = _checkout_relative(relative)
     blob = _checklist_blob(repo_root, merge_base, checkout_path)
@@ -1078,10 +1091,9 @@ def _judge_input(repo_root: Path, merge_base: str, relative: str) -> tuple[bytes
     try:
         package_file = machinery_path(relative)
         resolved = package_file.resolve(strict=True)
-        root = repo_root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError: a symlink loop before 3.13
         raise CloseoutStateError(f"{checkout_path} unavailable in the installed package") from exc
-    if resolved == root or root in resolved.parents:
+    if _inside(resolved, top):
         raise CloseoutStateError(
             f"{checkout_path} is missing at the merge-base and the only other copy is in the checkout "
             "under review; run this command from the installed release"
@@ -1234,7 +1246,16 @@ def _git_path(raw: str) -> str:
 
 def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[str, Any]]:
     """Every changed file of ``merge_base..head``: its paths, change kind, and added and removed lines."""
-    status_flags = ("--no-ext-diff", "--no-relative", "--name-status", "-z", *_CHECKLIST_DETECTION)
+    # A gitlink is a changed path whatever `.gitmodules` (from the change under review) or
+    # configuration says: `ignore = all` would drop it from both passes.
+    status_flags = (
+        "--no-ext-diff",
+        "--no-relative",
+        "--ignore-submodules=none",
+        "--name-status",
+        "-z",
+        *_CHECKLIST_DETECTION,
+    )
     status = _checklist_git(repo_root, "diff", *status_flags, merge_base, head, "--")
     fields = status.decode("utf-8", "surrogateescape").split("\x00")
     files: dict[str, dict[str, Any]] = {}
@@ -1258,13 +1279,16 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
         }
     # Content is matched as text whatever the checkout's attributes say: `-diff`, `binary` and
     # textconv drivers come from the change under review and could hide its lines. Prefixes,
-    # relativity and hunk merging are fixed so local diff configuration cannot reshape the patch.
+    # relativity, hunk merging and the submodule format are fixed so local diff configuration cannot
+    # reshape the patch (`diff.submodule=diff` would list files inside the submodule).
     patch_flags = (
         "--no-ext-diff",
         "--no-textconv",
         "--text",
         "--no-color",
         "--no-relative",
+        "--ignore-submodules=none",
+        "--submodule=short",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--inter-hunk-context=0",
@@ -1357,16 +1381,24 @@ def _checklist_match(trigger: dict[str, Any], changed: dict[str, Any]) -> list[s
 
 def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, Any]:
     """The checklist items and code owners ``base..head`` touches, read from the merge-base, with the brief section."""
+    top = _checkout_top(repo_root)
+    # This code matches the change and reads the judge inputs, so a copy from the checkout under
+    # review could be the change itself, whatever data it reads.
+    if _inside(Path(__file__).resolve(), top):
+        raise CloseoutStateError(
+            "checklist is running from the checkout under review; run the installed release with "
+            "python -P -m lu_machinery.review.closeout_cli"
+        )
     head_sha = _checklist_commit(repo_root, head)
     base_sha = _checklist_commit(repo_root, base)
     merge_base = _checklist_git(repo_root, "merge-base", base_sha, head_sha).decode().strip()
-    owners_raw, owners_source = _judge_input(repo_root, merge_base, _CODE_OWNERS_RELATIVE)
+    owners_raw, owners_source = _judge_input(repo_root, top, merge_base, _CODE_OWNERS_RELATIVE)
     owners = _code_owners(owners_raw)
     if _JUDGE_CHANGE_AREA not in owners["areas"]:
         raise CloseoutStateError(f"code owners map lacks the {_JUDGE_CHANGE_AREA} area")
-    raw, source = _judge_input(repo_root, merge_base, _CHECKLIST_RELATIVE)
+    raw, source = _judge_input(repo_root, top, merge_base, _CHECKLIST_RELATIVE)
     items = _checklist_items(raw, owners["areas"])
-    schema, schema_source = _judge_input(repo_root, merge_base, _SCHEMA_RELATIVE)
+    schema, schema_source = _judge_input(repo_root, top, merge_base, _SCHEMA_RELATIVE)
     diff = _checklist_diff(repo_root, merge_base, head_sha)
     changed_paths = sorted({path for changed in diff for path in changed["paths"]})
     judge_globs = [_glob_regex(pattern) for pattern in _JUDGE_PATHS]
@@ -1536,7 +1568,7 @@ Examples:
     --owned-path {_EXAMPLE_OWNED_PATH}
   .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
     resolve-reviewer --author-model claude --subject-seat grok
-  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
+  .venv/bin/python -P {_ENTRY} --state-file .agent/review.json \\
     checklist --base origin/main --head "$HEAD_SHA" --repo-root .
 
 NOTE: --state-file is a global argument and must precede the subcommand.

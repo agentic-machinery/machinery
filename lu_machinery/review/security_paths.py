@@ -65,6 +65,10 @@ SECURITY_SENSITIVE_PATHS = (
     f"{_MACHINERY}/config/model_catalog.yaml",
     f"{_MACHINERY}/config/agent_runtime*.yaml",
     f"{_MACHINERY}/config/agent_fallback_substitutions.yaml",
+    # The judge inputs the review closeout reads from the merge-base: an edit changes how later PRs are judged.
+    f"{_MACHINERY}/config/reliability_checklist.yaml",
+    f"{_MACHINERY}/config/code_owners.yaml",
+    f"{_MACHINERY}/schemas/code-review-findings.v1.schema.json",
 )
 
 

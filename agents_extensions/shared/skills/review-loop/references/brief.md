@@ -28,7 +28,7 @@ the file at its merge-base) uses the installed release copy, which the PR cannot
 Every round's brief, round 1 and each delta, carries the section this prints, verbatim:
 
 ```bash
-"$PY" -m lu_machinery.review.closeout_cli --state-file "$STATE" \
+"$PY" -P -m lu_machinery.review.closeout_cli --state-file "$STATE" \
   checklist --base "origin/$BASE" --head "$HEAD_SHA" --repo-root .
 ```
 
@@ -38,10 +38,12 @@ change kind, added and removed lines), and prints the matching items, each with 
 owning area, the owner of every area the diff touches, and the `judge-change` item when the diff
 touches a judge file (the checklist, the ownership map, the reply schema, the review skills, the
 brief template or the rules). Its JSON output's `brief_section` is the text the brief carries.
-The reviewer answers each item with file:line or test evidence. Run it from the installed
-release, not from a checkout of the change: it refuses a package copy inside the checkout under
-review. Exit 1 (a malformed checklist or map at the merge-base, an unreadable diff) is
-fail-closed: escalate to the CTO, and never hand-write the section.
+The reviewer answers each item with file:line or test evidence. It runs the installed release:
+`-P` keeps the working directory off `sys.path`, so a machinery checkout's own `lu_machinery`
+is not imported. It refuses to run from, or read a judge file from, the checkout under review
+(the work tree's top level, whichever subdirectory `--repo-root` names). Any other exit 1 (a
+malformed checklist or map at the merge-base, an unreadable diff) is fail-closed: escalate to
+the CTO, and never hand-write the section.
 
 For the `ukrainian` profile, identify the contracts in
 [`ukrainian-linguistics.md` §8](../../../rules/ukrainian-linguistics.md#ukrainian-linguistic-principles),
