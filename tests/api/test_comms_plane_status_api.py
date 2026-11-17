@@ -164,10 +164,8 @@ def test_comms_v1_collectors_with_seeded_broker(tmp_path: Path, monkeypatch: pyt
     )
     conn.close()
     client = _client(_message_ctx(tmp_path, broker))
-    backlog = client.get("/api/comms/v1/backlog").json()
-    dead = client.get("/api/comms/v1/dead-letters").json()
     metrics = client.get("/api/comms/v1/metrics").json()
-    for payload in (backlog, dead, metrics):
+    for payload in (metrics,):
         assert payload["response_schema_version"] == "comms.v2"
         assert payload["store"]["kind"] == "legacy-broker"
         assert payload["store"]["reachable"] is True

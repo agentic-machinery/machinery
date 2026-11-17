@@ -392,7 +392,9 @@ def legacy_comms_summary(
         for route_id, method in _ROUTE_METHODS.items()
     }
     for row in rows:
-        item = routes[row["route_id"]]
+        item = routes.get(row["route_id"])
+        if item is None:
+            continue
         count = int(row["count"])
         item["count"] += count
         item["first_seen"] = min(

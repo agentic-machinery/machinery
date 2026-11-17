@@ -36,6 +36,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import lu_machinery.github_rest_cache as github_rest
+from lu_machinery.agent_runtime.usage import has_headroom
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
 from lu_machinery.common.repo_root import ProductRootError, machinery_path
@@ -967,7 +968,7 @@ def _collect_runtime_orient_data(ctx: MonitorContext | None = None) -> dict:
         if not name or not model:
             continue
         try:
-            ok, _ = runtime_api.has_headroom(str(name), str(model), unreadable=unreadable)
+            ok, _ = has_headroom(str(name), str(model), unreadable=unreadable)
         except Exception:
             ok = False
         headroom[str(name)] = ok
