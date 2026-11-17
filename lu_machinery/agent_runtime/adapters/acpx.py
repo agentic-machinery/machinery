@@ -3256,7 +3256,7 @@ class AcpxAdapter:
 
     name: str = "acpx-codex-shadow"
     # Pin omitted requests too: the participant default is not routing policy.
-    default_model: str = "gpt-6.1-sol"
+    default_model: str = "gpt-6.2-sol"
     supported_modes: frozenset[str] = frozenset({"read-only"})
 
     def build_invocation(
@@ -3301,7 +3301,9 @@ class AcpxAdapter:
         ``stdin_payload``, and are never published to fleet-comms, dispatch
         authority, or review evidence.
         """
-        approved_models = frozenset({"gpt-6-luna", "gpt-6.1-sol"})
+        from lu_machinery.review.model_catalog import codex_dispatch_models
+
+        approved_models = codex_dispatch_models()
         if model is not None and model not in approved_models:
             raise AcpxShadowRefusalError(
                 f"AcpxAdapter: model={model!r} rejected; approved models are {', '.join(sorted(approved_models))}"

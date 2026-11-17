@@ -18,6 +18,10 @@ from tests.launcher_sandbox import (
 )
 from tests.lib.test_launcher_driver_scope import install_scope_sandbox
 from tests.rules_core_view import install_loader_bypass
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
+SOL_PATTERN = CURRENT_SOL.replace(".", r"\.")  # as context_profiles.yaml spells it
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor")]
 
@@ -190,7 +194,7 @@ def _launch(
     primary, linked = _prepare_repo(tmp_path, separate_git_dir=separate_git_dir)
     if stale_native_profile:
         profile_path = linked / "lu_machinery/config/context_profiles.yaml"
-        profile_path.write_text(profile_path.read_text().replace("'^(gpt-6\\.1-sol|gpt-6-luna)$'", "'^gpt-stale$'"))
+        profile_path.write_text(profile_path.read_text().replace(f"'^({SOL_PATTERN}|gpt-6-luna)$'", "'^gpt-stale$'"))
     home_bin = tmp_path / "home" / ".local" / "bin"
     capture = tmp_path / "capture.txt"
     _write_executable(
@@ -275,7 +279,7 @@ def _launch(
 def test_launcher_targets_canonical_main_without_creating_worktree(tmp_path: Path) -> None:
     values, forwarded, result, primary, linked = _launch(
         tmp_path,
-        ["--model", "gpt-6.1-sol", "resume", "thread-id"],
+        ["--model", CURRENT_SOL, "resume", "thread-id"],
     )
 
     assert linked != primary
@@ -287,7 +291,7 @@ def test_launcher_targets_canonical_main_without_creating_worktree(tmp_path: Pat
         "profile": "native_codex",
         "requested_profile": "native_codex",
         "transport": "native_codex",
-        "main_model": "gpt-6.1-sol",
+        "main_model": CURRENT_SOL,
         "main_window": "272000",
         "reason": "explicit-profile",
         "trusted": "1",
@@ -305,7 +309,7 @@ def test_launcher_targets_canonical_main_without_creating_worktree(tmp_path: Pat
         "-C",
         os.fspath(linked),
         "--model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "-c",
         "model_reasoning_effort=high",
         "resume",
@@ -319,7 +323,7 @@ def test_launcher_targets_canonical_main_without_creating_worktree(tmp_path: Pat
 def test_launcher_binds_epic_and_strips_private_flag(tmp_path: Path) -> None:
     values, forwarded, _, _, _ = _launch(
         tmp_path,
-        ["--epic", "hramatka", "--model", "gpt-6.1-sol", "orchestrate this epic"],
+        ["--epic", "hramatka", "--model", CURRENT_SOL, "orchestrate this epic"],
         driver=True,
     )
 
@@ -336,7 +340,7 @@ def test_launcher_imports_bundle_before_prelease_scan_and_lease_claim(tmp_path: 
     order_capture = tmp_path / "launcher-order.txt"
     _launch(
         tmp_path,
-        ["--epic", "hramatka", "--model", "gpt-6.1-sol"],
+        ["--epic", "hramatka", "--model", CURRENT_SOL],
         driver=True,
         order_capture=order_capture,
     )
@@ -352,7 +356,7 @@ def test_launcher_imports_bundle_before_prelease_scan_and_lease_claim(tmp_path: 
 def test_launcher_normalizes_equals_form_epic_suffix(tmp_path: Path) -> None:
     values, forwarded, _, _, _ = _launch(
         tmp_path,
-        ["--epic=atlas", "--model", "gpt-6.1-sol"],
+        ["--epic=atlas", "--model", CURRENT_SOL],
         driver=True,
     )
 
@@ -415,7 +419,7 @@ def test_launcher_rejects_old_native_model_before_provider_or_lease(tmp_path: Pa
 def test_untrusted_codex_driver_skips_lease_and_canary(tmp_path: Path) -> None:
     values, _, result, _, linked = _launch(
         tmp_path,
-        ["--epic", "devops", "--model", "gpt-6.1-sol"],
+        ["--epic", "devops", "--model", CURRENT_SOL],
         driver=True,
         stale_native_profile=True,
     )
@@ -430,7 +434,7 @@ def test_untrusted_codex_driver_skips_lease_and_canary(tmp_path: Path) -> None:
 def test_launcher_does_not_inherit_foreign_route_profile(tmp_path: Path) -> None:
     values, _, _, _, _ = _launch(
         tmp_path,
-        ["--model", "gpt-6.1-sol"],
+        ["--model", CURRENT_SOL],
         ambient_profile=("sol_lead", "claudex"),
     )
 
@@ -445,7 +449,7 @@ def test_launcher_accepts_validated_main_checkout_with_separate_git_dir(
 ) -> None:
     values, forwarded, _, primary, _ = _launch(
         tmp_path,
-        ["--model=gpt-6.1-sol"],
+        [f"--model={CURRENT_SOL}"],
         separate_git_dir=True,
         provide_canonical_root=True,
     )
@@ -499,7 +503,7 @@ def test_launcher_refuses_a_resolved_primary_that_is_not_on_main(tmp_path: Path)
 def test_fresh_exact_rollover_is_exported_to_new_codex_task(tmp_path: Path) -> None:
     values, _, result, _, linked = _launch(
         tmp_path,
-        ["--epic", "devops", "--model", "gpt-6.1-sol"],
+        ["--epic", "devops", "--model", CURRENT_SOL],
         driver=True,
         rollover="pending",
     )
@@ -515,7 +519,7 @@ def test_fresh_exact_rollover_is_exported_to_new_codex_task(tmp_path: Path) -> N
 def test_ambiguous_or_resumed_rollover_fails_before_lease_and_codex(tmp_path: Path, rollover: str) -> None:
     _, _, result, _, linked = _launch(
         tmp_path,
-        ["--epic", "devops", "--model", "gpt-6.1-sol"],
+        ["--epic", "devops", "--model", CURRENT_SOL],
         driver=True,
         rollover=rollover,
         expect_success=False,

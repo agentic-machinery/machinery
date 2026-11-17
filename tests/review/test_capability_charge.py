@@ -23,6 +23,9 @@ from tests.review.record_support import (
     recorder_matcher,  # noqa: F401 - autouse publication scanner rules
     write_task,
 )
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 H1, H2, H3, NEXT = "1" * 40, "2" * 40, "3" * 40, "4" * 40
 R3_STARTED = "2026-09-23T10:00:00.000001+00:00"
@@ -156,7 +159,7 @@ def blocked_reply(*, missing=("ci-logs",), explanation="CI run 41768361838 succe
 def r3_record(reply, **updates):
     record = {
         "task_id": "r3", "repository": REPOSITORY, "review_branch": BRANCH, "schema_version": 2, "pr": 42,
-        "worktree_base_sha": H3, "pinned_head": H3, "model": "gpt-6.1-sol", "agent": "codex",
+        "worktree_base_sha": H3, "pinned_head": H3, "model": CURRENT_SOL, "agent": "codex",
         "review_mode": "cross_family", "started_at": R3_STARTED, "run_nonce": "r3-run",
         "result_sha256": hashlib.sha256(reply.encode()).hexdigest(), "status": "done", "mode": "read-only",
     }

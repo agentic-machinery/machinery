@@ -8,14 +8,19 @@ from pathlib import Path
 from .agent_runtime_call import call_agent_with_fallback
 from .fallback import CallResult
 
-CODEX_MODEL_LADDER = ("gpt-6.1-sol",)
+
+def _current_sol() -> str:
+    """The model catalog's current Sol (the openai_frontier seat holder)."""
+    from lu_machinery.review.model_catalog import load_model_catalog
+
+    return load_model_catalog()["seats"]["openai_frontier"]["model_id"]
 
 
 def call_codex_with_fallback(
     prompt: str,
     *,
     task_name: str,
-    preferred_model: str = "gpt-6.1-sol",
+    preferred_model: str | None = None,
     effort: str | None = "high",
     per_rung_timeout_s: int | None = None,
     overall_timeout_s: int | None = None,
@@ -26,14 +31,16 @@ def call_codex_with_fallback(
     sleep_fn: Callable[[int, str], None] | None = None,
 ) -> CallResult:
     """Call Codex through the agent_runtime adapter."""
-    if preferred_model != CODEX_MODEL_LADDER[0]:
-        raise ValueError(f"Codex model {preferred_model!r} rejected; only gpt-6.1-sol is approved")
+    sol = _current_sol()
+    preferred_model = sol if preferred_model is None else preferred_model
+    if preferred_model != sol:
+        raise ValueError(f"Codex model {preferred_model!r} rejected; only {sol} is approved")
     return call_agent_with_fallback(
         agent_name="codex",
         prompt=prompt,
         task_name=task_name,
         preferred_model=preferred_model,
-        fallback_models=CODEX_MODEL_LADDER,
+        fallback_models=(sol,),
         effort=effort,
         per_rung_timeout_s=per_rung_timeout_s,
         overall_timeout_s=overall_timeout_s,

@@ -18,6 +18,9 @@ import yaml
 from lu_machinery.dispatcher import git, ownership, worker
 from tests.dispatcher.worker_reap import Reaper, reap_root
 from lu_machinery.common.repo_root import machinery_root
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -210,7 +213,7 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     )
     shutil.copy(SOURCE / "lu_machinery/config/model_catalog.yaml", config / "model_catalog.yaml")
     catalog_copy = yaml.safe_load((config / "model_catalog.yaml").read_text())
-    sol = catalog_copy["models"]["gpt-6.1-sol"]
+    sol = catalog_copy["models"][CURRENT_SOL]
     sol["aliases"] = [*(sol.get("aliases") or []), *STUB_MODELS]
     (config / "model_catalog.yaml").write_text(yaml.safe_dump(catalog_copy, sort_keys=False))
     shutil.copy(SOURCE / "lu_machinery/config/credit_lanes.yaml", config / "credit_lanes.yaml")
@@ -296,7 +299,7 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     def review_models(*models):
         """File the stub reviewer ``models`` under OpenAI in the sandbox catalog copy only."""
         catalog = yaml.safe_load((config / "model_catalog.yaml").read_text())
-        catalog["models"]["gpt-6.1-sol"].setdefault("runtime_model_ids", []).extend(models)
+        catalog["models"][CURRENT_SOL].setdefault("runtime_model_ids", []).extend(models)
         (config / "model_catalog.yaml").write_text(yaml.safe_dump(catalog, sort_keys=False))
 
     def review_target(*models):

@@ -23,6 +23,9 @@ from lu_machinery.fleet import capacity_pick, credit_lane, reset_reserve
 from lu_machinery.fleet.reset_reserve import unavailable_reserve
 from lu_machinery.fleet.routing_policy import projected_unused_pct
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -84,7 +87,7 @@ def _row(budget: dict, lane: str = "codex") -> dict:
 
 def test_policy_reads_codex_allowlist_from_config():
     assert POLICY.path.name == "credit_lanes.yaml"
-    assert POLICY.lane_models("codex") == ("gpt-6.1-sol", "gpt-6-luna")
+    assert POLICY.lane_models("codex") == (CURRENT_SOL, "gpt-6-luna")
     assert POLICY.lane_models("claude") is None
     assert (
         POLICY.near_cap_remaining_pct,
@@ -114,15 +117,15 @@ BAD_POLICIES = {
     "empty-allowlist": _GOOD_HEAD + "lanes: {codex: {allowed_models: []}}\n",
     "no-lanes": _GOOD_HEAD + "lanes: {}\n",
     "negative-threshold": _GOOD_HEAD.replace("near_cap_remaining_pct: 10", "near_cap_remaining_pct: -1")
-    + "lanes: {codex: {allowed_models: [gpt-6.1-sol]}}\n",
+    + "lanes: {codex: {allowed_models: [gpt-6.2-sol]}}\n",
     "threshold-string": _GOOD_HEAD.replace("near_cap_remaining_pct: 10", "near_cap_remaining_pct: ten")
-    + "lanes: {codex: {allowed_models: [gpt-6.1-sol]}}\n",
+    + "lanes: {codex: {allowed_models: [gpt-6.2-sol]}}\n",
     "zero-rate-limit-window": _GOOD_HEAD.replace("rate_limit_window_s: 3600", "rate_limit_window_s: 0")
-    + "lanes: {codex: {allowed_models: [gpt-6.1-sol]}}\n",
+    + "lanes: {codex: {allowed_models: [gpt-6.2-sol]}}\n",
     "missing-rate-limit-window": _GOOD_HEAD.replace("rate_limit_window_s: 3600\n", "")
-    + "lanes: {codex: {allowed_models: [gpt-6.1-sol]}}\n",
+    + "lanes: {codex: {allowed_models: [gpt-6.2-sol]}}\n",
     "lanes-list": _GOOD_HEAD + "lanes: [codex]\n",
-    "allowlist-string": _GOOD_HEAD + "lanes: {codex: {allowed_models: gpt-6.1-sol}}\n",
+    "allowlist-string": _GOOD_HEAD + "lanes: {codex: {allowed_models: gpt-6.2-sol}}\n",
     "top-level-list": "- codex\n",
 }
 
@@ -192,7 +195,7 @@ def test_missing_policy_file_raises(tmp_path):
 def test_state_machine(overrides, expected):
     state = credit_lane.lane_credit_state("codex", _codex(**overrides), POLICY, now=NOW)
     assert state["state"] == expected, state
-    assert state["allowed_models"] == ["gpt-6.1-sol", "gpt-6-luna"]
+    assert state["allowed_models"] == [CURRENT_SOL, "gpt-6-luna"]
     if expected == credit_lane.CREDIT_BALANCE_PRESENT:
         assert state["reason"].endswith("draw not verified by the router")
         assert state["credit_balance"] == 62500.0
@@ -354,9 +357,9 @@ def test_real_reader_counts_rate_limits_inside_the_window_only(monkeypatch, tmp_
     usage._reset_rate_limit_cache_for_tests()
     monkeypatch.setattr(usage, "_usage_dir", lambda: tmp_path)
     records = [
-        {"ts": "2026-10-02T16:30:00Z", "outcome": "rate_limited", "model": "gpt-6.1-sol"},
-        {"ts": "2026-10-02T16:45:00Z", "outcome": "ok", "model": "gpt-6.1-sol"},
-        {"ts": "2026-10-02T15:30:00Z", "outcome": "rate_limited", "model": "gpt-6.1-sol"},
+        {"ts": "2026-10-02T16:30:00Z", "outcome": "rate_limited", "model": CURRENT_SOL},
+        {"ts": "2026-10-02T16:45:00Z", "outcome": "ok", "model": CURRENT_SOL},
+        {"ts": "2026-10-02T15:30:00Z", "outcome": "rate_limited", "model": CURRENT_SOL},
     ]
     (tmp_path / "usage_codex-delegate_2026-10-02.jsonl").write_text(
         "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
@@ -392,7 +395,7 @@ def _real_reader_state(monkeypatch, tmp_path, files: dict[str, bytes | None]) ->
 
 
 def _line(**record) -> bytes:
-    return (json.dumps({"outcome": "rate_limited", "model": "gpt-6.1-sol", **record}) + "\n").encode()
+    return (json.dumps({"outcome": "rate_limited", "model": CURRENT_SOL, **record}) + "\n").encode()
 
 
 _LANE_FILE = "usage_codex-delegate_2026-10-02.jsonl"
@@ -604,7 +607,7 @@ def test_credit_balance_codex_is_usable_and_labelled_without_claiming_a_draw():
     assert row["status"] == credit_lane.CREDIT_BALANCE_PRESENT
     assert row["remaining_pct"] == 1.0
     assert (
-        "credit balance present (62500; draw not verified by the router; models gpt-6.1-sol, gpt-6-luna only)"
+        f"credit balance present (62500; draw not verified by the router; models {CURRENT_SOL}, gpt-6-luna only)"
         in row["notes"]
     )
     assert row["credit"]["evidence"] == {
@@ -667,7 +670,7 @@ def test_credit_balance_lane_ranks_after_plan_backed_seats_and_counts_as_usable(
     assert report["recommendation"]["primary_agent_for_code"] == "codex"
     assert any(
         "is past its plan cap with a credit balance present; draw not verified by the router: "
-        "dispatch only gpt-6.1-sol, gpt-6-luna" in w
+        f"dispatch only {CURRENT_SOL}, gpt-6-luna" in w
         for w in report["recommendation"]["warnings"]
     )
 
@@ -777,15 +780,15 @@ def test_bad_policy_keeps_other_router_rows_and_codex_plan_state(bad_policy):
     codex = rows["codex"]
     assert (codex["status"], codex["avoid"]) == ("near_cap", True)
     assert codex["credit"]["state"] == credit_lane.POLICY_ERROR
-    assert codex["credit"]["allowed_models"] == ["gpt-6.1-sol", "gpt-6-luna"]
+    assert codex["credit"]["allowed_models"] == [CURRENT_SOL, "gpt-6-luna"]
     assert "policy_error: credit-lane policy unreadable" in codex["notes"]
     warning = next(w for w in report["recommendation"]["warnings"] if "credit-lane policy unreadable" in w)
     assert str(bad_policy) in warning
-    assert "codex keeps its plan state and dispatch admits only gpt-6.1-sol, gpt-6-luna" in warning
+    assert f"codex keeps its plan state and dispatch admits only {CURRENT_SOL}, gpt-6-luna" in warning
     assert warning.endswith("other lanes unaffected")
     human = capacity_pick.format_human(report)
     assert "credit lane codex: policy_error (credit-lane policy unreadable" in human
-    assert "| dispatch admits only gpt-6.1-sol, gpt-6-luna" in human
+    assert f"| dispatch admits only {CURRENT_SOL}, gpt-6-luna" in human
     assert "cursor" in report["cooler_lanes"] and "codex" not in report["cooler_lanes"]
     assert "grok" not in report["cooler_lanes"]
 
@@ -993,7 +996,7 @@ GATE_SCENARIOS = {
     ),
     "policy-error": ("policy", _no_rate_limit, ("near_cap", credit_lane.POLICY_ERROR, True)),
 }
-_ALLOWLISTED = "gpt-6.1-sol"
+_ALLOWLISTED = CURRENT_SOL
 _OFF_ALLOWLIST = "gpt-5-codex"
 
 
@@ -1051,10 +1054,10 @@ def _published(**overrides) -> dict:
 
 
 def test_published_credit_relief_receipt_for_a_fresh_present_state():
-    receipt = credit_lane.published_credit_relief("codex", _published(), "gpt-6.1-sol", policy=POLICY, now=NOW)
+    receipt = credit_lane.published_credit_relief("codex", _published(), CURRENT_SOL, policy=POLICY, now=NOW)
     assert receipt["state"] == _PRESENT
     assert receipt["model_allowed"] is True
-    assert receipt["allowed_models"] == ["gpt-6.1-sol", "gpt-6-luna"]
+    assert receipt["allowed_models"] == [CURRENT_SOL, "gpt-6-luna"]
     assert receipt["draw"] == credit_lane.DRAW_NOT_VERIFIED
     assert receipt["evidence"]["credit_fetched_at"] == "2026-10-02T16:59:00Z"
     off = credit_lane.published_credit_relief("codex", _published(), "gpt-5.5", policy=POLICY, now=NOW)
@@ -1076,17 +1079,17 @@ def test_published_credit_relief_receipt_for_a_fresh_present_state():
     ],
 )
 def test_published_credit_relief_is_none_unless_present(published):
-    assert credit_lane.published_credit_relief("codex", published, "gpt-6.1-sol", policy=POLICY, now=NOW) is None
+    assert credit_lane.published_credit_relief("codex", published, CURRENT_SOL, policy=POLICY, now=NOW) is None
 
 
 def test_published_credit_relief_is_none_for_an_unconfigured_lane_or_unreadable_policy(monkeypatch):
-    assert credit_lane.published_credit_relief("claude", _published(), "gpt-6.1-sol", policy=POLICY, now=NOW) is None
+    assert credit_lane.published_credit_relief("claude", _published(), CURRENT_SOL, policy=POLICY, now=NOW) is None
 
     def broken(path=None):
         raise ValueError("unreadable")
 
     monkeypatch.setattr(credit_lane, "load_policy", broken)
-    assert credit_lane.published_credit_relief("codex", _published(), "gpt-6.1-sol", now=NOW) is None
+    assert credit_lane.published_credit_relief("codex", _published(), CURRENT_SOL, now=NOW) is None
 
 
 @pytest.mark.parametrize(
@@ -1097,7 +1100,7 @@ def test_published_credit_relief_is_none_for_an_unconfigured_lane_or_unreadable_
 def test_published_credit_relief_rechecks_freshness_now(fetched_at):
     published = _published()
     published["evidence"] = {**published["evidence"], "credit_fetched_at": fetched_at}
-    receipt = credit_lane.published_credit_relief("codex", published, "gpt-6.1-sol", policy=POLICY, now=NOW)
+    receipt = credit_lane.published_credit_relief("codex", published, CURRENT_SOL, policy=POLICY, now=NOW)
     assert receipt["state"] == credit_lane.CREDITS_UNVERIFIED
     assert receipt["reason"].startswith("published credit balance fetch time") and "900s" in receipt["reason"]
 
@@ -1115,7 +1118,7 @@ def test_published_credit_relief_rechecks_current_rate_limits_in_the_shared_log(
         json.dumps({"ts": "2026-10-02T16:55:00Z", "outcome": "rate_limited"}) + "\n", encoding="utf-8"
     )
     canonical = credit_lane.lane_credit_state("codex", _codex(), POLICY, now=NOW)
-    receipt = credit_lane.published_credit_relief("codex", published, "gpt-6.1-sol", policy=POLICY, now=NOW)
+    receipt = credit_lane.published_credit_relief("codex", published, CURRENT_SOL, policy=POLICY, now=NOW)
     assert canonical["state"] == receipt["state"] == credit_lane.CREDIT_USE_UNCONFIRMED
     assert receipt["reason"] == credit_lane.RATE_LIMIT_REASON
     assert receipt["evidence"]["rate_limited_count"] == 1
@@ -1128,7 +1131,7 @@ def test_published_credit_relief_denies_relief_when_the_reader_fails(monkeypatch
 
     published = _published()
     monkeypatch.setattr(credit_lane, "read_recent_rate_limits", broken)
-    receipt = credit_lane.published_credit_relief("codex", published, "gpt-6.1-sol", policy=POLICY, now=NOW)
+    receipt = credit_lane.published_credit_relief("codex", published, CURRENT_SOL, policy=POLICY, now=NOW)
     assert receipt["state"] == credit_lane.CREDITS_UNVERIFIED
     assert receipt["reason"].startswith("runtime usage records unreadable now")
     assert receipt["evidence"]["rate_limited_count"] is None
@@ -1145,7 +1148,7 @@ def test_published_credit_relief_denies_relief_for_unreadable_records(monkeypatc
             "unreadable": {"files": 1, "lines": 0, "records": 0, "total": 1},
         },
     )
-    receipt = credit_lane.published_credit_relief("codex", published, "gpt-6.1-sol", policy=POLICY, now=NOW)
+    receipt = credit_lane.published_credit_relief("codex", published, CURRENT_SOL, policy=POLICY, now=NOW)
     assert receipt["state"] == credit_lane.CREDITS_UNVERIFIED
     assert receipt["evidence"]["unreadable_records"] == {"files": 1}
 
@@ -1378,10 +1381,10 @@ def test_model_change_against_identical_credit_evidence():
     """F7: None is lane inventory (coverage for the listed models); a concrete route is model-specific."""
     info = _pace_hot_with_credits()
     inventory = _facts(info)
-    allowed = _facts(info, model="gpt-6.1-sol")
+    allowed = _facts(info, model=CURRENT_SOL)
     forbidden = _facts(info, model="gpt-5-codex")
     assert inventory.covered_by == allowed.covered_by == ("credits",)
-    assert inventory.credit_models == ("gpt-6.1-sol", "gpt-6-luna")
+    assert inventory.credit_models == (CURRENT_SOL, "gpt-6-luna")
     assert inventory.model_permission is None
     assert forbidden.covered_by == () and forbidden.uncovered is True
     assert forbidden.capacity == credit_lane.CAPACITY_AVOID
@@ -1436,12 +1439,12 @@ def test_published_relief_rechecks_the_complete_record(overrides, stale):
     """F6: a published credit_balance_present leaf cannot override contradictory probe evidence."""
     record = _codex(**overrides)
     receipt = credit_lane.published_credit_relief(
-        "codex", _published(), "gpt-6.1-sol", policy=POLICY, now=NOW, record=record, snapshot_stale=stale
+        "codex", _published(), CURRENT_SOL, policy=POLICY, now=NOW, record=record, snapshot_stale=stale
     )
     assert receipt["state"] == credit_lane.CREDITS_UNVERIFIED
     assert receipt["reason"].startswith("published credit relief not re-verified")
     fresh = credit_lane.published_credit_relief(
-        "codex", _published(), "gpt-6.1-sol", policy=POLICY, now=NOW, record=_codex()
+        "codex", _published(), CURRENT_SOL, policy=POLICY, now=NOW, record=_codex()
     )
     assert fresh["state"] == _PRESENT
 

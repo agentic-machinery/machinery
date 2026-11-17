@@ -18,6 +18,9 @@ from lu_machinery.lib.context_profiles import (
     resolve_profile,
 )
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("_configured_profile_product")
 
@@ -76,11 +79,11 @@ def test_only_native_claude_declares_a_rollover_mode() -> None:
     raw = load_registry(CONFIG_PATH)["profiles"]
 
     assert [key for key, profile in raw.items() if "rollover_mode" in profile] == ["native_claude"]
-    assert resolve_profile("sol_lead", "gpt-6.1-sol")["rollover_mode"] == "continuation"
+    assert resolve_profile("sol_lead", CURRENT_SOL)["rollover_mode"] == "continuation"
     assert resolve_profile("kimicc_k3", "kimi-k3[1m]")["rollover_mode"] == "continuation"
     assert resolve_profile()["rollover_mode"] == "continuation"
     # A model mismatch falls back, so it can never inherit operator_restart.
-    assert resolve_profile("native_claude", "gpt-6.1-sol")["rollover_mode"] == "continuation"
+    assert resolve_profile("native_claude", CURRENT_SOL)["rollover_mode"] == "continuation"
 
 
 def test_registry_rejects_unknown_rollover_mode(tmp_path: Path) -> None:
@@ -92,7 +95,7 @@ def test_registry_rejects_unknown_rollover_mode(tmp_path: Path) -> None:
         load_registry(path)
 
 
-@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", ["gpt-6-luna", CURRENT_SOL])
 def test_native_codex_profile_accepts_gpt6_and_rejects_other_models(model: str) -> None:
     trusted = resolve_profile("native_codex", model)
     mismatch = resolve_profile("native_codex", "gpt-5.6-terra")
@@ -194,7 +197,7 @@ def test_env0_output_is_exact_allow_list() -> None:
             "--profile",
             "sol_lead",
             "--model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "--format",
             "env0",
         ],
@@ -223,7 +226,7 @@ def test_shell_resolver_exports_only_project_private_fields() -> None:
         env | LC_ALL=C sort
         printf '%s\n' '__AFTER_PROFILE_RESOLUTION__'
         source {shlex.quote(os.fspath(SHELL_RESOLVER))}
-        resolve_context_profile sol_lead gpt-6.1-sol
+        resolve_context_profile sol_lead {CURRENT_SOL}
         env | LC_ALL=C sort
     """
     result = subprocess.run(

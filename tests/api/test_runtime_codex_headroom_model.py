@@ -17,6 +17,9 @@ from fastapi.testclient import TestClient
 
 from lu_machinery.api.main import app
 from lu_machinery.api.runtime_router import list_runtime_agents
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -48,9 +51,9 @@ def test_agents_endpoint_reports_last_used_and_headroom_model(tmp_path: Path, mo
     # 1. Without usage records, last_used_model is None and headroom_model falls back to default_model.
     agents = list_runtime_agents(ctx)
     codex = next(a for a in agents if a["name"] == "codex")
-    assert codex["default_model"] == "gpt-6.1-sol"
+    assert codex["default_model"] == CURRENT_SOL
     assert codex["last_used_model"] is None
-    assert codex["headroom_model"] == "gpt-6.1-sol"
+    assert codex["headroom_model"] == CURRENT_SOL
 
     # 2. Write live usage record for Codex with gpt-5.6-terra.
     today_file = usage_dir / f"usage_codex-delegate_{now:%Y-%m-%d}.jsonl"
@@ -72,6 +75,6 @@ def test_agents_endpoint_reports_last_used_and_headroom_model(tmp_path: Path, mo
     assert response.status_code == 200
     agents_json = response.json()["agents"]
     codex_json = next(a for a in agents_json if a["name"] == "codex")
-    assert codex_json["default_model"] == "gpt-6.1-sol"
+    assert codex_json["default_model"] == CURRENT_SOL
     assert codex_json["last_used_model"] == "gpt-5.6-terra"
     assert codex_json["headroom_model"] == "gpt-5.6-terra"

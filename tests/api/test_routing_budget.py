@@ -12,6 +12,9 @@ import pytest
 from lu_machinery.api import state_router
 from lu_machinery.fleet import capacity_pick, credit_lane
 from lu_machinery.telemetry import cost_report
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 # Captured at import, before the conftest autouse fixture stubs the reader.
 REAL_RATE_LIMIT_READER = credit_lane.read_recent_rate_limits
@@ -292,7 +295,7 @@ def test_b_sub_spend_and_in_flight_stay_off_account_a(monkeypatch, tmp_path: Pat
             json.dumps(
                 {
                     "agent": "codex",
-                    "model": "gpt-6.1-sol",
+                    "model": CURRENT_SOL,
                     "ok": True,
                     "prompt_tokens_est": tokens,
                     "codex_account": account,
@@ -535,7 +538,7 @@ def test_near_cap_codex_with_credits_is_recommended_when_no_plan_backed_seat_rem
     rec = data["recommendation"]
     assert rec["primary_agent_for_code"] == "codex"
     assert "draw not verified by the router" in rec["rationale"]
-    assert "gpt-6.1-sol, gpt-6-luna" in rec["rationale"]
+    assert f"{CURRENT_SOL}, gpt-6-luna" in rec["rationale"]
     assert any(
         w.startswith("recommendation 'codex' is past its plan cap") and "credit-period allowlist" in w
         for w in rec["warnings"]
@@ -638,7 +641,7 @@ def test_credit_relief_is_the_owner_decision_over_the_full_record(monkeypatch, t
     def relief(record):
         return state_router._credit_relief_models("codex", record, current_time=_CREDIT_NOW)
 
-    assert relief(codex) == ("gpt-6.1-sol", "gpt-6-luna")
+    assert relief(codex) == (CURRENT_SOL, "gpt-6-luna")
     assert relief({**codex, "probe_state": "NEED_LOGIN"}) is None
     # The leaf alone, or a leaf contradicted by its own record, grants nothing.
     assert relief({"credit": codex["credit"]}) is None

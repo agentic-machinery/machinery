@@ -821,6 +821,12 @@ def validate_catalog(data: Any) -> dict[str, Any]:
             alias_owner[alias] = model_id
         if "replaced_by" in model and lifecycle != "retired":
             raise ModelCatalogError(f"models.{model_id}.replaced_by is only valid on retired models")
+        if "efforts" in model:
+            efforts = _require_string_list(model["efforts"], f"models.{model_id}.efforts")
+            if not set(efforts) <= VALID_CODEX_EFFORTS or len(set(efforts)) != len(efforts):
+                raise ModelCatalogError(
+                    f"models.{model_id}.efforts must be distinct values from {sorted(VALID_CODEX_EFFORTS)}"
+                )
         if "glmcc" in model["transports"]:
             routes = _require_mapping(model.get("glm_routes"), f"models.{model_id}.glm_routes")
             for field in GLM_ROUTE_FIELDS:
@@ -1007,6 +1013,11 @@ def validate_catalog(data: Any) -> dict[str, Any]:
     from lu_machinery.review.role_resolution import validate_role_catalog
 
     validate_role_catalog(catalog)
+    for seat_name, seat in (catalog.get("seats") or {}).items():
+        offered = catalog["models"].get(seat.get("model_id"), {}).get("efforts")
+        for route_name, route in (seat.get("routes") or {}).items():
+            if offered is not None and route.get("effort") not in offered:
+                raise ModelCatalogError(f"seats.{seat_name}.{route_name} effort is not in models.{seat['model_id']}.efforts")
     _validate_ukrainian_seat_catalog(catalog["models"])
     return catalog
 
@@ -1331,6 +1342,32 @@ def runtime_model_matches_requested(
     catalog = catalog or load_model_catalog()
     model_id = resolve_catalog_model_id(requested_model, catalog)
     return bool(model_id and runtime_model in catalog["models"][model_id].get("runtime_model_ids", []))
+
+
+def effort_refusal(model: Any, effort: Any, catalog: dict[str, Any] | None = None) -> str | None:
+    """Refuse an explicit effort outside the model's catalog ``efforts`` list (operator 2026-11-17).
+
+    A model without the field, an unknown model and an omitted effort return None:
+    the adapter default applies and other gates own unknown ids. Never maps an effort.
+    """
+    if effort is None:
+        return None
+    catalog = catalog or load_model_catalog()
+    model_id = resolve_catalog_model_id(str(model or "").strip(), catalog)
+    allowed = catalog["models"].get(model_id, {}).get("efforts") if model_id else None
+    if allowed is None or effort in allowed:
+        return None
+    return (f"model {model_id} does not offer effort {effort!r}; offered: {', '.join(allowed)} "
+            f"(model catalog models.{model_id}.efforts)")
+
+
+def codex_dispatch_models(catalog: dict[str, Any] | None = None) -> frozenset[str]:
+    """Catalog ids the Codex adapters may run: active or fallback models with a native_codex transport."""
+    models = (catalog or load_model_catalog())["models"]
+    return frozenset(
+        model_id for model_id, model in models.items()
+        if model["lifecycle"] in {"active", "fallback"} and "native_codex" in model["transports"]
+    )
 
 
 def retired_model_refusal(

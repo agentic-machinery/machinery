@@ -1,24 +1,28 @@
 """Offline model-boundary checks for the native Codex diagnostic probe."""
+import re
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from lu_machinery.agent_runtime import codex_hook_probe as probe
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
-@pytest.mark.parametrize("model", [None, "gpt-6.1-sol"])
+@pytest.mark.parametrize("model", [None, CURRENT_SOL])
 def test_probe_pins_sol_low(tmp_path, model):
     with patch.object(probe, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
         probe._run_case(tmp_path, probe.PROBE_CASES[0], model, 1)
     command = run.call_args.args[0]
-    assert command[command.index("--model") + 1] == "gpt-6.1-sol"
+    assert command[command.index("--model") + 1] == CURRENT_SOL
     assert 'model_reasoning_effort="low"' in command
 
 
 def test_probe_rejects_explicit_old_pin_before_process(tmp_path):
     with patch.object(probe, "_run") as run:
-        with pytest.raises(ValueError, match=r"only gpt-6\.1-sol"):
+        with pytest.raises(ValueError, match=f"only {re.escape(CURRENT_SOL)}"):
             probe._run_case(tmp_path, probe.PROBE_CASES[0], "gpt-5.6-sol", 1)
     run.assert_not_called()
 

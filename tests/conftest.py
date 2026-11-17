@@ -4103,6 +4103,7 @@ BRANCH = "codex/fixture"
 @pytest.fixture
 def low_review(monkeypatch, tmp_path):
     """Keep real verdict parsing/qualification; replace GitHub and branch facts."""
+    from tests.helpers import current_sol
     from lu_machinery.orchestration import integration_sweep as sweep
     from lu_machinery.publish import github as publisher
     from lu_machinery.review import record_cf_verdict as recorder
@@ -4112,7 +4113,7 @@ def low_review(monkeypatch, tmp_path):
     task = {
         "task_id": "review-one", "repository": REPOSITORY,
         "worktree_branch": BRANCH, "worktree_base_sha": HEAD,
-        "model": "gpt-6.1-sol", "agent": "codex", "status": "done",
+        "model": current_sol(), "agent": "codex", "status": "done",
         "started_at": "2026-09-23T12:00:00.000001+00:00",
     }
     (tasks / "review-one.json").write_text(json.dumps(task))
@@ -4121,7 +4122,7 @@ def low_review(monkeypatch, tmp_path):
     facts = recorder.BranchReviewFacts(
         repository=REPOSITORY, base_tip_sha=BASE, head_sha=HEAD, merge_base_sha=BASE,
         commits=(recorder.CommitAttribution(
-            HEAD, "openai", "trailer-model", task_id="codex/author-one", author_models=("gpt-6.1-sol",),
+            HEAD, "openai", "trailer-model", task_id="codex/author-one", author_models=(current_sol(),),
         ),),
         existing_families=frozenset({"openai"}), incoming_writer=None, incoming_family=None,
         changed_paths=("docs/example.md",), owned_paths=(), subject_seats=frozenset(),

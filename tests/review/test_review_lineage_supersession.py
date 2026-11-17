@@ -12,11 +12,14 @@ from lu_machinery.review.review_lineage import (
     lineage_runs,
     superseded_runs,
 )
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 EARLY = "1" * 40
 APPROVED = "2" * 40
 CANDIDATE = "3" * 40
-SEATS = {"openai": ("gpt-6.1-sol", "codex"), "anthropic": ("claude-opus-5-5", "claude")}
+SEATS = {"openai": (CURRENT_SOL, "codex"), "anthropic": ("claude-opus-5-5", "claude")}
 
 
 def started(minute):
@@ -94,7 +97,7 @@ def test_a_later_same_seat_approve_supersedes_an_unpublished_rejection_and_keeps
             "head": EARLY,
             "verdict": "CHANGES_REQUESTED",
             "findings": recorder._review_verdict_and_count(ORPHAN_REJECTION)[1],
-            "model": "gpt-6.1-sol",
+            "model": CURRENT_SOL,
             "family": "openai",
             "profile": "code",
             "superseded_by": {
@@ -102,7 +105,7 @@ def test_a_later_same_seat_approve_supersedes_an_unpublished_rejection_and_keeps
                 "started": started(2),
                 "head": APPROVED,
                 "verdict": "APPROVED",
-                "model": "gpt-6.1-sol",
+                "model": CURRENT_SOL,
             },
         }
     ]
@@ -146,7 +149,7 @@ def test_an_approval_at_the_candidate_head_never_supersedes_to_prove_the_approve
     # Authors of every listed second-reviewer family exempt the head.
     exempt_run, exempt_comment = review("sol-exempt", APPROVED, "VERDICT: APPROVE", minute=2,
                                         author_models=["muse-wonder-full-1.0", "gemini-4-carbon-medium",
-                                                       "grok-4.7", "claude-opus-5-5", "gpt-6.1-sol"])
+                                                       "grok-4.7", "claude-opus-5-5", CURRENT_SOL])
     assert check_lineage(runs=[carbon_run, exempt_run], comments=[carbon_comment, exempt_comment],
                          login="fleet", approved=APPROVED, second_review=True) == ["openai"]
     opus = review("opus-r2", APPROVED, "VERDICT: APPROVE", minute=2, family="anthropic")
@@ -279,7 +282,7 @@ def _crashed(task, *, provider_pgid=None, result_sha256=None, include_provider=T
         "task_id": task,
         "worktree_base_sha": EARLY,
         "pinned_head": EARLY,
-        "model": "gpt-6.1-sol",
+        "model": CURRENT_SOL,
         "agent": "codex",
         "started_at": started(4),
         "status": status,

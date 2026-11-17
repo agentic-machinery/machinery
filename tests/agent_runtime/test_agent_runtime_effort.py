@@ -26,6 +26,9 @@ from lu_machinery.agent_runtime.adapters.gemini import GeminiAdapter
 from lu_machinery.agent_runtime.errors import AgentUnavailableError
 from lu_machinery.agent_runtime.usage import _reset_rate_limit_cache_for_tests
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -341,7 +344,7 @@ def test_codex_adapter_no_effort_means_default_high_override(tmp_path):
         for i in range(len(plan.cmd) - 1)
         if plan.cmd[i] == "-c"
     ]
-    assert plan.cmd[plan.cmd.index("-m") + 1] == "gpt-6.1-sol"
+    assert plan.cmd[plan.cmd.index("-m") + 1] == CURRENT_SOL
     assert ("-c", "model_reasoning_effort=high") in flag_pairs, (
         f"expected ('-c', 'model_reasoning_effort=high') in flag pairs; "
         f"plan.cmd={plan.cmd}"

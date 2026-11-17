@@ -8,6 +8,9 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.bakeoff import review_eval
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 SET_DIR = Path(__file__).resolve().parents[2] / "docs" / "review-eval"
 
@@ -99,6 +102,6 @@ def test_dry_run_prints_the_plan_and_dispatches_nothing(monkeypatch, capsys) -> 
                              "--run-label", "t"])
     assert code == 0
     out = capsys.readouterr().out
-    assert "lu_machinery.dispatch dispatch --agent codex --model gpt-6.1-sol" in out
+    assert f"lu_machinery.dispatch dispatch --agent codex --model {CURRENT_SOL}" in out
     assert "--agent agy --model gemini-4-carbon-medium" in out
     assert '"reviews": 33' in out

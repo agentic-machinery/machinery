@@ -286,7 +286,7 @@ canonical receipt using `contract_canary.record`:
 
 | Route | Model | Account |
 | --- | --- | --- |
-| Codex | `gpt-6.1-sol` | `b-sub` |
+| Codex | `gpt-6.2-sol` | `b-sub` |
 | Claude | `claude-sonnet-5-5` | `b` |
 | Cursor | `grok-4.7-high` | Existing host binding |
 | AGY | `gemini-3.8-flash-high` | Existing host binding |

@@ -12,6 +12,9 @@ from lu_machinery.dispatcher import checks, cli, git, store, worker
 from lu_machinery.review import record_cf_verdict as cf
 from lu_machinery.review.subject_seat import classify_owned_path
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -35,7 +38,7 @@ def dispatch(tmp_path, monkeypatch):
     ))
     monkeypatch.setattr(worker, "start", start)
 
-    def invoke(*flags, agent="sol", model="gpt-6.1-sol", expected=0):
+    def invoke(*flags, agent="sol", model=CURRENT_SOL, expected=0):
         assert cli.main(["dispatch", "--agent", agent, "--model", model, "--task-id", "review",
                          "--prompt", "Review this change", *flags]) == expected
         if expected:
@@ -69,32 +72,32 @@ def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, mo
     )
     monkeypatch.setattr(cf, "evaluate_candidate", lambda *a, **kw: SimpleNamespace(status="eligible"))
     cf._require_qualified_reviewer(facts, task=record,
-                                   model="gpt-6.1-sol", family="openai")
+                                   model=CURRENT_SOL, family="openai")
     assert facts.resolver_inputs.call_args.kwargs["risk"] == "high"
 
 
 @pytest.mark.parametrize("agent,model,flag,value", [
-    ("sol", "gpt-6.1-sol", "--subject-seat", "codex-desktop"),
-    ("sol", "gpt-6.1-sol", "--subject-family", " OPENAI "),
+    ("sol", CURRENT_SOL, "--subject-seat", "codex-desktop"),
+    ("sol", CURRENT_SOL, "--subject-family", " OPENAI "),
     ("claude", "claude-opus-5-5", "--subject-seat", "claude-infra"),
     ("cursor", "grok-4.7-high", "--subject-seat", "grok-build"),
     ("cursor", "grok-4.7-high", "--subject-seat", "cursor"),
     ("cursor", "grok-4.7-high", "--subject-family", "xai"),
-    ("cursor", "gpt-6.1-sol", "--subject-seat", "codex"),
-    ("cursor", "gpt-6.1-sol", "--subject-seat", "grok"),
-    ("cursor", "gpt-6.1-sol", "--subject-family", "xai"),
+    ("cursor", CURRENT_SOL, "--subject-seat", "codex"),
+    ("cursor", CURRENT_SOL, "--subject-seat", "grok"),
+    ("cursor", CURRENT_SOL, "--subject-family", "xai"),
     ("sol", "grok-4.7-high", "--subject-seat", "cursor"),
     ("sol", "grok-4.7-high", "--owned-path", "lu_machinery/dispatcher/providers/cursor.py"),
-    ("sol", "gpt-6.1-sol", "--subject-seat", "unknown-seat"),
-    ("sol", "gpt-6.1-sol", "--subject-family", "unknown-family"),
+    ("sol", CURRENT_SOL, "--subject-seat", "unknown-seat"),
+    ("sol", CURRENT_SOL, "--subject-family", "unknown-family"),
     ("cursor", "auto", "--subject-seat", "grok"),
-    ("sol", "gpt-6.1-sol", "--owned-path", "lu_machinery/dispatcher/providers/codex.py"),
+    ("sol", CURRENT_SOL, "--owned-path", "lu_machinery/dispatcher/providers/codex.py"),
     ("cursor", "grok-4.7-high", "--owned-path", "lu_machinery/dispatcher/providers/cursor.py"),
 ])
 def test_subject_self_review_effective_identity_or_unknown_refused_before_launch(dispatch, capsys, agent, model, flag, value):
     dispatch(flag, value, agent=agent, model=model, expected=2)
     err = capsys.readouterr().err
-    if agent == "cursor" and model == "gpt-6.1-sol":
+    if agent == "cursor" and model == CURRENT_SOL:
         assert "CURSOR_MODEL_NOT_APPROVED" in err
     elif agent == "cursor" and model == "auto":
         assert "cursor_auto_outside_coding_task" in err
@@ -104,7 +107,7 @@ def test_subject_self_review_effective_identity_or_unknown_refused_before_launch
 
 
 @pytest.mark.parametrize("model,flags", [
-    ("gpt-6.1-sol", ()),
+    (CURRENT_SOL, ()),
     ("auto", ()),
 ])
 def test_effective_identity_does_not_overexclude_cursor_without_matching_subject(dispatch, capsys, model, flags):
@@ -183,7 +186,7 @@ def test_v2_subject_provider_paths_inferred_from_absolute_and_windows_paths():
         assert classify_owned_path(path).seats == frozenset({"claude"})
 
 
-SOL = ("sol", "gpt-6.1-sol")
+SOL = ("sol", CURRENT_SOL)
 
 
 @pytest.mark.parametrize(
@@ -191,11 +194,11 @@ SOL = ("sol", "gpt-6.1-sol")
     [
         # Sol is outside the declared author's family but authored a commit on the branch. Medium risk: with
         # Grok retired, no third family reviews high-risk work (only Opus 5.5 and Sol 6.1 are admitted there).
-        (("claude/claude-opus-5-5", "codex/gpt-6.1-sol"), ("--review-author-model", "claude-opus-5-5", "--risk", "medium"),
+        (("claude/claude-opus-5-5", f"codex/{CURRENT_SOL}"), ("--review-author-model", "claude-opus-5-5", "--risk", "medium"),
          SOL, "['anthropic', 'openai']"),
         # Any review flag types a read-only review, dry runs included (F2).
-        (("codex/gpt-6.1-sol",), ("--review-mode", "cross_family"), SOL, "['openai']"),
-        (("codex/gpt-6.1-sol",), ("--review-mode", "cross_family", "--dry-run"), SOL, "['openai']"),
+        ((f"codex/{CURRENT_SOL}",), ("--review-mode", "cross_family"), SOL, "['openai']"),
+        ((f"codex/{CURRENT_SOL}",), ("--review-mode", "cross_family", "--dry-run"), SOL, "['openai']"),
         # An unresolvable trailer excludes no family, so no reviewer is provably outside it (F1).
         (("claude/cto-not-a-model",), ("--risk", "low"), SOL, "AUTHOR_UNRESOLVED"),
         # An empty range is a refusal, not a range with nobody to exclude (F2).
@@ -203,15 +206,15 @@ SOL = ("sol", "gpt-6.1-sol")
         # A task id without a task record is unresolved on a single-family harness too (F5).
         (("kimi/cto-not-a-model",), ("--risk", "low"), SOL, "AUTHOR_UNRESOLVED"),
         # Authorship runs from the default branch: a --base cut after the Claude commit hides nothing (F6).
-        (("claude/claude-opus-5-5", "codex/gpt-6.1-sol"), ("--base", "@1", "--risk", "low"),
+        (("claude/claude-opus-5-5", f"codex/{CURRENT_SOL}"), ("--base", "@1", "--risk", "low"),
          ("claude", "claude-opus-5-5"), "['anthropic', 'openai']"),
         # A red team keeps only its seat rule: unresolved authors and an empty range are refused (F9).
         (("claude/cto-not-a-model",), ("--review-mode", "red_team", "--review-author-model", "claude-opus-5-5"),
          SOL, "AUTHOR_UNRESOLVED"),
         ((), ("--review-mode", "red_team"), SOL, "has no commits"),
         # A review subject or a reviewed --branch types a read-only review (F10).
-        (("codex/gpt-6.1-sol",), ("--subject-seat", "claude"), SOL, "['openai']"),
-        (("codex/gpt-6.1-sol",), ("--branch", "review/target"), SOL, "['openai']"),
+        ((f"codex/{CURRENT_SOL}",), ("--subject-seat", "claude"), SOL, "['openai']"),
+        ((f"codex/{CURRENT_SOL}",), ("--branch", "review/target"), SOL, "['openai']"),
     ],
 )
 def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp_path, capsys, trailers, flags,
@@ -270,7 +273,7 @@ def test_typed_dispatch_without_a_reviewed_change_checks_no_branch_authorship(di
         raise AssertionError("branch authorship checked for a dispatch that reviews no change")
 
     monkeypatch.setattr(checks, "check_branch_author_families", unexpected)
-    dispatch("--mode", "read-only", *flags, "--pinned-head", "a" * 40, agent="codex", model="gpt-6.1-sol")
+    dispatch("--mode", "read-only", *flags, "--pinned-head", "a" * 40, agent="codex", model=CURRENT_SOL)
 
 
 def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_verdict(dispatch, monkeypatch, capsys):
@@ -281,7 +284,7 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     review = ("--mode", "read-only", "--branch", "codex/fix", "--pr", "42", "--risk", "medium",
               "--require-review-verdict", "--prompt", "Review this change")
     for round_number in (1, 2, 3):
-        assert cli.main(["dispatch", "--agent", "sol", "--model", "gpt-6.1-sol", "--task-id", f"round-{round_number}",
+        assert cli.main(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, "--task-id", f"round-{round_number}",
                          *review]) == 0
     # GitHub knows the PR at the fourth head, with a default-tier diff and no recorded verdict at all.
     monkeypatch.setattr(cf, "_run_json", lambda args, **_k: dict(headRefOid="4" * 40, headRefName="codex/fix",
@@ -291,7 +294,7 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
                                                                                  scope_paths=()))
     monkeypatch.setattr(cf.GitHubAdapter, "identity", lambda self: "fleet")
     monkeypatch.setattr(cf.GitHubAdapter, "comments", lambda self, repository, number: [])
-    assert cli.main(["dispatch", "--agent", "sol", "--model", "gpt-6.1-sol", "--task-id", "round-4", *review]) == 2
+    assert cli.main(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, "--task-id", "round-4", *review]) == 2
     assert "review dispatch refused: REVIEW_BUDGET_EXHAUSTED: PR #42 already has verdicts at 3 heads (3 dispatched " \
            "with no recorded verdict" in capsys.readouterr().err
     assert store.read("round-4", missing_ok=True) is None
@@ -318,7 +321,7 @@ def test_mixed_family_head_refuses_carbon(dispatch, monkeypatch, tmp_path, capsy
     run("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
     run("remote", "add", "origin", str(origin))
     run("push", "-q", "origin", "HEAD:refs/heads/main")
-    for trailer in ("claude/claude-opus-5-5", "codex/gpt-6.1-sol"):
+    for trailer in ("claude/claude-opus-5-5", f"codex/{CURRENT_SOL}"):
         run("commit", "-q", "--allow-empty", "-m", f"work\n\nX-Agent: {trailer}")
     head = run("rev-parse", "HEAD")
     monkeypatch.setattr(git, "resolve_repo", lambda _: (repo, dict(key="public", github="example/public")))

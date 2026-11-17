@@ -15,6 +15,9 @@ from lu_machinery.review.reviewer_resolver import (
     resolve_reviewer,
 )
 from tests.claude_route_accounts import HOST_ACCOUNT
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -119,7 +122,7 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
         for family in set(AUTHOR_FAMILIES) - {"anthropic", "openai"}:
             assert results[family] == ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy"]
         # The resolver names the single eligibility rule, not a bench-local list.
-        rule = "performed only by gpt-6.1-sol, claude-opus-5-5"
+        rule = f"performed only by {CURRENT_SOL}, claude-opus-5-5"
         assert rule in exclusions["anthropic"][GROK]
         assert rule in exclusions["openai"][GROK]
         assert rule in exclusions["openai"]["claude-sonnet-5-5"]

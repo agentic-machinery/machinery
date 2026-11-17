@@ -53,7 +53,7 @@ REFUSAL_CODE = "CREDIT_PERIOD_MODEL_REFUSED"
 
 # Hard-wired minimal policy for a policy file that cannot be read: only these
 # lanes stay restricted, to these models. A test pins it to the shipped yaml.
-DEFAULT_ALLOWED_MODELS: dict[str, tuple[str, ...]] = {"codex": ("gpt-6.1-sol", "gpt-6-luna")}
+DEFAULT_ALLOWED_MODELS: dict[str, tuple[str, ...]] = {"codex": ("gpt-6.2-sol", "gpt-6-luna")}
 
 NOT_CONFIGURED = "not_configured"
 POLICY_ERROR = "policy_error"

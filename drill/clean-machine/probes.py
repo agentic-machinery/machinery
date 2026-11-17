@@ -487,7 +487,7 @@ def dispatch_dry_run(_: list[str]) -> tuple[bool, dict]:
         "--agent",
         "codex",
         "--model",
-        "gpt-6.1-sol",
+        "gpt-6.2-sol",
         "--task-id",
         task,
         "--prompt",

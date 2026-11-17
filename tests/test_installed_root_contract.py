@@ -19,6 +19,9 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_root
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 _PROBE = r'''
 import importlib, json, os, subprocess, sys
@@ -313,7 +316,7 @@ code = worker._dispatcher_code()
 head = sys.argv[2]
 record = {"status": "done", "mode": "read-only", "require_review_verdict": True, "schema_version": 2,
           "review_profile": "code", "worktree_start_sha": head, "head_sha": head, "agent": "codex",
-          "model": "gpt-6.1-sol", "resolved_model_known": True, "resolved_model": "gpt-6.1-sol",
+          "model": "gpt-6.2-sol", "resolved_model_known": True, "resolved_model": "gpt-6.2-sol",
           "result_sha256": hashlib.sha256(b"reply").hexdigest(), "task_id": "attest-probe",
           "dispatcher_code": code, "dispatcher_code_start": dict(code)}
 try:

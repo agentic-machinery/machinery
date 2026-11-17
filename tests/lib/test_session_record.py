@@ -23,6 +23,9 @@ from lu_machinery.lib.session_record import (
     write_record,
 )
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 def test_canonical_state_root_uses_git_common_directory(configured_roots) -> None:
@@ -68,7 +71,7 @@ def test_update_session_writes_private_atomic_sol_record(tmp_path: Path) -> None
         "sol-session",
         transcript_path=os.fspath(transcript),
         source="startup",
-        observed_model="gpt-6.1-sol",
+        observed_model=CURRENT_SOL,
         agent_type="infra-orchestrator",
         profile_id="sol_lead",
         provenance="session-start",
@@ -185,7 +188,7 @@ def test_env_file_exports_are_shell_safe_and_project_private(tmp_path: Path) -> 
     record = update_session(
         "quoted-session",
         transcript_path=os.fspath(transcript),
-        observed_model="gpt-6.1-sol",
+        observed_model=CURRENT_SOL,
         profile_id="sol_lead",
         provenance="session-start",
         state_root=tmp_path,
@@ -230,7 +233,7 @@ def test_cli_round_trip_uses_explicit_state_root(tmp_path: Path) -> None:
             "--profile-id",
             "sol_lead",
             "--observed-model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
         ],
         check=True,
         capture_output=True,

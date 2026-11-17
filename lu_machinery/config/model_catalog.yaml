@@ -338,12 +338,16 @@ models:
     weaknesses: [worker_qualification_pending, no_review_or_approval_authority]
     notes: Explicit delegate worker only. Spark cannot approve or review.
     sources: [https://dev.meta.ai/docs/muse-code]
-  gpt-6.1-sol:
+  gpt-6.2-sol:
     routing_wire_ids:
-      native_codex: gpt-6.1-sol
+      native_codex: gpt-6.2-sol
     family: openai
     tier: frontier_authority
     lifecycle: active
+    # Operator 2026-11-17: high for reviews, accountable driving, advisory and
+    # approval and hard coding; medium for well-specified bounded coding.
+    # xhigh and max are refused, never mapped.
+    efforts: [medium, high]
     roles:
       - orchestration
       - architecture
@@ -358,6 +362,70 @@ models:
     strengths: [agentic_coding, demanding_reasoning, frontier_technical_judgment, near_astra_at_lower_cost]
     weaknesses: [not_independent_from_openai_authors]
     notes: >-
+      Operator 2026-11-17: Sol 6.2 replaces Sol 6.1 in every live role. It is the
+      only Sol and the only GPT-6 frontier seat: Codex orchestrator, coder,
+      reviewer and the hard advisory seat. GPT-6 Luna stays the scouting and
+      bounded-work seat. API id gpt-6.2-sol (official model page): "our go-to
+      model for everyday work, from coding to powering agents at scale". Context
+      window 1,050,000 tokens, max input 922,000, max output 128,000; knowledge
+      cutoff 2026-06-01; reasoning effort none is rejected. Standard price $2
+      input / $0.10 cached input / $10 output per million tokens; prompts over
+      272K input tokens bill 2x input and 1.5x output.
+    sources:
+      - https://developers.openai.com/api/docs/models/gpt-6.2-sol
+      - https://developers.openai.com/api/docs/pricing
+  gpt-6.2-astra:
+    routing_wire_ids:
+      native_codex: gpt-6.2-astra
+    family: openai
+    tier: frontier_authority
+    lifecycle: active
+    # Explicit pin only (operator 2026-11-17), like claude-fable-5-2: no seat,
+    # ladder, endpoint, substitution or default routes it. Work roles only; it
+    # holds no review, advisory or approval role, so it is never a review of
+    # record. Effort high only; xhigh and max are refused.
+    efforts: [high]
+    roles: [implementation, agentic_coding, long_horizon_coding]
+    transports: [native_codex]
+    strengths: [frontier_technical_judgment, hardest_problems]
+    weaknesses: [not_independent_from_openai_authors, four_times_sol_price, review_qualification_pending]
+    notes: >-
+      Operator order 2026-11-17: Astra 6.2 joins the Fable 5.2 pin-only tier and is
+      used in real situations for high-value reviews and hard problems as a coder.
+      Pinned implementer: dispatch --agent codex --model gpt-6.2-astra --effort high.
+      Extra pinned reviewer: the same with --mode read-only --base <head sha>; its
+      findings are real review input but it is not the review of record (it is
+      OpenAI-family and unqualified). Promotion to a review seat goes through a
+      review-eval protocol seat and its measured results. API id gpt-6.2-astra
+      (official model page): "our most capable model for your hardest projects".
+      Context window 1,050,000 tokens, max input 922,000, max output 128,000;
+      knowledge cutoff 2026-05-18. Standard price $8 input / $0.40 cached input /
+      $40 output per million tokens; prompts over 272K input tokens bill 2x input
+      and 1.5x output.
+    sources:
+      - https://developers.openai.com/api/docs/models/gpt-6.2-astra
+      - https://developers.openai.com/api/docs/pricing
+  gpt-6.1-sol:
+    family: openai
+    tier: frontier_authority
+    lifecycle: retired
+    replaced_by: gpt-6.2-sol
+    roles:
+      - orchestration
+      - architecture
+      - implementation
+      - standard_review
+      - critical_review
+      - agentic_coding
+      - bounded_advisory_envelope
+      - consequential_advisory
+      - ukrainian_review
+    transports: []
+    strengths: [agentic_coding, demanding_reasoning, frontier_technical_judgment, near_astra_at_lower_cost]
+    weaknesses: [not_independent_from_openai_authors]
+    notes: >-
+      Historical records only. Operator 2026-11-17: gpt-6.2-sol replaces it in
+      every live role. Not routable. Former note follows.
       Operator 2026-09-29 (#9230): the only Sol and the only GPT-6 frontier seat.
       Codex orchestrator, coder, reviewer, and the hard advisory seat that GPT-6
       Astra held. Orchestration, coding, review and the advisory seat
@@ -384,7 +452,7 @@ models:
     weaknesses: [not_a_formal_reviewer, no_driver_authority, no_security_tool_work, no_destructive_cleanup]
     notes: >-
       Default routine non-security coder through native Codex and Codex multi_agent_v2
-      at high effort. Use explicit Sol 6.1 for hard tasks, advisory work, drivers,
+      at high effort. Use explicit Sol 6.2 for hard tasks, advisory work, drivers,
       security tooling and destructive cleanup. No review-of-record, critique,
       designated approval or Ukrainian-content judgment role. The codex formal-review
       endpoint and authority seats remain Sol; this entry adds no reviewer candidate.
@@ -415,7 +483,7 @@ models:
       Operator 2026-09-22: scouting and bounded repeatable work at high.
       Use max only for an unusually hard scouting task. API id gpt-6-luna.
       Standard price $0.10 / $0.50 per million input/output tokens, 20x below
-      GPT-6.1 Sol. Routing decisions stay with the Sol orchestrator.
+      GPT-6.2 Sol. Routing decisions stay with the Sol orchestrator.
     sources:
       - https://developers.openai.com/api/docs/models/gpt-6-luna
       - https://openai.com/index/introducing-gpt-6-sol-and-luna/
@@ -423,7 +491,7 @@ models:
     family: openai
     tier: frontier_authority
     lifecycle: retired
-    replaced_by: gpt-6.1-sol
+    replaced_by: gpt-6.2-sol
     roles: [bounded_advisory_envelope, architecture, consequential_advisory]
     transports: []
     strengths: [agentic_coding, frontier_technical_judgment]
@@ -436,7 +504,7 @@ models:
     family: openai
     tier: frontier_authority
     lifecycle: retired
-    replaced_by: gpt-6.1-sol
+    replaced_by: gpt-6.2-sol
     roles: [orchestration, architecture, implementation, standard_review, critical_review, agentic_coding]
     transports: []
     strengths: [agentic_coding, demanding_reasoning]
@@ -450,14 +518,14 @@ models:
     family: openai
     tier: frontier_authority
     lifecycle: retired
-    replaced_by: gpt-6.1-sol
+    replaced_by: gpt-6.2-sol
     roles: [architecture, critical_review, bounded_advisory_envelope, difficult_debugging, final_synthesis]
     transports: []
     strengths: [frontier_technical_judgment, long_horizon_reasoning, programmatic_tools]
     weaknesses: [scarce_frontier_quota, wasteful_for_routine_work, not_a_speed_winner]
     notes: >-
       Historical Wave 1 scorecard only. Operator 2026-09-22: do not select
-      GPT-5.6. Live seats are gpt-6.1-sol and gpt-6-luna.
+      GPT-5.6. Live seats are gpt-6.2-sol and gpt-6-luna.
     sources:
       - https://developers.openai.com/api/docs/guides/latest-model
   gpt-5.6-terra:
@@ -511,7 +579,7 @@ models:
     notes: >-
       Operator decision 2026-10-03 (#9583): Fable 5.1 holds no advisory, approval,
       review or critique role and is not a last resort for any of them; Opus 5.5 /
-      Sol 6.1 hold those roles. It succeeds claude-fable-5 as a launchable Claude
+      Sol 6.2 hold those roles. It succeeds claude-fable-5 as a launchable Claude
       model only. Thinking is always on (never send
       thinking: disabled). Effort decision topology (operator 2026-09-09): default
       high (API default; start here — do not port Opus/xhigh habits); medium/low
@@ -572,7 +640,7 @@ models:
       Operator 2026-09-22: default Claude model and the Claude orchestrator seat.
       Opus 5.5 executes architecture, hard coding, deep code review and
       Ukrainian-specific linguistic work. start-claude-driver.sh pins claude-opus-5-5[1m] @ high.
-      Opus 5.5 / Sol 6.1 take review, critique and design input and hold
+      Opus 5.5 / Sol 6.2 take review, critique and design input and hold
       designated approval: the non-author's approval when one of them authored the
       proposal, both for any other author (#9583, #9616). Effort: API default is medium (not high); medium on
       Opus 5.5 beats Opus 5 @ high on coding and knowledge work. Orchestrating runs
@@ -595,7 +663,7 @@ models:
     notes: >-
       Anthropic authority-tier seat. Operator 2026-08-06: formal CF eligible when pinned
       on the sealed claude endpoint (sealed review-pr was removed in #8520).
-      Advisory consultations remain non-binding for designated approval authority (Opus 5.5 + Sol 6.1, #9583, #9616).
+      Advisory consultations remain non-binding for designated approval authority (Opus 5.5 + Sol 6.2, #9583, #9616).
       Kimi: web, UI and backend coding only — no Ukrainian-language content, no
       reviews, consults, design or rules.
       Effort ladder low..max; use high for advisory and xhigh only for a documented hard turn.
@@ -1279,12 +1347,12 @@ orchestrator_seats:
       advanced non-linguistic work (architecture, hard coding, deep code review).
       start-claude-driver.sh pins claude-opus-5-5[1m] @ high unless --model /
       --effort (or LAUNCHER_MODEL / LAUNCHER_EFFORT) override it. Opus 5.5 /
-      Sol 6.1 take review, critique, design input and Ukrainian work and hold
+      Sol 6.2 take review, critique, design input and Ukrainian work and hold
       designated approval: the non-author's approval when one of them authored the
       proposal, both for any other author (#9583, #9616). Orchestration alone does not
       confer approval authority. Claude driver sessions stay dispatch-heavy,
       never inline-heavy.
-      Escalation stays CROSS-FAMILY to GPT-6.1 Sol @ high; Claude is an escalation TARGET,
+      Escalation stays CROSS-FAMILY to GPT-6.2 Sol @ high; Claude is an escalation TARGET,
       not an escalator. Driving default is `high` (Opus 5.5 API default is medium;
       step down to medium/low for routine turns; xhigh for hard turns and pinned
       curriculum/linguistic review skills; max almost never) — see
@@ -1296,7 +1364,7 @@ orchestrator_seats:
     escalate_effort: high
     escalate_when: consequential_advisory
     note: >
-      Operator 2026-09-29 (#9230): GPT-6.1 Sol @ high is the Codex orchestrator,
+      Operator 2026-11-17: GPT-6.2 Sol @ high (replacing 6.1, #9230) is the Codex orchestrator,
       advanced seat; ordinary advice uses Sol high.
       The #9275 bounded-envelope route is unchanged. GPT-6
       Luna @ high does scouting and bounded work and is not this seat. Named alternate on
@@ -1314,9 +1382,9 @@ orchestrator_seats:
       Google-family seat. Gemini may drive epics (2026-10-08 approval):
       start-gemini-driver.sh defaults to gemini-3.8-flash-high and refuses every other Gemini id. The 2026-10-08 approval also
       admits Gemini as a formal reviewer of low-risk and medium-risk code, and of Ukrainian work with
-      the Sources MCP; high-risk and critical review stay with Opus 5.5 or Sol 6.1 under the current qualification policy. Security-path code reviews remain excluded.
+      the Sources MCP; high-risk and critical review stay with Opus 5.5 or Sol 6.2 under the current qualification policy. Security-path code reviews remain excluded.
       Native AGY review dispatches run directly in the exact-head worktree. Design input and designated approval stay
-      with Opus 5.5 and Sol 6.1.
+      with Opus 5.5 and Sol 6.2.
   # C-5307 restores an explicit Cursor review pin, not a Cursor driver or Auto allowlist.
 
 # Formal CF transport defaults (model + effort; sealed review-pr was removed in #8520). Advisor/authority
@@ -1379,13 +1447,13 @@ review_ladders:
 # does not reject, uses that lane's registry default.
 # An explicit model with no row that the substitute adapter rejects is
 # refused before spawn (agy rejects an unknown Gemini slug; codex rejects
-# anything outside gpt-6.1-sol/gpt-6-luna).
+# any model the catalog does not admit on native_codex).
 # GPT-6 has no Cursor row: native Codex only, until Cursor has a verified slug.
 # Grok has no shared Cursor usage pool or Cursor substitution row.
 usage_pools: {}
 budget_substitution_models:
   codex:
-    gpt-6.1-sol: {role: openai_frontier_coder}
+    gpt-6.2-sol: {role: openai_frontier_coder}
     gpt-6-luna: {role: bounded_recon}
 
 
@@ -1410,7 +1478,7 @@ seats:
         review_profiles: [code, infra]
         capabilities: [code_review]
   openai_frontier:
-    model_id: gpt-6.1-sol
+    model_id: gpt-6.2-sol
     bindings:
     - legacy_review_candidate
     - design_approval

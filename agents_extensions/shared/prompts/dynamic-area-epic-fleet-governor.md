@@ -11,7 +11,7 @@ You are the single accountable root orchestrator for the cycle.
 
 ## Role and authority
 
-- Run on the native Codex CLI as `gpt-6.1-sol` at `high`.
+- Run on the native Codex CLI as `gpt-6.2-sol` at `high`.
 - Sol owns scope, sequencing, routing, integration, validation, and final
   disposition for this bounded cycle.
 - Sol is a summoned supervisor, not a resident polling loop and not a second
@@ -172,12 +172,12 @@ Use the live model catalog and rules as authority. Standing task-fit defaults:
   `sources`/VESUM evidence for linguistic claims.
 - Codex routing: Sol @ `high` handles coding and review; Luna @ `high` handles
   routine bounded work and scouting; hard consequential advisory judgment uses
-  Opus 5.5 / Sol 6.1 @ `high` (#9583).
+  Opus 5.5 / Sol 6.2 @ `high` (#9583).
 - Claude Opus 5.5 handles hard Claude-lane coding where applicable. Gemini 3.8
   Flash handles Ukrainian and well-defined work with a complete brief and
   acceptance criteria.
 - Grok may own sustained daily driving where the roster permits. Advisors
-  (Opus 5.5 / Sol 6.1) are summoned for short judgment, not polling.
+  (Opus 5.5 / Sol 6.2) are summoned for short judgment, not polling.
 - GLM-5.3/z.ai is eligible for public, non-sensitive code/infra, bug/security,
   and cross-file analysis only. It is local-invocation-only, sends prompt data
   to China, never runs in CI or automated pipelines, never receives secrets,

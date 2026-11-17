@@ -56,7 +56,7 @@ Work in a git worktree under `.worktrees/dispatch/<agent>/<task>/`
 create a feature branch in the main checkout. Concrete dispatch:
 
     .venv/bin/python -m lu_machinery.dispatch dispatch \
-        --agent codex --model gpt-6.1-sol \
+        --agent codex --model gpt-6.2-sol \
         --task-id <task-id> \
         --mode workspace-write \
         --worktree \

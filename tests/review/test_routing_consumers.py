@@ -17,6 +17,9 @@ from lu_machinery.review.role_resolution import expand_routing_references, resol
 from tests.helpers import machinery_package as machinery_package
 from lu_machinery import model_families
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 def raw_catalog():
     return yaml.safe_load(CATALOG_PATH.read_text())
@@ -129,7 +132,7 @@ def test_expansion_preserves_inputs_and_explicit_identity_pins():
     before = deepcopy(raw)
     expanded = expand_routing_references(raw)
     assert raw == before
-    assert "gpt-6.1-sol" in expanded["budget_substitution_models"]["codex"]
+    assert CURRENT_SOL in expanded["budget_substitution_models"]["codex"]
     assert "openai_frontier_coder" not in expanded["budget_substitution_models"]["codex"]
     assert expanded["models"] == raw["models"]
 
@@ -153,7 +156,7 @@ def test_catalog_file_path_role_validation_is_clean_exit_two(tmp_path, bad, entr
     (config / "model_catalog.yaml").write_text(yaml.safe_dump(raw))
     command = [str(review / "model_catalog.py")] if entrypoint == "file" else ["-m", "lu_machinery.review.model_catalog"]
     result = subprocess.run(
-        [sys.executable, *command, "--check-retired-model", "gpt-6.1-sol"],
+        [sys.executable, *command, "--check-retired-model", CURRENT_SOL],
         cwd=tmp_path,
         env={"PATH": os.defpath},
         capture_output=True,
@@ -184,7 +187,7 @@ def test_legacy_allowlist_cannot_expand_from_injected_cursor_candidates():
         "review_profiles": ["code", "infra"], "capabilities": ["code_review"], "suitability_roles": ["critical_review"],
     }
     catalog["orchestrator_seats"]["cursor"] = {
-        "model_id": new_id, "effort": "high", "escalate_model_id": "gpt-6.1-sol", "escalate_effort": "high",
+        "model_id": new_id, "effort": "high", "escalate_model_id": CURRENT_SOL, "escalate_effort": "high",
         "escalate_when": "deep_single_shot_or_architecture", "auto_allowlist": [new_id],
         "auto_scope": "write_implementation_dispatch_with_green_dor",
         "attestation_rule": "driver_of_record_requires_attested_resolved_model",
@@ -447,7 +450,7 @@ def test_explicit_auto_selector_keeps_cursor_despite_runtime_telemetry(field, se
         ("agy:glm-5.3", "zhipu"),
         ("agy:laguna-s-2.1", "poolside"),
         ("agy:qwen", "qwen"),
-        ("cursor:agy:gpt-6.1-sol", "unknown"),
+        (f"cursor:agy:{CURRENT_SOL}", "unknown"),
         ("cursor:auto", "cursor"),
         ("fixture", "fixture"),
         ("adversarial-fixture", "fixture"),
@@ -464,10 +467,10 @@ def test_agy_route_fallback_and_other_family_controls(token, expected):
 @pytest.mark.parametrize(
     "mixed,expected",
     [
-        ("claude-opus-5-5:gpt-6.1-sol", "openai"),
-        ("gpt-6.1-sol:claude-opus-5-5", "openai"),
+        (f"claude-opus-5-5:{CURRENT_SOL}", "openai"),
+        (f"{CURRENT_SOL}:claude-opus-5-5", "openai"),
         ("claude-opus-5-5:gemini-3.1-pro-high", "google"),
-        ("gemini-3.1-pro-high:gpt-6.1-sol", "google"),
+        (f"gemini-3.1-pro-high:{CURRENT_SOL}", "google"),
         ("deepseek-v4.1-flash:gemini-3.1-pro-high", "deepseek"),
         ("grok-4.7:claude-opus-5-5", "anthropic"),
     ],
@@ -478,7 +481,7 @@ def test_agy_does_not_change_existing_mixed_concrete_token_precedence(mixed, exp
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.parametrize("model,family", [("claude-opus-5-5", "anthropic"), ("gpt-6.1-sol", "openai")])
+@pytest.mark.parametrize("model,family", [("claude-opus-5-5", "anthropic"), (CURRENT_SOL, "openai")])
 def test_agy_decoration_does_not_override_conflicting_lineage_or_author_family(model, family):
     from lu_machinery.review.reviewer_resolver import resolve_author_family
 

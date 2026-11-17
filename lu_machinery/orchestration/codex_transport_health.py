@@ -41,7 +41,7 @@ RESERVED_SCHEMA_FAILURE = "reserved_collaboration_schema"
 EXPECTED_TOOL_NAMESPACE = "agents"
 DEFAULT_TTL_SECONDS = 900
 DEFAULT_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL = "gpt-6.1-sol"
+DEFAULT_MODEL = "gpt-6.2-sol"
 DEFAULT_EFFORT = "low"
 
 # The product's Codex config, relative to the product checkout (C-4746).

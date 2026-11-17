@@ -11,6 +11,9 @@ from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import launcher_environment, launcher_toolchain_path
 from tests.lib.test_launcher_contract import run_launcher
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor")]
 
@@ -35,7 +38,7 @@ def test_codex_claude_code_harness_dry_run_uses_local_proxy_contract() -> None:
     result = run_launcher("start-codex.sh", "--harness", "claude-code")
     assert result.returncode == 0, result.stderr
     assert "credential_source=local-proxy-placeholder" in result.stdout
-    assert "would exec claude --model gpt-6.1-sol" in result.stdout
+    assert f"would exec claude --model {CURRENT_SOL}" in result.stdout
 
 
 @pytest.mark.parametrize("base", ("http://127.0.0.1:8317", "http://localhost:8317"))
@@ -104,4 +107,4 @@ def test_direct_codex_proxy_configuration_rejects_old_pin_without_exports():
         env=launcher_environment(),
     )
     assert result.returncode == 2
-    assert "approved models are gpt-6-luna, gpt-6.1-sol" in result.stderr
+    assert f"approved models are gpt-6-luna, {CURRENT_SOL}" in result.stderr

@@ -12,6 +12,9 @@ from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -119,7 +122,7 @@ def test_full_flow_target_freeze_expansion_cycle_reviewer_findings(tmp_path):
     resolution = json.loads(reviewer_proc.stdout)
     # The default OpenAI formal CF catalog seat resolves to Astra.
     assert resolution["selected"]["name"] == "openai_frontier"
-    assert resolution["selected"]["concrete_model"] == "gpt-6.1-sol"
+    assert resolution["selected"]["concrete_model"] == CURRENT_SOL
     assert resolution["selected"]["route"] == "codex"
     assert resolution["policy_version"] == "deterministic-formal-routing.v2"
     assert resolution["resolved_risk"] == "medium"
@@ -182,7 +185,7 @@ def test_resolve_reviewer_persists_resolution_to_state_file(tmp_path):
     state = json.loads(state_file.read_text(encoding="utf-8"))
     resolution = state["resolved_reviewer"]
     selected = resolution["selected"]
-    assert selected["concrete_model"] == "gpt-6.1-sol"
+    assert selected["concrete_model"] == CURRENT_SOL
     assert selected["family"] == "openai"
     assert selected["route"] == "codex"
     assert resolution["policy_version"] == "deterministic-formal-routing.v2"
@@ -197,7 +200,7 @@ def test_reviewer_without_target_or_owned_path_refuses_with_typed_reason(tmp_pat
     if existing_state:
         state.write_text("{}", encoding="utf-8")
     proc = _run_cli(
-        state, "resolve-reviewer", "--author-model", "gpt-6.1-sol", "--risk", "low", "--review-profile", profile
+        state, "resolve-reviewer", "--author-model", CURRENT_SOL, "--risk", "low", "--review-profile", profile
     )
     assert proc.returncode == 1
     assert json.loads(proc.stderr) == {
@@ -228,7 +231,7 @@ def test_reviewer_with_owned_path_preserves_security_floor(tmp_path, profile, ow
     assert proc.returncode == 0, proc.stderr
     payload = json.loads(proc.stdout)
     assert payload["resolved_risk"] == risk
-    assert payload["selected"]["concrete_model"] == "gpt-6.1-sol"
+    assert payload["selected"]["concrete_model"] == CURRENT_SOL
     assert json.loads(state.read_text(encoding="utf-8"))["resolved_reviewer"] == payload
 
 
@@ -247,7 +250,7 @@ def test_state_file_sha_validation_precedes_git(tmp_path, monkeypatch, field):
         pytest.fail("invalid state-file SHA must refuse before git")
 
     monkeypatch.setattr("lu_machinery.review.closeout_cli.git_changed_paths", unexpected)
-    proc = _run_cli(state, "resolve-reviewer", "--author-model", "gpt-6.1-sol")
+    proc = _run_cli(state, "resolve-reviewer", "--author-model", CURRENT_SOL)
     assert proc.returncode == 1
     assert json.loads(proc.stderr)["error"] == "target_sha_invalid"
 
@@ -306,7 +309,7 @@ def test_resolve_reviewer_cli_excludes_grok_for_grok_adapter_path(tmp_path, monk
         state_file,
         "resolve-reviewer",
         "--author-model",
-        "codex:gpt-6.1-sol",
+        f"codex:{CURRENT_SOL}",
         "--domain",
         "infra",
         "--risk",
@@ -799,7 +802,7 @@ def test_resolve_reviewer_excludes_every_branch_author_and_agrees_with_the_recor
         str(repo.root),
     )
     assert target.returncode == 0, target.stderr
-    common = ("--author-model", "gpt-6.1-sol", "--repository", REPOSITORY, "--task-root", str(tasks))
+    common = ("--author-model", CURRENT_SOL, "--repository", REPOSITORY, "--task-root", str(tasks))
 
     medium = _run_cli(state, "resolve-reviewer", *common, "--risk", "medium")
     payload = json.loads(medium.stdout)
@@ -819,7 +822,7 @@ def test_resolve_reviewer_excludes_every_branch_author_and_agrees_with_the_recor
         head_sha=frozen["head_sha"],
         task_root=tasks,
     )
-    for agent, model, family in (("claude", "claude-opus-5-5", "anthropic"), ("codex", "gpt-6.1-sol", "openai")):
+    for agent, model, family in (("claude", "claude-opus-5-5", "anthropic"), ("codex", CURRENT_SOL, "openai")):
         recorder._require_qualified_reviewer(facts, task={"agent": agent, "review_risk": "medium"}, model=model, family=family)
     with pytest.raises(recorder.RecordError, match="mixed-family review requires"):
         recorder._require_qualified_reviewer(
@@ -871,7 +874,7 @@ def test_resolve_reviewer_fails_closed_on_an_unattributed_commit(tmp_path, monke
         state,
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -937,7 +940,7 @@ def test_resolve_reviewer_attributes_only_the_branch_after_main_is_merged(tmp_pa
         state,
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -985,7 +988,7 @@ def test_resolve_reviewer_refuses_an_empty_review_range(tmp_path, monkeypatch):
         state,
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -1037,7 +1040,7 @@ def test_resolve_reviewer_still_refuses_a_branch_whose_only_commits_came_from_ma
         state,
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -1103,7 +1106,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
         state,
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -1132,16 +1135,18 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # Re-pinned for GROK-CANCEL-1110: each receipt only drops its retired grok-4.7-cursor-fallback
 # trace row; every other field is unchanged.
 # Muse retirement re-pins the low/medium receipts after its candidate leaves the trace.
+# Sol 6.2 (2026-11-17) re-pins all three: the only change is gpt-6.1-sol -> gpt-6.2-sol;
+# restoring that spelling in the stdout reproduces the previous digests.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
-        ("gpt-6.1-sol", "medium", "ordinary.py", "3fafd5450dd16ee556005e9023d1cb9e5e01ce654b0f3c1e8c21d550b5391045"),
-        ("claude-opus-5-5", "low", "ordinary.py", "b1e645d6fe8e9913d8667175c8d812d9d975f2d57be684058759ccad44bd12bf"),
+        (CURRENT_SOL, "medium", "ordinary.py", "bee25d0b1b573e4bb0afac6aaec6d37a5c89d454e20b59ea39729fcb20e6d453"),
+        ("claude-opus-5-5", "low", "ordinary.py", "2f226e7fd8e9e596cec9ecb8dc344857fb3546469fdf1f6cee8a70f12c8d9959"),
         (
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "303142eaeb6e21e06ca58b35d05e171651811540a58d1cd2fa2a5deac182d221",
+            "c295a7a555f348503986eba12569d9f04a081401f0bb37c044ece4d836dcfb9d",
         ),
     ],
 )

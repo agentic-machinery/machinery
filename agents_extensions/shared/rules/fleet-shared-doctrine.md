@@ -35,7 +35,7 @@ If a scorecard row conflicts with LANGUAGE-LANES, egress, or review-gate rules �
 | **Egress** | Where prompt/code data may leave (Western lab, China-route, local-only). |
 | **CF review** | Cross-**family** formal review of a change; discussion/panel alone does **not** satisfy the gate. |
 | **Consequential** | Work that can merge to `main`, change learner-facing Atlas/curriculum, alter security/CI gates, or spend non-trivial quota on multi-agent implementation. |
-| **Ceiling model** | Opus 5.5 (`claude-opus-5-5`) / Sol 6.1 (`gpt-6.1-sol`) for hard design/diagnostic/architecture. Future peers require qualification. Historical “Sol” references in older evidence remain historical. Designated approval is given by the operator, or when `claude-opus-5-5` and `gpt-6.1-sol` agree; when one of them authored the proposal, the other's approval completes it; a proposal by any other agent needs both; if they disagree, the operator decides (#9583, #9616). The former Astra seat holds no advisory, approval or review role; `gpt-6-astra` is not routable. |
+| **Ceiling model** | Opus 5.5 (`claude-opus-5-5`) / Sol 6.2 (`gpt-6.2-sol`) for hard design/diagnostic/architecture. Future peers require qualification. Historical “Sol” references in older evidence remain historical. Designated approval is given by the operator, or when `claude-opus-5-5` and `gpt-6.2-sol` agree; when one of them authored the proposal, the other's approval completes it; a proposal by any other agent needs both; if they disagree, the operator decides (#9583, #9616). The former Astra seat holds no advisory, approval or review role; `gpt-6-astra` is not routable. |
 | **Provisional / validated / deprecated** | Scorecard assignment confidence (see scorecard § evidence). |
 
 ---
@@ -89,7 +89,7 @@ Assign by **role × task family × harness × route/egress**, not marketing rank
 
 | Model | Effort |
 |---|---|
-| GPT-6.1 Sol (coding, review and advice; designated approver with Opus 5.5) | **`high`** for accountable driving, coding, adversarial review and consequential advisory judgment |
+| GPT-6.2 Sol (coding, review and advice; designated approver with Opus 5.5) | **`high`** for accountable driving, coding, adversarial review and consequential advisory judgment |
 | GPT-6 Luna (bounded work and scouting) | **`high`** with exact owned paths and an objective scope ceiling from a complete Sol advisory envelope (always required, #9275); never sole authority |
 | **Opus 5.5** (default Claude model + driver seat, operator 2026-09-22) | Orchestrating / epic driving **`high`** (the launcher default). Routine turns **`medium`** (the API default — and Opus 5.5 at `medium` beats Opus 5 at `high` on coding and knowledge work). See subsection below. |
 | **Sonnet 5.5** (provisional Claude practical seat) | Fleet dispatches **`high`** by default. Well-specified agentic coding may use `medium`; harder or longer coding and reviews use `high`. See subsection below. |
@@ -130,7 +130,7 @@ Sonnet 5.5 effort levels are recalibrated versus Sonnet 5; do not carry settings
 | **`low`** | Avoid for dispatched work: it can skip verification. |
 | **`xhigh` / `max`** | Only after a measured quality gain on the task family. |
 
-At `low` or `medium`, Sonnet 5.5 can check in before finishing. Make completion criteria and verification explicit even when choosing `medium`. Escalate complex, open-ended judgment to Opus 5.5 / Sol 6.1; designated authority decisions still require operator approval or Opus 5.5 and Sol 6.1 agreeing (when one of them authored the proposal, the other's approval completes it; any other author needs both).
+At `low` or `medium`, Sonnet 5.5 can check in before finishing. Make completion criteria and verification explicit even when choosing `medium`. Escalate complex, open-ended judgment to Opus 5.5 / Sol 6.2; designated authority decisions still require operator approval or Opus 5.5 and Sol 6.2 agreeing (when one of them authored the proposal, the other's approval completes it; any other author needs both).
 
 ---
 
@@ -156,7 +156,7 @@ For work in the **repository review-gate scope** (consequential PRs that must pa
 2. Reviewer must be **qualified for the task family** (code/infra vs VESUM language vs folk).
 3. Use a qualified native toolful review lane and the review-worktree contract in `agents_extensions/shared/skills/local-code-review/SKILL.md`; sealed formal review is retired.
 4. Record provenance on the PR (implementer + reviewer model/family/harness; note advisor if material).
-5. **Conditional selection:** do not offer GPT-6.1 Sol as CF for OpenAI-authored PRs, or Sonnet as CF for Anthropic-authored PRs, etc.
+5. **Conditional selection:** do not offer GPT-6.2 Sol as CF for OpenAI-authored PRs, or Sonnet as CF for Anthropic-authored PRs, etc.
 
 Authoritative CF quality ladder remains in `model-assignment.md`; this doctrine does not lower that floor.
 

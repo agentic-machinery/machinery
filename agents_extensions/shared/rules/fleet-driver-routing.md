@@ -17,7 +17,7 @@ attach tool-backed breadth evidence on handoff; missing card is a process defect
 only, PATH/tool outage already substituted) is allowed; silent single-seat
 marathons are not.
 
-**Escape:** The operator, or Opus 5.5 and Sol 6.1 agreeing (designated approval; when one authored the proposal, the other's approval completes it; any other author needs both), may waive breadth for one named
+**Escape:** The operator, or Opus 5.5 and Sol 6.2 agreeing (designated approval; when one authored the proposal, the other's approval completes it; any other author needs both), may waive breadth for one named
 session with a written NOTE on the issue/handoff. Cannot become the default.
 
 **Review trigger:** when breadth report shows median driver breadth ≥3 agents
@@ -29,20 +29,20 @@ and ≥2 tiers for 14 consecutive days. A review does not expire the standing ru
 
 | Operator name | Catalog tier | Role | Examples (confirm live ids in `model_catalog.yaml`) |
 | --- | --- | --- | --- |
-| **Big brain / advisor** | `frontier_authority` | One-shot judgment, **briefs**, contested design; high-stakes CF of record only on an eligible route, never from an advisory turn | **claude-opus-5-5** (Opus 5.5) / **gpt-6.1-sol** (Sol 6.1 @ high); bounded envelopes use Sol only (§2) |
-| **Hard implement / practical** | `frontier_practical` | Autonomous multi-file when scope is clear; standard CF | **GPT-6.1 Sol @ high** (Codex coding/review), Claude Opus 5.5 for hard Claude-lane coding, Gemini 4 Hydrogen for well-defined work |
+| **Big brain / advisor** | `frontier_authority` | One-shot judgment, **briefs**, contested design; high-stakes CF of record only on an eligible route, never from an advisory turn | **claude-opus-5-5** (Opus 5.5) / **gpt-6.2-sol** (Sol 6.2 @ high); bounded envelopes use Sol only (§2) |
+| **Hard implement / practical** | `frontier_practical` | Autonomous multi-file when scope is clear; standard CF | **GPT-6.2 Sol @ high** (Codex coding/review), Claude Opus 5.5 for hard Claude-lane coding, Gemini 4 Hydrogen for well-defined work |
 | **Heap / volume** | `economical` / strong_efficient | Bounded routine implementation, scouting, and recon | **GPT-6 Luna @ high**, Flash-class, other volume seats |
 
-**Codex role boundary:** GPT-6.1 Sol (`gpt-6.1-sol`) @ `high` is the only Sol: the coding and
+**Codex role boundary:** GPT-6.2 Sol (`gpt-6.2-sol`) @ `high` is the only Sol: the coding and
 review seat and, since operator 2026-09-29 (#9230), took over the former Astra advisory seat at `high`.
-Ordinary advice uses Opus 5.5 / Sol 6.1; Fable and the former Astra seat hold no advisory role (#9583).
+Ordinary advice uses Opus 5.5 / Sol 6.2; Fable and the former Astra seat hold no advisory role (#9583).
 Luna @ `high` handles routine bounded work and scouting under the driver-brief or Sol-envelope contract (§2).
 `gpt-6-sol` remains retired and is not routable. Astra (`gpt-6-astra`) is routable only for the Codex red-team code-review exception for Sol-authored PRs until 2026-11-04T00:00Z (#10437). Designated approval remains separate
 from ordinary advice; do not spend advisory turns on ordinary implementation or review.
 
 **Standing routing preference (#9583, operator decision 2026-10-03):** advice, critique, review and
-design input use Opus 5.5 / Sol 6.1. Designated approval is given by the operator, or by
-`claude-opus-5-5` and `gpt-6.1-sol` agreeing; when one of them authored the proposal, the other's
+design input use Opus 5.5 / Sol 6.2. Designated approval is given by the operator, or by
+`claude-opus-5-5` and `gpt-6.2-sol` agreeing; when one of them authored the proposal, the other's
 approval completes it; a proposal by any other agent needs both; if they disagree, the operator decides (#9616). Fable and the former Astra seat are not a last resort for any of these.
 
 Do **not** use an advisory seat on lockfiles, pointer publishes, rsync gates, or smoke
@@ -95,7 +95,7 @@ stampede one hot lane.
 | **DeepSeek V4.1 Flash** | Latest `deepseek-v4.1-flash` coding through opencode | Direct DeepSeek API or OpenRouter with a named US provider allow-list; never private-repository content or secrets. Pro and older are retired. Review-of-record and Ukrainian work need measured evidence first. `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` until a named US provider allow-list exists. `ask-deepseek` remains consult-only for non-language work. |
 | **Kimi** | retired (OO-58, #11327) | do not dispatch; every Kimi id is refused |
 | **AGY Gemini** | agentic scripts; language-lane content review stays on `gemini-3.8-flash-high` | `gemini-4-hydrogen-medium` (work default, HYDROGEN-REPLACES-38) |
-| **Claude Sonnet** | routine judgment/CF | Opus 5.5 / Sol 6.1 for hard judgment; ~1 Claude driver |
+| **Claude Sonnet** | routine judgment/CF | Opus 5.5 / Sol 6.2 for hard judgment; ~1 Claude driver |
 
 **OpenRouter:** use only active catalog routes with their data and provider restrictions.
 
@@ -123,12 +123,12 @@ naive-timestamp or non-numeric credit data also keep near_cap/AVOID. Admission i
 from the recommendation: whenever the plan window is at or below the threshold and a fresh positive
 balance exists (states `credit_balance_present`, `credit_use_unconfirmed` and `credits_unverified`
 from unreadable usage records), `dispatch.py dispatch` refuses any model outside the lane allowlist
-(Codex: `gpt-6.1-sol`, `gpt-6-luna`) with `CREDIT_PERIOD_MODEL_REFUSED`, even when the router no
+(Codex: `gpt-6.2-sol`, `gpt-6-luna`) with `CREDIT_PERIOD_MODEL_REFUSED`, even when the router no
 longer recommends the lane. Nothing is gated with a healthy plan window, with no fresh positive
 balance (near cap without credits: unchanged), or on other lanes. Dispatch v2 requires an explicit `--model`. A broken policy file restricts only Codex, to the built-in copy of that allowlist; other
 lanes are unaffected. The reset advice is text only: spending a free full reset stays an operator
 decision, and no tool consumes credits or resets.
-Luna handles bounded work under the driver-brief or Sol-envelope contract (§2); hard advice uses Opus 5.5 / Sol 6.1.
+Luna handles bounded work under the driver-brief or Sol-envelope contract (§2); hard advice uses Opus 5.5 / Sol 6.2.
 
 The operator records a shared assertion at `batch_state/routing_budget/operator_reset_reserve.json`
 in the primary checkout. Its exact JSON fields are `schema_version` (`operator-reset-reserve.v1`),
@@ -153,7 +153,7 @@ Source: [cursor.com/docs/models-and-pricing](https://cursor.com/docs/models-and-
 | Claude Fable 5.1 | $10 | $12.50 | $0.25 | $50 | native Claude CLI only; unavailable through Cursor; not a review route (D-129) |
 | Gemini 3.8 Flash | $0.75 | — | $0.075 | $3.50 | pass only if `cursor-agent --list-models` shows it |
 
-Cursor's catalog has no GPT-6 slug; GPT-6.1 Sol and GPT-6 Luna run on the native Codex CLI.
+Cursor's catalog has no GPT-6 slug; GPT-6.2 Sol and GPT-6 Luna run on the native Codex CLI.
 Claude Opus 5.5 hard coding uses the native Claude CLI; the model catalog carries no Opus
 Cursor transport (D-129, #10464). `claude-fable-5-thinking-high` is retired Fable 5, not 5.1.
 Fable 5.1 is parked: explicit native Claude CLI pin only, never routed. Cursor refuses it, including budget substitution; reintroduction or a successor model is an operator decision.
@@ -181,8 +181,8 @@ Other bounded work retains the existing envelope flow:
 ```text
 0) Driver fixes the worker dispatch arguments and prints their binding digest:
    dispatch.py dispatch <worker args> --print-advisory-binding
-1) ADVISOR envelope from the catalog advisor route (the Sol advisor (`gpt-6.1-sol` @ high)):
-   dispatch.py dispatch --agent codex --model gpt-6.1-sol --mode read-only \
+1) ADVISOR envelope from the catalog advisor route (the Sol advisor (`gpt-6.2-sol` @ high)):
+   dispatch.py dispatch --agent codex --model gpt-6.2-sol --mode read-only \
      --prompt-file <advisor-brief>
    Put the worker binding digest and envelope request in the advisor brief.
    → task_contract, owned_paths, max_changed_files, max_non_test_loc, constraints,
@@ -194,7 +194,7 @@ Other bounded work retains the existing envelope flow:
 
 This is the catalog `execution_routing.sol_advised_bounded` route. Outside the #10919
 driver-brief exception, Luna dispatches need a complete envelope from a finished
-`gpt-6.1-sol` advisor task bound to that dispatch's arguments and prompt text; `dispatch.py` refuses that Luna dispatch
+`gpt-6.2-sol` advisor task bound to that dispatch's arguments and prompt text; `dispatch.py` refuses that Luna dispatch
 otherwise (`BOUNDED_ENVELOPE_REQUIRED`), including after a budget substitution, and fails
 the worker at finalize when it exceeds the envelope ceilings (a completion gate checked after
 the worker exits, not a limit on what it does while running). The envelope's `owned_paths`
@@ -203,7 +203,7 @@ read-only and workspace-write worker and does not take an advisory task (#12291)
 that is not a Sol envelope does not admit a bounded worker (the packet path used to be "Fable or Astra"; it is now the catalog
 advisor route only). Routine lockfile, pointer and smoke tasks take
 no advisory seat, so they go to a non-bounded worker (for example `claude-sonnet-5-5`)
-instead of a bounded one. Native Codex subagents spawned in-session by a `gpt-6.1-sol`
+instead of a bounded one. Native Codex subagents spawned in-session by a `gpt-6.2-sol`
 parent run under that parent's own contract; the parent is their advisor and sets their
 owned paths and ceilings. Advisory family **never** satisfies cross-family PR CF.
 
@@ -266,7 +266,7 @@ Trivial one-shot (typo, single-file comment) is exempt if labeled
 | VPS launcher scripts, health probes, rsync gates | practical |
 | Residual lemma EN strategy, morphology policy | **authority brief** → heap fill |
 | Routine formal CF | practical cross-family |
-| Contested CF / architecture / process | Opus 5.5 / Sol 6.1; designated approval needs them to agree, and when one authored the proposal the other's approval completes it, and any other author needs both (#9583, #9616); operator escalation unchanged; formal CF remains independent and task-qualified |
+| Contested CF / architecture / process | Opus 5.5 / Sol 6.2; designated approval needs them to agree, and when one authored the proposal the other's approval completes it, and any other author needs both (#9583, #9616); operator escalation unchanged; formal CF remains independent and task-qualified |
 | UK content authoring | language-lane only (existing model-assignment) |
 
 ---

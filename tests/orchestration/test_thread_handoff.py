@@ -21,6 +21,9 @@ from lu_machinery.orchestration import thread_handoff as th
 from lu_machinery.orchestration.task_family import rollover, rollover_registry
 from lu_machinery.orchestration.task_family.storage import TaskFamilyStorage
 from tests.helpers.python import project_python
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -99,7 +102,7 @@ def seed_supervised_claudex(
     supervisor_env.update(
         {
             "LEARN_UKRAINIAN_PROFILE_ID": "sol_lead",
-            "LEARN_UKRAINIAN_MAIN_MODEL_ID": "gpt-6.1-sol",
+            "LEARN_UKRAINIAN_MAIN_MODEL_ID": CURRENT_SOL,
             "LEARN_UKRAINIAN_TRANSPORT": "claudex",
             "LEARN_UKRAINIAN_TRUSTED": "1",
             "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-6.1-terra",
@@ -109,7 +112,7 @@ def seed_supervised_claudex(
         "/bin/true",
         [
             "--model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "--agent",
             "infra-orchestrator",
             "--epic",
@@ -124,7 +127,7 @@ def seed_supervised_claudex(
         launch_generation=0,
         session_id=session_id,
         source="startup",
-        model_id="gpt-6.1-sol",
+        model_id=CURRENT_SOL,
         handoff_agent="claude-infra",
     )
     monkeypatch.setenv("LEARN_UKRAINIAN_CLAUDEX_RUN_ID", supervisor.run_id)
@@ -2036,7 +2039,7 @@ def test_supervised_claudex_prepare_emits_one_typed_request(
     assert request["source_session_id"] == "official-session-5265"
     assert request["launch_generation"] == 0
     assert request["profile_id"] == "sol_lead"
-    assert request["lead_model_id"] == "gpt-6.1-sol"
+    assert request["lead_model_id"] == CURRENT_SOL
     assert request["subagent_model_id"] == "gpt-6.1-terra"
     assert request["handoff_agent"] == "claude-infra"
     assert len(list(supervisor.run_dir.glob("request.json"))) == 1

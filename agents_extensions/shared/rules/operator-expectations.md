@@ -91,7 +91,7 @@ are the tie-breakers.
    limits; cost is never a reason to hold back — passivity is the failure mode, not spend).
    **Driver routing is enforced** (operator GO 2026-08-06): every dispatch needs a
    `ROUTING_CARD_V1` (tier · model×harness · advisor packet · alternatives); default bounded
-   work is **Sol 6.1 advisory envelope → bounded worker** (#9275); Sol is the default brief
+   work is **Sol 6.2 advisory envelope → bounded worker** (#9275); Sol is the default brief
    author. The #10919 exception admits Luna/Haiku read-only recon/classification
    and workspace-write bounded implementation from the complete driver brief,
    typed role, owned paths and verify command, without a separate advisory task.
@@ -105,7 +105,7 @@ are the tie-breakers.
    constants — confirm current capability before relying on a specific string. Distinguish the
    MODEL from the HARNESS it rides in (see "Harness vs model" in `model-assignment.md`):
    hermes and opencode each host many models and add their own capabilities.
-   **Tiers:** authority (Opus 5.5 / Sol 6.1) · practical
+   **Tiers:** authority (Opus 5.5 / Sol 6.2) · practical
    (Terra/Sonnet/Flash-high) · heap (Luna and weaker with a complete Sol advisory envelope,
    or the narrow #10919 driver-brief exception in item 4).
    **Kimi models are retired (OO-58, #11327). Do not dispatch them.**
@@ -187,7 +187,7 @@ are the tie-breakers.
     invent or unilaterally adopt **new** architecture, local layout, process, or policy
     without **present-tense approval** from the **operator** or **designated approval**: two
     frontier families agree through the designated advisors, **Opus 5.5** (`claude-opus-5-5`)
-    and **Sol 6.1** (`gpt-6.1-sol`). When one of them authored the proposal, the other's
+    and **Sol 6.2** (`gpt-6.2-sol`). When one of them authored the proposal, the other's
     approval completes it; a proposal by any other agent (Gemini, Grok, Kimi or another seat)
     needs both; if they disagree, the operator decides (#9583, #9616; roster may change — confirm via `/api/rules` / `model-assignment.md` when unsure;
     do not treat stale digests as roster). Fable 5.1 is parked: not routed by default, explicit pin only; reintroduction or a successor model is an operator decision. The former Astra seat holds no advisory,

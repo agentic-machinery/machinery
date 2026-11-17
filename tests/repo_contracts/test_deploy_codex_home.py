@@ -9,6 +9,9 @@ import pytest
 
 from lu_machinery import deploy_codex_home as deployer
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 @pytest.fixture
@@ -148,7 +151,7 @@ def test_bad_or_unsupported_config_writes_nothing(source, config):
 @pytest.mark.parametrize(
     "relative,content",
     [
-        ("config.toml", 'model = "gpt-6.1-sol"\n'),
+        ("config.toml", f'model = "{CURRENT_SOL}"\n'),
         ("config.toml", "[bad"),
         ("agents/sol_coder_high.toml", "model = [broken"),
         ("AGENTS.md", ""),
@@ -248,7 +251,7 @@ def test_role_matrix_cannot_be_swapped(source, name, field):
     profile = source / f"agents/{name}.toml"
     data = tomllib.loads(profile.read_text())
     alternatives = {
-        "model": ["gpt-6-luna", "gpt-6.1-sol"],
+        "model": ["gpt-6-luna", CURRENT_SOL],
         "model_reasoning_effort": ["low", "medium", "high"],
         "sandbox_mode": ["read-only", "workspace-write"],
     }
@@ -287,10 +290,10 @@ def test_canonical_cli_deploy_preserves_config_and_replays(tmp_path):
     assert '"xhigh" # nested sentinel\n' in (home / "config.toml").read_text()
     expected = {
         "terra_coder_high": ("gpt-6.1-terra", "high", "workspace-write"),
-        "sol_advisor_high": ("gpt-6.1-sol", "high", "read-only"),
-        "sol_coder_high": ("gpt-6.1-sol", "high", "workspace-write"),
-        "sol_red_team_high": ("gpt-6.1-sol", "high", "read-only"),
-        "sol_ukrainian_content_high": ("gpt-6.1-sol", "high", "workspace-write"),
+        "sol_advisor_high": (CURRENT_SOL, "high", "read-only"),
+        "sol_coder_high": (CURRENT_SOL, "high", "workspace-write"),
+        "sol_red_team_high": (CURRENT_SOL, "high", "read-only"),
+        "sol_ukrainian_content_high": (CURRENT_SOL, "high", "workspace-write"),
         "luna_coder_high": ("gpt-6-luna", "high", "workspace-write"),
         "luna_explorer_high": ("gpt-6-luna", "high", "read-only"),
         "luna_explorer_medium": ("gpt-6-luna", "medium", "read-only"),

@@ -20,12 +20,15 @@ from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review import target_resolution
 from tests.claude_route_accounts import HOST_ACCOUNT
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
 CLAUDE_ADAPTER = "lu_machinery/agent_runtime/adapters/claude.py"
 SHARED_HOOK = "agents_extensions/shared/hooks/guard-reviewer-publish.py"
 OPUS = "claude/claude-opus-5-5"
-SOL = "codex/gpt-6.1-sol"
+SOL = f"codex/{CURRENT_SOL}"
 # Native and Cursor Grok review at every risk (#9769), so exhausting the reviewers takes an xAI author too.
 GROK = "grok/grok-4.7"
 
@@ -309,7 +312,7 @@ GROK_RECEIPT = {
 @pytest.mark.parametrize("trailer", ["cursor/feature", "cursor/auto", "cursor/unattested", "codex/unrecognized"])
 @pytest.mark.parametrize(
     "agent,model,review",
-    [("claude", "claude-opus-5-5", {}), ("codex", "gpt-6.1-sol", {}), ("cursor", "grok-4.7-high", GROK_RECEIPT)],
+    [("claude", "claude-opus-5-5", {}), ("codex", CURRENT_SOL, {}), ("cursor", "grok-4.7-high", GROK_RECEIPT)],
 )
 def test_auto_and_unknown_authors_preserve_review_independence(
     repo, tasks, monkeypatch, tmp_path, trailer, agent, model, review
@@ -382,7 +385,7 @@ def test_single_family_branch_agrees_across_selector_and_recorder(repo, tasks, m
         tmp_path,
         repo,
         agent="codex",
-        model="gpt-6.1-sol",
+        model=CURRENT_SOL,
         review_risk="critical",
         comments=posted,
         _caller=provenance,
@@ -404,9 +407,9 @@ def test_unchanged_head_approval_stays_reusable_when_quota_changes(repo, tasks, 
     repo.commit(OPUS)
     repo.publish()
     posted: list[dict] = []
-    first = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", comments=posted)
+    first = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, comments=posted)
     # The recorder never consults routing health, so a later quota swing cannot invalidate it.
-    second = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", comments=posted)
+    second = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, comments=posted)
     assert (first["comment"], second["comment"]) == ("posted", "existing")
 
 
@@ -439,14 +442,14 @@ def test_mixed_family_at_lower_risk_keeps_a_third_family(repo, tasks, monkeypatc
 
     assert fact.existing_families == {"anthropic", "openai"}
     assert fact.receipt()["commits"] == 2 and len(fact.commits) == 3
-    assert fact.author_models == ("gpt-6.1-sol", "claude-opus-5-5", "gpt-6.1-sol")
+    assert fact.author_models == (CURRENT_SOL, "claude-opus-5-5", CURRENT_SOL)
     resolution = recorder.structural_review_route(fact, risk="medium", claude_account=HOST_ACCOUNT)
     assert resolution.selected is None and not resolution.quorum
     assert "cannot partition a commit authored by both families" in resolution.fail_closed_reason
     with pytest.raises(recorder.RecordError, match="mixed-family review requires"):
         record_verdict(monkeypatch, tmp_path, repo, agent="agy", model="gemini-3.8-flash-high", review_risk="medium")
     # Neither family can review the shared commit independently.
-    for agent, model in (("codex", "gpt-6.1-sol"), ("claude", "claude-opus-5-5")):
+    for agent, model in (("codex", CURRENT_SOL), ("claude", "claude-opus-5-5")):
         with pytest.raises(recorder.RecordError, match="cannot partition a commit authored by both families"):
             record_verdict(monkeypatch, tmp_path, repo, agent=agent, model=model, review_risk="medium")
 
@@ -562,7 +565,7 @@ def test_explicit_subjects_and_ambiguous_shared_hooks(repo, tasks, monkeypatch, 
 
     repo.commit(OPUS, path=SHARED_HOOK)
     repo.publish()
-    receipt = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", review_risk="critical")
+    receipt = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, review_risk="critical")
     assert receipt["verdict"] == "APPROVED"
     with pytest.raises(recorder.RecordError, match="equals an author family"):
         record_verdict(monkeypatch, tmp_path, repo, agent="claude", model="claude-opus-5-5", review_risk="critical")
@@ -575,7 +578,7 @@ def test_explicit_subjects_and_ambiguous_shared_hooks(repo, tasks, monkeypatch, 
     assert inferred.subject_families == frozenset()
     assert inferred.subject_evidence == (muse,)
     receipt = record_verdict(
-        monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", review_risk="critical", _task_id="review-muse"
+        monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, review_risk="critical", _task_id="review-muse"
     )
     assert receipt["verdict"] == "APPROVED"
 
@@ -585,7 +588,7 @@ def test_recorder_applies_protected_seats_to_the_actual_reviewer(repo, tasks, mo
     repo.publish()
     # Sol is outside the author family but governs this change's seat.
     with pytest.raises(recorder.RecordError, match="subject exclusion"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", review_risk="critical")
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, review_risk="critical")
 
 
 # --- 5a. commit-set agreement (A1) ---------------------------------------------------------------
@@ -597,9 +600,9 @@ def test_recorder_refuses_a_github_listing_that_differs_from_rev_list(repo, task
     repo.publish()
     listing = github_listing(repo, repo.sha("origin/main"), repo.sha("feature"))
     with pytest.raises(recorder.RecordError, match=r"differs from the local base\.\.head enumeration"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing[1:])
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing[1:])
     assert (
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing)["verdict"]
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing)["verdict"]
         == "APPROVED"
     )
 
@@ -623,7 +626,7 @@ def test_invalid_attribution_is_never_green(repo, tasks, case, reason):
     elif case == "duplicate-trailer":
         repo.commit(f"{OPUS}\nX-Agent: {SOL}\nX-Agent: ")
     elif case == "repository-mismatch":
-        task_record(tasks, "elsewhere", agent="codex", model="gpt-6.1-sol", repository="other/repo")
+        task_record(tasks, "elsewhere", agent="codex", model=CURRENT_SOL, repository="other/repo")
         repo.commit("codex/elsewhere")
     else:
         repo.git("checkout", "-q", "-b", "side", "origin/main")
@@ -701,7 +704,7 @@ def test_the_stale_custom_base_alone_would_have_been_feasible(repo, tasks):
         head_sha=repo.sha("origin/custom"),
         task_root=tasks,
         incoming_agent="codex",
-        incoming_model="gpt-6.1-sol",
+        incoming_model=CURRENT_SOL,
         owned_paths=(CODEX_ADAPTER,),
     )
     assert selected(stale, "critical") == "claude-opus-5-5"
@@ -932,7 +935,7 @@ def test_closeout_unknown_history_preview_preserves_default_refusal(repo, tasks,
         str(state),
         "resolve-reviewer",
         "--author-model",
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "--repository",
         REPOSITORY,
         "--task-root",
@@ -1055,7 +1058,7 @@ def test_forged_bot_field_in_local_data_is_never_proof(repo, tasks, monkeypatch,
     listing = github_listing(repo, repo.sha("origin/main"), head)
     listing[0].update({"author": {"login": "dependabot[bot]", "is_bot": True}})
     with pytest.raises(recorder.RecordError, match="missing explicit X-Agent"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing)
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing)
 
 
 def test_github_unreachable_fails_closed(repo, tasks, monkeypatch, tmp_path):
@@ -1067,7 +1070,7 @@ def test_github_unreachable_fails_closed(repo, tasks, monkeypatch, tmp_path):
     assert requested == [head]
     # The recorder's PR listing without author data (GitHub returned no proof) refuses too.
     with pytest.raises(recorder.RecordError, match="missing explicit X-Agent"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol")
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL)
 
 
 def listing_with_authors(repo: MiniRepo, authors: dict[str, dict]) -> list[dict]:
@@ -1107,7 +1110,7 @@ def test_verified_dependabot_branch_is_attributed_reviewed_and_recorded_without_
     assert selected(fact, "critical") is not None
 
     listing = listing_with_authors(repo, {head: github_commit(head)})
-    for agent, model in (("codex", "gpt-6.1-sol"), ("claude", "claude-opus-5-5")):
+    for agent, model in (("codex", CURRENT_SOL), ("claude", "claude-opus-5-5")):
         posted: list[dict] = []
         receipt = record_verdict(
             monkeypatch,
@@ -1161,7 +1164,7 @@ def test_human_commit_without_trailer_keeps_its_refusal(repo, tasks, monkeypatch
     assert refused.value.code == recorder.FACTS_AUTHORSHIP_UNKNOWN and requested == [head]
     listing = listing_with_authors(repo, {head: human_commit(head)})
     with pytest.raises(recorder.RecordError, match="missing explicit X-Agent"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing)
+        record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing)
 
 
 @pytest.mark.parametrize(
@@ -1206,7 +1209,7 @@ def test_human_commit_claiming_to_be_dependabot_keeps_its_refusal(repo, tasks, m
             tmp_path,
             repo,
             agent="codex",
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             listing=listing_with_authors(repo, {head: data}),
         )
 
@@ -1222,7 +1225,7 @@ def test_bot_commit_then_human_commit_applies_the_human_rule(repo, tasks, monkey
     assert human in requested
     with pytest.raises(recorder.RecordError, match="missing explicit X-Agent"):
         record_verdict(
-            monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing_with_authors(repo, authors)
+            monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing_with_authors(repo, authors)
         )
 
 
@@ -1238,5 +1241,5 @@ def test_bot_commit_then_agent_commit_keeps_the_agent_family(repo, tasks, monkey
     listing = listing_with_authors(repo, {bot: github_commit(bot)})
     with pytest.raises(recorder.RecordError, match="equals an author family"):
         record_verdict(monkeypatch, tmp_path, repo, agent="claude", model="claude-opus-5-5", listing=listing)
-    receipt = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model="gpt-6.1-sol", listing=listing)
+    receipt = record_verdict(monkeypatch, tmp_path, repo, agent="codex", model=CURRENT_SOL, listing=listing)
     assert receipt["verdict"] == "APPROVED" and receipt["app_bot_commits"] == [bot]

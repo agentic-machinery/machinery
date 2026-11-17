@@ -12,6 +12,9 @@ from lu_machinery.api.main import app
 from lu_machinery.api.telemetry import response as telemetry_response
 from lu_machinery.api.telemetry import transcript_tokens
 from lu_machinery.lib.session_record import update_session
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 def _write_transcript(path: Path, *, tokens: int = 187_000, prev: int = 125_000) -> None:
@@ -146,7 +149,7 @@ def test_session_record_drives_capacity_provenance_and_mismatch(
     update_session(
         session_id,
         transcript_path=str(transcript),
-        observed_model="gpt-6.1-sol",
+        observed_model=CURRENT_SOL,
         profile_id="sol_lead",
         provenance="SessionStart",
         state_root=project_root,
@@ -168,8 +171,8 @@ def test_session_record_drives_capacity_provenance_and_mismatch(
     telemetry = response.json()["_telemetry"]
     assert telemetry["caller_match"] is True
     assert telemetry["transcript"] == "sol.jsonl"
-    assert telemetry["declared_model"] == "gpt-6.1-sol"
-    assert telemetry["observed_model"] == "gpt-6.1-sol"
+    assert telemetry["declared_model"] == CURRENT_SOL
+    assert telemetry["observed_model"] == CURRENT_SOL
     assert telemetry["declared_context_limit"] == 272_000
     assert telemetry["actual_context_limit"] == 360_000
     assert telemetry["selected_profile"] == "sol_lead"
@@ -197,7 +200,7 @@ def test_linked_worktree_reads_record_from_canonical_primary_checkout(
     update_session(
         session_id,
         transcript_path=str(transcript),
-        observed_model="gpt-6.1-sol",
+        observed_model=CURRENT_SOL,
         profile_id="sol_lead",
         provenance="SessionStart",
         state_root=primary_root,

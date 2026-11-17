@@ -18,6 +18,9 @@ from tests.helpers.codex_exec_stream import (
     thread_started,
     turn_started,
 )
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
 
@@ -30,7 +33,7 @@ def test_codex_build_invocation_sends_prompt_via_stdin(tmp_path: Path, monkeypat
         prompt="write the module",
         mode="workspace-write",
         cwd=tmp_path,
-        model="gpt-6.1-sol",
+        model=CURRENT_SOL,
         task_id=None,
         session_id=None,
         tool_config=None,
@@ -91,7 +94,40 @@ def test_codex_rejects_unapproved_model_before_invocation_preparation(tmp_path, 
         )
 
 
-@pytest.mark.parametrize("model,expected_model", [(None, "gpt-6.1-sol"), ("gpt-6-luna", "gpt-6-luna")])
+def test_codex_allowlist_follows_catalog(tmp_path, monkeypatch):
+    """Defect class: the adapter allowlist drifting from the model catalog.
+
+    Every active native_codex catalog model is admitted (the pin-only Astra 6.2 and Terra
+    included); retiring one in the catalog alone makes the adapter refuse it.
+    """
+    from copy import deepcopy
+
+    from lu_machinery.review import model_catalog
+
+    live = model_catalog.load_model_catalog()
+    expected = {
+        model_id for model_id, entry in live["models"].items()
+        if entry["lifecycle"] in {"active", "fallback"} and "native_codex" in entry["transports"]
+    }
+    assert {CURRENT_SOL, "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6-luna"} <= expected
+    assert model_catalog.codex_dispatch_models() == expected
+    for model in sorted(expected):
+        plan = CodexAdapter().build_invocation(
+            prompt="test", mode="read-only", cwd=tmp_path, model=model, task_id=None, session_id=None,
+            tool_config=None,
+        )
+        assert plan.cmd[plan.cmd.index("-m") + 1] == model
+    retired = deepcopy(live)
+    retired["models"]["gpt-6.2-astra"].update(lifecycle="retired", transports=[])
+    monkeypatch.setattr(model_catalog, "load_model_catalog", lambda *_a, **_k: retired)
+    with pytest.raises(ValueError, match=r"model='gpt-6\.2-astra' rejected"):
+        CodexAdapter().build_invocation(
+            prompt="test", mode="read-only", cwd=tmp_path, model="gpt-6.2-astra", task_id=None,
+            session_id=None, tool_config=None,
+        )
+
+
+@pytest.mark.parametrize("model,expected_model", [(None, CURRENT_SOL), ("gpt-6-luna", "gpt-6-luna")])
 @pytest.mark.parametrize("effort,expected", [(None, "high"), ("xhigh", "xhigh")])
 def test_codex_pins_gpt6_and_preserves_effort(tmp_path, monkeypatch, model, expected_model, effort, expected):
     monkeypatch.setattr("lu_machinery.agent_runtime.adapters.codex.shutil.which", lambda _: "codex")

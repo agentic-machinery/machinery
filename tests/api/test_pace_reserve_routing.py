@@ -15,6 +15,9 @@ from lu_machinery.review.reviewer_resolver import OPENAI_FRONTIER, ResolverInput
 from tests.api.test_routing_budget import _configure_base
 from tests.api.test_routing_budget_endpoint import _record
 from tests.claude_route_accounts import HOST_ACCOUNT
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 @pytest.mark.parametrize(
@@ -131,7 +134,7 @@ def test_claude_headroom_reaches_routing_consumers(visible, monkeypatch, tmp_pat
     )
     assert recommendation["primary_agent_for_code"] == ("claude" if visible else "codex")
     result = resolve_reviewer(
-        ResolverInputs(author_model="gpt-6.1-sol", review_profile="code", risk="critical", routing_snapshot=data, claude_account=HOST_ACCOUNT)
+        ResolverInputs(author_model=CURRENT_SOL, review_profile="code", risk="critical", routing_snapshot=data, claude_account=HOST_ACCOUNT)
     )
     assert result.selected is not None
     assert result.selected.route == "claude"
@@ -294,7 +297,7 @@ def test_reviewer_resolver_covered_deficit(reserve_case, grok_status):
     sol = next(candidate for candidate in result.trace if candidate.name == "openai_frontier")
     # Reviews do not require pace coverage while allowance remains above reserve.
     assert sol.status == "selected"
-    assert result.selected.concrete_model == "gpt-6.1-sol"
+    assert result.selected.concrete_model == CURRENT_SOL
 
 
 @pytest.mark.parametrize("native_only", [False, True])
@@ -328,7 +331,7 @@ def test_credit_relief_is_model_specific(reserve_case, monkeypatch):
     info, covered, now = reserve_case
     info = copy.deepcopy(info)
     info["reset_credits"] = None
-    allowed = credit_lane.pace_deficit_state("codex", info, model="gpt-6.1-sol", now=now)
+    allowed = credit_lane.pace_deficit_state("codex", info, model=CURRENT_SOL, now=now)
     forbidden = credit_lane.pace_deficit_state("codex", info, model="gpt-5-codex", now=now)
     assert forbidden["uncovered"] is True
     if covered and info["credit_balance"]:
@@ -490,7 +493,7 @@ def test_routing_budget_preserves_hot_sources(monkeypatch, tmp_path, source, use
         # Exercise the adapter's hot source even if a future policy admits
         # Cursor credits. Current shipping policy remains untouched.
         monkeypatch.setattr(
-            credit_lane, "load_policy", lambda: replace(policy, allowed_models={"cursor": ("gpt-6.1-sol",)})
+            credit_lane, "load_policy", lambda: replace(policy, allowed_models={"cursor": (CURRENT_SOL,)})
         )
     data = state_router.compute_routing_budget(
         now,

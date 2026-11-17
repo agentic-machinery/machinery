@@ -21,6 +21,9 @@ from lu_machinery.review.reviewer_resolver import (
 )
 from tests.claude_route_accounts import HOST_ACCOUNT
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -30,13 +33,13 @@ GROK_SEAT = "grok-4.7-cursor-fallback"
 GROK_PIN = "grok-4.7-high"
 GROK_SEATS = (GROK_SEAT,)
 RISKS = ("critical", "high", "medium", "low")
-AUTHORS = ("claude-opus-5-5", "gpt-6.1-sol", "grok-4.7", "cursor:auto")
+AUTHORS = ("claude-opus-5-5", CURRENT_SOL, "grok-4.7", "cursor:auto")
 SOL_STATES = {"healthy": None, "unavailable": {"codex": "unhealthy"}}
 
 
 @pytest.mark.parametrize("profile", ["code", "infra"])
 @pytest.mark.parametrize("risk", RISKS)
-@pytest.mark.parametrize("author", ["claude-opus-5-5", "gpt-6.1-sol", "grok-4.7", "composer-2.5", "cursor:auto"])
+@pytest.mark.parametrize("author", ["claude-opus-5-5", CURRENT_SOL, "grok-4.7", "composer-2.5", "cursor:auto"])
 @pytest.mark.parametrize("health", ["healthy", "cursor_dark"])
 def test_denominator_admission_and_independence(profile, risk, author, health):
     snapshot = {"cursor": "unhealthy"} if health == "cursor_dark" else {}
@@ -48,7 +51,7 @@ def test_denominator_admission_and_independence(profile, risk, author, health):
     if author == "cursor:auto":
         assert resolution.selected.family != "cursor"
         assert resolution.selected.route != "cursor"
-    if author == "gpt-6.1-sol":
+    if author == CURRENT_SOL:
         assert resolution.selected.family != "openai"
     # The restored explicit pin does not enter ordinary reviewer-of-record ladders.
     assert GROK_SEAT in REVIEW_CANDIDATES
@@ -59,7 +62,7 @@ def test_denominator_admission_and_independence(profile, risk, author, health):
 def test_no_cursor_grok_fallback_when_opus_unavailable(risk):
     # Grok was the fallback here; with it retired the resolver fails closed instead.
     snapshot = {"claude": "unhealthy", "agy": "unhealthy"}
-    result = resolve_reviewer(ResolverInputs(author_model="gpt-6.1-sol", risk=risk, routing_snapshot=snapshot, claude_account=HOST_ACCOUNT))
+    result = resolve_reviewer(ResolverInputs(author_model=CURRENT_SOL, risk=risk, routing_snapshot=snapshot, claude_account=HOST_ACCOUNT))
     assert result.selected is None
     assert all(item.family != "xai" for item in result.trace)
 
@@ -67,14 +70,14 @@ def test_no_cursor_grok_fallback_when_opus_unavailable(risk):
 @pytest.mark.parametrize("risk", RISKS)
 @pytest.mark.parametrize("subject", [{"subject_seats": ("grok",)}, {"subject_seats": ("cursor",)}, {"subject_families": ("xai",)}])
 def test_cursor_grok_refuses_subject_seats_and_families(risk, subject):
-    inputs = ResolverInputs(author_model="gpt-6.1-sol", risk=risk, **subject, claude_account=HOST_ACCOUNT)
+    inputs = ResolverInputs(author_model=CURRENT_SOL, risk=risk, **subject, claude_account=HOST_ACCOUNT)
     result = resolve_reviewer(inputs)
     assert result.selected.family != "xai"
     assert all(item.family != "xai" for item in result.trace)
 
 
 def test_grok_never_reviews_its_own_adapter():
-    result = resolve_reviewer(ResolverInputs(author_model="gpt-6.1-sol", risk="critical", owned_paths=("lu_machinery/agent_runtime/adapters/grok_build.py",), claude_account=HOST_ACCOUNT))
+    result = resolve_reviewer(ResolverInputs(author_model=CURRENT_SOL, risk="critical", owned_paths=("lu_machinery/agent_runtime/adapters/grok_build.py",), claude_account=HOST_ACCOUNT))
     assert result.selected.name == "claude-opus-5-5"
     assert all(item.family != "xai" and item.name not in GROK_SEATS for item in result.trace)
 
@@ -83,7 +86,7 @@ def test_grok_never_reviews_its_own_adapter():
 @pytest.mark.parametrize("risk", RISKS)
 @pytest.mark.parametrize("name", GROK_SEATS)
 def test_explicit_grok_pin_retains_the_final_signoff_risk_floor(profile, risk, name):
-    inputs = ResolverInputs(author_model="gpt-6.1-sol", risk=risk, review_profile=profile,
+    inputs = ResolverInputs(author_model=CURRENT_SOL, risk=risk, review_profile=profile,
                             routing_snapshot={"cursor": "healthy"}, claude_account=HOST_ACCOUNT)
     pinned = resolve_reviewer(replace(inputs, pinned_candidate=name, pressure_override_reason="admission probe"))
     if risk in {"high", "critical"}:
@@ -98,7 +101,7 @@ def test_closeout_cli_fails_closed_without_a_cursor_grok_fallback(tmp_path, caps
     snapshot = tmp_path / "routing.json"
     snapshot.write_text(json.dumps({"claude": "unhealthy", "agy": "unhealthy"}))
     state = tmp_path / "state.json"
-    code = closeout_cli.main(["--state-file", str(state), "resolve-reviewer", "--author-model", "gpt-6.1-sol", "--review-profile", "code", "--owned-path", "site/src/app.ts", "--risk", "critical", "--routing-snapshot-file", str(snapshot)])
+    code = closeout_cli.main(["--state-file", str(state), "resolve-reviewer", "--author-model", CURRENT_SOL, "--review-profile", "code", "--owned-path", "site/src/app.ts", "--risk", "critical", "--routing-snapshot-file", str(snapshot)])
     payload = json.loads(capsys.readouterr().out)
     assert code == 1
     assert payload["selected"] is None
@@ -297,7 +300,7 @@ def test_a_grok_or_kimi_verdict_through_any_other_harness_is_refused(monkeypatch
 
 
 @pytest.mark.usefixtures("_publishing")
-@pytest.mark.parametrize("model,family", [("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "anthropic")])
+@pytest.mark.parametrize("model,family", [(CURRENT_SOL, "openai"), ("claude-opus-5-5", "anthropic")])
 def test_native_primary_reviewers_are_still_recorded(monkeypatch, tmp_path, model, family):
     agent = "codex" if family == "openai" else "claude"
     result, comments = _record(monkeypatch, tmp_path, resolved_model=model, agent=agent, families=frozenset({"xai"}))

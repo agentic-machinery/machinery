@@ -34,10 +34,13 @@ from lu_machinery.review.model_catalog import (
     validate_catalog,
 )
 from tests.claude_route_accounts import HOST_ACCOUNT
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 @pytest.mark.parametrize("seat,route,launcher,agent,model,effort", [
-    ("openai_frontier", "native", "lu_machinery.dispatch", "codex", "gpt-6.1-sol", "high"),
+    ("openai_frontier", "native", "lu_machinery.dispatch", "codex", CURRENT_SOL, "high"),
     ("anthropic_authority", "agy", "lu_machinery.dispatch", "agy", "claude-opus-5-5", None),
     ("anthropic_authority", "native", "lu_machinery.dispatch", "claude", "claude-opus-5-5", None),
     ("anthropic_practical", "native", "lu_machinery.dispatch", "claude", "claude-sonnet-5-5", None),
@@ -85,7 +88,7 @@ def test_review_runtime_model_ids_reject_fast_variants(runtime):
     ("grok-4.7", "grok-4.6", False),
     ("grok-4.7", "grok-4.7-build-extra", False),
     ("unknown", "grok-4.7-build", False),
-    ("gpt-6.1-sol", "grok-4.7-build", False),
+    (CURRENT_SOL, "grok-4.7-build", False),
 ])
 def test_runtime_substitution_matches_only_requested_model_ids(requested, runtime, expected):
     assert runtime_model_matches_requested(requested, runtime) is expected
@@ -140,8 +143,8 @@ def test_execution_default_resolves_active_alias_and_rejects_hold():
     for activity in ("review", "consult"):
         assert activity_role_refusal("gpt-6.1-terra", activity, catalog=catalog)
     assert all(row["model_id"] != "gpt-6.1-terra" for row in catalog["review_candidates"].values())
-    assert catalog["review_scheduler"]["endpoints"]["codex"]["models"] == ["gpt-6.1-sol"]
-    assert catalog["orchestrator_seats"]["codex"]["model_id"] == "gpt-6.1-sol"
+    assert catalog["review_scheduler"]["endpoints"]["codex"]["models"] == [CURRENT_SOL]
+    assert catalog["orchestrator_seats"]["codex"]["model_id"] == CURRENT_SOL
     assert require_execution_model("gemini-3.8-flash-low", transport="agy", catalog=catalog) == "gemini-3.8-flash-high"
     catalog["models"]["gemini-3.8-flash-high"]["lifecycle"] = "hold"
     with pytest.raises(ModelCatalogError, match="not admitted for execution"):
@@ -258,6 +261,36 @@ def test_fable_holds_no_review_or_advisory_role():
         assert not any(name.startswith("claude-fable") for rung in ladder for name in rung), risk
 
 
+def test_astra_6_2_is_pin_only():
+    """Defect class: a pin-only model silently entering routing (operator 2026-11-17).
+
+    Astra 6.2 runs only when a dispatch pins it: no seat, ladder, endpoint, candidate,
+    substitution, default or advisory route names it, and it holds no review or consult role.
+    """
+    import json
+
+    import yaml
+
+    from lu_machinery.review.model_catalog import CATALOG_PATH, REVIEW_ACTIVITY, activity_role_refusal
+
+    astra = "gpt-6.2-astra"
+    raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+    routing = {key: value for key, value in raw.items() if key != "models"}
+    assert astra not in json.dumps(routing, default=str), "a routing section names the pin-only model"
+    catalog = load_model_catalog()
+    expanded = {key: value for key, value in catalog.items() if key != "models"}
+    assert astra not in json.dumps(expanded, default=str), "role expansion routes the pin-only model"
+    entry = catalog["models"][astra]
+    assert entry["lifecycle"] == "active" and entry["transports"] == ["native_codex"]
+    assert entry["efforts"] == ["high"]
+    activity = catalog["review_scheduler"]["activity_roles"]
+    assert not set(entry["roles"]) & {*activity["review"], *activity["consult"]}
+    assert activity_role_refusal(astra, REVIEW_ACTIVITY, catalog) is not None
+    checks.check_model_admission("codex", astra, "read-only", {"effort": "high"}, b"")
+    with pytest.raises(ValueError, match="holds no review"):
+        checks.check_model_admission("codex", astra, "read-only", {"effort": "high", "risk": "medium"}, b"")
+
+
 @pytest.mark.parametrize(
     "model", ["claude-fable-5-1", "claude-fable-5-1[1m]", "claude-fable-5-1-thinking-high", "claude-fable-5-2"]
 )
@@ -271,7 +304,7 @@ def test_fable_is_refused_every_review_and_consult_activity(model, activity):
     assert f"review_scheduler.activity_roles.{activity}" in refusal
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "gpt-6.1-sol", "gemini-3.8-flash-high", "claude-sonnet-5-5"])
+@pytest.mark.parametrize("model", ["claude-opus-5-5", CURRENT_SOL, "gemini-3.8-flash-high", "claude-sonnet-5-5"])
 @pytest.mark.parametrize("activity", ["review", "consult"])
 def test_opus_sol_and_reviewers_are_admitted_every_activity(model, activity):
 
@@ -305,7 +338,7 @@ def test_unknown_activity_and_unknown_model():
     check_model_admission("claude", "opus", "read-only", {}, b"")
     check_model_admission("claude", "sonnet[1m]", "read-only", {}, b"")
     check_model_admission("claude", "fable", "read-only", {}, b"")
-    check_model_admission("codex", "gpt-6.1-sol-high", "read-only", {}, b"")
+    check_model_admission("codex", f"{CURRENT_SOL}-high", "read-only", {}, b"")
     check_model_admission("agy", "claude-opus-5-5-high", "read-only", {}, b"")
     for pin in (
         "claude-opus-5-6", "claude-sonnet-5-6", "claude-fable-5-3", "claude-opus-5-6[1m]",
@@ -387,8 +420,8 @@ def test_unknown_google_ais_gemma_stays_refused_under_the_routing_override(monke
             r"review_scheduler\.risk_reviewer_models\.high: model 'claude-fable-5-1'.*holds no review",
         ),
         (
-            lambda c: c["models"]["gpt-6.1-sol"]["roles"].remove("bounded_advisory_envelope"),
-            r"advisor\.model_id 'gpt-6\.1-sol' does not hold the 'bounded_advisory_envelope' role",
+            lambda c: c["models"][CURRENT_SOL]["roles"].remove("bounded_advisory_envelope"),
+            rf"advisor\.model_id '{re.escape(CURRENT_SOL)}' does not hold the 'bounded_advisory_envelope' role",
         ),
     ],
     ids=["missing", "missing-activity", "unheld-role", "candidate", "endpoint", "risk-model", "advisor"],
@@ -406,7 +439,7 @@ def test_catalog_rejects_a_high_ladder_seat_outside_risk_reviewer_models(candida
     broken = deepcopy(load_model_catalog())
     broken["review_ladders"]["high"].append([candidate])
     with pytest.raises(
-        ModelCatalogError, match=r"review_ladders\.high candidate .*performed only by gpt-6\.1-sol, claude-opus-5-5"
+        ModelCatalogError, match=rf"review_ladders\.high candidate .*performed only by {re.escape(CURRENT_SOL)}, claude-opus-5-5"
     ):
         validate_catalog(broken)
 
@@ -414,10 +447,10 @@ def test_catalog_rejects_a_high_ladder_seat_outside_risk_reviewer_models(candida
 def test_risk_reviewer_models_names_sol_and_opus_at_high():
     """Critical eligibility uses critical_review without another allowlist; retired Grok is not named (GROK-CANCEL-1110)."""
     catalog = load_model_catalog()
-    assert catalog["review_scheduler"]["risk_reviewer_models"] == {"high": ["gpt-6.1-sol", "claude-opus-5-5"]}
+    assert catalog["review_scheduler"]["risk_reviewer_models"] == {"high": [CURRENT_SOL, "claude-opus-5-5"]}
     assert risk_reviewer_refusal("grok-4.7", "high", catalog) is not None
     assert risk_reviewer_refusal("claude-opus-5-5-high", "high", catalog) is None
-    assert risk_reviewer_refusal("gpt-6.1-sol", "HIGH", catalog) is None
+    assert risk_reviewer_refusal(CURRENT_SOL, "HIGH", catalog) is None
     assert "performed only by" in risk_reviewer_refusal("claude-sonnet-5-5", "high", catalog)
     for risk in ("medium", "low"):
         assert risk_reviewer_refusal("claude-sonnet-5-5", risk, catalog) is None
@@ -426,7 +459,7 @@ def test_risk_reviewer_models_names_sol_and_opus_at_high():
 @pytest.mark.parametrize(
     "value,match",
     [
-        ({"urgent": ["gpt-6.1-sol"]}, "unknown risk"),
+        ({"urgent": [CURRENT_SOL]}, "unknown risk"),
         ({"high": []}, "non-empty list"),
         ({"high": ["no-such-model"]}, "unknown model"),
         ({"high": ["deepseek-v4-pro"]}, "retired model|DeepSeek"),
@@ -480,14 +513,14 @@ def test_catalog_rejects_candidate_transport_not_supported_by_model():
 # GROK-CANCEL-1110: the live catalog has no Cursor seat (its only pin, grok-4.7, is retired).
 # The seat validator still guards a future operator-approved pin, so these cases install one
 # simulated approved pin and its seat, then mutate that seat.
-_SIMULATED_CURSOR_PIN = "gpt-6.1-sol"
+_SIMULATED_CURSOR_PIN = CURRENT_SOL
 
 
 def _cursor_seat(pin: str, family: str) -> dict:
     return {
         "model_id": pin,
         "effort": "high",
-        "escalate_model_id": "gpt-6.1-sol",
+        "escalate_model_id": CURRENT_SOL,
         "escalate_effort": "high",
         "escalate_when": "deep_single_shot_or_architecture",
         "auto_allowlist": [pin],
@@ -880,7 +913,7 @@ def test_catalog_refuses_a_direct_bounded_worker_route():
         ("grok-4.7-cursor-fallback", None),
         ("claude-opus-5-5-agy", None),
         ("claude-sonnet-5-5-agy", None),
-        ("gpt-6.1-sol-high", "gpt-6.1-sol"),
+        (f"{CURRENT_SOL}-high", CURRENT_SOL),
         ("claude-fable-5-1-thinking-high", "claude-fable-5-1"),
         ("claude-opus-5-5-high", "claude-opus-5-5"),
         ("claude-fable-5-2", "claude-fable-5-2"),
@@ -901,10 +934,10 @@ def test_budget_substitution_table_admits_cursor_slugs_and_rejects_gpt6():
     catalog = load_model_catalog()
     table = catalog["budget_substitution_models"]
     assert "cursor" not in table
-    assert table["codex"]["gpt-6.1-sol"] == "gpt-6.1-sol"
+    assert table["codex"][CURRENT_SOL] == CURRENT_SOL
     broken = deepcopy(catalog)
-    broken["budget_substitution_models"]["cursor"] = {"gpt-6.1-sol": "gpt-6.1-sol"}
-    with pytest.raises(ModelCatalogError, match=r"gpt-6\.1-sol"):
+    broken["budget_substitution_models"]["cursor"] = {CURRENT_SOL: CURRENT_SOL}
+    with pytest.raises(ModelCatalogError, match=re.escape(CURRENT_SOL)):
         validate_catalog(broken)
 
 
@@ -919,10 +952,10 @@ def test_budget_substitution_table_admits_cursor_slugs_and_rejects_gpt6():
 )
 def test_retired_model_refusal_names_id_and_replacement(model, retired_id):
     refusal = retired_model_refusal(model)
-    assert refusal == f"model {model!r} is retired in the model catalog ({retired_id}); use gpt-6.1-sol"
+    assert refusal == f"model {model!r} is retired in the model catalog ({retired_id}); use {CURRENT_SOL}"
 
 
-@pytest.mark.parametrize("model", [None, "", "gpt-6.1-sol", "gpt-6.1-sol-high", "gpt-6-luna", "claude-opus-5-5", "auto"])
+@pytest.mark.parametrize("model", [None, "", CURRENT_SOL, f"{CURRENT_SOL}-high", "gpt-6-luna", "claude-opus-5-5", "auto"])
 def test_retired_model_refusal_admits_non_retired_ids(model):
     assert retired_model_refusal(model) is None
 
@@ -954,7 +987,7 @@ def test_retired_model_refusal_refuses_an_unknown_spelling_of_a_retired_or_red_t
 
 def test_replaced_by_must_sit_on_retired_model_and_name_active_model():
     broken = deepcopy(load_model_catalog())
-    broken["models"]["gpt-6-luna"]["replaced_by"] = "gpt-6.1-sol"
+    broken["models"]["gpt-6-luna"]["replaced_by"] = CURRENT_SOL
     with pytest.raises(ModelCatalogError, match="replaced_by is only valid on retired models"):
         validate_catalog(broken)
     broken = deepcopy(load_model_catalog())
@@ -1050,8 +1083,8 @@ def test_catalog_cli_help_explains_lookup_and_side_effects(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(("model", "retired_id", "successor"), [
-    ("gpt-6-sol", "gpt-6-sol", "gpt-6.1-sol"),
-    ("gpt-5.6-sol", "gpt-5.6-sol", "gpt-6.1-sol"),
+    ("gpt-6-sol", "gpt-6-sol", CURRENT_SOL),
+    ("gpt-5.6-sol", "gpt-5.6-sol", CURRENT_SOL),
     ("claude-fable-5", "claude-fable-5", "claude-fable-5-1"),
     ("claude-fable-5[1m]", "claude-fable-5", "claude-fable-5-1"),
 ])
@@ -1068,7 +1101,7 @@ def test_catalog_cli_retired_model_prints_only_refusal(model, retired_id, succes
     )
 
 
-@pytest.mark.parametrize("model", ["gpt-6.1-sol", "claude-opus-5-5", "unknown-model"])
+@pytest.mark.parametrize("model", [CURRENT_SOL, "claude-opus-5-5", "unknown-model"])
 def test_catalog_cli_non_retired_model_exits_silently(model):
     result = subprocess.run(
         [sys.executable, "-m", "lu_machinery.review.model_catalog", "--check-retired-model", model],
@@ -1109,9 +1142,9 @@ def test_catalog_rejects_retired_and_rule_excluded_executable_references(model, 
     elif reference == "family":
         catalog["formal_cf_defaults"]["claude"]["family_models"].append(model)
     elif reference == "substitution_source":
-        catalog["budget_substitution_models"]["codex"][model] = "gpt-6.1-sol"
+        catalog["budget_substitution_models"]["codex"][model] = CURRENT_SOL
     else:
-        catalog["budget_substitution_models"]["codex"]["gpt-6.1-sol"] = model
+        catalog["budget_substitution_models"]["codex"][CURRENT_SOL] = model
     with pytest.raises(ModelCatalogError):
         validate_catalog(catalog)
 
@@ -1137,9 +1170,9 @@ def test_deepseek_flash_catalog_class_is_opencode_execution_only():
         elif reference == "endpoint":
             changed["review_scheduler"]["endpoints"]["claude"]["models"].append(model)
         elif reference == "substitution_source":
-            changed["budget_substitution_models"]["codex"][model] = "gpt-6.1-sol"
+            changed["budget_substitution_models"]["codex"][model] = CURRENT_SOL
         else:
-            changed["budget_substitution_models"]["codex"]["gpt-6.1-sol"] = model
+            changed["budget_substitution_models"]["codex"][CURRENT_SOL] = model
         with pytest.raises(ModelCatalogError, match=r"DeepSeek|does not admit"):
             validate_catalog(changed)
 
@@ -1178,7 +1211,7 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
             review_dispatch=True,
             review_profile="code",
             review_risk=risk,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             route=forbidden,
             claude_account=HOST_ACCOUNT,
         )
@@ -1200,7 +1233,7 @@ def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent,
 
     review = {
         "pr": 12935, "require_review_verdict": True, "review_profile": "infra",
-        "review_author_model": "gpt-6.1-sol", "risk": "high",
+        "review_author_model": CURRENT_SOL, "risk": "high",
     }
     with pytest.raises(ValueError, match="holds no review"):
         checks.check_model_admission(agent, model, "read-only", review, b"review the change")
@@ -1269,7 +1302,7 @@ def test_sol_defaults_and_escalations_use_high_across_catalog():
     def visit(value, path):
         if isinstance(value, dict):
             for model_key, effort_key in (("model_id", "effort"), ("escalate_model_id", "escalate_effort")):
-                if value.get(model_key) == "gpt-6.1-sol" and effort_key in value:
+                if value.get(model_key) == CURRENT_SOL and effort_key in value:
                     assert value[effort_key] == "high", f"{path}.{effort_key}"
                     bindings.append(f"{path}.{effort_key}")
             for key, child in value.items():

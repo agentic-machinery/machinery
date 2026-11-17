@@ -23,6 +23,9 @@ from lu_machinery.ai_agent_bridge._ask_contract import (
     unsupported_effort_note,
 )
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir", "acp_runs_in_product")
 
@@ -587,7 +590,7 @@ def test_ask_deepseek_review_builds_same_dispatch_argv_as_ask_codex(
 
     assert codex[codex.index("--agent") + 1] == "codex"
     assert deepseek[deepseek.index("--agent") + 1] == "deepseek"
-    assert codex[codex.index("--model") + 1] == "gpt-6.1-sol"
+    assert codex[codex.index("--model") + 1] == CURRENT_SOL
     assert deepseek[deepseek.index("--model") + 1] == "deepseek-v4.1-flash"
     assert _review_argv_without_agent_and_prompt(deepseek) == _review_argv_without_agent_and_prompt(codex)
     assert "--mode" in deepseek and deepseek[deepseek.index("--mode") + 1] == "read-only"
@@ -840,7 +843,7 @@ def test_stopped_ask_saves_partial_streams_and_terminalizes_without_stale_lease(
         execution = runner._execute_invocation_plan(
             agent_name="acpx-codex-shadow", adapter=adapter,
             plan=InvocationPlan(cmd=[sys.executable, "-u", "-c", script], cwd=tmp_path),
-            prompt="question", mode="read-only", cwd=tmp_path, model="gpt-6.1-sol",
+            prompt="question", mode="read-only", cwd=tmp_path, model=CURRENT_SOL,
             task_id="timeout-regression", session_id=None, entrypoint="acpx-transport",
             hard_timeout=1, stall_timeout=0,
             transcript_path=kwargs["transcript_path"],
@@ -896,7 +899,7 @@ def test_transcript_io_failure_preserves_provider_outcome_job_receipt_and_cleanu
     cleanup_adapter = Mock()
     adapter = SimpleNamespace(
         name="acpx-codex-shadow",
-        default_model="gpt-6.1-sol",
+        default_model=CURRENT_SOL,
         supported_modes=frozenset({"read-only"}),
         liveness_signal_paths=lambda _plan: (),
         parse_response=lambda **kwargs: ParseResult(ok=stop == "complete", response=kwargs["stdout"].strip()),
