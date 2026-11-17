@@ -7715,11 +7715,6 @@
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bool\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "no-any-return",
       "message": "Returning Any from function declared to return \"int\""
     },
     {

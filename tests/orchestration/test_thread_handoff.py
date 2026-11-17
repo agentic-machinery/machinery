@@ -16,6 +16,7 @@ import pytest
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.lib import session_record
 from lu_machinery.orchestration import claudex_supervisor as cs
+from lu_machinery.orchestration import process_identity
 from lu_machinery.orchestration import task_identity
 from lu_machinery.orchestration import thread_handoff as th
 from lu_machinery.orchestration.task_family import rollover, rollover_registry
@@ -691,7 +692,7 @@ def test_zombie_owner_is_reclaimed_not_treated_as_live(tmp_path: Path, monkeypat
     lease_path = _write_lease(tmp_path, "claude-infra", lease)
     monkeypatch.setattr(th, "_default_machine_id", lambda: "machine-a")
     monkeypatch.setattr(th.os, "kill", lambda pid, sig: None)
-    monkeypatch.setattr(th, "_process_is_zombie", lambda pid: True)
+    monkeypatch.setattr(process_identity, "_process_is_zombie", lambda pid: True)
 
     result = th.claim_thread_lease(
         state_root=tmp_path, agent="claude-infra", current_thread_id="new-owner", now=now, starting_pid=1
@@ -3071,7 +3072,7 @@ def test_canonical_discovery_failure_refuses_fallback_and_explicit_root_is_isola
     monkeypatch.setattr(
         th,
         "run_command",
-        lambda *args, **kwargs: th.CommandResult(128, "", "not a repository"),
+        lambda *args, **kwargs: process_identity.CommandResult(128, "", "not a repository"),
     )
     with pytest.raises(ValueError, match="no shared-state anchor is configured"):
         th.canonical_state_root(tmp_path)

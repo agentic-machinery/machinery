@@ -306,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.subcommand not in {"hydrate", "protocol"}:
             validate_epic(args.epic)
         return int(args.func(args))
-    except (_gl.StreamResolutionError, ValueError) as exc:
+    except (handoff_select.StreamResolutionError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

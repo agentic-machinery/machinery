@@ -47,11 +47,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -66,72 +64,14 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 _PACKAGE = f"{_MACHINERY}.session_canary"
 
 
-class StreamResolutionError(ValueError):
-    """A lane selector could not be resolved by the launcher SSOT."""
-
-    reason = "unresolved-stream-selector"
-
-    def __init__(self, selector: str) -> None:
-        super().__init__(f"{self.reason}: {selector!r}; pass --stream epic:N")
-
-
-def _launcher_selector_stream(selector: str) -> str:
-    """Resolve one selector through the launcher shell SSOT, ignoring the environment."""
-    selector = selector.strip().lower()
-    try:
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'source "$1" && launcher_selector_stream "$2"',
-                "lane-stream",
-                str(machinery_path("lib/handoff_identity.sh")),
-                selector,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise StreamResolutionError(selector) from exc
-    if result.returncode != 0 or not result.stdout.strip():
-        raise StreamResolutionError(selector)
-    return result.stdout.strip()
-
-
-def resolve_stream_id(epic: str, explicit: str | None = None) -> str:
-    """CLI stream, launcher environment, then the shell selector SSOT."""
-    stream = explicit or os.environ.get("SESSION_STREAM_ID")
-    if stream:
-        return stream
-    return _launcher_selector_stream(epic)
-
-
-def launcher_stream_id(epic: str) -> str:
-    """The stream the launcher derives for ``epic``, never the ambient environment.
-
-    ``resolve_stream_id`` deliberately prefers ``SESSION_STREAM_ID`` for its
-    single-lane CLI callers. A supervisor that watches every lane must not apply
-    one lane's ambient stream to another lane's handoff, so the context guard
-    uses this helper, which resolves through ``launcher_selector_stream`` exactly
-    as ``codex.sh`` does with ``launcher_selector_stream "$LC_EPIC"``.
-    """
-    return _launcher_selector_stream(epic)
-
-
 def _stream_id(args: argparse.Namespace) -> str:
-    return resolve_stream_id(args.epic, getattr(args, "stream", None))
+    return handoff_select.resolve_stream_id(args.epic, getattr(args, "stream", None))
 
 
 DEFAULT_PASS_RATIO = 0.8
 DEFAULT_SIM_THRESHOLD = 0.75
-N_ANCHORS = 10
 _CANARY_TIMEOUT_SECONDS = 30
 _TIMEOUT_RETURN_CODE = 124
-_NEXT_HEADING_MARKERS = ("next drive", "next after", "next action", "in flight", "live session")
-_HANDS_OFF_HEADING_MARKERS = ("hands-off", "handsoff", "do not", "out of scope")
-_SECTION_COUNT_LIMIT = 10_000
 
 
 def _utc_now() -> str:
@@ -224,178 +164,6 @@ def _bound_handoff_path(
     return repo / ".claude" / f"{epic}-epic" / "INTERIM-DRIVER-HANDOFF.md"
 
 
-def _read_text(path: Path, limit: int = 120_000) -> str:
-    if not path.is_file():
-        return ""
-    return path.read_text(encoding="utf-8", errors="replace")[:limit]
-
-
-def _clip(text: str, max_len: int = 220) -> str:
-    text = " ".join(text.split())
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1].rstrip() + "…"
-
-
-def _load_stream_entries(stream_id: str, *, limit: int = 40) -> list[dict[str, str]]:
-    """Return [{type, body}, ...] from session stream; empty if store unavailable."""
-    try:
-        from lu_machinery.session_streams.db import SessionStreamDatabase
-        from lu_machinery.session_streams.store import SessionStreamStore
-
-        store = SessionStreamStore(SessionStreamDatabase())
-        digest = store.load_digest(stream_id, limit=limit)
-        out: list[dict[str, str]] = []
-        for entry in list(digest.pinned) + list(digest.recent):
-            body = (entry.body or "").strip()
-            if not body:
-                continue
-            out.append(
-                {
-                    "type": getattr(entry.type, "value", str(entry.type)),
-                    "body": body,
-                }
-            )
-        return out
-    except Exception as exc:
-        # Fail-open to handoff-only mint when stream DB is missing/unreadable.
-        print(f"warning: session stream unavailable ({type(exc).__name__}: {exc})", file=sys.stderr)
-        return []
-
-
-def _extract_handoff_bullets(md: str, *, heading_substrings: tuple[str, ...], limit: int = 12) -> list[str]:
-    """Pull bullet lines under headings whose title contains any substring (case-insensitive)."""
-    if not md:
-        return []
-    lines = md.splitlines()
-    bullets: list[str] = []
-    active = False
-    for line in lines:
-        if re.match(r"^#{1,4}\s+", line):
-            title = re.sub(r"^#{1,4}\s+", "", line).strip().lower()
-            active = any(s in title for s in heading_substrings)
-            continue
-        if not active:
-            continue
-        m = re.match(r"^\s*[-*]\s+(.+)$", line) or re.match(r"^\s*\d+\.\s+(.+)$", line)
-        if m:
-            item = m.group(1).strip()
-            # strip markdown bold/links lightly
-            item = re.sub(r"\*\*([^*]+)\*\*", r"\1", item)
-            item = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", item)
-            if item:
-                bullets.append(item)
-            if len(bullets) >= limit:
-                break
-    return bullets
-
-
-def _handoff_section_counts(md: str) -> tuple[int, int]:
-    """Count Next and Hands-off bullets the minter can consume."""
-    next_n = len(
-        _extract_handoff_bullets(
-            md,
-            heading_substrings=_NEXT_HEADING_MARKERS,
-            limit=_SECTION_COUNT_LIMIT,
-        )
-    )
-    hands_n = len(
-        _extract_handoff_bullets(
-            md,
-            heading_substrings=_HANDS_OFF_HEADING_MARKERS,
-            limit=_SECTION_COUNT_LIMIT,
-        )
-    )
-    return next_n, hands_n
-
-
-def _format_anchor_shortfall(attempts: list[tuple[str, int, int, int]]) -> str:
-    """Name every handoff tried and its next/hands-off bullet counts."""
-    best = max((anchors for _rel, anchors, _next_n, _hands_n in attempts), default=0)
-    tried = ", ".join(f"{rel} (next={next_n}, hands-off={hands_n})" for rel, _anchors, next_n, hands_n in attempts)
-    if not tried:
-        tried = "(no handoff) (next=0, hands-off=0)"
-    return (
-        f"error: could only derive {best}/{N_ANCHORS} durable anchors; "
-        f"tried {tried}; "
-        "dual-write handoff next/hands-off sections, then re-mint only within thread-rollover; "
-        "the launcher owns the stream lease; agents never open, claim, renew, release, or recover it"
-    )
-
-
-@dataclass(frozen=True)
-class HandoffAnchorCheck:
-    """The verdict the launcher's anchor mint would reach for one handoff set.
-
-    ``ok`` is true only when the shared selector found a handoff whose facts
-    reach :data:`N_ANCHORS`. ``next_count`` and ``hands_off_count`` are the
-    section counts of the best attempt (the selected file when ``ok``).
-    ``shortfall`` is the launcher's own message when ``ok`` is false, else empty.
-    ``no_handoff`` is true when no candidate file existed at all, so the caller
-    can fail open instead of demanding a rewrite. The check writes no file,
-    opens no network connection, and touches no lease.
-    """
-
-    ok: bool
-    anchors: int
-    target: int
-    next_count: int
-    hands_off_count: int
-    shortfall: str
-    handoff_rel: str
-    no_handoff: bool
-
-
-def check_handoff_anchors(
-    *,
-    repo: Path,
-    epic: str,
-    candidates: Sequence[handoff_select.LoadedCandidate | Path],
-    stream_id: str = "",
-    stream_entries: Sequence[dict[str, str]] = (),
-) -> HandoffAnchorCheck:
-    """Run the launcher's selector over ``candidates`` without writing anything.
-
-    This calls :func:`select_handoff`, which counts sections through
-    :func:`_handoff_section_counts` exactly as mint does, on the text the
-    launcher already ranked. Callers pass the candidates the launcher resolves
-    (``handoff_select.load_codex_candidates`` for the Codex lane) and the stream
-    entries the launcher loads; the helper itself reads nothing.
-    """
-    selection = select_handoff(
-        repo=repo,
-        epic=epic,
-        stream_id=stream_id,
-        stream_entries=list(stream_entries),
-        candidates=candidates,
-    )
-    attempts = list(selection.attempts)
-    if selection.reason and selection.anchor_count >= N_ANCHORS:
-        _rel, anchors, next_n, hands_n = attempts[-1]
-        return HandoffAnchorCheck(
-            ok=True,
-            anchors=anchors,
-            target=N_ANCHORS,
-            next_count=next_n,
-            hands_off_count=hands_n,
-            shortfall="",
-            handoff_rel=selection.reason,
-            no_handoff=False,
-        )
-    no_handoff = not any(rel != handoff_select.NO_HANDOFF_LABEL for rel, _anchors, _next_n, _hands_n in attempts)
-    _rel, anchors, next_n, hands_n = max(attempts, key=lambda attempt: attempt[1]) if attempts else ("", 0, 0, 0)
-    return HandoffAnchorCheck(
-        ok=False,
-        anchors=anchors,
-        target=N_ANCHORS,
-        next_count=next_n,
-        hands_off_count=hands_n,
-        shortfall=_format_anchor_shortfall(attempts),
-        handoff_rel="" if no_handoff else _rel,
-        no_handoff=no_handoff,
-    )
-
-
 def _resolve_handoff_override(repo: Path, raw: str | None) -> Path | None:
     if not raw:
         return None
@@ -403,189 +171,6 @@ def _resolve_handoff_override(repo: Path, raw: str | None) -> Path | None:
     if not path.is_absolute():
         path = repo / path
     return path
-
-
-def _build_facts(
-    *,
-    epic: str,
-    stream_id: str,
-    stream_entries: list[dict[str, str]],
-    handoff_text: str,
-    handoff_rel: str,
-    raise_on_shortfall: bool = True,
-) -> list[dict[str, str]]:
-    """Build exactly 10 unique {id,q,a} facts from durable sources only."""
-    facts: list[dict[str, str]] = []
-    used_answers: set[str] = set()
-
-    # Pre-extract working set so we can reserve probe slots (CF F001 on #5716).
-    working_set = _extract_handoff_bullets(
-        handoff_text,
-        heading_substrings=("active working set", "working set"),
-    )
-    workset_reserve = min(2, len(working_set))
-
-    def add(fid: str, q: str, a: str, *, reserve: int = 0) -> bool:
-        """Add a fact if unique. Respect optional slot reservation for later workset."""
-        if len(facts) >= N_ANCHORS - max(0, reserve):
-            return False
-        a_norm = _clip(a, 280)
-        if not a_norm or a_norm in used_answers:
-            return False
-        if any(f["id"] == fid for f in facts):
-            return False
-        used_answers.add(a_norm)
-        facts.append({"id": fid, "q": q, "a": a_norm})
-        return True
-
-    # 1) Session identity (always; never reserved against)
-    add(
-        "lane-stream",
-        "What session stream id is this Grok lane driving?",
-        stream_id,
-    )
-    add(
-        "lane-epic",
-        "What epic slug is this Grok lane bound to?",
-        epic,
-    )
-
-    # 2) Pinned binding orders from stream (leave room for workset when present)
-    pinned_orders = [e for e in stream_entries if e["type"] == "binding_order"]
-    for i, entry in enumerate(pinned_orders[:4], start=1):
-        if not add(
-            f"bind-{i}",
-            f"What is binding order #{i} for this lane (plain paraphrase of the frozen stream pin)?",
-            entry["body"],
-            reserve=workset_reserve,
-        ):
-            break
-
-    # 3) Negative constraints from stream
-    negs = [e for e in stream_entries if e["type"] == "negative_constraint"]
-    for i, entry in enumerate(negs[:2], start=1):
-        if not add(
-            f"neg-{i}",
-            f"What is negative constraint #{i} pinned on this stream?",
-            entry["body"],
-            reserve=workset_reserve,
-        ):
-            break
-
-    # 4) Handoff dual-write: Next Drive (reserve workset slots after these)
-    next_bullets = _extract_handoff_bullets(
-        handoff_text,
-        heading_substrings=_NEXT_HEADING_MARKERS,
-    )
-    for i, bullet in enumerate(next_bullets[:3], start=1):
-        if not add(
-            f"next-handoff-{i}",
-            f"According to the dual-write handoff ({handoff_rel}), what is next-item #{i}?",
-            bullet,
-            reserve=workset_reserve,
-        ):
-            break
-
-    # 4b) Active Working Set — reserved slots (load-bearing mid-flight facts)
-    for i, bullet in enumerate(working_set[:2], start=1):
-        add(
-            f"workset-{i}",
-            f"According to the dual-write handoff, what is active working-set fact #{i}?",
-            bullet,
-            reserve=0,
-        )
-
-    hands_off = _extract_handoff_bullets(
-        handoff_text,
-        heading_substrings=_HANDS_OFF_HEADING_MARKERS,
-    )
-    for i, bullet in enumerate(hands_off[:2], start=1):
-        if not add(
-            f"handsoff-{i}",
-            f"According to the dual-write handoff, what is hands-off rule #{i}?",
-            bullet,
-            reserve=0,
-        ):
-            break
-
-    # 5) Stream next_action fill remaining slots
-    nexts = [e for e in stream_entries if e["type"] == "next_action"]
-    for i, entry in enumerate(nexts[:3], start=1):
-        if not add(
-            f"next-stream-{i}",
-            f"What next-action entry #{i} was recorded on the stream?",
-            entry["body"],
-        ):
-            break
-
-    # 6) Recent durable decisions from stream if still short
-    decisions = [e for e in stream_entries if e["type"] == "decision"]
-    for i, entry in enumerate(decisions[:3], start=1):
-        if not add(
-            f"decision-{i}",
-            f"What decision #{i} was recorded on the stream?",
-            entry["body"],
-        ):
-            break
-
-    # 7) Recent state if still short (still dual-written stream entries — durable)
-    states = [e for e in stream_entries if e["type"] == "state"]
-    for i, entry in enumerate(reversed(states[-6:]), start=1):
-        if not add(
-            f"state-{i}",
-            f"What recent state note #{i} is on the stream (paraphrase the frozen text)?",
-            entry["body"],
-        ):
-            break
-
-    if len(facts) < N_ANCHORS:
-        if not raise_on_shortfall:
-            return facts
-        next_n, hands_n = _handoff_section_counts(handoff_text)
-        label = handoff_rel or "(no handoff)"
-        raise SystemExit(_format_anchor_shortfall([(label, len(facts), next_n, hands_n)]))
-
-    # Exactly 10 — prefer earliest (highest-trust: identity + pins)
-    return facts[:N_ANCHORS]
-
-
-def select_handoff(
-    *,
-    repo: Path,
-    epic: str,
-    stream_id: str,
-    stream_entries: list[dict[str, str]],
-    candidates: Sequence[handoff_select.LoadedCandidate | Path],
-    explicit: Path | None = None,
-) -> handoff_select.HandoffSelection:
-    """Anchor-yield selection mint and every pre-mint board share.
-
-    Ranking already read each :class:`handoff_select.LoadedCandidate`. Fact
-    counts are measured from that text's selection prefix, and mint builds
-    facts from the same string. ``reason`` is the selected file's
-    repo-relative label, ``(no handoff)`` when the stream alone suffices, or
-    empty when every candidate fell short.
-    """
-
-    def measure(text: str, rel: str) -> tuple[int, int, int]:
-        next_n, hands_n = _handoff_section_counts(text)
-        built = _build_facts(
-            epic=epic,
-            stream_id=stream_id,
-            stream_entries=stream_entries,
-            handoff_text=text,
-            handoff_rel=rel,
-            raise_on_shortfall=False,
-        )
-        return len(built), next_n, hands_n
-
-    return handoff_select.select_handoff(
-        repo=repo,
-        candidates=candidates,
-        explicit=explicit,
-        measure=measure,
-        min_anchors=N_ANCHORS,
-    )
 
 
 def select_board_handoff(
@@ -597,8 +182,8 @@ def select_board_handoff(
     stream_limit: int = 40,
 ) -> handoff_select.HandoffSelection:
     """Board-time pick. Same selector, candidates, and stream limit mint uses."""
-    stream_entries = _load_stream_entries(stream_id, limit=int(stream_limit))
-    return select_handoff(
+    stream_entries = handoff_select.load_stream_entries(stream_id, limit=int(stream_limit))
+    return handoff_select.select_anchor_handoff(
         repo=repo,
         epic=epic,
         stream_id=stream_id,
@@ -615,8 +200,8 @@ def cmd_mint(args: argparse.Namespace) -> int:
     explicit = _resolve_handoff_override(repo, getattr(args, "handoff", None))
     loaded = _load_ranked(repo, epic, preferred=getattr(args, "preferred", None))
     stream_limit = int(args.stream_limit)
-    stream_entries = _load_stream_entries(stream_id, limit=stream_limit)
-    selected = select_handoff(
+    stream_entries = handoff_select.load_stream_entries(stream_id, limit=stream_limit)
+    selected = handoff_select.select_anchor_handoff(
         repo=repo,
         epic=epic,
         stream_id=stream_id,
@@ -624,12 +209,12 @@ def cmd_mint(args: argparse.Namespace) -> int:
         candidates=loaded,
         explicit=explicit,
     )
-    if not selected.reason or selected.anchor_count < N_ANCHORS:
-        print(_format_anchor_shortfall(list(selected.attempts)), file=sys.stderr)
+    if not selected.reason or selected.anchor_count < handoff_select.N_ANCHORS:
+        print(handoff_select.format_anchor_shortfall(list(selected.attempts)), file=sys.stderr)
         return 1
     # Fact building uses the text the selector already validated. A later
     # rewrite of the file on disk must not change the minted anchors.
-    facts = _build_facts(
+    facts = handoff_select.build_facts(
         epic=epic,
         stream_id=stream_id,
         stream_entries=stream_entries,
@@ -637,14 +222,14 @@ def cmd_mint(args: argparse.Namespace) -> int:
         handoff_rel=selected.reason,
         raise_on_shortfall=False,
     )
-    if len(facts) < N_ANCHORS:
-        next_n, hands_n = _handoff_section_counts(selected.text)
+    if len(facts) < handoff_select.N_ANCHORS:
+        next_n, hands_n = handoff_select.handoff_section_counts(selected.text)
         print(
-            _format_anchor_shortfall([(selected.reason, len(facts), next_n, hands_n)]),
+            handoff_select.format_anchor_shortfall([(selected.reason, len(facts), next_n, hands_n)]),
             file=sys.stderr,
         )
         return 1
-    facts = facts[:N_ANCHORS]
+    facts = facts[:handoff_select.N_ANCHORS]
     handoff_rel = selected.reason
 
     out_dir = Path(args.out_dir) if args.out_dir else _canary_dir(repo, epic)
@@ -863,7 +448,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             with contextlib.suppress(json.JSONDecodeError, OSError):
                 stream_id = json.loads(meta_path.read_text(encoding="utf-8")).get("stream_id") or stream_id
 
-        stream_id = resolve_stream_id(epic, getattr(args, "stream", None) or stream_id)
+        stream_id = handoff_select.resolve_stream_id(epic, getattr(args, "stream", None) or stream_id)
 
         if verdict == "FAIL-HANDOFF":
             next_drive = _split_csv_lines(getattr(args, "next_drive", "") or "")
@@ -991,7 +576,7 @@ def emit_hydrate_capsule(
     from lu_machinery.session_canary import diary as diary_mod
 
     epic = epic.strip().lower()
-    stream_id = resolve_stream_id(epic, stream_id)
+    stream_id = handoff_select.resolve_stream_id(epic, stream_id)
     # Auto-hydrate passes handoff=None so this resolves the recorded path.
     # An explicit handoff is this invocation only and is not stored.
     explicit = handoff

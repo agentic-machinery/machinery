@@ -146,13 +146,13 @@ def test_bootstrap_rejects_partial_rollover_environment(tmp_path: Path, monkeypa
     assert not (tmp_path / ".claude" / "infra-epic" / "CODEX-COLD-START.md").exists()
 
 
-@pytest.mark.parametrize("lane_name", ["codex", "gemini", "glm"])
+@pytest.mark.parametrize("lane_name", ["codex", "gemini"])
 def test_hydrate_reports_retry_count_without_changing_capsule(monkeypatch, capsys, lane_name) -> None:
     import json
 
-    from lu_machinery.session_canary import gemini_lane, glm_lane
+    from lu_machinery.session_canary import gemini_lane
 
-    lane = {"codex": codex_lane, "gemini": gemini_lane, "glm": glm_lane}[lane_name]
+    lane = {"codex": codex_lane, "gemini": gemini_lane}[lane_name]
     capsule = {"execution_allowed": True}
     calls = []
 
@@ -183,14 +183,14 @@ def test_hydrate_preserves_launcher_codex_identity(monkeypatch, capsys, identity
     assert observed == ([] if identity == "gemini" else [identity])
 
 
-@pytest.mark.parametrize("provider", ["codex", "gemini", "glm"])
+@pytest.mark.parametrize("provider", ["codex", "gemini"])
 @pytest.mark.parametrize("registration", ["registered", "removed", "prefix", "foreign", "empty"])
 def test_hydrate_uses_exact_registered_provider_identity(monkeypatch, capsys, tmp_path, provider, registration) -> None:
     from lu_machinery.orchestration import handoff_slot_registry
-    from lu_machinery.session_canary import gemini_lane, glm_lane
+    from lu_machinery.session_canary import gemini_lane
 
-    lane = {"codex": codex_lane, "gemini": gemini_lane, "glm": glm_lane}[provider]
-    # A local roster exercises GLM slots without changing live eligibility.
+    lane = {"codex": codex_lane, "gemini": gemini_lane}[provider]
+    # A local roster exercises provider slots without changing live eligibility.
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(f"assignments:\n  core:\n    slots: [{provider}-core]\n", encoding="utf-8")
     monkeypatch.setattr(handoff_slot_registry._channels, "ASSIGNMENTS_PATH", roster)
@@ -221,12 +221,12 @@ def test_hydrate_uses_exact_registered_provider_identity(monkeypatch, capsys, tm
         assert output.err == "ACTION: hydration blocked — unregistered lane identity for this provider.\n"
 
 
-@pytest.mark.parametrize("provider", ["codex", "gemini", "glm"])
+@pytest.mark.parametrize("provider", ["codex", "gemini"])
 def test_hydrate_refuses_slot_when_registry_unavailable(monkeypatch, capsys, tmp_path, provider) -> None:
     from lu_machinery.orchestration import handoff_slot_registry
-    from lu_machinery.session_canary import gemini_lane, glm_lane
+    from lu_machinery.session_canary import gemini_lane
 
-    lane = {"codex": codex_lane, "gemini": gemini_lane, "glm": glm_lane}[provider]
+    lane = {"codex": codex_lane, "gemini": gemini_lane}[provider]
     monkeypatch.setattr(handoff_slot_registry._channels, "ASSIGNMENTS_PATH", tmp_path / "missing.yaml")
     monkeypatch.setenv("SESSION_STREAM_AGENT", f"{provider}-core")
     monkeypatch.setattr(
