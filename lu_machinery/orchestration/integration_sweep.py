@@ -819,7 +819,8 @@ def lookup_verdict(
         recorded = marker
         if (
             marker["verdict"] == "CHANGES_REQUESTED"
-            and not (is_second_review(marker) or is_second_review_only(marker["model"]))
+            and not is_second_review(marker)
+            and reviews_of_record(marker["model"])
             and recorded_p3_residuals(body) is not None
             and not _repair_receipt_blocks(body, marker["sha"])
         ):
@@ -840,11 +841,12 @@ def lookup_verdict(
             or is_ukrainian_review(item[2]) or item[2].get("review_pair")
             or item[2]["family"] not in attested_author_families([item[2]])
         ]
-    # A historical second review is never the reviewer of record: only its rejections stay candidates.
+    # A historical second review, or a marker from a model with no catalog review role, is never
+    # the reviewer of record: only its rejections stay candidates.
     candidates = [
         item for item in candidates
         if item[2]["verdict"] in REJECTED
-        or not (is_second_review(item[2]) or is_second_review_only(item[2]["model"]))
+        or (not is_second_review(item[2]) and reviews_of_record(item[2]["model"]))
     ]
     if not candidates:
         state = "CF-unrecorded" if legacy else "CF-stale" if other_head else "needs-CF"

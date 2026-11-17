@@ -281,7 +281,8 @@ def test_opus_sol_and_reviewers_are_admitted_every_activity(model, activity):
 def test_recon_models_consult_but_never_review():
 
     assert activity_role_refusal("gpt-6-luna", "consult") is None
-    assert activity_role_refusal("gemini-4-carbon-medium", "consult") is not None
+    assert activity_role_refusal("gemini-4-carbon-medium", "consult") is None
+    assert "holds no review" in activity_role_refusal("gemini-4-carbon-medium", "review")
     assert "holds no review" in activity_role_refusal("gpt-6-luna", "review")
 
 
@@ -1185,14 +1186,15 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
 
 @pytest.mark.parametrize(
     ("agent", "model"),
-    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium")],
+    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium"),
+     ("agy", "gemini-4-hydrogen-medium"), ("agy", "gemini-4-hydrogen-xhigh")],
 )
 def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent, model):
     """Defect class: a model with no catalog review role admitted to a review-typed dispatch.
 
     Dispatch admission must refuse it before any worktree or provider starts; the verdict
     recorder's later refusal only discards a run that already happened (#9583). The same
-    model stays admitted for work. Carbon is work-only: it is not a second reviewer.
+    model stays admitted for work. Carbon and Hydrogen hold no review role: neither is a second reviewer.
     """
     from lu_machinery.dispatcher import checks
 

@@ -373,7 +373,7 @@ Code-profile `closeout_cli resolve-reviewer` requires a resolved target or an ow
   * **Top advisors**: Opus 5.5 / Sol 6.1 for advice, critiques and design input; they hold
     designated approval by agreeing; when one authored the proposal, the other's approval
     completes it, and any other author needs both (#9583, #9616).
-  * **Other advisors**: none outside a council (`drive-epic` `references/decision-report.md` § Council). Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 4 Hydrogen (`gemini-4-hydrogen-medium` via AGY) is a standing member of every council and runs parallel non-record reviews for data collection (operator orders `USE-HYDROGEN-1117` and `HYDROGEN-COUNCIL-ALL-1117`, 2026-11-17); its council answers and parallel reviews are input, not designated approval or review of record. Gemini 3.8 Flash is not an advisor for
+  * **Other advisors**: none outside a council (`drive-epic` `references/decision-report.md` § Council). Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 3.8 Flash is not an advisor for
     planning or design (operator decision 2026-10-03, #9584); its task-level uses stay as listed in the routing tables. (Kimi is retired, OO-58.)
   * Legacy Terra review qualification does not authorize GPT-6.1 Terra review
     or advisory work; its current admission is routine coding only.
@@ -852,7 +852,7 @@ seats rotate — operator wording; the catalog-refresh contract §above owns nam
 
 | Area | Advisor pool | Evidence anchor |
 | --- | --- | --- |
-| Ukrainian language & pedagogy | Opus · Sol (sanctioned language seats ONLY). Gemini joins only as task-level content reviewer under a fixed brief, never for planning or advice on new design (operator decision 2026-10-03, #9584), except Gemini 4 Hydrogen as a standing advising member of every council and its discussion (operator orders 2026-11-16, `USE-HYDROGEN-1117` and `HYDROGEN-COUNCIL-ALL-1117` 2026-11-17; `drive-epic` `references/decision-report.md` § Council) | LANGUAGE-LANES RULE binds |
+| Ukrainian language & pedagogy | Opus · Sol (sanctioned language seats ONLY). Gemini joins only as task-level content reviewer under a fixed brief, never for planning or advice on new design (operator decision 2026-10-03, #9584) | LANGUAGE-LANES RULE binds |
 | Architecture & process design | Sol (designer) · Opus (counter-reader); designated approval needs the non-author's approval when Opus or Sol authored the proposal, both otherwise | fleet topology §above |
 | Code & infrastructure review | Opus 5.5 · GPT-6.1 Sol | Historical Terra review arcs on #5896/#5925/#5926/#5931 (defect-finding record) |
 | Security-sensitive changes | Sol · Opus | ambient-Anthropic-token→z.ai leak caught pre-merge (#5931 arc) |
@@ -968,10 +968,9 @@ permanent capability claim. Confirm exact live strings in native CLI catalogs an
 Operator order HYDROGEN-REPLACES-38 (2026-11-15): Google is retiring Gemini 3.8 Flash, and
 **Gemini 4 Hydrogen at medium (`gemini-4-hydrogen-medium`) is the AGY work default**
 (the AGY adapter, registry and interactive `start-gemini.sh` default; dispatch `--agent agy --model gemini-4-hydrogen-medium`).
-Hydrogen holds work roles plus the council advisory and non-record parallel-review roles, and no
-review-of-record or Ukrainian review role. Gemini 4 Carbon is used for read-only review and
-security-review dispatches outside the review-of-record ladders and is not a work route
-(operator 2026-11-17). Gemini 3.8 Flash keeps the Gemini review seat (low/medium code review), the Ukrainian review
+Hydrogen holds work roles only. Gemini 4 Carbon is used for read-only review and
+security-review dispatches outside the review-of-record ladders and for advisory asks, and is
+not a work route (operator 2026-11-17); it holds no review role, so it is never a review of record. Gemini 3.8 Flash keeps the Gemini review seat (low/medium code review), the Ukrainian review
 seat, the certified Gemini driver seat, the ACP `ask-agy` consultation pin and the legacy
 `gemini` runtime lane, and stays selectable by explicit pin until Google retires it.
 Earlier history: 3.8 Flash was the AGY top default from 2026-09-02; operator 2026-09-22 found
@@ -980,7 +979,7 @@ Gemini 3.7, 3.6 and 3.5 Flash are retired.
 
 | Model | Catalog slug | Tier | Use |
 | --- | --- | --- | --- |
-| Gemini 4 Hydrogen (Medium) | `gemini-4-hydrogen-medium` | `frontier_practical` | Default AGY work dispatch for routine AND deep work; subagents; fast tool loops; day-to-day coding. No review-of-record or Ukrainian review role |
+| Gemini 4 Hydrogen (Medium) | `gemini-4-hydrogen-medium` | `frontier_practical` | Default AGY work dispatch for routine AND deep work; subagents; fast tool loops; day-to-day coding. No review, Ukrainian review or advisory role |
 | Gemini 3.8 Flash (High) | `gemini-3.8-flash-high` | `frontier_practical` | Explicit pin; Gemini review and Ukrainian review seat, certified driver id, ACP consultation pin; Google is retiring it |
 | Gemini 3.7 Flash (High) | `gemini-3.7-flash-high` | `frontier_practical` | Retired; use `gemini-3.8-flash-high` |
 | Gemini 3.6 Flash (High) | `gemini-3.6-flash-high` | `frontier_practical` | Retired; use `gemini-3.8-flash-high` |
