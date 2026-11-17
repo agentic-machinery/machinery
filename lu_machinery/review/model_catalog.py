@@ -1165,6 +1165,15 @@ def routing_model(section: str, lane: str, field: str = "model_id") -> str:
     return value
 
 
+def codex_dispatch_models(catalog: dict[str, Any] | None = None) -> frozenset[str]:
+    """Models admitted for native Codex execution by the catalog."""
+    source = catalog if catalog is not None else load_model_catalog()
+    return frozenset(
+        model_id for model_id, entry in source["models"].items()
+        if entry["lifecycle"] in {"active", "fallback"} and "native_codex" in entry["transports"]
+    )
+
+
 def substitution_default_model(lane: str) -> str | None:
     """Role-backed substitution defaults; registry-only lanes migrate in PR 3c."""
     if lane == "cursor":

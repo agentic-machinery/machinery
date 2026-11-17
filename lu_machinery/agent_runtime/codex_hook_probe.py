@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.jsonl import jsonl_lines
+from lu_machinery.review.model_catalog import (
+    ModelCatalogError,
+    codex_dispatch_models,
+    routing_model,
+)
 
 DEFAULT_TIMEOUT_SECONDS = 180
 TEMP_PARENT = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path(tempfile.gettempdir())
@@ -225,8 +230,12 @@ def _tool_names(events: list[dict[str, Any]]) -> list[str]:
 
 
 def _run_case(repo: Path, case: ProbeCase, model: str | None, timeout: int) -> dict[str, Any]:
-    if model not in {None, "gpt-6.1-sol"}:
-        raise ValueError(f"Codex model {model!r} rejected; only gpt-6.1-sol is approved")
+    approved = routing_model("seats", "openai_frontier")
+    model = approved if model is None else model
+    if model != approved or model not in codex_dispatch_models():
+        raise ModelCatalogError(
+            f"codex_model_not_approved: Codex model {model!r} rejected; only {approved} is approved"
+        )
     log_path = repo / f"{case.name}.jsonl"
     env = os.environ.copy()
     env["CODEX_HOOK_PROBE_LOG"] = str(log_path)
@@ -244,7 +253,7 @@ def _run_case(repo: Path, case: ProbeCase, model: str | None, timeout: int) -> d
         "--output-last-message",
         str(output_file),
     ]
-    command.extend(["--model", model or "gpt-6.1-sol", "-c", 'model_reasoning_effort="low"'])
+    command.extend(["--model", model, "-c", 'model_reasoning_effort="low"'])
     command.append(case.prompt)
 
     result = _run(command, cwd=repo, env=env, timeout=timeout)
@@ -297,7 +306,8 @@ def _self_test() -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=os.environ.get("CODEX_HOOK_PROBE_MODEL", "gpt-6.1-sol"))
+    approved = routing_model("seats", "openai_frontier")
+    parser.add_argument("--model", default=os.environ.get("CODEX_HOOK_PROBE_MODEL", approved))
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
         "--keep-workdir",
@@ -310,8 +320,8 @@ def parse_args() -> argparse.Namespace:
         help="Validate probe repo generation without invoking Codex.",
     )
     args = parser.parse_args()
-    if args.model != "gpt-6.1-sol":
-        parser.error("only gpt-6.1-sol is approved for Codex hook probes")
+    if args.model != approved or args.model not in codex_dispatch_models():
+        parser.error(f"codex_model_not_approved: only {approved} is approved for Codex hook probes")
     return args
 
 

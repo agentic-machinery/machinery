@@ -46,14 +46,28 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
+from lu_machinery.agent_runtime.attempt_safe_read import (
+    AttemptReadError,
+    safe_read_attempt_file,
+)
+from lu_machinery.review.model_catalog import (
+    ModelCatalogError,
+    codex_dispatch_models,
+    routing_model,
+)
 from lu_machinery.review.product_hooks import attempt_hooks
 from lu_machinery.secret_redactor import redact_text
 
 from ..read_only_tmp import validate_read_only_tmp_root
 from ..result import ParseResult
 from ..sources_read_only import sources_tool_sets
-from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
+from ._output_schema import (
+    json_value,
+    load_output_schema,
+    plan_output_schema,
+    schema_metadata,
+    structured_result,
+)
 from .base import InvocationPlan
 from .codex_events import (
     INCOMPLETE_FAILURE_CODE,
@@ -276,16 +290,10 @@ def _discussion_readonly_requested(tool_config: dict | None) -> bool:
     )
 
 
-# Operator 2026-09-29 (#9230). GPT-6.1 Sol is the only Sol: it orchestrates and
-# holds the former Astra advisory seat. Luna scouts.
-CODEX_APPROVED_MODELS = frozenset({"gpt-6-luna", "gpt-6.1-sol"})
-
-
 class CodexAdapter:
     """Adapter for ``codex exec`` (OpenAI ChatGPT Codex CLI)."""
 
     name: str = "codex"
-    default_model: str = "gpt-6.1-sol"
     # Omitted effort is the orchestrator setting. Scouting passes Luna and its
     # own effort. An explicit --effort always wins.
     default_effort: str = "high"
@@ -296,6 +304,10 @@ class CodexAdapter:
     # ``_candidate_rollout_dirs`` so liveness polls the scoped sessions/ dir,
     # not the user's real ``~/.codex/sessions/``.
     _codex_home_scope: str | None = None
+
+    @property
+    def default_model(self) -> str:
+        return routing_model("seats", "openai_frontier")
 
     def __init__(self) -> None:
         # Early-reap evidence, keyed by each invocation's unique -o path so
@@ -331,9 +343,13 @@ class CodexAdapter:
         None, the lane default ``high`` is applied.
         See #1396.
         """
-        if model is not None and model not in CODEX_APPROVED_MODELS:
-            approved = ", ".join(sorted(CODEX_APPROVED_MODELS))
-            raise ValueError(f"CodexAdapter: model={model!r} rejected; approved models are {approved}")
+        model = self.default_model if model is None else model
+        admitted = codex_dispatch_models()
+        if model not in admitted:
+            approved = ", ".join(sorted(admitted))
+            raise ModelCatalogError(
+                f"codex_model_not_approved: CodexAdapter: model={model!r} rejected; approved models are {approved}"
+            )
 
         tc_early = tool_config or {}
         if tc_early.get("attempt_os_sandbox"):
@@ -459,7 +475,7 @@ class CodexAdapter:
             # the original session boundary and the subprocess itself still
             # runs from execution_cwd.
             cmd.extend(["-C", str(execution_cwd), "--color", "never"])
-        cmd.extend(["-o", str(output_path), "-m", model or self.default_model])
+        cmd.extend(["-o", str(output_path), "-m", model])
         # Review isolation (#5285): ignore user/project config when the bridge
         # marks the invocation as a fail-closed review. Missing flags on an
         # older binary are the caller's responsibility to feature-detect; the
