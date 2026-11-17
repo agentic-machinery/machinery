@@ -35,7 +35,7 @@ _PLAN = "curriculum/a1/plans/greetings.yaml"
 # post-B2 product entry (CTO decision on C-5041, 2026-11-10; B2a slice E3 adopts it verbatim):
 # the configured project interpreter runs the installed release's checker module. Today's
 # product entry runs scripts/pre_commit/{project_python.sh,check_plan_immutability.py}. The
-# checker is machinery-mapped in lint/rename-map.json, so a clean product checkout lacks it.
+# checker is a machinery module, so a clean product checkout lacks it.
 _PRODUCT_PRE_COMMIT_CONFIG = """\
 repos:
   - repo: local

@@ -1,4 +1,4 @@
-"""Contract gates recognize changes in both repository layouts."""
+"""Contract gates recognize changes to the machinery package's review contract files."""
 
 
 
@@ -17,17 +17,17 @@ from tests.helpers.product_tree import configured_roots as configured_roots
 GIB = 2**30
 
 def test_contract_paths_match_product_layout() -> None:
-    """Prevent installed keepers from missing product review-contract changes."""
+    """Every contract path is a machinery package file; the retired product scripts/ copies are not."""
     package_paths = [path for path in CONTRACT_PATHS if path.startswith("lu_machinery/")]
-    assert package_paths
+    assert package_paths == list(CONTRACT_PATHS)
     for path in package_paths:
-        assert touches_contract([path.replace("lu_machinery/", "scripts/", 1)])
-    assert touches_contract(["scripts/review/record_cf_verdict.py"])
-    assert touches_contract(["schemas/code-review-findings.v1.schema.json"])
-    assert not touches_contract(["scripts/unrelated.py"])
+        assert touches_contract([path])
+        assert not touches_contract([path.replace("lu_machinery/", "scripts/", 1)])
+    assert not touches_contract(["schemas/code-review-findings.v1.schema.json"])
+    assert not touches_contract(["lu_machinery/unrelated.py"])
 
 
-CONTRACT_FILE = "scripts/review/review_contract.py"
+CONTRACT_FILE = "lu_machinery/review/review_contract.py"
 
 
 RECEIPT = json.dumps({
@@ -75,7 +75,7 @@ def tasks(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[dict, str]]:
 @pytest.fixture
 def repo(tmp_path: Path) -> tuple[Path, str]:
     root = tmp_path / "repo"
-    (root / "scripts/review").mkdir(parents=True)
+    (root / "lu_machinery/review").mkdir(parents=True)
     _git(root, "init", "-q", "-b", "trunk")
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
@@ -242,7 +242,7 @@ def test_the_gate_trusts_the_candidate_settlement_not_mains_contract(repo, tasks
 
 @pytest.mark.usefixtures('configured_roots', 'tasks')
 def test_the_gate_itself_is_a_contract_path() -> None:
-    assert canary.touches_contract(["scripts/review/contract_canary.py"])
+    assert canary.touches_contract(["lu_machinery/review/contract_canary.py"])
 
 
 @pytest.mark.usefixtures('configured_roots', 'tasks')

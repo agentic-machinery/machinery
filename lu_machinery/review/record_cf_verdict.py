@@ -2315,20 +2315,15 @@ def _trusted_verdict_shas(comments: Sequence[Mapping[str, Any]], login: str) -> 
     return {marker["sha"] for _, marker in _trusted_markers(comments, login)}
 
 
-# Only these generated receipts may differ from Git's remerge result. Keep this
-# explicit: an arbitrary .sha256 file is not proof of generated content.
-CLEAN_MERGE_GENERATED_FILES = frozenset({"lu_machinery/lint/rename-map.json.sha256"})
-
-
 def clean_base_merge_descent(repo_root: Path, *, approved: str, head: str, base_tip: str) -> list[str] | None:
     """The base commits ``head`` merges after ``approved``, when that is all it adds; else None.
 
     The head must be one two-parent merge directly after ``approved``, with
-    its second parent on ``base_tip``. Git's merge conflicts and remerge diff
-    may name only explicitly listed, verified generated receipts. This
-    budget-only proof does not change the stricter merge proof used for author
-    attribution. Missing objects, real conflict resolutions and proof errors
-    grant no exemption.
+    its second parent on ``base_tip``. Git must merge the parents without a
+    conflict, and the head's tree must be exactly Git's merge result (an empty
+    remerge diff). This budget-only proof does not change the stricter merge
+    proof used for author attribution. Missing objects, conflicts, any edit in
+    the merge and proof errors grant no exemption.
     """
     deadline = time.monotonic() + BRANCH_FACTS_TIMEOUT_S
     try:
@@ -2349,37 +2344,18 @@ def clean_base_merge_descent(repo_root: Path, *, approved: str, head: str, base_
                 ["git", "merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", *parents],
                 env=env, capture_output=True, check=False, timeout=30,
             )
-            if merge.returncode not in (0, 1):
+            if merge.returncode != 0:  # 1 is a conflict; anything else is an error
                 return None
             fields = merge.stdout.decode("utf-8").split("\0")
-            if len(fields) < 2 or fields[-1] != "" or not SHA.fullmatch(fields[0]):
-                return None
-            conflicted = set(fields[1:-1])
-            if bool(conflicted) != (merge.returncode == 1):
-                return None
-            if not conflicted <= CLEAN_MERGE_GENERATED_FILES:
+            if len(fields) != 2 or fields[1] != "" or not SHA.fullmatch(fields[0]):
                 return None
             diff = subprocess.run(
                 ["git", "show", "--remerge-diff", "--format=", "--name-only", "-z",
                  "--no-renames", "--no-ext-diff", "--no-textconv", head, "--"],
                 env=env, capture_output=True, check=True, timeout=30,
             )
-            changed = set(diff.stdout.decode("utf-8").split("\0")) - {""}
-            if not changed <= CLEAN_MERGE_GENERATED_FILES:
+            if set(diff.stdout.decode("utf-8").split("\0")) - {""}:
                 return None
-            for receipt in changed | conflicted:
-                source = receipt.removesuffix(".sha256")
-                content = subprocess.run(
-                    ["git", "cat-file", "blob", f"{head}:{source}"],
-                    env=env, capture_output=True, check=True, timeout=30,
-                ).stdout
-                recorded = subprocess.run(
-                    ["git", "cat-file", "blob", f"{head}:{receipt}"],
-                    env=env, capture_output=True, check=True, timeout=30,
-                ).stdout
-                expected = f"{hashlib.sha256(content).hexdigest()}  {Path(source).name}\n".encode("ascii")
-                if recorded != expected:
-                    return None
     except (RecordError, OSError, subprocess.SubprocessError, UnicodeError):
         return None
     return [parents[1]]
