@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import subprocess
 from pathlib import Path
-from lu_machinery.lint.mypy_ratchet import MypyError, collect_errors, evaluate, write_baseline
 
-
-
+from lu_machinery.lint import mypy_ratchet as ratchet
+from lu_machinery.lint.mypy_ratchet import MypyError, collect_errors, evaluate, load_entries, write_baseline
 
 _CONFIG = """\
 [tool.mypy]
@@ -66,3 +68,38 @@ def test_line_move_does_not_change_baseline_identity(tmp_path: Path) -> None:
     assert after == before
     write_baseline(baseline, after)
     assert _check(root, baseline) == []
+
+
+def test_rename_map_flip_respell_is_not_growth(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: the shrink guard compares baselines under mismatched spellings.
+
+    A rename-map flip (machinery -> product) stops respelling one slot, so the
+    branch commits the message in its running spelling. Read with that ref's own
+    map, the landed baseline holds the same identity: no growth. Real growth fails.
+    """
+
+    message = 'Variable "{}.pkg.mod.Base" is not valid as a type'
+    root = tmp_path / "tree"
+    lint = root / "lu_machinery" / "lint"
+    lint.mkdir(parents=True)
+    baseline = lint / "mypy_baseline.json"
+    landed_map = json.dumps({"scripts/pkg/mod.py": "machinery"}, indent=1).encode() + b"\n"
+    (lint / "rename-map.json").write_bytes(landed_map)
+    (lint / "rename-map.json.sha256").write_text(
+        f"{hashlib.sha256(landed_map).hexdigest()}  rename-map.json\n", encoding="ascii"
+    )
+    write_baseline(baseline, [MypyError("lu_machinery/pkg/mod.py", "valid-type", message.format("scripts"))])
+    git = ["git", "-C", str(root), "-c", "user.name=Ratchet Fixture", "-c", "user.email=ratchet@example.invalid"]
+    for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "landed"]):
+        subprocess.run([*git, *args], check=True, capture_output=True, timeout=30)
+    subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True, timeout=30)
+
+    flipped = ratchet._BaselineSpelling("lu_machinery", ratchet._RenameMap({"scripts/pkg/mod.py": "product"}))
+    monkeypatch.setattr(ratchet, "_baseline_spelling", lambda root=None: flipped)
+    respelled = MypyError("lu_machinery/pkg/mod.py", "valid-type", message.format("lu_machinery"))
+    write_baseline(baseline, [respelled])
+    assert ratchet.shrink_violations(root, baseline, load_entries(baseline, root)) == []
+
+    write_baseline(baseline, [respelled, MypyError("lu_machinery/pkg/mod.py", "misc", "new error")])
+    grown = ratchet.shrink_violations(root, baseline, load_entries(baseline, root))
+    assert any("may only shrink" in item and "origin/main" in item for item in grown)
