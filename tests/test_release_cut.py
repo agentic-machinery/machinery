@@ -183,6 +183,39 @@ def _bare_checkout(seed, bare, checkout):
     subprocess.run(["git", "clone", "--quiet", str(bare), str(checkout)], check=True, capture_output=True, text=True)
 
 
+def test_release_shallow_clone_cannot_truncate_callers_linked_worktree_history(tmp_path, monkeypatch):
+    """Defect class: inherited GIT_COMMON_DIR sends a disposable clone's shallow writes to the caller."""
+    primary, remote, linked, work = (tmp_path / name for name in ("primary", "remote.git", "linked", "cut"))
+    _init_repo(primary)
+    _git(primary, "commit", "--allow-empty", "-m", "base")
+    _git(primary, "worktree", "add", "-b", "worker", str(linked))
+    _git(primary, "clone", "--bare", str(primary), str(remote))
+    work.mkdir()
+    cut = Cut(work=work, dry_run=False, machinery_remote=str(remote), product_remote=remote.as_uri(),
+              machinery_repo="fixture/machinery", product_repo="fixture/product", host_python=tmp_path / "python",
+              primary=primary, alert=False, x_agent="codex/fixture")
+    common = primary / ".git"
+    config = (common / "config").read_bytes()
+    refs = git_module._verification_git(primary, "show-ref")
+    head = git_module._verification_git(primary, "rev-parse", "HEAD")
+    assert git_module._verification_git(primary, "rev-parse", "--is-shallow-repository") == "false"
+    with monkeypatch.context() as caller:
+        caller.setenv("GIT_COMMON_DIR", str(common))
+        caller.chdir(linked)
+        cut.run([git_module.GIT_BINARY, "clone", "--quiet", "--depth", "1", "--branch", "main",
+                 remote.as_uri(), work / "product"])
+    assert git_module._verification_git(primary, "rev-parse", "--is-shallow-repository") == "false"
+    assert git_module._verification_git(linked, "rev-parse", "--is-shallow-repository") == "false"
+    assert not (common / "shallow").exists()
+    assert (common / "config").read_bytes() == config
+    assert git_module._verification_git(primary, "show-ref") == refs
+    assert git_module._verification_git(primary, "rev-parse", "HEAD") == head
+    clone = work / "product"
+    assert git_module._verification_git(clone, "rev-parse", "--is-shallow-repository") == "true"
+    assert git_module._verification_git(clone, "rev-parse", "--git-common-dir") == ".git"
+    assert (clone / ".git/shallow").read_text().strip() == head
+
+
 def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
     """Defect class: the adopt and post-release commits omit an X-Agent trailer, so review cannot resolve an author family."""
     machinery_seed = tmp_path / "machinery-seed"

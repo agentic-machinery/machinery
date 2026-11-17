@@ -32,6 +32,8 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lu_machinery.common.git_context import sanitized_git_env
+
 # The post-release PR's title. A range holding only these PRs is unchanged.
 BUMP_TITLE = "chore(release): record {released} and start {next}"
 _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.\d+( \(#\d+\))?")
@@ -344,7 +346,8 @@ class Cut:
         return result
 
     def env(self, **extra: str) -> dict[str, str]:
-        env = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+        env = {key: value for key, value in sanitized_git_env(strip_config_injection=True).items()
+               if key not in {"PYTHONPATH", "PYTHONHOME"}}
         env.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(self.primary), LU_PRODUCT_ROOT=str(self.primary))
         env.update(extra)
         return env
