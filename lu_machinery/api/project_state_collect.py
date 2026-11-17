@@ -86,7 +86,8 @@ def origin_main_age_s(repo_root: Path) -> float | None:
     """Seconds since the last fetch (FETCH_HEAD mtime), or ``None`` when the checkout was never fetched."""
     fetch_head = repo_root / ".git" / "FETCH_HEAD"
     if not fetch_head.is_file():
-        git_dir = _git(repo_root, "rev-parse", "--git-dir")
+        # Absolute: a relative --git-dir would resolve against this process's cwd, not repo_root.
+        git_dir = _git(repo_root, "rev-parse", "--absolute-git-dir")
         if git_dir:
             fetch_head = Path(git_dir) / "FETCH_HEAD"
     if not fetch_head.is_file():
