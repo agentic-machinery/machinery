@@ -178,6 +178,10 @@ first review of record, at most **one per PR lineage**.
 - **Non-record status:** it is never a review of record and never satisfies or waives the
   cross-family gate. No change to reviewer choice, risk floors, or round budgets.
 
+## Run the change
+
+Before the commit, and again before enqueue, run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that enqueue. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
+
 ## Stop and escalate
 
 Stop, and report `BLOCKED <reason>`, when: the proof cannot be obtained; the recorder's
