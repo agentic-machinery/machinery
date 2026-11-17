@@ -2020,16 +2020,26 @@ def _execute_invocation_once(
     transcript_path = (tool_config or {}).get("acp_transcript_path")
     transcript = None
     transcript_offsets = {"stdout": 0, "stderr": 0}
+    transcript_failed = False
+
+    def transcript_error(error: OSError) -> None:
+        nonlocal transcript_failed
+        if not transcript_failed:
+            print(f"ACP transcript persistence failed: {error}; provider execution and cleanup continue", file=sys.stderr)
+        transcript_failed = True
 
     def save_transcript() -> None:
-        if transcript is None or watchdog_state is None:
+        if transcript is None or watchdog_state is None or transcript_failed:
             return
-        for stream, lines in (("stdout", watchdog_state.stdout_lines), ("stderr", watchdog_state.stderr_lines)):
-            end = len(lines)
-            for line in lines[transcript_offsets[stream]:end]:
-                transcript.write(json.dumps({"stream": stream, "text": line}) + "\n")
-            transcript_offsets[stream] = end
-        transcript.flush()
+        try:
+            for stream, lines in (("stdout", watchdog_state.stdout_lines), ("stderr", watchdog_state.stderr_lines)):
+                end = len(lines)
+                for line in lines[transcript_offsets[stream]:end]:
+                    transcript.write(json.dumps({"stream": stream, "text": line}) + "\n")
+                transcript_offsets[stream] = end
+            transcript.flush()
+        except OSError as error:
+            transcript_error(error)
 
     # Mid-dispatch primary-tree tripwire (#6818): the spawn-time guard above
     # proved cwd isolation, but a child can still resolve absolute paths into
@@ -2384,7 +2394,10 @@ def _execute_invocation_once(
             try:
                 save_transcript()
             finally:
-                transcript.close()
+                try:
+                    transcript.close()
+                except OSError as error:
+                    transcript_error(error)
 
         if plan.output_file is not None and plan.output_file.exists() and _is_temp_file(plan.output_file):
             should_delete = False

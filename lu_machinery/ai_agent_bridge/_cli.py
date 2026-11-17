@@ -1868,7 +1868,7 @@ def _handle_acp_compat(args, target: str) -> None:
         raise SystemExit(
             f"ask-{target} reached the absolute hang guard ({exc.hard_timeout}s). "
             "Ordinary asks have no inactivity deadline; --no-timeout uses the same 24-hour hang guard. "
-            "Captured output is retained at the transcript path printed above."
+            "The transcript path is printed above; storage warnings report any capture failure."
         ) from exc
     except (AskForwardError, PlaneRootAnchorError) as exc:
         # #7172: notebook ask forward / retired-plane refusals are one-liners.
