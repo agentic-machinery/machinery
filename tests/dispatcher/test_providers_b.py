@@ -737,6 +737,16 @@ def test_claude_529_result_is_rate_limited_and_other_errors_stay_failed():
         assert (other.rate_limited, other.error) == (False, "claude: exited with status 1")
 
 
+def test_claude_too_deep_stream_line_is_refused_as_invalid_json():
+    """Defect class: a bare json.loads accepts a 600-deep stream line (CPython 3.12 and 3.14 alike)."""
+    deep_line = '{"type":"assistant","message":' + "[" * 599 + "]" * 599 + "}"
+    assert json.loads(deep_line)["type"] == "assistant"  # valid JSON: only its depth is refused
+    success = _claude_result(is_error=False, result="VERDICT: APPROVE")
+    assert load("claude").parse(success + "\n", "", 0, None).error is None
+    parsed = load("claude").parse(deep_line + "\n" + success + "\n", "", 0, None)
+    assert parsed.error == "claude: invalid JSON stream"
+
+
 _CLAUDE_529 = _claude_result(api_error_status=529, result="API Error: 529 Overloaded.")
 
 

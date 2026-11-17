@@ -4,11 +4,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 from lu_machinery.agent_runtime.adapters.claude import (
     ClaudeAdapter,
     _extract_stream_json_response,
+    _mcp_server_names,
 )
 
 
@@ -91,3 +94,13 @@ def test_claude_parse_response_multiturn_integration() -> None:
     assert result.ok is True
     assert result.session_id == "sess-123"
     assert result.response == f"{turn1_report}\n\n{turn2_followup}"
+
+
+def test_mcp_config_too_deep_is_refused_as_invalid_json(tmp_path: Path) -> None:
+    """Defect class: a bare json.loads accepts a 600-deep MCP config (CPython 3.12 and 3.14 alike)."""
+    config = tmp_path / "mcp.json"
+    config.write_text('{"mcpServers":{"sources":' + "[" * 598 + "]" * 598 + "}}", encoding="utf-8")
+    assert json.loads(config.read_text(encoding="utf-8"))["mcpServers"]  # valid JSON: only its depth is refused
+    with pytest.raises(ValueError, match=r"is invalid JSON: JSON nesting exceeds 512 levels") as refused:
+        _mcp_server_names(config)
+    assert isinstance(refused.value.__cause__, RecursionError)
