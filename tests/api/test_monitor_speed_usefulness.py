@@ -467,7 +467,7 @@ const now = Date.now();
 const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false);
 // The body says stale at 817 s while rewritten headers claim a young, fresh reading: the body wins.
 const milestones = {url: '/api/milestones', age: 40, bound: 420, state: 'fresh', data: {status: 'ok', age_seconds: 817, stale: true}};
-assert.match(line(milestones).text, /· STALE · source age 817s · bound 420s$/);
+assert.match(line(milestones).text, /· STALE · source age 817s · bound unknown$/);
 assert.equal(line(milestones).bad, true);
 // With every header stripped, the same body still judges itself.
 assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false}}).text, /· fresh · source age 12s · bound unknown$/);
@@ -499,11 +499,19 @@ assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_se
 assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
 // Populated but degraded data reads partial, and a body with no observation yet reads unavailable, whatever the header says.
 assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'ok'}, {status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound 900s$/);
+  repositories: [{status: 'ok'}, {status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound unknown$/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 0, stale: false,
   repositories: [{status: 'unknown'}, {status: 'unknown'}]}}).text, /· unavailable ·/);
 assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'pending', accounts: []}}).text, /· unavailable ·/);
+// Populated partial data is not unavailable, and a rewritten header bound never loosens a payload that owns its age.
+assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
+  repositories: [{status: 'partial', milestones: [{number: 1}]}, {status: 'unknown', milestones: []}]}}).text, /· partial data ·/);
+const oldLogins = {url: '/api/runtime/logins', age: 1200, bound: 9999, state: 'stale',
+  data: {state: 'ok', read_at: new Date(now - 1200000).toISOString()}};
+assert.match(line(oldLogins).text, /· freshness unknown · source age 1200s · bound unknown$/);
+assert.doesNotMatch(line({...oldLogins, url: '/api/git/pull-requests', data: {status: 'ok', repositories: [],
+  observed_at: new Date(now - 1200000).toISOString()}}).text, /· fresh ·/);
 // An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
 const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
 assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 12s · bound 900s$/);

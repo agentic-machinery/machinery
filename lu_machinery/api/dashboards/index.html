@@ -737,7 +737,9 @@ function payloadFreshness(url, data, receivedAt) {
   // "pending" is a body with no observation yet, so it is unavailable too; "partial" is populated but degraded.
   // A partial list in which no repository answered is a total outage, not partial data.
   const repos = Array.isArray(data.repositories) ? data.repositories : [];
-  const nobody = status === "partial" && repos.length > 0 && repos.every(repo => repo.status !== "ok");
+  // Usable data is a repository that answered, or one that still carries milestones (a page limit, a later failure).
+  const usable = repo => repo.status === "ok" || (Array.isArray(repo.milestones) && repo.milestones.length > 0);
+  const nobody = status === "partial" && repos.length > 0 && !repos.some(usable);
   const failed = status !== null && status !== "ok" && status !== "partial";
   return own && {...own, unavailable: failed || nobody, partial: status === "partial"};
 }
@@ -781,7 +783,8 @@ function freshnessOf(reading) {
   const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
   const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
   // The payload's own verdict (age, stale or failed) outranks the headers, even with no age to show.
-  if (own && (own.age !== null || own.flag !== null || own.unavailable)) return {...own, bound: own.bound ?? headerBound};
+  // The payload's bound is its own, null included: a header bound (which a gateway can rewrite) never loosens it.
+  if (own && (own.age !== null || own.flag !== null || own.unavailable)) return own;
   const flag = reading.state === "stale" ? "stale" : null;
   return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
 }
