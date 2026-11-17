@@ -11,8 +11,8 @@
 # passes. A product change that needs a newer machinery release is not a
 # reason to bump past that release's adoption.
 #
-# Pinned 2026-11-16: product main dc4d39e1, CI Gate success.
-commit dc4d39e121628005caf34614b0bcc1889f436fad
+# Pinned 2026-11-17: product main cdfdf658, CI Gate success.
+commit cdfdf658b1ab7171077bef6b57264926b588d055
 # Key consumer tests: product tests that run the installed lu-machinery at
 # runtime across the seams collection only imports.
 test tests/api/test_installed_monitor_drill_routes.py
