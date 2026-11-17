@@ -251,7 +251,9 @@ def shape_host_payload(
     collected_at: str,
 ) -> dict[str, Any]:
     primary = document["primary"]
-    stale_upstream = float(primary.get("origin_main_age_s", 0)) > STALE_UPSTREAM_THRESHOLD_S
+    upstream_age = primary.get("origin_main_age_s", 0)
+    # An unknown age (never fetched) cannot vouch for origin/main, so it counts as stale.
+    stale_upstream = upstream_age is None or float(upstream_age) > STALE_UPSTREAM_THRESHOLD_S
     services_out: list[dict[str, Any]] = []
     attention: list[str] = []
 
