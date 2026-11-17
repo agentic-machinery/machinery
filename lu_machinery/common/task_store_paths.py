@@ -14,7 +14,7 @@ from lu_machinery.common.repo_root import state_root
 # covers the historical inventory without retaining an unbounded number of runs.
 TASK_RECORD_CACHE_MAX_ENTRIES = 65_536
 _RecordStamp = tuple[int, int, int, int, int]
-_record_cache: OrderedDict[str, tuple[_RecordStamp, dict[str, Any] | None]] = OrderedDict()
+_record_cache: OrderedDict[str, tuple[_RecordStamp, dict[str, Any] | None | ValueError]] = OrderedDict()
 _record_cache_lock = threading.Lock()
 
 
@@ -23,7 +23,7 @@ def _record_stamp(info: os.stat_result) -> _RecordStamp:
 
 
 def read_cached_task_record(
-    path: Path, *, display_unknown_schema: bool = False, read_path: Path | None = None,
+    path: Path, *, tasks_dir: Path, display_unknown_schema: bool = False,
 ) -> dict[str, Any] | None:
     """Read a task once per file version across Monitor collectors.
 
@@ -31,13 +31,18 @@ def read_cached_task_record(
     version. ctime and inode also invalidate same-size rewrites and replacements
     whose mtime was restored. The lock coalesces concurrent misses. Returned
     records have a private top-level mapping; nested values are read-only to callers.
-    A caller that resolved containment passes ``read_path`` for the actual open
-    while ``path`` retains the filename used by task-identity classification.
+    Containment is checked here, beside the stat/open sinks, while ``path``
+    retains the filename used by task-identity classification. Structural
+    failures are memoized as ValueError messages; transient I/O stays retryable.
     """
     from lu_machinery.orchestration.task_record_store import parse_task_record
 
     path = Path(os.path.abspath(path))
-    source = path if read_path is None else read_path
+    root = os.path.realpath(tasks_dir)
+    fullpath = os.path.realpath(path)
+    if not fullpath.startswith(root + os.sep):
+        return None
+    source = Path(fullpath)
     key = os.fspath(path)
     with _record_cache_lock:
         stamp = _record_stamp(source.stat())
@@ -52,12 +57,18 @@ def read_cached_task_record(
                 opened_stamp = _record_stamp(os.fstat(handle.fileno()))
                 raw = handle.read()
                 finished_stamp = _record_stamp(os.fstat(handle.fileno()))
-            record = parse_task_record(path, raw, display_unknown_schema=True)
+            try:
+                record = parse_task_record(path, raw, display_unknown_schema=True)
+            except ValueError as exc:
+                # No traceback or JSONDecodeError.doc is retained in the cache.
+                record = ValueError(str(exc))
             # Do not memoize a concurrent rewrite under the earlier stat key.
             if stamp == opened_stamp == finished_stamp:
                 _record_cache[key] = (stamp, record)
                 while len(_record_cache) > TASK_RECORD_CACHE_MAX_ENTRIES:
                     _record_cache.popitem(last=False)
+        if isinstance(record, ValueError):
+            raise ValueError(str(record))
         if record is not None and record.get("schema_version", 1) > 2 and not display_unknown_schema:
             raise ValueError(f"task record {path} has invalid schema_version")
         return None if record is None else dict(record)

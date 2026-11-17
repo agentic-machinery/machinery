@@ -483,7 +483,7 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
         try:
             # Stat first: a write after the stat is newer than this read, so its own row outranks this one.
             mtime_ns = os.stat(path).st_mtime_ns
-            record = read_cached_task_record(path)
+            record = read_cached_task_record(path, tasks_dir=tasks_dir)
         except (OSError, ValueError, TypeError, RecursionError):
             counts["unreadable"] += 1
             continue

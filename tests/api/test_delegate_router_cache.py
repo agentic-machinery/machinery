@@ -40,7 +40,7 @@ def test_task_record_cache_rereads_changed_records(tmp_path, monkeypatch):
 
     def read():
         barrier.wait(timeout=10)
-        return task_store_paths.read_cached_task_record(path)["status"]
+        return task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)["status"]
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         assert list(pool.map(lambda _: read(), range(4))) == ["running"] * 4
@@ -51,19 +51,23 @@ def test_task_record_cache_rereads_changed_records(tmp_path, monkeypatch):
     before = path.stat()
     path.write_text('{"schema_version":2,"task_id":"cached","status":"failed!"}')
     os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-    assert task_store_paths.read_cached_task_record(path)["status"] == "failed!"
+    assert task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)["status"] == "failed!"
     assert parsed == [path, path]
 
     replacement = tmp_path / "replacement"
     replacement.write_text('{"schema_version":2,"task_id":"cached","status":"done"}')
     replacement.replace(path)
-    assert task_store_paths.read_cached_task_record(path)["status"] == "done"
+    assert task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)["status"] == "done"
     path.write_text('{"task_id":"cached","nested":' + '[' * 129 + '0' + ']' * 129 + '}')
+    before_invalid = len(parsed)
     with pytest.raises(ValueError):
-        task_store_paths.read_cached_task_record(path)
+        task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)
+    with pytest.raises(ValueError):
+        task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)
+    assert len(parsed) == before_invalid + 1
     path.unlink()
     with pytest.raises(FileNotFoundError):
-        task_store_paths.read_cached_task_record(path)
+        task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)
 
 
 def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path, monkeypatch):

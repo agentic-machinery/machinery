@@ -236,7 +236,7 @@ def scan_lane_health(
                 if stat.st_mtime < cutoff_timestamp:
                     continue
 
-                record = read_cached_task_record(entry)
+                record = read_cached_task_record(entry, tasks_dir=tasks_path)
 
                 if not isinstance(record, dict):
                     continue

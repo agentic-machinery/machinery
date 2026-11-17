@@ -152,13 +152,10 @@ def _read_task_state(
     raise_read_errors: bool = False,
 ) -> dict[str, Any] | None:
     """Read contained task JSON; scans can distinguish retryable I/O from invalid content."""
-    root = os.path.realpath(tasks_dir) if tasks_dir is not None else _tasks_root(ctx)
-    fullpath = os.path.realpath(path)
-    if not fullpath.startswith(root + os.sep):
-        return None
+    root = tasks_dir if tasks_dir is not None else _tasks_dir(ctx)
     for attempt in range(TASK_READ_RETRIES):
         try:
-            data = read_cached_task_record(Path(path), display_unknown_schema=True, read_path=Path(fullpath))
+            data = read_cached_task_record(Path(path), tasks_dir=root, display_unknown_schema=True)
         except (OSError, ValueError) as exc:
             if attempt + 1 == TASK_READ_RETRIES:
                 if raise_read_errors and isinstance(exc, OSError):

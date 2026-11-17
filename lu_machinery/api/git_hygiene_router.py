@@ -328,9 +328,9 @@ _running_ids_memo: dict[str, tuple[_TaskFileIdentity, tuple[str, ...]]] = {}
 _running_ids_lock = threading.Lock()
 
 
-def _running_ids_in_record(path: str, name: str) -> tuple[str, ...]:
+def _running_ids_in_record(path: str, name: str, tasks_dir: Path) -> tuple[str, ...]:
     try:
-        payload = read_cached_task_record(Path(path))
+        payload = read_cached_task_record(Path(path), tasks_dir=tasks_dir)
     except (OSError, ValueError):
         return ()
     if not isinstance(payload, dict) or payload.get("status") != "running":
@@ -364,7 +364,7 @@ def _active_task_ids(project_root: Path) -> set[str]:
             if cached is not None and cached[0] == identity:
                 ids = cached[1]
             else:
-                ids = _running_ids_in_record(entry.path, entry.name)
+                ids = _running_ids_in_record(entry.path, entry.name, tasks_dir)
                 _running_ids_memo[entry.path] = (identity, ids)
             active.update(ids)
         prefix = f"{tasks_dir}{os.sep}"
@@ -912,7 +912,7 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
     if path is None:
         return None
     try:
-        record = read_cached_task_record(path)
+        record = read_cached_task_record(path, tasks_dir=tasks_dir)
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:

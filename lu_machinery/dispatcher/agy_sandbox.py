@@ -1163,7 +1163,7 @@ class _GhBroker:
 
 class _Boundary:
     created_interpreter = False  # set by run() once it links the project venv into the worktree
-    gh = None
+    gh: _GhBroker | None = None
 
     def __init__(self, args: argparse.Namespace, receipt: dict):
         self.args, self.receipt = args, receipt

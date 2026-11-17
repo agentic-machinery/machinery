@@ -1908,7 +1908,7 @@ def _task_file_codex_account(tasks_dir: Path, task_id: str) -> object:
     if resolved.parent != root or not resolved.is_file():
         return None
     try:
-        payload = read_cached_task_record(resolved)
+        payload = read_cached_task_record(resolved, tasks_dir=tasks_dir)
     except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):
