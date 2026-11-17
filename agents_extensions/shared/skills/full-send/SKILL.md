@@ -63,7 +63,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    itself, a driver dispatches them (rules core P1). Fix the case that happened, not every case
    that could. Save command output (for example `dispatch.py wait` or `status`) only under
    `batch_state/tasks/<task-id>.artifacts/` or the session scratch, never as `*.json` beside the
-   task    records, which every ledger scan reads as records.
+   task records, which every ledger scan reads as records.
 
    **X-Verified commit line.** Every commit adds one declaration line in the same
    paragraph as `X-Agent`. It is not a Git trailer: `git log --format=%(trailers)`

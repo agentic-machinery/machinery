@@ -343,6 +343,7 @@ tests/ci/test_pytest_fanout_refusal.py
 tests/ci/test_semgrep_baseline.py
 tests/ci/test_test_env_sh.py
 tests/ci/test_test_source_cache.py
+tests/ci/test_verified_trailer.py
 tests/common/test_check_primary_integrity.py
 tests/common/test_conftest_task_store_guard.py
 tests/common/test_conftest_telemetry_guard.py
