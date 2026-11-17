@@ -180,6 +180,9 @@ class FakeGitHub:
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
 
+    def queue_removals(self, number: int) -> list[dict[str, Any]]:
+        return []
+
 
 def run(
     fake: FakeGitHub, path: Path, monkeypatch: pytest.MonkeyPatch, verdict: str = "APPROVED", *, apply: bool = True

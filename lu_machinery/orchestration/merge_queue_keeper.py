@@ -83,6 +83,11 @@ TEST_JOB_MARKER = "pytest"
 # A test node that failed merge_group runs of this many distinct PRs within 24 hours is
 # reported to the CTO as a defect.
 REPEATED_FAILURE_PRS = 2
+# Queue removals no merge_group run caused. Without a queue commit there is no run to read.
+NON_CI_REMOVALS = frozenset({"manual", "merge_conflict", "behind"})
+PASSED_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+FAILED_JOB_CONCLUSIONS = frozenset({"failure", "timed_out"})
+REMOVAL_PAGES = 20
 TEST_FAILED_NOTE = (
     " A failing test is never infrastructure (rules core P4), so the keeper does not re-enqueue this head:"
     " fix the test or the code, or delete the test with the reason in the commit and a note on its issue,"
@@ -182,7 +187,7 @@ class GitHub:
         self.queue_jump = False
 
     @publication_boundary(KeeperError)
-    def call(self, *args: str) -> str:
+    def call(self, *args: str | Request) -> str:
         try:
             result = request_run(
                 args[0] if len(args) == 1 and isinstance(args[0], Request) else ["gh", *args],
@@ -205,7 +210,7 @@ class GitHub:
         self.queue_jump = getattr(result, "queue_jump", False) is True
         return result.stdout
 
-    def json(self, *args: str) -> Any:
+    def json(self, *args: str | Request) -> Any:
         try:
             return json.loads(self.call(*args))
         except ValueError as exc:
@@ -323,6 +328,44 @@ class GitHub:
         if not isinstance(node, dict) or not isinstance(node.get("isInMergeQueue"), bool):
             raise KeeperError("queue membership unknown")
         return node["isInMergeQueue"]
+
+    def queue_removals(self, number: int) -> list[dict[str, Any]]:
+        """Every merge-queue removal of the PR: when, why, and the queue commit its runs tested.
+
+        A merge_group run's ``head_sha`` is that queue commit, which ties a removal to exactly
+        the runs behind it. Any unreadable or incomplete page raises.
+        """
+        removals: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(REMOVAL_PAGES):
+            fields: dict[str, Any] = {"number": number, **({"cursor": cursor} if cursor else {})}
+            data = self.json(Request("read-queue-removal", repo=self.repository, **fields))
+            try:
+                page = data["data"]["repository"]["pullRequest"]["removals"]
+                nodes, info = page["nodes"], page["pageInfo"]
+            except (KeyError, TypeError) as exc:
+                raise KeeperError("queue removal history unreadable") from exc
+            if (isinstance(data, dict) and data.get("errors")) or not isinstance(nodes, list) or not isinstance(info, dict):
+                raise KeeperError("queue removal history unreadable")
+            for node in nodes:
+                commit = node.get("beforeCommit") if isinstance(node, dict) else None
+                oid = commit.get("oid") if isinstance(commit, dict) else None
+                reason = node.get("reason") if isinstance(node, dict) else None
+                if (
+                    not isinstance(node, dict)
+                    or not isinstance(node.get("createdAt"), str)
+                    or not isinstance(reason, (str, type(None)))
+                    or (commit is not None and not (isinstance(oid, str) and SHA.fullmatch(oid)))
+                ):
+                    raise KeeperError("queue removal entry malformed")
+                removals.append({"at": node["createdAt"], "reason": (reason or "").lower(), "commit": oid})
+            more = info.get("hasNextPage")
+            if more is False:
+                return removals
+            cursor = info.get("endCursor")
+            if more is not True or not isinstance(cursor, str) or not cursor:
+                raise KeeperError("queue removal history incomplete")
+        raise KeeperError("queue removal history too long")
 
     def squash_blocked(self, number: int, head: str) -> bool | None:
         """Whether the squash text a queued PR will publish has a blocking finding; None when unverified.
@@ -501,10 +544,10 @@ def _reason(
     """Why the head may not enter the queue, or ``ready``.
 
     P4 allows one re-enqueue per unchanged approved head, and only after an ejection
-    with no failing test node (#12728). A second removal of the head is ``second-drop``;
-    ``ejection_hold`` names an ejection that failed a test (``test-failed``) or is not yet
-    diagnosed (``ejection-undiagnosed``); and a head the keeper already re-enqueued
-    (``requeued``) stays out even before that removal is counted.
+    whose queue removals show no failing test node (#12728). A second removal of the head is
+    ``second-drop``; ``ejection_hold`` names a removal with a failing test (``test-failed``)
+    or one whose evidence is still missing (``ejection-undiagnosed``); and a head the keeper
+    already re-enqueued (``requeued``) stays out even before that removal is counted.
     """
     if queue_enabled is not True:
         return "no-merge-queue" if queue_enabled is False else "queue-unknown"
@@ -528,6 +571,18 @@ def _reason(
     if requeued:
         return "requeue-spent"
     return "ready"
+
+
+def _ejection_gate(
+    gh: GitHub, number: int, since: str, drop_key: str, previous: dict[str, Any], observed: str
+) -> tuple[str | None, dict[str, Any]]:
+    """The ejection hold for a head about to enter the queue, recording a failing test for good."""
+    verdict, evidence = _ejection_evidence(gh, number, since)
+    if verdict == "clear":
+        return None, evidence
+    if verdict == "test-failed":
+        previous.setdefault("test_failures", {}).setdefault(drop_key, {**evidence, "at": observed})
+    return verdict, evidence
 
 
 def _gate_hold(gh: GitHub, number: int, head: str, previous: Mapping[str, Any]) -> str | None:
@@ -735,14 +790,118 @@ def _queue_cto_report(previous: dict[str, Any], kind: str, key: str, body: str) 
         outbox.append({"kind": kind, "key": key, "body": body})
 
 
-def _test_failure_hold(failed_jobs: Sequence[str], failed_tests: Mapping[str, list[str]]) -> list[str] | None:
-    """The failing test nodes of an ejection, or ``None`` when no test failed.
-
-    A failed pytest job is a failing test even when its log names no node (an empty list).
-    """
-    if not any(TEST_JOB_MARKER in job for job in failed_jobs) and not any(failed_tests.values()):
+def _stamp(value: Any) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
+    except ValueError:
         return None
-    return sorted({test for tests in failed_tests.values() for test in tests})
+    return when if when is not None and when.tzinfo is not None else None
+
+
+def _head_since(check_rows: Sequence[Any], head: str) -> str:
+    """When the head's first check run started; empty when unknown.
+
+    A head enters the queue only after its own checks ran, so every queue removal of this head
+    comes later, and a removal before it belonged to an earlier head.
+    """
+    stamps = [
+        row["started_at"] for row in check_rows
+        if isinstance(row, dict) and row.get("head_sha") == head and _stamp(row.get("started_at")) is not None
+    ]
+    return min(stamps, key=lambda stamp: _stamp(stamp) or datetime.max.replace(tzinfo=UTC)) if stamps else ""
+
+
+def _ejection_evidence(gh: GitHub, number: int, since: str) -> tuple[str, dict[str, Any]]:
+    """Whether the queue removals charged to a head prove that no test node failed (rules core P4).
+
+    Removals at or after ``since`` (the head's first check run, ``_head_since``; empty or
+    unreadable means every removal) are charged to the head, whether or not a pass saw it in
+    the queue; a removal whose time is unreadable is charged too.
+    Each removal's queue commit is the ``head_sha`` of the merge_group runs behind it. Every
+    failed job of every such run is read, whatever its name: a failing node, or a failed pytest
+    job, is a failing test. Returns ``("test-failed", {"runs", "tests"})``,
+    ``("ejection-undiagnosed", {"why"})`` while any evidence is missing (an unfinished run, an
+    unread page, a CI removal without a queue commit), or ``("clear", {"removed"})``.
+    """
+
+    def unknown(why: str) -> tuple[str, dict[str, Any]]:
+        return "ejection-undiagnosed", {"why": why}
+
+    start = _stamp(since)
+    try:
+        removals = [
+            item for item in gh.queue_removals(number)
+            if item["reason"] != "merged" and (start is None or (_stamp(item["at"]) or start) >= start)
+        ]
+    except KeeperError as exc:
+        return unknown(f"queue removal history unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
+    reasons: dict[str, set[str]] = defaultdict(set)
+    for item in removals:
+        if item["commit"] is not None:
+            reasons[item["commit"]].add(item["reason"])
+        elif item["reason"] not in NON_CI_REMOVALS:
+            return unknown("a queue removal names no queue commit")
+    if not reasons:
+        return "clear", {"removed": bool(removals)}
+    try:
+        rows = gh.runs(since if start is not None else gh.created_at(number))
+    except KeeperError as exc:
+        return unknown(f"merge_group runs unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
+    missing = ""
+    runs = []
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get("head_sha"), str):
+            missing = missing or "a merge_group run row is malformed"
+        elif row.get("event") == "merge_group" and row["head_sha"] in reasons:
+            runs.append(row)
+    if any(commit not in {row.get("head_sha") for row in runs} and not causes <= NON_CI_REMOVALS
+           for commit, causes in reasons.items()):
+        missing = "the merge_group run behind a queue removal is not visible yet"
+    failing_runs: set[int] = set()
+    tests: set[str] = set()
+    for row in runs:
+        run_id = row.get("id")
+        if type(run_id) is not int:
+            missing = missing or "a merge_group run has no id"
+            continue
+        if row.get("status") != "completed":
+            missing = missing or f"merge_group run {run_id} has not finished"
+            continue
+        if row.get("conclusion") in PASSED_RUN_CONCLUSIONS:
+            continue
+        try:
+            jobs = gh.jobs(run_id)
+        except KeeperError:
+            missing = missing or f"jobs of merge_group run {run_id} unread"
+            continue
+        for job in jobs:
+            if not isinstance(job, dict) or job.get("conclusion") not in FAILED_JOB_CONCLUSIONS:
+                continue
+            if type(job.get("id")) is not int:
+                missing = missing or f"a failed job of merge_group run {run_id} has no id"
+                continue
+            try:
+                nodes = gh.failed_tests(job["id"])
+            except KeeperError:
+                missing = missing or f"a failed job log of merge_group run {run_id} unread"
+                continue
+            if nodes or TEST_JOB_MARKER in str(job.get("name", "")):
+                failing_runs.add(run_id)
+                tests.update(nodes)
+    if failing_runs:
+        return "test-failed", {"runs": sorted(failing_runs), "tests": sorted(tests)}
+    if missing:
+        return unknown(missing)
+    return "clear", {"removed": True}
+
+
+def _evidence_detail(hold: str, evidence: Mapping[str, Any]) -> str:
+    """Display-safe comment detail for an ejection hold."""
+    if hold == "test-failed":
+        runs = ", ".join(map(str, evidence.get("runs", []))) or "unknown"
+        tests = ", ".join(code_span(test, DISPLAY_TEST_LIMIT) for test in evidence.get("tests", [])[:5])
+        return f" Failing merge_group runs: {runs}" + (f"; failing tests: {tests}." if tests else ".")
+    return f" {evidence.get('why', 'Queue removal evidence missing')}."
 
 
 def _queue_test_failure_report(
@@ -753,10 +912,11 @@ def _queue_test_failure_report(
     if not isinstance(tests, list):
         tests = []
     shown = ", ".join(code_span(str(test), DISPLAY_TEST_LIMIT) for test in tests[:5]) or "not named in the job log"
-    run_id = record.get("run_id")
+    runs = record.get("runs")
+    runs = ", ".join(str(run) for run in runs if type(run) is int) if isinstance(runs, list) else ""
     body = (
         f"Merge queue keeper: #{number} head {head[:12]} left the merge queue on a failing test "
-        f"(merge_group run {run_id if type(run_id) is int else 'unknown'}; failing tests: {shown}). "
+        f"(merge_group runs {runs or 'unknown'}; failing tests: {shown}). "
         "A failing test is never infrastructure (rules core P4), so the keeper will not re-enqueue this "
         "head. Fix the test or the code, or delete the test with the reason in the commit and a note on "
         "its issue; a new head starts a fresh count."
@@ -829,10 +989,10 @@ def _count_removals(gh: GitHub, number: int, head: str, previous: dict[str, Any]
 
 def _drop_detail(
     gh: GitHub, number: int, head: str, since: str
-) -> tuple[str, list[str], dict[str, list[str]], int | None, list[int], bool]:
+) -> tuple[str, list[str], dict[str, list[str]], int | None, list[int]]:
     """Return the diagnosis text, the failed job names and all failed tests per job, the latest
-    run ID, the IDs of every matching failed run, oldest first, and whether that run's job
-    list was read (``False`` only when a failing run was found but its jobs were not)."""
+    run ID, and the IDs of every matching failed run, oldest first. The PR comment and the
+    repeated-failure records use it; the re-enqueue decision uses ``_ejection_evidence``."""
     timeline = gh.timeline(number)
     events = [
         item
@@ -860,7 +1020,7 @@ def _drop_detail(
         and extract_pr_number(str(item.get("head_branch", ""))) == number
     ]
     if not runs:
-        return (" Queue removal confirmed; failing merge_group run unknown." if events else ""), [], {}, None, [], True
+        return (" Queue removal confirmed; failing merge_group run unknown." if events else ""), [], {}, None, []
     run = max(runs, key=lambda item: item.get("created_at", ""))
     if not isinstance(run.get("id"), int):
         raise KeeperError("matching merge_group run has no valid id")
@@ -869,10 +1029,7 @@ def _drop_detail(
     try:
         jobs = gh.jobs(run["id"])
     except KeeperError as exc:
-        return (
-            f"{run_detail}; failing job lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}.",
-            [], {}, run["id"], run_ids, False,
-        )
+        return f"{run_detail}; failing job lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}.", [], {}, run["id"], run_ids
     failed = sorted(
         {str(job["name"]) for job in jobs if job.get("conclusion") == "failure" and isinstance(job.get("name"), str)}
     )
@@ -889,7 +1046,7 @@ def _drop_detail(
                 tests[str(job["name"])] = nodes
         except KeeperError:
             pass  # Optional log enrichment must not hide the run/job diagnosis.
-    return detail, failed, tests, run["id"], run_ids, True
+    return detail, failed, tests, run["id"], run_ids
 
 
 def _repeated_failures(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
@@ -988,46 +1145,36 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         if queued is False and prior_drop_key in previous.get("undiagnosed", {}):
             try:
                 since = previous["undiagnosed"][prior_drop_key]
-                detail, failed_jobs, failed_tests, failed_run, run_ids, diagnosed = _drop_detail(gh, number, head, since)
-                if not diagnosed:
-                    # The failing run's jobs were not read: the removal stays undiagnosed, which
-                    # holds the head, and the next pass reads them again.
+                detail, failed_jobs, failed_tests, failed_run, run_ids = _drop_detail(gh, number, head, since)
+                seen_runs = previous.setdefault("ejections", {}).setdefault(prior_drop_key, [])
+                new_runs = [run_id for run_id in run_ids if run_id not in seen_runs]
+                seen_runs.extend(new_runs)
+                if failed_run is not None and failed_run not in new_runs:
+                    # An earlier removal's run, already diagnosed and recorded: it says
+                    # nothing about this removal, whose own run may still be running.
                     failed_jobs, failed_tests = [], {}
-                else:
-                    seen_runs = previous.setdefault("ejections", {}).setdefault(prior_drop_key, [])
-                    new_runs = [run_id for run_id in run_ids if run_id not in seen_runs]
-                    seen_runs.extend(new_runs)
-                    if failed_run is not None and failed_run not in new_runs:
-                        # An earlier removal's run, already diagnosed and recorded: it says
-                        # nothing about this removal, whose own run may still be running.
-                        failed_jobs, failed_tests = [], {}
-                    nodes = _test_failure_hold(failed_jobs, failed_tests)
-                    if nodes is not None:
-                        previous.setdefault("test_failures", {}).setdefault(
-                            prior_drop_key, {"run_id": failed_run, "tests": nodes, "at": observed}
-                        )
-                    if detail:
-                        previous["undiagnosed"].pop(prior_drop_key)
-                    else:
-                        detail = " Queue removal diagnosis unknown."
+                if detail:
+                    previous["undiagnosed"].pop(prior_drop_key)
+                elif not detail:
+                    detail = " Queue removal diagnosis unknown."
             except KeeperError as exc:
                 detail = f" Queue removal diagnosis lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}."
         # The keeper's one re-enqueue of this head is spent; a queued head is left alone.
         requeued = queued is not True and drop_key in previous.get("keeper_requeues", {})
-        # P4: only an ejection with no failing test node may be re-enqueued, so a head waits
-        # out of the queue until its removal is diagnosed, and a failing test holds it for good.
-        ejection_hold: str | None = None
-        if queued is not True:
-            if drop_key in previous.get("test_failures", {}):
-                ejection_hold = "test-failed"
-            elif drop_key in previous.get("undiagnosed", {}):
-                ejection_hold = "ejection-undiagnosed"
+        since = _head_since(check_rows, head)
+        # P4: a head is re-enqueued only when its queue removals prove no failing test node; a
+        # failing test holds it for good, and missing evidence holds it until a later pass.
+        ejection_hold = "test-failed" if queued is not True and drop_key in previous.get("test_failures", {}) else None
+        evidence: dict[str, Any] | None = None
         reason = _reason(pr, verdict, checks, drops, queue_enabled, requeued, ejection_hold)
         if reason == "ready" and queued is not True and not armed:
             try:
                 reason = _gate_hold(gh, number, head, previous) or reason
             except KeeperError:
                 reason = "requeue-unknown"
+        if reason == "ready" and queued is not True and not armed:
+            ejection_hold, evidence = _ejection_gate(gh, number, since, drop_key, previous, observed)
+            reason = ejection_hold or reason
         rollup = project_check_runs(check_rows)
         report = classify_pr(
             {**pr, "statusCheckRollup": rollup},
@@ -1114,6 +1261,9 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 )
                 if reason == "ready" and queued is not True and not armed:
                     reason = _gate_hold(gh, number, head, previous) or reason
+                if reason == "ready" and queued is not True and not armed and evidence is None:
+                    ejection_hold, evidence = _ejection_gate(gh, number, since, drop_key, previous, observed)
+                    reason = ejection_hold or reason
             if queued is True or armed:
                 fresh = bool(
                     current
@@ -1166,7 +1316,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 else:
                     lines.append(f"#{number} armed: requirement unmet")
             elif reason == "ready":
-                if drops >= 1 or drop_key in previous.get("ejections", {}):
+                if drops >= 1 or drop_key in previous.get("ejections", {}) or (evidence or {}).get("removed"):
                     # Spend the one re-enqueue on disk before the mutation, so neither a
                     # later tick nor a restart after a crash can enqueue this head again.
                     previous.setdefault("keeper_requeues", {})[drop_key] = observed
@@ -1213,6 +1363,8 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 and comment_safe
                 and (_ever_approved(comments, login) or dropped)
             ):
+                if reason in {"test-failed", "ejection-undiagnosed"} and evidence is not None and not detail:
+                    detail = _evidence_detail(reason, evidence)
                 _comment_once(
                     gh, number, head, reason, comments, login, detail + (TEST_FAILED_NOTE if reason == "test-failed" else "")
                 )
@@ -1278,7 +1430,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Guard and replenish approved, green pull requests in configured merge queues.\nUse --report to inspect and --apply only for authorized local scheduling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states; --apply also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nAn ejected head is re-enqueued at most once (P4), and only when no test failed: a failing test holds it and is reported\nto the CTO inbox, as is a test failing on two PRs within 24 hours; a second removal holds it and alerts the PR and the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
+        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states; --apply also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nAn ejected head is re-enqueued at most once (P4), and only after every merge_group run behind its queue removals is read\nwith no failing test node: a failing test holds it for good and is reported to the CTO inbox (so is a test failing on two\nPRs within 24 hours), missing evidence holds it until a later pass, and a second removal holds it and alerts the PR and the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--report", action="store_true", help="Read-only report (default).")

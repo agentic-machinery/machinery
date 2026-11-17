@@ -109,6 +109,8 @@ class FakeGitHub:
         self.events: list[dict[str, Any]] = []
         self.run_rows: list[dict[str, Any]] = []
         self.job_rows: list[dict[str, Any]] = []
+        self.removals: list[dict[str, Any]] = []
+        self.job_tests: dict[int, list[str]] = {}
         self.squash: bool | None = False
         self.files = ["scripts/example.py"]
 
@@ -177,6 +179,12 @@ class FakeGitHub:
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
+
+    def queue_removals(self, number: int) -> list[dict[str, Any]]:
+        return list(self.removals)
+
+    def failed_tests(self, job_id: int) -> list[str]:
+        return list(self.job_tests.get(job_id, []))
 
 
 def run(
@@ -1107,59 +1115,49 @@ def test_fresh_rejection_overrides_later_same_head_approval_in_keeper(tmp_path: 
     assert "enqueue" not in mutations(fake)
 
 
-@pytest.mark.parametrize("granted", [False, True])
-@pytest.mark.parametrize("failed_jobs", [["pytest"], []])
-def test_red_merge_group_drop_holds_a_failing_test_and_requeues_infrastructure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, granted: bool, failed_jobs: list[str]
-) -> None:
-    """P4: an ejection on a failing test is never re-enqueued; one with no failed job (infrastructure) is."""
+QUEUE_COMMIT = "c" * 40
+
+
+def _removed(fake: FakeGitHub, jobs: list[dict[str, Any]], *, at: str = "2026-09-23T00:00:01Z", **run: Any) -> None:
+    """One failed_checks removal of PR 42 whose queue commit's merge_group run 123 had these jobs."""
+    fake.removals = [{"at": at, "reason": "failed_checks", "commit": QUEUE_COMMIT}]
+    fake.run_rows = [{
+        "id": 123, "event": "merge_group", "status": "completed", "conclusion": "failure", "head_sha": QUEUE_COMMIT,
+        "created_at": "2026-09-23T00:00:00Z", "head_branch": "gh-readonly-queue/main/pr-42-deadbeef", **run,
+    }]
+    fake.job_rows = jobs
+
+
+@pytest.mark.parametrize(
+    ("jobs", "nodes", "tests"),
+    [
+        ([{"id": 7, "name": "pytest", "conclusion": "failure"}], {}, []),
+        ([{"id": 7, "name": "Installed wheel", "conclusion": "failure"}], {7: ["tests/a.py::test_a"]}, ["tests/a.py::test_a"]),
+        ([{"id": 7, "name": "pytest (3)", "conclusion": "timed_out"}], {}, []),
+    ],
+    ids=["unnamed-pytest-failure", "node-in-a-non-pytest-job", "pytest-timeout"],
+)
+def test_ejection_on_a_failing_test_is_never_requeued(tmp_path, monkeypatch, jobs, nodes, tests) -> None:
+    """P4: a failing test node, whatever job ran it, holds the head; nothing re-enqueues it.
+
+    The PR was never seen in the queue (an unsampled ejection), so only the removal history shows it.
+    """
     fake = FakeGitHub()
-    fake.events = [{"id": 987, "event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
-    fake.run_rows = [
-        {
-            "id": 123,
-            "event": "merge_group",
-            "conclusion": "failure",
-            "created_at": "2026-09-22T23:00:02Z",
-            "updated_at": "2026-09-23T00:00:02Z",
-            "head_branch": "gh-readonly-queue/main/pr-42-deadbeef",
-            "html_url": "https://github.com/example/runs/123",
-        }
-    ]
-    fake.job_rows = [{"name": job, "conclusion": "failure"} for job in failed_jobs]
-    fake.job_rows.append({"name": "ruff", "conclusion": "success"})
+    _removed(fake, jobs)
+    fake.job_tests = nodes
     path = tmp_path / "state.json"
-    path.write_text(json.dumps({"queued": {"42": HEAD_A}, "drops": {}, "observed": "2026-09-23T00:00:00Z"}))
-    if granted:
-        lines, failed = gated(fake, path, monkeypatch, _gate(tmp_path, {f"42:{HEAD_A}": {"decision": "grant"}}))
-    else:
-        lines, failed = run(fake, path, monkeypatch)
-    assert not failed
-    comments = [body for action, body in fake.actions if action == "comment"]
-    state = json.loads(path.read_text())
-    assert state["drops"][f"42:{HEAD_A}"] == 1
-    assert "drop_events" not in state
-    if not failed_jobs:
-        assert state["failures"] == [] and not state.get("test_failures")
-        assert "enqueue" in mutations(fake)
-        assert "reason=ready" in lines[0]
-        assert comments and "failing jobs: none reported" in comments[0]
-        assert "#42 enqueued" in lines
-        assert "was previously removed from the queue." in comments[0]
-        assert all("was not queued" not in body for body in comments)
-        assert _defect_reports(path, "queue-test-failure") == []
-        return
-    assert state["failures"][0]["job"] == "pytest"
-    assert state["test_failures"][f"42:{HEAD_A}"]["run_id"] == 123
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed and "reason=test-failed" in lines[0], lines
     assert "enqueue" not in mutations(fake)
-    assert "reason=test-failed" in lines[0]
-    assert "#42 test failure reported to the CTO" in lines
-    [comment] = comments
-    assert "was not queued because test-failed." in comment and "failing jobs: `pytest`" in comment
+    state = json.loads(path.read_text())
+    assert {key: state["test_failures"][f"42:{HEAD_A}"][key] for key in ("runs", "tests")} == {"runs": [123], "tests": tests}
+    [comment] = [body for kind, body in fake.actions if kind == "comment"]
+    assert "was not queued because test-failed." in comment and "Failing merge_group runs: 123" in comment
     assert keeper.TEST_FAILED_NOTE in comment
     [report] = _defect_reports(path, "queue-test-failure")
-    assert "#42" in report and "merge_group run 123" in report and "will not re-enqueue this head" in report
-    # Later passes keep the head out and neither comment nor report again.
+    assert "#42" in report and "merge_group runs 123" in report and "will not re-enqueue this head" in report
+    # Later passes keep it out with no new reads, comments or reports.
+    fake.removals = []
     for _ in range(2):
         lines, failed = run(fake, path, monkeypatch)
         assert not failed and "reason=test-failed" in lines[0]
@@ -1167,6 +1165,71 @@ def test_red_merge_group_drop_holds_a_failing_test_and_requeues_infrastructure(
     assert len([kind for kind, _ in fake.actions if kind == "comment"]) == 1
     assert len(_defect_reports(path, "queue-test-failure")) == 1
 
+
+def test_every_run_of_the_removal_is_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A later non-test failure for the same queue commit cannot hide an earlier failing test."""
+    fake = FakeGitHub()
+    _removed(fake, [])
+    fake.run_rows.append({**fake.run_rows[0], "id": 124, "created_at": "2026-09-23T00:00:05Z"})
+    per_run = {123: [{"id": 7, "name": "pytest (1)", "conclusion": "failure"}],
+               124: [{"id": 8, "name": "Ruff", "conclusion": "failure"}]}
+    monkeypatch.setattr(fake, "jobs", lambda run_id: per_run[run_id])
+    fake.job_tests = {7: ["tests/a.py::test_a"]}
+    lines, _ = run(fake, tmp_path / "state.json", monkeypatch)
+    assert "reason=test-failed" in lines[0] and "enqueue" not in mutations(fake)
+
+
+@pytest.mark.parametrize("cause", ["empty-job-list", "non-test-job", "manual-without-commit", "earlier-head"])
+def test_ejection_with_no_failing_test_node_is_requeued_once(tmp_path, monkeypatch, cause) -> None:
+    """Infrastructure (no test node failed) keeps the one re-enqueue per head (rules core P4)."""
+    fake = FakeGitHub()
+    if cause == "empty-job-list":
+        _removed(fake, [])
+    elif cause == "non-test-job":
+        _removed(fake, [{"id": 8, "name": "Ruff", "conclusion": "failure"}, {"id": 9, "name": "pytest", "conclusion": "success"}])
+    elif cause == "manual-without-commit":
+        fake.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "manual", "commit": None}]
+    else:  # A failing test of a head pushed before this head's first check run.
+        _removed(fake, [{"id": 7, "name": "pytest", "conclusion": "failure"}], at="2026-09-22T23:59:59Z")
+    path = tmp_path / "state.json"
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed and "reason=ready" in lines[0] and "#42 enqueued" in lines
+    state = json.loads(path.read_text())
+    assert not state.get("test_failures")
+    assert (f"42:{HEAD_A}" in state.get("keeper_requeues", {})) is (cause != "earlier-head")
+
+
+@pytest.mark.parametrize(
+    "missing", ["history-unread", "run-unfinished", "run-not-visible", "jobs-unread", "log-unread", "no-queue-commit"]
+)
+def test_missing_removal_evidence_holds_until_a_later_pass_reads_it(tmp_path, monkeypatch, missing) -> None:
+    """A removal is never cleared on absent evidence; the next complete read decides."""
+    fake = FakeGitHub()
+    _removed(fake, [{"id": 8, "name": "Ruff", "conclusion": "failure"}])
+    unavailable = keeper.KeeperError("unavailable")
+    if missing == "history-unread":
+        monkeypatch.setattr(fake, "queue_removals", lambda number: (_ for _ in ()).throw(unavailable))
+    elif missing == "run-unfinished":
+        fake.run_rows[0].update(status="in_progress", conclusion=None)
+    elif missing == "run-not-visible":
+        fake.run_rows = []
+    elif missing == "jobs-unread":
+        monkeypatch.setattr(fake, "jobs", lambda run_id: (_ for _ in ()).throw(unavailable))
+    elif missing == "log-unread":
+        monkeypatch.setattr(fake, "failed_tests", lambda job_id: (_ for _ in ()).throw(unavailable))
+    else:
+        fake.removals[0]["commit"] = None
+    path = tmp_path / "state.json"
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed and "reason=ejection-undiagnosed" in lines[0], lines
+    assert "enqueue" not in mutations(fake)
+    [comment] = [body for kind, body in fake.actions if kind == "comment"]
+    assert "was not queued because ejection-undiagnosed." in comment
+    fixed = FakeGitHub()
+    _removed(fixed, [{"id": 8, "name": "Ruff", "conclusion": "failure"}])
+    lines, failed = run(fixed, path, monkeypatch)
+    assert not failed and "reason=ready" in lines[0]
+    assert mutations(fixed).count("enqueue") == 1
 
 
 def test_runs_preserves_timestamp_and_paginates_at_filtered_url(tmp_path, monkeypatch) -> None:
@@ -1255,9 +1318,9 @@ def test_drop_lookup_error_is_not_reported_as_unknown(tmp_path, monkeypatch) -> 
 def test_drop_without_matching_run_is_unknown() -> None:
     fake = FakeGitHub()
     fake.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
-    detail, jobs, tests, run_id, _run_ids, diagnosed = keeper._drop_detail(fake, 42, HEAD_A, "2026-09-23T00:00:00Z")
+    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(fake, 42, HEAD_A, "2026-09-23T00:00:00Z")
     assert "failing merge_group run unknown" in detail and jobs == [] and tests == {}
-    assert run_id is None and diagnosed
+    assert run_id is None
 
 
 @pytest.mark.parametrize("entry_available", [False, True])
@@ -1287,11 +1350,11 @@ def test_drop_finds_run_created_before_last_queue_observation(monkeypatch, entry
 
     monkeypatch.setattr(fake, "runs", runs)
     fake.job_rows = [{"name": "pytest", "conclusion": "failure"}]
-    detail, jobs, tests, run_id, _run_ids, diagnosed = keeper._drop_detail(fake, 42, HEAD_A, observed)
+    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(fake, 42, HEAD_A, observed)
     assert windows == [entered if entry_available else fake.created_at(42)]
     assert "Failing merge_group: 123; failing jobs: `pytest`" in detail
     assert jobs == ["pytest"] and tests == {}
-    assert run_id == 123 and diagnosed
+    assert run_id == 123
 
 
 @pytest.mark.parametrize("payload,valid", [
@@ -1377,8 +1440,7 @@ def test_drop_detail_keeps_run_and_jobs_with_optional_first_failed_test(tmp_path
         return "2026-10-10T01:00:00Z FAILED tests/test_lint_tmp_paths.py::test_paths - AssertionError\nFAILED tests/other.py::test_other - error"
 
     monkeypatch.setattr(client, "call", call)
-    detail, jobs, tests, run_id, _run_ids, diagnosed = keeper._drop_detail(client, 10256, HEAD_A, "2026-10-10T00:00:00Z")
-    assert diagnosed  # The job list was read; a missing log only drops the optional node names.
+    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(client, 10256, HEAD_A, "2026-10-10T00:00:00Z")
     assert "https://github.com/example/runs/123" in detail and "pytest (N)" in detail
     assert jobs == ["CI Gate", "pytest (N)"]
     assert ("First FAILED test: `tests/test_lint_tmp_paths.py::test_paths`" in detail) is not log_error
@@ -1588,33 +1650,18 @@ def test_obsolete_used_grant_does_not_block_enqueue(tmp_path, monkeypatch, drops
     assert "enqueue" in mutations(fake)
 
 
-@pytest.mark.parametrize("diagnosis", ["KeeperError", "empty-timeline", "jobs-unread"])
+@pytest.mark.parametrize("diagnosis", ["KeeperError", "empty-timeline"])
+@pytest.mark.parametrize("granted", [False, True])
 @pytest.mark.parametrize("apply", [False, True])
-def test_undiagnosed_removal_holds_the_head_until_diagnosed(tmp_path, monkeypatch, diagnosis, apply):
-    """P4: a head is re-enqueued only once its removal is shown to have no failing test node."""
+def test_undiagnosed_removal_does_not_block_approved_green_head(tmp_path, monkeypatch, diagnosis, granted, apply):
     path = tmp_path / "state.json"
-    _dropped_state(path, drops={}, undiagnosed={f"42:{HEAD_A}": "2026-09-23T00:00:00Z"})
-    removal = {"id": 1, "event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}
+    _dropped_state(path, undiagnosed={f"42:{HEAD_A}": "2026-09-23T00:00:00Z"})
     fake = FakeGitHub()
     if diagnosis == "KeeperError":
         monkeypatch.setattr(fake, "timeline", lambda number: (_ for _ in ()).throw(keeper.KeeperError("unavailable")))
-    elif diagnosis == "jobs-unread":
-        fake.events = [removal]
-        _conclude(fake, 111)
-        monkeypatch.setattr(fake, "jobs", lambda run_id: (_ for _ in ()).throw(keeper.KeeperError("unavailable")))
     lines, failed = run(fake, path, monkeypatch, apply=apply)
-    assert not failed and "reason=ejection-undiagnosed" in lines[0]
-    assert "enqueue" not in mutations(fake)
-    if not apply:
-        return
-    assert f"42:{HEAD_A}" in json.loads(path.read_text())["undiagnosed"]
-    # The next pass reads an ejection with no failed job, which is infrastructure: one re-enqueue.
-    fake = FakeGitHub()
-    fake.events = [removal]
-    _conclude(fake, 111)
-    lines, failed = run(fake, path, monkeypatch)
     assert not failed and "reason=ready" in lines[0]
-    assert mutations(fake).count("enqueue") == 1
+    assert ("enqueue" in mutations(fake)) is apply
 
 
 def test_undiagnosed_old_head_does_not_hold_new_head(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1756,17 +1803,20 @@ def test_keeper_timer_runs_every_minute() -> None:
 def _ejected(fake: FakeGitHub, path: Path, jobs: list[str], **state: Any) -> None:
     since = "2026-09-23T00:00:00Z"
     fake.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
+    fake.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "failed_checks", "commit": QUEUE_COMMIT}]
     fake.run_rows = [
         {
             "id": 321,
             "event": "merge_group",
+            "status": "completed",
             "conclusion": "failure",
+            "head_sha": QUEUE_COMMIT,
             "created_at": "2026-09-23T00:00:02Z",
             "head_branch": "gh-readonly-queue/main/pr-42-deadbeef",
             "html_url": "https://github.com/example/runs/321",
         }
     ]
-    fake.job_rows = [{"name": job, "conclusion": "failure"} for job in jobs]
+    fake.job_rows = [{"id": 900 + index, "name": job, "conclusion": "failure"} for index, job in enumerate(jobs)]
     path.write_text(json.dumps({"queued": {"42": HEAD_A}, "drops": {}, "observed": since, **state}))
 
 
@@ -2370,3 +2420,41 @@ def test_report_shows_node_records_without_writes(tmp_path, monkeypatch):
     assert "repeated test failure: tests/a.py::test_one; PRs=41,42; runs=101,102" in lines
     assert mutations(fake) == [] and path.read_bytes() == before
 
+
+
+def _removal_page(nodes: Any, more: Any = False, cursor: Any = None) -> dict[str, Any]:
+    return {"data": {"repository": {"pullRequest": {"removals": {
+        "nodes": nodes, "pageInfo": {"hasNextPage": more, "endCursor": cursor}}}}}}
+
+
+def test_queue_removals_pages_and_keeps_reason_and_queue_commit(tmp_path, monkeypatch) -> None:
+    client = keeper.GitHub(tmp_path, "unit/public")
+    pages = iter([
+        _removal_page([{"createdAt": "2026-09-23T00:00:01Z", "reason": "FAILED_CHECKS", "beforeCommit": {"oid": QUEUE_COMMIT}}],
+                      True, "next"),
+        _removal_page([{"createdAt": "2026-09-23T00:00:02Z", "reason": None, "beforeCommit": None}]),
+    ])
+    requests = []
+    monkeypatch.setattr(client, "json", lambda request: requests.append(request.fields) or next(pages))
+    assert client.queue_removals(42) == [
+        {"at": "2026-09-23T00:00:01Z", "reason": "failed_checks", "commit": QUEUE_COMMIT},
+        {"at": "2026-09-23T00:00:02Z", "reason": "", "commit": None},
+    ]
+    assert [fields.get("cursor") for fields in requests] == [None, "next"]
+
+
+@pytest.mark.parametrize("page", [
+    {"errors": [{"message": "x"}], **_removal_page([])},
+    {"data": None},
+    _removal_page(None),
+    _removal_page([{"createdAt": 5}]),
+    _removal_page([{"createdAt": "2026-09-23T00:00:01Z", "beforeCommit": {"oid": "short"}}]),
+    _removal_page([], more=None),
+    _removal_page([], more=True, cursor=""),
+])
+def test_queue_removals_refuses_unreadable_history(tmp_path, monkeypatch, page) -> None:
+    """Unreadable removal history is never read as "no removals"; the gate then holds the head."""
+    client = keeper.GitHub(tmp_path, "unit/public")
+    monkeypatch.setattr(client, "json", lambda request: page)
+    with pytest.raises(keeper.KeeperError, match="queue removal"):
+        client.queue_removals(42)

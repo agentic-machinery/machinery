@@ -148,6 +148,7 @@ class Subject(keeper.GitHub):
         self.events: list[dict[str, Any]] = []
         self.run_rows: list[dict[str, Any]] = []
         self.job_rows: list[dict[str, Any]] = []
+        self.removals: list[dict[str, Any]] = []
 
     def branch_names(self) -> set[str]:
         return {"main"}
@@ -182,6 +183,9 @@ class Subject(keeper.GitHub):
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
 
+    def queue_removals(self, number: int) -> list[dict[str, Any]]:
+        return list(self.removals)
+
     def comment(self, number: int, body: str) -> None:
         super().comment(number, body)
         self.comment_rows.append({"body": body, "user": {"login": "driver"}})
@@ -207,17 +211,20 @@ def transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_opsec, 
 def ejected(subject: Subject, path: Path, jobs: list[str], **state: Any) -> None:
     """PR 42 was queued at ``HEAD`` on the last run and has since left the queue after a failed merge_group run."""
     subject.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
+    subject.removals = [{"at": "2026-09-23T00:00:01Z", "reason": "failed_checks", "commit": "c" * 40}]
     subject.run_rows = [
         {
             "id": 321,
             "event": "merge_group",
+            "status": "completed",
+            "head_sha": "c" * 40,
             "conclusion": "failure",
             "created_at": "2026-09-23T00:00:02Z",
             "head_branch": "gh-readonly-queue/main/pr-42-deadbeef",
             "html_url": RUN_URL,
         }
     ]
-    subject.job_rows = [{"name": job, "conclusion": "failure"} for job in jobs]
+    subject.job_rows = [{"id": 900 + index, "name": job, "conclusion": "failure"} for index, job in enumerate(jobs)]
     path.write_text(json.dumps({"queued": {"42": HEAD}, "drops": {}, "observed": "2026-09-23T00:00:00Z", **state}))
 
 
