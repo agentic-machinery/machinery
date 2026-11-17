@@ -80,6 +80,10 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
          "receivers": [{"name": "leak-receiver"}]},
         {"labels": {"alertname": "PROpenOver60m", "severity": "warning"}, "annotations": {},
          "startsAt": "2030-01-03T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "SubscriptionPoolRunsOutBeforeReset", "severity": "warning", "pool": "claude:b"}, "annotations": {},
+         "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "MonitorApiSlowRoute", "severity": "warning", "route": "/api/orient"}, "annotations": {},
+         "startsAt": "2030-01-05T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "ForeignAlert", "severity": "warning"}, "annotations": {},
          "startsAt": "2030-01-01T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "Watchdog", "severity": "none"}, "annotations": {},
@@ -114,6 +118,7 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert body["status"] == "ok" and body["heartbeat"] is True
     assert [row["alertname"] for row in body["alerts"]] == [
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
+        "SubscriptionPoolRunsOutBeforeReset", "MonitorApiSlowRoute",
     ]
     assert all(set(row) == {"alertname", "severity", "starts_at"} for row in body["alerts"])
     assert "leak" not in response.text and "ForeignAlert" not in response.text
