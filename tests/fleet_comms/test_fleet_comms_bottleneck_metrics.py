@@ -639,3 +639,89 @@ def test_task_record_size_cap_boundary(
     assert kinds == ([expected] if expected else [])
     assert payload["by_stream_epic"].get("4707", {}).get("dispatch", {}).get("n", 0) == (0 if expected else 1)
     _assert_aggregate_invariant(payload, 1)
+
+
+def _counting_reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    reads: list[str] = []
+    real = efficiency_metrics._read_task_record
+
+    def counting(path: Path) -> tuple[object, str | None]:
+        reads.append(path.name)
+        return real(path)
+
+    monkeypatch.setattr(efficiency_metrics, "_read_task_record", counting)
+    return reads
+
+
+def test_rescan_rereads_only_changed_records_never_serving_a_stale_sample(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: the sample memo serves a rewritten record's old fields, or re-parses unchanged ones.
+
+    An unchanged record is not read again; an atomic replace, an in-place rewrite
+    and a deletion each show up in the very next scan.
+    """
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    plane_db = tmp_path / "plane.sqlite3"
+    _plane_db(plane_db, with_identity=False)
+    started = NOW - timedelta(minutes=10)
+    _write_task(tasks_dir, "a", started=started, finished=None)
+    _write_task(tasks_dir, "b", started=started, finished=None)
+    _write_task(tasks_dir, "c", started=started, finished=NOW - timedelta(minutes=5))
+    # Every file is past the racy window, so the memo may keep it.
+    monkeypatch.setattr(efficiency_metrics, "_wall_clock_ns", lambda: os.stat(tasks_dir / "a.json").st_mtime_ns + 3600 * 10**9)
+    reads = _counting_reads(monkeypatch)
+
+    def dispatch_span() -> dict[str, object]:
+        payload = collect_stream_bottleneck_metrics(tasks_dir=tasks_dir, plane_db=plane_db, now=NOW, github_lookup=_merged_at)
+        return payload["by_stream_epic"]["4707"]["dispatch"]
+
+    assert dispatch_span()["n"] == 1
+    assert sorted(reads) == ["a.json", "b.json", "c.json"]
+
+    reads.clear()
+    assert dispatch_span()["n"] == 1
+    assert reads == []
+
+    # Atomic replace (new inode) and an in-place rewrite (same inode) both finish a dispatch.
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    _write_task(staged, "a", started=started, finished=NOW - timedelta(minutes=1))
+    os.replace(staged / "a.json", tasks_dir / "a.json")
+    _write_task(tasks_dir, "b", started=started, finished=NOW - timedelta(minutes=2))
+    reads.clear()
+    assert dispatch_span()["n"] == 3
+    assert sorted(reads) == ["a.json", "b.json"]
+
+    (tasks_dir / "c.json").unlink()
+    reads.clear()
+    assert dispatch_span()["n"] == 2
+    assert reads == []
+    assert sorted(Path(name).name for name in efficiency_metrics._dispatch_sample_cache[os.fspath(tasks_dir)]) == [
+        "a.json",
+        "b.json",
+    ]
+
+
+def test_rescan_never_memoizes_a_record_inside_the_racy_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: a same-size rewrite inside one timestamp tick keeps its stat identity and goes stale.
+
+    A record modified within the racy window of the scan is read again on the next
+    scan, even when its stat identity is unchanged.
+    """
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    plane_db = tmp_path / "plane.sqlite3"
+    _plane_db(plane_db, with_identity=False)
+    _write_task(tasks_dir, "a", started=NOW - timedelta(minutes=10), finished=None)
+    monkeypatch.setattr(efficiency_metrics, "_wall_clock_ns", lambda: os.stat(tasks_dir / "a.json").st_mtime_ns)
+    reads = _counting_reads(monkeypatch)
+
+    for _ in range(2):
+        collect_stream_bottleneck_metrics(tasks_dir=tasks_dir, plane_db=plane_db, now=NOW, github_lookup=_merged_at)
+
+    assert reads == ["a.json", "a.json"]
+    assert efficiency_metrics._dispatch_sample_cache[os.fspath(tasks_dir)] == {}

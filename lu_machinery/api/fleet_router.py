@@ -8,6 +8,7 @@ initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -28,10 +29,10 @@ from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fiel
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import authority_collector_payload, read_failure_code
-from lu_machinery.fleet_comms import message_plane
+from lu_machinery.fleet_comms import cold_start_board, message_plane
 from lu_machinery.fleet_comms.agent_success_metrics import collect_agent_success
 from lu_machinery.fleet_comms.cli import fleet_help_payload, fleet_status_payload
-from lu_machinery.fleet_comms.cold_start_board import build_cold_start_board
+from lu_machinery.fleet_comms.cold_start_board import ProbeResult, build_cold_start_board
 from lu_machinery.fleet_comms.efficiency_metrics import (
     collect_dead_letters_authority,
     collect_delivery_backlog_authority,
@@ -48,6 +49,7 @@ from . import comms_router as legacy_comms
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
+from .state_helpers import cache_get_or_compute, cache_get_or_refresh, ctx_scoped_ttl_key
 
 router = APIRouter(tags=["fleet"])
 logger = logging.getLogger(__name__)
@@ -491,13 +493,51 @@ def fleet_facade_board(
     needle: str | None = Query(default=None),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> dict[str, Any]:
-    """Expose the JSON cold-start board already used by the fleet CLI."""
+    """Expose the JSON cold-start board already used by the fleet CLI.
+
+    Two probes are served from the in-process cache (see ``_board_bottleneck_metrics``
+    and ``_board_pr_list``); every other probe, the inbox included, is read per request.
+    """
     return build_cold_start_board(
         stream_id=stream_id,
         agent=agent,
         needle=needle,
         repo_root=ctx.roots.state_root,
+        bottleneck_metrics=lambda tasks_dir, plane_db: _board_bottleneck_metrics(ctx, tasks_dir, plane_db),
+        pr_list_probe=lambda: _board_pr_list(ctx),
     )
+
+
+# The bottleneck slice is lifecycle statistics over every task record: a few seconds
+# old is fine, and a cold scan of today's ledger outlasts the request timeout. Serve it
+# stale-while-revalidate; the stored copy is refreshed by one background flight.
+BOARD_BOTTLENECK_TTL_S = 60.0
+# A cold process waits this long for the first scan, then reports the probe as warming.
+BOARD_BOTTLENECK_WAIT_S = 2.0
+# ``gh pr list`` is a network round trip on every board; the five newest PRs may lag this much.
+BOARD_PR_LIST_TTL_S = 30.0
+
+
+def _board_bottleneck_metrics(ctx: MonitorContext, tasks_dir: Path, plane_db: Path) -> dict[str, Any] | None:
+    key = ctx_scoped_ttl_key(ctx, "facade-board-bottleneck", tasks_dir, plane_db)
+    hit = cache_get_or_refresh(
+        key,
+        BOARD_BOTTLENECK_TTL_S,
+        lambda: cold_start_board.collect_board_bottleneck_metrics(tasks_dir, plane_db),
+        wait_s=BOARD_BOTTLENECK_WAIT_S,
+    )
+    if hit is None:
+        return None
+    payload, age_s = hit
+    return {**cast(dict[str, Any], payload), "cache_age_s": round(age_s, 1)}
+
+
+def _board_pr_list(ctx: MonitorContext) -> ProbeResult:
+    cached = cache_get_or_compute(
+        ctx_scoped_ttl_key(ctx, "facade-board-pr-list"), BOARD_PR_LIST_TTL_S, cold_start_board._probe_gh_pr_list
+    )
+    # The board stamps elapsed_ms on the result; never mutate the shared cached copy.
+    return dataclasses.replace(cached)
 
 
 @router.get("/facade/metrics")
