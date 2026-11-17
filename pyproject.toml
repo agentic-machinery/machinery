@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["PyMuPDF==2.1"]
+test = ["hypothesis==6.170.15", "PyMuPDF==2.1"]
 
 [tool.setuptools]
 include-package-data = true
