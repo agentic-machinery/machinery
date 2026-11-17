@@ -203,7 +203,6 @@ tests/ai_agent_bridge/test_bridge_wave2_cli.py
 tests/ai_agent_bridge/test_channels_discuss_idempotency.py
 tests/ai_agent_bridge/test_citation_check.py
 tests/ai_agent_bridge/test_codex_rollout_readiness.py
-tests/ai_agent_bridge/test_comms_router_expiry_sweep.py
 tests/ai_agent_bridge/test_fleet_comms_bottleneck_alerts.py
 tests/ai_agent_bridge/test_fleet_comms_migration.py
 tests/ai_agent_bridge/test_fleet_comms_rollout_acceptance.py
@@ -241,7 +240,6 @@ tests/api/opsec_sweep/test_opsec_sanitize.py
 tests/api/opsec_sweep/test_opsec_scan.py
 tests/api/test_account_logins.py
 tests/api/test_acp_routing_budget.py
-tests/api/test_agent_monitor_router.py
 tests/api/test_agent_success_metrics.py
 tests/api/test_api_router_split.py
 tests/api/test_api_session_telemetry.py
@@ -256,10 +254,8 @@ tests/api/test_codexbar_usage.py
 tests/api/test_comms_metrics_switch.py
 tests/api/test_comms_plane_status_api.py
 tests/api/test_context_cost.py
-tests/api/test_contracts_router_context.py
 tests/api/test_delegate_api.py
 tests/api/test_delegate_router_cache.py
-tests/api/test_discussions_router.py
 tests/api/test_epics_registry_seed.py
 tests/api/test_epics_router.py
 tests/api/test_fleet_dashboard_contract.py
@@ -268,7 +264,6 @@ tests/api/test_fleet_workers_sanitize.py
 tests/api/test_fleet_workers_unmocked.py
 tests/api/test_get_routes_no_5xx.py
 tests/api/test_git_cleanup_router.py
-tests/api/test_git_hygiene_endpoint.py
 tests/api/test_git_no_optional_locks.py
 tests/api/test_github_graphql_budget.py
 tests/api/test_host_path_guard.py

@@ -489,8 +489,6 @@ agent-side reasoning.
 | Classify every file tied to this module (source/generated/published/stale) | `GET /api/artifacts/{track}/{slug}/files` |
 | Latest main + style reviews + "reviewer gaming" flag | `GET /api/artifacts/{track}/{slug}/review-snapshot` |
 | Does state.json agree with audit / reviews / published MDX? | `GET /api/artifacts/{track}/{slug}/drift` |
-| Can I ship this module? (every gate green) | `GET /api/artifacts/{track}/{slug}` |
-| Aggregate list of ship-ready modules | `GET /api/artifacts/ship-ready[?track=...]` |
 | Is the public site actually reachable? | `GET /api/site/health` |
 | Recent GH Pages deployments | `GET /api/site/deployments` |
 | Which worktrees exist and which branches are they on? | `GET /api/worktrees` |

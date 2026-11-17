@@ -121,35 +121,7 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4. Failing modules
-# ---------------------------------------------------------------------------
-FAILING=$(curl -s "$API/api/state/failing")
-fail_count=$(echo "$FAILING" | jq '.count')
-
-if [ "$fail_count" -gt 0 ]; then
-    echo -e "${BOLD}FAILING MODULES${NC}  ${RED}$fail_count${NC}"
-    echo "$FAILING" | jq -r '.modules[:10][] |
-        "  \(.track)/\(.slug) — audit:\(.audit_status) phases:\(.failed_phases | join(","))"'
-    if [ "$fail_count" -gt 10 ]; then
-        echo -e "  ${DIM}... and $((fail_count - 10)) more${NC}"
-    fi
-else
-    echo -e "${BOLD}FAILING MODULES${NC}  ${GREEN}none${NC}"
-fi
-echo ""
-
-# ---------------------------------------------------------------------------
-# 5. Active-manifest learner state
-# ---------------------------------------------------------------------------
-PREPARATION=$(curl -s "$API/api/state/preparation")
-echo "$PREPARATION" | jq -r '
-    "\u001b[1mACTIVE MANIFEST\u001b[0m  \(.totals.manifest_active_tracks) tracks · \(.totals.manifest_active_modules) modules",
-    "  learner bundles: \(.totals.module_state_counts.built) built · \(.totals.module_state_counts.partial) partial · \(.totals.module_state_counts.unbuilt) unbuilt",
-    "  publication: \(.totals.publication_state_counts.published) published · \(.totals.publication_state_counts.generated) generated · \(.totals.publication_state_counts.absent) absent"'
-echo ""
-
-# ---------------------------------------------------------------------------
-# 6. Gemini inbox
+# 4. Gemini inbox
 # ---------------------------------------------------------------------------
 # Check via the message broker MCP — fall back gracefully if not available
 INBOX_COUNT=""

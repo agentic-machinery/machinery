@@ -5,10 +5,10 @@ truncated last line — is skipped and counted on the caller's ``unreadable``
 counter instead of raising or being silently dropped. Valid rows from the
 same file and from later files still count, and runtime API totals over the
 valid rows are unchanged. Every production caller surfaces the counts in the
-#9868 evidence shape (``{"files", "lines", "records", "total"}``): the usage,
-recent, and agents responses read them off the returned list's
-``unreadable`` attribute, and the headroom response reads them off the
-``has_headroom`` counter keyword.
+#9868 evidence shape (``{"files", "lines", "records", "total"}``): the usage
+and recent helpers read them off the returned list's ``unreadable`` attribute,
+the agents response does the same, and ``has_headroom`` reads them off its
+counter keyword.
 """
 
 from __future__ import annotations
@@ -205,10 +205,7 @@ def test_usage_api_reports_unreadable_and_counts_valid_rows(
     )
     monkeypatch.setattr(app.state, "ctx", _ctx_with_batch_state_dir(tmp_path))
 
-    response = client.get("/api/runtime/usage?days=1")
-
-    assert response.status_code == 200
-    data = response.json()
+    data = runtime_router.summarize_runtime_usage(days=1, ctx=app.state.ctx)
     assert data["records_total"] == 2
     assert data["by_agent"]["codex"]["total"] == 2
     assert data["unreadable"] == ONE_UNREADABLE_LINE
@@ -220,13 +217,11 @@ def test_headroom_api_reports_unreadable_and_keeps_clear_decision(headroom_usage
     counts as a rate-limit event and surfaces on ``unreadable``."""
     _today_file(headroom_usage_dir).write_bytes(_line(_record("codex", "ok")) + _corrupt_line(corrupt_kind))
 
-    response = client.get("/api/runtime/headroom?agent=codex&model=gpt-6.1-sol")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["has_headroom"] is True
-    assert data["reason"] == ""
-    assert data["unreadable"] == ONE_UNREADABLE_LINE
+    unreadable: dict[str, int] = {"files": 0, "lines": 0, "records": 0}
+    ok, reason = usage_mod.has_headroom("codex", "gpt-6.1-sol", unreadable=unreadable)
+    assert ok is True
+    assert reason == ""
+    assert runtime_router._unreadable_summary(unreadable) == ONE_UNREADABLE_LINE
 
 
 def test_headroom_api_blocked_decision_still_reports_unreadable(headroom_usage_dir: Path) -> None:
@@ -237,13 +232,11 @@ def test_headroom_api_blocked_decision_still_reports_unreadable(headroom_usage_d
         + _line(_record("codex", "rate_limited"))
     )
 
-    response = client.get("/api/runtime/headroom?agent=codex&model=gpt-6.1-sol")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["has_headroom"] is False
-    assert data["reason"]
-    assert data["unreadable"] == ONE_UNREADABLE_LINE
+    unreadable: dict[str, int] = {"files": 0, "lines": 0, "records": 0}
+    ok, reason = usage_mod.has_headroom("codex", "gpt-6.1-sol", unreadable=unreadable)
+    assert ok is False
+    assert reason
+    assert runtime_router._unreadable_summary(unreadable) == ONE_UNREADABLE_LINE
 
 
 @CORRUPT_KINDS
@@ -256,10 +249,7 @@ def test_recent_api_reports_unreadable_and_counts_valid_rows(
     _today_file(usage_dir).write_bytes(_line(_record("codex", "ok")) + _corrupt_line(corrupt_kind))
     monkeypatch.setattr(app.state, "ctx", _ctx_with_batch_state_dir(tmp_path))
 
-    response = client.get("/api/runtime/recent?limit=5")
-
-    assert response.status_code == 200
-    data = response.json()
+    data = runtime_router.recent_runtime_records(limit=5, ctx=app.state.ctx)
     assert len(data["records"]) == 1
     assert data["records"][0]["agent"] == "codex"
     assert data["unreadable"] == ONE_UNREADABLE_LINE

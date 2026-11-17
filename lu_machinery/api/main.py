@@ -57,7 +57,6 @@ from . import delegate_router as delegate_api
 from . import runtime_router as runtime_api
 from . import state_router as state_api
 from ._signal_log import install_signal_logging
-from .agent_monitor_router import router as agent_monitor_router
 from .cluster_router import router as cluster_router
 from .codexbar_usage import scheduler_status, start_periodic_refresh, stop_periodic_refresh
 from .comms_prometheus import CommsCollector
@@ -65,7 +64,6 @@ from .comms_router import ensure_broker_db_ready, refresh_panel_metrics_periodic
 from .comms_router import router as comms_router
 from .coordination_router import router as coordination_router
 from .delegate_router import router as delegate_router
-from .discussions_router import router as discussions_router
 from .docs_router import router as docs_router
 from .epics_router import router as epics_router
 from .epics_router import seed_manifest_inventory
@@ -97,8 +95,6 @@ from .project_state_router import router as project_state_router
 from .repository_authority import build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
-from .rollover_router import router as rollover_router
-from .route_contracts import router as contracts_router
 from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
@@ -2004,8 +2000,7 @@ def create_app(
             "Stream key remains `monitor`; historic Monitor docs paths are progressive rename. "
             "Versioning layers: app 2.0.0 · URL namespaces `/api/*/v1/*` · "
             "payload `response_schema_version` / `schema_version` on contracts. "
-            "Agent onboard: GET /api/rules, GET /api/orient?lean=true, "
-            "GET /api/contracts/routes, then docs/MONITOR-API.md. "
+            "Agent onboard: GET /api/rules, GET /api/orient?lean=true. "
             "Interactive explorer: /docs (Swagger) and /redoc. "
             "Powers ops dashboards (root /), cold-start, state, comms, delegate, "
             "build events, and operational tooling."
@@ -2034,7 +2029,6 @@ def create_app(
     # today's matching precedence.
     for mount in product.routers:
         factory_app.include_router(mount.router, prefix=mount.prefix, tags=list(mount.tags) or None)
-    factory_app.include_router(agent_monitor_router, prefix="/api/agent-monitor")
     factory_app.include_router(occupancy_router, prefix="/api/occupancy", tags=["occupancy"])
     factory_app.include_router(observer_presence_router, prefix="/api/observer", tags=["observer"])
     factory_app.include_router(epics_router, prefix="/api/epics", tags=["epics"])
@@ -2046,17 +2040,14 @@ def create_app(
     factory_app.include_router(session_streams_router, prefix="/api/session-streams", tags=["session-streams"])
     factory_app.include_router(coordination_router, prefix="/api/coordination")
     factory_app.include_router(cluster_router, prefix="/api/cluster", tags=["cluster"])
-    factory_app.include_router(contracts_router, prefix="/api/contracts", tags=["contracts"])
     factory_app.include_router(delegate_router, prefix="/api/delegate")
     factory_app.include_router(docs_router, prefix="/artifacts")
     factory_app.include_router(docs_router, prefix="/files")
-    factory_app.include_router(discussions_router, prefix="/api/discussions", tags=["discussions"])
     factory_app.include_router(milestones_router, prefix="/api/milestones", tags=["milestones"])
     factory_app.include_router(git_hygiene_router, prefix="/api/git", tags=["git"])
     factory_app.include_router(ops_router, prefix="/api/ops", tags=["ops"])
     factory_app.include_router(issues_router, prefix="/api/issues", tags=["issues"])
     factory_app.include_router(knowledge_router, prefix="/api/knowledge", tags=["knowledge"])
-    factory_app.include_router(rollover_router, prefix="/api/rollovers", tags=["rollovers"])
     factory_app.include_router(rules_router, prefix="/api/rules", tags=["rules"])
     factory_app.include_router(runtime_router, prefix="/api/runtime")
     factory_app.include_router(session_router, prefix="/api/session", tags=["session"])

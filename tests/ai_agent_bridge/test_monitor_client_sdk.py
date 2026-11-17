@@ -212,13 +212,11 @@ def test_sdk_not_modified_path(sdk, monkeypatch):
 # ---------------------------------------------------------------------
 
 
-def test_comms_live_activity_carries_deprecation_header():
+def test_comms_live_activity_does_not_point_at_build_status():
     resp = client.get("/api/comms/live-activity")
-    # Endpoint may 500 if the broker DB isn't available in the test
-    # environment — the deprecation header must still be on the
-    # response so clients see it either way.
-    assert resp.headers.get("X-Deprecated") == "true"
-    assert resp.headers.get("X-Deprecated-Use") == "/api/state/build-status"
+    assert resp.headers.get("X-Deprecated") is None
+    assert resp.headers.get("X-Deprecated-Use") is None
+    assert "build-status" not in resp.headers.get("Warning", "")
 
 
 # ---------------------------------------------------------------------

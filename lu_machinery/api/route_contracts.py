@@ -6,7 +6,7 @@ every public FastAPI route and literal dashboard HTML page matches a contract.
 
 The declarations here cover the machinery routes and pages. The product
 contribution adds its own (``scripts.project_api.route_contracts``), and the
-lookups and ``/api/contracts/routes`` read both: machinery first, then product
+lookups read both: machinery first, then product
 (Monitor split, C-4687).
 """
 
@@ -14,13 +14,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
-
-from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import ProductContribution, installed_product
 
 ContractKind = Literal["http", "websocket"]
@@ -164,31 +160,6 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "keep as the machinery home's alerts reading",
     ),
     RouteContract(
-        "/api/contracts/routes",
-        "exact",
-        "http",
-        "Machine-readable Monitor route and dashboard contract registry.",
-        "This module's ROUTE_CONTRACTS and PAGE_CONTRACTS declarations.",
-        "Generated per request; no route cache.",
-        ("tests", "agents", "docs"),
-        "Documents every other local Monitor endpoint.",
-        "low",
-        "keep",
-    ),
-    RouteContract(
-        "/api/state/github-budget",
-        "exact",
-        "http",
-        "Cached health probe of the authenticated GitHub GraphQL primary rate limit.",
-        "Shared GitHub client REST `rate_limit` read of `resources.graphql`.",
-        "In-process 60-second cache, stale-while-revalidate: an expired observation is served at once with X-Snapshot-Age-S and its own checked_at while one refresh asks GitHub; probe failures report exhausted=null.",
-        ("agents", "Monitor", "operators"),
-        "Agents can read the shared observation instead of spending separate GraphQL calls.",
-        "medium if a stale response is treated as the current budget after its 60-second cache window",
-        "read this endpoint for a lightweight shared GraphQL health signal",
-        response_schema_version="github-budget.v1",
-    ),
-    RouteContract(
         "/artifacts",
         "prefix",
         "http",
@@ -226,19 +197,6 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         locality="mixed",
     ),
     RouteContract(
-        "/api/fleet/facade/board",
-        "exact",
-        "http",
-        "JSON cold-start board for drivers: plane status, backlog, inbox, session streams, bottleneck slice and recent PRs.",
-        "The fleet CLI's cold-start board builder over the fleet-comms plane, the batch task ledger and gh pr list.",
-        "The default board is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S; past 15 s one background rebuild, and a board unread for 135 s waits up to 0.5 s for a fresh one. Inside a build, two in-process caches: the bottleneck slice (task-ledger spans) is reused for 60 s and then refreshed by one background scan, served stale with cache_age_s while that scan runs, and reported as warming on a cold process; gh pr list is reused for 30 s. Ledger rescans re-read only task records whose stat identity changed.",
-        ("agents", "operators"),
-        "Same board as the fleet CLI cold-start command, which reads every probe live.",
-        "low; the board, inbox included, may lag by 15 s or by a slow rebuild (age in X-Snapshot-Age-S), the bottleneck slice by about a minute and recent PRs by 30 s",
-        "keep; read the inbox and plane probes as recent (check X-Snapshot-Age-S), the bottleneck slice as recent statistics",
-        locality="mixed",
-    ),
-    RouteContract(
         "/api/fleet/agents",
         "exact",
         "http",
@@ -258,52 +216,13 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "http",
         "Unified read-only observer for durable fleet-comms requests, authority queue jobs, messages, discussions, ACP rounds, formal reviews, endpoints, migrations, dead letters, provenance, and operations health.",
         "Fleet-comms v1 SQLite read models, endpoint registry metadata, sanitized runtime/ACP projections, and sanitized legacy operations read models.",
-        "No response cache except facade/board, facade/metrics and the default acp/conversations page, served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S for 15 s; every other route opens the durable plane in SQLite read-only mode. Lists have deterministic order and bounded limit/offset pages; inline bodies are preview-only, redacted, and never fetch artifact blobs.",
+        "No response cache except the default acp/conversations page, served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S for 15 s; every other route opens the durable plane in SQLite read-only mode. Lists have deterministic order and bounded limit/offset pages; inline bodies are preview-only, redacted, and never fetch artifact blobs.",
         ("operators", "agents"),
         "Consolidates observation previously spread across comms, runtime, ACP, and session-stream pages; legacy pages remain during the pre-flip soak.",
         "medium if a consumer mistakes the observer for plane authority or relies on an absent optional table as evidence of no historical work",
         "keep as the pre-flip consolidated observer; file handoffs remain authoritative and all fleet routes are read-only",
         locality="cluster_authoritative",
         response_schema_version="comms.v2",
-    ),
-    RouteContract(
-        "/api/comms/messages",
-        "exact",
-        "http",
-        "Deprecated legacy direct-message list.",
-        "SQLite message broker.",
-        "No route cache; live broker reads.",
-        ("legacy external callers",),
-        "Replaced by channel message endpoints.",
-        "medium",
-        "deprecated; migrate to /api/comms/channels/{name}/messages (NOTE: compat_keep gated by #6106 and legacy telemetry)",
-        replacement="/api/comms/channels/{name}/messages",
-    ),
-    RouteContract(
-        "/api/comms/conversations",
-        "exact",
-        "http",
-        "Deprecated legacy direct-message conversation list.",
-        "SQLite message broker.",
-        "No route cache; live broker reads.",
-        ("legacy external callers",),
-        "Replaced by channel threads.",
-        "medium",
-        "deprecated; migrate to /api/comms/channels/{name}/threads/{thread_id} (NOTE: compat_keep gated by #6106 and legacy telemetry)",
-        replacement="/api/comms/channels/{name}/threads/{thread_id}",
-    ),
-    RouteContract(
-        "/api/comms/conversation",
-        "prefix",
-        "http",
-        "Deprecated legacy direct-message conversation detail.",
-        "SQLite message broker.",
-        "No route cache; live broker reads.",
-        ("legacy external callers",),
-        "Replaced by channel threads.",
-        "medium",
-        "deprecated; migrate to /api/comms/channels/{name}/threads/{thread_id} (NOTE: compat_keep gated by #6106 and legacy telemetry)",
-        replacement="/api/comms/channels/{name}/threads/{thread_id}",
     ),
     RouteContract(
         "/api/comms/live-activity",
@@ -315,21 +234,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         ("legacy docs",),
         "Replaced by channel activity and delegate/build event endpoints.",
         "medium",
-        "deprecated; migrate to /api/comms/agent-activity and /api/delegate/active (NOTE: compat_keep gated by #6106 and legacy telemetry)",
-        replacement="/api/comms/agent-activity",
-    ),
-    RouteContract(
-        "/api/comms/send",
-        "exact",
-        "http",
-        "Deprecated legacy direct-message send endpoint.",
-        "SQLite message broker.",
-        "No route cache; the retired POST returns 410 and does not mutate broker state.",
-        ("legacy external callers",),
-        "Replaced by channel post endpoint.",
-        "medium",
-        "deprecated; migrate to /api/comms/channels/{name}/post (NOTE: compat_keep gated by #6106 and legacy telemetry)",
-        replacement="/api/comms/channels/{name}/post",
+        "deprecated legacy live-activity summary; delegate/active is the live task view",
+        replacement="/api/delegate/active",
     ),
     RouteContract(
         "/api/comms",
@@ -373,7 +279,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/coordination",
         "prefix",
         "http",
-        "Parallel-agent coordination ledger summary, active task list, and task detail.",
+        "Parallel-agent coordination ledger task detail.",
         f"orchestration/agent-ledger/tasks/*.json written by {_rel('orchestration', 'agent_ledger.py')}.",
         "No route cache; live filesystem reads from the local coordination ledger.",
         ("agents", "orchestrator", "future dashboards"),
@@ -389,7 +295,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "git worktree list --porcelain, per-worktree git status, and git log -1.",
         "No route cache; each git subprocess has a bounded timeout.",
         ("agents", "cold-start tooling", "worktree hygiene"),
-        "Complements /api/git/hygiene and /api/git/cleanup.",
+        "Complements /api/git/cleanup.",
         "low; failures degrade to empty/error payload",
         "keep",
     ),
@@ -506,18 +412,6 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         response_schema_version="orient.v2",
     ),
     RouteContract(
-        "/api/rollovers",
-        "exact",
-        "http",
-        "Read-only fleet rollover audit and exact selector projection.",
-        "Versioned registry records under .agent/thread-rollover-registry/v1/.",
-        "The unfiltered audit is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, refreshed after 120 s (generated_at names the audit time); selector and agent queries are generated per request; no mutation path is exposed over HTTP.",
-        ("agents", "monitor client", "orchestrators"),
-        "Compact actionable entries are also exposed through /api/orient.",
-        "low — corrupt records are isolated and returned as explicit errors",
-        "keep as the canonical rollover observability surface",
-    ),
-    RouteContract(
         "/api/knowledge",
         "prefix",
         "http",
@@ -542,85 +436,9 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Rules/session hash helpers plus static endpoint metadata.",
         "Generated per request; rules/session hashes let agents skip unchanged payloads.",
         ("agents", "monitor client"),
-        "Index for /api/rules, /api/session/current, /api/orient, comms inbox/activity.",
+        "Index for /api/rules, /api/session/current, /api/orient, and the comms inbox.",
         "low",
         "keep cold-start source of truth",
-    ),
-    RouteContract(
-        "/api/agent-monitor/status",
-        "exact",
-        "http",
-        "Aggregate host-local resource, process, and capacity reservation summary.",
-        "psutil host/process metrics and aggregate agent-monitor lease counts.",
-        "Computed per request; dead and expired leases reconciled at read time; no response cache.",
-        ("agent launchers", "orchestrators", "tests"),
-        "Complements /api/runtime provider usage and /api/delegate task telemetry.",
-        "medium if launcher heartbeat coverage is incomplete",
-        "keep as canonical aggregate host-capacity summary",
-    ),
-    RouteContract(
-        "/api/agent-monitor/status/details",
-        "exact",
-        "http",
-        "Detailed host capacity status including active lease process listings (requires auth).",
-        "psutil host/process metrics and detailed transactional agent-monitor lease store.",
-        "Computed per request; dead and expired leases reconciled at read time; no response cache.",
-        ("agent launchers", "orchestrators", "tests"),
-        "Complements /api/agent-monitor/status for authorized detailed process telemetry.",
-        "medium if launcher heartbeat coverage is incomplete",
-        "keep as canonical detailed host-capacity snapshot",
-    ),
-    RouteContract(
-        "/api/agent-monitor/preflight",
-        "exact",
-        "http",
-        "Advisory read-only capacity check evaluating host allocatable headroom.",
-        "Configured capacity policy, live psutil memory, and active lease reservations.",
-        "Evaluated per request; no cache.",
-        ("agent launchers", "orchestrators", "tests"),
-        "Memory admission check prior to atomic lease registration.",
-        "low",
-        "keep advisory preflight",
-        mutates=False,
-    ),
-    RouteContract(
-        "/api/agent-monitor/register",
-        "exact",
-        "http",
-        "Activates an admitted reservation for an identified agent process.",
-        "Pending reservation plus verified PID and process creation time.",
-        "Transactional mutation; immediately visible.",
-        ("agent launchers", "tests"),
-        "Complements task ownership in /api/delegate and /api/coordination.",
-        "medium if process identity is not verified",
-        "keep",
-        mutates=True,
-    ),
-    RouteContract(
-        "/api/agent-monitor/heartbeat",
-        "exact",
-        "http",
-        "Renews one live agent lease.",
-        "Existing lease identity and verified process liveness.",
-        "Transactional TTL renewal; immediately visible.",
-        ("agent launchers", "tests"),
-        "None.",
-        "low with bounded TTL and identity validation",
-        "keep",
-        mutates=True,
-    ),
-    RouteContract(
-        "/api/agent-monitor/release",
-        "exact",
-        "http",
-        "Explicitly releases one agent capacity reservation.",
-        "Existing lease identity.",
-        "Transactional removal; immediately visible.",
-        ("agent launchers", "tests"),
-        "Expired/dead-lease reconciliation is the fallback.",
-        "low",
-        "keep",
-        mutates=True,
     ),
     RouteContract(
         "/api/milestones",
@@ -653,8 +471,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "healthy data at most 420s old; a request with no snapshot waits up to 15s for that collect, then answers "
         "pending with Retry-After 1.",
         ("model-stats.html", "operators"),
-        "Joins what /api/runtime/usage (ACP runs only) and /api/fleet/workers/v1 (live workers) do not; "
-        "agent_success in the fleet facade counts runs without landing or rounds.",
+        "Joins the agent-runtime usage log (ACP runs only) and /api/fleet/workers/v1 (live workers); "
+        "agent success counts runs without landing or rounds.",
         "medium if a low-sample rate or a confounded comparison is read as a routing verdict",
         "keep as the model value reading; routing stays a CTO decision",
         response_schema_version="model-stats.v2",
@@ -675,7 +493,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/git",
         "prefix",
         "http",
-        "Git hygiene and cleanup dry-run reporting.",
+        "Git cleanup dry-run and open pull-request reporting.",
         "Local git branches, worktrees, and batch_state task metadata.",
         "/api/git/cleanup is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, refreshed after 60 s (computed_at names the report time) and reusing git cherry answers for unchanged branch and main tips; other routes read git and the filesystem live.",
         ("agents", "docs"),
@@ -687,26 +505,13 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/telemetry",
         "prefix",
         "http",
-        "Tool timing, module-build token, and body-free legacy HTTP/one-shot bridge telemetry ingest/readback.",
+        "Tool-timing ingest and readback. Module-build token routes are product routes under the same prefix.",
         "Telemetry SQLite state used by Monitor instrumentation and module-build PR reporting.",
-        "No route cache; POST mutates telemetry stores, GET reads current telemetry state. Legacy HTTP and one-shot bridge usage is retained only as hourly allowlisted aggregates for 90 days.",
+        "No route cache; POST records tool timings and GET reads them.",
         ("agents", "runtime tooling"),
         "Complements optional telemetry footer, runtime usage logs, analytics cost summaries, and #6106 legacy comms retirement evidence.",
         "low",
         "keep",
-    ),
-    RouteContract(
-        "/api/discussions/active",
-        "exact",
-        "http",
-        "Active multi-agent discussion snapshot.",
-        "Channel bridge SQLite messages and discussion state.",
-        "No route cache; live broker reads.",
-        ("orient.html",),
-        "Complements channel message endpoints.",
-        "low",
-        "keep",
-        locality="mixed",
     ),
     RouteContract(
         "/api/health",
@@ -739,7 +544,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "prefix",
         "http",
         "Read-only Work control-plane projection: normalized public attention list, source envelopes, open PR rows plus bounded merged history qualified only by GitHub merged_at, and optional private-source capability seam.",
-        "GitHub open issue/PR list enumerations (cap 1000), public /api/issues/streams, and frozen class-4 summaries (/api/delegate/active, /api/delegate/tasks, /api/fleet/reviews).",
+        "GitHub open issue/PR list enumerations (cap 1000), public /api/issues/streams, and frozen class-4 summaries (/api/delegate/active, /api/delegate/tasks, and in-process formal-review rows).",
         "Warm projection cache ~30s with cache_age_s; warm target <=2s; typed degradation within 5s; never proxies private adapters.",
         ("operators", "agents"),
         "Joins existing GH list + streams + class-4 summaries; does not replace GitHub or those sources as authority.",
@@ -767,7 +572,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "In-process TTL store keyed by (opaque host, observer agent, instance); occupancy partitions live rows and the fresh matching instance can supply notebook-presence telemetry.",
         "Upsert immediately; row expires after 15 minutes without a heartbeat; Monitor restart drops the store.",
         ("qa-engineer", "grok-bot", "cursor", "codex", "tests"),
-        "Not a fleet seat, not POST /api/agent-monitor/register, and never writes fleet-comms.",
+        "Not a fleet seat and never writes fleet-comms.",
         "low with loopback-only mutation and a short TTL",
         "keep",
         mutates=True,
@@ -821,7 +626,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "FastAPI app routes; redirect target is the built-in Swagger UI page.",
         "Static redirect; generated per request, no cache.",
         ("humans", "agents"),
-        "Complements /api/contracts/routes, the machine-readable route registry.",
+        "Complements the in-process route-contract registry.",
         "low",
         "keep; do not grow this into a new docs site",
     ),
@@ -878,9 +683,6 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     ),
 )
 
-router = APIRouter(tags=["contracts"])
-
-
 def all_route_contracts(product: ProductContribution | None = None) -> tuple[RouteContract, ...]:
     """Machinery route contracts, then the product's (the installed product when none is given)."""
     return (*ROUTE_CONTRACTS, *(installed_product() if product is None else product).route_contracts)
@@ -915,15 +717,3 @@ def contract_for_page(filename: str) -> PageContract | None:
         if contract.file == filename:
             return contract
     return None
-
-
-@router.get("/routes")
-async def route_contracts(request: Request, ctx: MonitorContext = Depends(get_ctx)):
-    """Public Monitor route/page contract registry."""
-    _ = resolve_context(ctx)
-    product = getattr(request.app.state, "product", None)
-    return {
-        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "route_contracts": [contract.to_dict() for contract in all_route_contracts(product)],
-        "page_contracts": [contract.to_dict() for contract in all_page_contracts(product)],
-    }

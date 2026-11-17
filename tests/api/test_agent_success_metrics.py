@@ -299,7 +299,7 @@ def test_metrics_api_uses_context_ledger_even_when_comms_store_is_missing(tmp_pa
         },
     )
     with TestClient(create_app(fixture_context(tmp_path))) as client:
-        for route in ("/api/comms/v1/metrics", "/api/fleet/facade/metrics"):
+        for route in ("/api/comms/v1/metrics",):
             assert "agent_success" not in client.get(route).json()
             response = client.get(route, params={"include_agent_success": "true"})
             assert response.status_code == 200

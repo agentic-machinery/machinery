@@ -1,6 +1,6 @@
 """Tests for routing-budget runtime-usage diagnostics honesty (#7085).
 
-The USD cost ledger can be empty while ``/api/runtime/usage`` serves rows.
+The USD cost ledger can be empty while the runtime usage log has rows.
 ``diagnostics.runtime_data_available`` must reflect the same 7-day runtime
 usage, and the ledger-empty state must be stated, not read as "no data".
 """
@@ -130,7 +130,7 @@ def _configure(
 
 
 def test_runtime_data_available_when_7d_usage_exists_but_ledger_empty(monkeypatch, tmp_path):
-    """Acceptance fixture: /api/runtime/usage has rows, USD ledger is empty."""
+    """Acceptance fixture: the runtime usage log has rows, USD ledger is empty."""
     now = datetime(2026, 8, 22, 12, 0, tzinfo=UTC)
     _configure(monkeypatch, tmp_path, runtime_records_7d=25)
 

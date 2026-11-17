@@ -67,18 +67,8 @@ _CALLER_TAG_HEADER = "x-learn-uk-caller"
 _TAGGED_CALLERS = frozenset({"automation", "broker-ops", "canary", "cli", "dashboard", "test"})
 _CALLER_CLASSES = frozenset({*_TAGGED_CALLERS, "browser", "programmatic", "unknown"})
 _ROUTE_METHODS = {
-    "messages": "GET",
-    "conversations": "GET",
-    "conversation_detail": "GET",
     "acknowledge": "POST",
-    "send": "POST",
 }
-_EXACT_ROUTES = {
-    ("GET", "/api/comms/messages"): "messages",
-    ("GET", "/api/comms/conversations"): "conversations",
-    ("POST", "/api/comms/send"): "send",
-}
-_CONVERSATION_DETAIL_RE = re.compile(r"^/api/comms/conversation/[^/]+$")
 _ACKNOWLEDGE_RE = re.compile(r"^/api/comms/acknowledge/[^/]+$")
 _init_lock = threading.Lock()
 _initialized_paths: set[Path] = set()
@@ -133,12 +123,7 @@ def _initialize_db(path: Path, *, now: datetime | None = None) -> None:
 
             CREATE TABLE IF NOT EXISTS legacy_comms_route_usage (
                 hour_utc     TEXT NOT NULL,
-                route_id     TEXT NOT NULL CHECK (
-                    route_id IN (
-                        'messages', 'conversations', 'conversation_detail',
-                        'acknowledge', 'send'
-                    )
-                ),
+                route_id     TEXT NOT NULL CHECK (route_id IN ('acknowledge')),
                 method       TEXT NOT NULL CHECK (method IN ('GET', 'POST')),
                 caller_class TEXT NOT NULL CHECK (
                     caller_class IN (
@@ -190,13 +175,7 @@ def _reset_initialized_paths_for_tests() -> None:
 
 def match_legacy_route(method: str, path: str) -> str | None:
     """Return an allowlisted normalized route id without retaining path data."""
-    normalized_method = method.upper()
-    exact = _EXACT_ROUTES.get((normalized_method, path))
-    if exact is not None:
-        return exact
-    if normalized_method == "GET" and _CONVERSATION_DETAIL_RE.fullmatch(path):
-        return "conversation_detail"
-    if normalized_method == "POST" and _ACKNOWLEDGE_RE.fullmatch(path):
+    if method.upper() == "POST" and _ACKNOWLEDGE_RE.fullmatch(path):
         return "acknowledge"
     return None
 
