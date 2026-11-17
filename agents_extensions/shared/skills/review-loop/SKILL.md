@@ -31,6 +31,16 @@ the finding ledger and rounds already used.
 **Tiers, findings, rounds and recording:** [policy](references/policy.md) is the single source. Read it
 before round 1 and before every further round.
 
+**Read the tier first**, at the pushed head, with the classifier the merge gates use:
+
+```bash
+"$PY" -m lu_machinery.review.tiers --repository "$REPOSITORY" --pr "$PR"
+```
+
+`trivial` needs no review: stop here, seat no reviewer, and land on required CI. `low` gets the
+policy's quick red-team pass, with `--risk low` and break-it findings only. Other tiers continue
+below.
+
 Recipes run with the primary checkout's interpreter, resolved once
 ([delivery](../full-send/references/delivery.md#interpreter)):
 

@@ -1,6 +1,9 @@
 # fnmatch patterns over repository-relative paths. Both names of a rename count.
-# High wins over Ukrainian content, then Medium, then Low.
-schema_version: 1
+# A path takes the first list it matches, in the order high, ukrainian-content,
+# trivial, low; no match is Medium. A pull request takes the highest tier any of
+# its paths takes. What each tier requires before merge is review-loop
+# references/policy.md section 2; lu_machinery/review/tiers.py reads this file.
+schema_version: 2
 default: medium
 tiers:
   high:
@@ -126,6 +129,20 @@ tiers:
     - site/src/content/**
     - site/src/data/**
     - site/src/lib/lexicon/curated-heteronyms.ts
+  # Root documentation for people. Everything under docs/ keeps its tier: code and
+  # agents read it as input or procedure (the review protocol, session handoffs,
+  # epics, the release procedure, the workstream registry), and the product's docs
+  # tree is the same, so no denylist of model-facing docs can be complete.
+  trivial:
+    - README
+    - README.md
+    - README.rst
+    - README.txt
+    - CHANGELOG.md
+    - LICENSE
+    - LICENSE.md
+    - LICENSE.txt
+    - SECURITY.md
   low:
     - docs/**
     - data/**
@@ -145,4 +162,11 @@ tiers:
     - LICENSE.md
     - LICENSE.txt
     - SECURITY.md
-# Removed High/content paths keep their tier; all other removals are Low.
+# Removed High/content/Trivial paths keep their tier; all other removals are Low.
+
+# The release cut's files a patch can prove. The product's lu-machinery lock is
+# Trivial only when its one hunk, from line 1, replaces the lu-machinery line and its
+# hashes with a raised version. pyproject.toml and package*.json keep their tier: a
+# patch cannot prove TOML or JSON scope.
+release_version_files:
+  requirements-machinery.lock: machinery-lock

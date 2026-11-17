@@ -54,9 +54,7 @@ tests/repo_contracts/test_store_resolver.py
 # PORT-1108 T1, from LU 5aba2adb.
 
 tests/agent_deploy/test_deploy_extensions.py
-tests/agent_deploy/test_reap_agent_mirrors.py
 tests/agent_deploy/test_release_deployer.py
-tests/agent_deploy/test_retire_codex_skills.py
 tests/agent_deploy/test_update_agent_deploy_status.py
 tests/agent_runtime/adapters/test_acpx_claude_adapter_modes.py
 tests/agent_runtime/adapters/test_agy_cancel_recovery.py

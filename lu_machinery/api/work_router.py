@@ -18,7 +18,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from lu_machinery.api.state_helpers import cache_get, cache_get_with_age, cache_invalidate, cache_set, ctx_cache_scope
+from lu_machinery.api.state_helpers import (
+    Demand,
+    cache_get,
+    cache_get_with_age,
+    cache_invalidate,
+    cache_set,
+    ctx_cache_scope,
+)
 from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, resolve_area
 from lu_machinery.orchestration.issue_stream_audit import load_registry
 from lu_machinery.orchestration.launcher_aliases import load_launcher_aliases
@@ -483,12 +490,20 @@ def warm_projection_cache(
     return _follow_cfuture(_get_or_create_build_task(key, canonical, ctx))
 
 
-async def refresh_projection_cache_periodically(ctx: MonitorContext) -> None:
-    """Keep the default public queue warm while the application is idle.
+def _work_demand(ctx: MonitorContext) -> Demand:
+    demand: Demand = ctx.runtime.get_or_create_derived("work-projection-demand", Demand)
+    return demand
 
-    Startup warmup handles the first build. Half-TTL ticks also keep the PR
-    snapshot refreshing while the projection is warm, so an idle board does
-    not repeatedly rebuild from the previous expired PR observation.
+
+async def refresh_projection_cache_periodically(ctx: MonitorContext) -> None:
+    """Keep the default public queue warm between the polls of its readers.
+
+    Startup warmup handles the first build. While Work is read
+    (``DEMAND_WINDOW_S``), half-TTL ticks also keep the PR snapshot
+    refreshing, so a polled board does not rebuild from the previous expired
+    PR observation. Unread, the tick only samples host load: no GitHub reads
+    and no projection builds. The next read is served from the cache with its
+    true age (or /next's 503 ``stale``) and starts the refresh itself.
     Each expired projection joins the same
     bounded single-flight job as HTTP callers; failures retry on the next
     tick and never relax /next's maximum stale age.
@@ -500,6 +515,8 @@ async def refresh_projection_cache_periodically(ctx: MonitorContext) -> None:
             await asyncio.to_thread(sample_host_load, ctx.roots.batch_state_dir)
         except Exception as exc:
             log.warning("Load sampling failed: %s", type(exc).__name__)
+        if not _work_demand(ctx).active():
+            continue
         fetch_open_prs()  # nonblocking single-flight snapshot refresh
         if cache_get_with_age(key, CACHE_TTL_S) is not None:
             continue
@@ -629,6 +646,7 @@ async def work_projection(
     # invalid_saved_view even when stream is absent.
     filters = _filters_from_request(request)
     stream = _require_projection_stream(request, ctx)
+    _work_demand(ctx).touch()
     key = projection_cache_key(filters, ctx)
 
     if not fresh:
@@ -827,6 +845,7 @@ async def work_next(
             body["diagnostic"] = alias_diagnostic
         return _next_error(400, body)
 
+    _work_demand(ctx).touch()
     key = projection_cache_key({}, ctx)
     cached = cache_get_with_age(key, float("inf"))
     if cached is None or not isinstance(cached[0], dict):

@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.ci import queue_review_gate as gate
+from tests.helpers import product_tree
 
+configured_roots = product_tree.configured_roots
 _GIT_BIN = os.environ.get("AGENT_REAL_GIT", "git")  # the agent shim refuses some plumbing
 REPOSITORY = "owner/repo"
 ENQUEUED_AT = "2026-11-11T10:00:00Z"
@@ -309,3 +311,42 @@ def test_event_whose_ref_disagrees_with_its_base_is_refused() -> None:
         gate.parse_event(payload)
     payload["merge_group"]["head_ref"] = f"refs/heads/gh-readonly-queue/main/pr-7-{'a' * 40}"
     assert gate.parse_event(payload) == gate.Event(REPOSITORY, "main", "a" * 40, "b" * 40, 7)
+
+
+def _first_member_changes(candidate: Candidate, files: dict[str, str]) -> None:
+    """Rebuild PR 1 (and the stacked squashes) so PR 1 changes ``files``."""
+    for name in files:
+        (candidate.repo / name).parent.mkdir(parents=True, exist_ok=True)
+    candidate.heads[1] = candidate.commit(candidate.tip, files, "first")
+    candidate.s1 = candidate.squash(candidate.tip, candidate.heads[1], 1)
+    candidate.s2 = candidate.squash(candidate.s1, candidate.heads[2], 2)
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_trivial_member_passes_without_review_status(
+    candidate: Candidate, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Defect class: the queue ejects a Trivial PR for a review status the Trivial tier does not require."""
+    _first_member_changes(candidate, {"README.md": "1\n"})
+    github = FakeGitHub(candidate.tip, [[candidate.entry(1), candidate.entry(2)]], {candidate.heads[2]: "SUCCESS"})
+    assert _run(candidate, github) == 0
+    out = capsys.readouterr().out
+    assert "#1 (queue position 1" in out and "Trivial tier, no review required" in out
+    # A rejection recorded on the Trivial head still fails it.
+    github = FakeGitHub(
+        candidate.tip,
+        [[candidate.entry(1), candidate.entry(2)]],
+        {candidate.heads[1]: "FAILURE", candidate.heads[2]: "SUCCESS"},
+    )
+    assert _run(candidate, github) == 1
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_non_trivial_member_still_needs_status(candidate: Candidate, capsys: pytest.CaptureFixture[str]) -> None:
+    """Defect class: a code change rides into the queue on a Trivial file's exemption."""
+    _first_member_changes(candidate, {"README.md": "1\n", "tool.py": "print(1)\n"})
+    github = FakeGitHub(candidate.tip, [[candidate.entry(1), candidate.entry(2)]], {candidate.heads[2]: "SUCCESS"})
+    assert _run(candidate, github) == 1
+    out = capsys.readouterr().out
+    assert "::error::queue review gate: #1 " in out
+    assert "no fleet/cross-family-review status on the current head (tier medium)" in out

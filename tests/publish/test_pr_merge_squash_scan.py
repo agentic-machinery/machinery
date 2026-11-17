@@ -224,3 +224,37 @@ def test_direct_merge_sends_explicit_text_instead_of_defaults(synthetic_opsec):
         runner=transport(calls, body="* " + TOKEN, queue=False),
     )
     assert len(calls) == 1 and "--subject=clean" in calls[0]["argv"] and calls[0]["body"] == "clean"
+
+
+def test_trivial_head_merges_without_recorded_approval(low_review):
+    """Defect class: the merge gate demands a review of record the Trivial tier does not require."""
+    _tasks, comments, _statuses, files, admit = low_review
+    files[:] = [{"filename": "CHANGELOG.md", "status": "modified"}]
+    assert comments == []
+    assert admit() is None
+
+
+def test_trivial_head_with_recorded_rejection_is_refused(low_review):
+    """Defect class: a Trivial head lands over a rejection recorded at that head."""
+    from lu_machinery.review.record_cf_verdict import build_comment
+
+    _tasks, comments, _statuses, files, admit = low_review
+    files[:] = [{"filename": "CHANGELOG.md", "status": "modified"}]
+    comments.append({
+        "id": 1,
+        "body": build_comment(
+            sha=HEAD, task_id="review-two", started="2026-09-23T12:00:00.000001+00:00",
+            verdict="CHANGES_REQUESTED", model="claude-opus-5-5", family="anthropic",
+            author_models=["gpt-6.1-sol"],
+            reply="VERDICT: CHANGES_REQUESTED\n\nThe example command in the doc deletes the checkout.\n",
+        ),
+        "user": {"login": "fleet"},
+        "author_association": "MEMBER",
+        "created_at": "2026-09-23T13:00:00Z",
+        "updated_at": "2026-09-23T13:00:00Z",
+    })
+    with pytest.raises(publisher.gate.PublishBlocked, match="CHANGES_REQUESTED"):
+        admit()
+    # The same head with no record lands.
+    comments.clear()
+    assert admit() is None

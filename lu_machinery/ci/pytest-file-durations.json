@@ -1,8 +1,6 @@
 {
   "tests/agent_deploy/test_deploy_extensions.py": 2.932,
-  "tests/agent_deploy/test_reap_agent_mirrors.py": 0.303,
   "tests/agent_deploy/test_release_deployer.py": 52.063,
-  "tests/agent_deploy/test_retire_codex_skills.py": 3.633,
   "tests/agent_deploy/test_update_agent_deploy_status.py": 0.11,
   "tests/agent_runtime/adapters/test_acpx_claude_adapter_modes.py": 0.157,
   "tests/agent_runtime/adapters/test_agy_cancel_recovery.py": 22.516,

@@ -749,7 +749,12 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "active_delegate_tasks", forbidden)
         monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1e12)
+        # Reads join the held wake-up refresh only briefly, then answer from the snapshot.
+        monkeypatch.setattr(state_helpers, "DORMANT_READ_WAIT_S", 0.05)
         try:
+            # The clock jump left the writer unread past the demand window; a
+            # read answers from the snapshot and wakes it.
+            assert snapshot.read()[0] == expected
             assert entered.wait(5), "periodic refresh never ran"
             for _ in range(2):
                 response = running.get("/api/delegate/active")
@@ -828,6 +833,67 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
     assert cold.read()[0] == {"ready": True}
 
 
+def test_periodic_snapshot_refreshes_only_while_read(monkeypatch):
+    """Defect class: a snapshot writer rescanned the task store every interval with no readers.
+
+    Unread past the demand window, the writer stops. The next read wakes it and
+    gets that fresh collection, never the minutes-old observation, and so does
+    a reader that overlaps the wake-up collection.
+    """
+    import asyncio
+    import threading
+
+    from lu_machinery.api import state_helpers
+
+    now = [0.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
+    lock = threading.Lock()
+    calls = []
+    waking, release = threading.Event(), threading.Event()
+
+    def compute():
+        with lock:
+            calls.append(now[0])
+            n = len(calls)
+            if n == 3:
+                # Nobody reads for a whole window. Advancing inside the third
+                # collection means no later refresh can start before the jump.
+                now[0] += state_helpers.DEMAND_WINDOW_S
+        if n == 4:  # the wake-up collection, held open for an overlapping reader
+            waking.set()
+            assert release.wait(5), "the test never released the wake-up collection"
+        return n
+
+    def count():
+        with lock:
+            return len(calls)
+
+    async def until(predicate, timeout=5.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            assert asyncio.get_running_loop().time() < deadline, "condition never held"
+            await asyncio.sleep(0.01)
+
+    async def scenario():
+        snapshot = state_helpers.PeriodicSnapshot(compute, 0.01)
+        async with snapshot.lifespan():
+            await until(lambda: count() >= 3)  # demanded at startup: refreshes repeat
+            await asyncio.sleep(0.3)  # thirty intervals without a reader
+            assert count() == 3, "an unread snapshot kept refreshing"
+
+            # Handlers read in the thread pool, as production routes do.
+            first = asyncio.ensure_future(asyncio.to_thread(snapshot.read))
+            await until(waking.is_set)  # the first read woke the writer
+            second = asyncio.ensure_future(asyncio.to_thread(snapshot.read))
+            await asyncio.sleep(0.2)
+            assert not second.done(), "an overlapping read returned the dormant observation"
+            release.set()
+            assert await first == (4, 0.0), "a dormant read returned the old observation"
+            assert await second == (4, 0.0)
+
+    asyncio.run(scenario())
+
+
 def test_snapshot_age_includes_collection_and_failed_refresh(tmp_path, monkeypatch):
     """Both endpoints expose advancing observation age, including refresh failures."""
     import asyncio
@@ -842,7 +908,7 @@ def test_snapshot_age_includes_collection_and_failed_refresh(tmp_path, monkeypat
     clock = [100.0]
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock[0])
     for snapshot, route, payload in (
-        (delegate_router.active_snapshot(ctx), lambda: asyncio.run(delegate_router.delegate_active(ctx)), {"tasks": []}),
+        (delegate_router.active_snapshot(ctx), lambda: delegate_router.delegate_active(ctx), {"tasks": []}),
         (fleet_workers_router.workers_snapshot(ctx), lambda: fleet_workers_router.get_workers(None, ctx), {None: {}, "": {}}),
     ):
         def fail():
