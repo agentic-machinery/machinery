@@ -97,6 +97,7 @@ TASK_SCOPES: dict[str, TaskScope] = {
             f"{_RULES}/critical-rules.md",
             f"{_RULES}/dispatch-must-use-worktree.md",
             f"{_RULES}/workflow.md",
+            f"{_RULES}/design-charter.md",
         ),
     ),
     "cli": TaskScope("CLI implementation", (f"{_RULES}/cli-help-standard.md",)),

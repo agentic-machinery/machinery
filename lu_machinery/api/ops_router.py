@@ -113,7 +113,8 @@ HEARTBEAT_ALERTNAMES = frozenset({"Watchdog"})
 # Alertmanager v2 alert states; anything else is a malformed reading.
 ALERT_STATES = frozenset({"active", "suppressed", "unprocessed"})
 # Names our own alerting rules define. Anything else stays UnrecognizedAlert;
-# labels are never passed through.
+# labels are never passed through. A rule added without its name here reads as
+# UnrecognizedAlert, so a new rule adds its name in the same change.
 _ALERT_NAMES = frozenset({
     "ApprovedNotLanded30m",
     "BackupSuccessOverdue",
@@ -139,6 +140,7 @@ _ALERT_NAMES = frozenset({
     "LuApiProbeSlow",
     "LuPaceStale",
     "MergeQueueStalled",
+    "MonitorApiSlowRoute",
     "NonLoopbackListener",
     "OffsiteBackupFreshnessUnknown",
     "OffsiteBackupOverdue",
@@ -153,6 +155,7 @@ _ALERT_NAMES = frozenset({
     "ShutDownUnitBecameActive",
     "SreWatchTimerMissed",
     "StalePRsIdleOver24h",
+    "SubscriptionPoolRunsOutBeforeReset",
     "SystemdUnitCrashLooping",
     "SystemdUnitFailed",
     "TeacherApiProbeDown",

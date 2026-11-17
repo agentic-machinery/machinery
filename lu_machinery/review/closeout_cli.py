@@ -1066,11 +1066,51 @@ def _checkout_top(repo_root: Path) -> Path:
         raise CloseoutStateError("the checkout's top level is unavailable") from exc
 
 
-def _inside(path: Path, top: Path) -> bool:
-    return path == top or top in path.parents
+def _checkout_source(path: Path, top: Path, head: str) -> bool:
+    """Whether ``path`` (resolved) is a file the checkout under review tracks, so it could be the change itself.
+
+    Tracked means in the work tree's index or in the reviewed head's tree, and a file is matched by
+    identity (device and inode), not by name, so a staged deletion, a case alias on a
+    case-insensitive filesystem or a hard link still counts. An installed release in an untracked
+    virtual environment inside the work tree (``<top>/.venv``) is not checkout source. No path
+    comparison decides it: a case alias of the checkout directory names the same files.
+
+    A file in another work tree nested in the checkout (a submodule, a linked worktree or a clone
+    below ``top``) counts too: the index lists a submodule only as its gitlink, never the files
+    under it, and a nested worktree can hold the reviewed head itself.
+    """
+    target = _file_identity(path)
+    if target is None:
+        raise CloseoutStateError("the running checklist file is unavailable")
+    top_identity = _file_identity(top)
+    nested = False
+    for parent in path.parents:
+        if _file_identity(parent) == top_identity:
+            if nested:
+                return True
+            break
+        nested = nested or _file_identity(parent / ".git") is not None
+    names = set(_checklist_git(top, "ls-files", "-z").split(b"\x00"))
+    names |= set(_checklist_git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", head).split(b"\x00"))
+    return any(_file_identity(top / os.fsdecode(name)) == target for name in names - {b""})
 
 
-def _judge_input(repo_root: Path, top: Path, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """``path``'s device and inode, without following a final symlink; None only when nothing is there.
+
+    Any other failure (a permission error, a symlink loop) cannot show that ``path`` is a different
+    file, so the guard fails closed on it.
+    """
+    try:
+        status = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise CloseoutStateError("a path in the checkout under review cannot be inspected") from exc
+    return status.st_dev, status.st_ino
+
+
+def _judge_input(repo_root: Path, top: Path, head: str, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
     """Machinery file ``relative`` as the merge-base holds it, else as the installed package holds it.
 
     A repository without the file at its merge-base (a consumer repository) cannot change the
@@ -1093,7 +1133,7 @@ def _judge_input(repo_root: Path, top: Path, merge_base: str, relative: str) -> 
         resolved = package_file.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:  # RuntimeError: a symlink loop before 3.13
         raise CloseoutStateError(f"{checkout_path} unavailable in the installed package") from exc
-    if _inside(resolved, top):
+    if _checkout_source(resolved, top, head):
         raise CloseoutStateError(
             f"{checkout_path} is missing at the merge-base and the only other copy is in the checkout "
             "under review; run this command from the installed release"
@@ -1382,23 +1422,27 @@ def _checklist_match(trigger: dict[str, Any], changed: dict[str, Any]) -> list[s
 def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, Any]:
     """The checklist items and code owners ``base..head`` touches, read from the merge-base, with the brief section."""
     top = _checkout_top(repo_root)
+    head_sha = _checklist_commit(repo_root, head)
     # This code matches the change and reads the judge inputs, so a copy from the checkout under
     # review could be the change itself, whatever data it reads.
-    if _inside(Path(__file__).resolve(), top):
+    try:
+        running = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop before 3.13
+        raise CloseoutStateError("the running checklist file is unavailable") from exc
+    if _checkout_source(running, top, head_sha):
         raise CloseoutStateError(
             "checklist is running from the checkout under review; run the installed release with "
             "python -P -m lu_machinery.review.closeout_cli"
         )
-    head_sha = _checklist_commit(repo_root, head)
     base_sha = _checklist_commit(repo_root, base)
     merge_base = _checklist_git(repo_root, "merge-base", base_sha, head_sha).decode().strip()
-    owners_raw, owners_source = _judge_input(repo_root, top, merge_base, _CODE_OWNERS_RELATIVE)
+    owners_raw, owners_source = _judge_input(repo_root, top, head_sha, merge_base, _CODE_OWNERS_RELATIVE)
     owners = _code_owners(owners_raw)
     if _JUDGE_CHANGE_AREA not in owners["areas"]:
         raise CloseoutStateError(f"code owners map lacks the {_JUDGE_CHANGE_AREA} area")
-    raw, source = _judge_input(repo_root, top, merge_base, _CHECKLIST_RELATIVE)
+    raw, source = _judge_input(repo_root, top, head_sha, merge_base, _CHECKLIST_RELATIVE)
     items = _checklist_items(raw, owners["areas"])
-    schema, schema_source = _judge_input(repo_root, top, merge_base, _SCHEMA_RELATIVE)
+    schema, schema_source = _judge_input(repo_root, top, head_sha, merge_base, _SCHEMA_RELATIVE)
     diff = _checklist_diff(repo_root, merge_base, head_sha)
     changed_paths = sorted({path for changed in diff for path in changed["paths"]})
     judge_globs = [_glob_regex(pattern) for pattern in _JUDGE_PATHS]

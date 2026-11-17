@@ -277,7 +277,9 @@ def test_reviewer_reproducer_publishes_no_mention_or_link_in_reason_or_marker(
     # The admission reason names CI Gate; hostile merge-group jobs stay inert.
     assert f"reason={reason} " in lines[0]
     assert keeper._check_state(subject.check_rows, HEAD) == reason
-    assert json.loads(path.read_text())["drops"] == {f"42:{HEAD}": 1}
+    state = json.loads(path.read_text())
+    assert f"42:{HEAD}" in state["ejections"]
+    assert "drops" not in state
 
 
 HOSTILE_NAMES = {

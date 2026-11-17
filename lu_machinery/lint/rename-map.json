@@ -53,6 +53,7 @@
  "agents_extensions/shared/rules/core-manifest.yaml": "machinery",
  "agents_extensions/shared/rules/core.md": "machinery",
  "agents_extensions/shared/rules/critical-rules.md": "machinery",
+ "agents_extensions/shared/rules/design-charter.md": "machinery",
  "agents_extensions/shared/rules/dispatch-must-use-worktree.md": "machinery",
  "agents_extensions/shared/rules/fleet-comms-coordination.md": "machinery",
  "agents_extensions/shared/rules/fleet-driver-routing.md": "machinery",
