@@ -1072,6 +1072,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ask_cursor_parser,
         ask_grok_build_parser,
     ):
+        ask_parser.description = (
+            "Send an ordinary ask through ACP; use review intent for toolful code review.\n"
+            "Provider delays are allowed: no inactivity deadline, only a 24-hour hang guard."
+        )
+        ask_parser.epilog = (
+            f"Example: {BRIDGE_ENTRY} {ask_parser.prog.split()[-1]} 'question' --task-id advice --from codex\n"
+            "Outputs: answer on stdout; durable transcript path on stderr and in the job receipt.\n"
+            "Exit codes: 0 successful reply; non-zero refusal, provider failure or hang guard.\n"
+            "Related: dispatch for implementation and toolful reviews."
+        )
+        if not any(action.dest == "no_timeout" for action in ask_parser._actions):
+            ask_parser.add_argument("--no-timeout", action="store_true")
+        for action in ask_parser._actions:
+            if action.dest == "no_timeout":
+                action.help = "Allow provider delays; same 24-hour hang guard as the default (default: false)."
         ask_parser.add_argument(
             "--subject-seat",
             action="append",
@@ -1821,11 +1836,7 @@ def _handle_acp_compat(args, target: str) -> None:
 
     from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
 
-    from ._acp_compat import (
-        ASK_HARD_TIMEOUT_DEFAULT_S,
-        ask_hard_timeout,
-        run_compat_ask,
-    )
+    from ._acp_compat import run_compat_ask
     from ._job_host_forward import AskForwardError
 
     try:
@@ -1842,8 +1853,7 @@ def _handle_acp_compat(args, target: str) -> None:
             review=False,
             output_path=getattr(args, "output_path", None),
             stdout_only=bool(getattr(args, "stdout_only", False)),
-            # None resolves the seat's per-seat timeout profile (#6877);
-            # --no-timeout bypasses every profile as before.
+            # Ordinary asks and --no-timeout share the 24-hour hang guard.
             hard_timeout=86400 if bool(getattr(args, "no_timeout", False)) else None,
         )
         if not bool(getattr(result, "ok", False)):
@@ -1856,10 +1866,9 @@ def _handle_acp_compat(args, target: str) -> None:
         raise SystemExit(str(exc)) from exc
     except AgentTimeoutError as exc:
         raise SystemExit(
-            f"ask-{target} exceeded hard_timeout={exc.hard_timeout}s "
-            f"(seat profile: ask-{target} defaults to {ask_hard_timeout(target)}s, "
-            f"generic default {ASK_HARD_TIMEOUT_DEFAULT_S}s). "
-            "Retry with --no-timeout to lift the wall-clock cap for this ask."
+            f"ask-{target} reached the absolute hang guard ({exc.hard_timeout}s). "
+            "Ordinary asks have no inactivity deadline; --no-timeout uses the same 24-hour hang guard. "
+            "The transcript path is printed above; storage warnings report any capture failure."
         ) from exc
     except (AskForwardError, PlaneRootAnchorError) as exc:
         # #7172: notebook ask forward / retired-plane refusals are one-liners.
