@@ -116,6 +116,7 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
     ]
     assert all(set(row) == {"alertname", "severity", "starts_at"} for row in body["alerts"])
+    assert body["stale_after_s"] == 60.0
     assert "leak" not in response.text and "ForeignAlert" not in response.text
     # One malformed item makes the whole reading unknown, never a healthy "nothing firing".
     for bad in ({}, None, {"labels": {"alertname": "X"}}, {"labels": {"alertname": "X"}, "status": {}},

@@ -107,6 +107,9 @@ ALERTMANAGER_PORT = 9093
 ALERTMANAGER_ALERTS_PATH = "/api/v2/alerts?active=true&silenced=false&inhibited=false"
 ALERTS_TTL_S = 15.0
 ALERTS_TIMEOUT_S = 3.0
+# A second reader may keep a cache hit 15 s old. Include the 3 s collector, 30 s page cycle,
+# 8 s HTTP budget and 4 s margin.
+ALERTS_STALE_AFTER_S = 60.0
 # The dead-man heartbeat fires all the time by design; it proves Alertmanager
 # is evaluating, so it is reported as a flag and not listed as a firing alert.
 HEARTBEAT_ALERTNAMES = frozenset({"Watchdog"})
@@ -234,11 +237,11 @@ async def firing_alerts(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     key = ctx_scoped_ttl_key(ctx, "ops", "alerts")
     # This loopback read is cheap. Waiting for it on expiry avoids serving the
     # previous page refresh's reading on every 30-second UI cycle.
-    payload = await cache_get_or_compute_async(key, ALERTS_TTL_S, _alerts_reading)
+    reading = await cache_get_or_compute_async(key, ALERTS_TTL_S, _alerts_reading)
+    # The bound travels in the body too, so a reader that loses the headers still judges the age.
+    payload = {**reading, "stale_after_s": ALERTS_STALE_AFTER_S}
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
-        # A second reader may keep a cache hit 15 s old. Include the 3 s
-        # collector, 30 s page cycle, 8 s HTTP budget and 4 s margin.
-        panel_values.observation_age_s(payload.get("observed_at")), 60.0,
+        panel_values.observation_age_s(payload.get("observed_at")), ALERTS_STALE_AFTER_S,
         unavailable=payload.get("status") != "ok",
     ))
 
