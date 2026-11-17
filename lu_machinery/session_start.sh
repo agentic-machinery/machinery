@@ -157,6 +157,6 @@ except Exception as e:
 fi
 
 echo ""
-echo -e "${DIM}Endpoints: $API/api/state/{preparation,summary,pipeline/{track},weak-points,failing}${NC}"
+echo -e "${DIM}Endpoints: $API/api/state/{summary,pipeline/{track},weak-points}${NC}"
 echo -e "${DIM}Dashboard: $API/ | Docs: $API/docs${NC}"
 echo ""

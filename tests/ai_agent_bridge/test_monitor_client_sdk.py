@@ -214,6 +214,7 @@ def test_sdk_not_modified_path(sdk, monkeypatch):
 
 def test_comms_live_activity_does_not_point_at_build_status():
     resp = client.get("/api/comms/live-activity")
+    assert resp.status_code == 200
     assert resp.headers.get("X-Deprecated") is None
     assert resp.headers.get("X-Deprecated-Use") is None
     assert "build-status" not in resp.headers.get("Warning", "")
