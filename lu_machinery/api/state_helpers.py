@@ -344,6 +344,42 @@ def schedule_cache_refresh(
     threading.Thread(target=_run, name="status-cache-refresh", daemon=True).start()
 
 
+def cache_get_or_refresh(key: str, ttl: float, compute: Callable[[], object], *, wait_s: float) -> tuple[object, float] | None:
+    """TTL read whose recompute never holds a request longer than ``wait_s``.
+
+    A value younger than ``ttl`` is returned at once with its age. Otherwise the
+    caller starts (or joins) one background flight and waits at most ``wait_s``
+    for it. If the flight is still running, or fails, the previous value is
+    returned with its real age (stale-while-revalidate); with no previous value
+    a running flight returns ``None`` so the caller can report a warming state,
+    and a failed flight raises. The flight keeps running and stores its result.
+    """
+    stored = cache_get_stored(key)
+    if stored is not None and stored[1] < ttl:
+        return stored
+    fut, leader, cached = _claim_flight(key, ttl, force=False)
+    if cached is not None:
+        return cached, 0.0
+    assert fut is not None
+    if leader:
+
+        def _lead() -> None:
+            with suppress(Exception):
+                _finish_flight(key, fut, compute)
+
+        threading.Thread(target=_lead, name="status-cache-refresh", daemon=True).start()
+    try:
+        return fut.result(timeout=wait_s), 0.0
+    except TimeoutError:
+        # Re-read so the age includes the wait (or the flight finished just now).
+        return cache_get_stored(key)
+    except Exception:
+        if stored is None:
+            raise
+        _cache_log.debug("cache refresh failed; serving the previous value", exc_info=True)
+        return cache_get_stored(key)
+
+
 def cache_invalidate(prefix: str = "") -> int:
     """Drop every cache entry whose key starts with ``prefix``.
 

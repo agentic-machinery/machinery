@@ -14,6 +14,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -233,20 +234,40 @@ def _probe_backlog_and_dead_letters(root: Path | None, repo_root: Path | None) -
     }
 
 
-def _probe_bottleneck_slice(
-    root: Path | None,
-    repo_root: Path | None,
-    stream_id: str | None,
-) -> dict[str, Any]:
-    plane_root = root if root is not None else default_plane_root(repo_root=repo_root)
-    plane_db = plane_root / "comms.sqlite3"
-    tasks_dir = (repo_root or Path.cwd()) / "batch_state" / "tasks"
+BottleneckMetrics = Callable[[Path, Path], dict[str, Any] | None]
 
-    payload = collect_stream_bottleneck_metrics(
+
+def collect_board_bottleneck_metrics(tasks_dir: Path, plane_db: Path) -> dict[str, Any]:
+    """The board's bottleneck collection: lifecycle spans only, no GitHub lookups."""
+    return collect_stream_bottleneck_metrics(
         tasks_dir=tasks_dir,
         plane_db=plane_db,
         github_lookup=lambda repo, pr_number: (None, "skipped_for_cold_start"),
     )
+
+
+def _probe_bottleneck_slice(
+    root: Path | None,
+    repo_root: Path | None,
+    stream_id: str | None,
+    collector: BottleneckMetrics | None = None,
+) -> dict[str, Any] | ProbeResult:
+    """Top streams' bottleneck spans; ``collector`` returning ``None`` means still warming."""
+    plane_root = root if root is not None else default_plane_root(repo_root=repo_root)
+    plane_db = plane_root / "comms.sqlite3"
+    tasks_dir = (repo_root or Path.cwd()) / "batch_state" / "tasks"
+
+    payload = (collector or collect_board_bottleneck_metrics)(tasks_dir, plane_db)
+    if payload is None:
+        return ProbeResult(
+            status="skipped",
+            elapsed_ms=0.0,
+            data={
+                "reason": "warming",
+                "tasks_store": batch_tasks_store(reachable=tasks_dir.is_dir()),
+                "plane_store": comms_plane_store(reachable=plane_db.is_file()),
+            },
+        )
     streams = payload.get("by_stream_epic") or {}
 
     if stream_id and stream_id in streams:
@@ -261,6 +282,7 @@ def _probe_bottleneck_slice(
         "tasks_store": batch_tasks_store(reachable=tasks_dir.is_dir()),
         "plane_store": comms_plane_store(reachable=plane_db.is_file()),
         "db_missing": not plane_db.is_file(),
+        **({"cache_age_s": payload["cache_age_s"]} if "cache_age_s" in payload else {}),
     }
 
 
@@ -885,8 +907,14 @@ def build_cold_start_board(
     needle: str | None = None,
     root: Path | None = None,
     repo_root: Path | None = None,
+    bottleneck_metrics: BottleneckMetrics | None = None,
+    pr_list_probe: Callable[[], ProbeResult] | None = None,
 ) -> dict[str, Any]:
-    """Build driver cold start board with fail-open diagnostic probes."""
+    """Build driver cold start board with fail-open diagnostic probes.
+
+    ``bottleneck_metrics`` and ``pr_list_probe`` replace the direct bottleneck
+    collection and ``gh pr list`` call; the Monitor API passes cached versions.
+    """
     r_root = repo_root or Path.cwd()
     p_root = root if root is not None else default_plane_root(repo_root=repo_root)
 
@@ -911,6 +939,7 @@ def build_cold_start_board(
         p_root,
         r_root,
         eff_stream_id,
+        bottleneck_metrics,
     )
 
     orient_probe = _probe_orient_lean()
@@ -925,7 +954,7 @@ def build_cold_start_board(
 
     inbox_probe = run_fail_open_probe("inbox_check", _probe_inbox, p_root, r_root, eff_agent)
 
-    gh_probe = run_fail_open_probe("gh_pr_list", _probe_gh_pr_list)
+    gh_probe = run_fail_open_probe("gh_pr_list", pr_list_probe or _probe_gh_pr_list)
 
     probes: dict[str, Any] = {
         "capsule_session_env": env_probe.to_dict(),
