@@ -2010,7 +2010,6 @@
  "scripts/pre_commit/project_python.sh": "product",
  "scripts/pre_commit/regen_lesson_schema.py": "product",
  "scripts/pre_commit/regen_lexicon_fingerprint.py": "product",
- "scripts/pre_push/dagger_pytest.sh": "machinery",
  "scripts/project_api/__init__.py": "product",
  "scripts/project_api/admin_router.py": "product",
  "scripts/project_api/agent_router.py": "product",
