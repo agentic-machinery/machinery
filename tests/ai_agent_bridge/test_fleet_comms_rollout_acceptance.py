@@ -20,9 +20,11 @@ from lu_machinery.fleet_comms.request_executor import RequestExecutor
 _REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
 _HEAD_SHA = "a" * 40
 
+pytestmark = pytest.mark.usefixtures("fleet_comms_primary")
+
 
 @pytest.fixture
-def dual_write_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+def dual_write_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet_comms_primary) -> tuple[Path, Path]:
     """Point the legacy bridge and opt-in plane at isolated durable stores."""
     legacy_db = tmp_path / "legacy" / "messages.db"
     plane_root = tmp_path / "batch_state" / "fleet-comms" / "v1"

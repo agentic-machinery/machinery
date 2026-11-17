@@ -85,6 +85,16 @@ def test_non_release_code_cannot_migrate_live_store(tmp_path: Path, monkeypatch)
     with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
         ArtifactStore(root=tmp_path / "unknown-plane")
     assert not (tmp_path / "unknown-plane").exists()
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    loop = tmp_path / "identity-loop"
+    loop.symlink_to(loop)
+    with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
+        paths.assert_store_write_allowed(db, package_file=str(loop / "fleet_comms" / "artifacts.py"))
+    live.rename(live.with_name("original-live"))
+    live.symlink_to(loop)
+    with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
+        ArtifactStore(root=tmp_path / "loop-identity-plane")
+    assert not (tmp_path / "loop-identity-plane").exists()
 
 
 def test_test_session_fleet_root_is_isolated(fleet_comms_root) -> None:

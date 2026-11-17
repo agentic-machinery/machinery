@@ -21,7 +21,7 @@ from lu_machinery.ai_agent_bridge._db import (
 
 
 @pytest.fixture
-def bridge_db(tmp_path):
+def bridge_db(tmp_path, fleet_comms_primary):
     """Use a temporary broker DB so tests never touch the real one."""
     db_path = tmp_path / "messages.db"
     with patch.dict(os.environ, {"AB_DB_PATH": str(db_path)}):

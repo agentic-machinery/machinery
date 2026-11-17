@@ -7,7 +7,7 @@ from lu_machinery.fleet_comms import migrations
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
 
 
-def test_bridge_upgrades_legacy_copy_without_mutating_legacy_rows(tmp_path, monkeypatch) -> None:
+def test_bridge_upgrades_legacy_copy_without_mutating_legacy_rows(tmp_path, monkeypatch, fleet_comms_primary) -> None:
     db_path = tmp_path / "messages.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
@@ -45,7 +45,7 @@ def test_bridge_upgrades_legacy_copy_without_mutating_legacy_rows(tmp_path, monk
 
 
 def test_apply_migrations_closes_prelock_read_transaction_and_returns_version(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, fleet_comms_primary
 ) -> None:
     """A transaction retained by the optimistic read must not nest BEGIN IMMEDIATE."""
     conn = sqlite3.connect(tmp_path / "messages.db")

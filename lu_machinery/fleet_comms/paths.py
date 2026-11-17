@@ -6,7 +6,7 @@ import os
 import sysconfig
 from pathlib import Path
 
-from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.repo_root import MachineryConfigError, resolve_path, state_root
 from lu_machinery.guardrails.worktree_containment import (
     NotAGitRepositoryError,
     canonicalize,
@@ -48,19 +48,20 @@ def assert_store_write_allowed(store: Path, *, package_file: str) -> None:
     back to source is not an installed release. No subprocess or store open is
     needed to establish this boundary.
     """
-    package = Path(package_file).resolve().parents[1]
+    package = Path(package_file).parent.parent
     try:
-        primary = state_root().resolve(strict=True)
-        live_store = (primary / DEFAULT_ROOT_REL / "comms.sqlite3").resolve()
-        store = store.resolve()
+        package = resolve_path(package_file).parents[1]
+        primary = resolve_path(state_root(), strict=True)
+        live_store = resolve_path(primary / DEFAULT_ROOT_REL / "comms.sqlite3")
+        store = resolve_path(store)
         if store != live_store and not (
             store.exists() and live_store.exists() and store.samefile(live_store)
         ):
             return
         venv = str(primary / ".venv")
-        site = Path(sysconfig.get_path(
+        site = resolve_path(sysconfig.get_path(
             "purelib", scheme="venv", vars={"base": venv, "platbase": venv}
-        )).resolve()
+        ))
     except (MachineryConfigError, OSError, RuntimeError, KeyError, ValueError) as exc:
         raise LiveStoreReleaseError("live_store_identity_unknown", package, store) from exc
     if package != site / "lu_machinery":

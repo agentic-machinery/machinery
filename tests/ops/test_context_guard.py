@@ -1210,7 +1210,7 @@ def test_fleet_sender_uses_the_data_file_identity_and_never_raises(monkeypatch: 
 
 
 @pytest.fixture
-def temp_plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def temp_plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fleet_comms_primary) -> Path:
     """A temporary Fleet Comms authority store; fleet_sender resolves it through FLEET_COMMS_ROOT."""
     root = tmp_path / "plane"
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))

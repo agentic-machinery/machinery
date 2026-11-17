@@ -13,6 +13,8 @@ import pytest
 
 from lu_machinery.orchestration import backup_failure_alert as alert
 
+pytestmark = pytest.mark.usefixtures("fleet_comms_primary")
+
 BACKUP = "learn-ukrainian-backup.service"
 RETENTION = "learn-ukrainian-backup-retention.service"
 

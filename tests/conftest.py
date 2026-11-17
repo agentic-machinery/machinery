@@ -130,6 +130,18 @@ def fleet_comms_root(pytestconfig: pytest.Config) -> Path:
     return pytestconfig._fleet_comms_root
 
 
+@pytest.fixture
+def fleet_comms_primary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Opt-in identity anchor for temporary Fleet writers; never the code checkout."""
+    primary = tmp_path / "fleet-primary"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    return primary
+
+
 @pytest.fixture(scope="session", autouse=True)
 def sources_log_dir(tmp_path_factory: pytest.TempPathFactory) -> Generator[Path, None, None]:
     """Keep sources request logs outside the checkout in each pytest worker."""
@@ -2992,14 +3004,10 @@ def pytest_configure(config: pytest.Config) -> None:
     # also open stores. Set the default before importing any test module.
     fleet_root = tempfile.TemporaryDirectory(prefix="fleet-comms-")
     config.add_cleanup(fleet_root.cleanup)
-    config._fleet_comms_root = Path(fleet_root.name)
+    config._fleet_comms_root = Path(fleet_root.name).resolve(strict=True)
     fleet_env = pytest.MonkeyPatch()
     config.add_cleanup(fleet_env.undo)
-    fleet_env.setenv("FLEET_COMMS_ROOT", fleet_root.name)
-    # Clean-machine runners have no host settings; their own checkout anchors
-    # identity checks for explicitly named temporary stores.
-    if not os.environ.get("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"):
-        fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(main_checkout_root(_REPO_ROOT)))
+    fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
     config.addinivalue_line("markers", "reads_content: test reads a controlled content or policy fixture")
     config.pluginmanager.register(
         _TelemetryIsolation(

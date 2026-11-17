@@ -869,8 +869,6 @@ class ArtifactStore:
         self.blob_root = self.root / "blobs" / "sha256"
         self.db_path = self.root / "comms.sqlite3"
         self._readonly = bool(readonly)
-        if not self._readonly:
-            assert_store_write_allowed(self.db_path, package_file=__file__)
         self._authority = assert_component_supported(StoreId.FLEET_COMMS, "artifact_store")
         if self._authority is Authority.PG:
             # Byte-plane slice (#603): connect first, touch no local disk.
@@ -904,6 +902,7 @@ class ArtifactStore:
             )
             self._conn.row_factory = sqlite3.Row
             return
+        assert_store_write_allowed(self.db_path, package_file=__file__)
         self._prepare_private_dir(self.root)
         self._prepare_private_dir(self.root / "blobs")
         self._prepare_private_dir(self.blob_root)

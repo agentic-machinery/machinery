@@ -14,6 +14,11 @@ from psycopg.conninfo import make_conninfo
 _PG_DSN_ENV = "LEARN_UKRAINIAN_CP_PG_DSN"
 
 
+@pytest.fixture(autouse=True)
+def isolated_fleet_primary(fleet_comms_primary) -> None:
+    """Fleet writers opt into a private anchor; no-root suites elsewhere do not."""
+
+
 @pytest.fixture(scope="session")
 def fleet_comms_pg_dsn(worker_id: str) -> Iterator[str]:
     """One disposable database for every PG test in this worker process.

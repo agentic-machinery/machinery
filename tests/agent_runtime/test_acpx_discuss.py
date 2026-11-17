@@ -20,6 +20,8 @@ from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.fleet_comms.message_plane import default_plane_root
 from tests.helpers.python import project_python
 
+pytestmark = pytest.mark.usefixtures("fleet_comms_primary")
+
 
 def _result(agent: str, response: str, *, tokens: int = 5) -> Result:
     return Result(

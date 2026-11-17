@@ -12,6 +12,8 @@ from lu_machinery.orchestration import pr_ownership as own
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.publish import recovery
 
+pytestmark = pytest.mark.usefixtures("fleet_comms_primary")
+
 REPO = "learn-ukrainian/learn-ukrainian.github.io"
 KEY = own.pr_key(REPO, 42)
 T0 = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)

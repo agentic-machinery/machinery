@@ -739,7 +739,7 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
     (product / "README.md").write_text(
         "Synthetic product checkout for the lu-machinery clean-machine drill.\n"
     )
-    (product / ".gitignore").write_text("batch_state/\nlogs/\n.deploy-state/\n")
+    (product / ".gitignore").write_text("batch_state/\nlogs/\n.deploy-state/\n.venv\n")
     (product / "scripts" / "curriculum").mkdir()
     (product / "scripts" / "curriculum" / "admission_policy.v1.json").write_text(
         json.dumps(ADMISSION_POLICY, indent=2) + "\n"
@@ -1983,6 +1983,9 @@ def main(argv: list[str] | None = None) -> int:
             "interpreter_roots": interpreter_roots(base_py),
         }
         (out / "names.json").write_text(json.dumps(names, indent=1))
+        # The synthetic primary names its installed release just like a real
+        # primary. The venv remains the existing isolated wheel environment.
+        (paths["product"] / ".venv").symlink_to(venv, target_is_directory=True)
         seed_world(names)
         phases["forward"] = run_isolated_phase(
             workdir, "forward", args.version, isolation, args.only

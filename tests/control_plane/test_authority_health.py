@@ -14,7 +14,7 @@ from lu_machinery.fleet_comms.cli import _short_plane_health
 
 
 @pytest.fixture(autouse=True)
-def isolated_authority(monkeypatch, tmp_path):
+def isolated_authority(monkeypatch, tmp_path, fleet_comms_primary):
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY", "sqlite")
     monkeypatch.delenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", raising=False)
     monkeypatch.delenv("LEARN_UKRAINIAN_CP_PG_DSN", raising=False)

@@ -69,7 +69,7 @@ def snapshot(stores):
 
 
 @pytest.fixture
-def stores(tmp_path, monkeypatch):
+def stores(tmp_path, monkeypatch, fleet_comms_primary):
     legacy = tmp_path / "messages.db"
     authority = tmp_path / "comms.sqlite3"
     with sqlite3.connect(legacy) as conn:

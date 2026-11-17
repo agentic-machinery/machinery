@@ -22,7 +22,7 @@ BASE, LOCAL, REMOTE = "a" * 40, "b" * 40, "c" * 40
 
 
 @pytest.fixture
-def host(tmp_path, monkeypatch):
+def host(tmp_path, monkeypatch, fleet_comms_primary):
     tasks = tmp_path / "tasks"
     tasks.mkdir()
     target = mod.stale.FetchTarget("fixture", "https://github.com/example/public.git")

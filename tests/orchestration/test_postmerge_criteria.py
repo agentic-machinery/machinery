@@ -8,7 +8,7 @@ import pytest
 
 from lu_machinery.orchestration import postmerge_criteria as pc
 
-pytestmark = pytest.mark.usefixtures("github_command_boundary")
+pytestmark = pytest.mark.usefixtures("github_command_boundary", "fleet_comms_primary")
 
 OWNED = "- [ ] AC-01: After merge, review receipts; owner: codex-devops; due: 2026-11-20"
 UNOWNED = "- [ ] AC-02: Unit tests pass"
