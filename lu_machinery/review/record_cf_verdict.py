@@ -1689,10 +1689,6 @@ def _require_qualified_reviewer(
     # when the profile field says code. The seat allowlist covers that too.
     if is_ukrainian_review(task) and (agent, family) not in UKRAINIAN_SEAT_ROUTES:
         raise RecordError("reviewer not qualified: Ukrainian review needs a Gemini or Sol seat")
-    if profile == "ukrainian":
-        if facts.subject_seats or facts.subject_families or is_security_sensitive_change(facts.changed_paths):
-            raise RecordError("reviewer not qualified: protected scope needs a code-profile review")
-        return
     canonical = resolve_catalog_model_id(model)
     candidates = [
         candidate
@@ -1701,6 +1697,10 @@ def _require_qualified_reviewer(
     ]
     if not candidates:
         raise RecordError(f"reviewer not qualified: {agent}/{model} is not a catalog review candidate")
+    if profile == "ukrainian":
+        if facts.subject_seats or facts.subject_families or is_security_sensitive_change(facts.changed_paths):
+            raise RecordError("reviewer not qualified: protected scope needs a code-profile review")
+        return
     inputs = facts.resolver_inputs(
         risk=risk,
         review_profile=seat_profile,
