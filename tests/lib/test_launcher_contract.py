@@ -320,7 +320,8 @@ def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
     [
         ("start-codex.sh", [], CURRENT_SOL, "high"),
         ("start-codex-driver.sh", ["--epic", "devops"], CURRENT_SOL, "high"),
-        ("start-codex.sh", ["--model", CURRENT_SOL, "--effort", "max"], CURRENT_SOL, "max"),
+        # A non-default effort the current Sol offers (models.<id>.efforts); max is refused.
+        ("start-codex.sh", ["--model", CURRENT_SOL, "--effort", "medium"], CURRENT_SOL, "medium"),
     ],
 )
 def test_codex_launchers_pin_roles_and_preserve_explicit_effort(launcher, args, model, effort):

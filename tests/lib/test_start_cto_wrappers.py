@@ -64,8 +64,10 @@ def test_cto_selection_and_dry_run(name: str, case: str, launch_with_usage) -> N
     elif case == "environment":
         env, expected_model, effort = {"LAUNCHER_MODEL": alternate, "LAUNCHER_EFFORT": "medium"}, alternate, "medium"
     elif case == "precedence":
+        # The current Sol offers only medium and high (models.<id>.efforts), so its CLI effort is medium.
+        cli_effort = "xhigh" if name == WRAPPERS[0] else "medium"
         env = {"LAUNCHER_MODEL": "not-certified", "LAUNCHER_EFFORT": "low"}
-        args, effort = ("--model=" + model, "--effort", "xhigh"), "xhigh"
+        args, effort = ("--model=" + model, "--effort", cli_effort), cli_effort
     result = launch_with_usage("0", *args, name=name, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     command = shlex.split(
