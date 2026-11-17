@@ -1674,9 +1674,11 @@ jobs:
           python -I -m venv --without-pip product-venv
           grep -viE -e '^(torch|torchvision|open_clip_torch|stanza)==' -e '^\./packages/v4-runtime$' \
             "$product/requirements-lock.txt" > product-requirements.txt
-          "$uv" pip install --python product-venv/bin/python --no-deps -r product-requirements.txt
+          # --no-config: the product checkout sits inside this repository, whose
+          # pyproject.toml [tool.uv] pins this workflow's uv, not the product's.
+          "$uv" pip install --no-config --python product-venv/bin/python --no-deps -r product-requirements.txt
           cd "$product"
-          "$uv" pip install --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
+          "$uv" pip install --no-config --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
           "$work/product-venv/bin/python" packages/v4-runtime/build_assets.py
 
       - name: Collect the product's tests with the candidate first
