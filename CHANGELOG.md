@@ -9,6 +9,41 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.28"></a>
+## [0.1.28] - 2026-11-17
+
+### Added
+
+- Add Gemini 4 Hydrogen to every council and parallel review ([#683](https://github.com/learn-ukrainian/machinery/pull/683))
+- Make Gemini 4 Hydrogen the default Gemini work model ([#686](https://github.com/learn-ukrainian/machinery/pull/686))
+- Add verify_run for the api, sources, and host areas ([#696](https://github.com/learn-ukrainian/machinery/pull/696))
+- Record an X-Verified line and observe it ([#695](https://github.com/learn-ukrainian/machinery/pull/695))
+
+### Changed
+
+- Say when the handoff_note must be written ([#673](https://github.com/learn-ukrainian/machinery/pull/673))
+- Class 56 learn-ukrainian files and the review taxonomy as product in the rename map ([#681](https://github.com/learn-ukrainian/machinery/pull/681))
+- Stop the cold-start board rescanning the whole task ledger per request ([#691](https://github.com/learn-ukrainian/machinery/pull/691))
+
+### Fixed
+
+- Installed agent shims and push hook run on their venv and reach the real tool ([#674](https://github.com/learn-ukrainian/machinery/pull/674))
+- Give the project-state reporter both checkout roots ([#677](https://github.com/learn-ukrainian/machinery/pull/677))
+- Anchor the default plane on the shared-state root, never the cwd ([#678](https://github.com/learn-ukrainian/machinery/pull/678))
+- Run full PR suite for machinery lock changes ([#679](https://github.com/learn-ukrainian/machinery/pull/679))
+- Restore sys.modules and sys.path in sources_product_root ([#684](https://github.com/learn-ukrainian/machinery/pull/684))
+- Council is Opus, Sol and Grok; Hydrogen keeps work roles only (supersedes #687) ([#689](https://github.com/learn-ukrainian/machinery/pull/689))
+- Keep AST fingerprints identical on Python 3.12 and 3.14 ([#690](https://github.com/learn-ukrainian/machinery/pull/690))
+- An unpinned review runs the lane's formal review default ([#692](https://github.com/learn-ukrainian/machinery/pull/692))
+- Recover ownership verification after fetch failures ([#688](https://github.com/learn-ukrainian/machinery/pull/688))
+- Admit declared external drain recipients (eggbot, dot, mac-agent) ([#693](https://github.com/learn-ukrainian/machinery/pull/693))
+- Serve cached metrics and detach slow orient scans ([#702](https://github.com/learn-ukrainian/machinery/pull/702))
+
+### Removed
+
+- Remove unreachable scratch tools and the fleet_repos shim ([#680](https://github.com/learn-ukrainian/machinery/pull/680))
+- Retire the unused Dagger pytest replay ([#685](https://github.com/learn-ukrainian/machinery/pull/685))
+
 <a id="v0.1.27"></a>
 ## [0.1.27] - 2026-11-16
 
@@ -650,7 +685,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.27...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...HEAD
+[0.1.28]: https://github.com/learn-ukrainian/machinery/compare/v0.1.27...v0.1.28
 [0.1.27]: https://github.com/learn-ukrainian/machinery/compare/v0.1.26...v0.1.27
 [0.1.26]: https://github.com/learn-ukrainian/machinery/compare/v0.1.25...v0.1.26
 [0.1.25]: https://github.com/learn-ukrainian/machinery/compare/v0.1.24...v0.1.25
