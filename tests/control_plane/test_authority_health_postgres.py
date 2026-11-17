@@ -130,21 +130,13 @@ def test_real_pg_adapter_api_and_cli_agree_without_sqlite(isolated_pg, tmp_path,
     with TestClient(app) as client:
         health = client.get("/api/fleet/health").json()
         overview = client.get("/api/fleet/overview").json()
-        facade = client.get("/api/fleet/facade/status").json()
-        for projected in (health, overview["health"], facade["plane_status"]):
+        for projected in (health, overview["health"]):
             assert projected["schema"]["authority"] == "pg"
             assert projected["store"] == status["store"]
             assert not projected["schema"].get("db_error")
         assert health["ok"] is True
         assert health["authority_health"]["state"] == "idle"
         assert overview["availability"] == "empty"
-        assert facade["health"]["healthy"] is True
-        for suffix in ("metrics", "backlog", "dead"):
-            payload = client.get(f"/api/fleet/facade/{suffix}").json()
-            assert payload["authority"] == "pg"
-            assert payload["store"]["reachable"] is True
-            assert not payload.get("db_missing")
-            assert not payload.get("db_error")
         # A detail component not ported to PG is explicitly unsupported.
         legacy = client.get("/api/fleet/requests").json()
         assert legacy["availability"] == "authority_unsupported_component"

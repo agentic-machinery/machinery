@@ -1,18 +1,10 @@
-"""Read-only API coverage for the fleet rollover registry."""
+"""Orient projection of the fleet rollover registry."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
-from fastapi.testclient import TestClient
-
 import lu_machinery.api.rollover_router as rollover_router
-from lu_machinery.api.main import app
-from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.orchestration import task_identity
 from lu_machinery.orchestration.task_family import rollover_registry as registry
-
-client = TestClient(app, raise_server_exceptions=False)
 
 
 def _record(
@@ -70,101 +62,6 @@ def _record(
         "terminal_reason": None,
         "last_reconciliation": None,
     }
-
-
-def test_rollover_audit_route_is_read_only_and_uses_live_repo_root(monkeypatch, tmp_path):
-    captured = {}
-
-    def fake_audit(root, *, stale_hours=registry.DEFAULT_STALE_HOURS):
-        captured["root"] = root
-        captured["stale_hours"] = stale_hours
-        return {
-            "schema_version": 1,
-            "generated_at": "2026-07-16T10:00:00Z",
-            "counts": {"total": 1, "live_pending": 1, "corrupt": 0},
-            "entries": [registry.candidate_summary(_record())],
-            "errors": [],
-            "mutation_allowed": False,
-        }
-
-    monkeypatch.setattr(app.state, "ctx", fixture_context(tmp_path))
-    monkeypatch.setattr(rollover_router.registry, "audit_fleet", fake_audit)
-
-    response = client.get("/api/rollovers")
-
-    assert response.status_code == 200
-    assert response.json()["mutation_allowed"] is False
-    assert captured == {"root": tmp_path, "stale_hours": registry.DEFAULT_STALE_HOURS}
-
-
-def test_rollover_audit_rejects_invalid_agent_filter(monkeypatch):
-    monkeypatch.setattr(
-        rollover_router.registry,
-        "audit_fleet",
-        lambda _root, *, stale_hours: {
-            "counts": {"total": 0, "live_pending": 0, "corrupt": 0},
-            "entries": [],
-            "errors": [],
-        },
-    )
-
-    response = client.get("/api/rollovers?agent=../codex")
-
-    assert response.status_code == 400
-
-
-def test_rollover_exact_selector_ignores_unrelated_pending_records(monkeypatch):
-    selected = _record()
-    unrelated = _record(
-        lineage_id="lineage-other",
-        rollover_id="rollover-other",
-        source_thread_id="source-other",
-    )
-    monkeypatch.setattr(rollover_router.registry, "scan_records", lambda _root: ([selected, unrelated], []))
-    monkeypatch.setattr(
-        rollover_router.registry,
-        "utc_now",
-        lambda: datetime(2026, 7, 16, 10, tzinfo=UTC),
-    )
-
-    response = client.get("/api/rollovers?source_thread_id=source-api")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["entry"]["lineage_id"] == "lineage-api"
-    assert payload["classification"] == registry.AuditClassification.AWAITING_NATIVE_ACTION.value
-    assert payload["mutation_allowed"] is False
-
-
-def test_rollover_exact_selector_fails_closed_when_ambiguous(monkeypatch):
-    first = _record()
-    second = _record(
-        lineage_id="lineage-other",
-        rollover_id="rollover-other",
-        source_thread_id="source-api",
-    )
-    monkeypatch.setattr(rollover_router.registry, "scan_records", lambda _root: ([first, second], []))
-
-    response = client.get("/api/rollovers?source_thread_id=source-api")
-
-    assert response.status_code == 409
-    assert len(response.json()["detail"]["matches"]) == 2
-
-
-def test_rollover_exact_selector_surfaces_corrupt_authoritative_record(monkeypatch, tmp_path):
-    record = _record()
-    corrupt_path = registry.record_path(tmp_path, **record["key"]).relative_to(tmp_path).as_posix()
-    monkeypatch.setattr(app.state, "ctx", fixture_context(tmp_path))
-    monkeypatch.setattr(
-        rollover_router.registry,
-        "scan_records",
-        lambda _root: ([record], [{"path": corrupt_path, "error": "malformed record"}]),
-    )
-
-    response = client.get("/api/rollovers?source_thread_id=source-api")
-
-    assert response.status_code == 409
-    assert "corrupt durable source" in response.json()["detail"]["error"]
 
 
 def test_rollover_orient_projection_exposes_only_actionable_entries(monkeypatch, tmp_path):

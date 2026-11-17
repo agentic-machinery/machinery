@@ -20,7 +20,3 @@ Monitor(
 
 `v7_build.py` emits JSONL events from the wrapper and `linear_pipeline.py`: single-module lifecycle notifications such as `phase_done`, `review_score`, and `module_done`; writer/reviewer telemetry such as `writer_cot_emit`, `writer_tool_call`, `writer_end_gate`, `writer_tool_theatre`, `phase_writer_summary`, `mcp_config_resolved`, `reviewer_dim_evidence`, `reviewer_audit_call`, and `phase_review_summary`; and correction diagnostics `writer_correction_unparseable`, `reviewer_fixes_unparseable`, `reviewer_fixes_anchor_unmatched`. Each line becomes a notification — zero polling overhead.
 
-For state queries without running builds, use the Monitor API (`docs/MONITOR-API.md`):
-- Track health: `/api/state/track-health/a1`
-- Failing modules: `/api/state/failing?track=a2`
-- Build status: `/api/state/build-status/a1`

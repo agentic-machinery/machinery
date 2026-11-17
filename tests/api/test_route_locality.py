@@ -2,31 +2,15 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import get_args
 
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-
-from lu_machinery.api.monitor_context import fixture_context
-from lu_machinery.api.route_contracts import (
-    RouteLocality,
-    router,
-)
+from lu_machinery.api.route_contracts import ROUTE_CONTRACTS, RouteLocality, all_route_contracts
 
 VALID_LOCALITIES = set(get_args(RouteLocality))
 
 
-def test_contracts_routes_endpoint_exposes_locality(tmp_path: Path) -> None:
-    app = FastAPI()
-    app.state.ctx = fixture_context(tmp_path)
-    app.include_router(router, prefix="/api/contracts")
-    client = TestClient(app)
-
-    resp = client.get("/api/contracts/routes")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert "route_contracts" in data
-    for entry in data["route_contracts"]:
-        assert "locality" in entry
-        assert entry["locality"] in VALID_LOCALITIES
+def test_route_contracts_expose_locality() -> None:
+    entries = [*ROUTE_CONTRACTS, *all_route_contracts()]
+    assert entries
+    for entry in entries:
+        assert entry.locality in VALID_LOCALITIES

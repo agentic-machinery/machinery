@@ -109,7 +109,7 @@ class ProductContribution:
     maps each declared page or asset URL path (``"index.html"``,
     ``"data/status.json"``) to its file; nothing else under the product root is
     served. ``route_contracts`` and ``page_contracts`` join the machinery
-    registry at ``/api/contracts/routes``. ``preload`` and
+    registry. ``preload`` and
     ``preload_optional`` join the machinery startup preload. ``warmup`` hooks
     run in the machinery state-scan warmup thread after the routing-budget
     warm. Product resources created through ``ctx.runtime`` close with the

@@ -14,7 +14,7 @@ remain authoritative in every currently implemented plane mode.
 | GET | `/api/fleet/health` | Sanitized mode, health, schema, and pre-flip authority posture |
 | GET | `/api/fleet/overview` | Durable requests/messages/reviews/dead-letter/ACP counts |
 | GET | `/api/fleet/agents` or `/api/fleet/endpoints` | Configured and durable endpoint metadata; configuration JSON is omitted |
-| GET | `/api/fleet/requests`, `/messages`, `/discussions`, `/reviews`, `/dead-letters` | Deterministic, paginated metadata projections with applicable filters |
+| GET | `/api/fleet/requests` | Deterministic, paginated request metadata with applicable filters |
 | GET | `/api/fleet/authority/jobs` | Authority queue metadata with canonical `Source` / `Agent` / `Via`; payload and result artifacts are omitted |
 | GET | `/api/fleet/acp/conversations` | Existing body-free ACP conversation and round read model |
 | GET | `/api/fleet/activity` | Recent runtime `Source` / `Agent` / `Via` provenance projection |
@@ -22,8 +22,7 @@ remain authoritative in every currently implemented plane mode.
 
 Collection routes accept bounded `limit`/`offset`; applicable routes support
 `kind`, `state`, `agent`, `source`, `pr`, `conversation`, `since`, and `until`
-filters. Message detail is an explicitly read-only, no-store redacted inline
-preview; artifact content is deliberately omitted. Missing databases and
+filters. Artifact content is deliberately omitted. Missing databases and
 optional tables return deterministic empty availability states, not a write or
 bootstrap attempt.
 

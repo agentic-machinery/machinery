@@ -1,7 +1,7 @@
 """Loopback-only observer presence — no RAM lease, not a dispatch seat.
 
 Grok Bot / QA Engineer / Cursor-driver / Codex-UI heartbeats land here so
-occupancy can show the current task without ``POST /api/agent-monitor/register``.
+occupancy can show the current task without a RAM lease.
 In-process TTL store; a Monitor restart drops rows (callers heartbeat). Never
 writes fleet-comms. A live ``/api/fleet/agents`` row is not occupancy evidence.
 """

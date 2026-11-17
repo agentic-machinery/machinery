@@ -20,15 +20,6 @@ def _state_root(ctx: MonitorContext | None = None) -> Path:
     return resolve_context(ctx).roots.state_root
 
 
-@router.get("/summary")
-async def coordination_summary(ctx: MonitorContext = Depends(get_ctx)):
-    return await asyncio.to_thread(agent_ledger.summary, _state_root(ctx))
-
-
-@router.get("/active")
-async def coordination_active(ctx: MonitorContext = Depends(get_ctx)):
-    tasks = await asyncio.to_thread(agent_ledger.active_tasks, _state_root(ctx))
-    return {"total": len(tasks), "tasks": tasks}
 
 
 @router.get("/tasks/{task_id}")

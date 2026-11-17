@@ -135,7 +135,6 @@ def _offline_bin(directory: Path) -> None:
 # a port an earlier case already recorded.
 _ROUTE_PORTS = {
     "/api/ops/v1/alerts": 9093,
-    "/api/fleet/facade/board": 8765,
     "/api/orient": 8766,
 }
 
