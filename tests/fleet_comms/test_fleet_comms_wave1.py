@@ -23,6 +23,8 @@ from lu_machinery.fleet_comms.contracts import CompletionState
 from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
 from lu_machinery.fleet_comms.request_executor import RequestExecutor
 
+_COLLECTION_FLEET_ROOT = os.environ.get("FLEET_COMMS_ROOT")
+
 # ── PR-C: artifact store ────────────────────────────────────────────────────
 
 
@@ -85,12 +87,13 @@ def test_non_release_code_cannot_migrate_live_store(tmp_path: Path, monkeypatch)
     assert not (tmp_path / "unknown-plane").exists()
 
 
-def test_test_session_fleet_root_is_isolated(tmp_path_factory, fleet_comms_root) -> None:
+def test_test_session_fleet_root_is_isolated(fleet_comms_root) -> None:
     """Defect class: a test omitting its root opens the live Fleet store."""
     from lu_machinery.fleet_comms.authority import AuthorityService
     from lu_machinery.fleet_comms.paths import default_plane_root
 
-    assert fleet_comms_root.is_relative_to(tmp_path_factory.getbasetemp())
+    assert _COLLECTION_FLEET_ROOT == str(fleet_comms_root)
+    assert fleet_comms_root.is_dir()
     assert Path(os.environ["FLEET_COMMS_ROOT"]) == fleet_comms_root
     assert default_plane_root() == fleet_comms_root
     with AuthorityService() as service:

@@ -125,16 +125,9 @@ pytest_plugins = [
 
 
 @pytest.fixture(scope="session", autouse=True)
-def fleet_comms_root(tmp_path_factory: pytest.TempPathFactory) -> Generator[Path, None, None]:
-    """An omitted Fleet root always selects this test session's private store."""
-    root = tmp_path_factory.mktemp("fleet-comms")
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("FLEET_COMMS_ROOT", str(root))
-        # Clean-machine test runners have no host settings. Supply their own
-        # checkout as the anchor so explicit test stores can be classified.
-        if not os.environ.get("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"):
-            mp.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(main_checkout_root(Path(__file__).parents[1])))
-        yield root
+def fleet_comms_root(pytestconfig: pytest.Config) -> Path:
+    """Expose the private default installed before test-module collection."""
+    return pytestconfig._fleet_comms_root
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -2995,6 +2988,18 @@ def pytest_configure_node(node: Any) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # A session fixture alone starts after collection: test-module imports can
+    # also open stores. Set the default before importing any test module.
+    fleet_root = tempfile.TemporaryDirectory(prefix="fleet-comms-")
+    config.add_cleanup(fleet_root.cleanup)
+    config._fleet_comms_root = Path(fleet_root.name)
+    fleet_env = pytest.MonkeyPatch()
+    config.add_cleanup(fleet_env.undo)
+    fleet_env.setenv("FLEET_COMMS_ROOT", fleet_root.name)
+    # Clean-machine runners have no host settings; their own checkout anchors
+    # identity checks for explicitly named temporary stores.
+    if not os.environ.get("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"):
+        fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(main_checkout_root(_REPO_ROOT)))
     config.addinivalue_line("markers", "reads_content: test reads a controlled content or policy fixture")
     config.pluginmanager.register(
         _TelemetryIsolation(
