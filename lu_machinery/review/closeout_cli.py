@@ -1079,29 +1079,35 @@ def _checkout_source(path: Path, top: Path, head: str) -> bool:
     below ``top``) counts too: the index lists a submodule only as its gitlink, never the files
     under it, and a nested worktree can hold the reviewed head itself.
     """
-    try:
-        target = path.lstat()
-        top_status = top.stat()
-        nested = False
-        for parent in path.parents:
-            status = parent.lstat()
-            if (status.st_dev, status.st_ino) == (top_status.st_dev, top_status.st_ino):
-                if nested:
-                    return True
-                break
-            nested = nested or os.path.lexists(parent / ".git")
-    except OSError as exc:
-        raise CloseoutStateError("the running checklist file is unavailable") from exc
+    target = _file_identity(path)
+    if target is None:
+        raise CloseoutStateError("the running checklist file is unavailable")
+    top_identity = _file_identity(top)
+    nested = False
+    for parent in path.parents:
+        if _file_identity(parent) == top_identity:
+            if nested:
+                return True
+            break
+        nested = nested or _file_identity(parent / ".git") is not None
     names = set(_checklist_git(top, "ls-files", "-z").split(b"\x00"))
     names |= set(_checklist_git(top, "ls-tree", "-r", "-z", "--name-only", "--full-tree", head).split(b"\x00"))
-    for name in names - {b""}:
-        try:
-            tracked = (top / os.fsdecode(name)).lstat()
-        except OSError:
-            continue
-        if (tracked.st_dev, tracked.st_ino) == (target.st_dev, target.st_ino):
-            return True
-    return False
+    return any(_file_identity(top / os.fsdecode(name)) == target for name in names - {b""})
+
+
+def _file_identity(path: Path) -> tuple[int, int] | None:
+    """``path``'s device and inode, without following a final symlink; None only when nothing is there.
+
+    Any other failure (a permission error, a symlink loop) cannot show that ``path`` is a different
+    file, so the guard fails closed on it.
+    """
+    try:
+        status = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise CloseoutStateError("a path in the checkout under review cannot be inspected") from exc
+    return status.st_dev, status.st_ino
 
 
 def _judge_input(repo_root: Path, top: Path, head: str, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
@@ -1419,7 +1425,11 @@ def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, An
     head_sha = _checklist_commit(repo_root, head)
     # This code matches the change and reads the judge inputs, so a copy from the checkout under
     # review could be the change itself, whatever data it reads.
-    if _checkout_source(Path(__file__).resolve(), top, head_sha):
+    try:
+        running = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop before 3.13
+        raise CloseoutStateError("the running checklist file is unavailable") from exc
+    if _checkout_source(running, top, head_sha):
         raise CloseoutStateError(
             "checklist is running from the checkout under review; run the installed release with "
             "python -P -m lu_machinery.review.closeout_cli"
