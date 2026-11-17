@@ -20,8 +20,8 @@ from lu_machinery.orchestration import task_identity
 from lu_machinery.orchestration import thread_handoff as th
 from lu_machinery.orchestration.task_family import rollover, rollover_registry
 from lu_machinery.orchestration.task_family.storage import TaskFamilyStorage
-from tests.helpers.python import project_python
 from tests.helpers import current_sol
+from tests.helpers.python import project_python
 
 CURRENT_SOL = current_sol()
 

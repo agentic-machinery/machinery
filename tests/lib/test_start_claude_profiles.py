@@ -9,13 +9,13 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.review.model_catalog import load_model_catalog
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import launcher_toolchain_path
 from tests.lib.test_launcher_contract import (
     _core_driver_exit_fixture,
     run_launcher,
 )
-from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 

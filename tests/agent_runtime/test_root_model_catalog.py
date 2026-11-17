@@ -271,7 +271,11 @@ def test_astra_6_2_is_pin_only():
 
     import yaml
 
-    from lu_machinery.review.model_catalog import CATALOG_PATH, REVIEW_ACTIVITY, activity_role_refusal
+    from lu_machinery.review.model_catalog import (
+        CATALOG_PATH,
+        REVIEW_ACTIVITY,
+        activity_role_refusal,
+    )
 
     astra = "gpt-6.2-astra"
     raw = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))

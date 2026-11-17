@@ -11,8 +11,7 @@ import pytest
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
-from tests.helpers import product_tree
-from tests.helpers import current_sol
+from tests.helpers import current_sol, product_tree
 
 CURRENT_SOL = current_sol()
 

@@ -17,8 +17,8 @@ from lu_machinery.lib.context_profiles import (
     load_registry,
     resolve_profile,
 )
-from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 CURRENT_SOL = current_sol()
 

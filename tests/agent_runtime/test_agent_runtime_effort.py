@@ -25,8 +25,8 @@ from lu_machinery.agent_runtime.adapters.codex import CodexAdapter
 from lu_machinery.agent_runtime.adapters.gemini import GeminiAdapter
 from lu_machinery.agent_runtime.errors import AgentUnavailableError
 from lu_machinery.agent_runtime.usage import _reset_rate_limit_cache_for_tests
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 

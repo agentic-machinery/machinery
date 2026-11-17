@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from lu_machinery import deploy_codex_home as deployer
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 

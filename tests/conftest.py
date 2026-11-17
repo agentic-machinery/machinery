@@ -4103,10 +4103,10 @@ BRANCH = "codex/fixture"
 @pytest.fixture
 def low_review(monkeypatch, tmp_path):
     """Keep real verdict parsing/qualification; replace GitHub and branch facts."""
-    from tests.helpers import current_sol
     from lu_machinery.orchestration import integration_sweep as sweep
     from lu_machinery.publish import github as publisher
     from lu_machinery.review import record_cf_verdict as recorder
+    from tests.helpers import current_sol
 
     tasks = tmp_path / "tasks"
     tasks.mkdir()

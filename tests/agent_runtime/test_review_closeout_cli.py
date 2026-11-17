@@ -12,6 +12,7 @@ from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
+
 from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()

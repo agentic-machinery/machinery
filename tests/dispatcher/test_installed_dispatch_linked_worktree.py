@@ -16,8 +16,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from tests.helpers.wheel import install_release, release_wheel
 from tests.helpers import current_sol
+from tests.helpers.wheel import install_release, release_wheel
 
 CURRENT_SOL = current_sol()
 

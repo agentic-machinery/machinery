@@ -22,8 +22,8 @@ from lu_machinery.ai_agent_bridge._ask_contract import (
     response_provenance,
     unsupported_effort_note,
 )
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 

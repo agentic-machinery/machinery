@@ -22,8 +22,8 @@ from lu_machinery.lib.session_record import (
     validate_transcript_path,
     write_record,
 )
-from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 CURRENT_SOL = current_sol()
 

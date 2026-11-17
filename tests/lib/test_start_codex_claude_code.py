@@ -8,10 +8,10 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_path
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import launcher_environment, launcher_toolchain_path
 from tests.lib.test_launcher_contract import run_launcher
-from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 

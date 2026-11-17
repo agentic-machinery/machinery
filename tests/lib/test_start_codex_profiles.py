@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.repo_root import machinery_path
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import (
     copy_launcher_sources,
@@ -18,7 +19,6 @@ from tests.launcher_sandbox import (
 )
 from tests.lib.test_launcher_driver_scope import install_scope_sandbox
 from tests.rules_core_view import install_loader_bypass
-from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 SOL_PATTERN = CURRENT_SOL.replace(".", r"\.")  # as context_profiles.yaml spells it

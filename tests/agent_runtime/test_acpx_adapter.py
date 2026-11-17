@@ -66,8 +66,8 @@ from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
-from tests.wait_helpers import wait_for_line, wait_until
 from tests.helpers import current_sol
+from tests.wait_helpers import wait_for_line, wait_until
 
 CURRENT_SOL = current_sol()
 

@@ -22,8 +22,8 @@ import pytest
 from lu_machinery.fleet import capacity_pick, credit_lane, reset_reserve
 from lu_machinery.fleet.reset_reserve import unavailable_reserve
 from lu_machinery.fleet.routing_policy import projected_unused_pct
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 
