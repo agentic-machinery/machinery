@@ -380,23 +380,24 @@ models:
     family: openai
     tier: frontier_authority
     lifecycle: active
-    # Explicit pin only (operator 2026-11-17), like claude-fable-5-2: no seat,
-    # ladder, endpoint, substitution or default routes it. Work roles only; it
-    # holds no review, advisory or approval role, so it is never a review of
-    # record. Effort high only; xhigh and max are refused.
+    # Request-only (operator 2026-11-17), like claude-fable-5-2: no seat, ladder,
+    # endpoint, council, substitution or default routes it. Work roles only, as for
+    # Gemini 4 Carbon; it holds no review, advisory or approval role, so it is never
+    # a review of record. Effort high only; xhigh and max are refused.
     efforts: [high]
     roles: [implementation, agentic_coding, long_horizon_coding]
     transports: [native_codex]
-    strengths: [frontier_technical_judgment, hardest_problems]
+    strengths: [frontier_technical_judgment, security_review_depth]
     weaknesses: [not_independent_from_openai_authors, four_times_sol_price, review_qualification_pending]
     notes: >-
-      Operator order 2026-11-17: Astra 6.2 joins the Fable 5.2 pin-only tier and is
-      used in real situations for high-value reviews and hard problems as a coder.
-      Pinned implementer: dispatch --agent codex --model gpt-6.2-astra --effort high.
-      Extra pinned reviewer: the same with --mode read-only --base <head sha>; its
-      findings are real review input but it is not the review of record (it is
-      OpenAI-family and unqualified). Promotion to a review seat goes through a
-      review-eval protocol seat and its measured results. API id gpt-6.2-astra
+      Operator orders 2026-11-17: Astra 6.2 joins the Fable 5.2 pin-only tier and
+      stays request-only; its use is security review. Extra pinned read-only
+      reviewer on a security-sensitive PR: dispatch --agent codex --model
+      gpt-6.2-astra --effort high --mode read-only --base <head sha>. Its findings
+      are real review input but it is not the review of record (it is OpenAI-family
+      and unqualified). Councils and discussions use gpt-6.2-sol, never Astra.
+      Promotion to a review seat goes through a review-eval protocol seat and its
+      measured results. API id gpt-6.2-astra
       (official model page): "our most capable model for your hardest projects".
       Context window 1,050,000 tokens, max input 922,000, max output 128,000;
       knowledge cutoff 2026-05-18. Standard price $8 input / $0.40 cached input /

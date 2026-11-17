@@ -510,8 +510,8 @@ def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypa
 def test_pinned_astra_rows_counted_separately(tmp_path, monkeypatch):
     """Defect class: a pinned model's runs merged into, or dropped beside, the routed Sol rows.
 
-    Astra 6.2 runs only by explicit pin (operator 2026-11-17); its implementer and extra-review
-    runs must stay their own model rows next to Sol 6.2 and historical Sol 6.1 rows.
+    Astra 6.2 runs only on request (operator 2026-11-17); each pinned run, read-only security
+    review or write, must stay its own model row next to Sol 6.2 and historical Sol 6.1 rows.
     """
     batch_state, tasks = _state(tmp_path)
     monkeypatch.setenv("LU_TASKS_DIR", str(tasks))

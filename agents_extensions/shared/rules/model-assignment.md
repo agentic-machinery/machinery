@@ -231,15 +231,13 @@ the former GPT-6 Astra advisory seat. Review, critique and design input use
 accountable driving, advisory and approval work and hard coding, and at `medium` for well-specified
 bounded coding. Astra 6.2 runs at `high` only. Dispatch and the Codex launcher refuse `xhigh` and
 `max` for both models; nothing maps them to another effort.
-**GPT-6.2 Astra (`gpt-6.2-astra`) is pin-only** (operator 2026-11-17), like Fable 5.2: no seat,
-ladder, endpoint, substitution or default routes it, and it holds no review, advisory or approval
-role. Use it for hard problems and high-value reviews by explicit pin:
+**GPT-6.2 Astra (`gpt-6.2-astra`) is request-only** (operator 2026-11-17), like Fable 5.2: no seat,
+ladder, endpoint, council, substitution or default routes it, and it holds no review, advisory or
+approval role. Its documented use is security review: an extra pinned read-only reviewer on a
+security-sensitive PR, next to the review of record (Carbon shape: its findings are real input,
+it is not recorded with `record_cf_verdict`). Councils and discussions use Sol 6.2, never Astra.
 
 ```bash
-# Implementer for a hard problem
-.venv/bin/python -m lu_machinery.dispatch dispatch --agent codex --model gpt-6.2-astra --effort high \
-    --worktree .worktrees/dispatch/<agent>/<task>/ --task-id <task> --prompt-file <brief>
-# Extra pinned reviewer next to the review of record (findings are real input; not recorded with record_cf_verdict)
 .venv/bin/python -m lu_machinery.dispatch dispatch --agent codex --model gpt-6.2-astra --effort high \
     --mode read-only --base <head sha> --repo <repo key> --task-id <task>-astra --prompt-file <review brief>
 ```

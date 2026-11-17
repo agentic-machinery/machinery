@@ -69,7 +69,7 @@ Before **every** implement `dispatch.py dispatch`:
    (operator decision 2026-09-30, #9275): `dispatch.py` refuses Luna, and Flash not classified
    Ukrainian authoring/review, without a complete envelope bound to that dispatch. See
    `fleet-driver-routing.md` §2.
-4. **Advisory path:** Opus 5.5 / Sol 6.1; Fable holds no advisory role (#9583). Do not spend
+4. **Advisory path:** Opus 5.5 / Sol 6.2; Fable holds no advisory role (#9583). Do not spend
    an advisory seat on lockfiles / pointer / smoke jobs.
 5. After ≥3 implement dispatches this session, require ≥2 agents **and** ≥2 tiers **or** a
    written `NOTE: fleet_breadth` with tool-backed blockers.

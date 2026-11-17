@@ -13,7 +13,7 @@ def _current_sol() -> str:
     """The model catalog's current Sol (the openai_frontier seat holder)."""
     from lu_machinery.review.model_catalog import load_model_catalog
 
-    return load_model_catalog()["seats"]["openai_frontier"]["model_id"]
+    return str(load_model_catalog()["seats"]["openai_frontier"]["model_id"])
 
 
 def call_codex_with_fallback(

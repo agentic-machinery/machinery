@@ -68,8 +68,8 @@ qualification gate below is read against them; they do not qualify Gemini 4.
 | Epic driver | Admitted. `start-gemini-driver.sh --epic <lane>` enters the shared driver path. The driver default is `gemini-3.1-pro-high`; `gemini-3.8-flash-high` is also certified. Every other Gemini model id is refused. |
 | Low-risk and medium-risk code review | Admitted as formal review. The reviewer resolver and target admission still exclude Gemini from code and infra review; wiring this seat is a separate reviewed change. |
 | Ukrainian review | Admitted as formal review when the reviewer uses the Sources MCP. |
-| High-risk and critical code review | Not admitted. These stay with Opus 5.5 or Sol 6.1 until Gemini 4 passes this protocol's code/infra high and critical gates. |
-| Design input and designated approval | Not admitted. Designated approval stays with Opus 5.5 and Sol 6.1. |
+| High-risk and critical code review | Not admitted. These stay with Opus 5.5 or Sol 6.2 until Gemini 4 passes this protocol's code/infra high and critical gates. |
+| Design input and designated approval | Not admitted. Designated approval stays with Opus 5.5 and Sol 6.2. |
 
 ## Current source evidence and unresolved prerequisites
 
