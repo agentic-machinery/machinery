@@ -36,6 +36,7 @@ from fastapi.testclient import TestClient
 from lu_machinery.api import config, epics_router
 from lu_machinery.api.epics_router import seed_manifest_inventory
 from lu_machinery.api.fleet_workers_collect import reset_workers_payload_cache
+from lu_machinery.api.fleet_workers_router import workers_snapshot
 from lu_machinery.api.main import create_app
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.occupancy import PRODUCTION_LINUX_HOST_ID
@@ -129,9 +130,13 @@ def _offline_bin(directory: Path) -> None:
         script.chmod(0o755)
 
 
-# Ports the handlers open themselves: Alertmanager, the live Monitor, Sources.
-# The suite's socket guard allows loopback, so this fixture refuses it too.
-_OFFLINE_PORTS = (9093, 8765, 8766)
+# The handler dials this port itself. Checked on that request, not across the
+# module: CI splits the cases across workers, so one worker never sees all three.
+_ROUTE_PORTS = {
+    "/api/ops/v1/alerts": 9093,
+    "/api/fleet/facade/board": 8765,
+    "/api/orient": 8766,
+}
 
 
 class _OfflineSockets:
@@ -263,7 +268,6 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
     sockets.install()
     previous_health: dict[str, object] | None = None
     previous_snapshot: str | None = None
-    ran = False
     try:
         app = create_app(fixture_context(repo), lifespan=_no_lifespan, product=ProductContribution())
         with epics_router._REGISTRY_HEALTH_LOCK:
@@ -276,15 +280,12 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
             ctx=app.state.ctx,
         )
         with TestClient(app, raise_server_exceptions=False) as client:
-            ran = True
+            # The workers map is a lifespan snapshot. Its first collect can
+            # outlast the startup wait, and the route then answers 503.
+            workers_snapshot(app.state.ctx).refresh()
             yield client, repo, sockets
     finally:
         sockets.restore()
-        missing = sorted(set(_OFFLINE_PORTS) - sockets.attempted)
-        if ran and (missing or sockets.completed):
-            raise AssertionError(
-                f"offline sockets missed ports {missing}; completed {sockets.completed}"
-            )
         reset_local_document_cache()
         reset_workers_payload_cache()
         if previous_health is not None:
@@ -322,6 +323,10 @@ def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
     monkeypatch.chdir(repo)
     reset_local_document_cache()
     _hold_audit_cooldown(repo)
+    before = set(sockets.attempted)
     response = client.get(route)
-    assert response.status_code < 500, f"{route} -> HTTP {response.status_code}"
+    assert response.status_code < 500, f"{route} -> HTTP {response.status_code} {response.text[:180]}"
     assert not sockets.completed, f"{route} opened a connection: {sockets.completed}"
+    expected = _ROUTE_PORTS.get(route)
+    if expected is not None:
+        assert expected in sockets.attempted - before, f"{route} did not dial port {expected}"
