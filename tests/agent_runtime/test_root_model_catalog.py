@@ -197,6 +197,9 @@ def test_runtime_registry_defaults_resolve_to_catalog_model_or_alias():
     known = set(catalog["models"])
     for model_id, model in catalog["models"].items():
         known.update(model.get("aliases", []))
+        # A lane default may be the model's own routing wire id (the AGY default
+        # gemini-4-hydrogen-medium); the loop below proves each one resolves to its row.
+        known.update(wire for wire in (model.get("routing_wire_ids") or {}).values() if isinstance(wire, str))
         known.add(model_id)
 
     unresolved = {
