@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -214,6 +215,8 @@ def _pid_alive(pid: int) -> bool:
 # ~15k. ``None`` marks a record that is unreadable or not running.
 _RecordIdentity = tuple[int, int, int, int]
 _dispatch_memo: dict[Path, tuple[_RecordIdentity, dict[str, Any] | None]] = {}
+# Canaries for different contexts can run at once; one run reads and prunes the memo at a time.
+_dispatch_memo_lock = threading.Lock()
 
 
 def _dispatch_fields(path: Path) -> dict[str, Any] | None:
@@ -235,26 +238,27 @@ def _running_dispatches(tasks_dir: Path | None) -> list[dict[str, Any]]:
     """Dispatch tasks whose state says running/spawning with a live PID."""
     if tasks_dir is None or not tasks_dir.is_dir():
         return []
-    running: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     seen: set[Path] = set()
-    for path in sorted(tasks_dir.glob("*.json")):
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-        seen.add(path)
-        cached = _dispatch_memo.get(path)
-        if cached is not None and cached[0] == identity:
-            fields = cached[1]
-        else:
-            fields = _dispatch_fields(path)
-            _dispatch_memo[path] = (identity, fields)
-        if fields is not None and _pid_alive(int(fields["pid"])):
-            running.append(dict(fields))
-    for path in [path for path in _dispatch_memo if path.parent == tasks_dir and path not in seen]:
-        _dispatch_memo.pop(path, None)
-    return running
+    with _dispatch_memo_lock:
+        for path in sorted(tasks_dir.glob("*.json")):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            seen.add(path)
+            cached = _dispatch_memo.get(path)
+            if cached is not None and cached[0] == identity:
+                fields = cached[1]
+            else:
+                fields = _dispatch_fields(path)
+                _dispatch_memo[path] = (identity, fields)
+            if fields is not None:
+                candidates.append(fields)
+        for path in [path for path in _dispatch_memo if path.parent == tasks_dir and path not in seen]:
+            _dispatch_memo.pop(path, None)
+    return [dict(fields) for fields in candidates if _pid_alive(int(fields["pid"]))]
 
 
 def _state_dir(main_root: Path, state_dir: Path | None) -> Path:

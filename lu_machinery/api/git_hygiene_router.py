@@ -23,6 +23,7 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -164,16 +165,15 @@ def _isoformat_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+# Fields of ``git for-each-ref`` per local branch, NUL-separated.
+_BRANCH_FIELDS = "%00".join((
+    "%(refname:short)", "%(upstream:short)", "%(upstream:track)",
+    "%(objectname:short)", "%(committerdate:unix)", "%(committername)", "%(objectname)",
+))
+
+
 def _list_local_branches(cwd: Path) -> list[dict[str, Any]]:
-    code, stdout, _stderr = _run_git(
-        [
-            "for-each-ref",
-            "--format=%(refname:short)%00%(upstream:short)%00%(upstream:track)"
-            "%00%(objectname:short)%00%(committerdate:unix)%00%(committername)%00%(objectname)",
-            "refs/heads",
-        ],
-        cwd=cwd,
-    )
+    code, stdout, _stderr = _run_git(["for-each-ref", f"--format={_BRANCH_FIELDS}", "refs/heads"], cwd=cwd)
     if code != 0:
         return []
 
@@ -234,7 +234,8 @@ def _list_worktrees(cwd: Path) -> list[dict[str, Any]]:
 # ``git cherry`` answers depend only on the two tips. Keep the answers for the
 # current ``main`` tip so a cleanup report runs cherry only for moved branches.
 _CHERRY_WORKERS = 4
-# repository -> (main tip, {(branch, branch tip): fully merged})
+# repository -> (main tip, {(branch, branch tip): fully merged}). Only an answer
+# ``git cherry`` gave for that exact pair of commits is kept.
 _merged_memo: dict[str, tuple[str, dict[tuple[str, str], bool]]] = {}
 
 
@@ -253,30 +254,43 @@ def _branches_merged_to_main(branches: list[dict[str, Any]], cwd: Path) -> dict[
             answers[key] = previous[key]
         else:
             missing.append(key)
+
+    def ask(key: tuple[str, str]) -> tuple[bool, bool]:
+        name, tip = key
+        # The exact commits the memo key names, so a ref moving mid-scan cannot
+        # file one commit's answer under another.
+        return _merged_to_main_answer(name, cwd, main=main_sha or "main", tip=tip or None)
+
     with ThreadPoolExecutor(max_workers=_CHERRY_WORKERS) as pool:
-        computed = list(pool.map(lambda key: _merged_to_main_answer(key[0], cwd), missing))
-    # A git failure reads as "not merged" (never removable) and is asked again next time.
-    answers.update((key, bool(answer)) for key, answer in zip(missing, computed, strict=True))
+        computed = list(pool.map(ask, missing))
+    answers.update((key, merged) for key, (merged, _cacheable) in zip(missing, computed, strict=True))
     if main_sha:
         # A moved ``main`` replaces every earlier answer for this repository.
         known = {key: value for key, value in answers.items() if key[1] and key not in missing}
-        known.update((key, answer) for key, answer in zip(missing, computed, strict=True)
-                     if key[1] and answer is not None)
+        known.update((key, merged) for key, (merged, cacheable) in zip(missing, computed, strict=True)
+                     if key[1] and cacheable)
         _merged_memo[str(cwd)] = (main_sha, known)
     return {name: value for (name, _tip), value in answers.items()}
 
 
-def _merged_to_main_answer(branch: str, cwd: Path) -> bool | None:
-    """Whether every commit of ``branch`` is in ``main``; ``None`` when git could not say."""
-    code, stdout, _stderr = _run_git(["cherry", "main", branch], cwd=cwd)
+def _merged_to_main_answer(branch: str, cwd: Path, *, main: str = "main", tip: str | None = None) -> tuple[bool, bool]:
+    """``(fully merged, cacheable)`` for ``branch`` (at ``tip`` when given) against ``main``.
+
+    Only a ``git cherry`` answer about those exact commits is cacheable. After
+    cherry fails, the ancestry fallback answers for this report only: it cannot
+    see patch-equivalent commits, so its "not merged" must not hide a later
+    cherry answer. When git cannot say, the branch reads as not merged (never
+    removable).
+    """
+    code, stdout, _stderr = _run_git(["cherry", main, tip or branch], cwd=cwd)
     if code == 0:
         lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        return all(line.startswith("-") for line in lines)
+        return all(line.startswith("-") for line in lines), True
 
-    code, stdout, _stderr = _run_git(["branch", "--merged", "main", "--format=%(refname:short)"], cwd=cwd)
+    code, stdout, _stderr = _run_git(["branch", "--merged", main, "--format=%(refname:short)"], cwd=cwd)
     if code != 0:
-        return None
-    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}
+        return False, False
+    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}, False
 
 
 def _is_worktree_clean(path: Path, cwd: Path) -> bool:
@@ -309,6 +323,8 @@ def _disk_bytes(path: Path) -> int | None:
 # report re-reads only records written since the last report, not all ~15k.
 _TaskFileIdentity = tuple[int, int, int, int]
 _running_ids_memo: dict[str, tuple[_TaskFileIdentity, tuple[str, ...]]] = {}
+# Reports for different contexts can scan at once; one scan reads and prunes the memo at a time.
+_running_ids_lock = threading.Lock()
 
 
 def _running_ids_in_record(path: str, name: str) -> tuple[str, ...]:
@@ -333,24 +349,26 @@ def _active_task_ids(project_root: Path) -> set[str]:
         return active
 
     seen: set[str] = set()
-    for entry in entries:
-        if not entry.name.endswith(".json"):
-            continue
-        try:
-            st = entry.stat()
-        except OSError:
-            continue
-        identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-        seen.add(entry.path)
-        cached = _running_ids_memo.get(entry.path)
-        if cached is not None and cached[0] == identity:
-            ids = cached[1]
-        else:
-            ids = _running_ids_in_record(entry.path, entry.name)
-            _running_ids_memo[entry.path] = (identity, ids)
-        active.update(ids)
-    for path in [path for path in _running_ids_memo if path.startswith(f"{tasks_dir}{os.sep}") and path not in seen]:
-        _running_ids_memo.pop(path, None)
+    with _running_ids_lock:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            seen.add(entry.path)
+            cached = _running_ids_memo.get(entry.path)
+            if cached is not None and cached[0] == identity:
+                ids = cached[1]
+            else:
+                ids = _running_ids_in_record(entry.path, entry.name)
+                _running_ids_memo[entry.path] = (identity, ids)
+            active.update(ids)
+        prefix = f"{tasks_dir}{os.sep}"
+        for path in [path for path in _running_ids_memo if path.startswith(prefix) and path not in seen]:
+            _running_ids_memo.pop(path, None)
     return active
 
 
