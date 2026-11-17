@@ -913,6 +913,501 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     return 0
 
 
+# Diff-triggered reliability checklist (VERIFY-ADOPT-1117 item 2). The checklist and the judge's
+# inputs are read from the merge-base, never from the change under review: a PR that edits them
+# is still judged with the copy it started from.
+_CHECKLIST_RELATIVE = "config/reliability_checklist.yaml"
+_SCHEMA_RELATIVE = "schemas/code-review-findings.v1.schema.json"
+_CODE_OWNERS_RELATIVE = "config/code_owners.yaml"
+_CODE_OWNER_KEYS = frozenset({"area", "owner", "paths", "ui_qa", "note"})
+_CHECKLIST_CHANGES = {
+    "A": "added",
+    "M": "modified",
+    "D": "deleted",
+    "R": "renamed",
+    "C": "copied",
+    "T": "type_changed",
+}
+_CHECKLIST_TRIGGER_KEYS = frozenset({"paths", "change", "added", "removed"})
+_CHECKLIST_ITEM_KEYS = frozenset({"id", "area", "check", "incident", "triggers"})
+_CHECKLIST_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_CHECKLIST_EVIDENCE_LIMIT = 5
+# What a reviewer reads to judge a change: the checklist and the code that selects from it, the
+# reply schema, the review skills and brief template, and the rules. A diff touching any of them
+# changes its own judge, so it gets the built-in judge-change item, which no checklist edit removes.
+_JUDGE_PATHS = (
+    "**/config/reliability_checklist.yaml",
+    "**/config/code_owners.yaml",
+    "**/review/closeout_cli.py",
+    "**/schemas/code-review-findings.v1.schema.json",
+    "agents_extensions/**/skills/review-loop/**",
+    "agents_extensions/**/skills/local-code-review/**",
+    "agents_extensions/**/skills/drive-epic/references/review-merge-cleanup.md",
+    "agents_extensions/**/rules/**",
+)
+_JUDGE_CHANGE_ID = "judge-change"
+_JUDGE_CHANGE_CHECK = (
+    "This diff changes what reviewers read or how a review is judged. Is every changed judge file "
+    "reviewed against its merge-base copy (`git show <merge-base>:<path>`), never the head copy, and "
+    "does the PR cite the designated approval (rules core P6) that a review policy, reply schema, "
+    "rules or checklist change needs?"
+)
+_JUDGE_CHANGE_INCIDENT = "VERIFY-ADOPT-1117 item 2: a PR could edit the schema and rules that judge it"
+_JUDGE_CHANGE_AREA = "rules-skills-policy"
+
+
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """A full-path match for ``pattern``: ``**`` spans whole directories, ``*`` and ``?`` stay in one."""
+    if not pattern or pattern.startswith("/") or "\x00" in pattern:
+        raise CloseoutStateError(f"checklist path glob invalid: {pattern!r}")
+    parts: list[str] = []
+    segments = pattern.split("/")
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        if segment == "**":
+            parts.append(".*" if last else "(?:[^/]+/)*")
+            continue
+        body = ""
+        position = 0
+        while position < len(segment):
+            char = segment[position]
+            if char == "*":
+                body += "[^/]*"
+            elif char == "?":
+                body += "[^/]"
+            elif char == "[":
+                end = segment.find("]", position + 2)
+                if end < 0:
+                    raise CloseoutStateError(f"checklist path glob invalid: {pattern!r}")
+                inner = segment[position + 1 : end]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                body += "[" + inner.replace("\\", "\\\\") + "]"
+                position = end
+            else:
+                body += re.escape(char)
+            position += 1
+        parts.append(body if last else body + "/")
+    return re.compile("".join(parts), re.DOTALL)
+
+
+def _checklist_git(repo_root: Path, *args: str) -> bytes:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            check=False,
+            timeout=120,
+            env=sanitized_git_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CloseoutStateError(f"git {args[0]} unavailable") from exc
+    if proc.returncode:
+        raise CloseoutStateError(f"git {args[0]} failed: {proc.stderr.decode('utf-8', 'replace').strip()}")
+    return proc.stdout
+
+
+def _checklist_commit(repo_root: Path, ref: str) -> str:
+    if not ref or ref.startswith("-") or any(ord(char) < 0x20 for char in ref):
+        raise CloseoutStateError(f"revision invalid: {ref!r}")
+    return _checklist_git(repo_root, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
+
+
+def _checklist_blob(repo_root: Path, commit: str, path: str) -> bytes | None:
+    """``path`` at ``commit``, or None when the commit has no such file."""
+    listing = _checklist_git(repo_root, "ls-tree", "-z", "--full-tree", commit, "--", path)
+    entries = [entry for entry in listing.split(b"\x00") if entry]
+    if not entries:
+        return None
+    meta, _, name = entries[0].partition(b"\t")
+    mode, kind, oid = meta.split(b" ")
+    if name.decode() != path or kind != b"blob" or mode not in {b"100644", b"100755"}:
+        raise CloseoutStateError(f"{path} at {commit} is not a regular file")
+    return _checklist_git(repo_root, "cat-file", "blob", oid.decode())
+
+
+def _judge_input(repo_root: Path, merge_base: str, relative: str) -> tuple[bytes, dict[str, str]]:
+    """Machinery file ``relative`` as the merge-base holds it, else as the installed package holds it.
+
+    A repository without the file at its merge-base (a consumer repository) cannot change the
+    package copy. A package copy inside the checkout under review could be the change itself, so
+    that read is refused.
+    """
+    checkout_path = _checkout_relative(relative)
+    blob = _checklist_blob(repo_root, merge_base, checkout_path)
+    if blob is not None:
+        return blob, {
+            "kind": "merge-base",
+            "commit": merge_base,
+            "path": checkout_path,
+            "sha256": hashlib.sha256(blob).hexdigest(),
+        }
+    from lu_machinery.common.repo_root import machinery_path
+
+    package_file = machinery_path(relative)
+    root = repo_root.resolve()
+    if package_file.resolve() == root or root in package_file.resolve().parents:
+        raise CloseoutStateError(
+            f"{checkout_path} is missing at the merge-base and the only other copy is in the checkout "
+            "under review; run this command from the installed release"
+        )
+    try:
+        blob = package_file.read_bytes()
+    except OSError as exc:
+        raise CloseoutStateError(f"{checkout_path} unavailable in the installed package") from exc
+    return blob, {"kind": "installed-package", "path": checkout_path, "sha256": hashlib.sha256(blob).hexdigest()}
+
+
+def _load_yaml(raw: bytes, what: str) -> Any:
+    import yaml
+
+    try:
+        return yaml.safe_load(raw.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise CloseoutStateError(f"{what} is not valid YAML") from exc
+
+
+def _code_owners(raw: bytes) -> dict[str, Any]:
+    """The validated ownership map: its main owner and each area's owner and compiled path globs."""
+    data = _load_yaml(raw, "code owners map")
+    if not isinstance(data, dict) or set(data) != {"version", "main_owner", "areas"} or data["version"] != 1:
+        raise CloseoutStateError("code owners map needs exactly version: 1, main_owner and areas")
+    if not isinstance(data["main_owner"], str) or not data["main_owner"].strip():
+        raise CloseoutStateError("code owners main_owner must be a non-empty string")
+    if not isinstance(data["areas"], list) or not data["areas"]:
+        raise CloseoutStateError("code owners areas must be a non-empty list")
+    areas: dict[str, dict[str, Any]] = {}
+    for entry in data["areas"]:
+        if not isinstance(entry, dict) or not {"area", "owner", "paths"} <= set(entry) or set(entry) - _CODE_OWNER_KEYS:
+            raise CloseoutStateError(f"code owners area keys: area, owner, paths; optional {sorted(_CODE_OWNER_KEYS)}")
+        area = entry["area"]
+        if not isinstance(area, str) or not _CHECKLIST_ID.fullmatch(area) or area in areas:
+            raise CloseoutStateError(f"code owners area invalid or repeated: {area!r}")
+        for key in ("owner", "ui_qa", "note"):
+            if key in entry and (not isinstance(entry[key], str) or not entry[key].strip()):
+                raise CloseoutStateError(f"code owners area {area} {key} must be a non-empty string")
+        paths = entry["paths"]
+        if not isinstance(paths, list) or not paths or not all(isinstance(path, str) and path for path in paths):
+            raise CloseoutStateError(f"code owners area {area} paths must list strings")
+        areas[area] = {
+            **{key: entry[key].strip() for key in ("owner", "ui_qa", "note") if key in entry},
+            "globs": [_glob_regex(path) for path in paths],
+        }
+    return {"main_owner": data["main_owner"].strip(), "areas": areas}
+
+
+def _checklist_items(raw: bytes, areas: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The validated checklist entries, each trigger compiled; anything unexpected fails closed."""
+    data = _load_yaml(raw, "reliability checklist")
+    if not isinstance(data, dict) or set(data) != {"version", "items"} or data["version"] != 1:
+        raise CloseoutStateError("reliability checklist needs exactly version: 1 and items")
+    if not isinstance(data["items"], list) or not data["items"]:
+        raise CloseoutStateError("reliability checklist items must be a non-empty list")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = {_JUDGE_CHANGE_ID}
+    for entry in data["items"]:
+        if not isinstance(entry, dict) or set(entry) != _CHECKLIST_ITEM_KEYS:
+            raise CloseoutStateError(f"checklist item needs exactly {sorted(_CHECKLIST_ITEM_KEYS)}")
+        item_id = entry["id"]
+        if not isinstance(item_id, str) or not _CHECKLIST_ID.fullmatch(item_id) or item_id in seen:
+            raise CloseoutStateError(f"checklist item id invalid or repeated: {item_id!r}")
+        seen.add(item_id)
+        for key in ("check", "incident"):
+            if not isinstance(entry[key], str) or not entry[key].strip():
+                raise CloseoutStateError(f"checklist item {item_id} needs a non-empty {key}")
+        if entry["area"] not in areas:
+            raise CloseoutStateError(f"checklist item {item_id} names an area the code owners map lacks")
+        if not isinstance(entry["triggers"], list) or not entry["triggers"]:
+            raise CloseoutStateError(f"checklist item {item_id} needs a non-empty triggers list")
+        triggers = []
+        for trigger in entry["triggers"]:
+            if not isinstance(trigger, dict) or not trigger or set(trigger) - _CHECKLIST_TRIGGER_KEYS:
+                raise CloseoutStateError(f"checklist item {item_id} trigger keys: {sorted(_CHECKLIST_TRIGGER_KEYS)}")
+            if not {"paths", "added", "removed"} & set(trigger):
+                raise CloseoutStateError(f"checklist item {item_id} trigger needs paths, added or removed")
+            compiled: dict[str, Any] = {}
+            for key in ("paths", "change", "added", "removed"):
+                values = trigger.get(key)
+                if values is None:
+                    continue
+                if not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values):
+                    raise CloseoutStateError(f"checklist item {item_id} trigger {key} must list strings")
+                if key == "paths":
+                    compiled[key] = [_glob_regex(value) for value in values]
+                elif key == "change":
+                    if set(values) - set(_CHECKLIST_CHANGES.values()):
+                        raise CloseoutStateError(f"checklist item {item_id} change values invalid")
+                    compiled[key] = frozenset(values)
+                else:
+                    try:
+                        compiled[key] = [re.compile(value) for value in values]
+                    except re.error as exc:
+                        raise CloseoutStateError(f"checklist item {item_id} {key} regex invalid") from exc
+            triggers.append(compiled)
+        items.append(
+            {
+                "id": item_id,
+                "area": entry["area"],
+                "check": entry["check"].strip(),
+                "incident": entry["incident"].strip(),
+                "triggers": triggers,
+            }
+        )
+    return items
+
+
+def _git_path(raw: str) -> str:
+    """A path from a patch header, C-unquoted when Git quoted it."""
+    if not (raw.startswith('"') and raw.endswith('"') and len(raw) >= 2):
+        return raw
+    out = bytearray()
+    body = raw[1:-1]
+    index = 0
+    escapes = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out += char.encode("utf-8")
+            index += 1
+            continue
+        nxt = body[index + 1 : index + 2]
+        if nxt in escapes:
+            out.append(escapes[nxt])
+            index += 2
+        elif re.fullmatch(r"[0-7]{3}", body[index + 1 : index + 4]):
+            out.append(int(body[index + 1 : index + 4], 8))
+            index += 4
+        else:
+            raise CloseoutStateError("unparseable quoted path in diff")
+    return out.decode("utf-8", "surrogateescape")
+
+
+def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[str, Any]]:
+    """Every changed file of ``merge_base..head``: its paths, change kind, and added and removed lines."""
+    status = _checklist_git(repo_root, "diff", "--no-ext-diff", "--name-status", "-z", "-M", merge_base, head, "--")
+    fields = status.decode("utf-8", "surrogateescape").split("\x00")
+    files: dict[str, dict[str, Any]] = {}
+    index = 0
+    while index < len(fields) and fields[index]:
+        letter = fields[index][0]
+        if letter in {"R", "C"}:
+            old, new = fields[index + 1], fields[index + 2]
+            index += 3
+        else:
+            old = new = fields[index + 1]
+            index += 2
+        if letter not in _CHECKLIST_CHANGES:
+            raise CloseoutStateError(f"unknown diff status {fields[index - 1]!r}")
+        files[new] = {
+            "path": new,
+            "paths": sorted({old, new}),
+            "change": _CHECKLIST_CHANGES[letter],
+            "added": [],
+            "removed": [],
+        }
+    patch_flags = ("--no-ext-diff", "--no-color", "-U0", "-M")
+    patch = _checklist_git(repo_root, "-c", "core.quotePath=true", "diff", *patch_flags, merge_base, head, "--")
+    patch_text = patch.decode("utf-8", "surrogateescape")
+    current: dict[str, Any] | None = None
+    old_path = ""
+    old_line = new_line = old_left = new_left = 0
+    for line in patch_text.split("\n"):
+        if old_left or new_left:
+            if line.startswith("-") and old_left:
+                if current is not None:
+                    current["removed"].append((old_line, line[1:]))
+                old_line += 1
+                old_left -= 1
+            elif line.startswith("+") and new_left:
+                if current is not None:
+                    current["added"].append((new_line, line[1:]))
+                new_line += 1
+                new_left -= 1
+            elif not line.startswith("\\"):
+                raise CloseoutStateError("diff hunk ended early")
+            continue
+        if line.startswith("--- "):
+            old_path = line[4:]
+        elif line.startswith("+++ "):
+            new_raw = line[4:]
+            name = old_path if new_raw == "/dev/null" else new_raw
+            # Git ends an unquoted header name that holds a space with a tab.
+            name = _git_path(name[:-1] if name.endswith("\t") else name)
+            if name.startswith(("a/", "b/")):
+                name = name[2:]
+            current = files.get(name)
+            if current is None:
+                current = next((entry for entry in files.values() if name in entry["paths"]), None)
+            if current is None:
+                raise CloseoutStateError(f"diff names a file the status list lacks: {name!r}")
+        elif line.startswith("@@ "):
+            match = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if match is None:
+                raise CloseoutStateError("unparseable diff hunk header")
+            old_line, new_line = int(match.group(1)), int(match.group(3))
+            old_left = 1 if match.group(2) is None else int(match.group(2))
+            new_left = 1 if match.group(4) is None else int(match.group(4))
+    return list(files.values())
+
+
+def _checklist_match(trigger: dict[str, Any], changed: dict[str, Any]) -> list[str]:
+    """Evidence (``path`` or ``path:line``) that ``trigger`` fires on one changed file; empty when it does not."""
+    paths = trigger.get("paths")
+    if paths is not None and not any(glob.fullmatch(path) for glob in paths for path in changed["paths"]):
+        return []
+    if "change" in trigger and changed["change"] not in trigger["change"]:
+        return []
+    name = changed["path"]
+    if "added" not in trigger and "removed" not in trigger:
+        return [f"{name} ({changed['change']})"]
+    evidence = [
+        f"{name}:{number}"
+        for number, text in changed["added"]
+        if any(pattern.search(text) for pattern in trigger.get("added", ()))
+    ]
+    evidence += [
+        f"{name}:{number} (removed)"
+        for number, text in changed["removed"]
+        if any(pattern.search(text) for pattern in trigger.get("removed", ()))
+    ]
+    return evidence
+
+
+def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, Any]:
+    """The checklist items and code owners ``base..head`` touches, read from the merge-base, with the brief section."""
+    head_sha = _checklist_commit(repo_root, head)
+    base_sha = _checklist_commit(repo_root, base)
+    merge_base = _checklist_git(repo_root, "merge-base", base_sha, head_sha).decode().strip()
+    owners_raw, owners_source = _judge_input(repo_root, merge_base, _CODE_OWNERS_RELATIVE)
+    owners = _code_owners(owners_raw)
+    if _JUDGE_CHANGE_AREA not in owners["areas"]:
+        raise CloseoutStateError(f"code owners map lacks the {_JUDGE_CHANGE_AREA} area")
+    raw, source = _judge_input(repo_root, merge_base, _CHECKLIST_RELATIVE)
+    items = _checklist_items(raw, owners["areas"])
+    schema, schema_source = _judge_input(repo_root, merge_base, _SCHEMA_RELATIVE)
+    diff = _checklist_diff(repo_root, merge_base, head_sha)
+    changed_paths = sorted({path for changed in diff for path in changed["paths"]})
+    judge_globs = [_glob_regex(pattern) for pattern in _JUDGE_PATHS]
+    judge_changed = [path for path in changed_paths if any(glob.fullmatch(path) for glob in judge_globs)]
+    matched: list[dict[str, Any]] = []
+    if judge_changed:
+        matched.append(
+            {
+                "id": _JUDGE_CHANGE_ID,
+                "area": _JUDGE_CHANGE_AREA,
+                "check": _JUDGE_CHANGE_CHECK,
+                "incident": _JUDGE_CHANGE_INCIDENT,
+                "evidence": judge_changed,
+            }
+        )
+    for item in items:
+        evidence: list[str] = []
+        for trigger in item["triggers"]:
+            for changed in diff:
+                evidence += [entry for entry in _checklist_match(trigger, changed) if entry not in evidence]
+        if evidence:
+            matched.append({key: item[key] for key in ("id", "area", "check", "incident")} | {"evidence": evidence})
+    for item in matched:
+        item["owner"] = owners["areas"][item["area"]]["owner"]
+    touched: list[dict[str, Any]] = []
+    for area, spec in owners["areas"].items():
+        paths = [path for path in changed_paths if any(glob.fullmatch(path) for glob in spec["globs"])]
+        if paths:
+            details = {key: value for key, value in spec.items() if key != "globs"}
+            touched.append({"area": area} | details | {"paths": paths})
+    mapped = {path for area in touched for path in area["paths"]}
+    owner_report = {
+        "source": owners_source,
+        "main_owner": owners["main_owner"],
+        "areas": touched,
+        "unmapped": [path for path in changed_paths if path not in mapped],
+    }
+    schema_changed = schema_source["path"] in judge_changed
+    return {
+        "base": base_sha,
+        "head": head_sha,
+        "merge_base": merge_base,
+        "changed_files": len(diff),
+        "checklist_source": source,
+        "checklist_items": len(items),
+        "schema_source": schema_source,
+        "judge_files_changed": judge_changed,
+        "matched": matched,
+        "code_owners": owner_report,
+        "brief_section": _checklist_brief(
+            merge_base, head_sha, source, matched, owner_report, schema if schema_changed else None
+        ),
+    }
+
+
+def _shown(entries: list[str]) -> str:
+    """The first few ``entries`` as code spans, with a count of the rest."""
+    shown = entries[:_CHECKLIST_EVIDENCE_LIMIT]
+    more = len(entries) - len(shown)
+    return ", ".join(f"`{entry}`" for entry in shown) + (f" and {more} more" if more > 0 else "")
+
+
+def _checklist_brief(
+    merge_base: str,
+    head: str,
+    source: dict[str, str],
+    matched: list[dict[str, Any]],
+    owners: dict[str, Any],
+    changed_schema: bytes | None,
+) -> str:
+    def origin(read: dict[str, str]) -> str:
+        where = f"merge-base `{merge_base}`" if read["kind"] == "merge-base" else "the installed release"
+        return f"`{read['path']}` read from {where} (sha256 `{read['sha256']}`)"
+
+    lines = [
+        "## Reliability checklist",
+        "",
+        f"Matched against `{merge_base}..{head}`; checklist {origin(source)}.",
+        "",
+        "Every judge file this repository holds (the reply schema, the review policy, the rules, this "
+        f"checklist) is read as the merge-base holds it: `git show {merge_base}:<path>`. A head copy this "
+        "diff changes is the change under review, never the standard.",
+        "",
+    ]
+    if not matched:
+        lines.append("No checklist item matched this diff.")
+    else:
+        lines.append("Each item below needs an answer with file:line or test evidence in the reply.")
+        lines.append("")
+        for item in matched:
+            lines.append(
+                f"- **{item['id']}** ({item['area']}, owner {item['owner']}): {item['check']} "
+                f"(incident: {item['incident']}; matched: {_shown(item['evidence'])})"
+            )
+    lines += [
+        "",
+        "### Code owners",
+        "",
+        f"Main owner: {owners['main_owner']}. Map {origin(owners['source'])}. Areas this diff touches:",
+        "",
+    ]
+    for area in owners["areas"]:
+        extra = "".join(f"; {key.replace('_', ' ')} {area[key]}" for key in ("ui_qa", "note") if key in area)
+        lines.append(f"- **{area['area']}**: owner {area['owner']}{extra}; {_shown(area['paths'])}")
+    if owners["unmapped"]:
+        lines.append(f"- no area (owner {owners['main_owner']}): {_shown(owners['unmapped'])}")
+    if changed_schema is not None:
+        lines += [
+            "",
+            f"The reply schema as the merge-base holds it (this diff changes `{_checkout_relative(_SCHEMA_RELATIVE)}`):",
+            "",
+            "```json",
+            changed_schema.decode("utf-8").rstrip("\n"),
+            "```",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _cmd_checklist(args: argparse.Namespace) -> int:
+    print(json.dumps(reliability_checklist(args.repo_root, args.base, args.head), indent=2))
+    return 0
+
+
 # The machinery package's directory name, which its files' checkout paths start with, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
 # (the package directory on ``sys.path``) cannot shorten it.
@@ -941,13 +1436,15 @@ Examples:
     --owned-path {_EXAMPLE_OWNED_PATH}
   .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
     resolve-reviewer --author-model claude --subject-seat grok
+  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
+    checklist --base origin/main --head "$HEAD_SHA" --repo-root .
 
 NOTE: --state-file is a global argument and must precede the subcommand.
 
 Outputs:
   stdout JSON for the subcommand, and the same closeout state JSON file
   (--state-file). resolve-reviewer merges a resolved_reviewer receipt into
-  that file. Nothing here mutates the git tree.
+  that file; checklist leaves it untouched. Nothing here mutates the git tree.
 
 Exit codes:
   0  the subcommand completed (resolve-reviewer: a reviewer was selected, or
@@ -1328,6 +1825,25 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     behavior_receipt.set_defaults(func=_cmd_behavior_proof_receipt)
+
+    p_checklist = sub.add_parser(
+        "checklist",
+        help="Print the reliability checklist items a diff triggers, read from its merge-base",
+        description=(
+            "Match merge-base(--base, --head)..--head against the reliability checklist and print the "
+            "matching items plus a brief section to paste into the review brief. The checklist and the "
+            "reply schema are read from the merge-base (git objects, not the checkout); a repository "
+            "without them there (a consumer repository) uses the installed package's copy. A diff that "
+            "touches the checklist, the schema, the review skills or the rules always gets the "
+            "judge-change item. Read-only: --state-file is neither read nor written."
+        ),
+    )
+    p_checklist.add_argument("--base", required=True, help="Base ref or merge-base SHA. Example: origin/main")
+    p_checklist.add_argument("--head", required=True, help="Exact head SHA under review. Example: 9e86842")
+    p_checklist.add_argument(
+        "--repo-root", type=Path, default=Path("."), help="Repository holding the change. Default: current directory"
+    )
+    p_checklist.set_defaults(func=_cmd_checklist)
 
     return parser
 

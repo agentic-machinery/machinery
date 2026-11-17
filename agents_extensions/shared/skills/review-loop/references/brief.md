@@ -16,8 +16,36 @@ Add to the template's **Target** section:
   and the checks still pending on that head, named as pending. Review starts without waiting
   for the PR's `CI Gate`; pending CI is not successful CI.
 
+## Judge inputs come from the merge-base
+
+The reviewer's checkout is the change under review, so a PR can edit the reply schema, this
+skill, the review policy or the rules that judge it. Every brief therefore names the judge
+inputs as the merge-base holds them, never as the head does. In a repository that holds a
+judge file, the reviewer reads it with `git show <merge-base>:<path>`; a head copy the diff
+changes is the change under review, not the standard. A consumer repository (one without
+the file at its merge-base) uses the installed release copy, which the PR cannot change.
+
+Every round's brief, round 1 and each delta, carries the section this prints, verbatim:
+
+```bash
+"$PY" -m lu_machinery.review.closeout_cli --state-file "$STATE" \
+  checklist --base "origin/$BASE" --head "$HEAD_SHA" --repo-root .
+```
+
+It reads `lu_machinery/config/reliability_checklist.yaml` and `lu_machinery/config/code_owners.yaml`
+from the merge-base, matches every checklist item against `merge-base..head` (changed paths,
+change kind, added and removed lines), and prints the matching items, each with its incident and
+owning area, the owner of every area the diff touches, and the `judge-change` item when the diff
+touches a judge file (the checklist, the ownership map, the reply schema, the review skills, the
+brief template or the rules). Its JSON output's `brief_section` is the text the brief carries.
+The reviewer answers each item with file:line or test evidence. Run it from the installed
+release, not from a checkout of the change: it refuses a package copy inside the checkout under
+review. Exit 1 (a malformed checklist or map at the merge-base, an unreadable diff) is
+fail-closed: escalate to the CTO, and never hand-write the section.
+
 For the `ukrainian` profile, identify the contracts in
-[`ukrainian-linguistics.md` §8](../../../rules/ukrainian-linguistics.md#ukrainian-linguistic-principles):
+[`ukrainian-linguistics.md` §8](../../../rules/ukrainian-linguistics.md#ukrainian-linguistic-principles),
+as the merge-base holds it:
 Every Ukrainian-profile brief identifies these contracts and their applicability, including level, track, workflow, learner state where relevant, and explicit exceptions.
 
 ## Reply format
@@ -26,7 +54,8 @@ Every code or infra brief includes this **Reply format** section. It is the repl
 `verify_review` and the verdict recorder both accept. The reply is one JSON object and
 nothing else. The object matches
 [`lu_machinery/schemas/code-review-findings.v1.schema.json`](../../../../../lu_machinery/schemas/code-review-findings.v1.schema.json)
-at the exact review head: the reviewer uses that file's field names, required fields,
+as the merge-base holds it ([judge inputs](#judge-inputs-come-from-the-merge-base)); `verify_review`
+and the recorder validate against the installed release's copy. The reviewer uses that file's field names, required fields,
 allowed values and nested definitions, and adds none. `overall` includes `correctness`,
 `explanation` and `confidence`. Each finding includes `confidence` and `verbatim` with the
 schema's other required fields. `overall.correctness` is `correct` to approve, `incorrect`
@@ -80,11 +109,12 @@ diff since the last reviewed head ([policy](policy.md#4-convergence)), and repli
 ## Commands a read-only reviewer can run
 
 The reviewer's worktree is already checked out at the exact head and the base ref is present, so
-the brief says no fetch is needed (`git fetch` writes refs and is not a read-only command). A
+the brief says no fetch is needed (`git fetch` writes refs and is not a read-only command), and
+`git show <merge-base>:<path>` reads a judge file as the merge-base holds it. A
 compound line runs only when every part is read-only, so one denied part denies the whole line
 (https://code.claude.com/docs/en/permissions, "Read-only commands"). The brief tells the reviewer
 to run read-only git commands one per call (`git rev-parse HEAD`, `git diff <merge-base>..HEAD`,
-`git log`), that `gh pr view`, `gh pr diff` and `gh pr checks` are allowed, and that after a
+`git show <merge-base>:<path>`, `git log`), that `gh pr view`, `gh pr diff` and `gh pr checks` are allowed, and that after a
 denial it retries once with a simple literal read-only form before it replies BLOCKED.
 
 A review gets a shell and the project interpreter only inside an OS boundary (decision
