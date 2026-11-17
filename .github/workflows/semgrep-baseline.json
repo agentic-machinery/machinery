@@ -390,11 +390,6 @@
    "sha256": "2f0cc1e650546132ce2fc6cd58e60be8787698fae491df926631d3d08dc018b5"
   },
   {
-   "path": "lu_machinery/tools/message_viewer.py",
-   "rule": "python.lang.best-practice.unspecified-open-encoding",
-   "sha256": "00a20169994f852768a16cd0c99cf07f060f376478d7fed7e7315b4fd015c9af"
-  },
-  {
    "path": "lu_machinery/tools/remove_dead_code.py",
    "rule": "python.lang.best-practice.unspecified-open-encoding",
    "sha256": "5f696db9e5cfe93ad7d7a9596c1170b1a6dfcfd884408d2cc8b0be2ee03ab384"
@@ -1323,16 +1318,6 @@
    "path": "lu_machinery/api/worktrees_router.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "cb70d0b87128618944dd3ab95e6c9e65c33c3adb754fa5bc00374bb112787c13"
-  },
-  {
-   "path": "lu_machinery/bench/writer_matrix.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "41114aef55a18d1854ccc901a59e0d8d5c149a530bbb9e2c96f352539d4b7570"
-  },
-  {
-   "path": "lu_machinery/bench/writer_matrix.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "cefad7b603df8e58ff962d035cd028290c2f45976b18e60ddbfea086570bfaff"
   },
   {
    "path": "lu_machinery/ci/audit_dependencies.py",

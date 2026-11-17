@@ -1442,8 +1442,8 @@ jobs:
 
           # Modules that need an optional extra of pyproject.toml, which the
           # lock does not install: each may fail only with ModuleNotFoundError
-          # for that extra's package.
-          OPTIONAL = {"lu_machinery.debug.debug_pymorphy": "pymorphy2"}
+          # for that extra's package. No shipped module needs one today.
+          OPTIONAL: dict[str, str] = {}
 
           site = Path(sys.argv[1]).resolve()
           origin = Path(lu_machinery.__file__).resolve()
