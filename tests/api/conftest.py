@@ -96,9 +96,14 @@ _CONFIG_ROOT_CACHES = (
 
 
 def _forget_entry_modules() -> None:
-    for name, module in tuple(sys.modules.items()):
-        origin = getattr(module, "__file__", None) or ""
-        if (name == "scripts" or name.startswith("scripts.")) and origin.startswith(str(_SESSION_ROOTS)):
+    """Drop every cached product ``scripts`` package.
+
+    A test may import ``scripts`` from its own tmp. Dropping only the session-root
+    copies leaves that import in place after retention removes the tmp, and the
+    next product load then refuses the file.
+    """
+    for name in tuple(sys.modules):
+        if name == "scripts" or name.startswith("scripts."):
             del sys.modules[name]
 
 
