@@ -1501,7 +1501,9 @@ jobs:
           wheel="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl')"
           version="$(python -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' src/pyproject.toml)"
           mkdir wheelhouse
-          python -I -m pip download --no-cache-dir --disable-pip-version-check --no-input \
+          # The build venv's pip (a stdlib venv of the same interpreter): the
+          # activated uv venv has no pip.
+          build-venv/bin/python -I -m pip download --no-cache-dir --disable-pip-version-check --no-input \
             --require-hashes --only-binary=:all: --no-deps --dest wheelhouse --requirement "$lock"
           cp "$wheel" wheelhouse/
           # The consumer lock: the release line, then the dependency lock.

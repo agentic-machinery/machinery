@@ -555,7 +555,9 @@ class Cut:
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
                              "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
         lock.write_text(exported, encoding="utf-8")
-        self.run([self.host_python, "-I", "-m", "pip", "download", "--no-cache-dir", "--disable-pip-version-check",
+        # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
+        self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
+                  "--disable-pip-version-check",
                   "--no-input", "--require-hashes", "--only-binary=:all:", "--no-deps", "--dest", house,
                   "--requirement", lock])
         shutil.copy2(files["wheel"], house)
