@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import functools
 import hashlib
 import json
 import math
@@ -32,12 +33,15 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+from jsonschema import Draft202012Validator
+
+from lu_machinery.common import github_client
 
 SPLITS = ("tune", "test")
 BLOCKING = frozenset({"P0", "P1", "P2"})
@@ -64,6 +68,10 @@ class EvalSet:
     digests: dict[str, str] = field(default_factory=dict)
 
 
+def _is_sha(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(c in "0123456789abcdef" for c in value)
+
+
 def _require(item: dict[str, Any], keys: Iterable[str], where: str) -> None:
     missing = [k for k in keys if item.get(k) in (None, "")]
     if missing:
@@ -72,6 +80,13 @@ def _require(item: dict[str, Any], keys: Iterable[str], where: str) -> None:
 
 def load_set(set_dir: Path) -> EvalSet:
     """Load and validate the frozen set; raise EvalError on any malformed entry."""
+    try:
+        return _load_set(set_dir)
+    except (KeyError, TypeError, AttributeError, ValueError, yaml.YAMLError) as exc:
+        raise EvalError(f"{set_dir}: malformed set ({type(exc).__name__}: {exc})") from exc
+
+
+def _load_set(set_dir: Path) -> EvalSet:
     raw: dict[str, Any] = {}
     digests: dict[str, str] = {}
     for name in ("known-answers.yaml", "controls.yaml", "protocol.yaml"):
@@ -94,8 +109,7 @@ def load_set(set_dir: Path) -> EvalSet:
         where = f"{item.get('repository')}#{item.get('pr')}"
         _require(item, ("id", "repository", "pr", "base_sha", "head_sha", "size_lines"), where)
         for key in ("base_sha", "head_sha"):
-            sha = str(item[key])
-            if len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            if not _is_sha(item[key]):
                 raise EvalError(f"{where}: {key} is not a full lowercase SHA")
         if item["repository"] not in protocol["repositories"]:
             raise EvalError(f"{where}: repository has no fleet key in protocol.yaml")
@@ -105,14 +119,24 @@ def load_set(set_dir: Path) -> EvalSet:
     for case in cases:
         if not case.get("defects"):
             raise EvalError(f"{case['id']}: a defect case needs at least one defect")
+        if not isinstance(case["source_review"]["family"], str):
+            raise EvalError(f"{case['id']}: source_review.family must name the source reviewer's family")
+        if len({d["id"] for d in case["defects"]}) != len(case["defects"]):
+            raise EvalError(f"{case['id']}: defect ids repeat")
         for defect in case["defects"]:
             _require(defect, ("id", "severity", "location", "answer", "source"), f"{case['id']} {defect.get('id')}")
             if defect["severity"] not in ("P0", "P1", "P2", "P3"):
                 raise EvalError(f"{case['id']} {defect['id']}: severity must be P0-P3")
-            if not defect["source"].get("fix_commits"):
-                raise EvalError(f"{case['id']} {defect['id']}: no fix commit proves the defect")
+            if not isinstance(defect["source"], dict):
+                raise EvalError(f"{case['id']} {defect['id']}: source must be a mapping")
+            fixes = defect["source"].get("fix_commits")
+            if not isinstance(fixes, list) or not fixes or not all(_is_sha(c) for c in fixes):
+                raise EvalError(f"{case['id']} {defect['id']}: fix_commits must list full SHAs of the fixing commits")
     for control in controls:
-        _require(control, ("clean_window_ends",), control["id"])
+        check = control.get("clean_check") or {}
+        if (check.get("window_closed_at_check") is not True or not _is_sha(check.get("checked_tip"))
+                or not _is_sha(control.get("merge_commit"))):
+            raise EvalError(f"{control['id']}: no clean check covering the whole 14-day window")
     return EvalSet(cases=cases, controls=controls, protocol=protocol, digests=digests)
 
 
@@ -167,17 +191,6 @@ def estimate(evalset: EvalSet, items: list[Item]) -> dict[str, Any]:
         "usd_ceiling": ceiling,
         "within_ceiling": usd * attempts <= ceiling,
     }
-
-
-def open_windows(items: list[Item], now: dt.datetime) -> list[str]:
-    """Controls whose 14-day clean window has not closed at ``now``."""
-    late = []
-    for item in items:
-        if item.kind == "control":
-            ends = dt.datetime.fromisoformat(item.entry["clean_window_ends"])
-            if ends > now:
-                late.append(f"{item.entry['id']} (window ends {item.entry['clean_window_ends']})")
-    return late
 
 
 def review_brief(entry: dict[str, Any], repo_key: str) -> str:
@@ -240,20 +253,58 @@ Reply with one JSON object and nothing else:
 """
 
 
-def first_json_object(text: str) -> dict[str, Any] | None:
-    """Return the first JSON object in ``text``, or None."""
+def json_objects(text: str) -> Iterator[dict[str, Any]]:
+    """Yield every top-level JSON object embedded in ``text``, in order."""
     decoder = json.JSONDecoder()
     start = text.find("{")
     while start >= 0:
         try:
-            value, _ = decoder.raw_decode(text[start:])
+            value, end = decoder.raw_decode(text[start:])
         except ValueError:
             start = text.find("{", start + 1)
             continue
         if isinstance(value, dict):
-            return value
-        start = text.find("{", start + 1)
+            yield value
+        start = text.find("{", start + end)
+
+
+def first_json_object(text: str) -> dict[str, Any] | None:
+    """Return the first JSON object in ``text``, or None."""
+    return next(json_objects(text), None)
+
+
+def _findings_validator() -> Any:
+    schema = json.loads((Path(__file__).resolve().parents[1] / "schemas" / Path(FINDINGS_SCHEMA).name).read_text())
+    return Draft202012Validator(schema)
+
+
+def valid_review(text: str, validator: Any) -> dict[str, Any] | None:
+    """The reply as a findings object when it is schema-valid and conclusive, else None.
+
+    An ``uncertain`` (BLOCKED) reply is not a completed review: it would otherwise count as a
+    clean control or a review that found nothing.
+    """
+    for reply in json_objects(text):
+        if validator.is_valid(reply):
+            return reply if reply["overall"]["correctness"] in ("correct", "incorrect") else None
     return None
+
+
+def valid_matches(text: str) -> dict[str, str | None] | None:
+    """A judge's {defect id: finding id or None} mapping, or None when the reply is malformed."""
+    reply = next((obj for obj in json_objects(text) if "matches" in obj), None)
+    matches = reply.get("matches") if reply else None
+    if not isinstance(matches, list):
+        return None
+    out: dict[str, str | None] = {}
+    for match in matches:
+        if not isinstance(match, dict) or not isinstance(match.get("defect_id"), str) or match["defect_id"] in out:
+            return None
+        finding = match.get("finding_id")
+        if finding is not None and not isinstance(finding, str):
+            return None
+        out[match["defect_id"]] = finding
+    return out
 
 
 def grade_defect_case(
@@ -270,12 +321,12 @@ def grade_defect_case(
     if not findings:
         return {}
     matches = judge(case, reviewer, findings)
-    known = {str(f.get("id")) for f in findings}
+    known = {f["id"] for f in findings if isinstance(f.get("id"), str) and f["id"]}
     defect_ids = {d["id"] for d in case["defects"]}
     found: dict[str, str] = {}
     used: set[str] = set()
     for defect_id, finding_id in matches.items():
-        if defect_id in defect_ids and finding_id in known and finding_id not in used:
+        if defect_id in defect_ids and isinstance(finding_id, str) and finding_id in known and finding_id not in used:
             found[defect_id] = finding_id
             used.add(finding_id)
     return found
@@ -300,7 +351,7 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
     for seat in seats:
         family = evalset.protocol["seats"][seat]["family"]
         hit = total = hit_other = total_other = 0
-        alarms = controls = failed = missing = 0
+        alarms = controls = failed = missing = transport = 0
         minutes: list[float] = []
         for item in (i for i in items if i.seat == seat):
             row = by_case.get((seat, item.entry["id"]), {})
@@ -311,6 +362,7 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
             if row.get("minutes") is not None:
                 minutes.append(row["minutes"])
             ok = row.get("status") == "done"
+            transport += int(ok and row.get("task_status") != "done")
             if item.kind == "defect":
                 n = len(item.entry["defects"])
                 got = len(row.get("matched", {})) if ok else 0
@@ -335,6 +387,7 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
             "controls_scored": controls,
             "reviews_failed": failed,
             "reviews_missing": missing,
+            "scored_replies_from_failed_tasks": transport,
             "minutes_median": round(statistics.median(minutes), 1) if minutes else None,
             "minutes_total": round(sum(minutes), 1),
         }
@@ -342,31 +395,31 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
 
 
 class Dispatcher:
-    """Runs lu_machinery.dispatch as a subprocess with the project interpreter."""
+    """Runs lu_machinery.dispatch with the project interpreter through the shared command seam."""
 
     def __init__(self, python: str) -> None:
         self.python = python
 
-    def _cli(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
-        return subprocess.run([self.python, "-m", "lu_machinery.dispatch", *args],
-                              capture_output=True, text=True, timeout=timeout, check=False)
+    def _cli(self, *args: str) -> subprocess.CompletedProcess[str]:
+        proc: subprocess.CompletedProcess[str] = github_client.run(
+            [self.python, "-m", "lu_machinery.dispatch", *args], capture_output=True, text=True, check=False)
+        return proc
 
-    def run(self, argv: list[str], task_id: str, hard_timeout: int) -> tuple[dict[str, Any], str]:
-        """Dispatch, wait to a terminal state, return (task record, result text)."""
+    def start(self, argv: list[str], task_id: str) -> tuple[str | None, str]:
+        """Start one dispatch; return (run nonce, error)."""
         started = self._cli(*argv)
-        if started.returncode != 0:
-            return {"status": "refused", "error": started.stderr.strip()[-500:]}, ""
         lines = started.stdout.split()
-        if len(lines) < 2 or lines[0] != task_id:
-            return {"status": "refused", "error": f"unexpected dispatch output: {started.stdout[-200:]}"}, ""
-        nonce = lines[1]
+        if started.returncode != 0 or len(lines) < 2 or lines[0] != task_id:
+            return None, (started.stderr.strip() or started.stdout.strip())[-500:]
+        return lines[1], ""
+
+    def collect(self, task_id: str, nonce: str, hard_timeout: int) -> tuple[dict[str, Any], str]:
+        """Wait for a started task to settle; return (task record, result text)."""
         deadline = time.monotonic() + hard_timeout + 300
-        while True:
-            waited = self._cli("wait", task_id, "--run-nonce", nonce, "--timeout", "600")
-            if waited.returncode != 124 or time.monotonic() > deadline:
+        while self._cli("wait", task_id, "--run-nonce", nonce, "--timeout", "600").returncode == 124:
+            if time.monotonic() > deadline:
                 break
-        status = self._cli("status", task_id, "--run-nonce", nonce)
-        record = first_json_object(status.stdout) or {"status": "unknown"}
+        record = first_json_object(self._cli("status", task_id, "--run-nonce", nonce).stdout) or {"status": "unknown"}
         text = ""
         if record.get("result_file"):
             try:
@@ -376,12 +429,80 @@ class Dispatcher:
         return record, text
 
 
-def review_argv(evalset: EvalSet, item: Item, brief: Path, attempt: int) -> list[str]:
+class Journal:
+    """Append-only record of every dispatch and its outcome, so a rerun never repeats one.
+
+    ``journal.jsonl`` holds ``dispatched`` events (task id and run nonce, written before the
+    wait) and ``settled`` events (status and, when valid, the parsed reply).
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def _write(self, event: dict[str, Any]) -> None:
+        self.events.append(event)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def dispatched(self, key: str, task_id: str, nonce: str) -> None:
+        self._write({"event": "dispatched", "key": key, "task_id": task_id, "nonce": nonce})
+
+    def settled(self, key: str, task_id: str, record: dict[str, Any], parsed: Any) -> None:
+        self._write({"event": "settled", "key": key, "task_id": task_id, "status": record.get("status"),
+                     "model": record.get("resolved_model") or record.get("model"),
+                     "model_attested": record.get("resolved_model_known") is True, "duration_s": record.get("duration_s"),
+                     "error": record.get("error"), "parsed": parsed})
+
+    def history(self, key: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """(dispatches, settlements) recorded for one key."""
+        return ([e for e in self.events if e["key"] == key and e["event"] == "dispatched"],
+                [e for e in self.events if e["key"] == key and e["event"] == "settled"])
+
+
+def attempt(
+    journal: Journal, dispatcher: Dispatcher, key: str, base_id: str, attempts: int, hard_timeout: int,
+    argv_for: Callable[[str], list[str]], accept: Callable[[dict[str, Any], str], Any],
+) -> tuple[Any, dict[str, Any]]:
+    """Return (parsed reply or None, last settlement) for one review or judgement.
+
+    A recorded valid settlement is reused; a recorded dispatch that never settled is waited on
+    rather than started again; otherwise up to ``attempts`` new dispatches start.
+    """
+    dispatches, settlements = journal.history(key)
+    for event in settlements:
+        if event["parsed"] is not None:
+            return event["parsed"], event
+    last: dict[str, Any] = settlements[-1] if settlements else {}
+    settled_ids = {e["task_id"] for e in settlements}
+    pending = [e for e in dispatches if e["task_id"] not in settled_ids]
+    for number in range(len(dispatches) + 1, len(dispatches) + 1 + attempts):
+        if pending:
+            event = pending.pop(0)
+            task_id, nonce = event["task_id"], event["nonce"]
+        else:
+            task_id = f"{base_id}-{number}"
+            nonce, error = dispatcher.start(argv_for(task_id), task_id)
+            if nonce is None:
+                last = {"status": "refused", "error": error}
+                journal.settled(key, task_id, last, None)
+                continue
+            journal.dispatched(key, task_id, nonce)
+        record, text = dispatcher.collect(task_id, nonce, hard_timeout)
+        parsed = accept(record, text) if text else None
+        journal.settled(key, task_id, record, parsed)
+        last = journal.events[-1]
+        if parsed is not None:
+            return parsed, last
+    return None, last
+
+
+def review_argv(evalset: EvalSet, item: Item, brief: Path, task_id: str) -> list[str]:
     seat = evalset.protocol["seats"][item.seat]
     head = item.entry["head_sha"]
     return [
         "dispatch", "--agent", seat["agent"], "--model", seat["model"], "--effort", seat["effort"],
-        "--mode", "read-only", "--worktree", "--task-id", f"{item.task_id}-a{attempt}",
+        "--mode", "read-only", "--worktree", "--task-id", task_id,
         "--prompt-file", str(brief), "--repo", evalset.protocol["repositories"][item.entry["repository"]],
         "--base", head, "--pinned-head", head,
         *(["--review-profile", "code", "--require-review-verdict"] if seat["review_role"]
@@ -398,9 +519,21 @@ def judge_argv(evalset: EvalSet, judge: dict[str, Any], task_id: str, brief: Pat
     ]
 
 
-def _minutes(record: dict[str, Any], wall: float) -> float:
-    duration = record.get("duration_s")
-    return round((float(duration) if isinstance(duration, (int, float)) else wall) / 60, 2)
+def _rows(path: Path) -> list[dict[str, Any]]:
+    """Rows of a results file, oldest first; a later row for a seat and case supersedes earlier ones."""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def accept_review(model: str, validator: Any, record: dict[str, Any], text: str) -> dict[str, Any] | None:
+    """A valid conclusive reply from the seat's own model, whatever the task's final status.
+
+    A task whose stream attests a different model is refused. A task that settled as failed after
+    returning a complete, schema-valid reply (an AGY transport error at exit) is scored and
+    flagged through its row's ``task_status``.
+    """
+    if record.get("resolved_model_known") is True and record.get("resolved_model") != model:
+        return None
+    return valid_review(text, validator)
 
 
 def execute(evalset: EvalSet, items: list[Item], out: Path, dispatcher: Dispatcher) -> int:
@@ -408,52 +541,51 @@ def execute(evalset: EvalSet, items: list[Item], out: Path, dispatcher: Dispatch
     briefs = out / "briefs"
     briefs.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
+    journal = Journal(out / "journal.jsonl")
     done = set()
     if results.exists():
-        done = {(row["seat"], row["case_id"]) for row in map(json.loads, results.read_text().splitlines())}
+        done = {(row["seat"], row["case_id"]) for row in _rows(results) if row["status"] == "done"}
     limits = evalset.protocol["limits"]
+    validator = _findings_validator()
     failures = 0
     for item in items:
         if (item.seat, item.entry["id"]) in done:
             continue
         seat = evalset.protocol["seats"][item.seat]
-        repo_key = evalset.protocol["repositories"][item.entry["repository"]]
         brief = briefs / f"{item.task_id}.review.md"
-        brief.write_text(review_brief(item.entry, repo_key), encoding="utf-8")
-        record: dict[str, Any] = {}
-        reply: dict[str, Any] | None = None
-        began = time.monotonic()
-        for attempt in range(1, limits["attempts_per_review"] + 1):
-            record, text = dispatcher.run(review_argv(evalset, item, brief, attempt), f"{item.task_id}-a{attempt}",
-                                          limits["review_hard_timeout_s"])
-            reply = first_json_object(text) if record.get("status") == "done" else None
-            if reply is not None and isinstance(reply.get("findings"), list):
-                break
-            reply = None
+        brief.write_text(review_brief(item.entry, evalset.protocol["repositories"][item.entry["repository"]]),
+                         encoding="utf-8")
+        reply, settled = attempt(
+            journal, dispatcher, f"{item.task_id}:review", f"{item.task_id}-a", limits["attempts_per_review"],
+            limits["review_hard_timeout_s"], functools.partial(review_argv, evalset, item, brief),
+            functools.partial(accept_review, seat["model"], validator))
+        duration = settled.get("duration_s")
         row: dict[str, Any] = {
             "seat": item.seat, "model": seat["model"], "case_id": item.entry["id"], "kind": item.kind,
-            "head_sha": item.entry["head_sha"], "task_status": record.get("status"),
-            "attested_model": record.get("model"), "minutes": _minutes(record, time.monotonic() - began),
+            "head_sha": item.entry["head_sha"], "task_id": settled.get("task_id"), "task_status": settled.get("status"),
+            "attested_model": settled.get("model"),
+            "minutes": round(float(duration) / 60, 2) if isinstance(duration, (int, float)) else None,
         }
         if reply is None:
-            row.update(status="failed", error=record.get("error"))
+            row.update(status="failed", error=settled.get("error"))
             failures += 1
         else:
             failures = 0
-            row.update(status="done", findings=reply["findings"], correctness=(reply.get("overall") or {}).get("correctness"))
+            row.update(status="done", findings=reply["findings"], correctness=reply["overall"]["correctness"])
             if item.kind == "defect":
                 judge = judge_seat(evalset.protocol, seat["family"])
-                judge_id = f"{item.task_id}-judge"
 
                 def run_judge(case: dict[str, Any], _rev: dict[str, Any], found: list[dict[str, Any]],
-                              _judge: dict[str, Any] = judge, _id: str = judge_id) -> dict[str, str | None]:
-                    path = briefs / f"{_id}.md"
+                              _judge: dict[str, Any] = judge, _item: Item = item) -> dict[str, str | None]:
+                    path = briefs / f"{_item.task_id}.judge.md"
                     path.write_text(judge_brief(case, found), encoding="utf-8")
-                    rec, out_text = dispatcher.run(judge_argv(evalset, _judge, _id, path), _id, limits["judge_hard_timeout_s"])
-                    parsed = first_json_object(out_text) if rec.get("status") == "done" else None
-                    if parsed is None or not isinstance(parsed.get("matches"), list):
-                        raise EvalError(f"judge {_id} returned no matches object (status {rec.get('status')})")
-                    return {str(m.get("defect_id")): m.get("finding_id") for m in parsed["matches"] if isinstance(m, dict)}
+                    matches, last = attempt(
+                        journal, dispatcher, f"{_item.task_id}:judge", f"{_item.task_id}-j",
+                        limits["attempts_per_review"], limits["judge_hard_timeout_s"],
+                        lambda tid: judge_argv(evalset, _judge, tid, path), lambda _rec, text: valid_matches(text))
+                    if matches is None:
+                        raise EvalError(f"judge for {_item.task_id} returned no valid matches (status {last.get('status')})")
+                    return dict(matches)
 
                 try:
                     row["matched"] = grade_defect_case(item.entry, seat, judge["family"], reply["findings"], run_judge)
@@ -491,24 +623,20 @@ def main(argv: list[str] | None = None) -> int:
     except EvalError as exc:
         print(f"[review-eval] refused: {exc}", file=sys.stderr)
         return 2
-    now = dt.datetime.now(dt.UTC)
     refusals: list[str] = []
     report: dict[str, Any] = {"split": args.split, "set_sha256": evalset.digests, "seats": {}}
     for seat, items in plans.items():
         cost = estimate(evalset, items)
-        late = open_windows(items, now)
-        report["seats"][seat] = {**cost, "open_control_windows": late,
+        report["seats"][seat] = {**cost,
                                  "defect_cases": sum(i.kind == "defect" for i in items),
                                  "controls": sum(i.kind == "control" for i in items)}
         if not cost["within_ceiling"]:
             refusals.append(f"{seat}: worst-case ${cost['usd_worst_case_with_retries']} exceeds the ${cost['usd_ceiling']} ceiling")
-        if late:
-            refusals.append(f"{seat}: controls still inside their 14-day clean window: {', '.join(late)}")
     if args.dry_run:
         for seat, items in plans.items():
             for item in items:
                 brief = Path("<out>/briefs") / f"{item.task_id}.review.md"
-                cmd = [args.python, "-m", "lu_machinery.dispatch", *review_argv(evalset, item, brief, 1)]
+                cmd = [args.python, "-m", "lu_machinery.dispatch", *review_argv(evalset, item, brief, f"{item.task_id}-a1")]
                 print(f"{seat}\t{item.kind}\t{item.entry['id']}\t{shlex.join(cmd)}")
         print(json.dumps({**report, "refusals": refusals}, indent=2))
         return 0
@@ -524,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     code = 0
     for items in plans.values():
         code = max(code, execute(evalset, items, out, dispatcher))
-    rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()] if (out / "results.jsonl").exists() else []
+    rows = _rows(out / "results.jsonl") if (out / "results.jsonl").exists() else []
     report["scores"] = score(evalset, [i for items in plans.values() for i in items], rows)
     (out / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report["scores"], indent=2))

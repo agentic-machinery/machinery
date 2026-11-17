@@ -1,6 +1,7 @@
 """Reviewer-grading runner: split stability, cross-family scoring and a dispatch-free dry run."""
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -33,7 +34,22 @@ def test_split_is_a_pinned_hash_so_tuning_never_reaches_the_held_out_split() -> 
 
 def test_a_finding_scores_only_when_a_cross_family_judge_matches_a_returned_finding() -> None:
     """Defect class: recall inflated by judge answers that name findings the reviewer never
-    returned, by one finding credited to two defects, or by a same-family judge."""
+    returned, by one finding credited to two defects, or by a same-family judge; and a BLOCKED
+    or malformed reply scored as a completed review (a clean control or a review that found
+    nothing)."""
+    validator = review_eval._findings_validator()
+    overall = {"explanation": "x", "confidence": 0.5}
+    blocked = {"schema_version": "code-review-findings.v1", "overall": {**overall, "correctness": "uncertain"},
+               "findings": [], "missing_capabilities": ["checkout-data"]}
+    approve = {"schema_version": "code-review-findings.v1", "overall": {**overall, "correctness": "correct"},
+               "findings": []}
+    assert review_eval.valid_review(json.dumps(blocked), validator) is None
+    assert review_eval.valid_review(json.dumps({"findings": []}), validator) is None
+    assert review_eval.valid_review(json.dumps({**approve, "findings": [42]}), validator) is None
+    assert review_eval.valid_review("APPROVE " + json.dumps(approve), validator) == approve
+    assert review_eval.valid_matches('{"matches": [{"defect_id": "D1", "finding_id": 3}]}') is None
+    assert review_eval.valid_matches('{"matches": [{"defect_id": "D1", "finding_id": null}]}') == {"D1": None}
+
     case = {
         "id": "machinery-1", "repository": "learn-ukrainian/machinery", "pr": 1,
         "source_review": {"family": "openai"},
@@ -85,4 +101,4 @@ def test_dry_run_prints_the_plan_and_dispatches_nothing(monkeypatch, capsys) -> 
     out = capsys.readouterr().out
     assert "lu_machinery.dispatch dispatch --agent codex --model gpt-6.1-sol" in out
     assert "--agent agy --model gemini-4-carbon-medium" in out
-    assert '"reviews": 32' in out
+    assert '"reviews": 33' in out
