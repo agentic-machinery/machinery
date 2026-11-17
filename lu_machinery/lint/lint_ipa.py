@@ -19,10 +19,10 @@ Errors detected:
   ɐ → ɑ       Near-open central → open back (our convention)
 
 Usage:
-  .venv/bin/python scripts/lint_ipa.py FILE              # lint one file
-  .venv/bin/python scripts/lint_ipa.py FILE --fix        # auto-fix
-  .venv/bin/python scripts/lint_ipa.py DIR/*.md          # batch lint
-  .venv/bin/python scripts/lint_ipa.py DIR/*.md --fix    # batch fix
+  .venv/bin/python -m lu_machinery.lint.lint_ipa FILE              # lint one file
+  .venv/bin/python -m lu_machinery.lint.lint_ipa FILE --fix        # auto-fix
+  .venv/bin/python -m lu_machinery.lint.lint_ipa DIR/*.md          # batch lint
+  .venv/bin/python -m lu_machinery.lint.lint_ipa DIR/*.md --fix    # batch fix
 """
 
 import argparse
