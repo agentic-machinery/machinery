@@ -60,22 +60,17 @@ def release(tmp_path_factory):
 
 
 def test_wheel_omission_or_product_leakage(release):
-    """Every tracked machinery resource ships with its bytes; no product resource ships."""
+    """Every declared release resource ships with its bytes; nothing undeclared ships."""
     _, wheel, _, _ = release
-    tracked = subprocess.check_output(["git", "ls-files", "agents_extensions/shared"], cwd=REPO, text=True).splitlines()
-    ownership = json.loads(machinery_path("lint/rename-map.json").read_text())
-    # The historical extraction map predates the approved move into fleet rules.
-    moves = {
-        SHARED + "rules/" + name: "docs/best-practices/" + name
-        for name in ("fleet-shared-doctrine.md", "fleet-role-scorecard.md")
-    }
-    assert all(ownership.get(moves.get(name, name)) in {"machinery", "product"} for name in tracked)
-    machinery = {name for name in tracked if ownership[moves.get(name, name)] == "machinery"}
+    tracked = set(subprocess.check_output(["git", "ls-files", SHARED], cwd=REPO, text=True).splitlines())
+    # The release inventory is the declaration of what this release owns and deploys.
+    declared = {SHARED + name for name in json.loads(machinery_path("agent_deploy/release.v1.json").read_text())["files"]}
+    assert tracked == declared
     with zipfile.ZipFile(wheel) as archive:
         shipped = {name for name in archive.namelist() if name.startswith(SHARED)}
-        assert shipped == machinery
+        assert shipped == declared
         assert not any(name.endswith("/__init__.py") for name in shipped)
-        for name in machinery:
+        for name in declared:
             assert archive.read(name) == (REPO / name).read_bytes(), name
 
 

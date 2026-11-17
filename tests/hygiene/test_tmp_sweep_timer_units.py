@@ -30,7 +30,7 @@ def test_service_and_timer_contract() -> None:
         "ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary",
         "ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary",
     ]
-    # The data-volume drop-in is product-retained (docs/step7/port_triage.py, #127 R20).
+    # The data-volume drop-in is product-retained (#127 R20).
     # This package's unit template does not ship it.
     assert "PrivateTmp" not in service  # the sweep must see the real system temp area
     # A user manager forces NoNewPrivileges=yes for every seccomp filter, so sudo

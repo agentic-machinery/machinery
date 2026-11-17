@@ -31,7 +31,7 @@ STAMP = "2026-09-23T10:30:00Z"
 
 @pytest.fixture
 def budget_merge_repo(tmp_path):
-    """Real Git objects, including a hash conflict over an otherwise clean merge."""
+    """Real Git objects: two branches that change different lines of one file merge cleanly."""
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                GIT_AUTHOR_NAME="Test", GIT_AUTHOR_EMAIL="test@example.invalid",
@@ -53,13 +53,9 @@ def budget_merge_repo(tmp_path):
         tree = git("write-tree")
         return git("commit-tree", tree, *(arg for parent in parents for arg in ("-p", parent)), input="fixture\n")
 
-    source = "lu_machinery/lint/rename-map.json"
-    digest = source + ".sha256"
-
     def files(left, right, code="original\n"):
         content = json.dumps({"left": left, "padding": [1, 2, 3, 4, 5], "right": right}, indent=2) + "\n"
-        return {source: content, digest: hashlib.sha256(content.encode()).hexdigest() + "  rename-map.json\n",
-                "code.py": code}
+        return {"data.json": content, "code.py": code}
 
     root = commit(files(0, 0))
     approved = commit(files(1, 0), root)
@@ -68,12 +64,10 @@ def budget_merge_repo(tmp_path):
     return tmp_path, git, commit, files, root, approved, base, candidate
 
 
-def test_clean_generated_hash_merge_gets_one_delta_outside_spent_budget(budget_merge_repo):
-    """Defect class: generated-hash regeneration consumes a round, or unreviewed merges chain."""
+def test_clean_base_merge_gets_one_delta_outside_spent_budget(budget_merge_repo):
+    """Defect class: a clean base merge consumes a round, or unreviewed merges chain."""
     repo, git, commit, files, _root, approved, base, candidate = budget_merge_repo
-    assert git("show", "--remerge-diff", "--format=", "--name-only", candidate) == (
-        "lu_machinery/lint/rename-map.json.sha256"
-    )
+    assert git("show", "--remerge-diff", "--format=", "--name-only", candidate) == ""
     comments = [recorded_verdict(H1, "CHANGES_REQUESTED", task_id="r1"),
                 recorded_verdict(H2, "CHANGES_REQUESTED", task_id="r2"),
                 recorded_verdict(approved, "APPROVED", task_id="r3")]
@@ -112,10 +106,10 @@ def test_clean_generated_hash_merge_gets_one_delta_outside_spent_budget(budget_m
     exemptions = recorder.budget_exempt_heads(comments[:3], sibling, "fleet", prove=next_proof,
                                              unrecorded=[candidate])
     assert set(exemptions) == {candidate}
-    # The generated-file exception requires the actual merged source's hash.
-    invalid = files(1, 1)
-    invalid["lu_machinery/lint/rename-map.json.sha256"] = "0" * 64 + "  rename-map.json\n"
-    assert prove(approved, commit(invalid, approved, base)) is None
+    # A merge whose tree differs from Git's own merge result is not a clean base merge.
+    edited = files(1, 1)
+    edited["data.json"] += "edited in the merge\n"
+    assert prove(approved, commit(edited, approved, base)) is None
 
 
 @pytest.mark.parametrize("conflict", ["text", "binary-ours", "modify-delete-keep"])

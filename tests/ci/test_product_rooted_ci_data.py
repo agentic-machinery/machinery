@@ -122,7 +122,6 @@ def test_wheel_cannot_supply_checkout_ci_census(installed: tuple[Path, Path]) ->
     # Host drift probes still need release-owned pins. CI must ignore this copy.
     assert "lu_machinery/config/stack_pins.yaml" in names
     assert "lu_machinery/ci/components.json" in names
-    assert "lu_machinery/lint/rename-map.json" in names
     assert "agents_extensions/shared/rules/workflow.md" in names
 
 

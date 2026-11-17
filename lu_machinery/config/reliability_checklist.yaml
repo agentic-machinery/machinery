@@ -155,8 +155,8 @@ items:
     area: ci-release-deps
     check: >-
       A file under agents_extensions/shared is added, removed or renamed. Is it registered in
-      MANIFEST.in, lu_machinery/lint/rename-map.json (with its .sha256 regenerated) and, if deployed,
-      agent_deploy/release.v1.json? The wheel census test runs only in the merge group.
+      MANIFEST.in and lu_machinery/agent_deploy/release.v1.json? The wheel census test runs only in
+      the merge group.
     incident: "tests/packaging/test_release_resources.py (wheel omission census); lesson launcher test pins skills deploy set (merge group only)"
     triggers:
       - paths: ["agents_extensions/shared/**"]
