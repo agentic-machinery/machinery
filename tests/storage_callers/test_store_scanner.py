@@ -1,10 +1,32 @@
 """Scanner corrections must not hide real store paths or aliased writer calls."""
 
+import ast
 import json
 
 import pytest
 
+from lu_machinery.ci.subprocess_timeout_guard import call_shape_hash
 from lu_machinery.hygiene import lint_source_db_writable_connects as lint
+
+# CPython 3.12 dump of a call whose ``keywords`` list is empty.
+# Store findings keep the full sha256; call shapes keep the first 16 hex digits.
+_CONNECT_FINGERPRINT = "fa42fb797bd8ef444003f611c3affa23704dc42a9642238fab779a1d1495c204"
+_RUN_SHAPE = "5205a35b6d77f3ed"
+
+
+def test_empty_keyword_list_fingerprint_matches_cpython_312_bytes():
+    """Defect class: ast.dump omitting empty lists changes a stored fingerprint.
+
+    CPython 3.13+ drops ``keywords=[]``. Both fingerprint sites must keep the
+    3.12 bytes, so an allowlist or baseline keyed there does not move.
+    """
+    source = "import sqlite3\nsqlite3.connect('data/sources.db')\n"
+    findings = lint.classify_store_source(source, "scripts/example.py")
+    assert sorted(finding.kind for finding in findings) == ["raw_store_constructor", "store_path"]
+    assert {finding.fingerprint for finding in findings} == {_CONNECT_FINGERPRINT}
+    call = ast.parse("subprocess.run(['true'])").body[0].value
+    assert isinstance(call, ast.Call)
+    assert call_shape_hash(call) == _RUN_SHAPE
 
 
 def test_diagnostic_and_logical_label_are_not_store_constructions(tmp_path):
