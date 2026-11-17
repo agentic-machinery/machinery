@@ -70,8 +70,8 @@ The `/machinery` page links the installed version to
 - `SHA256SUMS` listing both (`sha256sum` format).
 - The GitHub release `v<version>` with those three files as assets.
 - The host wheelhouse (its location is host configuration in infra-private)
-  holds the same wheel bytes plus every wheel named in this commit's
-  `requirements-machinery.lock`. It keeps the previous release's wheel and
+  holds the same wheel bytes plus every wheel of this commit's runtime closure
+  (the `uv.lock` export under Dependency lock). It keeps the previous release's wheel and
   dependencies, so a consumer can roll back offline.
 - The machinery-owned `package.json`, `package-lock.json` and `.nvmrc` ship
   with the wheel at `share/lu-machinery/node-contract` under its environment.
@@ -81,16 +81,28 @@ The `/machinery` page links the installed version to
 
 ## Dependency lock
 
-`requirements-machinery.lock` pins every transitive runtime dependency with
-the hash of the one wheel installed on the server and on GitHub-hosted
-`ubuntu-24.04` (CPython 3.12, x86_64). Its header records the resolution
-command. Resolve against learn-ukrainian's `requirements-lock.txt` as
-constraints, so the machinery lock agrees with the main consumer's pins. After
-resolving, take each hash from the wheel `pip download --only-binary=:all:`
-selects for both targets. Use `--platform` for the hosted runner's glibc
-ladder. If the targets select different wheels, list both hashes. The
-`Installed wheel` job of CI Gate installs the lock with `--require-hashes`.
-It fails when a dependency in `pyproject.toml` has no pin.
+`uv.lock` is the one lock: the runtime closure of `pyproject.toml` and the
+development groups (`[dependency-groups]`: test, typecheck, lint, audit), each
+package at one version with the SHA-256 of every wheel and sdist PyPI serves.
+`pyproject.toml` `[tool.uv] required-version` names the one uv release that
+writes and reads it (`UV_VERSION` in `.github/workflows/pins.txt`), and
+`.python-version` names the CPython that CI and the host run;
+`requires-python` stays the supported floor. Change a dependency in
+`pyproject.toml`, then run `uv lock` (or `uv lock --upgrade-package NAME`);
+CI's `uv sync --locked` fails when the lock no longer matches, and refuses
+any wheel whose hash differs from the lock. Semgrep is the one tool outside
+the lock (pins.txt `SEMGREP_PYTHON` records why).
+
+The release's runtime closure is the lock's export without the project and
+without any dependency group, with every hash:
+
+```bash
+uv export --locked --quiet --format requirements.txt --no-emit-project --no-default-groups
+```
+
+The `Installed wheel` job of CI Gate installs that export with pip
+`--require-hashes` from an offline wheelhouse on the pinned Python and on the
+`requires-python` floor; the `Dependency audit` job audits it.
 
 ## Cut a release
 
@@ -153,13 +165,15 @@ order:
    `python -I -m build --sdist --wheel --no-isolation`. It writes `SHA256SUMS`
    for the wheel and sdist.
 4. **Wheelhouse and consumer lock.** The wheelhouse is the wheel plus
-   `pip download --require-hashes --only-binary=:all: --no-deps -r requirements-machinery.lock`.
-   The consumer lock is the release line followed by the dependency lock:
+   `pip download --require-hashes --only-binary=:all: --no-deps -r <export>`,
+   where `<export>` is the runtime closure above, exported from `uv.lock` at
+   `$SHA` with `uv` (`UV_VERSION`) on `PATH`. The consumer lock is the release
+   line followed by that export:
 
    ```text
    lu-machinery==$V \
        --hash=sha256:<wheel sha256>
-   <requirements-machinery.lock at $SHA>
+   <the uv.lock runtime export at $SHA>
    ```
 
 5. **Clean install** into a new machinery-only environment created from the
