@@ -103,7 +103,7 @@ from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
 from .session_streams_router import router as session_streams_router
-from .state_helpers import Demand, cache_get, cache_invalidate, cache_set, ctx_cache_scope
+from .state_helpers import Demand, cache_get, cache_get_stored, cache_invalidate, cache_set, ctx_cache_scope
 from .state_router import router as state_router
 from .state_router import schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -1576,17 +1576,32 @@ def _orient_section_demanded(key: str, ctx: MonitorContext | None) -> bool:
     return demand is not None and demand.active()
 
 
+def _orient_request_waits_on(key: str, layout: OrientLayout) -> bool:
+    """True for a section an /api/orient request collects inline once it expires.
+
+    Cache-first sections (the detached ones, idle PRs, product scans) answer a
+    request from their last value, so only those may go cold while unread.
+    """
+    return key not in DETACHED_ORIENT_SECTION_KEYS and key != "idle_prs" and key not in layout.product
+
+
 async def refresh_orient_periodically(ctx: MonitorContext, product: ProductContribution) -> None:
     """Keep the sections agents are reading warm between their polls, without stacking TTLs."""
     startup = True
     while True:
         try:
             layout = _orient_layout(product)
-            # Warm expensive product scans once at startup. Afterwards a section
+            # Warm expensive product scans once at startup. A cache-first section
             # is refreshed only while requests read it: an app nobody orients
-            # against runs no task-store scans, GitHub reads or host probes.
-            selected = [key for key in layout.keys if (startup and key in layout.product) or
-                        _orient_section_demanded(key, ctx)]
+            # against runs no task-store scans, GitHub fan-out or host probes.
+            # A cheap section a request would collect inline stays warm once used.
+            scope = _ctx_cache_scope(ctx)
+            selected = [
+                key for key in layout.keys
+                if (startup and key in layout.product)
+                or _orient_section_demanded(key, ctx)
+                or (_orient_request_waits_on(key, layout) and cache_get_stored(f"orient_{key}{scope}") is not None)
+            ]
             await _collect_orient_sections(ctx, layout, selected)
         except Exception:
             logger.warning("Orient refresh failed", exc_info=True)
