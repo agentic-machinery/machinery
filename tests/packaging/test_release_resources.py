@@ -124,6 +124,7 @@ print(json.dumps(result))
             "rules/critical-rules.md",
             "rules/dispatch-must-use-worktree.md",
             "rules/workflow.md",
+            "rules/design-charter.md",
         ],
         "task:review": ["skills/local-code-review/SKILL.md"],
         "task:driver": [

@@ -139,6 +139,8 @@ must never mutate the source tree:
 
 Report failures; do not silently correct them here.
 
+Check the diff against `agents_extensions/shared/rules/design-charter.md`, read from the base branch (for example `git show <base>:agents_extensions/shared/rules/design-charter.md`), never from the PR under review.
+
 ---
 
 ## Step 4: Resolve the cross-family reviewer
