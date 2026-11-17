@@ -103,32 +103,34 @@ def _structure_depth(text: str, start: int) -> int:
     return max(accumulate(map(_STEP, outside), initial=0))
 
 
-def _shallow(text: str, start: int, max_depth: int) -> bool:
-    """Whether the decoder can meet no bracket deeper than ``max_depth`` from ``start``.
-
-    Both checks run at C speed and come before :func:`_first_too_deep`'s per-token scan, so
-    an ordinary document costs close to a plain decode. When they pass, the scan could only
-    find a too-deep bracket past a backslash outside a string, which the decoder never reads,
-    so decoding the whole text gives what decoding through that bracket gives.
-    """
+def _decode(text: str, idx: int, max_depth: int, decoder: json.JSONDecoder) -> tuple[Any, int]:
     # At most one bracket per level can be open, so a text with few brackets cannot be too
     # deep. Brackets inside strings only add to this count.
-    if text.count("[", start) + text.count("{", start) <= max_depth:
-        return True
-    return _structure_depth(text, start) <= max_depth
-
-
-def _decode(text: str, idx: int, max_depth: int, decoder: json.JSONDecoder) -> tuple[Any, int]:
-    deep = None if _shallow(text, idx, max_depth) else _first_too_deep(text, idx, max_depth)
-    if deep is None:
-        # At most max_depth levels: no interpreter's decoder recursion limit is reachable.
+    if text.count("[", idx) + text.count("{", idx) <= max_depth:
         return decoder.raw_decode(text, idx)
+    if _structure_depth(text, idx) <= max_depth:
+        # Both checks run at C speed, so an ordinary document never pays the per-match scan.
+        # The scan could still find a too-deep bracket past a backslash outside a string, but
+        # the decoder never reads that far, so decoding the whole text reads what decoding
+        # through that bracket reads. Only an error needs the scan, to judge it as below.
+        deep = None
+        end = len(text)
+    else:
+        deep = _first_too_deep(text, idx, max_depth)
+        if deep is None:
+            # At most max_depth levels: no interpreter's decoder recursion limit is reachable.
+            return decoder.raw_decode(text, idx)
+        end = deep + 1
     # Decode only through the first too-deep bracket. The decoder then meets, in document
     # order, every syntax error and every hook call for a container closed before that
     # bracket, as 3.12 did before its recursion limit.
     try:
-        return decoder.raw_decode(text[: deep + 1], idx)
+        return decoder.raw_decode(text[:end], idx)
     except json.JSONDecodeError as exc:
+        if deep is None:
+            deep = _first_too_deep(text, idx, max_depth)
+            if deep is None:
+                raise
         if exc.pos <= deep:
             raise json.JSONDecodeError(exc.msg, text, exc.pos) from None
     # The decoder accepted the bracket and ran out of text inside it: too deep.
