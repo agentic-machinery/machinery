@@ -5,6 +5,7 @@
     "rules/workflow.md",
     "rules/fleet-comms-coordination.md",
     "rules/dispatch-must-use-worktree.md",
+    "rules/design-charter.md",
     "rules/cli-help-standard.md",
     "rules/model-assignment.md",
     "rules/catalog-routing-tables.md",
@@ -550,6 +551,21 @@
         ],
         "cursor": [
           ".cursor/rules/critical-rules.md"
+        ]
+      }
+    },
+    "rules/design-charter.md": {
+      "mode": 420,
+      "owner": "fleet",
+      "targets": {
+        "agy": [
+          ".agent/rules/design-charter.md"
+        ],
+        "codex": [
+          ".codex/rules/design-charter.md"
+        ],
+        "cursor": [
+          ".cursor/rules/design-charter.md"
         ]
       }
     },

@@ -50,6 +50,7 @@ run receives the core as an appended system prompt:
     scope=task:repo-change agents_extensions/shared/rules/critical-rules.md
                            agents_extensions/shared/rules/dispatch-must-use-worktree.md
                            agents_extensions/shared/rules/workflow.md
+                           agents_extensions/shared/rules/design-charter.md
     scope=task:cli         agents_extensions/shared/rules/cli-help-standard.md
     scope=task:curriculum  agents_extensions/shared/rules/non-negotiable-rules.md
     scope=task:fresh-build docs/epics/fresh-build-build-program.md
