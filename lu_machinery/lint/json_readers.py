@@ -118,6 +118,7 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
             name in _READERS
             or (
                 name in {"json", "json.decoder", "_json"}
+                and (not isinstance(node, ast.Name) or node.id in names)
                 and not (isinstance(parents.get(node), ast.Attribute) and parents[node].value is node)
             )
             or (name == "json.JSONDecoder" and node not in allowed_constructors)

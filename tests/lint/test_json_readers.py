@@ -51,6 +51,8 @@ def test_new_bare_reader_and_aliases_fail_the_gate(tmp_path, capsys, source):
     "import json\nfrom lu_machinery.common import json_depth\ndef r(text):\n d=json.JSONDecoder()\n return json_depth.raw_decode(text, max_depth=512, decoder=d)",
 ])
 def test_bounded_readers_and_only_the_helper_are_admitted(tmp_path, capsys, source):
+    # A real serializer helper name must not be confused with the stdlib C module.
+    source += "\ndef _json(value): return value\n_json(1)\n"
     root = _package(tmp_path, source)
     assert json_readers.main(["--root", str(root)]) == 0
     assert "JSON reader lint passed" in capsys.readouterr().out
