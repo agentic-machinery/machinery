@@ -31,6 +31,10 @@ from lu_machinery.common import github_client
 from lu_machinery.orchestration import issue_stream_audit as audit
 
 from .monitor_context import MonitorContext, get_ctx, resolve_context
+from .state_helpers import swr_route
+
+# One ``gh issue list`` call per refresh; a read never waits on GitHub after the first.
+ISSUES_MAP_TTL_S = 120.0
 
 router = APIRouter(tags=["issues"])
 
@@ -177,7 +181,8 @@ def _fetch_issues(limit: int, ctx: MonitorContext | None = None) -> dict[str, An
 
 
 @router.get("/map")
-async def issues_map(
+@swr_route("issues-map", ISSUES_MAP_TTL_S, vary=("limit",))
+def issues_map(
     limit: int = Query(50, ge=1, le=200, description="Upper bound on issues to scan."),
     ctx: MonitorContext = Depends(get_ctx),
 ):
@@ -190,7 +195,7 @@ async def issues_map(
 
     Reviewer Codex-6 / #1313: makes queue management less manual.
     """
-    return await asyncio.to_thread(_fetch_issues, limit, ctx)
+    return _fetch_issues(limit, ctx)
 
 
 @router.get("/streams")

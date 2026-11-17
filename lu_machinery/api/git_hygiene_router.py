@@ -23,7 +23,9 @@ import json
 import os
 import shlex
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,7 +41,13 @@ from lu_machinery.orchestration.task_record_store import locate_task_record, rea
 
 from . import panel_values
 from .monitor_context import MonitorContext, get_ctx, resolve_context
-from .state_helpers import cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key, schedule_cache_refresh
+from .state_helpers import (
+    cache_get_or_compute_async,
+    cache_get_stored,
+    ctx_scoped_ttl_key,
+    schedule_cache_refresh,
+    swr_route,
+)
 
 router = APIRouter(tags=["git"])
 FALLBACK_EXEMPTION_PATTERNS = (
@@ -55,6 +63,8 @@ BUCKET_NAMES = (
 )
 
 _GIT_TIMEOUT_S = 2.0
+# A cleanup report runs git per branch and per worktree; branches move slowly.
+GIT_CLEANUP_TTL_S = 60.0
 
 
 
@@ -155,25 +165,24 @@ def _isoformat_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+# Fields of ``git for-each-ref`` per local branch, NUL-separated.
+_BRANCH_FIELDS = "%00".join((
+    "%(refname:short)", "%(upstream:short)", "%(upstream:track)",
+    "%(objectname:short)", "%(committerdate:unix)", "%(committername)", "%(objectname)",
+))
+
+
 def _list_local_branches(cwd: Path) -> list[dict[str, Any]]:
-    code, stdout, _stderr = _run_git(
-        [
-            "for-each-ref",
-            "--format=%(refname:short)%00%(upstream:short)%00%(upstream:track)"
-            "%00%(objectname:short)%00%(committerdate:unix)%00%(committername)",
-            "refs/heads",
-        ],
-        cwd=cwd,
-    )
+    code, stdout, _stderr = _run_git(["for-each-ref", f"--format={_BRANCH_FIELDS}", "refs/heads"], cwd=cwd)
     if code != 0:
         return []
 
     branches: list[dict[str, Any]] = []
     for line in stdout.splitlines():
         parts = line.split("\x00")
-        if len(parts) != 6:
+        if len(parts) != 7:
             continue
-        name, upstream, upstream_track, sha, timestamp, committer = parts
+        name, upstream, upstream_track, sha, timestamp, committer, full_sha = parts
         try:
             committed_at = datetime.fromtimestamp(int(timestamp), UTC)
             last_commit_date = _isoformat_z(committed_at)
@@ -185,6 +194,7 @@ def _list_local_branches(cwd: Path) -> list[dict[str, Any]]:
             "last_commit_sha": sha,
             "last_commit_date": last_commit_date,
             "committer": committer,
+            "_full_sha": full_sha,
         })
     return branches
 
@@ -221,16 +231,66 @@ def _list_worktrees(cwd: Path) -> list[dict[str, Any]]:
     return worktrees
 
 
-def _is_branch_merged_to_main(branch: str, cwd: Path) -> bool:
-    code, stdout, _stderr = _run_git(["cherry", "main", branch], cwd=cwd)
+# ``git cherry`` answers depend only on the two tips. Keep the answers for the
+# current ``main`` tip so a cleanup report runs cherry only for moved branches.
+_CHERRY_WORKERS = 4
+# repository -> (main tip, {(branch, branch tip): fully merged}). Only an answer
+# ``git cherry`` gave for that exact pair of commits is kept.
+_merged_memo: dict[str, tuple[str, dict[tuple[str, str], bool]]] = {}
+
+
+def _branches_merged_to_main(branches: list[dict[str, Any]], cwd: Path) -> dict[str, bool]:
+    """``fully_merged_to_main`` per branch name, reusing answers for unchanged tips."""
+    code, stdout, _stderr = _run_git(["rev-parse", "--verify", "--quiet", "main^{commit}"], cwd=cwd)
+    main_sha = stdout.strip() if code == 0 else ""
+    memo_main, previous = _merged_memo.get(str(cwd), ("", {}))
+    if not main_sha or memo_main != main_sha:
+        previous = {}
+    answers: dict[tuple[str, str], bool] = {}
+    missing: list[tuple[str, str]] = []
+    for branch in branches:
+        key = (branch["name"], branch.get("_full_sha") or "")
+        if key[1] and key in previous:
+            answers[key] = previous[key]
+        else:
+            missing.append(key)
+
+    def ask(key: tuple[str, str]) -> tuple[bool, bool]:
+        name, tip = key
+        # The exact commits the memo key names, so a ref moving mid-scan cannot
+        # file one commit's answer under another.
+        return _merged_to_main_answer(name, cwd, main=main_sha or "main", tip=tip or None)
+
+    with ThreadPoolExecutor(max_workers=_CHERRY_WORKERS) as pool:
+        computed = list(pool.map(ask, missing))
+    answers.update((key, merged) for key, (merged, _cacheable) in zip(missing, computed, strict=True))
+    if main_sha:
+        # A moved ``main`` replaces every earlier answer for this repository.
+        known = {key: value for key, value in answers.items() if key[1] and key not in missing}
+        known.update((key, merged) for key, (merged, cacheable) in zip(missing, computed, strict=True)
+                     if key[1] and cacheable)
+        _merged_memo[str(cwd)] = (main_sha, known)
+    return {name: value for (name, _tip), value in answers.items()}
+
+
+def _merged_to_main_answer(branch: str, cwd: Path, *, main: str = "main", tip: str | None = None) -> tuple[bool, bool]:
+    """``(fully merged, cacheable)`` for ``branch`` (at ``tip`` when given) against ``main``.
+
+    Only a ``git cherry`` answer about those exact commits is cacheable. After
+    cherry fails, the ancestry fallback answers for this report only: it cannot
+    see patch-equivalent commits, so its "not merged" must not hide a later
+    cherry answer. When git cannot say, the branch reads as not merged (never
+    removable).
+    """
+    code, stdout, _stderr = _run_git(["cherry", main, tip or branch], cwd=cwd)
     if code == 0:
         lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-        return all(line.startswith("-") for line in lines)
+        return all(line.startswith("-") for line in lines), True
 
-    code, stdout, _stderr = _run_git(["branch", "--merged", "main", "--format=%(refname:short)"], cwd=cwd)
+    code, stdout, _stderr = _run_git(["branch", "--merged", main, "--format=%(refname:short)"], cwd=cwd)
     if code != 0:
-        return False
-    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}
+        return False, False
+    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}, False
 
 
 def _is_worktree_clean(path: Path, cwd: Path) -> bool:
@@ -259,6 +319,25 @@ def _disk_bytes(path: Path) -> int | None:
         return None
 
 
+# Running task ids per record file, keyed by the file's identity. A cleanup
+# report re-reads only records written since the last report, not all ~15k.
+_TaskFileIdentity = tuple[int, int, int, int]
+_running_ids_memo: dict[str, tuple[_TaskFileIdentity, tuple[str, ...]]] = {}
+# Reports for different contexts can scan at once; one scan reads and prunes the memo at a time.
+_running_ids_lock = threading.Lock()
+
+
+def _running_ids_in_record(path: str, name: str) -> tuple[str, ...]:
+    try:
+        payload = read_task_record(Path(path))
+    except (OSError, ValueError):
+        return ()
+    if not isinstance(payload, dict) or payload.get("status") != "running":
+        return ()
+    task_id = payload.get("task_id")
+    return (name[:-5], task_id) if isinstance(task_id, str) and task_id else (name[:-5],)
+
+
 def _active_task_ids(project_root: Path) -> set[str]:
     tasks_dir = project_root / "batch_state" / "tasks"
     active: set[str] = set()
@@ -269,19 +348,27 @@ def _active_task_ids(project_root: Path) -> set[str]:
     except OSError:
         return active
 
-    for entry in entries:
-        if not entry.name.endswith(".json"):
-            continue
-        try:
-            payload = read_task_record(Path(entry.path))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(payload, dict) or payload.get("status") != "running":
-            continue
-        active.add(entry.name[:-5])
-        task_id = payload.get("task_id")
-        if isinstance(task_id, str) and task_id:
-            active.add(task_id)
+    seen: set[str] = set()
+    with _running_ids_lock:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            identity = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            seen.add(entry.path)
+            cached = _running_ids_memo.get(entry.path)
+            if cached is not None and cached[0] == identity:
+                ids = cached[1]
+            else:
+                ids = _running_ids_in_record(entry.path, entry.name)
+                _running_ids_memo[entry.path] = (identity, ids)
+            active.update(ids)
+        prefix = f"{tasks_dir}{os.sep}"
+        for path in [path for path in _running_ids_memo if path.startswith(prefix) and path not in seen]:
+            _running_ids_memo.pop(path, None)
     return active
 
 
@@ -350,10 +437,12 @@ def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
 
     branch_state: dict[str, dict[str, Any]] = {}
     stale_branches: list[StaleBranch] = []
+    merged = _branches_merged_to_main(branches, project_root)
     for branch in branches:
         name = branch["name"]
-        fully_merged = _is_branch_merged_to_main(name, project_root)
-        state = {**branch, "fully_merged_to_main": fully_merged}
+        fully_merged = merged[name]
+        state = {key: value for key, value in branch.items() if key != "_full_sha"}
+        state["fully_merged_to_main"] = fully_merged
         branch_state[name] = state
 
         if name == "main" or name.startswith("origin/") or name in checked_out_branches:
@@ -989,6 +1078,11 @@ async def git_hygiene(ctx: MonitorContext = Depends(get_ctx)):
 
 
 @router.get("/cleanup", response_model=CleanupReport, response_model_exclude_none=True)
-async def git_cleanup(ctx: MonitorContext = Depends(get_ctx)) -> CleanupReport:
-    """Classify stale branches and removable worktrees without changing git state."""
-    return await asyncio.to_thread(compute_git_cleanup, ctx.roots.live_repo_root)
+@swr_route("git-cleanup", GIT_CLEANUP_TTL_S)
+def git_cleanup(ctx: MonitorContext = Depends(get_ctx)) -> CleanupReport:
+    """Classify stale branches and removable worktrees without changing git state.
+
+    Served from the last report with its true age (``X-Snapshot-Age-S``);
+    ``computed_at`` names when that report was taken.
+    """
+    return compute_git_cleanup(ctx.roots.live_repo_root)

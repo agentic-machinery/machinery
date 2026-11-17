@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,8 @@ router = APIRouter(tags=["worktrees"])
 # bounded; the aggregate endpoint budget is ~4 × timeout_s per
 # worktree.
 _GIT_TIMEOUT_S = 2.0
+# Worktrees whose git status runs at the same time.
+_STATUS_WORKERS = 4
 
 
 def _worktree_git_env() -> dict[str, str]:
@@ -206,6 +209,7 @@ async def list_worktrees(ctx: MonitorContext = Depends(get_ctx)):
             project_root_str = str(live_repo_root)
 
         enriched: list[dict[str, Any]] = []
+        pending: list[tuple[dict[str, Any], Path]] = []
         for record in parsed:
             path_str = record.get("path")
             if not path_str:
@@ -223,8 +227,15 @@ async def list_worktrees(ctx: MonitorContext = Depends(get_ctx)):
                 enriched.append(record)
                 continue
             record["is_primary"] = (resolved == project_root_str)
-            record.update(_wt_status(wt_path))
+            pending.append((record, wt_path))
             enriched.append(record)
+
+        # Each status is two git subprocesses; run them side by side so the
+        # answer stays live without waiting on every checkout in turn.
+        with ThreadPoolExecutor(max_workers=_STATUS_WORKERS) as pool:
+            statuses = list(pool.map(_wt_status, [wt_path for _record, wt_path in pending]))
+        for (record, _wt_path), status in zip(pending, statuses, strict=True):
+            record.update(status)
 
         return {"count": len(enriched), "worktrees": enriched}
 
