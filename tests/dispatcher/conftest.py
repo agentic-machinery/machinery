@@ -379,7 +379,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
     from lu_machinery.orchestration import pr_ownership
 
     world = SimpleNamespace(
-        prs={}, files={}, listed=[], published=(None, True), lookup_error=None,
+        prs={}, files={}, messages={}, listed=[], published=(None, True), lookup_error=None,
         record={
             "task_id": "merge-probe", "agent": "claude", "mode": "workspace-write", "status": "done", "error": None,
             "owned_paths": ["docs/owned.md"], "worktree_remote_url": "https://github.com/org/repo.git",
@@ -399,7 +399,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
                             "base": {"repo": {"full_name": "other/repo" if pr["isCrossRepository"] else "org/repo"}}}
                            for pr in world.listed if "headRefOid" in pr])
                if words[0] == "api" and words[2].endswith("/pulls")
-               else json.dumps("deliver\n\nX-Agent: claude/merge-probe")
+               else json.dumps(world.messages.get(int(words[2].split("/")[4]), "deliver\n\nX-Agent: claude/merge-probe"))
                if words[0] == "api" and words[2].endswith("/commits")
                else json.dumps(world.listed) if words[:2] == ["pr", "list"]
                else json.dumps(world.prs[int(words[2])]) if words[:2] == ["pr", "view"]

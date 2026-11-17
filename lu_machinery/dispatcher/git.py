@@ -1027,27 +1027,26 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
 def _delivery_prs(record: dict, repo: str) -> list[int]:
     """Numbers of the ``repo`` pull requests that may carry the task's delivery.
 
-    They are the ones it accepted and the merged ones opened from its own or its publish branch.
+    They are the ones it accepted and merged PRs from its recorded branch family.
+    Prefix search only discovers candidates; merged_delivery still requires task attribution.
     """
     numbers = set(_accepted_prs(record["task_id"], repo))
     for branch in sorted({record["worktree_branch"], record.get("publish_branch")} - {None}):
-        listed = json.loads(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "merged",
-                                "--json", "number,isCrossRepository,headRefName"))
-        numbers.update(pr["number"] for pr in listed if pr["headRefName"] == branch and not pr["isCrossRepository"])
+        listed = json.loads(_gh("pr", "list", "--repo", repo, "--search", f"head:{branch}", "--state", "merged",
+                                "--limit", "1000", "--json", "number,isCrossRepository,headRefName"))
+        if len(listed) >= 1000:
+            raise ValueError("delivery branch search may be truncated")
+        numbers.update(pr["number"] for pr in listed if not pr["isCrossRepository"] and (
+            pr["headRefName"] == branch or pr["headRefName"].startswith((branch + "-", branch + "/"))))
     return sorted(numbers)
 
 
 def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
-    """Try known candidates before exact-head association, without using the issue-search index."""
+    """Try recorded-branch candidates before exact-head association; neither is attribution by itself."""
     seen = set()
-    try:
-        for number in _delivery_prs(record, repo):
-            seen.add(number)
-            yield number
-    except GitHubRefused:
-        raise
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
-        record["merged_delivery_lookup"] = f"error:{type(exc).__name__}"
+    for number in _delivery_prs(record, repo):
+        seen.add(number)
+        yield number
     head = record.get("head_sha")
     # A task that added no commit of its own has nothing to attribute: its head is where it started, which another
     # task's merged pull request can share.
@@ -1093,12 +1092,13 @@ def merged_delivery(record: dict) -> dict | None:
     """The merged pull request that carries this task's delivery, or None when none is proven.
 
     A task that ends with its work merged has nothing left on its own branch to inspect: the
-    PR it accepted, or the one opened from its branch, is the delivery, and a worker may have
+    PRs it accepted, or those opened from its branch family, carry the delivery, and a worker may have
     reset or deleted the branch after the merge. A candidate counts only when GitHub reports
     it MERGED after the task started into the task's recorded base branch or the remote's
     default branch (a stacked task's base is the parent branch, and the pull request is
     retargeted onto the default branch once that parent is gone), with a merge commit and a
-    task-authored commit (or an explicit task acceptance when it added no commits). Any lookup
+    task-authored commit (or an explicit task acceptance when it added no commits). All attributed
+    candidates contribute paths, so an earlier valid split cannot hide a later ownership violation. Any lookup
     failure is None, so the caller falls back to refusing on the local evidence. ``paths`` is
     every path the PR changed, rename sources included, plus every path any commit of the task's
     touched, as the settlement walk reads them from the PR's final head (a reverted change still
@@ -1115,6 +1115,10 @@ def merged_delivery(record: dict) -> dict | None:
             return None
         started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
         accepted_default = None
+        deliveries, paths = [], set()
+        primary = None
+        snapshot_published = record.get("commits_ahead") == 0
+        accepted = set(_accepted_prs(record["task_id"], repo))
 
         def accepted_base(name: str) -> bool:
             nonlocal accepted_default
@@ -1136,21 +1140,14 @@ def merged_delivery(record: dict) -> dict | None:
                 continue
             # An accepted pull request is the task's whatever it committed; otherwise a commit of its own must carry
             # its trailer, and a matching branch name alone never attributes another task's work.
-            if number not in _accepted_prs(record["task_id"], repo):
-                if record.get("commits_ahead") == 0:
-                    continue
+            if number not in accepted:
                 messages = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/commits", "--jq",
                                ".[] | .commit.message | @json")
                 trailer = f"X-Agent: {record['agent']}/{record['task_id']}"
                 if not any(trailer in json.loads(line).splitlines() for line in messages.splitlines()):
                     continue
-            # A merged PR whose final head is the task's head proves the push, even once its branch and its
-            # refs/pull/N/head are gone from the remote and a squash merge left that head out of the base.
-            if record.get("commits_ahead") != 0 and pr["headRefOid"] != record["head_sha"]:
-                tip, merged = _canonical_publication(
-                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])
-                if not (merged or tip == record["head_sha"]):
-                    continue  # this candidate does not prove the push; a later one may
+            # Any exact merged head proves the snapshot's publication, even after branch deletion.
+            snapshot_published = snapshot_published or pr["headRefOid"] == record["head_sha"]
             # One JSON string per line keeps a name with a newline or quote whole.
             changed = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/files",
                           "--jq", ".[] | (.filename, (.previous_filename // empty)) | @json")
@@ -1163,10 +1160,20 @@ def merged_delivery(record: dict) -> dict | None:
                 commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
                 history = ownership.delivered_paths(
                     run, pr["headRefOid"], parent, start, commits_expected=commits_expected)
+            paths.update(json.loads(line) for line in changed.splitlines() if line)
+            paths.update(history)
+            delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=pr["mergeCommit"]["oid"])
+            deliveries.append(delivery)
+            if pr["headRefOid"] == record["head_sha"]:
+                primary = delivery
+        if deliveries:
+            if not snapshot_published:
+                tip, merged = _canonical_publication(
+                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])
+                if not (merged or tip == record["head_sha"]):
+                    return None  # merged splits cannot conceal further unpublished work
             record.pop("merged_delivery_lookup", None)
-            return dict(repo=repo, number=number, merged_at=pr["mergedAt"],
-                        merge_sha=pr["mergeCommit"]["oid"],
-                        paths=sorted({json.loads(line) for line in changed.split("\n") if line} | set(history) - {""}))
+            return {**(primary or deliveries[0]), "pull_requests": deliveries, "paths": sorted(paths - {""})}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
         # The refusal remains fail-closed, but a later investigation can distinguish an empty lookup
         # from an exception. Exception text can contain credentials or private paths, so keep only its type.
