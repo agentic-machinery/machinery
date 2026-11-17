@@ -185,11 +185,15 @@ jobs:
           work="$RUNNER_TEMP/installed-wheel"
           cd "$work"
           wheel="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl')"
-          echo "lu-machinery sha256:$(sha256sum "$wheel" | cut -d' ' -f1)"
+          version="$(python -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' src/pyproject.toml)"
+          digest="$(sha256sum "$wheel" | cut -d' ' -f1)"
+          # The release line of the consumer lock: pip installs only these bytes.
+          printf 'lu-machinery==%s \\\n    --hash=sha256:%s\n' "$version" "$digest" > wheel.lock
+          echo "lu-machinery ${version} sha256:${digest}"
           # Its dependencies are already installed from uv.lock; --no-index keeps
           # this install offline.
           "$RUNNER_TEMP/test-venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check --no-input \
-            --no-index --no-deps "$wheel"
+            --no-index --find-links dist --no-deps --require-hashes --requirement wheel.lock
           "$RUNNER_TEMP/test-venv/bin/python" -I -m pip check --disable-pip-version-check
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
