@@ -92,6 +92,87 @@ def test_ci_gate_not_green_on_the_exact_commit_refuses(runs, expected):
     assert expected in decision.reason
 
 
+@pytest.mark.parametrize(("mode", "field", "value"), [
+    ("full", "", None),
+    ("reuse", "", None),
+    ("reuse", "receipt", None),
+    ("reuse", "receipt.schema", "unknown"),
+    ("reuse", "receipt.repository", "other/repo"),
+    ("reuse", "receipt.workflow", ".github/workflows/other.yml"),
+    ("reuse", "receipt.mode", "skip"),
+    ("full", "receipt.source", {}),
+    ("reuse", "receipt.target.run_id", 6),
+    ("reuse", "receipt.target.run_attempt", 2),
+    ("reuse", "receipt.target.commit", "d" * 40),
+    ("reuse", "receipt.target.tree", "d" * 40),
+    ("reuse", "receipt.source", None),
+    ("reuse", "receipt.source.run_id", True),
+    ("reuse", "receipt.source.run_attempt", 2),
+    ("reuse", "receipt.source.commit", "d" * 40),
+    ("reuse", "receipt.source.tree", "d" * 40),
+    ("reuse", "source", None),
+    ("reuse", "source.conclusion", "failure"),
+    ("reuse", "source.status", "in_progress"),
+    ("reuse", "source.event", "push"),
+    ("reuse", "source.head_branch", "gh-readonly-queue/other/pr-1"),
+    ("reuse", "source.path", ".github/workflows/other.yml"),
+    ("reuse", "source.head_sha", "d" * 40),
+    ("reuse", "source.head_commit.tree_id", "d" * 40),
+    ("reuse", "source.repository.full_name", "other/repo"),
+    ("reuse", "source.head_repository.full_name", "other/repo"),
+    ("reuse", "source_jobs", []),
+    ("reuse", "source_jobs.0.conclusion", "failure"),
+    ("reuse", "source_jobs.0.status", "queued"),
+    ("reuse", "target.conclusion", "failure"),
+    ("reuse", "target.run_attempt", 2),
+    ("reuse", "target.head_branch", "other"),
+    ("reuse", "tree", "d" * 40),
+    ("reuse", "commit", "d" * 40),
+])
+def test_ci_reuse_receipt_rejects_mismatched_evidence(mode, field, value, tmp_path):
+    """Defect class: a green push releases an untested tree using missing, stale or foreign CI evidence."""
+    tree = "c" * 40
+    target = {"id": 7, "run_attempt": 1, "head_sha": HEAD, "head_branch": "main", "event": "push",
+              "status": "completed", "conclusion": "success", "path": ".github/workflows/ci-gate.yml",
+              "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+              "head_commit": {"tree_id": tree}}
+    source = {**target, "id": 5, "event": "merge_group", "head_branch": "gh-readonly-queue/main/pr-1"}
+    receipt = {"schema": "ci-gate-evidence.v1", "repository": REPO, "workflow": ".github/workflows/ci-gate.yml",
+               "mode": mode, "target": {"run_id": 7, "run_attempt": 1, "commit": HEAD, "tree": tree},
+               "source": {"run_id": 5, "run_attempt": 1, "commit": HEAD, "tree": tree} if mode == "reuse" else None}
+    inputs = {"receipt": receipt, "repository": REPO, "target": target, "commit": HEAD, "tree": tree, "source": source,
+              "source_jobs": [{"name": "CI Gate", "status": "completed", "conclusion": "success"}]}
+    if not field:
+        assert release_cut.validate_ci_receipt(**inputs) is None
+        cut = Cut(work=tmp_path, dry_run=True, machinery_remote="unused", product_remote="unused",
+                  machinery_repo=REPO, product_repo="unused", host_python=Path(sys.executable),
+                  primary=tmp_path, alert=False, x_agent="codex/test", head=HEAD)
+        cut.publisher = lambda *_args: json.dumps(target if _args[-1] == "7" else source)
+        cut.git = lambda *_args: tree
+
+        def run(argv, **_kwargs):
+            if argv[:3] == ["gh", "run", "download"]:
+                assert argv[argv.index("--name") + 1] == "ci-gate-evidence-1"
+                destination = Path(argv[argv.index("--dir") + 1])
+                destination.mkdir()
+                (destination / "ci-gate-evidence.json").write_text(json.dumps(receipt), encoding="utf-8")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            assert argv[:3] == ["gh", "run", "view"] and argv[argv.index("--attempt") + 1] == "1"
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"jobs": inputs["source_jobs"]}), "")
+
+        cut.run = run
+        cut.verify_ci_receipt(tmp_path, GREEN)
+        assert cut.ci == f"; {mode} receipt verified on tree {tree}"
+        return
+    path = field.split(".")
+    parent = inputs
+    for key in path[:-1]:
+        parent = parent[int(key)] if isinstance(parent, list) else parent[key]
+    parent[path[-1]] = value
+    with pytest.raises(CutError, match="CI evidence"):
+        release_cut.validate_ci_receipt(**inputs)
+
+
 @pytest.mark.parametrize("opener", [
     "",
     "## [Pending fixes]\n\n",
@@ -305,11 +386,27 @@ def _released_history(tmp_path, commits, releases):
               machinery_repo="learn-ukrainian/machinery", product_repo="learn-ukrainian/learn-ukrainian",
               host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="claude/claude-cto")
     original_run = cut.run
+    tree = cut.git(seed, "rev-parse", "HEAD^{tree}")
+    target = {"id": 7, "run_attempt": 1, "head_sha": head, "head_branch": "main", "event": "push",
+              "status": "completed", "conclusion": "success", "path": ".github/workflows/ci-gate.yml",
+              "repository": {"full_name": REPO}, "head_repository": {"full_name": REPO},
+              "head_commit": {"tree_id": tree}}
+    cut.publisher = lambda *_args: json.dumps(target)
+
 
     def run(argv, **kwargs):
         command = [str(part) for part in argv]
         if command[:3] == ["gh", "run", "list"]:
             return subprocess.CompletedProcess(command, 0, json.dumps([{**GREEN[0], "headSha": head}]), "")
+        if command[:3] == ["gh", "run", "download"]:
+            destination = Path(command[command.index("--dir") + 1])
+            destination.mkdir()
+            (destination / "ci-gate-evidence.json").write_text(json.dumps({
+                "schema": "ci-gate-evidence.v1", "repository": REPO, "workflow": ".github/workflows/ci-gate.yml",
+                "mode": "full", "target": {"run_id": 7, "run_attempt": 1, "commit": head, "tree": tree},
+                "source": None,
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 0, "", "")
         if command[:3] == ["gh", "release", "view"]:
             if command[3] not in releases:
                 return subprocess.CompletedProcess(command, 1, "", "release not found\n")

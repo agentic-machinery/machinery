@@ -5,7 +5,8 @@
 #
 # Bootstrap CI for the first push. Branch protection requires one check named
 # "CI Gate", and the merge queue ruleset waits for that check on merge groups.
-# Main pushes also run it to seed shared, verified tool archives. Pins and their
+# Main pushes reuse a successful merge-group result for the same Git tree and
+# seed shared, verified tool archives without repeating context-free checks. Pins and their
 # upstream evidence are recorded in pins.txt beside this file; bump them
 # together there.
 #
@@ -24,7 +25,7 @@
 #   pinned in product-consumer.pin beside this file: the release cut's
 #   consumer test collection (release_cut consumer-collection) and the pin's
 #   key consumer tests, on PRs and merge groups alike. pytest calls tests.yml for the full six-shard suite on
-#   merge_group, push and workflow_dispatch. pull_request calls that workflow
+#   merge_group, unmatched push and workflow_dispatch. pull_request calls that workflow
 #   as pr-affected and does not run the full suite.
 # - The mypy job imports lu_machinery from the checkout: it runs the ratchet
 #   module. installed-wheel imports only the installed wheel.
@@ -32,9 +33,11 @@
 #   exit 0 on an empty or missing target. Each job prints what it inspected.
 # - CI Gate needs every other job, runs even when one of them fails, and passes
 #   only when each job reports the result its event requires. On pull_request,
-#   pr-affected must succeed and pytest must be skipped. On merge_group, push
+#   pr-affected must succeed and pytest must be skipped. On merge_group, unmatched push
 #   and workflow_dispatch, pytest (the full suite) must succeed and pr-affected
-#   must be skipped. A failed, cancelled, skipped or missing required job fails
+#   must be skipped. A matched main push instead requires main-proof and skips
+#   context-free checks, while push history scans and trailers still run.
+#   A failed, cancelled, skipped or missing required job fails
 #   the gate, because GitHub counts a skipped required check as passing. Each check name is the job
 #   name. The called tests.yml reports its shards as "pytest / pytest (N)"
 #   and their always() aggregate as "pytest / pytest shards"; `pytest` here
@@ -49,7 +52,7 @@
 #   and pip-audit; npm audit uses the hosted runner's npm.
 #   Install steps run from the job temp directory with isolated interpreters
 #   (python -I), so no Python module in the checkout is imported while installing.
-# - Read-only contents permission (none for CI Gate), no kept checkout token,
+# - Read-only contents permission, no kept checkout token,
 #   no secrets. Scanners and zizmor run under `env -i`, so no runner credential
 #   reaches them. zizmor runs offline: its online audits (impostor commits,
 #   known-vulnerable actions) need a token, and the action pins in pins.txt are
@@ -60,7 +63,7 @@
 name: CI Gate
 
 on:
-  # Main-scope archives are visible to future PR and merge-queue refs.
+  # Reuse verified merge-group trees; keep main-scope tool archives for future refs.
   push:
     branches: [main]
   pull_request:
@@ -102,7 +105,116 @@ env:
   SEMGREP_RULES_COMMIT: 16b9e6d45f10649f6a531ec4838ed9924372c3bc
 
 jobs:
+  main-proof:
+    name: Reuse verified merge-group tree
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    # An unavailable optimization falls back to the full required checks.
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+      source: ${{ steps.proof.outputs.source }}
+    steps:
+      - name: Find successful CI Gate for this tree
+        id: match
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Bind both commit and tree: equal trees alone can hide intermediate
+          # direct-push commits from the range-based secret scan. Never read refs.
+          # Any unavailable or malformed proof leaves reuse unset: run all checks.
+          lookup() {
+            local tree runs source run_id attempt jobs
+            tree="$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$GITHUB_SHA" --jq '.tree.sha')" || return 1
+            [[ "$tree" =~ ^[0-9a-f]{40}$ ]] || return 1
+            runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci-gate.yml/runs?event=merge_group&head_sha=$GITHUB_SHA&status=success&per_page=100")" || return 1
+            source="$(jq -ec --arg tree "$tree" --arg repo "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" '
+              first(.workflow_runs[]
+              | select(.event == "merge_group" and .status == "completed" and .conclusion == "success")
+              | select(.repository.full_name == $repo and .head_repository.full_name == $repo)
+              | select(.head_branch | startswith("gh-readonly-queue/main/"))
+              | select(.path == ".github/workflows/ci-gate.yml")
+              | select(.head_sha == $sha and .head_commit.tree_id == $tree)
+              | select((.id | type) == "number" and .id > 0)
+              | select((.run_attempt | type) == "number" and .run_attempt > 0)
+              | {run_id: .id, run_attempt: .run_attempt, commit: .head_sha, tree: .head_commit.tree_id})
+              ' <<< "$runs")" || return 1
+            run_id="$(jq -r .run_id <<< "$source")" || return 1
+            attempt="$(jq -r .run_attempt <<< "$source")" || return 1
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100")" || return 1
+            jq -e 'any(.jobs[]; .name == "CI Gate" and .status == "completed" and .conclusion == "success")' \
+              <<< "$jobs" > /dev/null || return 1
+            printf 'run_id=%s\ntree=%s\nsource=%s\n' "$run_id" "$tree" "$source" >> "$GITHUB_OUTPUT"
+          }
+          if ! lookup; then
+            echo 'No matching successful merge-group CI Gate proof; running all checks.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # These are the only main-scope outputs of the full check jobs. Queue-ref
+      # caches cannot seed main, so retain just their existing verified saves.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.match.outputs.run_id != ''
+        with:
+          persist-credentials: false
+
+      - name: Restore verified actionlint
+        if: steps.match.outputs.run_id != ''
+        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        with:
+          tool: actionlint
+          version: ${{ env.ACTIONLINT_VERSION }}
+          sha256: ${{ env.ACTIONLINT_LINUX_AMD64_SHA256 }}
+          repository: rhysd/actionlint
+          asset-id: ${{ env.ACTIONLINT_RELEASE_ASSET_ID }}
+          token: ${{ github.token }}
+          member: actionlint
+
+      - name: Restore verified ShellCheck
+        if: steps.match.outputs.run_id != ''
+        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        with:
+          tool: shellcheck
+          version: ${{ env.SHELLCHECK_VERSION }}
+          sha256: ${{ env.SHELLCHECK_LINUX_X86_64_SHA256 }}
+          repository: koalaman/shellcheck
+          asset-id: ${{ env.SHELLCHECK_RELEASE_ASSET_ID }}
+          token: ${{ github.token }}
+          member: shellcheck-v${{ env.SHELLCHECK_VERSION }}/shellcheck
+          strip-components: '1'
+
+      - name: Restore verified TruffleHog
+        if: steps.match.outputs.run_id != ''
+        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        with:
+          tool: trufflehog
+          version: ${{ env.TRUFFLEHOG_VERSION }}
+          sha256: ${{ env.TRUFFLEHOG_LINUX_AMD64_SHA256 }}
+          repository: trufflesecurity/trufflehog
+          asset-id: ${{ env.TRUFFLEHOG_RELEASE_ASSET_ID }}
+          token: ${{ github.token }}
+          member: trufflehog
+
+      - name: Record reused CI Gate proof
+        id: proof
+        if: steps.match.outputs.run_id != ''
+        env:
+          RUN_ID: ${{ steps.match.outputs.run_id }}
+          TREE: ${{ steps.match.outputs.tree }}
+          SOURCE: ${{ steps.match.outputs.source }}
+        run: |
+          set -euo pipefail
+          printf 'Reused merge-group CI Gate run [%s](https://github.com/%s/actions/runs/%s), tree `%s`. Main-scope tool archives preserved; push history scans and trailers still required.\n' \
+            "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$TREE" >> "$GITHUB_STEP_SUMMARY"
+          printf 'source=%s\nreuse=true\n' "$SOURCE" >> "$GITHUB_OUTPUT"
+
   ruff:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Ruff
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -177,6 +289,8 @@ jobs:
           "$ruff" check --no-cache --config "$config" --output-format=github lu_machinery
 
   compileall:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Compile (Python 3.12)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -233,6 +347,8 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/pycache"
 
   mypy:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: mypy ratchet
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -450,6 +566,8 @@ jobs:
             env -u PYTHONPATH -u MYPYPATH "$venv/bin/python" -m lu_machinery.lint.mypy_ratchet
 
   actionlint:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: actionlint
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -533,6 +651,8 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/actionlint" "$RUNNER_TEMP/shellcheck"
 
   zizmor:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: zizmor
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -862,6 +982,8 @@ jobs:
   #   checkout is imported. Suppressions (.semgrepignore, nosemgrep comments)
   #   are repository content and are reviewed in the diff, like this workflow.
   sast:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: SAST (Semgrep CE)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1180,6 +1302,8 @@ jobs:
   # - A suppression is an `--ignore-vuln ID` argument below with its reason,
   #   reviewed in the diff like every other suppression.
   dependency-audit:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Dependency audit
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -1362,6 +1486,8 @@ jobs:
   # with the wheel and every locked dependency, install offline with hashes
   # required, then import every module from the installed wheel only.
   installed-wheel:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Installed wheel
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1683,7 +1809,8 @@ jobs:
   # skip, and requires pr-affected instead. A skip on merge_group fails the gate.
   pytest:
     name: pytest
-    if: github.event_name != 'pull_request'
+    needs: [main-proof]
+    if: always() && !cancelled() && github.event_name != 'pull_request' && needs.main-proof.outputs.reuse != 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/tests.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
@@ -1692,7 +1819,8 @@ jobs:
   # The workflow run shows this job's time. merge_group does not run it.
   pr-affected:
     name: PR changed tests and guards
-    if: github.event_name == 'pull_request'
+    needs: [main-proof]
+    if: always() && !cancelled() && github.event_name == 'pull_request' && needs.main-proof.outputs.reuse != 'true'
     permissions:
       contents: read
     uses: ./.github/workflows/tests.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
@@ -1702,31 +1830,45 @@ jobs:
     # always(): a job skipped because a dependency failed would otherwise count
     # as a passing required check.
     if: always()
-    needs: [ruff, compileall, mypy, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
+    needs: [main-proof, ruff, compileall, mypy, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      contents: read
     steps:
       - name: Require every job to succeed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
           EVENT_NAME: ${{ github.event_name }}
+          REUSE: ${{ needs.main-proof.outputs.reuse }}
         run: |
           set -euo pipefail
           # Keep the two lists together equal to `needs` above. On merge_group,
-          # push and workflow_dispatch, pytest is tests.yml's full six-shard
+          # unmatched push and workflow_dispatch, pytest is tests.yml's full six-shard
           # suite and must succeed; pr-affected must be skipped. On pull_request
           # the reverse holds. Failed, cancelled, skipped and missing required
-          # results all fail this gate.
+          # results all fail this gate. A matched push requires only main-proof;
+          # it has already checked the run/tree and preserved main-scope archives.
+          optional=()
           common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan verified-trailer zizmor)
           case "$EVENT_NAME" in
             pull_request)
               must_succeed=(pr-affected "${common[@]}")
-              must_skip=(pytest)
+              must_skip=(pytest main-proof)
               ;;
-            merge_group|push|workflow_dispatch)
+            push)
+              if [ "$REUSE" = true ]; then
+                must_succeed=(main-proof secret-scan verified-trailer)
+                must_skip=(pytest pr-affected actionlint compileall dependency-audit installed-wheel mypy ruff sast zizmor)
+              else
+                must_succeed=(pytest "${common[@]}")
+                must_skip=(pr-affected)
+                optional=(main-proof)
+              fi
+              ;;
+            merge_group|workflow_dispatch)
               must_succeed=(pytest "${common[@]}")
-              must_skip=(pr-affected)
+              must_skip=(pr-affected main-proof)
               ;;
             *)
               echo "::error::Unsupported event ${EVENT_NAME}"
@@ -1759,7 +1901,7 @@ jobs:
               failed=1
             fi
           done
-          expected=("${must_succeed[@]}" "${must_skip[@]}")
+          expected=("${must_succeed[@]}" "${must_skip[@]}" "${optional[@]}")
           while IFS= read -r job; do
             [ -n "$job" ] || continue
             if ! printf '%s\n' "${expected[@]}" | grep -qxF -- "$job"; then
@@ -1771,3 +1913,37 @@ jobs:
             exit 1
           fi
           echo "CI Gate green: ${#must_succeed[@]} required job(s) succeeded on ${EVENT_NAME}."
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'push'
+        with:
+          persist-credentials: false
+
+      - name: Bind main CI evidence to this run and tree
+        if: github.event_name == 'push'
+        env:
+          REUSE: ${{ needs.main-proof.outputs.reuse }}
+          SOURCE: ${{ needs.main-proof.outputs.source }}
+        run: |
+          set -euo pipefail
+          tree="$(git rev-parse HEAD^{tree})"
+          mode=full
+          if [ "$REUSE" = true ]; then mode=reuse; fi
+          jq -n --arg repo "$GITHUB_REPOSITORY" --arg mode "$mode" \
+            --arg sha "$GITHUB_SHA" --arg tree "$tree" \
+            --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --argjson source "${SOURCE:-null}" \
+            '{schema: "ci-gate-evidence.v1", repository: $repo,
+              workflow: ".github/workflows/ci-gate.yml", mode: $mode,
+              target: {run_id: $run, run_attempt: $attempt, commit: $sha, tree: $tree},
+              source: $source}' > "$RUNNER_TEMP/ci-gate-evidence.json"
+          cat "$RUNNER_TEMP/ci-gate-evidence.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve main CI evidence for release preflight
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-gate-evidence-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-gate-evidence.json
+          if-no-files-found: error
+          compression-level: 0
