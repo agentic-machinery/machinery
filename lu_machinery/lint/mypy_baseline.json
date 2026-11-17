@@ -7035,11 +7035,6 @@
     {
       "path": "lu_machinery/orchestration/merge_queue_keeper.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"add\" of \"set\" has incompatible type \"Any | None\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"position\" has incompatible type \"Any | None\"; expected \"str\""
     },
     {
