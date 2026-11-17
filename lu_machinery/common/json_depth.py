@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import accumulate
 from typing import Any
 
 __all__ = ["MAX_DEPTH_CEILING", "check_depth", "loads", "raw_decode"]
@@ -40,6 +41,12 @@ MAX_DEPTH_CEILING = 512
 # never rescans the rest (no quadratic backtracking).
 _TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 _OPENERS = "[{"
+# Bytes for the C-speed view of the same scan: brackets folded to one pair, quotes, and for
+# text with escaped quotes, backslashes plus the marker that replaces each escape pair.
+_FOLD = bytes.maketrans(b"{}", b"[]")
+_NOT_STRUCTURE = bytes(sorted(set(range(256)) - set(b'[]{}"')))
+_NOT_STRUCTURE_OR_ESCAPE = bytes(sorted(set(range(256)) - set(b'[]{}"\\\x00')))
+_STEP = {ord("["): 1, ord("]"): -1}.__getitem__
 # JSON whitespace, as json.loads skips it around a document (json.decoder.WHITESPACE).
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
 
@@ -70,6 +77,11 @@ def _first_too_deep(text: str, start: int, max_depth: int) -> int | None:
     # At most one bracket per level can be open, so a short text cannot be too deep.
     if text.count("[", start) + text.count("{", start) <= max_depth:
         return None
+    # A long text is usually shallow: confirm that at C speed before the per-match scan. A
+    # negative start slices from the end but the scan clamps it to 0, so it skips the view.
+    view = _structure_depth(text, start) if start >= 0 else None
+    if view is not None and view <= max_depth:
+        return None
     depth = 0
     for match in _TOKEN.finditer(text, start):
         token = match.group()
@@ -80,6 +92,29 @@ def _first_too_deep(text: str, start: int, max_depth: int) -> int | None:
         elif token in "]}":
             depth -= 1
     return None
+
+
+def _structure_depth(text: str, start: int) -> int | None:
+    """The scan's deepest nesting from ``start``, from C-speed bytes operations; None if unsure.
+
+    UTF-8 keeps every ASCII character as one byte and puts no ASCII byte in a multi-byte
+    character. When no quote follows a backslash, every quote opens or closes a string, as
+    in the scan, so splitting on quotes leaves the text between strings at even indexes.
+
+    Otherwise each escaped backslash and then each escaped quote becomes a NUL marker, which
+    leaves exactly the string delimiters as quotes up to the first backslash outside a
+    string. That backslash then stays outside a string as a backslash or a marker, so any
+    backslash or NUL found there returns None and the caller runs the scan itself.
+    """
+    data = text[start:].encode("utf-8", "surrogatepass")
+    if b'\\"' not in data:
+        outside = b"".join(data.translate(_FOLD, _NOT_STRUCTURE).split(b'"')[::2])
+    else:
+        data = data.replace(b"\\\\", b"\x00").replace(b'\\"', b"\x00")
+        outside = b"".join(data.translate(_FOLD, _NOT_STRUCTURE_OR_ESCAPE).split(b'"')[::2])
+        if b"\\" in outside or b"\x00" in outside:
+            return None
+    return max(accumulate(map(_STEP, outside), initial=0))
 
 
 def _decode(text: str, idx: int, max_depth: int, decoder: json.JSONDecoder) -> tuple[Any, int]:
