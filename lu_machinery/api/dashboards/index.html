@@ -56,24 +56,22 @@
   table.subs { border-collapse: separate; border-spacing: 0; }
   table.subs td { min-width: 4.5em; }
   table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
-  .scroll-cue { display: none; margin: 0 0 6px; }
   @media (max-width: 640px) {
     header { padding: 8px 10px; } main { padding: 10px; gap: 10px; } section { padding: 8px 10px; }
     .refresh { margin-left: 0; }
-    /* One line per row; each card scrolls sideways instead of the page growing tall. */
+    /* One line per row; each table scrolls sideways inside its card instead of the page growing tall. */
     th, td { white-space: nowrap; }
     td br { display: none; }
-    .scroll-cue { display: block; }
-    /* The heading and the scroll hint stay put; only the tables move. */
-    #subs { overflow: hidden; }
-    .table-scroll {
-      overflow-x: auto;
-      background-image: linear-gradient(to left, color-mix(in srgb, var(--fg) 18%, transparent), transparent 18px);
-      background-repeat: no-repeat; background-position: right top; background-size: 18px 100%;
-    }
-    table.subs th:first-child, table.subs td:first-child {
-      position: sticky; left: 0; background: var(--card); z-index: 1; box-shadow: 1px 0 0 var(--line);
-    }
+    /* The subscriptions table stacks instead: every account is a card, so no column sits off-screen. */
+    #subs table, #subs tbody, #subs tr, #subs td, #subs th { display: block; white-space: normal; }
+    #subs thead { display: none; }
+    #subs tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
+    #subs tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
+    #subs th[colspan] { border: 0; padding: 0; }
+    #subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
+    #subs td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
+    #subs td:first-child { font-weight: 600; }
+    #subs td:first-child::before { display: none; }
   }
 </style>
 </head>
@@ -93,7 +91,7 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section class="wide" id="subs"><h2>Subscriptions: usage, pace, resets and sign-in <span class="age" id="usage-age">Loading…</span></h2><p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><p class="muted scroll-cue">Scroll sideways for the other columns. The account name stays visible.</p><div id="usage-content">Loading…</div></section>
+  <section class="wide" id="subs"><h2>Subscriptions: usage, pace, resets and sign-in <span class="age" id="usage-age">Loading…</span></h2><p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="usage-content">Loading…</div></section>
   <section class="wide" id="fleet"><h2>Agent fleet <span class="age" id="workers-age">Loading…</span></h2>
     <p id="workers-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="workers-content">Loading…</div>
@@ -177,10 +175,15 @@ function bar(left) {
   return `<span class="bar"><span style="width:${left}%;background:${color}"></span></span>`;
 }
 
-function table(headers, rows) {
+// A cell carries its column name, so a stacked (card) layout can show it beside the value.
+// The first cell is the card's own heading, so it keeps no label.
+const labelled = (cells, headers) => cells.map((cell, index) => index && headers[index]
+  ? cell.replace(/^<td/, `<td data-label="${escapeHtml(headers[index])}"`) : cell).join("");
+
+function table(headers, rows, stacked = false) {
   if (!rows.length) return '<p class="muted">None.</p>';
   return `<table><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>`
-    + rows.map(cells => `<tr>${cells.join("")}</tr>`).join("") + "</tbody></table>";
+    + rows.map(cells => `<tr>${stacked ? labelled(cells, headers) : cells.join("")}</tr>`).join("") + "</tbody></table>";
 }
 
 const td = (html, cls = "") => `<td${cls ? ` class="${cls}"` : ""}>${html}</td>`;
@@ -324,11 +327,11 @@ function subscriptionRows(subs, logins) {
       return true;
     });
     if (!accounts.length) return "";
-    return `<tr><th colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
+    return `<tr class="group"><th colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
       + accounts.map(row => {
         const usage = readingState(row.reading?.status, row.reading?.age_s, staleAfter) === "fresh" ? row : {};
         const weekly = usage.weekly || {};
-        return `<tr>${[
+        return `<tr>${labelled([
           text(row.account),
           weeklyResetCell(weekly),
           windowLeft(weekly),
@@ -340,7 +343,7 @@ function subscriptionRows(subs, logins) {
           planCell(row.plan),
           signInCell(row.account, logins),
           readingCell(row.reading, staleAfter),
-        ].join("")}</tr>`;
+        ], SUBSCRIPTION_HEADERS)}</tr>`;
       }).join("");
   }).join("");
   return {groups, hidden};
@@ -398,9 +401,9 @@ function renderUsage(subs, budget, logins) {
     + "The Codex API credits belong to Codex a and renew with its monthly turnover.");
   notes.push("Sign-in is read for Claude a, Claude b, Codex a and Codex b only. Any other account has no side-effect-free sign-in reader.");
   const head = `<thead><tr>${SUBSCRIPTION_HEADERS.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>`;
-  const api = budget ? `<div class="table-scroll">${table(["API account", "Balance / spend", "Reading", ""], apiRows(budget))}</div>`
+  const api = budget ? table(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
     : unknown("API account balances: the routing budget did not answer");
-  const subsTable = groups ? `<div class="table-scroll"><table class="subs">${head}<tbody>${groups}</tbody></table></div>`
+  const subsTable = groups ? `<table class="subs">${head}<tbody>${groups}</tbody></table>`
     : '<p class="muted">None.</p>';
   return subsTable + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api;
 }
