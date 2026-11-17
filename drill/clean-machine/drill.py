@@ -1566,6 +1566,47 @@ def bwrap_prefix(workdir: Path, roots: list[str]) -> list[str]:
     return [*argv, "--"]
 
 
+def resolve_interpreter(choice: str | None) -> str:
+    """The real path of the base interpreter for the venv: this one, or ``--python`` found on PATH.
+
+    A bare name is looked up on PATH, never against the current directory, and the interpreter
+    itself reports its real base executable, so a venv or a symlink resolves to the installation
+    the sandbox must bind.
+    """
+    if choice is None:
+        return base_interpreter()
+    found = choice if os.sep in choice else shutil.which(choice)
+    if not found or not os.path.isfile(found):
+        raise DrillError(
+            f"--python {choice!r} is not an interpreter on PATH or an existing file"
+        )
+    script = (
+        "import json, os, sys; print(json.dumps([os.path.realpath(getattr(sys, '_base_executable', None) "
+        "or sys.executable), sys.version_info[:2] >= (3, 12)]))"
+    )
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        [os.path.abspath(found), "-I", "-c", script],
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise DrillError(f"--python {choice!r} exited {result.returncode}")
+    try:
+        path, new_enough = json.loads(result.stdout.decode("utf-8"))
+        if (
+            not isinstance(path, str)
+            or not os.path.isabs(path)
+            or not isinstance(new_enough, bool)
+        ):
+            raise ValueError("unexpected report")
+    except (UnicodeDecodeError, ValueError, TypeError):
+        raise DrillError(f"--python {choice!r} gave an unreadable report") from None
+    if not new_enough:
+        raise DrillError(f"--python {choice!r} is older than Python 3.12")
+    return path
+
+
 def base_interpreter() -> str:
     return os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable)
 
@@ -1875,10 +1916,10 @@ def main(argv: list[str] | None = None) -> int:
     isolation = args.isolation
     if isolation == "auto":
         isolation = "bwrap" if bwrap_usable() else "none"
-    base_py = args.python or base_interpreter()
     integrity: dict[str, Any] = {}
     phases: dict[str, list[dict[str, Any]]] = {}
     try:
+        base_py = resolve_interpreter(args.python)
         env_report = preflight(use_strace, isolation)
         workdir.mkdir(parents=True, exist_ok=True)
         marker = workdir / ".lu-clean-machine-drill"
@@ -1956,7 +1997,12 @@ def main(argv: list[str] | None = None) -> int:
             log(f"roll-forward: install v{args.version}")
             install_wheel(py, forward, home)
             integrity["roll_forward"] = check_integrity(py, args.version, home)
-    except (DrillError, subprocess.TimeoutExpired, OSError) as exc:
+    except (
+        DrillError,
+        subprocess.TimeoutExpired,
+        subprocess.CalledProcessError,
+        OSError,
+    ) as exc:
         print(f"drill: setup failed: {exc}", file=sys.stderr)
         return 2
     summary = summarize(phases, data)
