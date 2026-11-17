@@ -213,10 +213,21 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
             path_tiers.extend(tier for _pair, tier in bumps)
         result = max(path_tiers, key=_RANK.__getitem__)
         if result == "trivial":
+            # Security paths and learner content (the product's deploy policy, which can name
+            # more than the table) are never Trivial; an unreadable policy is unknown, so High.
+            from lu_machinery.ci.deploy_paths import DeployPathsError
+            from lu_machinery.orchestration.integration_sweep import (
+                changes_learner_content,
+            )
             from lu_machinery.review.security_paths import is_security_sensitive_change
 
             if is_security_sensitive_change(paths):
                 return "medium"
+            try:
+                if changes_learner_content(paths):
+                    return "ukrainian-content"
+            except DeployPathsError:
+                return "high"
         return result
     except (OSError, UnicodeError, ValueError, TypeError, yaml.YAMLError):
         return "high"

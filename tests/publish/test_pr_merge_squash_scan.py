@@ -234,20 +234,27 @@ def test_trivial_head_merges_without_recorded_approval(low_review):
     assert admit() is None
 
 
-def test_trivial_head_with_recorded_rejection_is_refused(low_review, tmp_path):
+def test_trivial_head_with_recorded_rejection_is_refused(low_review):
     """Defect class: a Trivial head lands over a rejection recorded at that head."""
-    import hashlib
+    from lu_machinery.review.record_cf_verdict import build_comment
 
-    from lu_machinery.review import record_cf_verdict as recorder
-
-    tasks, _comments, _statuses, files, admit = low_review
+    _tasks, comments, _statuses, files, admit = low_review
     files[:] = [{"filename": "docs/decisions/example.md", "status": "modified"}]
-    reply = b"VERDICT: CHANGES_REQUESTED\n\nThe example command in the doc deletes the checkout.\n"
-    task = json.loads((tasks / "review-one.json").read_text())
-    task["result_sha256"] = hashlib.sha256(reply).hexdigest()
-    (tasks / "review-one.json").write_text(json.dumps(task))
-    (tasks / "review-one.result").write_bytes(reply)
-    result = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
-    assert result["verdict"] == "CHANGES_REQUESTED"
+    comments.append({
+        "id": 1,
+        "body": build_comment(
+            sha=HEAD, task_id="review-two", started="2026-09-23T12:00:00.000001+00:00",
+            verdict="CHANGES_REQUESTED", model="claude-opus-5-5", family="anthropic",
+            author_models=["gpt-6.1-sol"],
+            reply="VERDICT: CHANGES_REQUESTED\n\nThe example command in the doc deletes the checkout.\n",
+        ),
+        "user": {"login": "fleet"},
+        "author_association": "MEMBER",
+        "created_at": "2026-09-23T13:00:00Z",
+        "updated_at": "2026-09-23T13:00:00Z",
+    })
     with pytest.raises(publisher.gate.PublishBlocked, match="CHANGES_REQUESTED"):
         admit()
+    # The same head with no record lands.
+    comments.clear()
+    assert admit() is None
