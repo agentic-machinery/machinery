@@ -69,11 +69,14 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   ([review-merge-cleanup](review-merge-cleanup.md)) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
 - **Members:** live eligible routes only: Opus 5.5 via Claude, Sol 6.1 via Codex, Grok 4.7
-  via Cursor (`model-assignment.md`). On Ukrainian language, culture and heritage questions,
-  Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment), and
-  Gemini 4 Hydrogen via AGY (`--agent agy --model gemini-4-hydrogen-medium`) joins as a fourth
-  member (operator order 2026-11-16). Both advise in the council and the discussion only, never
-  as review of record or designated approval. AGY read-only dispatch runs inside the
+  via Cursor (`model-assignment.md`), and Gemini 4 Hydrogen via AGY
+  (`--agent agy --model gemini-4-hydrogen-medium`) as a standing fourth member of every
+  council (operator orders `USE-HYDROGEN-1117` and `HYDROGEN-COUNCIL-ALL-1117`, 2026-11-17;
+  superseding the 2026-11-16 Ukrainian-only limit). On Ukrainian language, culture and
+  heritage questions, Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE,
+  2026-11-16 amendment). Hydrogen's council answers and parallel reviews, and Grok's
+  Ukrainian council answers, are input in the council and the discussion only, never review
+  of record or designated approval. AGY read-only dispatch runs inside the
   dispatcher's bubblewrap boundary (C-3027) and is refused only on a host that cannot start it;
   Hydrogen is then unavailable, and an ACP seat on the agy route may join the discussion round
   only. An unavailable member is reported, never substituted, and the panel is then not called
