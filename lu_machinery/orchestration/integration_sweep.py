@@ -1146,8 +1146,16 @@ def _check_blockers(pr: Mapping[str, Any], required: Sequence[str] = REQUIRED_CH
     return sorted(blockers)
 
 
-def classify_pr(pr: Mapping[str, Any], verdict: Verdict, *, queued: bool | None, observed_at: str) -> PRReport:
-    """Expose a deterministic, importable state classifier for the queue keeper."""
+def classify_pr(
+    pr: Mapping[str, Any], verdict: Verdict, *, queued: bool | None, observed_at: str, tier: str = "high",
+) -> PRReport:
+    """Expose a deterministic, importable state classifier for the queue keeper.
+
+    ``tier`` is the head's review tier; a Trivial head with no review on record is not
+    blocked on review (``review/tiers.py``).
+    """
+    from lu_machinery.review.tiers import review_satisfied
+
     number = pr.get("number")
     head = pr.get("headRefOid")
     if not isinstance(number, int) or number < 1 or not isinstance(head, str) or not SHA.fullmatch(head):
@@ -1165,7 +1173,8 @@ def classify_pr(pr: Mapping[str, Any], verdict: Verdict, *, queued: bool | None,
     blockers: list[str] = []
     if pr.get("isDraft") is True:
         blockers.append("draft")
-    if verdict.state != "APPROVED":
+    reviewed = review_satisfied(tier, verdict.state)  # type: ignore[arg-type]
+    if not reviewed:
         blockers.append(verdict.state)
     blockers.extend(_check_blockers(pr))
     mergeable = str(pr.get("mergeable") or "").upper()
@@ -1181,7 +1190,7 @@ def classify_pr(pr: Mapping[str, Any], verdict: Verdict, *, queued: bool | None,
         state = "armed"
     elif verdict.state == "unknown" or queued is None or "CI unknown" in " ".join(blockers):
         state = "CF-unknown" if verdict.state == "unknown" else "unknown"
-    elif verdict.state in {"needs-CF", "CF-unrecorded", "CF-stale", NEEDS_SEAT, NEEDS_COVERAGE}:
+    elif not reviewed and verdict.state in {"needs-CF", "CF-unrecorded", "CF-stale", NEEDS_SEAT, NEEDS_COVERAGE}:
         state = verdict.state
     elif verdict.state in REJECTED:
         state = "CF-rejected"
@@ -1327,16 +1336,18 @@ def run(adapter: GitHubAdapter, repository: str, *, now: datetime | None = None)
             comments = adapter.comments(repository, number)
             files = adapter.pr_file_rows(repository, number)
             content = changes_learner_content(pr_file_paths(files))
+            tier = classify_pr_files(files)
             verdict = lookup_verdict(
-                comments, head, login, learner_content=content, low_tier=classify_pr_files(files) == "low",
+                comments, head, login, learner_content=content, low_tier=tier in {"trivial", "low"},
             )
         except SweepError:
+            tier = "high"
             verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
         try:
             queued = adapter.queue_membership(repository, pr)
         except (SweepError, ValueError, KeyError):
             queued = None
-        rows.append(classify_pr(pr, verdict, queued=queued, observed_at=observed))
+        rows.append(classify_pr(pr, verdict, queued=queued, observed_at=observed, tier=tier))
     return rows
 
 

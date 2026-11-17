@@ -11,6 +11,9 @@ import pytest
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
+from tests.helpers import product_tree
+
+configured_roots = product_tree.configured_roots
 
 
 def test_low_same_family_non_author_approve_passes_recorder_and_landing(low_review, tmp_path):
@@ -270,3 +273,191 @@ def test_second_review_is_refused_before_a_merged_pr_is_read(low_review, tmp_pat
     with pytest.raises(recorder.RecordError, match="second review is not recorded"):
         recorder.record(name, pr_number=1, task_root=tasks, lock_root=tmp_path / "locks", second_review=True)
     assert len(comments) == before and statuses == []
+
+
+# Trivial tier (operator 2026-11-17): required CI only, exactly the files review policy section 2 names.
+LOCK_BUMP = """@@ -1,5 +1,5 @@
+-lu-machinery==0.1.25 \\
+-    --hash=sha256:c61c2df718fe2aba37846a9bede0a4fe8b8b79bcca76278c8784374f1cdb744a
++lu-machinery==0.1.26 \\
++    --hash=sha256:4402d4615237001bcccedd64d61f2dbb9bd3174262e962ff9977316ff1fc5a3d
+ # lu-machinery release dependency lock: every transitive runtime dependency of
+ # pyproject.toml, exact version and SHA-256 hashes of the accepted wheels.
+ # docs/release.md is the procedure; a consumer's requirements-machinery.lock is"""
+PYPROJECT_BUMP = """@@ -5,6 +5,6 @@
+ [project]
+ name = "lu-machinery"
+-version = "0.1.28"
++version = "0.1.29"
+ description = "Shared agent orchestration and development tooling"
+ readme = "README.md"
+ license = "MIT\""""
+PACKAGE_BUMP = """@@ -1,6 +1,6 @@
+ {
+   "name": "lu-machinery-acp",
+-  "version": "0.1.28",
++  "version": "0.1.29",
+   "private": true,
+   "engines": {
+     "node": "22.x\""""
+PACKAGE_LOCK_BUMP = """@@ -1,12 +1,12 @@
+ {
+   "name": "lu-machinery-acp",
+-  "version": "0.1.28",
++  "version": "0.1.29",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "lu-machinery-acp",
+-      "version": "0.1.28",
++      "version": "0.1.29",
+       "dependencies": {
+         "@agentclientprotocol/claude-agent-acp": "0.95.0",
+         "@agentclientprotocol/codex-acp": "1.13.1","""
+
+
+def _modified(path: str, patch: str | None = None) -> dict[str, str]:
+    row = {"filename": path, "status": "modified"}
+    if patch is not None:
+        row["patch"] = patch
+    return row
+
+
+def _release_cut() -> list[dict[str, str]]:
+    return [
+        _modified("CHANGELOG.md"),
+        _modified("package-lock.json", PACKAGE_LOCK_BUMP),
+        _modified("package.json", PACKAGE_BUMP),
+        _modified("pyproject.toml", PYPROJECT_BUMP),
+    ]
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_docs_only_pr_is_trivial():
+    """Defect class: root documentation for people still demands a review of record."""
+    assert classify_pr_files([_modified("CHANGELOG.md"), _modified("README.md")]) == "trivial"
+    assert classify_pr_files([{"filename": "SECURITY.md", "status": "removed"}]) == "trivial"
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_trivial_doc_plus_code_takes_code_tier():
+    """Defect class: mixing a Trivial file into a code change lowers the code change's review."""
+    assert classify_pr_files([_modified("README.md"), _modified("lu_machinery/common/x.py")]) == "medium"
+    assert classify_pr_files([_modified("README.md"), _modified("tests/test_x.py")]) == "low"
+    lock = _modified("requirements-machinery.lock", LOCK_BUMP)
+    assert classify_pr_files([lock, _modified("lu_machinery/common/x.py")]) == "medium"
+    assert classify_pr_files([lock, _modified(".github/workflows/ci.yml")]) == "high"
+
+
+@pytest.mark.usefixtures("configured_roots")
+@pytest.mark.parametrize(
+    "path",
+    [
+        "agents_extensions/shared/skills/review-loop/references/policy.md",
+        "agents_extensions/README.md",
+        "docs/best-practices/test-quality.md",
+        "docs/runbooks/ci-gate.md",
+        "docs/prompts/x.md",
+        "docs/rules/x.md",
+        "plans/a1/x.md",
+        "CLAUDE.md",
+        "lu_machinery/agent_runtime/profiles/README.md",
+        "tests/fixtures/README.md",
+        # Code and agents read these as input or procedure: docs/ is never Trivial.
+        "docs/review-protocol.md",
+        "docs/session-state/current.md",
+        "docs/release.md",
+        "docs/decisions/x.md",
+        "drill/clean-machine/README.md",
+    ],
+)
+def test_agents_extensions_and_model_facing_docs_are_not_trivial(path):
+    """Defect class: text a model reads as instructions lands with no review."""
+    assert classify_pr_files([_modified(path)]) != "trivial"
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_release_adoption_lock_bump_is_trivial():
+    """Defect class: the product's adoption of an accepted release still needs a review."""
+    assert classify_pr_files([_modified("requirements-machinery.lock", LOCK_BUMP)]) == "trivial"
+    # The adoption PR that also fixes product tests takes the tests' tier.
+    assert classify_pr_files([
+        _modified("requirements-machinery.lock", LOCK_BUMP), _modified("tests/test_orient_api.py"),
+    ]) == "low"
+    # Machinery's post-release bump keeps its review: a patch cannot prove TOML or JSON scope.
+    assert classify_pr_files(_release_cut()) == "high"
+
+
+@pytest.mark.usefixtures("configured_roots")
+@pytest.mark.parametrize(
+    ("path", "patch"),
+    [
+        # A dependency pin moved with the version.
+        ("requirements-machinery.lock", LOCK_BUMP.replace(
+            " # lu-machinery release", "-pyyaml==6.0.2 \\\n+pyyaml==6.0.3 \\\n # lu-machinery release", 1,
+        )),
+        # An old hash kept as context on the new version.
+        ("requirements-machinery.lock", LOCK_BUMP.replace(
+            " # lu-machinery release",
+            "     --hash=sha256:" + "0" * 64 + "\n # lu-machinery release", 1,
+        )),
+        # A dependency's own version line: no package name line above it.
+        ("package-lock.json", """@@ -20,7 +20,7 @@
+     "node_modules/@agentclientprotocol/claude-agent-acp": {
+-      "version": "0.1.28",
++      "version": "0.1.29",
+       "resolved": "https://registry.npmjs.org/x.tgz","""),
+        # A dependency added next to the version.
+        ("pyproject.toml", PYPROJECT_BUMP.replace(
+            ' description = "Shared', '+dependencies = ["requests"]\n description = "Shared', 1,
+        )),
+        ("package.json", PACKAGE_BUMP.replace('   "private": true,', '+  "postinstall": "x",\n   "private": true,', 1)),
+        # A dependency entry that carries its own name line (an npm alias).
+        ("package-lock.json", """@@ -20,7 +20,7 @@
+     "node_modules/alias": {
+       "name": "some-dependency",
+-      "version": "0.1.28",
++      "version": "0.1.29",
+       "resolved": "https://registry.npmjs.org/x.tgz","""),
+        # The lock block below line 1, or a second hunk after it.
+        ("requirements-machinery.lock", LOCK_BUMP.replace("@@ -1,5 +1,5 @@", "@@ -3,5 +3,5 @@", 1)),
+        ("requirements-machinery.lock", LOCK_BUMP + "\n@@ -40,2 +40,2 @@\n-pyyaml==6.0.2 \\\n+pyyaml==6.0.3 \\"),
+        # A second hunk that only adds another package's hash.
+        ("requirements-machinery.lock", LOCK_BUMP + "\n@@ -40,2 +40,3 @@\n pyyaml==6.0.2 \\\n+    --hash=sha256:"
+         + "1" * 64 + " \\\n     --hash=sha256:" + "2" * 64),
+        # Valid nested JSON shaped like the root object (round-2 repro).
+        ("package-lock.json", """@@ -6,7 +6,7 @@
+     "node_modules/example":
+ {
+   "name": "example",
+-  "version": "9.1.0",
++  "version": "9.1.1",
+   "dev": true
+ }"""),
+        # Another TOML table's name and version.
+        ("pyproject.toml", """@@ -40,6 +40,6 @@
+ [tool.poetry]
+ name = "lu-machinery"
+-version = "0.1.28"
++version = "0.1.29"
+ description = "x\""""),
+    ],
+)
+def test_version_file_with_dependency_change_is_not_trivial(path, patch):
+    """Defect class: a dependency or script change hides inside a release version bump."""
+    assert classify_pr_files([_modified(path, patch)]) != "trivial"
+    rows = [row if row["filename"] != path else _modified(path, patch) for row in _release_cut()]
+    if path in {row["filename"] for row in rows}:
+        assert classify_pr_files(rows) != "trivial"
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_version_downgrade_or_missing_patch_is_not_trivial():
+    """Defect class: a lowered, disagreeing or unreadable version change passes as a release cut."""
+    downgrade = LOCK_BUMP.replace("0.1.25", "0.1.X").replace("0.1.26", "0.1.25").replace("0.1.X", "0.1.26")
+    assert classify_pr_files([_modified("requirements-machinery.lock", downgrade)]) != "trivial"
+    assert classify_pr_files([_modified("requirements-machinery.lock")]) != "trivial"
+    assert classify_pr_files([_modified("pyproject.toml")]) == "high"
+    added = [{"filename": "requirements-machinery.lock", "status": "added", "patch": LOCK_BUMP}]
+    assert classify_pr_files(added) != "trivial"

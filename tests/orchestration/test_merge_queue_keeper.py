@@ -360,7 +360,7 @@ def test_low_scoped_pair_cannot_replace_a_whole_head_non_author_approval(tmp_pat
     """Scoped co-author reviews must never admit or keep a Low head queued."""
     for queued in (False, True):
         fake = FakeGitHub(pr(isInMergeQueue=queued))
-        fake.files = ["docs/example.md"]
+        fake.files = ["tests/test_example.py"]
         whole = recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00")
         whole["body"] = build_comment(
             sha=HEAD_A, task_id="non-author", started="2026-09-23T12:00:00.000001+00:00",
@@ -374,7 +374,7 @@ def test_low_scoped_pair_cannot_replace_a_whole_head_non_author_approval(tmp_pat
         assert mutations(fake) == ([] if queued else ["enqueue"])
 
         fake = FakeGitHub(pr(isInMergeQueue=queued))
-        fake.files = ["docs/example.md"]
+        fake.files = ["tests/test_example.py"]
         fake.comments_rows = []
         for family, model, scope in (
             ("openai", "gpt-6.1-sol", "c" * 40),
@@ -439,3 +439,32 @@ def test_machinery_carbon_debt_admission_preserves_rejections(tmp_path: Path, qu
     else:
         assert "dequeue" not in mutations(fake)
         assert ("enqueue" in mutations(fake)) is (not queued)
+
+
+def test_trivial_head_is_ready_without_verdict(tmp_path: Path) -> None:
+    """Defect class: the keeper holds or dequeues a Trivial head for a review it does not need."""
+    for queued in (False, True):
+        fake = FakeGitHub(pr(isInMergeQueue=queued))
+        fake.files = ["CHANGELOG.md"]
+        fake.comments_rows = []
+        lines, failed = keeper.run(fake, tmp_path / f"trivial-{queued}.json", apply=True)
+        assert not failed
+        assert "reason=ready" in lines[0]
+        assert mutations(fake) == ([] if queued else ["enqueue"])
+    # One non-Trivial file makes the whole head wait for its review again.
+    fake = FakeGitHub(pr())
+    fake.files = ["CHANGELOG.md", "scripts/example.py"]
+    fake.comments_rows = []
+    lines, failed = keeper.run(fake, tmp_path / "mixed.json", apply=True)
+    assert not failed
+    assert "reason=needs-CF" in lines[0]
+    assert "enqueue" not in mutations(fake)
+    # Unreadable evidence for a queued Trivial head removes it: no review status backs it in the queue gate.
+    fake = FakeGitHub(pr(isInMergeQueue=True))
+    fake.files = ["CHANGELOG.md"]
+    malformed = recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00")
+    malformed["body"] = malformed["body"].replace("verdict=APPROVED model", "verdict=MAYBE model")
+    fake.comments_rows = [malformed]
+    lines, failed = keeper.run(fake, tmp_path / "unknown.json", apply=True)
+    assert "#42 revoked: CF-unknown" in "\n".join(lines)
+    assert "dequeue" in mutations(fake)

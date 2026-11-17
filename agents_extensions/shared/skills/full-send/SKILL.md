@@ -99,7 +99,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    Before step 5, the author may optionally run the DeepSeek author pre-check
    ([below](#optional-deepseek-author-pre-check-ds-precheck-1101)) on the pinned pushed head.
 5. **Review with `review-loop`**, which you run yourself, at that pushed head, in parallel with
-   its PR CI. It resolves the reviewer live (never from a family that authored the branch,
+   its PR CI; a Trivial-tier change has no review (review policy section 2), so go to step 6. It resolves the reviewer live (never from a family that authored the branch,
    except any qualified non-author reviewer at the review policy's Low tier), dispatches it at
    the exact pushed head, keeps the budget and the ledger, and records the verdict. A fix that
    moves the head returns to step 4: push, then run the next round on the new head while its
