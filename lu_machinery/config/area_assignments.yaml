@@ -126,3 +126,12 @@ assignments:
     driver_agent_type: infra-orchestrator
     slots:
       - claude-kube-dojo
+
+# External drain recipients: agents outside the launcher fleet whose Fleet Comms
+# inbox an external bridge drains (the UI QA bot and other external agents).
+# They are not launcher slots (no mintable selector, no lease); the Fleet Comms
+# authority reads this list only to admit mail addressed to them (#594 gate).
+external_recipients:
+  - eggbot
+  - dot
+  - mac-agent
