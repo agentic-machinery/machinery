@@ -725,6 +725,7 @@ def test_legacy_drop_history_holds_new_head_for_owner(tmp_path: Path) -> None:
     keeper.run(fake, path, apply=True)
     assert "enqueue" not in mutations(fake)
     assert f"42:{HEAD_A}" in json.loads(path.read_text())["ejections"]
+    assert _defect_reports(path, "queue-ejection") == []
 
 
 def test_moved_head_before_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -988,7 +989,7 @@ def test_defect_report_requires_two_distinct_prs_and_is_sent_once(tmp_path: Path
     state["failures"].append({"job": "pytest", "pr": 43, "at": timestamp})
     path.write_text(json.dumps(state))
     lines, failed = run(fake, path, monkeypatch)
-    assert not failed and "repeated test failure: pytest; PRs=42,43; runs=unknown" in lines
+    assert not failed and "repeated job failure: pytest; PRs=42,43; runs=unknown" in lines
     [body] = _defect_reports(path)
     assert "`pytest` failed merge_group runs of distinct PRs #42, #43 within 24 hours" in body
     assert "No failing test node was read for it: diagnose the job." in body
@@ -2304,7 +2305,7 @@ def test_grouping_and_counting_use_the_raw_name(tmp_path: Path, monkeypatch: pyt
     fake = FakeGitHub()
     _ejected(fake, path, [HOSTILE_JOB], failures=[_recent(HOSTILE_JOB, 10596)])
     lines, _ = run(fake, path, monkeypatch)
-    assert f"repeated test failure: {keeper.display_text(HOSTILE_JOB, keeper.DISPLAY_TEST_LIMIT)}; PRs=42,10596; runs=321" in lines
+    assert f"repeated job failure: {keeper.display_text(HOSTILE_JOB, keeper.DISPLAY_TEST_LIMIT)}; PRs=42,10596; runs=321" in lines
     stored = json.loads(path.read_text())["failures"]
     assert {item["job"] for item in stored} == {HOSTILE_JOB}  # state keeps the raw name
 

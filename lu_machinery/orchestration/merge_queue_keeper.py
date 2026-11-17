@@ -568,6 +568,7 @@ def _load(path: Path) -> dict[str, Any]:
     if (
         not isinstance(data, dict)
         or not isinstance(data.get("queued"), dict)
+        or not isinstance(data.get("drops", {}), dict)
         or not isinstance(data.get("approved", {}), dict)
         or not isinstance(data.get("undiagnosed", {}), dict)
         or not isinstance(data.get("squash_revoked", {}), dict)
@@ -586,6 +587,7 @@ def _load(path: Path) -> dict[str, Any]:
     for key, count in drops.items() if isinstance(drops, dict) else ():
         if isinstance(key, str) and type(count) is int and count > 0:
             data.setdefault("ejections", {}).setdefault(key, [])
+            data.setdefault("ejection_alerts", {}).setdefault(key, data.get("observed", ""))
     for name in (
         "requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates", "last_removal", "drops",
     ):
@@ -719,7 +721,7 @@ def _queue_cto_alert(previous: dict[str, Any], number: int, head: str, runs: Seq
         f"Merge queue keeper: #{number} head {head[:12]} left the merge queue without merging "
         f"(merge_group runs found: {_run_ids(runs)}; a run still finishing may be missing), so the keeper "
         "holds it out of the queue (rules core P4). A failing test is fixed, or the test is deleted with "
-        "the reason in the commit and a note on its issue, and a new head starts afresh. A failure with no "
+        "the reason in the commit and a note on its issue, and the owner enqueues the fixed head. A failure with no "
         "failing test node is re-enqueued once by the owner, with the recovery evidence on the PR first."
     )
     _queue_cto_report(previous, "queue-ejection", key, body)
@@ -1198,7 +1200,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             == (kind, key)
         )]
         run_ids = sorted({item["run_id"] for item in matching if type(item.get("run_id")) is int})
-        lines.append(f"repeated test failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
+        lines.append(f"repeated {kind} failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
                      f"runs={','.join(map(str, run_ids)) or 'unknown'}")
         digest = hashlib.sha256(f"{kind}\n{key}\n{numbers}".encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
         report_key = f"merge-queue-keeper:test-defect:{digest}"
