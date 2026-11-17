@@ -40,6 +40,7 @@
   h2 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
   h2 .age { font-weight: normal; font-size: 12px; color: var(--muted); }
   h2 .age.bad { color: var(--bad); }
+  h2 .age.warn { color: var(--warn); }
   h3 { margin: 10px 0 4px; font-size: 13px; color: var(--muted); font-weight: 600; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -130,7 +131,7 @@ async function fetchJson(url) {
     const state = response.headers.get("X-Snapshot-State");
     return {data, age: age !== null && Number.isFinite(age) && age >= 0 ? age : null,
       bound: bound !== null && Number.isFinite(bound) && bound > 0 ? bound : null,
-      state, snapshot: true, receivedAt: Date.now()};
+      state, snapshot: true, receivedAt: Date.now(), url};
   } finally {
     clearTimeout(timer);
   }
@@ -655,7 +656,7 @@ function renderMilestones(data) {
   const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
   const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}GitHub data age ${age(data.age_seconds)}. ${escapeHtml(data.freshness)} Private repositories show counts only.</p>`];
   for (const repo of repos) {
-    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}</h3>`);
+    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
     if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);
     const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
     if (!milestones.length && repo.status === "ok") out.push('<p class="muted">No open milestones.</p>');
@@ -713,33 +714,125 @@ function clockUtc(moment = Date.now()) {
   return new Date(moment).toISOString().slice(11, 19) + " UTC";
 }
 
+// ---- Freshness: one reading of "how old, and is it stale" per source ----
+//
+// The panel heading and the rows below it both come from the payload fields the API returns.
+// The X-Snapshot-* headers are only the fallback for a payload that carries no age of its own
+// (a gateway or cache between the page and the API can strip or rewrite headers, never the body).
+
+const finiteAge = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+// Rows of one source -> {age, flag}: the oldest reading, and the worst state any row shows,
+// by the same readingState() the rows use.
+function rowsFreshness(rows, bound) {
+  const ages = rows.map(row => finiteAge(row.age)).filter(age => age !== null);
+  // A row with no usable reading (missing, unknown) is not fresh, so it cannot leave the heading fresh.
+  const flag = rows.some(row => row.state !== "fresh" && row.state !== "last_good") ? "stale"
+    : rows.some(row => row.state === "last_good") ? "last_good" : ages.length ? "fresh" : null;
+  return {age: ages.length ? Math.max(...ages) : null, bound, flag};
+}
+
+// Where each panel source keeps its own age. Returns null when the payload has none.
+function payloadFreshness(url, data, receivedAt) {
+  const own = payloadAge(url, data, receivedAt);
+  // A timestamp of the attempt does not make a failed collection usable: availability is the payload's own status.
+  const status = typeof data.status === "string" ? data.status : typeof data.state === "string" ? data.state : null;
+  // "pending" is a body with no observation yet, so it is unavailable too; "partial" is populated but degraded.
+  // A partial list in which no repository answered is a total outage, not partial data.
+  const repos = Array.isArray(data.repositories) ? data.repositories : [];
+  // Usable data is a repository that answered, or one that still carries milestones (a page limit, a later failure).
+  const usable = repo => repo.status === "ok" || (Array.isArray(repo.milestones) && repo.milestones.length > 0);
+  const nobody = status === "partial" && repos.length > 0 && !repos.some(usable);
+  const failed = status !== null && status !== "ok" && status !== "partial";
+  return own && {...own, unavailable: failed || nobody, partial: status === "partial"};
+}
+
+function payloadAge(url, data, receivedAt) {
+  const since = value => {
+    const moment = toDate(value);
+    return moment ? Math.max(0, (receivedAt - moment.getTime()) / 1000) : null;
+  };
+  if (url === "/api/milestones") {
+    return {age: finiteAge(data.age_seconds), bound: null, flag: typeof data.stale === "boolean" ? (data.stale ? "stale" : "fresh") : null};
+  }
+  if (url === "/api/runtime/subscriptions") {
+    const bound = finiteAge(data.stale_after_s) || null;
+    return rowsFreshness(liveAccounts(data).map(row => ({age: row.reading?.age_s,
+      state: readingState(row.reading?.status, row.reading?.age_s, bound ?? undefined)})), bound);
+  }
+  if (url === "/api/state/routing-budget") {
+    const bound = finiteAge(data.diagnostics?.stale_threshold_s) || null;
+    const rows = Object.values(data.api_accounts || {}).map(row => ({age: row.age_s,
+      state: readingState(row.freshness, row.age_s, bound ?? undefined)}));
+    // The age is the rows' own, as the rows show it; the snapshot's age and stale flag only add a stale verdict
+    // (an old snapshot is stale however its account rows read) and stand in for the age when no row has one.
+    const base = rowsFreshness(rows, bound), snapshotAge = finiteAge(data.diagnostics?.data_age_s);
+    const stale = data.diagnostics?.stale;
+    return {age: base.age ?? snapshotAge, bound, flag: stale === true ? "stale" : base.flag ?? (stale === false ? "fresh" : null)};
+  }
+  if (url === "/api/runtime/logins") return {age: since(data.read_at), bound: null, flag: null};
+  if (url === "/api/git/pull-requests") {
+    // A repository that did not answer leaves the list partial, which the server also reports as stale.
+    const partial = (Array.isArray(data.repositories) ? data.repositories : []).some(repo => repo.status !== "ok");
+    return {age: since(data.observed_at), bound: null, flag: partial ? "stale" : null};
+  }
+  if (url === "/api/ops/v1/alerts") return {age: since(data.observed_at), bound: finiteAge(data.stale_after_s) || null, flag: null};
+  return null;
+}
+
+// The reading's freshness: its own payload first, then the snapshot headers, never a mix of both ages.
+function freshnessOf(reading) {
+  if (!reading || !reading.data) return {age: null, bound: null, flag: null, unavailable: true};
+  const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
+  const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
+  // The payload's own verdict (age, stale or failed) outranks the headers, even with no age to show.
+  // The payload's bound is its own, null included: a header bound (which a gateway can rewrite) never loosens it.
+  if (own && (own.age !== null || own.flag !== null || own.unavailable)) return own;
+  const flag = reading.state === "stale" ? "stale" : null;
+  return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
+}
+
+// fresh | stale | last_good | unknown | unavailable; `elapsed` is the time since the reading was received.
+function freshnessState(fresh, elapsed = 0) {
+  if (fresh.unavailable) return "unavailable";
+  if (fresh.flag === "stale") return "stale";
+  const age = fresh.age === null ? null : fresh.age + elapsed;
+  if (age !== null && fresh.bound !== null && age > fresh.bound) return "stale";
+  if (fresh.flag === "last_good") return "last_good";
+  if (fresh.partial) return "partial";
+  if (age === null) return fresh.unavailable ? "unavailable" : "unknown";
+  return fresh.flag === "fresh" || fresh.bound !== null ? "fresh" : "unknown";
+}
+
+const FRESHNESS_LABELS = {fresh: "fresh", stale: "STALE", last_good: "last good reading", partial: "partial data", unknown: "freshness unknown", unavailable: "unavailable"};
+
 function headingAge(readings, badOnFailure, attemptedAt = null) {
   const sources = Array.isArray(readings) ? readings : [];
   const moment = sources[0]?.receivedAt ?? attemptedAt;
   const label = sources.length ? "Fetched" : "Last attempt";
   const fetched = moment ? `${label} at ${clockUtc(moment)}` : `${label} time unknown`;
   if (!sources.length) return {text: `${fetched} · unavailable · source age unknown`, bad: Boolean(badOnFailure)};
-  let bad = false;
+  let bad = false, caution = false;
   const labels = sources.map((reading, index) => {
+    const fresh = freshnessOf(reading);
     const elapsed = reading?.receivedAt ? Math.max(0, Date.now() - reading.receivedAt) / 1000 : 0;
-    const age = typeof reading?.age === "number" ? reading.age + elapsed : null;
-    const bound = reading?.bound;
-    const unknown = age === null || !Number.isFinite(bound) || bound <= 0;
-    const state = reading?.state === "unavailable" || unknown ? "unavailable"
-      : reading.state === "stale" || age > bound ? "STALE" : "fresh";
-    bad ||= state !== "fresh";
+    const state = freshnessState(fresh, elapsed);
+    bad ||= state === "stale" || state === "unavailable";
+    caution ||= state === "last_good" || state === "unknown" || state === "partial";
     const prefix = sources.length > 1 ? `${["Usage", "API balances", "Sign-in"][index] || "Source"}: ` : "";
-    return `${prefix}${state} · source age ${age === null ? "unknown" : `${Math.ceil(age)}s`}`
-      + ` · bound ${Number.isFinite(bound) && bound > 0 ? `${bound}s` : "unknown"}`;
+    // The age shown is the reading's own, as the rows show it; a stall since the fetch is named separately.
+    const overdue = state === "stale" && freshnessState(fresh) !== "stale" ? " · refresh overdue" : "";
+    return `${prefix}${FRESHNESS_LABELS[state]} · source age ${fresh.age === null ? "unknown" : `${Math.ceil(fresh.age)}s`}`
+      + ` · bound ${fresh.bound === null ? "unknown" : `${fresh.bound}s`}${overdue}`;
   });
-  return {text: `${fetched} · ${labels.join("; ")}`, bad};
+  return {text: `${fetched} · ${labels.join("; ")}`, bad, caution};
 }
 
 function updatePanelAge(panel) {
   const age = document.getElementById(`${panel.id}-age`);
   const line = headingAge(panel.readings, panel.ok === false && !panel.refusal, panel.attemptedAt);
   age.textContent = line.text;
-  age.className = line.bad ? "age bad" : "age";
+  age.className = line.bad ? "age bad" : line.caution ? "age warn" : "age";
 }
 
 // Announce only when the status changes, so a healthy 30 s refresh stays quiet.
@@ -822,7 +915,7 @@ async function loadPanel(panel) {
     const ageLine = headingAge(readings, false, panel.attemptedAt);
     panel.readings = readings;
     age.textContent = ageLine.text;
-    age.className = ageLine.bad ? "age bad" : "age";
+    age.className = ageLine.bad ? "age bad" : ageLine.caution ? "age warn" : "age";
     panel.ok = true;
     panel.refusal = false;
     announce(panel, "ready");
