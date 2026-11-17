@@ -737,6 +737,8 @@ tests/fleet_comms/test_request_executor_pg.py
 tests/test_pg_skip_guard.py
 # VERIFY-ADOPT item 4: reviewer-grading runner.
 tests/bakeoff/test_review_eval.py
+# Clean-machine release drill kit (drill/clean-machine): rows, receipts, origin oracle, OPSEC.
+tests/drill/test_clean_machine_kit.py
 # [support]
 tests/property/conftest.py
 tests/fixtures/product_tree/agents_extensions/codex-home/AGENTS.md
