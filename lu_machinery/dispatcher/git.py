@@ -1121,6 +1121,7 @@ def merged_delivery(record: dict) -> dict | None:
     from lu_machinery.dispatcher import ownership
 
     record["merged_delivery_lookup"] = "no_match"
+    record.pop("merged_delivery_exclusions", None)
     try:
         repo, base = _repo_and_base(record)
         if repo is None:
@@ -1130,6 +1131,7 @@ def merged_delivery(record: dict) -> dict | None:
         deliveries = []
         paths: set[str] = set()
         primary = None
+        strong_delivery = False
         snapshot_published = record.get("commits_ahead") == 0
         accepted = set(_accepted_prs(record["task_id"], repo))
 
@@ -1151,6 +1153,8 @@ def merged_delivery(record: dict) -> dict | None:
                     or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started
                     or not accepted_base(pr["baseRefName"])):
                 continue
+            strong = (number in accepted or pr["headRefName"] in {
+                record["worktree_branch"], record.get("publish_branch")} or pr["headRefOid"] == record["head_sha"])
             # An accepted pull request is the task's whatever it committed; otherwise a commit of its own must carry
             # its trailer, and a matching branch name alone never attributes another task's work.
             if number not in accepted:
@@ -1161,11 +1165,11 @@ def merged_delivery(record: dict) -> dict | None:
                             if line.startswith("X-Agent:")]
                 if trailer not in trailers:
                     continue
-                family_only = (pr["headRefName"] not in {record["worktree_branch"], record.get("publish_branch")}
-                               and pr["headRefOid"] != record["head_sha"])
-                if family_only and any(line != trailer for line in trailers):
+                if not strong and any(line != trailer for line in trailers):
                     record["merged_delivery_lookup"] = "ambiguous_task_attribution"
-                    return None  # inherited task commits do not establish custody of a successor's PR
+                    record.setdefault("merged_delivery_exclusions", []).append(
+                        {"repo": repo, "number": number, "reason": "ambiguous_task_attribution"})
+                    continue  # inherited task commits do not establish custody of a successor's PR
             # Any exact merged head proves the snapshot's publication, even after branch deletion.
             snapshot_published = snapshot_published or pr["headRefOid"] == record["head_sha"]
             # One JSON string per line keeps a name with a newline or quote whole.
@@ -1184,9 +1188,12 @@ def merged_delivery(record: dict) -> dict | None:
             paths.update(history)
             delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=pr["mergeCommit"]["oid"])
             deliveries.append(delivery)
+            strong_delivery = strong_delivery or strong
             if pr["headRefOid"] == record["head_sha"]:
                 primary = delivery
         if deliveries:
+            if record.get("merged_delivery_exclusions") and not strong_delivery:
+                return None  # only family-prefix evidence cannot resolve the mixed-task ambiguity
             if not snapshot_published:
                 tip, merged = _canonical_publication(
                     record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])

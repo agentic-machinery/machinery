@@ -175,7 +175,7 @@ def test_additional_task_prs_recover_split_branch_delivery(
     assert calls == [78, 79]
 
 
-@pytest.mark.parametrize("fault", ["outside-path", "reverted-outside-path", "foreign-trailer", "branch-collision", "invalid-family-page", "mixed-trailers"])
+@pytest.mark.parametrize("fault", ["outside-path", "reverted-outside-path", "foreign-trailer", "branch-collision", "invalid-family-page", "mixed-trailers", "own-exact-with-mixed-successor"])
 def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypatch, fault):
     """Defect class: accepting the first merged split hides an unowned path or credits another task's split."""
     world = merged_delivery_world
@@ -195,10 +195,22 @@ def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypat
         world.listed[0]["headRefName"] = world.listed[1]["headRefName"] = "claude/merge-probeother"
     elif fault == "invalid-family-page":
         world.closed_pages = {1: [{"updated_at": "not-a-timestamp"}]}
-    elif fault == "mixed-trailers":
+    elif fault in {"mixed-trailers", "own-exact-with-mixed-successor"}:
         world.files[79] = ["docs/owned.md"]
         world.messages[79] = "X-Agent: claude/merge-probe\nX-Agent: claude/successor-task"
+        if fault == "own-exact-with-mixed-successor":
+            world.listed[0]["headRefName"] = "claude/merge-probe"
+            world.prs[78]["headRefOid"] = world.record["head_sha"]
+            world.files[79] = ["foreign-task.txt"]
     worker._enforce_delivery(world.record)
+    if fault == "own-exact-with-mixed-successor":
+        assert (world.record["status"], world.record["error"]) == ("done", None)
+        assert world.record["delivery_prs"] == ["org/repo#78"]
+        assert world.record["merged_delivery_exclusions"] == [
+            {"repo": "org/repo", "number": 79, "reason": "ambiguous_task_attribution"}]
+        proof = git.merged_delivery(world.record)
+        assert [pr["number"] for pr in proof["pull_requests"]] == [78]
+        return
     assert world.record["status"] == "no_deliverable"
     if fault in {"outside-path", "reverted-outside-path"}:
         assert world.record["error"] == "outside_owned_paths: outside.txt"
