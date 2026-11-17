@@ -558,13 +558,19 @@ zero; PR-run reuse is retired. The existing
 `projected_cost_after_lost_reuse` receipt key is retained for reader compatibility.
 The driver must measure combined PR/queue cost before decision A; the retired reuse path cannot supply current proof.
 
+CI recovery covers only a failure with no failing test node (rules core P4): a lost
+runner, an empty job list, or a network fetch that failed before the change's code ran.
+A failing test node (a JUnit failure or error) is fixed, or the test is deleted with the
+reason in the commit and a note on its issue; it is never rerun or re-enqueued. The
+merge-queue keeper never re-enqueues an ejected head: it holds it, comments once and reports
+it to the CTO inbox, and the owner decides between a fix and the one evidenced re-enqueue.
 CI recovery uses one durable Git-common-directory `ci-recovery.sqlite3` record per
-repository/PR/head on each host for both failed-job reruns and keeper/direct
+repository/PR/head on each host for both failed-job reruns and the owner's
 re-enqueue. Before recovery, post
 `<!-- ci-recovery-evidence {"pr":42,"head":"<PR SHA>","run_id":123,"job_ids":[456],"tested_sha":"<tested SHA>","failure_evidence":"<failure evidence>","unrelated_to_diff":"<diff diagnosis>"} -->`
 on the PR. All failing job IDs are required. Evidence must be posted by the
 authenticated login with OWNER, MEMBER or COLLABORATOR association, matching
-the verdict author filter. Retain any keeper requeue grant.
+the verdict author filter.
 
 The publisher pages through all GitHub `RemovedFromMergeQueueEvent.beforeCommit.oid`
 values, using `pageInfo` rather than `totalCount` to establish completeness.

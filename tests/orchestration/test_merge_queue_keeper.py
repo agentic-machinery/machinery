@@ -111,7 +111,6 @@ class FakeGitHub:
         self.events: list[dict[str, Any]] = []
         self.run_rows: list[dict[str, Any]] = []
         self.job_rows: list[dict[str, Any]] = []
-        self.issue_rows: list[dict[str, Any]] = []
         self.squash: bool | None = False
         self.files = ["scripts/example.py"]
 
@@ -180,18 +179,6 @@ class FakeGitHub:
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
-
-    def issues(self, title: str) -> list[dict[str, Any]]:
-        return self.issue_rows
-
-    def issue_comment(self, number: int, body: str) -> None:
-        self.actions.append(("issue-comment", (number, body)))
-
-    def create_issue(self, title: str, body: str) -> int:
-        self.actions.append(("issue", title))
-        number = 1000 + len(self.issue_rows)
-        self.issue_rows.append({"title": title, "body": body, "number": number})
-        return number
 
 
 def run(
@@ -270,7 +257,7 @@ def test_queued_without_cf_at_head_is_revoked(tmp_path: Path) -> None:
     )
     state = json.loads(path.read_text())
     assert "42" not in state["queued"]
-    assert state["drops"][f"42:{HEAD_A}"] == 1
+    assert f"42:{HEAD_A}" not in state["drops"]  # A keeper dequeue is not an ejection.
     assert f"42:{HEAD_A}" not in state.get("pending_comments", {})
     assert f"42:{HEAD_A}" not in state.get("squash_revoked", {})
 

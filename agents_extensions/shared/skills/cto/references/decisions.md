@@ -37,7 +37,8 @@ Practices used:
   decision.
 - Reversible and in scope: decide now and report; otherwise P6.
 - Probe a claimed limit, outage or impossibility before routing around it.
-- Use the [CI recovery recipe](recipes.md#ci-recovery) before the single rerun.
+- Use the [CI recovery recipe](recipes.md#ci-recovery) before the single rerun, which is
+  only for an infrastructure failure: a failing test node is fixed or deleted, never rerun.
 - For review scope and repeated findings, apply the canonical
   [review budget](../../review-loop/references/policy.md).
 - Apply OO-99 through the binding [native usage pace/reserve rule](../../../rules/model-assignment.md).

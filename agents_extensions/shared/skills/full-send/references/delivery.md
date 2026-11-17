@@ -84,7 +84,8 @@ private task metadata, stays in the task result (rules core P8).
 
 The ledger and budget follow the work: a replacement PR, a new reviewer, a new session or an
 accepted successor (`pr_ownership accept`) carries them forward, along with the head's CI rerun
-allowance. A handoff never resets a budget.
+allowance (infrastructure failures only, never a failing test node). A handoff never resets a
+budget.
 
 ## Proof
 

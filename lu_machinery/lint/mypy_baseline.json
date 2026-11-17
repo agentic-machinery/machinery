@@ -7040,67 +7040,7 @@
     {
       "path": "lu_machinery/orchestration/merge_queue_keeper.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"json\" of \"GitHub\" has incompatible type \"Request\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"position\" has incompatible type \"Any | None\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"str\")"
     },
     {
       "path": "lu_machinery/orchestration/merge_queue_keeper.py",

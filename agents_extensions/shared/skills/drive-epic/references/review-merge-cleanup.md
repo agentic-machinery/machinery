@@ -255,7 +255,8 @@ with no visible failure unless you go look. CI Gate now comments the source PR w
 the run URL and per-job `RESULTS` on a kick; that comment is the trigger, not a
 courtesy. On seeing it: read the failed jobs from the run, fix or rebase, re-run
 exact-head CF review if the head moved, then re-queue — same hour, never left
-overnight. Do not stand up a bot or recovery workflow for this; it is driver work
+overnight. A failing test node is never re-queued unchanged: fix it, or delete the
+test with the reason in the commit and a note on its issue (rules core P4). Do not stand up a bot or recovery workflow for this; it is driver work
 like any other red CI.
 
 **Before enqueue: use `full-ci` only for a classifier blind spot (#9066).** Do not
@@ -282,8 +283,9 @@ PRIMARY_REPO="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir
 `gh run view --log-failed` and the live log truncate or stall — that read as a "silent
 shard death", cost a closed PR and 3 review rounds, and was wrong. When the run has
 `pytest-junit-*` artifacts, download them to a scratch dir (never the primary checkout)
-and parse `<failure>`; a FAILED test there is a test failure, so confirm any new failure
-mode in the artifact before naming it. Lint, setup, and other jobs without that artifact:
+and parse `<failure>`; a FAILED test there is a test failure, never infrastructure, so
+it is fixed or deleted and never rerun; confirm any new failure mode in the artifact
+before naming it. Lint, setup, and other jobs without that artifact:
 read `gh run view <run> --log-failed`.
 
 ```bash
@@ -291,7 +293,7 @@ gh run download <run> --pattern 'pytest-junit-*' -D "$(mktemp -d)"
 ```
 
 **Main red: fix main first.** Find the breaking commit (`git log` of the failing test's
-inputs) and fix main before re-enqueueing anything. Refresh blocked PRs with
+inputs) and fix main, or delete the test with the reason, before re-enqueueing anything. Refresh blocked PRs with
 `.venv/bin/python -m lu_machinery.publish pr-update-branch --number <pr>` (always pass the number; bare, it targets the current
 branch's PR) — never close/reopen, which reuses stale merge refs and fails again. Verify
 parent1 == the approved head and the PR patch-id is unchanged, then get

@@ -1,9 +1,9 @@
-"""Untrusted CI text never escapes into public merge-queue keeper comments, markers or issues (#10600).
+"""Untrusted CI text never escapes into public merge-queue keeper comments or markers, nor into
+its CTO inbox reports (#10600).
 
 Workflow job and check names, failed-test identifiers and GitHub error text are
 controlled by whoever can push a workflow. These tests drive the real
-``keeper.run`` through the real ``GitHub.comment`` / ``GitHub.issue_comment``
-methods and the typed publisher; only read observations and the final ``gh``
+``keeper.run`` through the real ``GitHub.comment`` method and the typed publisher; only read observations and the final ``gh``
 transport are injected, and assertions inspect the exact bytes that would be
 published.
 """
@@ -48,7 +48,7 @@ class Transport:
 
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         verb = argv[1:3]
-        if verb in (["pr", "comment"], ["issue", "comment"], ["issue", "create"]):
+        if verb == ["pr", "comment"]:
             body = Path(argv[argv.index("--body-file") + 1]).read_text(encoding="utf-8")
             title = next((arg.partition("=")[2] for arg in argv if arg.startswith("--title=")), "")
             self.sent.append((" ".join(verb), title, body))
@@ -93,11 +93,16 @@ class Transport:
             return subprocess.CompletedProcess(argv, 0, "", "")
         raise AssertionError(f"unexpected gh operation: {verb}")
 
-    def comments(self) -> list[str]:
-        return [body for verb, _, body in self.sent if verb == "pr comment"]
+    def comments(self, *, ejection: bool = False) -> list[str]:
+        """Published PR comments: the reason comments, or with ``ejection`` the one ejection alert.
 
-    def issues(self) -> list[tuple[str, str]]:
-        return [(title, body) for verb, title, body in self.sent if verb == "issue create"]
+        Every ejected PR also gets the alert, which carries only the PR number and run IDs.
+        """
+        return [
+            body for verb, _, body in self.sent
+            if verb == "pr comment" and ("reason=ejected -->" in body) is ejection
+        ]
+
 
 
 def approval() -> dict[str, Any]:
@@ -150,7 +155,6 @@ class Subject(keeper.GitHub):
         self.events: list[dict[str, Any]] = []
         self.run_rows: list[dict[str, Any]] = []
         self.job_rows: list[dict[str, Any]] = []
-        self.issue_rows: list[dict[str, Any]] = []
 
     def branch_names(self) -> set[str]:
         return {"main"}
@@ -185,17 +189,9 @@ class Subject(keeper.GitHub):
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         return self.job_rows
 
-    def issues(self, title: str) -> list[dict[str, Any]]:
-        return self.issue_rows
-
     def comment(self, number: int, body: str) -> None:
         super().comment(number, body)
         self.comment_rows.append({"body": body, "user": {"login": "driver"}})
-
-    def create_issue(self, title: str, body: str) -> int:
-        number = super().create_issue(title, body)
-        self.issue_rows.append({"title": title, "body": body, "number": number})
-        return number
 
 
 @pytest.fixture
@@ -217,18 +213,22 @@ def transport(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, synthetic_opsec, 
 
 def ejected(subject: Subject, path: Path, jobs: list[str], **state: Any) -> None:
     """PR 42 was queued at ``HEAD`` on the last run and has since left the queue after a failed merge_group run."""
-    subject.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
+    subject.events = [
+        {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:00Z"},
+        {"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"},
+    ]
     subject.run_rows = [
         {
             "id": 321,
             "event": "merge_group",
+            "status": "completed",
             "conclusion": "failure",
             "created_at": "2026-09-23T00:00:02Z",
             "head_branch": "gh-readonly-queue/main/pr-42-deadbeef",
             "html_url": RUN_URL,
         }
     ]
-    subject.job_rows = [{"name": job, "conclusion": "failure"} for job in jobs]
+    subject.job_rows = [{"id": 900 + index, "name": job, "conclusion": "failure"} for index, job in enumerate(jobs)]
     path.write_text(json.dumps({"queued": {"42": HEAD}, "drops": {}, "observed": "2026-09-23T00:00:00Z", **state}))
 
 
@@ -425,11 +425,15 @@ def test_owed_comment_read_back_from_state_is_sanitised(tmp_path: Path, transpor
     assert "pending_comments" not in json.loads(path.read_text())
 
 
-# --- the issue path: title and body of a flaky-test issue ---
+# --- a failing test: the public hold comment and the CTO inbox reports ---
+
+
+def cto_reports(path: Path) -> list[str]:
+    return [entry["body"] for entry in json.loads(path.read_text()).get("cto_outbox", [])]
 
 
 @pytest.mark.parametrize("label", sorted(HOSTILE_NAMES))
-def test_flaky_issue_title_and_body_stay_inert(tmp_path: Path, transport: Transport, label: str) -> None:
+def test_failing_test_hold_comment_and_cto_reports_stay_inert(tmp_path: Path, transport: Transport, label: str) -> None:
     job = HOSTILE_NAMES[label].replace("Analyze", "pytest", 1)
     test = "tests/a.py::test_x --> <!-- @octocat [l](https://example.invalid/l)\n```"
     subject = Subject(tmp_path)
@@ -437,47 +441,42 @@ def test_flaky_issue_title_and_body_stay_inert(tmp_path: Path, transport: Transp
     ejected(subject, path, [job], failures=[{"job": job, "pr": 7, "at": "2999-01-01T00:00:00+00:00", "test": test}])
     subject.job_rows[0]["id"] = 456
     subject.failed_tests = lambda job_id: [test]
-    title = f"Merge queue flaky test: {keeper.display_text(test, keeper.DISPLAY_TEST_LIMIT)}"
-    subject.issue_rows = [{"number": 77, "title": title}]
     lines, failed = keeper.run(subject, path, apply=True)
     assert not failed, lines
-    [enqueue] = [json.loads(payload) for verb, payload, _body in transport.sent if verb == "enqueue"]
-    assert "enqueuePullRequest" in enqueue["query"]
-    assert "expectedHeadOid:$head" in enqueue["query"]
-    assert enqueue["variables"] == {"id": "PR_node", "head": HEAD}
-    assert "#42 enqueued" in lines
-    [queue_comment] = transport.comments()
-    assert "was previously removed from the queue." in assert_inert(queue_comment)
-    assert "was not queued" not in queue_comment
-    assert transport.issues() == []
-    [(verb, _, body)] = [row for row in transport.sent if row[0] == "issue comment"]
-    assert verb == "issue comment"
-    body = body.removesuffix("\n\n<!-- mq-keeper-flake -->")
-    for field in (title, body):
-        assert not any(token in field for token in ("<", ">", "](", "![", "```", "\n", "\r", *LOOKALIKE_AT)), field
-        assert "://" not in field
-        assert not any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in field)
-    assert "`" not in CODE_SPAN.sub("", body)
-    assert title == f"Merge queue flaky test: {keeper.display_text(test, keeper.DISPLAY_TEST_LIMIT)}" and len(title) < 256
+    assert "reason=ejected" in lines[0] and "#42 enqueued" not in lines
+    assert [verb for verb, _payload, _body in transport.sent] == ["pr comment", "pr comment"]
+    [hold_comment] = transport.comments(ejection=True)
+    assert "was not queued because ejected." in assert_inert(hold_comment)
+    [drop_comment] = transport.comments()
+    assert_inert(drop_comment)
+    reports = cto_reports(path)
+    assert len(reports) == 2  # the head's ejection, and the test failing on PRs 7 and 42
+    for body in reports:
+        assert not any(token in body for token in ("<", ">", "](", "![", "```", "\n", "\r", *LOOKALIKE_AT)), body
+        assert "://" not in body
+        assert not any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in body)
+        assert "`" not in CODE_SPAN.sub("", body)
+        assert len(body) < 2000
     assert {item["job"] for item in json.loads(path.read_text())["failures"]} == {job}  # raw name kept
     keeper.run(subject, path, apply=True)
-    assert transport.issues() == []
-    assert len([row for row in transport.sent if row[0] == "issue comment"]) == 1
+    assert [verb for verb, _payload, _body in transport.sent] == ["pr comment", "pr comment"]
+    assert cto_reports(path) == reports
 
 
-def test_plain_flaky_issue_is_unchanged(tmp_path: Path, transport: Transport) -> None:
+def test_plain_repeated_failure_is_a_cto_report_not_an_issue(tmp_path: Path, transport: Transport) -> None:
     subject = Subject(tmp_path)
     path = tmp_path / "state.json"
     ejected(subject, path, ["pytest (3)"], failures=[{"job": "pytest (3)", "pr": 7, "at": "2999-01-01T00:00:00+00:00"}])
-    subject.issue_rows = [{"number": 77, "title": "Renamed",
-                           "body": "Quarantine pytest (3).  \n\n<!-- mq-keeper-flake -->"}]
     lines, failed = keeper.run(subject, path, apply=True)
     assert not failed, lines
-    assert transport.issues() == []
-    assert [body for verb, _, body in transport.sent if verb == "issue comment"] == [
-        "`pytest (3)` failed merge_group runs on distinct PRs #7, #42 within 24 hours. Run IDs: 321."
-        "\n\n<!-- mq-keeper-flake -->"
+    assert all(verb == "pr comment" for verb, _payload, _body in transport.sent)
+    defect = [entry for entry in json.loads(path.read_text())["cto_outbox"] if entry["kind"] == "queue-test-defect"]
+    assert [entry["body"] for entry in defect] == [
+        "Merge queue keeper: `pytest (3)` failed merge_group runs of distinct PRs #7, #42 within 24 hours "
+        "(run IDs: 321). A failing test is never infrastructure and is never rerun (rules core P4): assign "
+        "a fix, or delete the test with the reason in the commit and a note on its issue."
     ]
+    assert defect[0]["key"].startswith("merge-queue-keeper:test-defect:")
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
