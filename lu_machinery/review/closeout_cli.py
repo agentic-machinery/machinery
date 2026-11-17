@@ -935,37 +935,42 @@ _CHECKLIST_EVIDENCE_LIMIT = 5
 # Renames and copies, including copies of a file the diff leaves unchanged; both diff passes use
 # the same options so every patch header names a file the status list holds.
 _CHECKLIST_DETECTION = ("-M", "-C", "--find-copies-harder")
-# What judges a change, as a class: the checklist and ownership map; review configuration and the
-# catalog and substitutions that seat the reviewer; the review package (this CLI, the resolver, the
-# reply contract, parser and recorder); the verifier; the reply schema, its binding and the provider
-# and adapter code that runs a reviewer and validates its structured reply; the publication and
-# finalization of verdicts; the gates that let a verdict land a PR; the review skills and brief
-# template; and the rules. A diff touching any of them changes its own judge, so it gets the built-in
-# judge-change item, which no checklist edit removes.
+# What judges a change, as classes rather than a file list (a list kept missing siblings):
+# - anything named for review or verdicts in the code and agent trees (the review package, verdict
+#   parsing, recording, publication, finalization and ground truth, the review MCP, review configs,
+#   the reply schema, the queue review gate, the reviewer guard hooks, the review skills);
+# - the harnesses that launch a reviewer and validate its reply: the agent runtime and its adapters,
+#   the dispatcher and its providers, and the agent bridge;
+# - what accepts a verdict or lets it land a PR: the Fleet authority's formal-review acceptance and its
+#   finalize command, the publisher, the integration sweep, the keeper;
+# - what seats the reviewer: the model catalog, substitutions, runtime failover and routing defaults;
+# - the rules, and this checklist and ownership map.
+# A diff touching any of them changes its own judge, so it gets the built-in judge-change item, which
+# no checklist edit removes.
 _JUDGE_PATHS = (
-    "**/config/reliability_checklist.yaml",
-    "**/config/code_owners.yaml",
-    "**/config/review_*.yaml",
-    "**/config/model_catalog.yaml",
-    "**/config/agent_fallback_substitutions.yaml",
-    "lu_machinery/review/**",
-    "scripts/review/**",
-    "**/verify_review.py",
-    "**/schemas/code-review-*",
-    "**/dispatcher/output_schema.py",
-    "**/dispatcher/worker.py",
-    "**/dispatcher/review_attempt.py",
-    "**/dispatcher/providers/**",
-    "**/agent_runtime/adapters/**",
-    "**/ai_agent_bridge/_review_safety.py",
-    "**/fleet_comms/review_publication.py",
-    "**/fleet_comms/formal_review_finalize.py",
-    "**/ci/queue_review_gate.py",
+    "lu_machinery/**/*review*",
+    "lu_machinery/**/*review*/**",
+    "lu_machinery/**/*verdict*",
+    "scripts/**/*review*",
+    "scripts/**/*review*/**",
+    "scripts/**/*verdict*",
+    "agents_extensions/**/*review*",
+    "agents_extensions/**/*review*/**",
+    "**/agent_runtime/**",
+    "**/dispatcher/**",
+    "**/ai_agent_bridge/**",
+    "**/publish/**",
     "**/orchestration/integration_sweep.py",
     "**/orchestration/merge_queue_keeper.py",
-    "agents_extensions/**/skills/review-loop/**",
-    "agents_extensions/**/skills/local-code-review/**",
-    "agents_extensions/**/skills/drive-epic/references/review-merge-cleanup.md",
+    "**/fleet_comms/authority.py",
+    "**/fleet_comms/cli.py",
+    "**/config/model_catalog.yaml",
+    "**/config/agent_fallback_substitutions.yaml",
+    "**/config/agent_runtime_failover.yaml",
+    "**/config/routing_defaults.yaml",
+    "**/config/reliability_checklist.yaml",
+    "**/config/code_owners.yaml",
+    "**/verify_review.py",
     "agents_extensions/**/rules/**",
 )
 _JUDGE_CHANGE_ID = "judge-change"
