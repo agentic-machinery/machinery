@@ -134,6 +134,9 @@ def pytest_make_collect_report(collector: pytest.Collector):
 def _session_roots_for_this_test(monkeypatch):
     for name, value in _ROOT_VALUES.items():
         monkeypatch.setenv(name, value)
+    # A passed test may have cached config.PRODUCT_ROOT at its own tmp. Retention has
+    # removed that directory; drop the cache so this test reads the session roots above.
+    _forget_session_roots()
     state = _SESSION_ROOTS / _ROOT_VARIABLES["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]
     for child in state.iterdir():
         if child.name == ".git":
