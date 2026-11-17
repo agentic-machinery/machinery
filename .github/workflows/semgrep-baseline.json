@@ -135,11 +135,6 @@
    "sha256": "368e9ac1f109f9c9d4da443e3f8fb31ecc8e98fbbc646b197d411cd276121892"
   },
   {
-   "path": "lu_machinery/pre_push/dagger_pytest.sh",
-   "rule": "bash.lang.correctness.unquoted-variable-expansion-in-command",
-   "sha256": "daa9976e55c85af0c3004ee0178a058476a26b1624f749209ec7a0b4be6a7d90"
-  },
-  {
    "path": "lu_machinery/tools/safe_git.sh",
    "rule": "bash.lang.correctness.unquoted-variable-expansion-in-command",
    "sha256": "182ecb846efa7c3f401ccba8594002b5dc8de4cdc53a9332e97b3a8be0b53c83"
