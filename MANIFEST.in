@@ -50,6 +50,7 @@ include agents_extensions/shared/rules/core-lifecycle.yaml
 include agents_extensions/shared/rules/core-manifest.yaml
 include agents_extensions/shared/rules/core.md
 include agents_extensions/shared/rules/critical-rules.md
+include agents_extensions/shared/rules/design-charter.md
 include agents_extensions/shared/rules/dispatch-must-use-worktree.md
 include agents_extensions/shared/rules/fleet-comms-coordination.md
 include agents_extensions/shared/rules/fleet-driver-routing.md

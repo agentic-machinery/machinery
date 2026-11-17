@@ -257,9 +257,11 @@ request, instead of one round trip per blob. Attribution reads commits and
 fetches PR heads exactly as before; `merge-tree` fetches any blob it needs.
 
 The queue metadata job publishes `ci-queue-candidate`, binding the event's original
-base and candidate to the workflow run and attempt. For recovery, compare these
-immutable SHAs, then inspect that complete base-to-head diff against the failing tests, code,
-fixtures, dependencies, configuration and workflow. This includes every grouped
+base and candidate to the workflow run and attempt. Recovery is available only
+when no failing test node was found. A failing test node is fixed, or deleted with the reason in the commit and a note on its issue;
+it is never rerun. For a failure with no failing test node, compare these immutable
+SHAs and inspect the complete base-to-head diff against the failed job, exercised
+code, fixtures, dependencies, configuration and workflow. This includes every grouped
 change without guessing membership. Include `queue_group_diff` with `base_sha`,
 `head_sha` and the sorted `paths` list in the existing recovery evidence comment.
 Include old and new names for renames. The publisher verifies this against the

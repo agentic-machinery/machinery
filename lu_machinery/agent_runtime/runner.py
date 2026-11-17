@@ -1688,6 +1688,7 @@ def _execute_invocation_plan(
     initial_response_timeout: int | None = None,
     agy_budget: _AgyLaunchBudget | None = None,
     cli_version: str = "unknown",
+    transcript_path: Path | None = None,
 ) -> _ExecutionOutcome:
     """Two launches maximum; cancellation, eligibility and provider faults share it."""
     kwargs = dict(
@@ -1708,6 +1709,7 @@ def _execute_invocation_plan(
         stdout_silence_timeout=stdout_silence_timeout,
         initial_response_timeout=initial_response_timeout,
         cli_version=cli_version,
+        transcript_path=transcript_path,
     )
     if agent_name != "agy":
         return _execute_invocation_once(**kwargs)
@@ -1928,6 +1930,7 @@ def _execute_invocation_once(
     stdout_silence_timeout: int | None = None,
     initial_response_timeout: int | None = None,
     cli_version: str = "unknown",
+    transcript_path: Path | None = None,
 ) -> _ExecutionOutcome:
     """Spawn one plan, run watchdog/parse flow, and return raw execution state."""
     # Exact-target review isolation (#5285): when tool_config requests
@@ -2018,6 +2021,29 @@ def _execute_invocation_once(
     kill_reason: str | None = None
     escaped_primary: list[str] = []
     cwd_pin: _ChildCwdPin | None = None
+    transcript = None
+    transcript_offsets = {"stdout": 0, "stderr": 0}
+    transcript_failed = False
+
+    def transcript_error(error: OSError) -> None:
+        nonlocal transcript_failed
+        if not transcript_failed:
+            print(f"ACP transcript persistence failed: {error}; provider execution and cleanup continue", file=sys.stderr)
+        transcript_failed = True
+
+    def save_transcript() -> None:
+        if transcript is None or watchdog_state is None or transcript_failed:
+            return
+        try:
+            for stream, lines in (("stdout", watchdog_state.stdout_lines), ("stderr", watchdog_state.stderr_lines)):
+                end = len(lines)
+                for line in lines[transcript_offsets[stream]:end]:
+                    transcript.write(json.dumps({"stream": stream, "text": line}) + "\n")
+                transcript_offsets[stream] = end
+            transcript.flush()
+        except OSError as error:
+            transcript_error(error)
+
     # Mid-dispatch primary-tree tripwire (#6818): the spawn-time guard above
     # proved cwd isolation, but a child can still resolve absolute paths into
     # the primary checkout while running (the agy escape class). Baseline is
@@ -2041,6 +2067,11 @@ def _execute_invocation_once(
     )
 
     try:
+        if transcript_path is not None:
+            # The caller owns this durable path. Append each captured chunk
+            # before parsing or temporary-file cleanup can discard it.
+            fd = os.open(transcript_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+            transcript = os.fdopen(fd, "a", encoding="utf-8")
         try:
             if plan.stdin_payload:
                 if tool_config and tool_config.get("review_isolation"):
@@ -2125,6 +2156,7 @@ def _execute_invocation_once(
         early_reap_check = getattr(adapter, "check_early_reap", None)
         returncode: int | None = None
         while True:
+            save_transcript()
             if output_limit is not None:
                 new_stdout_lines = watchdog_state.stdout_lines[observed_output_stdout_lines:]
                 observed_output_stdout_lines = len(watchdog_state.stdout_lines)
@@ -2344,6 +2376,14 @@ def _execute_invocation_once(
             with contextlib.suppress(Exception):
                 tree_watch.final_check()
 
+        if transcript is not None:
+            # A cancelled child can leave a final unterminated pipe chunk.
+            # Let drainers consume EOF before stop_watchdog sets state.stop
+            # and closes their pipes, which would discard that paid output.
+            for thread in watchdog_threads:
+                if "stdout" in thread.name or "stderr" in thread.name:
+                    thread.join(timeout=5.0)
+
         if watchdog_state is not None:
             stop_watchdog(
                 watchdog_state,
@@ -2352,6 +2392,15 @@ def _execute_invocation_once(
                 stdout_master_fd=stdout_master_fd,
                 stderr_master_fd=stderr_master_fd,
             )
+
+        if transcript is not None:
+            try:
+                save_transcript()
+            finally:
+                try:
+                    transcript.close()
+                except OSError as error:
+                    transcript_error(error)
 
         if plan.output_file is not None and plan.output_file.exists() and _is_temp_file(plan.output_file):
             should_delete = False
@@ -3500,6 +3549,7 @@ def _invoke_impl(
     allow_runner_failover: bool = True,
     rules_seat: str | None = None,
     rules_core_delivery: RulesCoreDelivery = RulesCoreDelivery.INJECT,
+    transcript_path: Path | None = None,
 ) -> Result:
     """Runner implementation after any parent-owned isolation preparation.
 
@@ -3520,7 +3570,9 @@ def _invoke_impl(
             adapter's ``resume_policy`` both allow it. See § 6.3.
         tool_config: Adapter-specific tool configuration dict. For Claude
             and Gemini this carries MCP server names and allowed-tools
-            strings. Adapters ignore keys they don't understand.
+            strings. Strict adapters reject unknown keys.
+        transcript_path: Runner-owned capture path, kept separate from
+            adapter-facing tool configuration.
         entrypoint: Who called us — drives resume policy enforcement and
             usage record labeling. One of: ``"bridge"``, ``"dispatch"``,
             ``"delegate"``, ``"consult"``, ``"runtime"``.
@@ -3708,6 +3760,7 @@ def _invoke_impl(
         stdout_silence_timeout=stdout_silence_timeout,
         initial_response_timeout=initial_response_timeout,
         cli_version=telemetry.cli_version,
+        transcript_path=transcript_path,
     )
     parse = _validated_agy_parse(execution.parse, agent=agent_name, requested_model=effective_model,
                                  task_id=task_id, run_nonce=(tool_config or {}).get("run_nonce"))
@@ -4178,7 +4231,8 @@ def invoke_inter_agent(
     transport: str | None = None,
     metadata: Mapping[str, object] | None = None,
     sealed_review_mcp_config: Path | None = None,
-    hard_timeout: int = 300,
+    hard_timeout: int = 86400,
+    transcript_path: Path | None = None,
     rules_seat: str | None = None,
 ) -> Result:
     """Invoke one confined ACP participant through the normal communication seam.
@@ -4188,6 +4242,10 @@ def invoke_inter_agent(
     and never retries a failed ACP request through the legacy bridge.  The
     returned :class:`Result` carries runner-sealed ``transport_metadata``
     (Source, Agent, Via) and a normalized ``transport_outcome``.
+
+    ``hard_timeout`` is a 24-hour hang guard, with no inactivity deadline.
+    ``transcript_path`` retains captured stdout/stderr chunks as JSON lines,
+    including when a timeout, cancellation or parser error stops the call.
     """
     _require_acp_transport(transport)
     _validate_transport_metadata(metadata)
@@ -4246,6 +4304,7 @@ def invoke_inter_agent(
                     **({"sealed_review_mcp_config": sealed_config} if sealed_config is not None else {}),
                 },
                 hard_timeout=hard_timeout,
+                transcript_path=transcript_path,
                 effort=route.effort,
                 entrypoint="acpx-transport",
                 rules_seat=rules_seat,
@@ -4276,6 +4335,7 @@ def _invoke_direct_only(
     entrypoint: str = "acpx-pilot-shadow",
     initiator: str | None = None,
     rules_seat: str | None = None,
+    transcript_path: Path | None = None,
 ) -> Result:
     """Invoke one explicitly marked direct-only, read-only shadow seat.
 
@@ -4314,6 +4374,7 @@ def _invoke_direct_only(
             rules_seat=rules_seat,
             allow_direct_only=True,
             allow_runner_failover=False,
+            transcript_path=transcript_path,
         )
     except AcpxShadowRefusalError as exc:
         write_record(

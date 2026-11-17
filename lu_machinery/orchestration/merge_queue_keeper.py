@@ -562,7 +562,7 @@ def _throttled(state_path: Path, seconds: int, now: datetime | None = None) -> b
 
 def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"queued": {}, "drops": {}}
+        return {"queued": {}}
     try:
         data = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError) as exc:
@@ -570,13 +570,12 @@ def _load(path: Path) -> dict[str, Any]:
     if (
         not isinstance(data, dict)
         or not isinstance(data.get("queued"), dict)
-        or not isinstance(data.get("drops"), dict)
+        or not isinstance(data.get("drops", {}), dict)
         or not isinstance(data.get("approved", {}), dict)
         or not isinstance(data.get("undiagnosed", {}), dict)
         or not isinstance(data.get("squash_revoked", {}), dict)
         or not isinstance(data.get("pending_comments", {}), dict)
         or not isinstance(data.get("defect_reports", {}), dict)
-        or not isinstance(data.get("last_removal", {}), dict)
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
     ):
@@ -585,7 +584,20 @@ def _load(path: Path) -> dict[str, Any]:
     # carried that ceremony's "spent" reasons, so loading them would hold heads
     # nothing can clear. ``keeper_requeues`` recorded the retired one keeper re-enqueue per
     # head, and ``flake_issue_updates`` paced the retired flaky-test issue comments.
-    for name in ("requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates"):
+    # Preserve legacy queue history without claiming a diagnosed exit or a delivered alert.
+    drops = data.get("drops")
+    for key, count in drops.items() if isinstance(drops, dict) else ():
+        if isinstance(key, str) and type(count) is int and count > 0:
+            if (
+                key.partition(":")[0] in data["queued"]
+                or key in data.get("ejections", {})
+                or key in data.get("undiagnosed", {})
+            ):
+                continue  # Existing observations retain history and must still report a real exit.
+            data.setdefault("ejection_alerts", {}).setdefault(key, data.get("observed", ""))
+    for name in (
+        "requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates", "last_removal", "drops",
+    ):
         data.pop(name, None)
     return data
 
@@ -716,7 +728,7 @@ def _queue_cto_alert(previous: dict[str, Any], number: int, head: str, runs: Seq
         f"Merge queue keeper: #{number} head {head[:12]} left the merge queue without merging "
         f"(merge_group runs found: {_run_ids(runs)}; a run still finishing may be missing), so the keeper "
         "holds it out of the queue (rules core P4). A failing test is fixed, or the test is deleted with "
-        "the reason in the commit and a note on its issue, and a new head starts afresh. A failure with no "
+        "the reason in the commit and a note on its issue, and the owner enqueues the fixed head. A failure with no "
         "failing test node is re-enqueued once by the owner, with the recovery evidence on the PR first."
     )
     _queue_cto_report(previous, "queue-ejection", key, body)
@@ -730,13 +742,16 @@ def _queue_cto_report(previous: dict[str, Any], kind: str, key: str, body: str) 
 
 
 def _ever_queued(gh: GitHub, number: int) -> bool:
-    """Whether the PR's timeline shows any merge-queue entry, by anyone, at any head.
+    """Whether the PR's timeline shows any queue stay, by anyone, at any head.
 
     GitHub binds no queue stay to a PR head (a merge_group ref names the base commit), so
     the keeper makes no per-head judgement: a PR that was ever queued is the owner's to
     re-enqueue. An unreadable timeline raises.
     """
-    return any(isinstance(item, dict) and item.get("event") == "added_to_merge_queue" for item in gh.timeline(number))
+    return any(
+        isinstance(item, dict) and item.get("event") in {"added_to_merge_queue", "removed_from_merge_queue"}
+        for item in gh.timeline(number)
+    )
 
 
 def _alert_service() -> Any:
@@ -760,46 +775,6 @@ def _deliver_alerts(state_path: Path, service_factory: Callable[[], Any] = _aler
         state.pop("cto_outbox")
     _save(state_path, state)
     return [f"CTO alert delivery FAILED: {error}" for error in errors]
-
-
-def _count_removals(gh: GitHub, number: int, head: str, previous: dict[str, Any]) -> None:
-    """Count timeline removals independently of membership and failure diagnosis."""
-    key = str(number)
-    dropped_head = previous["queued"].get(key, head)
-    drop_key = f"{number}:{dropped_head}"
-    cursor = previous.get("last_removal", {}).get(key, {
-        "created_at": previous.get("undiagnosed", {}).get(drop_key, previous.get("observed", "")), "id": 0,
-    })
-
-    def position(stamp: str, event_id: int) -> tuple[datetime, int]:
-        if not isinstance(stamp, str) or not stamp or type(event_id) is not int:
-            raise KeeperError("queue removal position malformed")
-        try:
-            when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        except ValueError as exc:
-            raise KeeperError("queue removal timestamp invalid") from exc
-        if when.tzinfo is None:
-            raise KeeperError("queue removal timestamp has no timezone")
-        return when, event_id
-
-    after = position(cursor["created_at"], cursor["id"]) if cursor["created_at"] else (datetime.min.replace(tzinfo=UTC), 0)
-    events = sorted({
-        position(item.get("created_at"), item.get("id", 0))
-        for item in gh.timeline(number)
-        if item.get("event") == "removed_from_merge_queue"
-    })
-    for stamp, event_id in events:
-        if (stamp, event_id) <= after:
-            continue
-        # Keeper dequeues are handled at mutation. Their timeline confirmation
-        # must not charge them again or attribute them to a later head.
-        pending = cursor.get("keeper_dequeues", 0)
-        if pending:
-            cursor["keeper_dequeues"] = pending - 1
-        else:
-            previous["drops"][drop_key] = int(previous["drops"].get(drop_key, 0)) + 1
-        cursor["created_at"], cursor["id"] = stamp.isoformat(), event_id
-    previous.setdefault("last_removal", {})[key] = cursor
 
 
 def _drop_detail(
@@ -864,18 +839,18 @@ def _drop_detail(
     return detail, failed, tests, run["id"], run_ids
 
 
-def _repeated_failures(failures: Any) -> dict[str, tuple[list[int], list[str]]]:
+def _repeated_failures(failures: Any) -> dict[tuple[str, str], tuple[list[int], list[str]]]:
     """Group by failed node ID, falling back to the job only without a node; keep the keys
     that failed on at least ``REPEATED_FAILURE_PRS`` distinct PRs."""
-    prs: dict[str, set[int]] = defaultdict(set)
-    tests: dict[str, set[str]] = defaultdict(set)
+    prs: dict[tuple[str, str], set[int]] = defaultdict(set)
+    tests: dict[tuple[str, str], set[str]] = defaultdict(set)
     for item in failures if isinstance(failures, list) else []:
         if not isinstance(item, dict):
             continue
         job, number, test = item.get("job"), item.get("pr"), item.get("test")
         if not isinstance(job, str) or job in AGGREGATE_JOBS or type(number) is not int:
             continue
-        key = test if isinstance(test, str) and test else job
+        key = ("test", test) if isinstance(test, str) and test else ("job", job)
         prs[key].add(number)
         if isinstance(test, str) and test:  # Node evidence, even when a job is named like its node.
             tests[key].add(test)
@@ -896,11 +871,14 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             f"GraphQL budget stop: skipped remaining={snap['remaining']} cost={snap['cost']} floor={FLOOR} reset_at={snap.get('reset_at')}"
         ], False
     previous = _load(state_path)
-    queued_now: dict[str, str] = {}
     approved_now: dict[str, str] = {}
     login = gh.identity()
     observed = datetime.now(UTC).isoformat()
     open_numbers = {str(pr.get("number")) for pr in snap["prs"]}
+    # Unknown membership or an incomplete row cannot erase a previously observed queue stay.
+    queued_now: dict[str, str] = {
+        number: head for number, head in previous["queued"].items() if number in open_numbers
+    }
     for pr in snap["prs"]:
         number, head, node_id = pr.get("number"), pr.get("headRefOid"), pr.get("id")
         if not isinstance(number, int) or not isinstance(head, str) or not isinstance(node_id, str):
@@ -912,6 +890,11 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         armed = _auto_merge_armed(pr)
         if queued is True:
             queued_now[key] = head
+            if f"{number}:{head}" not in previous.get("ejections", {}):
+                # Owner reentry ends a keeper-removal suppression; a later real exit may alert.
+                previous.get("ejection_alerts", {}).pop(f"{number}:{head}", None)
+        elif queued is False:
+            queued_now.pop(key, None)
         queue_enabled = snap["queues"].get(pr.get("baseRefName"))
         comment_safe = True
         # Whether the PR changes learner content, which takes the Ukrainian seats; None when unread.
@@ -938,11 +921,6 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         if approved_before:
             approved_now[key] = head
         drop_key = f"{number}:{head}"
-        removal_error = ""
-        try:
-            _count_removals(gh, number, head, previous)
-        except KeeperError as exc:
-            removal_error = display_text(str(exc), DISPLAY_REASON_LIMIT)
         dropped = key in previous["queued"] and queued is False
         detail = ""
         failed_jobs: list[str] = []
@@ -978,9 +956,14 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         exited = queued is not True and (
             drop_key in previous.get("ejections", {}) or drop_key in previous.get("undiagnosed", {})
         )
-        ejected = exited
+        # A head push does not erase the PR's earlier stay when its timeline lags.
+        ejected = queued is not True and (exited or key in previous["queued"] or any(
+            item.startswith(f"{number}:")
+            for name in (*REQUEUE_STATE, "undiagnosed", "squash_revoked", "pending_comments")
+            for item in previous.get(name, {})
+        ))
         # An unread queue history cannot show that this PR was never queued.
-        ejection_unknown = bool(removal_error)
+        ejection_unknown = False
         if queued is not True and not ejected and not ejection_unknown:
             # Read on every pass, whatever holds the head, so no later readiness read skips it.
             try:
@@ -1012,8 +995,6 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             f"#{number} head={head[:12]} state={state} reason={shown} queued={queued} armed={armed}"
             + verdict_detail(verdict.reason, verdict.comment_id, verdict.superseded_markers)
         )
-        if removal_error:
-            lines.append(f"#{number} queue removal count unknown: {removal_error}")
         if not apply:
             continue
         if not budget:
@@ -1078,6 +1059,11 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     current_checks = _check_state(gh.checks(head), head)
                 except KeeperError:
                     current_checks = "CI-unknown"
+                if queued is not True and not ejected and not ejection_unknown:
+                    try:
+                        ejected = _ever_queued(gh, number)
+                    except KeeperError:
+                        ejection_unknown = True
                 reason = (
                     _reason(current, current_verdict, current_checks, ejected, queue_enabled)
                     if verdict_lookup_ok
@@ -1111,6 +1097,9 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     if fresh
                     else None
                 )
+                if revoke is None and not fresh and queued is not True and armed and not gh.membership(number):
+                    # An unverified identity cannot keep auto-merge armed until the next pass.
+                    revoke = reason
                 if (
                     revoke is None and fresh and queued is not True and armed and (ejected or ejection_unknown)
                     and not gh.membership(number)  # A PR GitHub queued since the snapshot is left alone.
@@ -1126,15 +1115,13 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 if revoke is not None:
                     if queued is True:
                         gh.dequeue(node_id)
-                        cursor = previous.setdefault("last_removal", {}).setdefault(key, {
-                            "created_at": previous.get("observed", ""), "id": 0,
-                        })
-                        cursor["keeper_dequeues"] = cursor.get("keeper_dequeues", 0) + 1
                     else:
                         gh.disarm(number)
                     lines.append(f"#{number} revoked: {revoke}" + _cf_unknown_detail(revoke, current_verdict))
                     if queued is True:
                         queued_now.pop(key, None)
+                        # The keeper removed it, so retain the stay without announcing an ejection.
+                        previous.setdefault("ejection_alerts", {}).setdefault(drop_key, observed)
                     if revoke == "squash-text-blocked":
                         previous.setdefault("squash_revoked", {})[drop_key] = observed
                     if queued is True and revoke == "needs-CF":
@@ -1207,7 +1194,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         previous["queued"] = queued_now
         previous["approved"] = approved_now
         previous["observed"] = observed
-        for name in ("squash_revoked", "undiagnosed", "pending_comments", "last_removal", *REQUEUE_STATE):
+        for name in ("squash_revoked", "undiagnosed", "pending_comments", *REQUEUE_STATE):
             if name in previous:
                 previous[name] = {
                     item: value for item, value in previous[name].items() if item.split(":", 1)[0] in open_numbers
@@ -1224,12 +1211,15 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
     for report_key, stamp in list(reports.items()):
         if not isinstance(stamp, str) or stamp < cutoff:
             reports.pop(report_key)
-    for key, (numbers, tests) in sorted(_repeated_failures(failures).items()):
-        matching = [item for item in failures if (item.get("test") or item.get("job")) == key]
+    for (kind, key), (numbers, tests) in sorted(_repeated_failures(failures).items()):
+        matching = [item for item in failures if (
+            (("test", item["test"]) if isinstance(item.get("test"), str) and item["test"] else ("job", item.get("job")))
+            == (kind, key)
+        )]
         run_ids = sorted({item["run_id"] for item in matching if type(item.get("run_id")) is int})
-        lines.append(f"repeated test failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
+        lines.append(f"repeated {kind} failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
                      f"runs={','.join(map(str, run_ids)) or 'unknown'}")
-        digest = hashlib.sha256(f"{key}\n{numbers}".encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
+        digest = hashlib.sha256(f"{kind}\n{key}\n{numbers}".encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
         report_key = f"merge-queue-keeper:test-defect:{digest}"
         if not apply or report_key in reports:
             continue

@@ -1,0 +1,2036 @@
+{
+ "schema": "lu-clean-machine-drill-rows/1",
+ "denominator": 144,
+ "classes": {
+  "as-is": "Runs on a clean machine with only the installed release and a temp directory.",
+  "mock": "Runs against the drill's mocks: synthetic product checkout and stores, stub tools and loopback stand-ins.",
+  "cannot-run": "Cannot run off-host; each such row states its reason."
+ },
+ "mocks": {
+  "product-root": "Synthetic product Git checkout with its own bare remote, product marker and task records",
+  "fleet-plane": "Fleet Comms plane in the synthetic product, seeded with a cto channel",
+  "fixture-store": "Synthetic session or tool store built by drill.py",
+  "stub-gh": "gh stand-in: fake token, GitHub REST/GraphQL answers framed like gh api --include",
+  "stub-tmux": "tmux stand-in: no sessions exist",
+  "stub-systemctl": "systemctl stand-in: units active, dispatch slice loaded",
+  "stub-sudo": "sudo stand-in: runs the command as the current user (user-level root stand-in)",
+  "stub-provider-cli": "codex, claude, agy, cursor-agent and opencode stand-ins with fixed answers",
+  "stub-backup-script": "Product backup script stand-in that only echoes",
+  "monitor-standin": "Loopback Monitor stand-in on 127.0.0.1:8765",
+  "sources-standin": "Loopback Sources stand-in on 127.0.0.1:8766 (four public VESUM words) plus a declaration-only MCP server file",
+  "synthetic-admission-policy": "The public test fixture admission policy, copied into the synthetic product",
+  "fake-credentials": "GH_TOKEN and GITHUB_TOKEN set to a fake value",
+  "no-private-opsec-matcher": "The private OPSEC matcher is absent, so public writes must be refused",
+  "stand-in-consumer": "A stand-in for a consumer that does not use machinery"
+ },
+ "probes": {
+  "digest": {
+   "title": "Session digester over a synthetic Codex session store",
+   "mocks": [
+    "fixture-store"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.ops.digest_codex_rollout"
+   ],
+   "env": {
+    "DIGEST_LABEL": "writer",
+    "DIGEST_REPO": "{scratch}/repo",
+    "DIGEST_ROOTS": "{home}/.codex/sessions"
+   },
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "sources=1 label=writer"
+    ],
+    "files": [
+     {
+      "path": "{scratch}/repo/logs/agent-digests/writer-latest.md",
+      "re": "drill"
+     }
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "fleet-roundtrip": {
+   "title": "Fleet Comms publish to cto and read the delivery back",
+   "mocks": [
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "fleet-roundtrip"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "fleet-authority": {
+   "title": "Fleet Comms authority service on the mock plane",
+   "mocks": [
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "fleet-authority"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "wake-watch": {
+   "title": "Wake watcher: Fleet Comms post plus fail-closed prepublish gate",
+   "mocks": [
+    "product-root",
+    "fleet-plane",
+    "no-private-opsec-matcher"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "wake-watch"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "api": {
+   "title": "Monitor API from the release: health, rules core, every plain GET route",
+   "mocks": [
+    "product-root",
+    "monitor-standin",
+    "stub-gh"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "api"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "backup-alert": {
+   "title": "Backup failure alert: one change-only cto report, quiet repeat, recovery",
+   "mocks": [
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "backup-alert"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "scheduled-backup": {
+   "title": "Scheduled backup runner from the release resource path, receipt written",
+   "mocks": [
+    "product-root",
+    "stub-backup-script"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "scheduled-backup"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "scheduled-backup-retention": {
+   "title": "Scheduled backup retention mode from the release resource path",
+   "mocks": [
+    "product-root",
+    "stub-backup-script"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "scheduled-backup",
+    "retention"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "context-guard": {
+   "title": "Context guard tick over the shipped lane data with tmux stand-in",
+   "mocks": [
+    "stub-tmux",
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.ops.context_guard",
+    "tick",
+    "--state-dir",
+    "{scratch}/guard"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   }
+  },
+  "data-tier": {
+   "title": "Data-tier runner logic: audited selection, known-failure baseline and JUnit summary over a real pytest run",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "data-tier"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "git-maintenance": {
+   "title": "Data-volume guard wrapping scheduled Git maintenance of the mock product (report only)",
+   "mocks": [
+    "product-root",
+    "stub-gh"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-c",
+    "import os, sys; from importlib.resources import files; os.execvp(\"bash\", [\"bash\", str(files(\"lu_machinery\").joinpath(sys.argv[1])), *sys.argv[2:]])",
+    "storage/data_volume_guard.sh",
+    "--",
+    "{py}",
+    "-I",
+    "-c",
+    "import os, sys; from importlib.resources import files; os.execvp(\"bash\", [\"bash\", str(files(\"lu_machinery\").joinpath(sys.argv[1])), *sys.argv[2:]])",
+    "orchestration/run_scheduled_worktree_cleanup.sh",
+    "--repo-root",
+    "{product}",
+    "--git-maintenance"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "scheduled-git-hygiene"
+    ],
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "worktree-gc": {
+   "title": "Scheduled worktree cleanup of the mock product (report only), fake GitHub token",
+   "mocks": [
+    "product-root",
+    "stub-gh",
+    "fake-credentials"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-c",
+    "import os, sys; from importlib.resources import files; os.execvp(\"bash\", [\"bash\", str(files(\"lu_machinery\").joinpath(sys.argv[1])), *sys.argv[2:]])",
+    "orchestration/run_scheduled_worktree_cleanup.sh",
+    "--repo-root",
+    "{product}"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "scheduled-git-hygiene"
+    ],
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "issue-quality": {
+   "title": "Issue quality report through the GitHub stand-in (no publish)",
+   "mocks": [
+    "stub-gh",
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.orchestration.issue_quality_report"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "\"repositories\""
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "lane-relaunch": {
+   "title": "Lane relaunch plan (dry run) with tmux stand-in",
+   "mocks": [
+    "stub-tmux",
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.ops.lane_relaunch",
+    "--dry-run"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "\"session\""
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "mq-keeper": {
+   "title": "Merge-queue keeper report through the GitHub stand-in",
+   "mocks": [
+    "stub-gh",
+    "product-root",
+    "fake-credentials"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.orchestration.merge_queue_keeper",
+    "--report",
+    "--repo",
+    "drill/product",
+    "--repo-root",
+    "{product}"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   }
+  },
+  "mq-guard": {
+   "title": "Queue guard imports and integration sweep through the GitHub stand-in",
+   "mocks": [
+    "stub-gh",
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "mq-guard"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "agent-deploy": {
+   "title": "Consumer agent deployment from the release: apply then --check",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "agent-deploy"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "agent-session": {
+   "title": "Harness session stand-in: deploy, then run every deployed SessionStart hook",
+   "mocks": [
+    "product-root",
+    "stub-provider-cli"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "agent-deploy",
+    "session"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "opencode-retention": {
+   "title": "OpenCode session retention (dry run) against an OpenCode CLI stand-in",
+   "mocks": [
+    "stub-provider-cli",
+    "fixture-store"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.orchestration.opencode_session_retention",
+    "--dry-run",
+    "--days",
+    "30"
+   ],
+   "expect": {
+    "rc": 0,
+    "output_re": [
+     "ses_drillold"
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "project-state-reporter": {
+   "title": "Project-state reporter posts to the Monitor stand-in",
+   "mocks": [
+    "product-root",
+    "monitor-standin",
+    "stub-provider-cli"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "project-state-reporter"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 240
+  },
+  "quota-history": {
+   "title": "Quota history collect from the Monitor stand-in",
+   "mocks": [
+    "monitor-standin"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "quota-history"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "reconcile": {
+   "title": "Reconcile sweep over synthetic task records (dry run)",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.orchestration.reconcile_sweep",
+    "--json"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "\"scanned_tasks\": 3"
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "sources-watchdog": {
+   "title": "Data-volume guard wrapping the Sources watchdog, probing the Sources stand-in",
+   "mocks": [
+    "sources-standin",
+    "stub-systemctl"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-c",
+    "import os, sys; from importlib.resources import files; os.execvp(\"bash\", [\"bash\", str(files(\"lu_machinery\").joinpath(sys.argv[1])), *sys.argv[2:]])",
+    "storage/data_volume_guard.sh",
+    "--",
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.orchestration.sources_watchdog",
+    "--dump-dir",
+    "{scratch}/dumps",
+    "--health-url",
+    "{sources_url}/health",
+    "run-once"
+   ],
+   "expect": {
+    "rc": 0,
+    "output_re": [
+     "healthy"
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "sources-probe": {
+   "title": "Sources port probe: healthy stand-in, then a failing endpoint",
+   "mocks": [
+    "sources-standin",
+    "stub-systemctl"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "sources-probe"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "tmp-sweep": {
+   "title": "Temp sweep (dry run) and batch_state retention report over the synthetic state root",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "tmp-sweep"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "stale-records": {
+   "title": "Stale task-record archive on a private copy: exactly the two old terminal records move",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "stale-records"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "scorecard-imports": {
+   "title": "Scorecard imports: fleet repositories and test-slot status",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "scorecard-imports"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "publish-fail-closed": {
+   "title": "Publish CLI refuses a public comment without the private matcher; gh never written",
+   "mocks": [
+    "stub-gh",
+    "no-private-opsec-matcher"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "publish-fail-closed"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "resolver": {
+   "title": "Reviewer resolver picks a non-Anthropic reviewer for an Anthropic author",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "resolver"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "admission": {
+   "title": "Dispatch admission thresholds, disk probe and product policy",
+   "mocks": [
+    "product-root",
+    "synthetic-admission-policy"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "admission"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "root-admission": {
+   "title": "Root-run gate stand-in: admission probes through the user-level sudo stand-in",
+   "mocks": [
+    "stub-sudo",
+    "product-root",
+    "synthetic-admission-policy"
+   ],
+   "argv": [
+    "sudo",
+    "-n",
+    "-u",
+    "root",
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "admission"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   }
+  },
+  "bridge-inbox": {
+   "title": "Agent bridge inbox view on the mock plane",
+   "mocks": [
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "-m",
+    "lu_machinery.ai_agent_bridge",
+    "inbox",
+    "--for",
+    "claude",
+    "show",
+    "claude"
+   ],
+   "expect": {
+    "rc": 0,
+    "stdout_re": [
+     "pending: +0"
+    ],
+    "machinery_loaded": true
+   }
+  },
+  "dispatch-dry-run": {
+   "title": "Read-only dispatch dry run: admitted, planned, no worker",
+   "mocks": [
+    "product-root",
+    "synthetic-admission-policy",
+    "sources-standin",
+    "stub-provider-cli"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "dispatch-dry-run"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 240
+  },
+  "linked-worktree": {
+   "title": "Dispatcher run from a linked worktree reads the primary's records",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "linked-worktree"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "merge-closeout": {
+   "title": "Merge closeout report through the GitHub stand-in",
+   "mocks": [
+    "product-root",
+    "stub-gh"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "merge-closeout"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 240
+  },
+  "claims-lock": {
+   "title": "Worktree lock identity across a symlink alias; second holder refused",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "claims-lock"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "launcher-dry-run": {
+   "title": "Product start script on the release launcher core: interactive dry run",
+   "mocks": [
+    "product-root",
+    "stub-provider-cli"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "launcher-dry-run",
+    "interactive"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 240
+  },
+  "launcher-driver-dry-run": {
+   "title": "Driver launcher dry run on the release launcher core",
+   "mocks": [
+    "product-root",
+    "stub-provider-cli",
+    "monitor-standin"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "launcher-dry-run",
+    "driver"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 240
+  },
+  "review-path": {
+   "title": "Review verifier: exact-head target manifest and a held-out malformed verdict",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "review-path"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "git-hooks": {
+   "title": "One release pre-commit hook and one product hook on consumer commits",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "git-hooks"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "shipped-units": {
+   "title": "Every shipped systemd unit names a module or resource the release provides",
+   "mocks": [],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "shipped-units"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "cli-help": {
+   "title": "Command-line entry points used by host wrappers answer --help",
+   "mocks": [],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "cli-help"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 300
+  },
+  "product-import": {
+   "title": "In-process product import: every machinery module from the release",
+   "mocks": [
+    "product-root"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "product-import"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "skill-cli": {
+   "title": "One fleet CLI and one shipped skill from the release",
+   "mocks": [
+    "product-root",
+    "fleet-plane"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "skill-cli"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "release-integrity": {
+   "title": "Installed release equals the expected version's RECORD; no left-over files",
+   "mocks": [],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "release-integrity"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "stand-in-no-release": {
+   "title": "Consumer without machinery: its interpreter cannot import the release",
+   "mocks": [
+    "stand-in-consumer"
+   ],
+   "argv": [
+    "{base_py}",
+    "-I",
+    "{kit}/probes.py",
+    "stand-in-no-release"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": false
+   },
+   "timeout": 180
+  },
+  "stand-in-venv": {
+   "title": "Consumer on the release venv that imports no machinery loads none",
+   "mocks": [
+    "stand-in-consumer"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "stand-in-venv"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": false
+   },
+   "timeout": 180
+  },
+  "stand-in-root": {
+   "title": "Root or system-unit consumer without machinery, through the user-level sudo stand-in",
+   "mocks": [
+    "stub-sudo",
+    "stand-in-consumer"
+   ],
+   "argv": [
+    "sudo",
+    "-n",
+    "-u",
+    "root",
+    "{base_py}",
+    "-I",
+    "{kit}/probes.py",
+    "stand-in-no-release"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": false
+   }
+  },
+  "git-maintenance-standin": {
+   "title": "Hardened Git maintenance stand-in: system git over the mock product, no machinery",
+   "mocks": [
+    "stand-in-consumer",
+    "product-root"
+   ],
+   "argv": [
+    "git",
+    "-c",
+    "maintenance.repo={product}",
+    "for-each-repo",
+    "--config=maintenance.repo",
+    "maintenance",
+    "run",
+    "--task=commit-graph"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": false
+   }
+  },
+  "no-launcher-for-copy": {
+   "title": "Backup copies stay unlaunched: nothing shipped names a .bak file",
+   "mocks": [
+    "stand-in-consumer"
+   ],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "no-launcher-for-copy"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  },
+  "no-machinery-checkout": {
+   "title": "Development reader stand-in: no machinery checkout is reachable",
+   "mocks": [],
+   "argv": [
+    "{base_py}",
+    "-I",
+    "{kit}/probes.py",
+    "no-machinery-checkout"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": false
+   },
+   "timeout": 180
+  },
+  "retired-unit": {
+   "title": "Retired unit stays retired: the release ships no reaper unit",
+   "mocks": [],
+   "argv": [
+    "{py}",
+    "-I",
+    "{kit}/probes.py",
+    "retired-unit"
+   ],
+   "expect": {
+    "rc": 0,
+    "machinery_loaded": true
+   },
+   "timeout": 180
+  }
+ },
+ "rows": [
+  {
+   "id": "R001",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "admission",
+   "summary": "Dispatch admission thresholds, disk probe and product policy"
+  },
+  {
+   "id": "R002",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "agent-deploy",
+   "summary": "Consumer agent deployment from the release: apply then --check"
+  },
+  {
+   "id": "R003",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "agent-deploy",
+   "summary": "Consumer agent deployment from the release: apply then --check"
+  },
+  {
+   "id": "R004",
+   "kind": "harness-session",
+   "class": "mock",
+   "probe": "agent-session",
+   "summary": "Harness session stand-in: deploy, then run every deployed SessionStart hook"
+  },
+  {
+   "id": "R005",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "api",
+   "summary": "Monitor API from the release: health, rules core, every plain GET route"
+  },
+  {
+   "id": "R006",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "api",
+   "summary": "Monitor API from the release: health, rules core, every plain GET route"
+  },
+  {
+   "id": "R007",
+   "kind": "socket-activated-user-service",
+   "class": "mock",
+   "probe": "api",
+   "summary": "Monitor API from the release: health, rules core, every plain GET route"
+  },
+  {
+   "id": "R008",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "backup-alert",
+   "summary": "Backup failure alert: one change-only cto report, quiet repeat, recovery"
+  },
+  {
+   "id": "R009",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "bridge-inbox",
+   "summary": "Agent bridge inbox view on the mock plane"
+  },
+  {
+   "id": "R010",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "claims-lock",
+   "summary": "Worktree lock identity across a symlink alias; second holder refused"
+  },
+  {
+   "id": "R011",
+   "kind": "contract-row",
+   "class": "as-is",
+   "probe": "cli-help",
+   "summary": "Command-line entry points used by host wrappers answer --help"
+  },
+  {
+   "id": "R012",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "context-guard",
+   "summary": "Context guard tick over the shipped lane data with tmux stand-in"
+  },
+  {
+   "id": "R013",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "data-tier",
+   "summary": "Data-tier runner logic: audited selection, known-failure baseline and JUnit summary over a real pytest run"
+  },
+  {
+   "id": "R014",
+   "kind": "cron-line",
+   "class": "mock",
+   "probe": "digest",
+   "summary": "Session digester over a synthetic Codex session store"
+  },
+  {
+   "id": "R015",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "digest",
+   "summary": "Session digester over a synthetic Codex session store"
+  },
+  {
+   "id": "R016",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "digest",
+   "summary": "Session digester over a synthetic Codex session store"
+  },
+  {
+   "id": "R017",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "dispatch-dry-run",
+   "summary": "Read-only dispatch dry run: admitted, planned, no worker"
+  },
+  {
+   "id": "R018",
+   "kind": "worker-scope",
+   "class": "mock",
+   "probe": "dispatch-dry-run",
+   "summary": "Read-only dispatch dry run: admitted, planned, no worker"
+  },
+  {
+   "id": "R019",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "fleet-authority",
+   "summary": "Fleet Comms authority service on the mock plane"
+  },
+  {
+   "id": "R020",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "fleet-authority",
+   "summary": "Fleet Comms authority service on the mock plane"
+  },
+  {
+   "id": "R021",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "fleet-authority",
+   "summary": "Fleet Comms authority service on the mock plane"
+  },
+  {
+   "id": "R022",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "fleet-authority",
+   "summary": "Fleet Comms authority service on the mock plane"
+  },
+  {
+   "id": "R023",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "fleet-authority",
+   "summary": "Fleet Comms authority service on the mock plane"
+  },
+  {
+   "id": "R024",
+   "kind": "cron-line",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R025",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R026",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R027",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R028",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R029",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "fleet-roundtrip",
+   "summary": "Fleet Comms publish to cto and read the delivery back"
+  },
+  {
+   "id": "R030",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "git-hooks",
+   "summary": "One release pre-commit hook and one product hook on consumer commits"
+  },
+  {
+   "id": "R031",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "git-maintenance",
+   "summary": "Data-volume guard wrapping scheduled Git maintenance of the mock product (report only)"
+  },
+  {
+   "id": "R032",
+   "kind": "hardened-user-service",
+   "class": "mock",
+   "probe": "git-maintenance-standin",
+   "summary": "Hardened Git maintenance stand-in: system git over the mock product, no machinery"
+  },
+  {
+   "id": "R033",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "issue-quality",
+   "summary": "Issue quality report through the GitHub stand-in (no publish)"
+  },
+  {
+   "id": "R034",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "lane-relaunch",
+   "summary": "Lane relaunch plan (dry run) with tmux stand-in"
+  },
+  {
+   "id": "R035",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "launcher-driver-dry-run",
+   "summary": "Driver launcher dry run on the release launcher core"
+  },
+  {
+   "id": "R036",
+   "kind": "launcher",
+   "class": "mock",
+   "probe": "launcher-driver-dry-run",
+   "summary": "Driver launcher dry run on the release launcher core"
+  },
+  {
+   "id": "R037",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "launcher-dry-run",
+   "summary": "Product start script on the release launcher core: interactive dry run"
+  },
+  {
+   "id": "R038",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "linked-worktree",
+   "summary": "Dispatcher run from a linked worktree reads the primary's records"
+  },
+  {
+   "id": "R039",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "merge-closeout",
+   "summary": "Merge closeout report through the GitHub stand-in"
+  },
+  {
+   "id": "R040",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "mq-guard",
+   "summary": "Queue guard imports and integration sweep through the GitHub stand-in"
+  },
+  {
+   "id": "R041",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "mq-guard",
+   "summary": "Queue guard imports and integration sweep through the GitHub stand-in"
+  },
+  {
+   "id": "R042",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "mq-keeper",
+   "summary": "Merge-queue keeper report through the GitHub stand-in"
+  },
+  {
+   "id": "R043",
+   "kind": "static-copy",
+   "class": "mock",
+   "probe": "no-launcher-for-copy",
+   "summary": "Backup copies stay unlaunched: nothing shipped names a .bak file"
+  },
+  {
+   "id": "R044",
+   "kind": "static-copy",
+   "class": "mock",
+   "probe": "no-launcher-for-copy",
+   "summary": "Backup copies stay unlaunched: nothing shipped names a .bak file"
+  },
+  {
+   "id": "R045",
+   "kind": "static-copy",
+   "class": "mock",
+   "probe": "no-launcher-for-copy",
+   "summary": "Backup copies stay unlaunched: nothing shipped names a .bak file"
+  },
+  {
+   "id": "R046",
+   "kind": "development-reader",
+   "class": "as-is",
+   "probe": "no-machinery-checkout",
+   "summary": "Development reader stand-in: no machinery checkout is reachable"
+  },
+  {
+   "id": "R047",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "opencode-retention",
+   "summary": "OpenCode session retention (dry run) against an OpenCode CLI stand-in"
+  },
+  {
+   "id": "R048",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "product-import",
+   "summary": "In-process product import: every machinery module from the release"
+  },
+  {
+   "id": "R049",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "project-state-reporter",
+   "summary": "Project-state reporter posts to the Monitor stand-in"
+  },
+  {
+   "id": "R050",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "publish-fail-closed",
+   "summary": "Publish CLI refuses a public comment without the private matcher; gh never written"
+  },
+  {
+   "id": "R051",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "publish-fail-closed",
+   "summary": "Publish CLI refuses a public comment without the private matcher; gh never written"
+  },
+  {
+   "id": "R052",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "quota-history",
+   "summary": "Quota history collect from the Monitor stand-in"
+  },
+  {
+   "id": "R053",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "reconcile",
+   "summary": "Reconcile sweep over synthetic task records (dry run)"
+  },
+  {
+   "id": "R054",
+   "kind": "contract-row",
+   "class": "as-is",
+   "probe": "release-integrity",
+   "summary": "Installed release equals the expected version's RECORD; no left-over files"
+  },
+  {
+   "id": "R055",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "resolver",
+   "summary": "Reviewer resolver picks a non-Anthropic reviewer for an Anthropic author"
+  },
+  {
+   "id": "R056",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "resolver",
+   "summary": "Reviewer resolver picks a non-Anthropic reviewer for an Anthropic author"
+  },
+  {
+   "id": "R057",
+   "kind": "retired-user-service",
+   "class": "as-is",
+   "probe": "retired-unit",
+   "summary": "Retired unit stays retired: the release ships no reaper unit"
+  },
+  {
+   "id": "R058",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "review-path",
+   "summary": "Review verifier: exact-head target manifest and a held-out malformed verdict"
+  },
+  {
+   "id": "R059",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "review-path",
+   "summary": "Review verifier: exact-head target manifest and a held-out malformed verdict"
+  },
+  {
+   "id": "R060",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "root-admission",
+   "summary": "Root-run gate stand-in: admission probes through the user-level sudo stand-in"
+  },
+  {
+   "id": "R061",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "root-admission",
+   "summary": "Root-run gate stand-in: admission probes through the user-level sudo stand-in"
+  },
+  {
+   "id": "R062",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "root-admission",
+   "summary": "Root-run gate stand-in: admission probes through the user-level sudo stand-in"
+  },
+  {
+   "id": "R063",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "scheduled-backup",
+   "summary": "Scheduled backup runner from the release resource path, receipt written"
+  },
+  {
+   "id": "R064",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "scheduled-backup-retention",
+   "summary": "Scheduled backup retention mode from the release resource path"
+  },
+  {
+   "id": "R065",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "scorecard-imports",
+   "summary": "Scorecard imports: fleet repositories and test-slot status"
+  },
+  {
+   "id": "R066",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "scorecard-imports",
+   "summary": "Scorecard imports: fleet repositories and test-slot status"
+  },
+  {
+   "id": "R067",
+   "kind": "contract-row",
+   "class": "as-is",
+   "probe": "shipped-units",
+   "summary": "Every shipped systemd unit names a module or resource the release provides"
+  },
+  {
+   "id": "R068",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "skill-cli",
+   "summary": "One fleet CLI and one shipped skill from the release"
+  },
+  {
+   "id": "R069",
+   "kind": "contract-row",
+   "class": "mock",
+   "probe": "sources-probe",
+   "summary": "Sources port probe: healthy stand-in, then a failing endpoint"
+  },
+  {
+   "id": "R070",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "sources-watchdog",
+   "summary": "Data-volume guard wrapping the Sources watchdog, probing the Sources stand-in"
+  },
+  {
+   "id": "R071",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stale-records",
+   "summary": "Stale task-record archive on a private copy: exactly the two old terminal records move"
+  },
+  {
+   "id": "R072",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R073",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R074",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R075",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R076",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R077",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R078",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R079",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R080",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R081",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R082",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R083",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R084",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R085",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R086",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R087",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R088",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R089",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R090",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R091",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R092",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R093",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R094",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R095",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R096",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R097",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R098",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R099",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R100",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R101",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R102",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R103",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R104",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R105",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R106",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R107",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R108",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R109",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R110",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R111",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R112",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R113",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R114",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R115",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R116",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R117",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R118",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R119",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R120",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R121",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R122",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R123",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R124",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R125",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R126",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "stand-in-no-release",
+   "summary": "Consumer without machinery: its interpreter cannot import the release"
+  },
+  {
+   "id": "R127",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R128",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R129",
+   "kind": "root-service",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R130",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R131",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R132",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R133",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R134",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R135",
+   "kind": "system-service-non-root",
+   "class": "mock",
+   "probe": "stand-in-root",
+   "summary": "Root or system-unit consumer without machinery, through the user-level sudo stand-in"
+  },
+  {
+   "id": "R136",
+   "kind": "cron-line",
+   "class": "mock",
+   "probe": "stand-in-venv",
+   "summary": "Consumer on the release venv that imports no machinery loads none"
+  },
+  {
+   "id": "R137",
+   "kind": "hardened-user-service",
+   "class": "mock",
+   "probe": "stand-in-venv",
+   "summary": "Consumer on the release venv that imports no machinery loads none"
+  },
+  {
+   "id": "R138",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "stand-in-venv",
+   "summary": "Consumer on the release venv that imports no machinery loads none"
+  },
+  {
+   "id": "R139",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "tmp-sweep",
+   "summary": "Temp sweep (dry run) and batch_state retention report over the synthetic state root"
+  },
+  {
+   "id": "R140",
+   "kind": "host-wrapper",
+   "class": "mock",
+   "probe": "wake-watch",
+   "summary": "Wake watcher: Fleet Comms post plus fail-closed prepublish gate"
+  },
+  {
+   "id": "R141",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "wake-watch",
+   "summary": "Wake watcher: Fleet Comms post plus fail-closed prepublish gate"
+  },
+  {
+   "id": "R142",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "wake-watch",
+   "summary": "Wake watcher: Fleet Comms post plus fail-closed prepublish gate"
+  },
+  {
+   "id": "R143",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "wake-watch",
+   "summary": "Wake watcher: Fleet Comms post plus fail-closed prepublish gate"
+  },
+  {
+   "id": "R144",
+   "kind": "scheduled-user-service",
+   "class": "mock",
+   "probe": "worktree-gc",
+   "summary": "Scheduled worktree cleanup of the mock product (report only), fake GitHub token"
+  }
+ ]
+}

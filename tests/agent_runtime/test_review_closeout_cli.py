@@ -1377,3 +1377,117 @@ def test_checklist_refuses_the_checkout_copy_from_a_subdirectory(tmp_path, monke
 
     assert result.returncode == 1
     assert "the only other copy is in the checkout under review" in result.stdout + result.stderr
+
+
+def test_checklist_admits_the_installed_release_in_an_untracked_venv(tmp_path, monkeypatch):
+    """Defect class: the checkout guard refuses the installed release because it sits inside the work tree.
+
+    A primary checkout can hold its virtual environment (`<top>/.venv`, untracked); the release
+    installed there is not checkout source, so the epilog's `.venv/bin/python -P ...` run works.
+    """
+    from lu_machinery.review import closeout_cli
+
+    repo = _init_repo(tmp_path)
+    _commit_judge_inputs(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "edit app.py")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    installed = repo / ".venv" / "lib" / "python3.12" / "site-packages" / "lu_machinery" / "review"
+    installed.mkdir(parents=True)
+    (installed / "closeout_cli.py").write_text("# installed release\n", encoding="utf-8")
+    monkeypatch.setattr(closeout_cli, "__file__", str(installed / "closeout_cli.py"))
+
+    result = _run_cli(tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["checklist_source"]["kind"] == "merge-base"
+
+
+def _run_from_copy(monkeypatch, running: Path) -> None:
+    """Point the running module at ``running``, a copy of this source."""
+    from lu_machinery.review import closeout_cli
+
+    running.parent.mkdir(parents=True, exist_ok=True)
+    running.write_bytes(Path(closeout_cli.__file__).read_bytes())
+    monkeypatch.setattr(closeout_cli, "__file__", str(running))
+
+
+def _feature_repo(tmp_path: Path) -> Path:
+    repo = _init_repo(tmp_path)
+    _commit_judge_inputs(repo)
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "app.py").write_text("print('v2')\n", encoding="utf-8")
+    return repo
+
+
+def _checklist_at_commit(tmp_path: Path, repo: Path, message: str) -> subprocess.CompletedProcess[str]:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    return _run_cli(tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+
+def test_checklist_refuses_a_running_copy_whose_index_entry_is_staged_for_deletion(tmp_path, monkeypatch):
+    """Defect class: tracked source is decided by the index alone, so `git rm --cached` hides the change itself.
+
+    The reviewed head commits the running copy and the work tree's index then drops it; the head's
+    tree still names it, so it is checkout source.
+    """
+    repo = _feature_repo(tmp_path)
+    _run_from_copy(monkeypatch, repo / "lu_machinery" / "review" / "closeout_cli.py")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "edit app.py and the cli")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "rm", "-q", "--cached", "lu_machinery/review/closeout_cli.py")
+
+    result = _run_cli(tmp_path / "state.json", "checklist", "--base", "trunk", "--head", head, "--repo-root", str(repo))
+
+    assert result.returncode == 1
+    assert "running from the checkout under review" in result.stdout + result.stderr
+
+
+def test_checklist_refuses_a_tracked_file_reached_by_another_name(tmp_path, monkeypatch):
+    """Defect class: checkout source is matched by path name, so another name for the same file passes.
+
+    A case alias on a case-insensitive filesystem is one such name; a hard link outside the work
+    tree is the same defect on any filesystem: the file is tracked, whatever name runs it.
+    """
+    repo = _feature_repo(tmp_path)
+    tracked = repo / "lu_machinery" / "review" / "closeout_cli.py"
+    _run_from_copy(monkeypatch, tracked)
+    alias = tmp_path / "elsewhere" / "closeout_cli.py"
+    alias.parent.mkdir()
+    alias.hardlink_to(tracked)
+    from lu_machinery.review import closeout_cli
+
+    monkeypatch.setattr(closeout_cli, "__file__", str(alias))
+
+    result = _checklist_at_commit(tmp_path, repo, "edit app.py and the cli")
+
+    assert result.returncode == 1
+    assert "running from the checkout under review" in result.stdout + result.stderr
+
+
+def test_checklist_refuses_a_running_copy_inside_a_submodule_of_the_checkout(tmp_path, monkeypatch):
+    """Defect class: the checkout's index lists a submodule only as its gitlink, so files under it pass as untracked.
+
+    The running copy is tracked by a submodule nested in the work tree, not by the checkout's own
+    index or head tree; it is still the checkout under review.
+    """
+    source = tmp_path / "sub-source"
+    source.mkdir()
+    _git(source, "init", "-q", "-b", "trunk")
+    identity = ("-c", "user.email=test@example.com", "-c", "user.name=Test")
+    _git(source, *identity, "commit", "-q", "--allow-empty", "-m", "sub")
+    repo = _feature_repo(tmp_path)
+    _git(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source), "vendor/sub")
+    sub = repo / "vendor" / "sub"
+    _run_from_copy(monkeypatch, sub / "lu_machinery" / "review" / "closeout_cli.py")
+    _git(sub, "add", "-A")
+    _git(sub, *identity, "commit", "-q", "-m", "cli")
+
+    result = _checklist_at_commit(tmp_path, repo, "edit app.py and add the submodule")
+
+    assert result.returncode == 1
+    assert "running from the checkout under review" in result.stdout + result.stderr

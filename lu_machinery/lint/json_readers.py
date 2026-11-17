@@ -48,8 +48,8 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
             for item in node.names:
                 names[item.asname or item.name] = f"{node.module}.{item.name}"
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    # Module aliases are safe to follow. Reader references and decoder classes
-    # cannot escape into aliases: the references themselves are checked below.
+    # Aliases of the bounded helper stay bounded. Stdlib JSON module objects
+    # cannot escape into values; their readers must remain visible references.
     assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
     while True:
         added = False
@@ -57,7 +57,7 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
             if node.value is None:
                 continue
             value = _name(node.value, names)
-            if value not in {"json", "json.decoder", _BOUNDED}:
+            if value != _BOUNDED:
                 continue
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
@@ -116,6 +116,10 @@ def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
         name = _name(node, names)
         if isinstance(node, (ast.Attribute, ast.Name, ast.Call)) and (
             name in _READERS
+            or (
+                name in {"json", "json.decoder", "_json"}
+                and not (isinstance(parents.get(node), ast.Attribute) and parents[node].value is node)
+            )
             or (name == "json.JSONDecoder" and node not in allowed_constructors)
             or any(name == prefix or name.startswith(prefix + ".") for prefix in _INTERNAL_READERS)
             or (isinstance(node, ast.Attribute) and node.attr == "raw_decode" and name != f"{_BOUNDED}.raw_decode")
