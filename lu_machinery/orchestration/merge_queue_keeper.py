@@ -864,11 +864,14 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             f"GraphQL budget stop: skipped remaining={snap['remaining']} cost={snap['cost']} floor={FLOOR} reset_at={snap.get('reset_at')}"
         ], False
     previous = _load(state_path)
-    queued_now: dict[str, str] = {}
     approved_now: dict[str, str] = {}
     login = gh.identity()
     observed = datetime.now(UTC).isoformat()
     open_numbers = {str(pr.get("number")) for pr in snap["prs"]}
+    # Unknown membership or an incomplete row cannot erase a previously observed queue stay.
+    queued_now: dict[str, str] = {
+        number: head for number, head in previous["queued"].items() if number in open_numbers
+    }
     for pr in snap["prs"]:
         number, head, node_id = pr.get("number"), pr.get("headRefOid"), pr.get("id")
         if not isinstance(number, int) or not isinstance(head, str) or not isinstance(node_id, str):
@@ -880,6 +883,11 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         armed = _auto_merge_armed(pr)
         if queued is True:
             queued_now[key] = head
+            if f"{number}:{head}" not in previous.get("ejections", {}):
+                # Owner reentry ends a keeper-removal suppression; a later real exit may alert.
+                previous.get("ejection_alerts", {}).pop(f"{number}:{head}", None)
+        elif queued is False:
+            queued_now.pop(key, None)
         queue_enabled = snap["queues"].get(pr.get("baseRefName"))
         comment_safe = True
         # Whether the PR changes learner content, which takes the Ukrainian seats; None when unread.
@@ -1105,6 +1113,8 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     lines.append(f"#{number} revoked: {revoke}" + _cf_unknown_detail(revoke, current_verdict))
                     if queued is True:
                         queued_now.pop(key, None)
+                        # The keeper removed it, so retain the stay without announcing an ejection.
+                        previous.setdefault("ejection_alerts", {}).setdefault(drop_key, observed)
                     if revoke == "squash-text-blocked":
                         previous.setdefault("squash_revoked", {})[drop_key] = observed
                     if queued is True and revoke == "needs-CF":

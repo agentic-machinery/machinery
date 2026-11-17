@@ -411,8 +411,8 @@ def test_red_ci_with_missing_cf_revoke_is_not_an_ejection(tmp_path: Path) -> Non
     approved.comments_rows = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00")]
     lines, failed = keeper.run(approved, path, apply=True)
     assert not failed
-    assert "enqueue" in mutations(approved)
-    assert "reason=ready" in lines[0]
+    assert "enqueue" not in mutations(approved)
+    assert "reason=queued-before" in lines[0]
 
 
 def test_needs_cf_comment_is_retried_after_the_pull_request_leaves_the_queue(tmp_path: Path) -> None:
@@ -2408,7 +2408,10 @@ def test_report_shows_node_records_without_writes(tmp_path, monkeypatch):
     assert mutations(fake) == [] and path.read_bytes() == before
 
 
-@pytest.mark.parametrize("history", ["removal-only", "old-queued-head", "old-ejection", "legacy-removal", "late-removal"])
+@pytest.mark.parametrize("history", [
+    "removal-only", "old-queued-head", "old-ejection", "legacy-removal", "late-removal",
+    "keeper-revoked", "unknown-membership", "invalid-row",
+])
 @pytest.mark.parametrize("apply", [False, True])
 def test_queue_history_at_any_head_prevents_automatic_reentry(tmp_path, monkeypatch, history, apply):
     """Removal-only timelines and lagging history after a push must never auto-requeue a PR."""
@@ -2424,18 +2427,44 @@ def test_queue_history_at_any_head_prevents_automatic_reentry(tmp_path, monkeypa
         state["ejections"] = {f"42:{HEAD_A}": []}
     elif history == "legacy-removal":
         state["drops"] = {f"42:{HEAD_A}": 1}
+    elif history in {"keeper-revoked", "unknown-membership", "invalid-row"}:
+        if history == "keeper-revoked":
+            fake = FakeGitHub()  # Same-head owner reentry must still alert on a later real ejection.
+        path.write_text(json.dumps({"queued": {"42": HEAD_A}}))
+        prior = FakeGitHub(pr(isInMergeQueue=True if history == "keeper-revoked" else None))
+        if history == "keeper-revoked":
+            prior.fresh["labels"] = [{"name": "hold"}]
+        elif history == "invalid-row":
+            prior.row["id"] = None
+        prior_lines, prior_failed = run(prior, path, monkeypatch)
+        assert not prior_failed and "enqueue" not in mutations(prior), prior_lines
+        state = json.loads(path.read_text())
+        assert _defect_reports(path, "queue-ejection") == []
     else:
         reads = iter([[], [removal]])
         monkeypatch.setattr(fake, "timeline", lambda number: next(reads, [removal]))
     path.write_text(json.dumps(state))
+    before = path.read_bytes()
     lines, failed = run(fake, path, monkeypatch, apply=apply)
     assert not failed and "enqueue" not in mutations(fake), lines
+    if not apply:
+        assert path.read_bytes() == before
+    if history == "late-removal" and not apply:
+        assert "reason=ready" in lines[0], lines  # No second read or mutation in report mode.
     if history != "late-removal":
         assert "reason=queued-before" in lines[0], lines
     if apply:
         fake.actions.clear()
         lines, failed = run(fake, path, monkeypatch)
         assert not failed and "enqueue" not in mutations(fake), lines
+
+        if history == "keeper-revoked":
+            owner_queued = FakeGitHub(pr(isInMergeQueue=True))
+            run(owner_queued, path, monkeypatch)
+            owner_ejected = FakeGitHub()
+            lines, failed = run(owner_ejected, path, monkeypatch)
+            assert not failed and "enqueue" not in mutations(owner_ejected), lines
+            assert len(_defect_reports(path, "queue-ejection")) == 1
 
 
 def test_job_named_like_test_node_does_not_borrow_node_evidence(tmp_path, monkeypatch):
