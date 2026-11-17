@@ -61,6 +61,22 @@ def _timeout_stderr(exc: subprocess.TimeoutExpired, label: str) -> str:
     return text or f"context_canary {label} timed out after {exc.timeout}s"
 
 
+def _run_context_canary(command: list[str], repo: Path, label: str) -> tuple[int, str, str]:
+    """Run one bounded ``context_canary`` step; a timeout becomes rc 124 with a notice."""
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CANARY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _TIMEOUT_RETURN_CODE, "", _timeout_stderr(exc, label)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -234,27 +250,12 @@ def cmd_mint(args: argparse.Namespace) -> int:
         "--out",
         str(probe_path),
     ]
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_CANARY_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        proc = subprocess.CompletedProcess(
-            command,
-            _TIMEOUT_RETURN_CODE,
-            stdout="",
-            stderr=_timeout_stderr(exc, "mint"),
-        )
-    if proc.returncode != 0:
-        print(proc.stdout, end="")
-        print(proc.stderr, end="", file=sys.stderr)
-        return proc.returncode or 1
-    print(proc.stdout, end="")
+    returncode, stdout, stderr = _run_context_canary(command, repo, "mint")
+    if returncode != 0:
+        print(stdout, end="")
+        print(stderr, end="", file=sys.stderr)
+        return returncode or 1
+    print(stdout, end="")
 
     meta = {
         "minted_at": _utc_now(),
@@ -344,32 +345,17 @@ def cmd_score(args: argparse.Namespace) -> int:
         "--log",
         str(log_path),
     ]
-    try:
-        proc = subprocess.run(
-            command,
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=_CANARY_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        proc = subprocess.CompletedProcess(
-            command,
-            _TIMEOUT_RETURN_CODE,
-            stdout="",
-            stderr=_timeout_stderr(exc, "score"),
-        )
-    print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+    returncode, stdout, stderr = _run_context_canary(command, repo, "score")
+    print(stdout, end="")
+    if stderr:
+        print(stderr, end="", file=sys.stderr)
 
     # Parse SCORE line for machine verdict file
     score_line = ""
-    for line in (proc.stdout or "").splitlines():
+    for line in (stdout or "").splitlines():
         if line.startswith("SCORE "):
             score_line = line
-    verdict = "PASS" if proc.returncode == 0 else "FAIL-HANDOFF"
+    verdict = "PASS" if returncode == 0 else "FAIL-HANDOFF"
     payload = {
         "scored_at": _utc_now(),
         "epic": epic,
@@ -378,7 +364,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         "context_tokens": int(args.context_tokens),
         "model": args.model,
         "score_line": score_line,
-        "rc": proc.returncode,
+        "rc": returncode,
         "handoff_changed_since_mint": False,
         "policy": "operational-end-on-fail-handoff-not-on-compact-count",
         "action_if_fail": [
@@ -406,7 +392,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         )
         if isinstance(handoff_path, handoff_select.NoHandoff):
             print("diary: (no handoff)")
-            return 0 if proc.returncode == 0 else (2 if proc.returncode == 2 else proc.returncode)
+            return 0 if returncode == 0 else (2 if returncode == 2 else returncode)
         recorded_meta = _recorded_write_meta(repo, epic, out_dir, handoff_path, explicit_raw)
         if recorded_meta is not None:
             current = handoff_select.read_consumed_handoff(handoff_path, meta_path=recorded_meta)
@@ -521,7 +507,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     except Exception as exc:  # fail-open: never block score exit codes
         print(f"warning: diary dual-write skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
 
-    return 0 if proc.returncode == 0 else (2 if proc.returncode == 2 else proc.returncode)
+    return 0 if returncode == 0 else (2 if returncode == 2 else returncode)
 
 
 def _split_csv_lines(raw: str) -> list[str]:
