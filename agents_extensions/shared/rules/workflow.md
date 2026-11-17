@@ -384,6 +384,13 @@ This creates an isolated `handoff.md` inside `.agent/thread-rollovers/codex/<lin
 Do **not** write `docs/session-state/current.md` or any other git-tracked
 handoff file just to survive compaction.
 
+A launcher-bound lane's handoff content is its DB note: the lane's newest
+driver-state `handoff_note` that is not done or dropped, which
+`lu-driver-state render --lane <lane>` shows (#511). Cold start, compaction and
+replacement read it on every harness. For a lane, packets carry identity and
+lifecycle only, `DRIVER-STATE.md` is a pinned-facts pointer, and markdown
+handoffs and briefs are supplemental continuity that never outranks the DB note.
+
 SessionStart automatically runs the read-only engine detector. If it reports a
 packet, follow its exact ordered commands; it never chooses a lease by filesystem
 order and never auto-runs resume, confirmation, or cleanup. A no-packet

@@ -259,7 +259,7 @@ def test_cold_start_board_uses_the_recorded_mint_file(tmp_path: Path, lane, boar
     assert lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas"]) == 0
 
     board = (epic / board_name).read_text(encoding="utf-8")
-    assert f"**Handoff dual-write:** `{recorded}`" in board
+    assert f"**Canary recall input:** `{recorded}`" in board
 
 
 def test_explicit_superseded_path_is_not_minted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -297,7 +297,7 @@ def test_gemini_board_and_mint_both_fall_through_a_short_own_handoff(
         == 0
     )
     board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Handoff dual-write:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
+    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
 
     assert _mint(gemini_lane, tmp_path) == 0
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
@@ -411,7 +411,7 @@ def test_stream_alone_board_and_mint_both_report_no_handoff(
         == 0
     )
     board = (tmp_path / ".claude" / "atlas-epic" / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Handoff dual-write:** `(no handoff)`" in board
+    assert "**Canary recall input:** `(no handoff)`" in board
     assert "GEMINI-DRIVER-HANDOFF.md" not in board
 
     assert _mint(gemini_lane, tmp_path) == 0
@@ -443,7 +443,7 @@ def test_recorded_no_handoff_stays_when_a_file_appears_later(
         == 0
     )
     board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Handoff dual-write:** `(no handoff)`" in board
+    assert "**Canary recall input:** `(no handoff)`" in board
     assert "GEMINI-DRIVER-HANDOFF.md" not in board
 
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
@@ -547,7 +547,7 @@ def test_living_edit_after_mint_is_a_notice_not_a_failure(
         == 0
     )
     board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Handoff dual-write:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in board
+    assert "**Canary recall input:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in board
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) == gemini
 
     assert _score(tmp_path, canary, facts) == 0
@@ -579,7 +579,7 @@ def test_absent_mint_meta_keeps_cold_start_selection(
         == 0
     )
     board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Handoff dual-write:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
+    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
 
     resolved = diary.resolve_handoff_path(tmp_path, "atlas")
     ranked = handoff_select.lane_handoff_candidates(
@@ -693,10 +693,10 @@ def test_board_and_mint_share_a_custom_stream_limit(
 
     wide = board(8)
     assert "**Handoff binding:** preview" in wide
-    assert "**Handoff dual-write:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in wide
+    assert "**Canary recall input:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in wide
     narrow = board(4)
     assert "**Handoff binding:** preview" in narrow
-    assert "**Handoff dual-write:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in narrow
+    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in narrow
 
     assert (
         gemini_lane.main(
@@ -722,7 +722,7 @@ def test_board_and_mint_share_a_custom_stream_limit(
 
     stuck = board(8)
     assert "**Handoff binding:** recorded path" in stuck
-    assert "**Handoff dual-write:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in stuck
+    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in stuck
     assert "preview (not minted)" not in stuck
 
 
@@ -780,10 +780,12 @@ def _fake_driver_state_cli(tmp_path: Path, payload: object, *, exit_code: int = 
     return script, argv_file
 
 
-def test_fetch_newest_handoff_note_reads_one_lane_and_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_newest_handoff_note_reads_one_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lane fence of ``lu-driver-state render``: exact lane, not done or dropped, any owner."""
     notes = [
         _note("C-0001", "2026-11-01 10:00:00+00:00"),
         _note("C-0003", "2026-11-03 10:00:00+00:00", status="dropped"),
+        _note("C-0006", "2026-11-06 10:00:00+00:00", status="done"),
         _note("C-0004", "2026-11-04 10:00:00+00:00", owner="claude-atlas"),
         _note("C-0005", "2026-11-05 10:00:00+00:00", lane="infra"),
         _note("C-0002", "2026-11-02 20:23:39.965370+00:00"),
@@ -791,11 +793,11 @@ def test_fetch_newest_handoff_note_reads_one_lane_and_owner(tmp_path: Path, monk
     script, argv_file = _fake_driver_state_cli(tmp_path, notes)
     monkeypatch.setenv(handoff_select.DRIVER_STATE_CLI_ENV, str(script))
 
-    note = handoff_select.fetch_newest_handoff_note("atlas", "codex-atlas")
+    note = handoff_select.fetch_newest_handoff_note("atlas")
 
-    assert note is not None and note["id"] == "C-0002"
+    assert note is not None and note["id"] == "C-0004"
     assert json.loads(argv_file.read_text(encoding="utf-8")) == [
-        "list", "--lane", "atlas", "--kind", "handoff_note", "--owner", "codex-atlas", "--all", "--json",
+        "list", "--lane", "atlas", "--kind", "handoff_note", "--json",
     ]
 
 
@@ -805,18 +807,18 @@ def test_fetch_newest_handoff_note_falls_back_on_absent_or_failed_reads(
 ) -> None:
     script, _ = _fake_driver_state_cli(tmp_path, payload, exit_code=exit_code)
     monkeypatch.setenv(handoff_select.DRIVER_STATE_CLI_ENV, str(script))
-    assert handoff_select.fetch_newest_handoff_note("atlas", "codex-atlas") is None
+    assert handoff_select.fetch_newest_handoff_note("atlas") is None
 
 
-def _lane_note(monkeypatch: pytest.MonkeyPatch, note: dict[str, object] | None) -> list[tuple[str, str]]:
+def _lane_note(monkeypatch: pytest.MonkeyPatch, note: dict[str, object] | None) -> list[str]:
     """Launcher environment plus a database that returns ``note``; records each read."""
-    reads: list[tuple[str, str]] = []
+    reads: list[str] = []
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "codex-atlas")
     monkeypatch.setenv("SESSION_EPIC", "atlas")
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
 
-    def fetch(lane: str, owner: str) -> dict[str, object] | None:
-        reads.append((lane, owner))
+    def fetch(lane: str) -> dict[str, object] | None:
+        reads.append(lane)
         return note
 
     monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", fetch)
@@ -834,7 +836,7 @@ def test_codex_mint_derives_anchors_from_the_newest_db_handoff_note(
 
     assert _mint(codex_lane, tmp_path) == 0
 
-    assert reads == [("atlas", "codex-atlas")]
+    assert reads == ["atlas"]
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
     assert meta["handoff"] == ".claude/atlas-epic/canary/driver-state-handoff-note.md"
     assert meta["n_anchors"] == 10

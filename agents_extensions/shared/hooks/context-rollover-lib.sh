@@ -290,3 +290,27 @@ print(lanes[0] if len(lanes) == 1 else "")
 ' "$registry_module" "$session" "$SESSION_EPIC" 2>/dev/null) || return 0
   printf '%s\n' "$name"
 }
+
+# The driver-state lane whose DB note holds this launcher-bound session's
+# handoff content (#511): cto for the CTO seat, otherwise SESSION_EPIC, the
+# lane the launcher prompt names. Prints nothing outside a launcher-bound lane
+# or for a malformed name, so a worker or an ordinary session keeps its own
+# handoff flow.
+context_handoff_note_lane() {
+  local LC_ALL=C
+  case "${SESSION_EPIC:-}" in
+    ''|*[!a-z0-9.-]*|[-.]*|*[-.]) return 0 ;;
+  esac
+  if [ "${SESSION_SEAT:-}" = cto ]; then printf 'cto\n'; else printf '%s\n' "$SESSION_EPIC"; fi
+}
+
+# The one statement of handoff content authority for lane $1. Cold start,
+# compaction and replacement context all print it, so every harness reads the
+# same note: the lane fence of lu-driver-state render and the driver keeper.
+# Prints nothing without a lane.
+context_handoff_authority() {
+  [ -n "${1:-}" ] || return 0
+  printf '%s\n' "Handoff content: the lane's DB note, its newest driver-state handoff_note that is not done or dropped (lane $1).
+Read it first: lu-driver-state render --lane $1, then lu-driver-state show <its ID> for the full note.
+DRIVER-STATE.md is a pinned-facts pointer. Markdown handoffs, briefs and thread-rollover packets never outrank the DB note."
+}

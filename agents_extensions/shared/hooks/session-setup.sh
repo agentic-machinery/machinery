@@ -640,6 +640,11 @@ if [ -n "${SESSION_EPIC:-}" ]; then
     SESSION_EPIC_VALID=0
   fi
 fi
+# A launcher-bound lane's handoff content is its DB note (#511); empty otherwise.
+HANDOFF_NOTE_LANE=""
+if [ "$SESSION_EPIC_VALID" = "1" ]; then
+  HANDOFF_NOTE_LANE="$(context_handoff_note_lane)"
+fi
 
 # Optional disambiguation hint from the launcher epic (#5398). Packet families
 # need not equal the epic name; detect keeps candidates when no family matches.
@@ -895,7 +900,9 @@ unset GATE_RC
 if [ -z "$HANDOFF_CONTEXT" ] && [ "$GATE_DETECT_STATUS" = "none" ]; then
   HANDOFF_FILE="$PROJECT_DIR/docs/session-state/current.md"
 
-  if [ -f "$PROJECT_DIR/.agent/${HANDOFF_AGENT}-thread-handoff.md" ]; then
+  if [ -n "$HANDOFF_NOTE_LANE" ]; then
+    : # The lane banner names the DB note; no markdown handoff pointer competes with it.
+  elif [ -f "$PROJECT_DIR/.agent/${HANDOFF_AGENT}-thread-handoff.md" ]; then
     HANDOFF_CONTEXT=$(build_local_handoff_pointer ".agent/${HANDOFF_AGENT}-thread-handoff.md")
   elif [ "${SESSION_HANDOFF_ALLOW_GIT_ROUTER:-0}" = "1" ] && [ -f "$HANDOFF_FILE" ]; then
     AGENT_HANDOFF=$(sed -n "s/^[[:space:]]*-[[:space:]]*${HANDOFF_AGENT}:[[:space:]]*//p" "$HANDOFF_FILE" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
@@ -986,36 +993,13 @@ if [ -n "${SESSION_EPIC:-}" ] && [ "$SESSION_EPIC_VALID" = "1" ] && [ "${SESSION
   # epics lease, but it is not that lane's driver (#12496).
   EPIC_BANNER="CTO SEAT: combined CTO and cross-epic lead on the ${SESSION_EPIC} lease (binding — from the launch command).
 Rollover namespace: ${HANDOFF_AGENT}. Entry point: the cto skill. State: lu-driver-state render --lane cto
-and lu-driver-state check --lane cto (the driver-state database is the CTO state)."
+and lu-driver-state check --lane cto (the driver-state database is the CTO state).
+$(context_handoff_authority "$HANDOFF_NOTE_LANE")"
 elif [ -n "${SESSION_EPIC:-}" ] && [ "$SESSION_EPIC_VALID" = "1" ]; then
-  EPIC_HANDOFF_PATH=".claude/${SESSION_EPIC}-epic/CLAUDE-DRIVER-HANDOFF.md"
-  case "$HANDOFF_AGENT" in
-    codex|codex-*)
-      CODEX_EPIC_HANDOFF=".claude/${SESSION_EPIC}-epic/CODEX-DRIVER-HANDOFF.md"
-      if [ -f "$PROJECT_DIR/$CODEX_EPIC_HANDOFF" ]; then
-        EPIC_HANDOFF_PATH="$CODEX_EPIC_HANDOFF"
-      fi
-      unset CODEX_EPIC_HANDOFF
-      ;;
-  esac
   EPIC_BANNER="ASSIGNED EPIC: ${SESSION_EPIC}.epic (binding — from the launch command).
 You are the ${SESSION_EPIC} lane, NOT the main orchestrator. Do not claim or work
 other lanes' queues. Rollover namespace: ${HANDOFF_AGENT}.
-Epic driver handoff (load AFTER the thread handoff below, it
-is the lane SSOT): $EPIC_HANDOFF_PATH"
-  if [ ! -f "$PROJECT_DIR/$EPIC_HANDOFF_PATH" ]; then
-    EPIC_BANNER="$EPIC_BANNER
-(No driver handoff exists yet for this epic — create it at first rollover.)"
-  fi
-  # Lane goal file: the current driver state. When present it is authoritative
-  # and outranks the handoffs above and dated docs/session-state briefs.
-  DRIVER_STATE_PATH=".claude/${SESSION_EPIC}-epic/DRIVER-STATE.md"
-  if [ -f "$PROJECT_DIR/$DRIVER_STATE_PATH" ]; then
-    EPIC_BANNER="$EPIC_BANNER
-Driver state (AUTHORITATIVE, read it FIRST; where they conflict it supersedes
-the handoffs above and any dated docs/session-state brief): $DRIVER_STATE_PATH"
-  fi
-  unset EPIC_HANDOFF_PATH DRIVER_STATE_PATH
+$(context_handoff_authority "$HANDOFF_NOTE_LANE")"
 elif [ -n "${SESSION_EPIC:-}" ] && [ "$SESSION_EPIC_VALID" = "0" ]; then
   VALID_SELECTORS_HELP=""
   if declare -f launcher_selector_help >/dev/null 2>&1; then

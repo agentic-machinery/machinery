@@ -91,9 +91,16 @@ def _run_hook(
         stream_argument = ' --stream "$HYDRATION_STREAM"'
         assert source.count(stream_argument) == 1
         hook.write_text(source.replace(stream_argument, ""))
-    diary = repo / f".claude/{selector}-epic/CODEX-DRIVER-HANDOFF.md"
-    diary.parent.mkdir(parents=True)
-    diary.write_text("# Driver handoff\n## Next Drive\n- Reconcile queue.\n")
+    epic_dir = repo / f".claude/{selector}-epic"
+    epic_dir.mkdir(parents=True)
+    # The handoff content is the lane's DB note (#511), served by a fake driver-state CLI.
+    note = {
+        "id": "C-0511", "kind": "handoff_note", "lane": selector, "owner": "claude-fixture", "status": "open",
+        "created_utc": "2026-11-17 10:00:00+00:00", "statement": "1. Reconcile queue.", "done_when": "Read.",
+    }
+    driver_state_cli = tmp_path / "lu-driver-state"
+    driver_state_cli.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(json.dumps([note]))}\n")
+    driver_state_cli.chmod(0o755)
 
     # The hook takes its code from the release the project interpreter imports (#100 R51), so that
     # interpreter imports this repo's capsule first, then the test's dependencies.
@@ -154,6 +161,7 @@ def _run_hook(
             "SESSION_STREAM_INSTANCE_ID": "codex-fixture",
             "SESSION_STREAM_PROCESS_ID": "1234",
             "SESSION_STREAM_TASK_ID": "launcher-fixture",
+            "LU_DRIVER_STATE_CLI": str(driver_state_cli),
         }
     )
     if export_stream:
@@ -161,7 +169,7 @@ def _run_hook(
     if dispatch_task is not None:
         environment["LEARN_UKRAINIAN_DISPATCH_TASK_ID"] = dispatch_task
     # The receipt is only fixture data; no lease is opened, renewed, or closed.
-    (diary.parent / "session-lease.env").write_text(
+    (epic_dir / "session-lease.env").write_text(
         "\n".join(
             f"export {key}={shlex.quote(value)}"
             for key, value in environment.items()
@@ -254,6 +262,8 @@ def test_hook_valid_launcher_lane_classes_are_ready(tmp_path, selector, stream) 
     context, args, requests = _run_hook(tmp_path, selector=selector, stream=stream)
     assert "HYDRATION BLOCKED" not in context
     assert '"execution_allowed": true' in context
+    assert "DB note: C-0511" in context
+    assert f"lu-driver-state render --lane {selector}" in context
     assert f"--stream {stream}" in args[0]
     assert requests == [f"/api/epics/v1/{stream}?limit=1"]
 
