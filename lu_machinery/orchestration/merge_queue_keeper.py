@@ -586,6 +586,12 @@ def _load(path: Path) -> dict[str, Any]:
     drops = data.get("drops")
     for key, count in drops.items() if isinstance(drops, dict) else ():
         if isinstance(key, str) and type(count) is int and count > 0:
+            if (
+                key.partition(":")[0] in data["queued"]
+                or key in data.get("ejections", {})
+                or key in data.get("undiagnosed", {})
+            ):
+                continue  # Existing observations retain history and must still report a real exit.
             data.setdefault("ejection_alerts", {}).setdefault(key, data.get("observed", ""))
     for name in (
         "requeued", "shared_pass", "shared_requeues", "keeper_requeues", "flake_issue_updates", "last_removal", "drops",

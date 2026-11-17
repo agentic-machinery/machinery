@@ -2427,6 +2427,7 @@ def test_queue_history_at_any_head_prevents_automatic_reentry(tmp_path, monkeypa
         state["ejections"] = {f"42:{HEAD_A}": []}
     elif history == "legacy-removal":
         state["drops"] = {f"42:{HEAD_A}": 1}
+        state["ejections"] = {f"42:{HEAD_A}": []}  # A real exit must retain its unspent alert.
     elif history in {"keeper-revoked", "unknown-membership", "invalid-row"}:
         if history == "keeper-revoked":
             fake = FakeGitHub()  # Same-head owner reentry must still alert on a later real ejection.
