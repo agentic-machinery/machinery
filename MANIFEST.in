@@ -9,6 +9,7 @@ exclude lu_machinery/ci/pytest-file-durations.json
 exclude lu_machinery/config/package_boundary.yaml
 exclude lu_machinery/lint/boundary_baseline.json
 exclude lu_machinery/lint/mypy_baseline.json
+exclude lu_machinery/lint/test_waits_baseline.json
 # Explicit release allowlist; product-owned resources never enter the wheel.
 include agents_extensions/shared/contracts/rollover-registry.md
 include agents_extensions/shared/contracts/task-identity.md
