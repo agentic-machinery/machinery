@@ -26,7 +26,6 @@ Threat model and cost: ``scripts/guardrails/primary_dirt_audit.py``.
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import sys
@@ -36,11 +35,14 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 try:
     from agents_extensions.shared.hooks.tool_names import is_shell_tool
+    from lu_machinery.common import json_depth
 except ImportError:
     print("audit-primary-checkout-dirt: installed machinery unavailable; audit skipped.", file=sys.stderr)
     raise SystemExit(0) from None
 
 MAX_LISTED = 20
+# Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+_PAYLOAD_MAX_DEPTH = 512
 _CLEANUP_MODULE = "lu_machinery.hygiene.primary_dirt_cleanup"
 # The phase comes from the payload, so the wired command stays a plain hook path.
 PHASES = {"PreToolUse": "pre", "PostToolUse": "post", "PostToolUseFailure": "post"}
@@ -122,7 +124,7 @@ def _report(records: list[dict], session_id: str) -> str:
 
 def main() -> int:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json_depth.loads(sys.stdin.read() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
     except (ValueError, RecursionError):
         return 0
     if not isinstance(payload, dict):

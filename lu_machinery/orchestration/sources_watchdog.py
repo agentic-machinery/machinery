@@ -59,9 +59,13 @@ from types import ModuleType
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, ProductRootError, state_root
 from lu_machinery.common.repo_root import product_root as resolve_product_root
 from lu_machinery.ops.product_entry import ConfiguredModuleError, load_configured_module
+
+# Deepest JSON this module reads (json_depth): its product configuration file.
+_JSON_MAX_DEPTH = 128
 
 # The product data file that names the hang-diagnostics module, relative to the product root.
 HANG_DIAGNOSTICS_FILE = Path("scripts/rag/hang_diagnostics.v1.json")
@@ -98,7 +102,9 @@ def _gates_module_name(path: Path) -> str:
         raise ValueError(f"non-finite number {token}")
 
     try:
-        document = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys, parse_constant=no_constants)
+        document = json_depth.loads(
+            raw.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, object_pairs_hook=unique_keys, parse_constant=no_constants
+        )
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ImportError("hang diagnostics configuration must be strict UTF-8 JSON") from exc
     if not isinstance(document, dict) or set(document) != {"schema", "schema_version", "origin", "module"}:

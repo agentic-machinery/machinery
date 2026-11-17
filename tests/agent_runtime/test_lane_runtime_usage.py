@@ -540,11 +540,13 @@ def _declared_directory_denial(root: Path):
     ``os.access`` failure as one unreadable file, then ``Path.glob`` swallows
     the listing error and yields no rows. Both halves are required: an access
     failure alone would still count readable rows, and an empty listing alone
-    would look like a missing directory.
+    would look like a missing directory. The listing is denied at ``os.scandir``,
+    which ``Path.glob`` calls on every supported Python (through ``Path._scandir``
+    on 3.12, through ``glob`` from 3.13).
     """
     target = os.path.abspath(os.fspath(root))
     real_access = usage_mod.os.access
-    real_scandir = Path._scandir
+    real_scandir = os.scandir
 
     def access(path, mode, *args, **kwargs):
         denied = os.path.abspath(os.fspath(path)) == target and mode & (os.R_OK | os.X_OK)
@@ -552,18 +554,18 @@ def _declared_directory_denial(root: Path):
             return False
         return real_access(path, mode, *args, **kwargs)
 
-    def scandir(self):
-        if os.path.abspath(os.fspath(self)) == target:
-            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(self))
-        return real_scandir(self)
+    def scandir(path="."):
+        if not isinstance(path, int) and os.path.abspath(os.fspath(path)) == target:
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        return real_scandir(path)
 
     usage_mod.os.access = access
-    Path._scandir = scandir
+    os.scandir = scandir
     try:
         yield _DECLARED_DIRECTORY_DENIAL
     finally:
         usage_mod.os.access = real_access
-        Path._scandir = real_scandir
+        os.scandir = real_scandir
 
 
 def _prove_unlistable_directory(root: Path, prove: Callable[[], None]) -> None:

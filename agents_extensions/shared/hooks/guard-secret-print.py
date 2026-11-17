@@ -76,7 +76,6 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 from __future__ import annotations
 
 import codecs
-import json
 import os
 import re
 import shlex
@@ -101,6 +100,13 @@ try:
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
+try:
+    from lu_machinery.common import json_depth
+except Exception as exc:
+    print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
+    raise SystemExit(2) from exc
+# Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+_PAYLOAD_MAX_DEPTH = 512
 
 SEPARATORS = {"&&", "||", ";", "&", "\n"}
 DISPLAY_FILE_COMMANDS = {"cat", "bat", "less", "head", "tail"}
@@ -266,7 +272,7 @@ _VAR_REF_RE = re.compile(
 
 def _read_payload() -> dict | None:
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json_depth.loads(sys.stdin.read() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
     except (ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None

@@ -85,6 +85,7 @@ places. The installed package refuses state-dependent use without that anchor.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import os
 import re
@@ -367,6 +368,33 @@ def machinery_root() -> Path:
     return _MACHINERY_ROOT
 
 
+def resolve_path(path: Path | str, *, strict: bool = False) -> Path:
+    """``Path(path).resolve(strict=strict)`` that refuses a symlink loop on every supported Python.
+
+    Python 3.12's ``Path.resolve`` raises ``RuntimeError("Symlink loop from ...")`` for a loop in
+    either mode. Python 3.13 changed that: non-strict resolution returns the looping path
+    unchanged and strict resolution raises ``OSError(ELOOP)``
+    (https://docs.python.org/3/library/pathlib.html#pathlib.Path.resolve). A guard that treats
+    ``RuntimeError`` as "cannot be resolved" would then accept the loop. This restores the 3.12
+    behaviour with the same two steps 3.12 used: a loop reported by the resolution itself, then
+    an ``ELOOP`` from a stat of the non-strict result. Every other stat failure is ignored, as a
+    non-strict resolution of a missing leaf must still succeed.
+    """
+    try:
+        resolved = Path(path).resolve(strict=strict)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise RuntimeError(f"Symlink loop from {exc.filename!r}") from None
+        raise
+    if not strict:
+        try:
+            os.stat(resolved)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise RuntimeError(f"Symlink loop from {exc.filename!r}") from None
+    return resolved
+
+
 def machinery_path(relative: str) -> Path:
     """The machinery file or directory at package-relative ``relative``, which need not exist for code; shared resources must exist.
 
@@ -398,12 +426,12 @@ def machinery_path(relative: str) -> Path:
         # The wheel preserves this sibling layout. No source/install branch or
         # import search participates, even when product namespaces overlap.
         root = root.parent / "agents_extensions" / "shared"
-        if root.resolve() != root:
+        if resolve_path(root) != root:
             raise ValueError("machinery resource tree must not be a symlink")
         components = components[2:]
     logical = root.joinpath(*components)
     try:
-        resolved = logical.resolve()
+        resolved = resolve_path(logical)
     except (OSError, RuntimeError) as exc:
         raise ValueError(f"machinery path {relative!r} cannot be resolved: {exc}") from exc
     if os.path.commonpath([root, resolved]) != str(root):
@@ -445,7 +473,7 @@ def _carries_product_marker(checkout: Path, *, through_primary: bool) -> bool:
     """
     # An unreadable candidate, or unreadable, malformed or looping Git metadata, does not qualify:
     # OSError covers permissions, ValueError covers NUL bytes and UnicodeDecodeError, and
-    # RuntimeError is what Path.resolve() raises for a symlink loop before Python 3.13.
+    # RuntimeError is what resolve_path() raises for a symlink loop.
     try:
         if (checkout / PRODUCT_MARKER).is_file():
             return True
@@ -526,7 +554,7 @@ def main_checkout_root(repo_root: Path) -> Path:
     git_dir = Path(first_line[len(prefix) :].strip())
     if not git_dir.is_absolute():
         git_dir = repo_root / git_dir
-    git_dir = git_dir.resolve()
+    git_dir = resolve_path(git_dir)
     if git_dir.parent.name != "worktrees":
         return repo_root
     common_git_dir = git_dir.parent.parent
@@ -595,7 +623,7 @@ def project_interpreter(root: Path | None = None, *, env: Mapping[str, str] | No
     primary = main_checkout_root(repo)
     # main_checkout_root anchors a malformed gitfile to the directory itself.
     # That directory is a linked worktree, not the primary, so its .venv is refused.
-    if (repo / ".git").is_file() and primary.resolve() == repo.resolve():
+    if (repo / ".git").is_file() and resolve_path(primary) == resolve_path(repo):
         refused = repo / ".venv" / "bin" / "python"
         raise FileNotFoundError(
             f"project interpreter not found: {refused} (a linked worktree .venv is not used)"

@@ -11,6 +11,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher.types import ReviewAttempt
@@ -24,6 +25,9 @@ from lu_machinery.orchestration.task_record_store import (
     relocated_result_file,
     task_state_lock,
 )
+
+# Deepest JSON this module reads (json_depth): dispatcher task records.
+_JSON_MAX_DEPTH = 128
 
 ACTIVE = {"spawning", "running"}
 
@@ -245,7 +249,7 @@ def _write(path: Path, record: dict, exclusive: bool = False, *, grant: dict | N
             raise TaskRecordError("TASK_RECORD_DAMAGED")
         if not exclusive and path.exists():
             try:
-                current = json.loads(path.read_text())
+                current = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
                 if not isinstance(current, dict):
                     raise ValueError("not an object")
             except (OSError, ValueError, RecursionError) as exc:
@@ -344,7 +348,7 @@ def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root
             return None
         raise ValueError("task not found")
     try:
-        record = json.loads(path.read_text())
+        record = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
         if not isinstance(record, dict):
             raise ValueError("not an object")
     except (OSError, ValueError, RecursionError) as exc:
@@ -370,7 +374,7 @@ def publish_failed_record(record: dict, path: Path) -> None:
     try:
         with task_state_lock(path):
             try:
-                current = json.loads(path.read_text())
+                current = json_depth.loads(path.read_text(), max_depth=_JSON_MAX_DEPTH)
             except (FileNotFoundError, ValueError, RecursionError):
                 current = None
             if (isinstance(current, dict) and isinstance(current.get("run_nonce"), str)

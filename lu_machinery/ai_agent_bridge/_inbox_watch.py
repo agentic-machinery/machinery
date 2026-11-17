@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 from lu_machinery.agent_identity import seat_read_aliases
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, open_readonly
 from lu_machinery.secret_redactor import redact_text
@@ -33,6 +34,9 @@ from lu_machinery.secret_redactor import redact_text
 from . import _config
 from ._channels import resolve_recipient_alias
 from ._config import MACHINERY_PACKAGE
+
+# Deepest JSON this module reads (json_depth): its own wake-state file.
+_JSON_MAX_DEPTH = 128
 
 if TYPE_CHECKING:
     from lu_machinery.fleet_comms.authority import AuthorityDelivery, AuthorityService
@@ -688,7 +692,7 @@ def _rollout_key(report: dict) -> str:
 def _read_wake_state(path: Path) -> dict:
     """Missing state is empty; unreadable or malformed state is not clean."""
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
+        state = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError:
         return {}
     if (not isinstance(state, dict) or state.get("schema") != "inbox-wake-state.v1"

@@ -91,6 +91,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, codex_account_home
+from lu_machinery.common import json_depth
+
+# Deepest JSON this module reads (json_depth): session transcript rows, tool-call arguments and its frozen manifest.
+_JSON_MAX_DEPTH = 512
 
 # The machinery package's directory name, which is also its import name and the first component
 # of its files' checkout paths. Taken from this file's unresolved location, so neither a short
@@ -206,7 +210,7 @@ def records(path: Path, counters: Counter):
                 yield {"_oversized": length}
                 continue
             try:
-                record = json.loads(chunk)
+                record = json_depth.loads(chunk, max_depth=_JSON_MAX_DEPTH)
             except (ValueError, UnicodeError, RecursionError):
                 counters["malformed_line"] += 1
                 if not chunk.endswith(b"\n"):
@@ -390,7 +394,7 @@ def call_shape(name: Any, arguments: Any, cwd: str) -> tuple[str, str | None, st
         return "other", None, None
     if isinstance(arguments, str):
         try:
-            arguments = json.loads(arguments)
+            arguments = json_depth.loads(arguments, max_depth=_JSON_MAX_DEPTH)
         except (ValueError, RecursionError):
             # functions.exec has a JS body. Admit one literal cmd and no compounds.
             matches = re.findall(r'(?:"cmd"|\bcmd)\s*:\s*("(?:[^"\\]|\\.)*")', arguments)
@@ -925,7 +929,7 @@ def report(manifest: Path, *, tool_sha: str = "unknown") -> dict:
     if tool_sha != "unknown" and not re.fullmatch(r"[0-9a-f]{40}", tool_sha):
         raise ValueError("invalid_manifest")
     raw = manifest.read_bytes()
-    frozen = json.loads(raw)
+    frozen = json_depth.loads(raw, max_depth=_JSON_MAX_DEPTH)
     if not isinstance(frozen, dict) or frozen.get("schema") != "context-cost-manifest.v1":
         raise ValueError("invalid_manifest")
     start = timestamp(frozen.get("run_start_utc"))

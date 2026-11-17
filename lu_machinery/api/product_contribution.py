@@ -36,9 +36,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from fastapi import APIRouter
 
+from lu_machinery.common import json_depth
 from lu_machinery.ops.product_entry import ConfiguredModuleError, load_configured_module
 
 from . import config
+
+# Deepest JSON this module reads (json_depth): the product data file.
+_JSON_MAX_DEPTH = 128
 
 if TYPE_CHECKING:
     from .monitor_context import MonitorContext
@@ -148,7 +152,7 @@ def product_module_name(product_root: Path) -> str:
     if len(raw) > _PRODUCT_DATA_MAX_BYTES:
         raise ProductEntryError(f"{PRODUCT_DATA}: larger than {_PRODUCT_DATA_MAX_BYTES} bytes")
     try:
-        document = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_keys)
+        document = json_depth.loads(raw.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_unique_keys)
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise ProductEntryError(f"{PRODUCT_DATA}: unreadable: {exc}") from exc
     if not isinstance(document, dict) or document.get("schema") != PRODUCT_DATA_SCHEMA:

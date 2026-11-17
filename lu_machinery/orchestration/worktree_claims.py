@@ -39,6 +39,7 @@ from typing import Any, TypeGuard
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import main_checkout_root, state_root
 from lu_machinery.guardrails import worktree_containment
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
@@ -53,6 +54,9 @@ from lu_machinery.orchestration.task_record_store import (
     task_record_path,
 )
 from lu_machinery.path_safety import assert_delete_target
+
+# Deepest JSON this module reads (json_depth): dispatcher task records.
+_JSON_MAX_DEPTH = 128
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -420,7 +424,7 @@ def active_worktree_claim_refusal(
     if owner_task_id is not None:
         owner_path = owner_state_file or task_record_path(tasks_dir, owner_task_id)
         try:
-            owner = json.loads(owner_path.read_bytes())
+            owner = json_depth.loads(owner_path.read_bytes(), max_depth=_JSON_MAX_DEPTH)
         except (OSError, ValueError, RecursionError):
             owner = None
         nonce = owner.get("run_nonce") if isinstance(owner, dict) else None
@@ -974,7 +978,7 @@ def owner_release_refusal(
     """
     record_path = task_record_path(tasks_dir, owner_task_id)
     try:
-        record = json.loads(record_path.read_bytes())
+        record = json_depth.loads(record_path.read_bytes(), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError:
         return f"owner task {owner_task_id} has no task record; refusing worktree removal"
     except (OSError, ValueError, RecursionError):

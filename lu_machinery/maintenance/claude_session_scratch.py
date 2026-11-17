@@ -17,6 +17,11 @@ from pathlib import Path
 
 import psutil
 
+from lu_machinery.common import json_depth
+
+# Deepest JSON this module reads (json_depth): Claude session registry and rollover lease records.
+_JSON_MAX_DEPTH = 128
+
 
 def _machinery_top() -> str:
     # Unresolved package directory (design-v1 amendment 1). Never __package__.
@@ -89,7 +94,7 @@ def _registry_evidence(root: Path) -> tuple[set[str], set[int], bool]:
                     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
                         raise ValueError("invalid registry file")
                     try:
-                        record = json.load(source)
+                        record = json_depth.loads(source.read(), max_depth=_JSON_MAX_DEPTH)
                     except Exception as exc:
                         # Confine broad handling to decoding untrusted JSON;
                         # depth and resource failures also invalidate absence.
@@ -257,7 +262,7 @@ def confirmed_sessions(roots: Iterable[Path], *, errors: list[dict] | None = Non
                             if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
                                 continue
                             try:
-                                record = json.load(source)
+                                record = json_depth.loads(source.read(), max_depth=_JSON_MAX_DEPTH)
                             except Exception as exc:
                                 if errors is not None:
                                     errors.append(

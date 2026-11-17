@@ -21,8 +21,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_scratch import mount_points
+
+# Deepest JSON this module reads (json_depth): batch-state scratch expiry metadata.
+_JSON_MAX_DEPTH = 128
 
 
 def _machinery_top() -> str:
@@ -90,7 +94,7 @@ def scratch_expiry(
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_size > 65536:
                 return None, "expiry_metadata_unknown"
             raw = handle.read(65537)
-        data = json.loads(raw)
+        data = json_depth.loads(raw, max_depth=_JSON_MAX_DEPTH)
         if (len(raw) > 65536 or not isinstance(data, dict) or data.get("schema") != "batch-state-scratch.v1"
                 or not all(isinstance(data.get(key), str) and data[key].strip() for key in ("owner", "purpose", "delete_after"))):
             return None, "expiry_metadata_unknown"

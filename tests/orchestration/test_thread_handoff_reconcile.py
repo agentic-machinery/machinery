@@ -301,13 +301,13 @@ _BUNDLE_HELPER_CALLS = {
         'replacement.get', 'state.get', 'str', 'validate_live_lease',
     },
     '_bundle_load_json': {
-        '_bundle_conversion', '_bundle_require_json_value', 'json.loads', 'payload.decode',
+        '_bundle_conversion', '_bundle_require_json_value', 'json.loads', 'json_depth.loads', 'payload.decode',
     },
     '_bundle_conversion': {
         'ValueError',
     },
     '_bundle_require_json_value': {
-        'ValueError', '_bundle_conversion', 'float', 'isinstance', 'item.items', 'json.dumps',
+        'ValueError', '_bundle_conversion', 'float', 'isinstance', 'item.items', 'json.dumps', 'json_depth.check_depth',
         'json.dumps(value, allow_nan=False, ensure_ascii=False).encode', 'parse_iso_datetime',
         'pending.append', 'pending.extend', 'pending.pop',
     },
@@ -351,7 +351,7 @@ _BUNDLE_HELPER_CALLS = {
         'str(repo_root.resolve()).encode',
     },
     '_bundle_json': {
-        '_bundle_conversion', 'json.dumps', "json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode",
+        '_bundle_conversion', 'json.dumps', 'json_depth.check_depth', "json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode",
     },
     '_bundle_order': {
         'ValueError', '_bundle_conversion', '_bundle_replacement_status', 'int', 'manifest.get', 'normalize_rollover_id',

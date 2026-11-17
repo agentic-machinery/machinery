@@ -49,6 +49,7 @@ from typing import Literal
 # broke every write-capable dispatch spawn (fail-closed refusal) after the
 # #4931 relocation. Keep both flavors resolvable.
 from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS, sanitized_git_env
+from lu_machinery.common.repo_root import resolve_path
 
 __all__ = [
     "PROTECTED_BRANCHES",
@@ -203,9 +204,10 @@ def canonicalize(path: Path | str) -> Path:
     non-existent leaf is appended lexically (``..`` still collapsed). This is
     what lets a not-yet-created file be classified the same as an existing one,
     and neutralizes both symlink escapes and ``..`` escapes before containment
-    checks (``Path.resolve`` is non-strict on Python 3.6+).
+    checks (``Path.resolve`` is non-strict on Python 3.6+). A symlink loop raises
+    ``RuntimeError`` on every supported Python (:func:`resolve_path`), never a looping path.
     """
-    return Path(path).expanduser().resolve()
+    return resolve_path(Path(path).expanduser())
 
 
 def absolute_path(path: Path | str, cwd: Path | str | None = None) -> Path:

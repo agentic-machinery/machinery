@@ -65,7 +65,11 @@ from pathlib import Path
 
 import ijson
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_TIMEOUT_S = 1800  # 30 min — covers most multi-turn dispatches
@@ -498,7 +502,7 @@ def find_live_session(lease: dict) -> LiveSession | None:
                     if not path.name.startswith("rollout-") or path.suffix != ".jsonl":
                         continue
                     with path.open("rb") as handle:
-                        metadata = json.loads(handle.readline())
+                        metadata = json_depth.loads(handle.readline(), max_depth=_JSON_MAX_DEPTH)
                     if metadata.get("type") != "session_meta":
                         continue
                     payload = metadata["payload"]

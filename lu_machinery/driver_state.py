@@ -76,6 +76,7 @@ from markdown_it import MarkdownIt
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.epic_selector import validate_epic
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import (
@@ -87,6 +88,9 @@ from lu_machinery.common.repo_root import (
 from lu_machinery.common.safe_unit_install import InstallError, open_unit_dir, read_unit, write_unit
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.orchestration.task_record_store import read_task_record
+
+# Deepest JSON this module reads (json_depth): hook payloads and Claude Code transcript rows.
+_JSON_MAX_DEPTH = 512
 
 # The machinery package's import name, which is also the directory its files have in checkout
 # paths: from this module's package, or from its unresolved location when run as a file.
@@ -234,7 +238,7 @@ def render_injection(text: str, path: Path) -> str:
 
 def _payload(stdin_text: str) -> dict:
     try:
-        payload = json.loads(stdin_text) if stdin_text.strip() else {}
+        payload = json_depth.loads(stdin_text, max_depth=_JSON_MAX_DEPTH) if stdin_text.strip() else {}
     except (ValueError, RecursionError):
         # Malformed JSON, integer-digit limits and deep nesting are untrusted input, not driver errors.
         return {}
@@ -427,9 +431,9 @@ def _reverse_jsonl_rows(path: Path):
                     trailing = False
                     continue  # the text after the final newline is empty or still being written
                 if raw.strip():
-                    yield json.loads(raw.decode("utf-8"))
+                    yield json_depth.loads(raw.decode("utf-8"), max_depth=_JSON_MAX_DEPTH)
         if position == 0 and pending.strip() and not trailing:
-            yield json.loads(pending.decode("utf-8"))
+            yield json_depth.loads(pending.decode("utf-8"), max_depth=_JSON_MAX_DEPTH)
 
 
 def claude_turn_started_by_human(transcript_path: object) -> bool:

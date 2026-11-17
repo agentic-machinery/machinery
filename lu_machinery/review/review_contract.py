@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.orchestration.integration_sweep import (
     ITEM_ID_RE,
@@ -38,6 +39,9 @@ from lu_machinery.review.evidence import (
     verify_finding_evidence,
 )
 from lu_machinery.review.target_resolution import ReviewTarget
+
+# Deepest JSON this module reads (json_depth): reviewer replies.
+_JSON_MAX_DEPTH = 512
 
 SCHEMA_VERSION = "code-review-findings.v1"
 RECEIPT_SCHEMA_VERSION = "code-review-receipt.v1"
@@ -208,7 +212,7 @@ def parse_reviewer_json(raw: str) -> dict[str, Any]:
             exit_code=EXIT_INVALID,
         )
     try:
-        payload = json.loads(text)
+        payload = json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
     except json.JSONDecodeError as exc:
         raise ContractError(
             f"non_json_or_chatter:{exc.msg}",
@@ -279,7 +283,7 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
     ):
         raise ContractError("review_envelope_invalid_json_fence")
     try:
-        payload = json.loads(block.content)
+        payload = json_depth.loads(block.content, max_depth=_JSON_MAX_DEPTH)
     except json.JSONDecodeError as exc:
         raise ContractError(f"review_envelope_invalid_json:{exc.msg}") from exc
     if not isinstance(payload, dict):
@@ -332,7 +336,7 @@ def _json_objects(text: str) -> list[dict[str, Any]]:
         if start < 0:
             return found
         try:
-            payload, end = decoder.raw_decode(text, start)
+            payload, end = json_depth.raw_decode(text, start, max_depth=_JSON_MAX_DEPTH, decoder=decoder)
         except (json.JSONDecodeError, RecursionError):
             index = start + 1
             continue

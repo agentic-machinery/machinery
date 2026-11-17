@@ -18,8 +18,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.common.safe_unit_install import InstallError, open_unit_dir
+
+# Deepest JSON this module reads (json_depth): the Monitor routing-budget response and its own sample lines.
+_JSON_MAX_DEPTH = 128
 
 WINDOW = "weekly"
 SLOTS = ("codex", "codex:a", "codex:b", "claude:a", "claude:b", "grok", "antigravity")
@@ -178,7 +182,7 @@ def collect(base: str, timeout: float, now: dt.datetime | None = None) -> list[d
     """
     try:
         with urllib.request.urlopen(base + ROUTING_BUDGET_PATH, timeout=timeout) as response:
-            payload = json.loads(response.read(MAX_RESPONSE_BYTES).decode("utf-8"))
+            payload = json_depth.loads(response.read(MAX_RESPONSE_BYTES).decode("utf-8"), max_depth=_JSON_MAX_DEPTH)
     except (OSError, ValueError, RecursionError, http.client.HTTPException):
         payload = None
     moment = (now or dt.datetime.now(dt.UTC)).astimezone(dt.UTC)
@@ -268,7 +272,7 @@ def load(path: Path) -> tuple[list[dict[str, Any]], int]:
     parsed = []
     for line in filter(bytes.strip, raw.split(b"\n")):  # JSONL is LF-delimited; U+2028 stays inside a record
         try:
-            parsed.append(_validate(json.loads(line)))
+            parsed.append(_validate(json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)))
         except (TypeError, ValueError, RecursionError):  # invalid or too deeply nested JSON, or an unhashable value
             parsed.append(None)
     samples = [sample for sample in parsed if sample is not None]

@@ -33,10 +33,14 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
+from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import ContractError, parse_reviewer_json
+
+# Deepest JSON this module reads (json_depth): its own model-stats rows.
+_JSON_MAX_DEPTH = 128
 
 ROW_SCHEMA = "model-stats-row.v1"
 ROWS_DIR = "model-stats"
@@ -457,7 +461,7 @@ def read_rows(batch_state_dir: Path) -> tuple[list[dict[str, Any]], Counter[str]
     with os.fdopen(fd, "rb") as stream:
         for line in stream:
             try:
-                row = json.loads(line)
+                row = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
             except (ValueError, RecursionError):
                 counts["malformed_lines"] += 1
                 continue

@@ -46,7 +46,7 @@ from urllib.parse import urlencode, urlparse
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.common.repo_root import state_root as shared_state_root
 from lu_machinery.identity import KNOWN_HARNESS_EXECUTABLES
@@ -55,6 +55,9 @@ from lu_machinery.orchestration.task_family import codex_state as task_family_co
 from lu_machinery.orchestration.task_family import rollover as task_family_rollover
 from lu_machinery.orchestration.task_family import rollover_registry as task_family_rollover_registry
 from lu_machinery.orchestration.task_family.storage import advisory_lock as task_family_advisory_lock
+
+# Deepest JSON a rollover bundle may carry (json_depth): manifests and lease state are small fixed-schema objects.
+_JSON_MAX_DEPTH = 128
 
 SCHEMA_VERSION = 2
 DEFAULT_MONITOR_BASE_URL = "http://127.0.0.1:8765"
@@ -494,12 +497,14 @@ def _bundle_conversion() -> Iterator[None]:
 
 def _bundle_json(value: Any) -> bytes:
     with _bundle_conversion():
+        json_depth.check_depth(value, max_depth=_JSON_MAX_DEPTH)
         return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def _bundle_require_json_value(value: Any) -> None:
     """Refuse values that cannot be represented as finite, bounded-depth JSON."""
     with _bundle_conversion():
+        json_depth.check_depth(value, max_depth=_JSON_MAX_DEPTH)
         json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8")
         # Check optional timestamps before persisting data for later consumers.
         # owner_pid_started_at is an epoch number, not an ISO timestamp.
@@ -548,7 +553,7 @@ def _bundle_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _bundle_load_json(payload: bytes) -> Any:
     with _bundle_conversion():
-        value = json.loads(payload.decode("utf-8"), object_pairs_hook=_bundle_json_object)
+        value = json_depth.loads(payload.decode("utf-8"), max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_bundle_json_object)
     _bundle_require_json_value(value)
     return value
 
