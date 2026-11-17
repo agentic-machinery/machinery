@@ -942,11 +942,6 @@ def _run_single_acp_job(
                         hard_timeout=hard_timeout,
                         transcript_path=transcript_path,
                     )
-                try:
-                    with transcript_path.open("a", encoding="utf-8") as transcript:
-                        transcript.write(json.dumps({"stream": "response", "text": str(getattr(result, "response", ""))}) + "\n")
-                except OSError as capture_error:
-                    print(f"ACP transcript persistence failed: {capture_error}; provider response preserved", file=sys.stderr)
             except BaseException as exc:
                 # Persist the substitution decision and the typed failure code
                 # on the receipt (#8499): a post-crash retry replays this

@@ -1687,6 +1687,7 @@ def _execute_invocation_plan(
     initial_response_timeout: int | None = None,
     agy_budget: _AgyLaunchBudget | None = None,
     cli_version: str = "unknown",
+    transcript_path: Path | None = None,
 ) -> _ExecutionOutcome:
     """Two launches maximum; cancellation, eligibility and provider faults share it."""
     kwargs = dict(
@@ -1707,6 +1708,7 @@ def _execute_invocation_plan(
         stdout_silence_timeout=stdout_silence_timeout,
         initial_response_timeout=initial_response_timeout,
         cli_version=cli_version,
+        transcript_path=transcript_path,
     )
     if agent_name != "agy":
         return _execute_invocation_once(**kwargs)
@@ -1927,6 +1929,7 @@ def _execute_invocation_once(
     stdout_silence_timeout: int | None = None,
     initial_response_timeout: int | None = None,
     cli_version: str = "unknown",
+    transcript_path: Path | None = None,
 ) -> _ExecutionOutcome:
     """Spawn one plan, run watchdog/parse flow, and return raw execution state."""
     # Exact-target review isolation (#5285): when tool_config requests
@@ -2017,7 +2020,6 @@ def _execute_invocation_once(
     kill_reason: str | None = None
     escaped_primary: list[str] = []
     cwd_pin: _ChildCwdPin | None = None
-    transcript_path = (tool_config or {}).get("acp_transcript_path")
     transcript = None
     transcript_offsets = {"stdout": 0, "stderr": 0}
     transcript_failed = False
@@ -3546,6 +3548,7 @@ def _invoke_impl(
     allow_runner_failover: bool = True,
     rules_seat: str | None = None,
     rules_core_delivery: RulesCoreDelivery = RulesCoreDelivery.INJECT,
+    transcript_path: Path | None = None,
 ) -> Result:
     """Runner implementation after any parent-owned isolation preparation.
 
@@ -3566,7 +3569,9 @@ def _invoke_impl(
             adapter's ``resume_policy`` both allow it. See § 6.3.
         tool_config: Adapter-specific tool configuration dict. For Claude
             and Gemini this carries MCP server names and allowed-tools
-            strings. Adapters ignore keys they don't understand.
+            strings. Strict adapters reject unknown keys.
+        transcript_path: Runner-owned capture path, kept separate from
+            adapter-facing tool configuration.
         entrypoint: Who called us — drives resume policy enforcement and
             usage record labeling. One of: ``"bridge"``, ``"dispatch"``,
             ``"delegate"``, ``"consult"``, ``"runtime"``.
@@ -3754,6 +3759,7 @@ def _invoke_impl(
         stdout_silence_timeout=stdout_silence_timeout,
         initial_response_timeout=initial_response_timeout,
         cli_version=telemetry.cli_version,
+        transcript_path=transcript_path,
     )
     parse = _validated_agy_parse(execution.parse, agent=agent_name, requested_model=effective_model,
                                  task_id=task_id, run_nonce=(tool_config or {}).get("run_nonce"))
@@ -4294,10 +4300,10 @@ def invoke_inter_agent(
                     "target_agent": route.target_agent,
                     "correlation_id": validated_correlation_id,
                     "idempotency_key": validated_idempotency_key,
-                    **({"acp_transcript_path": str(transcript_path)} if transcript_path is not None else {}),
                     **({"sealed_review_mcp_config": sealed_config} if sealed_config is not None else {}),
                 },
                 hard_timeout=hard_timeout,
+                transcript_path=transcript_path,
                 effort=route.effort,
                 entrypoint="acpx-transport",
                 rules_seat=rules_seat,
@@ -4328,6 +4334,7 @@ def _invoke_direct_only(
     entrypoint: str = "acpx-pilot-shadow",
     initiator: str | None = None,
     rules_seat: str | None = None,
+    transcript_path: Path | None = None,
 ) -> Result:
     """Invoke one explicitly marked direct-only, read-only shadow seat.
 
@@ -4366,6 +4373,7 @@ def _invoke_direct_only(
             rules_seat=rules_seat,
             allow_direct_only=True,
             allow_runner_failover=False,
+            transcript_path=transcript_path,
         )
     except AcpxShadowRefusalError as exc:
         write_record(
