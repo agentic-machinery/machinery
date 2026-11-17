@@ -59,7 +59,11 @@ def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
         assert len(attempts) == 2
         # The salvage gate's best-effort fetch must still be suppressed by its existing boundary.
         with suppress(OSError, subprocess.SubprocessError):
-            git._verification_git(Path(record["cwd"]), "fetch", "--", "origin", record["head_sha"])
+            try:
+                git._verification_git(Path(record["cwd"]), "fetch", "--", "origin", record["head_sha"])
+            except git.VerificationFetchError as exc:
+                assert "secret" not in repr(exc) and "transport-location" not in str(exc.args)
+                raise
     else:
         assert (record["status"], record["error"]) == (
             ("no_deliverable", "outside_owned_paths: delivered.txt") if scope == "outside" else ("done", None))

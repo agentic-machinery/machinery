@@ -82,6 +82,8 @@ class VerificationFetchError(subprocess.CalledProcessError):
         self.reason = (f"HTTP {http[1]}" if http else
                        next((reason for marker, reason in reasons if marker in stderr), "unclassified transport error"))
         super().__init__(code, ["git", "fetch"], output="", stderr=self.reason)
+        # BaseException retains the original constructor arguments for repr and pickling.
+        self.args = (code, self.reason)
 
     def __str__(self) -> str:
         return f"git fetch failed (exit {self.returncode}; {self.reason})"
