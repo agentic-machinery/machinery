@@ -19,6 +19,7 @@ from lu_machinery.secret_redactor import redact_text
 from . import load_samples, panel_values
 from .monitor_context import MonitorContext, get_ctx
 from .opsec_scan import scan_text
+from .route_contracts import all_route_contracts
 from .state_helpers import cache_get_or_compute_async, ctx_scoped_ttl_key
 
 logger = logging.getLogger(__name__)
@@ -189,8 +190,6 @@ _SEVERITIES = frozenset({"critical", "warning", "info", "none"})
 
 @lru_cache(maxsize=1)
 def _declared_routes() -> frozenset[str]:
-    from .route_contracts import all_route_contracts
-
     return frozenset(contract.pattern for contract in all_route_contracts() if contract.match == "exact")
 
 
