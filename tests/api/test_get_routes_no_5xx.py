@@ -261,9 +261,16 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
         # hosts the handlers dial.
         "NO_PROXY": "localhost,127.0.0.1",
         "no_proxy": "localhost,127.0.0.1",
+        # The workers snapshot reads the product root while the fixture is
+        # still starting, before the test body can point it at this checkout.
+        "LU_PRODUCT_ROOT": str(repo),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo),
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR": str(repo / "batch_state"),
     }
     previous_env = {key: os.environ.get(key) for key in offline}
     os.environ.update(offline)
+    for name in _CONFIG_ROOTS:
+        vars(config).pop(name, None)
     sockets = _OfflineSockets()
     sockets.install()
     previous_health: dict[str, object] | None = None
