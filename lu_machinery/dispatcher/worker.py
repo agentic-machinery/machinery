@@ -605,7 +605,8 @@ def _outside_cause(paths, owned) -> str | None:
 
 def _verification_cause(exc: Exception) -> str:
     """Name what stopped the ownership check: the failing Git step, or the check's own refusal."""
-    return f"owned_paths_verification_failed: {ownership.failure_detail(exc)}"[:200]
+    detail = str(exc) if isinstance(exc, git.VerificationFetchError) else ownership.failure_detail(exc)
+    return f"owned_paths_verification_failed: {detail}"[:200]
 
 
 def _enforce_delivery(record: dict) -> None:

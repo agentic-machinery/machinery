@@ -65,7 +65,7 @@ VERIFICATION_FETCH_TIMEOUT = 60
 HISTORY_SLACK_SECONDS = 86400
 
 
-class VerificationFetchError(ValueError):
+class VerificationFetchError(subprocess.CalledProcessError):
     """A transport refusal with only allow-listed, non-sensitive diagnostics."""
 
     def __init__(self, code: int, stderr: str):
@@ -81,8 +81,10 @@ class VerificationFetchError(ValueError):
         http = re.search(r"The requested URL returned error: ([45][0-9]{2})\b", stderr)
         self.reason = (f"HTTP {http[1]}" if http else
                        next((reason for marker, reason in reasons if marker in stderr), "unclassified transport error"))
-        self.returncode = code
-        super().__init__(f"git fetch failed (exit {code}; {self.reason})")
+        super().__init__(code, [GIT_BINARY, "fetch"], output="", stderr=self.reason)
+
+    def __str__(self) -> str:
+        return f"git fetch failed (exit {self.returncode}; {self.reason})"
 
 
 def _ownership_fetch(run, record: dict, *args: str, phase: str) -> None:
@@ -264,17 +266,22 @@ def ownership_git(record: dict, head: str | None = None):
     refspecs = (f"+{base_source}:refs/heads/base",
                 f"+{delivery_source}:refs/heads/delivery")
     with _private_remote_git(record["task_id"], remote) as (run, git_dir):
-        fetch = partial(_ownership_fetch, run, record)
-        try:
-            fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="initial")
-        except VerificationFetchError as exc:
-            if head is not None or exc.reason != "remote ref missing":
-                raise
-            snapshot = record["head_sha"]
-            if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", snapshot):
-                raise ValueError("delivery head must be a full object name") from None
-            refspecs = (refspecs[0], f"+{snapshot}:refs/heads/delivery")
-            fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="recorded-head")
+        def fetch(*args: str, phase: str) -> None:
+            nonlocal refspecs
+            try:
+                _ownership_fetch(run, record, *args, phase=phase)
+            except VerificationFetchError as exc:
+                if head is not None or exc.reason != "remote ref missing":
+                    raise
+                snapshot = record["head_sha"]
+                if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", snapshot):
+                    raise ValueError("delivery head must be a full object name") from None
+                previous = refspecs[1]
+                refspecs = (refspecs[0], f"+{snapshot}:refs/heads/delivery")
+                _ownership_fetch(run, record, *(refspecs[1] if arg == previous else arg for arg in args),
+                                 phase=f"recorded-head-{phase}")
+
+        fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="initial")
         since = int(run("show", "-s", "--format=%ct", task_base)) - HISTORY_SLACK_SECONDS
         # Git selects no history below a tip dated before the cutoff and aborts the
         # bounded fetch; its message does not reach HTTPS clients, so decide by date.

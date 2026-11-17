@@ -4,6 +4,7 @@
 
 import json
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 import pytest
 from lu_machinery.dispatcher import git, worker
@@ -18,7 +19,7 @@ from lu_machinery.dispatcher import ownership
 from lu_machinery.dispatcher import store
 from tests.dispatcher.conftest import MERGED as MERGED
 
-@pytest.mark.parametrize("fault", ["deleted-branch", "transient", "persistent"])
+@pytest.mark.parametrize("fault", ["deleted-branch", "deleted-after-initial", "transient", "persistent"])
 @pytest.mark.parametrize("scope", ["owned", "granted", "outside"])
 def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
         sandbox, delivery_settle, monkeypatch, fault, scope):
@@ -31,8 +32,9 @@ def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
         record["owned_path_grants"] = [{
             "task_id": record["task_id"], "run_nonce": record["run_nonce"], "grant_id": "approved",
             "owned_paths": ["delivered.txt"], "reason": "Approved delivery", "approval_ref": "coordinator-reply"}]
-    if fault == "deleted-branch":
+    if fault.startswith("deleted-"):
         run_git(sandbox.remote, "update-ref", "refs/pull/42/head", record["head_sha"])
+    if fault == "deleted-branch":
         run_git(sandbox.remote, "update-ref", "-d", f"refs/heads/{record['worktree_branch']}")
     original_run = subprocess.run
     attempts = []
@@ -40,6 +42,8 @@ def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
     def transport(argv, *args, **kwargs):
         if argv[0] == git.GIT_BINARY and "fetch" in argv:
             attempts.append(argv)
+            if fault == "deleted-after-initial" and any(arg.startswith("--shallow-since=") for arg in argv):
+                run_git(sandbox.remote, "update-ref", "-d", f"refs/heads/{record['worktree_branch']}")
             if fault == "persistent" or (fault == "transient" and len(attempts) == 1):
                 raise subprocess.CalledProcessError(
                     128, argv, stderr="private diagnostic: secret /private/transport-location\n"
@@ -53,12 +57,15 @@ def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
         assert (record["status"], record["error"]) == (
             "no_deliverable", "owned_paths_verification_failed: git fetch failed (exit 128; HTTP 503)")
         assert len(attempts) == 2
+        # The salvage gate's best-effort fetch must still be suppressed by its existing boundary.
+        with suppress(OSError, subprocess.SubprocessError):
+            git._verification_git(Path(record["cwd"]), "fetch", "--", "origin", record["head_sha"])
     else:
         assert (record["status"], record["error"]) == (
             ("no_deliverable", "outside_owned_paths: delivered.txt") if scope == "outside" else ("done", None))
         assert len(attempts) >= 2
     failures = record["owned_paths_fetch_failures"]
-    assert failures[0]["reason"] == ("remote ref missing" if fault == "deleted-branch" else "HTTP 503")
+    assert failures[0]["reason"] == ("remote ref missing" if fault.startswith("deleted-") else "HTTP 503")
     assert "secret" not in json.dumps(record) and "transport-location" not in json.dumps(failures)
     if scope == "granted" and fault != "persistent":
         assert record["owned_path_grants_used"] == [{"path": "delivered.txt", "grant_id": "approved"}]
