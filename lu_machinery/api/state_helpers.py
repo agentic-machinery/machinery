@@ -25,14 +25,18 @@ from __future__ import annotations
 # wall-clock staleness budgets on loaded CI runners (#8583).
 import asyncio
 import concurrent.futures
+import functools
+import inspect
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
+
+from .panel_values import snapshot_headers
 
 if TYPE_CHECKING:
     from .monitor_context import MonitorContext
@@ -55,6 +59,10 @@ DEMAND_WINDOW_S = 120.0
 # cleanup, hand-off readiness) never get a minutes-old observation that way.
 # It matches the Retry-After of a snapshot that has no observation yet.
 DORMANT_READ_WAIT_S = 2.0
+# A stale-while-revalidate route read that finds its value dormant waits this
+# long for the refresh it starts; under the 1 s panel budget, then the stored
+# value with its true age.
+SWR_DORMANT_READ_WAIT_S = 0.5
 
 
 class Demand:
@@ -79,14 +87,16 @@ class PeriodicSnapshot[T]:
 
     The writer refreshes every ``interval`` only while the snapshot is read
     (:data:`DEMAND_WINDOW_S`). Unread, it sleeps until the next read. That read
-    wakes it and, off the event loop, waits up to :data:`DORMANT_READ_WAIT_S`
-    for the fresh collection; otherwise it gets the last observation with its
-    true age. Reads while the writer is active never wait.
+    wakes it and, off the event loop, waits up to ``dormant_wait_s`` (default
+    :data:`DORMANT_READ_WAIT_S`) for the fresh collection; otherwise it gets
+    the last observation with its true age. Reads while the writer is active
+    never wait.
     """
 
-    def __init__(self, compute: Callable[[], T], interval: float):
+    def __init__(self, compute: Callable[[], T], interval: float, *, dormant_wait_s: float | None = None):
         self.compute = compute
         self.interval = interval
+        self.dormant_wait_s = dormant_wait_s
         self._entry: tuple[float, T] | None = None
         self._demand = Demand()
         self._demand.touch()  # the startup collection
@@ -144,7 +154,8 @@ class PeriodicSnapshot[T]:
         if on_loop:
             return  # the writer needs this thread; answer from the last observation
         with self._settled:
-            self._settled.wait_for(lambda: self._attempts != pending, timeout=DORMANT_READ_WAIT_S)
+            wait_s = DORMANT_READ_WAIT_S if self.dormant_wait_s is None else self.dormant_wait_s
+            self._settled.wait_for(lambda: self._attempts != pending, timeout=wait_s)
 
     async def _refresh(self) -> None:
         work = asyncio.create_task(asyncio.to_thread(self.refresh))
@@ -431,6 +442,153 @@ def schedule_cache_refresh(
             return
         _refresh_keys.add(key)
     threading.Thread(target=_run, name="status-cache-refresh", daemon=True).start()
+
+
+# Stale-while-revalidate refreshes wait their turn on two shared threads. A page
+# or a verify pass that finds many stale routes must not start every collector
+# at once: together they starve request threads of the GIL. Two, so one slow
+# or hung collector does not hold back every other refresh.
+_SWR_REFRESH_WORKERS = 2
+_swr_refresh_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_SWR_REFRESH_WORKERS, thread_name_prefix="swr-cache-refresh",
+)
+_swr_refresh_keys: set[str] = set()
+
+
+def _queue_swr_refresh(key: str, ttl: float, compute: Callable[[], object]) -> None:
+    """Queue one refresh per key; it skips the work if a fresh value arrived meanwhile."""
+
+    def _run() -> None:
+        try:
+            cache_get_or_compute(key, ttl, compute)
+        except Exception:
+            _cache_log.debug("stale-while-revalidate refresh failed", exc_info=True)
+        finally:
+            with _refresh_keys_lock:
+                _swr_refresh_keys.discard(key)
+
+    with _refresh_keys_lock:
+        if key in _swr_refresh_keys:
+            return
+        _swr_refresh_keys.add(key)
+    _swr_refresh_executor.submit(_run)
+
+
+class _Unstorable(Exception):
+    """A computed value that reports its own failure: served to its reader, never stored."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__("value reports a failure")
+        self.value = value
+
+
+async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-param support here
+    key: str, ttl: float, compute: Callable[[], T], *, storable: Callable[[T], bool] | None = None,
+) -> tuple[T, float, bool]:
+    """Stale-while-revalidate read: the stored value at once, with its true age.
+
+    Returns ``(value, age, stored)``. A value older than ``ttl`` is still
+    returned, with its real age, and one background refresh is queued on the
+    shared refresh threads. A value that went unread past
+    :data:`DEMAND_WINDOW_S` after it expired is dormant: that read starts (or
+    joins) one refresh and waits for it, off the event loop, up to
+    :data:`SWR_DORMANT_READ_WAIT_S`; a slower refresh leaves it the stored value
+    with its true age. Only the first read of a key waits for the whole
+    computation, which concurrent first reads share. The age is the time since
+    the value was stored.
+
+    A refresh that fails, or whose value ``storable`` rejects (the value reports
+    its own failure), leaves the previous value in place, still ageing. When
+    nothing is stored yet, such a value is returned with ``stored`` False and
+    is not kept.
+    """
+
+    def guarded() -> T:
+        value = compute()
+        if storable is not None and not storable(value):
+            raise _Unstorable(value)
+        return value
+
+    try:
+        stored = cache_get_stored(key)
+        if stored is not None and stored[1] >= ttl + DEMAND_WINDOW_S:
+            # This read starts or joins the refresh itself; nothing more to queue.
+            dormant = await asyncio.to_thread(cache_get_or_refresh, key, ttl, guarded, wait_s=SWR_DORMANT_READ_WAIT_S)
+            if dormant is not None:
+                return dormant[0], dormant[1], True  # type: ignore[return-value]
+            stored = None
+        if stored is None:
+            first = await cache_get_or_compute_async(key, ttl, guarded)
+            stored = cache_get_stored(key)
+            return first, 0.0 if stored is None else stored[1], True
+    except _Unstorable as failed:
+        return failed.value, 0.0, False  # type: ignore[return-value]
+    if stored[1] >= ttl:
+        _queue_swr_refresh(key, ttl, guarded)
+    return stored[0], stored[1], True  # type: ignore[return-value]
+
+
+def reports_failure(value: object) -> bool:
+    """Whether a route payload reports its own failure (``error``, or an unusable ``availability``)."""
+    if not isinstance(value, dict):
+        return False
+    return bool(value.get("error")) or value.get("availability") in _FAILED_AVAILABILITY
+
+
+_FAILED_AVAILABILITY = frozenset({"unavailable", "malformed", "schema_read_failed", "db_missing", "db_error"})
+
+
+def swr_route(
+    name: str, ttl: float, *, vary: tuple[str, ...] = (),
+) -> Callable[[Callable[..., T]], Callable[..., Awaitable[T]]]:
+    """Serve a synchronous read-only GET handler through :func:`cache_read_swr`.
+
+    Query parameters named in ``vary`` (each with a bounded set of values) are
+    part of the cache key. A call that sets any other parameter away from its
+    default is not cached: it runs the handler as before. Every cached
+    response carries the snapshot freshness headers with the value's true age
+    (``X-Snapshot-Age-S``), marked ``stale`` past ``ttl``. A payload that
+    reports its own failure (:func:`reports_failure`) is never stored: a failed
+    refresh leaves the last good value ageing, and a failed first read is
+    returned as ``unavailable``.
+    """
+
+    def decorate(handler: Callable[..., T]) -> Callable[..., Awaitable[T]]:
+        if inspect.iscoroutinefunction(handler):
+            raise TypeError(f"swr_route needs a synchronous handler: {handler.__name__}")
+        signature = inspect.signature(handler)
+        if "ctx" not in signature.parameters:
+            raise TypeError(f"swr_route needs a ctx parameter: {handler.__name__}")
+        unknown = set(vary) - set(signature.parameters)
+        if unknown:
+            raise TypeError(f"swr_route vary names no parameter of {handler.__name__}: {sorted(unknown)}")
+        defaults = {
+            param.name: getattr(param.default, "default", param.default)
+            for param in signature.parameters.values()
+            if param.name != "ctx" and param.name not in vary
+        }
+
+        @functools.wraps(handler)
+        async def wrapper(*, _swr_response: Response, **kwargs: Any) -> T:
+            if any(kwargs.get(param) != default for param, default in defaults.items()):
+                return await asyncio.to_thread(functools.partial(handler, **kwargs))
+            ctx = kwargs["ctx"]
+            # Every root, not just the project root: two contexts never share a value.
+            key = ctx_scoped_ttl_key(ctx, "swr", name, repr(ctx.roots),
+                                     *(f"{param}={kwargs.get(param)!r}" for param in vary))
+            value, age, stored = await cache_read_swr(
+                key, ttl, functools.partial(handler, **kwargs), storable=lambda value: not reports_failure(value),
+            )
+            _swr_response.headers.update(snapshot_headers(age, ttl, unavailable=not stored))
+            return value
+
+        response_param = inspect.Parameter("_swr_response", inspect.Parameter.KEYWORD_ONLY, annotation=Response)
+        wrapper.__signature__ = signature.replace(  # type: ignore[attr-defined]
+            parameters=[*signature.parameters.values(), response_param],
+        )
+        return wrapper
+
+    return decorate
 
 
 def cache_get_or_refresh(key: str, ttl: float, compute: Callable[[], object], *, wait_s: float) -> tuple[object, float] | None:

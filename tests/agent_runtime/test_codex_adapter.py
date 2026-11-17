@@ -7,6 +7,7 @@ import pytest
 
 from lu_machinery.agent_runtime.adapters.base import InvocationPlan
 from lu_machinery.agent_runtime.adapters.codex import CodexAdapter
+from lu_machinery.review import model_catalog
 from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
@@ -22,6 +23,22 @@ from tests.helpers.codex_exec_stream import (
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
 
 
+@pytest.fixture(autouse=True)
+def codex_catalog(monkeypatch):
+    catalog = {
+        "seats": {"openai_frontier": {"model_id": "test-sol-current"}},
+        "models": {
+            "test-sol-current": {"lifecycle": "active", "transports": ["native_codex"]},
+            "test-luna": {"lifecycle": "fallback", "transports": ["native_codex"]},
+            "test-retired": {"lifecycle": "retired", "transports": ["native_codex"]},
+            "test-held": {"lifecycle": "hold", "transports": ["native_codex"]},
+            "test-other": {"lifecycle": "active", "transports": ["native_claude"]},
+        },
+    }
+    monkeypatch.setattr(model_catalog, "load_model_catalog", lambda: catalog)
+    return catalog
+
+
 def test_codex_build_invocation_sends_prompt_via_stdin(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("lu_machinery.agent_runtime.adapters.codex.shutil.which", lambda _: "codex")
     adapter = CodexAdapter()
@@ -30,7 +47,7 @@ def test_codex_build_invocation_sends_prompt_via_stdin(tmp_path: Path, monkeypat
         prompt="write the module",
         mode="workspace-write",
         cwd=tmp_path,
-        model="gpt-6.1-sol",
+        model="test-sol-current",
         task_id=None,
         session_id=None,
         tool_config=None,
@@ -77,7 +94,7 @@ def test_codex_liveness_dirs_include_local_date_midnight_straddle(tmp_path: Path
     assert local_rollout_dir in adapter.liveness_signal_paths(plan)
 
 
-@pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.5", "gpt-6-sol", "gpt-6-astra", "", "auto"])
+@pytest.mark.parametrize("model", ["test-retired", "test-held", "test-other", "test-unknown", "", "auto"])
 def test_codex_rejects_unapproved_model_before_invocation_preparation(tmp_path, monkeypatch, model):
     adapter = CodexAdapter()
 
@@ -91,7 +108,39 @@ def test_codex_rejects_unapproved_model_before_invocation_preparation(tmp_path, 
         )
 
 
-@pytest.mark.parametrize("model,expected_model", [(None, "gpt-6.1-sol"), ("gpt-6-luna", "gpt-6-luna")])
+def test_codex_allowlist_follows_catalog(tmp_path, monkeypatch, codex_catalog):
+    """A catalog switch must admit the new current model and refuse the retired one."""
+    monkeypatch.setattr("lu_machinery.agent_runtime.adapters.codex.shutil.which", lambda _: "codex")
+    adapter = CodexAdapter()
+
+    def invocation(model):
+        return adapter.build_invocation(
+            prompt="test", mode="read-only", cwd=tmp_path, model=model,
+            task_id=None, session_id=None, tool_config=None,
+        )
+
+    assert model_catalog.codex_dispatch_models() == {"test-sol-current", "test-luna"}
+    assert adapter.default_model == "test-sol-current"
+    for model in (None, "test-sol-current", "test-luna"):
+        plan = invocation(model)
+        assert plan.cmd[plan.cmd.index("-m") + 1] == (model if model is not None else "test-sol-current")
+
+    codex_catalog["models"]["test-sol-current"]["lifecycle"] = "retired"
+    codex_catalog["models"]["test-sol-next"] = {"lifecycle": "active", "transports": ["native_codex"]}
+    codex_catalog["seats"]["openai_frontier"]["model_id"] = "test-sol-next"
+    assert model_catalog.codex_dispatch_models() == {"test-sol-next", "test-luna"}
+    assert adapter.default_model == "test-sol-next"
+    for model in (None, "test-sol-next"):
+        plan = invocation(model)
+        assert plan.cmd[plan.cmd.index("-m") + 1] == "test-sol-next"
+    with pytest.raises(model_catalog.ModelCatalogError, match="codex_model_not_approved"):
+        invocation("test-sol-current")
+    codex_catalog["models"]["test-sol-next"]["lifecycle"] = "retired"
+    with pytest.raises(model_catalog.ModelCatalogError, match="codex_model_not_approved"):
+        invocation(None)
+
+
+@pytest.mark.parametrize("model,expected_model", [(None, "test-sol-current"), ("test-luna", "test-luna")])
 @pytest.mark.parametrize("effort,expected", [(None, "high"), ("xhigh", "xhigh")])
 def test_codex_pins_gpt6_and_preserves_effort(tmp_path, monkeypatch, model, expected_model, effort, expected):
     monkeypatch.setattr("lu_machinery.agent_runtime.adapters.codex.shutil.which", lambda _: "codex")

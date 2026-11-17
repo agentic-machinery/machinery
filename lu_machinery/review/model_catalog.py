@@ -1176,6 +1176,15 @@ def routing_model(section: str, lane: str, field: str = "model_id") -> str:
     return value
 
 
+def codex_dispatch_models(catalog: dict[str, Any] | None = None) -> frozenset[str]:
+    """Models admitted for native Codex execution by the catalog."""
+    source = catalog if catalog is not None else load_model_catalog()
+    return frozenset(
+        model_id for model_id, entry in source["models"].items()
+        if entry["lifecycle"] in {"active", "fallback"} and "native_codex" in entry["transports"]
+    )
+
+
 def substitution_default_model(lane: str) -> str | None:
     """Role-backed substitution defaults; registry-only lanes migrate in PR 3c."""
     if lane == "cursor":
@@ -1359,15 +1368,6 @@ def effort_refusal(model: Any, effort: Any, catalog: dict[str, Any] | None = Non
         return None
     return (f"model {model_id} does not offer effort {effort!r}; offered: {', '.join(allowed)} "
             f"(model catalog models.{model_id}.efforts)")
-
-
-def codex_dispatch_models(catalog: dict[str, Any] | None = None) -> frozenset[str]:
-    """Catalog ids the Codex adapters may run: active or fallback models with a native_codex transport."""
-    models = (catalog or load_model_catalog())["models"]
-    return frozenset(
-        model_id for model_id, model in models.items()
-        if model["lifecycle"] in {"active", "fallback"} and "native_codex" in model["transports"]
-    )
 
 
 def retired_model_refusal(

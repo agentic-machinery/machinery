@@ -49,9 +49,13 @@ from . import comms_router as legacy_comms
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
-from .state_helpers import cache_get_or_compute, cache_get_or_refresh, ctx_scoped_ttl_key
+from .state_helpers import cache_get_or_compute, cache_get_or_refresh, ctx_scoped_ttl_key, swr_route
 
 router = APIRouter(tags=["fleet"])
+# Fleet read models served stale-while-revalidate (``state_helpers.swr_route``):
+# a read gets the last projection with its true age and an older one queues
+# one refresh. Each projection reads the whole plane or task store.
+FACADE_TTL_S = 15.0
 logger = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE = 50
@@ -487,6 +491,7 @@ def fleet_facade_status(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any
 
 
 @router.get("/facade/board")
+@swr_route("fleet-facade-board", FACADE_TTL_S)
 def fleet_facade_board(
     stream_id: str | None = Query(default=None),
     agent: str | None = Query(default=None),
@@ -541,6 +546,7 @@ def _board_pr_list(ctx: MonitorContext) -> ProbeResult:
 
 
 @router.get("/facade/metrics")
+@swr_route("fleet-facade-metrics", FACADE_TTL_S)
 def fleet_facade_metrics(ctx: MonitorContext = Depends(get_ctx), include_agent_success: bool = False) -> dict[str, Any]:
     """Return authority-plane metrics through the existing collector."""
     payload = _facade_authority_payload(collect_efficiency_metrics_authority, ctx)
@@ -2493,6 +2499,7 @@ def _acp_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/acp/conversations")
+@swr_route("fleet-acp-conversations", FACADE_TTL_S)
 def fleet_acp_conversations(
     state: str | None = Query(default=None),
     agent: str | None = Query(default=None),

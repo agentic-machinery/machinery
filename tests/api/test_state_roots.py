@@ -112,7 +112,7 @@ def test_occupancy_and_rollover_paths_follow_state_at_use_time(roots, monkeypatc
     monkeypatch.setattr(rollover_router.registry, "audit_fleet", audit)
     monkeypatch.setattr(rollover_router.thread_handoff, "rollover_identity_snapshot", lambda root: {"schema_version": 1, "candidate_count": 0, "errors": []})
     rollover_router.collect_rollover_orient_data()
-    rollover_router.rollover_audit(agent=None, source_thread_id=None, replacement_thread_id=None,
+    rollover_router.rollover_audit.__wrapped__(agent=None, source_thread_id=None, replacement_thread_id=None,
                                    lineage_id=None, rollover_id=None, stale_hours=24, ctx=ctx)
     assert seen == [state, state]
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(product))
@@ -319,7 +319,7 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     assert listed["availability"] == "empty"
 
     seen.clear()
-    board = fleet_router.fleet_facade_board(None, None, None, ctx)
+    board = fleet_router.fleet_facade_board.__wrapped__(None, None, None, ctx)
     assert seen == [state.resolve(), plane]
     assert board["probes"]["plane_status"]["status"] == "ok"
     assert not (product / "batch_state").exists()
