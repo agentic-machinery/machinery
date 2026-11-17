@@ -735,6 +735,8 @@ tests/fleet_comms/test_artifacts_pg_transactions.py
 tests/fleet_comms/test_pg_schema_ledger.py
 tests/fleet_comms/test_request_executor_pg.py
 tests/test_pg_skip_guard.py
+# VERIFY-ADOPT item 4: reviewer-grading runner.
+tests/bakeoff/test_review_eval.py
 # [support]
 tests/property/conftest.py
 tests/fixtures/product_tree/agents_extensions/codex-home/AGENTS.md

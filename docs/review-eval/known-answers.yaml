@@ -1,0 +1,1103 @@
+# Reviewer-grading answer keys (operator order VERIFY-ADOPT item 4). Frozen set; see README.md.
+# Each case is the exact head a recorded reviewer saw and the merge base it reviewed against.
+# A defect is listed only when a later commit fixed it (source.fix_commits) and, for recorded
+# rounds, the next review round at source.resolved_at confirmed the fix. Findings whose only
+# evidence was a failing CI tool (lint, type ratchet, SAST baseline) are not answer keys: the
+# evaluation brief carries no CI results. The split (tune or test) is not stored here; it is
+# computed from repository and PR by lu_machinery.bakeoff.review_eval.split_of.
+schema_version: 1
+frozen_on: '2026-11-17'
+cases:
+- id: learn-ukrainian-13008
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13008
+  base_sha: dad8aac858056b50f5776dc0e318a40b039cb245
+  head_sha: 16cd4d6d312bb93d39af17a2dfb419764279c708
+  size_lines: 533
+  pr_state: MERGED
+  source_review:
+    task: cto-11ce-vtsimp-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: scripts/ingest/slovnyk_me_ingest.py:503
+    answer: The unchanged-article comparison includes the location-dependent cache_path, so relocating identical staging copies counts as updates and triggers a backup and upsert.
+    source:
+      finding: F1
+      fix_commits:
+      - 18a4cba19bd328ff0b0ff5a2001fccbcacaa9d7c
+      resolved_at: 18a4cba19bd328ff0b0ff5a2001fccbcacaa9d7c
+- id: learn-ukrainian-13011
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13011
+  base_sha: c6ce7c75e6c765fe8da3c6ab37e04d803035b092
+  head_sha: 71a051df8a9234607c6c2544fe06e4822e36f9c5
+  size_lines: 76
+  pr_state: MERGED
+  source_review:
+    task: cto-11ce-pr13011-review
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: scripts/common/github_client.py:1658
+    answer: When cache persistence times out the preliminary result is returned, bypassing 304 cache reconstruction and Retry-After handling, so an empty 304 is reported as github_http_error.
+    source:
+      finding: F1
+      fix_commits:
+      - c7a3cfe8a95d3ea6eeda625330066ede8a447ad8
+      resolved_at: c7a3cfe8a95d3ea6eeda625330066ede8a447ad8
+  - id: D2
+    severity: P2
+    location: scripts/common/github_client.py:1420
+    answer: Pruning in _maintain_cache after the response transaction starts an implicit transaction that is closed without commit, so oversized responses stay persisted and the pruning is undone.
+    source:
+      finding: F2
+      fix_commits:
+      - c7a3cfe8a95d3ea6eeda625330066ede8a447ad8
+      resolved_at: c7a3cfe8a95d3ea6eeda625330066ede8a447ad8
+- id: learn-ukrainian-13018
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13018
+  base_sha: c6cf9e674922396bd098112313b5f41a3dfe30c1
+  head_sha: 66829b8bdab933517aff18dff2b16f81d1bdae38
+  size_lines: 146
+  pr_state: MERGED
+  source_review:
+    task: cto-344e-hydrate-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: .github/workflows/ci.yml:415
+    answer: Consumers run on artifact presence rather than hydration success and the gate aggregates only consumer results, so a failed hydration job can be masked by an anonymous repair.
+    source:
+      finding: F1
+      fix_commits:
+      - 4858a22039c4275b522ba1858e7a8a3d3a119c5a
+      - 1661f148779d20648c1caa963b13c3a17927837e
+      resolved_at: 1661f148779d20648c1caa963b13c3a17927837e
+- id: learn-ukrainian-13048
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13048
+  base_sha: 0e7b8343d71b54179560210323785d3700b3a33d
+  head_sha: 0894ac756e8008479a072126485d37cbfedbdc5c
+  size_lines: 78
+  pr_state: MERGED
+  source_review:
+    task: cto-4fee-guardsynth-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: agents_extensions/shared/hooks/context-rollover-lib.sh:56
+    answer: A zero usage total on the latest non-synthetic turn is discarded, so consumers report an older turn's context measurement as current.
+    source:
+      finding: F1
+      fix_commits:
+      - 63a20e8ddb0faeb859abf8f9ef4c8671377b2f78
+      resolved_at: 63a20e8ddb0faeb859abf8f9ef4c8671377b2f78
+- id: learn-ukrainian-13049
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13049
+  base_sha: 917b5102f063f4cb42736c0260c5955edcdd8914
+  head_sha: 4456914c94115c9bd5afebe5c3b55735831c2a29
+  size_lines: 251
+  pr_state: MERGED
+  source_review:
+    task: cto-be90-r13049-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: agents_extensions/shared/statusline/statusline.sh:187
+    answer: The live-usage write sits behind the enclosing interpreter check, so it is skipped when that check fails even though the shared project interpreter exists.
+    source:
+      finding: F1
+      fix_commits:
+      - 1546e321a6a0f2048c0e957cb8a45cf0234bba57
+      resolved_at: 1546e321a6a0f2048c0e957cb8a45cf0234bba57
+  - id: D2
+    severity: P2
+    location: agents_extensions/shared/statusline/statusline.sh:187
+    answer: A harness report of zero usage does not invalidate cached high usage, so freshness reflects the last positive observation rather than the newer harness reading.
+    source:
+      finding: F2
+      fix_commits:
+      - 1546e321a6a0f2048c0e957cb8a45cf0234bba57
+      resolved_at: 1546e321a6a0f2048c0e957cb8a45cf0234bba57
+- id: learn-ukrainian-13119
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13119
+  base_sha: 81a1c67e2fee78249fcf94840626e6e23f2d04b4
+  head_sha: 620366142722a67eaf971708e0b4c4a2ad6a3282
+  size_lines: 2613
+  pr_state: MERGED
+  source_review:
+    task: cto-45ff-i13032s5b-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: scripts/lib/launcher_core.sh:255
+    answer: Replacing the sanitizer import drops the root initialization its import closure provided, so drivers reach hooks without the shared-state anchor and interactive GitHub App launches cannot resolve their repository.
+    source:
+      finding: F1
+      fix_commits:
+      - ae918c435f734d65544b024362de974a892b1817
+      resolved_at: ae918c435f734d65544b024362de974a892b1817
+- id: learn-ukrainian-13120
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13120
+  base_sha: 7e3b3802f25a60a5c1aa1ae1f2120e5976e2e759
+  head_sha: 21ec5d359cdbd1376856a437ab06c1ae77263c4f
+  size_lines: 890
+  pr_state: MERGED
+  source_review:
+    task: cto-45ff-i13032s5c-cf-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: tests/test_review_reviewer_resolver.py:1602
+    answer: The PR deletes the Codex hook copies that an existing repo-wide test still requires to exist, so the full suite fails on the merge-group candidate.
+    source:
+      finding: F1
+      fix_commits:
+      - 4b3e66b519d4ace2c8e66344df1ddf721ae3331a
+      resolved_at: 4b3e66b519d4ace2c8e66344df1ddf721ae3331a
+- id: learn-ukrainian-13135
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13135
+  base_sha: c50654e3ee54fd3e304860752099cc093b8ce624
+  head_sha: f945e352c68c334ba3b9f2e727c3e08be119047b
+  size_lines: 375
+  pr_state: MERGED
+  source_review:
+    task: cto-33f8-docrefs-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: docs/runbooks/data-backup.md:563
+    answer: The migrated standalone maintenance commands omit the explicit product root the installed modules require, so the documented commands fail.
+    source:
+      finding: F1
+      fix_commits:
+      - dee0ca16c84ace4cdabc1fa92871cd3106472157
+      resolved_at: dee0ca16c84ace4cdabc1fa92871cd3106472157
+- id: learn-ukrainian-13140
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13140
+  base_sha: 7c9c4fae48147a7310e66ed0d2ba111955f30bf3
+  head_sha: 8d40f44c18398237dd9a6b03f8b38e3c593aa734
+  size_lines: 13107
+  pr_state: MERGED
+  source_review:
+    task: cto-33f8-deadforks-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: scripts/ci/pytest-file-durations.json:21
+    answer: Deleting the whole mixed review test suite also deletes the two tests that cover surviving release code (review-target admission and refusal before provider invocation).
+    source:
+      finding: F1
+      fix_commits:
+      - 411fb62c1bb83db94d390c673e92613d1a76a777
+      resolved_at: 411fb62c1bb83db94d390c673e92613d1a76a777
+- id: learn-ukrainian-13143
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13143
+  base_sha: 951f3387a6d1a82ed8a259830a2ed6cf830090ad
+  head_sha: 224ee279cc7c2a760cf592ebc90399e65cc61772
+  size_lines: 5
+  pr_state: MERGED
+  source_review:
+    task: null
+    model: gemini-4-carbon-medium
+    family: google
+    verdict: parallel read-only Carbon review (not the review of record)
+    recorded: CTO brief cto-bb0c-revevalset-opus
+  defects:
+  - id: D1
+    severity: P1
+    location: tests/test_playground_api_stability.py:170
+    answer: The fix redirects only the playground smoke's telemetry; the compat-ask test path through start_bridge_invocation_safely (installed ai_agent_bridge/_acp_compat.py:659) still writes data/telemetry/legacy_comms_routes.db into the checkout.
+    source:
+      finding: Carbon P1 (test_ask_job_host_forward)
+      fix_commits:
+      - ac7f9f116d8392fd432138396b7216424219f7e5
+      fix_pr: 13148
+      resolved_at: null
+- id: learn-ukrainian-13145
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13145
+  base_sha: b449245686005ade07dcbdb460aca252a3a317b6
+  head_sha: 89c7daef3547779277f964f9675bc50162dc6665
+  size_lines: 143
+  pr_state: MERGED
+  source_review:
+    task: cto-33f8-p0deps-opus-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: requirements.txt:108
+    answer: Dropping SecretStorage and jeepney removes yt-dlp's Chrome-cookie backend, which the repository enables, because a repository import search cannot see that library-internal use.
+    source:
+      finding: F1
+      fix_commits:
+      - f69319def2d77dd20619ada027e285d98962a938
+      resolved_at: f69319def2d77dd20619ada027e285d98962a938
+- id: learn-ukrainian-13162
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13162
+  base_sha: d4b3ad29299e560144493b17e6ea7c84c3cd5b24
+  head_sha: 8d6791cdae940499e47311d928d080ffefc1ae83
+  size_lines: 162
+  pr_state: MERGED
+  source_review:
+    task: cto-2817-p314ab-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: scripts/audit/literary_year_inventory.py:200
+    answer: The new JSON depth bound changes existing machine-readable refusal codes and, applied after decoding, still lets deeply nested input produce version-dependent codes.
+    source:
+      finding: F1
+      fix_commits:
+      - 573747366604e4ecf4092bd49e1831d8759dafe7
+      resolved_at: 573747366604e4ecf4092bd49e1831d8759dafe7
+- id: learn-ukrainian-13164
+  repository: learn-ukrainian/learn-ukrainian.github.io
+  pr: 13164
+  base_sha: ac7f9f116d8392fd432138396b7216424219f7e5
+  head_sha: 7dc8f7cf2f804526593fd2cb7c280fb8bd6b7bb0
+  size_lines: 840
+  pr_state: MERGED
+  source_review:
+    task: cto-2817-pipeapi-grok-r1b
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: scripts/project_api/dashboard_helpers.py:697
+    answer: The pipeline-queue cache fingerprint omits lesson and review symlink targets, so deleting a nested target leaves cached classifications that disagree with classify_module_queue.
+    source:
+      finding: F1
+      fix_commits:
+      - c6a7f90bd5d6d0e79d032e6b8d8762597a4d17b6
+      resolved_at: c6a7f90bd5d6d0e79d032e6b8d8762597a4d17b6
+  - id: D2
+    severity: P2
+    location: scripts/project_api/dashboard_helpers.py:746
+    answer: The snapshot scan builds status paths directly instead of through _safe_join and drops dangling symlinks, removing the containment check on escaping status targets.
+    source:
+      finding: F2
+      fix_commits:
+      - c6a7f90bd5d6d0e79d032e6b8d8762597a4d17b6
+      resolved_at: c6a7f90bd5d6d0e79d032e6b8d8762597a4d17b6
+- id: machinery-343
+  repository: learn-ukrainian/machinery
+  pr: 343
+  base_sha: 1e6c84e7d4fcb8680483f14ccae1dddac76b6094
+  head_sha: 0b6569ab8082b93e5a3caae2a6aeed43bd02b0aa
+  size_lines: 632
+  pr_state: MERGED
+  source_review:
+    task: review-cto-c69c-carbonoff-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/publish/github.py:621
+    answer: When a repository opts out of the verdict recorder, the landing gate waives the required Carbon second approval for High-tier or security-sensitive changes with no reviews.
+    source:
+      finding: F1
+      fix_commits:
+      - 04fc120c8b003df178f47847c0f0ba68d1646c86
+      - 89a97aacbb00bb42bfd83c3923c4e3a9a9c16eae
+      resolved_at: 8c50288f64ad8cc848cc7f16af1e5bc7de7bb405
+  - id: D2
+    severity: P1
+    location: lu_machinery/review/record_cf_verdict.py:3009
+    answer: The newly mandatory Carbon seat cannot be dispatched for mixed-family heads; only the recorder accepts it.
+    source:
+      finding: F2
+      fix_commits:
+      - 04fc120c8b003df178f47847c0f0ba68d1646c86
+      - 89a97aacbb00bb42bfd83c3923c4e3a9a9c16eae
+      resolved_at: 8c50288f64ad8cc848cc7f16af1e5bc7de7bb405
+  - id: D3
+    severity: P2
+    location: lu_machinery/orchestration/integration_sweep.py:1308
+    answer: The integration readiness report ignores the newly mandatory Carbon seat and disagrees with the landing gate on the same evidence.
+    source:
+      finding: F3
+      fix_commits:
+      - 04fc120c8b003df178f47847c0f0ba68d1646c86
+      - 89a97aacbb00bb42bfd83c3923c4e3a9a9c16eae
+      resolved_at: 8c50288f64ad8cc848cc7f16af1e5bc7de7bb405
+- id: machinery-349
+  repository: learn-ukrainian/machinery
+  pr: 349
+  base_sha: 367a29bd3bd0873a86ad3c53480f0024af390ed9
+  head_sha: bbd94af58bdb116c211bb601c7638d93902930d1
+  size_lines: 171
+  pr_state: MERGED
+  source_review:
+    task: cto-e896-mc2c3-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/lib/project_interpreter.sh:322
+    answer: The physical working-directory path is altered before its nearest .git is inspected, so a valid sibling at the truncated path hides a symlinked or malformed .git at the real invocation path.
+    source:
+      finding: F1
+      fix_commits:
+      - 95e8da3644497ec20fd6f6e258171eb520c82cb8
+      resolved_at: 95e8da3644497ec20fd6f6e258171eb520c82cb8
+- id: machinery-354
+  repository: learn-ukrainian/machinery
+  pr: 354
+  base_sha: 682fbd77141b7a3c494f8bd9326dc52a699b4552
+  head_sha: 15085658709ea8d217b7c0b085ef026f080e1027
+  size_lines: 143
+  pr_state: MERGED
+  source_review:
+    task: c010-354-opus-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/dispatcher/worker.py:302
+    answer: The canary import-root attestation checks only top-level tracked names, so an untracked __init__.py inside a tracked directory still attests clean and can shadow an installed dependency on sys.path.
+    source:
+      finding: F1-untracked-under-tracked-top-tree
+      fix_commits:
+      - 928a46ab06eece0a481565cc68b6702843a93fb6
+      resolved_at: 928a46ab06eece0a481565cc68b6702843a93fb6
+  - id: D2
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:288
+    answer: Top-level entries are compared against a re-resolved HEAD rather than the attested commit, so the tree checked can differ from the commit reported.
+    source:
+      finding: F2-root-listing-rereads-HEAD
+      fix_commits:
+      - 928a46ab06eece0a481565cc68b6702843a93fb6
+      resolved_at: 928a46ab06eece0a481565cc68b6702843a93fb6
+- id: machinery-365
+  repository: learn-ukrainian/machinery
+  pr: 365
+  base_sha: 7dba4186f53ed1399cddb604f8b1ef7b7e236586
+  head_sha: d078a62c42c20a02bfd7ab86cb80988589515700
+  size_lines: 323
+  pr_state: MERGED
+  source_review:
+    task: cto-82f9-grpe-review-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/review/record_cf_verdict.py:3265
+    answer: record() classifies learner content after posting the verdict marker and crashes without a product root, leaving a published APPROVE with no review status that retries cannot repair.
+    source:
+      finding: R08-post-publish-product-root
+      fix_commits:
+      - da4c52670c5167fb2032a3287908db7c88d7be60
+      resolved_at: da4c52670c5167fb2032a3287908db7c88d7be60
+- id: machinery-366
+  repository: learn-ukrainian/machinery
+  pr: 366
+  base_sha: 7dba4186f53ed1399cddb604f8b1ef7b7e236586
+  head_sha: 99adcaa3d11b19a43fd2550580e2ffbe3c20dd8e
+  size_lines: 134
+  pr_state: MERGED
+  source_review:
+    task: cto-82f9-grpf-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:545
+    answer: The unfinished-AGY classification is read from a display error that does not reliably carry it, so merged work can erase the failure and settle an unfinished AGY run as done.
+    source:
+      finding: F1
+      fix_commits:
+      - cadf108c0f2d8d62af75c238fbd743d2b92da08e
+      resolved_at: cadf108c0f2d8d62af75c238fbd743d2b92da08e
+- id: machinery-370
+  repository: learn-ukrainian/machinery
+  pr: 370
+  base_sha: b89b52d15a567b8a2377a47601f04b86904ab5c4
+  head_sha: e8a89298693d43146cd2d6c2c37fa32453f682ab
+  size_lines: 197
+  pr_state: MERGED
+  source_review:
+    task: cto-1b95-subsview-opus-review-370-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/api/subscriptions.py:330
+    answer: Claude and Codex 300-minute windows are still published through the Other windows list although the dedicated 5-hour column reports them as not reported.
+    source:
+      finding: F1
+      fix_commits:
+      - 9a852669d6656e3cc7d686eed8431a8d0cc6e12e
+      resolved_at: 9a852669d6656e3cc7d686eed8431a8d0cc6e12e
+- id: machinery-393
+  repository: learn-ukrainian/machinery
+  pr: 393
+  base_sha: 27c1a05c9d4ead56437a342db6e814e2df8b42c6
+  head_sha: 3687e6b17448823fb22702f6a124e5f2e216f2ad
+  size_lines: 91
+  pr_state: MERGED
+  source_review:
+    task: drive374-393-sol-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:1648
+    answer: Schema validation replaces the provider's real process exit code with the gate's synthetic success code, corrupting the persisted observation and lane-health classification.
+    source:
+      finding: F1
+      fix_commits:
+      - 80cd6f15c39f12d09629a813ed1bc642dfc2896a
+      resolved_at: 80cd6f15c39f12d09629a813ed1bc642dfc2896a
+- id: machinery-396
+  repository: learn-ukrainian/machinery
+  pr: 396
+  base_sha: 6840751e74fb1e0e5b9ece789d558eb48b730b85
+  head_sha: bd4ce8490e9550d719c50ae5d563d031bc4beebd
+  size_lines: 1009
+  pr_state: MERGED
+  source_review:
+    task: review-396-sol-r2
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/publish/github.py:627
+    answer: With the verdict recorder optional, the merge gate lets a security-sensitive head pass with zero qualifying review approvals.
+    source:
+      finding: F1
+      fix_commits:
+      - 5615765d43fbf9d77d96a1de15de470397a911e3
+      resolved_at: 5615765d43fbf9d77d96a1de15de470397a911e3
+- id: machinery-399
+  repository: learn-ukrainian/machinery
+  pr: 399
+  base_sha: 81061291f21a8d5537eb8352cff201d194e66181
+  head_sha: 4ef300b026d4b94ac821ce5f74ada5368a25cea6
+  size_lines: 694
+  pr_state: MERGED
+  source_review:
+    task: cto-64e8-review-r2
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/orchestration/stale_task_records.py:848
+    answer: A worktree HEAD counts as holding the rescued commit only when the SHAs are equal, so a detached HEAD that descends from the commit is settled as class C (a terminal write) instead of reported as class B.
+    source:
+      finding: F5-worktree-head-containment
+      fix_commits:
+      - f4d9e474a57e8686982ac515974084af87b8ffd8
+      resolved_at: f4d9e474a57e8686982ac515974084af87b8ffd8
+- id: machinery-405
+  repository: learn-ukrainian/machinery
+  pr: 405
+  base_sha: 13fa4c6781989eb7a25934b3825091657797008e
+  head_sha: 3ee32e619d8f9d2a05f1e91a9c9591b389fbbe58
+  size_lines: 250
+  pr_state: MERGED
+  source_review:
+    task: cto-ee10-m405-r1-opus
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/api/claude_account_usage.py:1126
+    answer: Excluding account a from probing leaves a restored a-row permanently stale, so the TTL gate fires on every kick and account b is re-probed far more often than scheduled.
+    source:
+      finding: probe-labels-stale-a-hammers-b
+      fix_commits:
+      - d4330c2b0818192ecf4588ad030263f2b93eaa88
+      resolved_at: d4330c2b0818192ecf4588ad030263f2b93eaa88
+- id: machinery-422
+  repository: learn-ukrainian/machinery
+  pr: 422
+  base_sha: 44d5ba1c8858adc173a62fc5110c10ee40173ee6
+  head_sha: 69bd3050583939acfe2a3357053e16ac33b16287
+  size_lines: 1385
+  pr_state: MERGED
+  source_review:
+    task: cto-11ce-dtinplace-opus-r2-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/ci/data_tier.py:475
+    answer: The data-tier namespace leaves child-writable Git metadata that the parent later consumes for cleanup outside the read-only boundary, so product test code can redirect host cleanup.
+    source:
+      finding: F1
+      fix_commits:
+      - b321aedd649897d77d220a05b3ecf66d6f9c9bf0
+      resolved_at: b321aedd649897d77d220a05b3ecf66d6f9c9bf0
+- id: machinery-424
+  repository: learn-ukrainian/machinery
+  pr: 424
+  base_sha: 41d0d8c3508ff309e68a92b84567016bf46ee3f6
+  head_sha: f891edf3901f44f4ccb3cc5bba890b0ab3813805
+  size_lines: 1528
+  pr_state: MERGED
+  source_review:
+    task: cto-9362-contain3-opus-review-r2
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/write_boundary.py:782
+    answer: Closeout runs when the sandbox exits, before supervisor worktree settlement, which guarantees a worktree residual for the requesting worker.
+    source:
+      finding: F1
+      fix_commits:
+      - ce6f65353ee3f8951cc8532d45938d161b09415f
+      resolved_at: 5f511e6081cbb049990de054310f2807afebe61c
+- id: machinery-429
+  repository: learn-ukrainian/machinery
+  pr: 429
+  base_sha: 41d0d8c3508ff309e68a92b84567016bf46ee3f6
+  head_sha: 9955d8cea151672ffa3b4f1f2e736128efe1af3b
+  size_lines: 406
+  pr_state: MERGED
+  source_review:
+    task: cto-9362-settle2-review-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/orchestration/stale_task_records.py:1254
+    answer: Promoting former class D records settles them as failed without consulting merged-PR evidence, so work delivered through a merged PR is terminalized as failed.
+    source:
+      finding: F1-merged-pr-ignored-on-promotion
+      fix_commits:
+      - 5034cb5264647fdf9b8e6bbb3f8a0a696b49b370
+      resolved_at: 5034cb5264647fdf9b8e6bbb3f8a0a696b49b370
+- id: machinery-430
+  repository: learn-ukrainian/machinery
+  pr: 430
+  base_sha: 0ee9403c3489173a4fa4d2187513e01e705b8569
+  head_sha: 34b6e9859d3a39f2b6b2827ba18b2ddfdcf8d2f2
+  size_lines: 235
+  pr_state: MERGED
+  source_review:
+    task: cto-9362-ghport-r1-sonnet
+    model: claude-sonnet-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/common/github_client.py:1388
+    answer: A SQLite lock timeout while opening or maintaining the cache during admission raises sqlite3.OperationalError out of request() and native gh calls instead of falling back to a normal Result.
+    source:
+      finding: F1
+      fix_commits:
+      - 8245f51e2da2de8abc8b6a1f007c7765d92b98a9
+      resolved_at: 8245f51e2da2de8abc8b6a1f007c7765d92b98a9
+- id: machinery-431
+  repository: learn-ukrainian/machinery
+  pr: 431
+  base_sha: 900e0cfffbb2fd1328e04c314f83711751e54fc0
+  head_sha: e72a09fdee945176d56de077f65cadbcc3bcec95
+  size_lines: 467
+  pr_state: MERGED
+  source_review:
+    task: cto-9362-settle3-r1-sonnet
+    model: claude-sonnet-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/orchestration/stale_task_records.py:1276
+    answer: An abandoned record with no commits is marked done and linked to a merged PR that merely shares its branch name, recording delivery that never happened.
+    source:
+      finding: F1
+      fix_commits:
+      - ce782f548d422719bbc84a6b85225109e0c6ed3f
+      resolved_at: ce782f548d422719bbc84a6b85225109e0c6ed3f
+- id: machinery-447
+  repository: learn-ukrainian/machinery
+  pr: 447
+  base_sha: cde9577bcbdfa2907297b8d6f17a145eb8bd12c2
+  head_sha: a2822ac49872a3b49b36dbb268d305c0ecc8f756
+  size_lines: 158
+  pr_state: MERGED
+  source_review:
+    task: cto-344e-m100b-opus-rev1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:1265
+    answer: For legacy records without a stored result, the successful empty cache census is discarded instead of persisted, so the hourly cache walk never stops.
+    source:
+      finding: F1
+      fix_commits:
+      - 2a98d107f69e6f500999e715272c3f7cff7a5a13
+      resolved_at: 2a98d107f69e6f500999e715272c3f7cff7a5a13
+  - id: D2
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:214
+    answer: The authoritative empty-result marker is recorded while a recovery provider may still be alive and writing, suppressing future cache cleanup for a task that can still produce cache entries.
+    source:
+      finding: F3
+      fix_commits:
+      - 2a98d107f69e6f500999e715272c3f7cff7a5a13
+      resolved_at: 2a98d107f69e6f500999e715272c3f7cff7a5a13
+- id: machinery-450
+  repository: learn-ukrainian/machinery
+  pr: 450
+  base_sha: d63ee6b0f06d5457fb0ad9daf7646359a90c0801
+  head_sha: 910aea4d979a29ebf6667e7ce965569e93cb7adc
+  size_lines: 559
+  pr_state: MERGED
+  source_review:
+    task: cto-344e-parity-opus-rvA-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/publish/github.py:1604
+    answer: The ruleset PUT runs outside the unverified-write handler, so a timeout or transport failure after GitHub may have applied the update is reported as a pre-write refusal or confirmed refusal instead of an unverified write.
+    source:
+      finding: F1
+      fix_commits:
+      - 5d1361e49b9f16e9b7fb6dd9d4a4980403118e2b
+      resolved_at: 2793a0b1dafab20be021ac3c6e60f5cb192d6651
+- id: machinery-456
+  repository: learn-ukrainian/machinery
+  pr: 456
+  base_sha: d42a3e5eece6f171584bd27532ffd9036582b23c
+  head_sha: 26463d00588726633615d19f40d842bd7820d05f
+  size_lines: 31
+  pr_state: MERGED
+  source_review:
+    task: cto-f220-gemmafix-review-r1a
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/config/model_catalog.yaml:1125
+    answer: Moving the Gemma rows to a hold lifecycle lets Gemma aliases reach OpenCode bridge execution (three without the override, all four with it), because the execution gates refuse only retired models.
+    source:
+      finding: F1
+      fix_commits:
+      - a46ba386c57b43e4dc43d35b0df72f97f8dc2f25
+      resolved_at: a46ba386c57b43e4dc43d35b0df72f97f8dc2f25
+- id: machinery-481
+  repository: learn-ukrainian/machinery
+  pr: 481
+  base_sha: fcb7e8d20dd1b61e18e75ce496c97b6c615b0b25
+  head_sha: cf2ec0b0ed627e939e699fb39d5536510bbfba75
+  size_lines: 128
+  pr_state: MERGED
+  source_review:
+    task: cto-414d-spawnorphan-opus-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/cli.py:589
+    answer: A pre-lock observation that the worktree path is absent is treated as proof this dispatch created it, so attribution is not synchronized with create_worktree's later locking and can claim another dispatch's checkout.
+    source:
+      finding: F1
+      fix_commits:
+      - 3b65ed9bcd3faaba2121c3f3e22e30416ca3a2a6
+      resolved_at: 3b65ed9bcd3faaba2121c3f3e22e30416ca3a2a6
+  - id: D2
+    severity: P2
+    location: lu_machinery/dispatcher/host_admission.py:160
+    answer: Publishing worktree_path in the admission hold before the directory exists activates the missing-tree terminalization path, which can invalidate a live reservation before the worker starts.
+    source:
+      finding: F2
+      fix_commits:
+      - 3b65ed9bcd3faaba2121c3f3e22e30416ca3a2a6
+      resolved_at: 3b65ed9bcd3faaba2121c3f3e22e30416ca3a2a6
+- id: machinery-498
+  repository: learn-ukrainian/machinery
+  pr: 498
+  base_sha: fa36a6386f9a1fba8ef15b250da6837323e1796c
+  head_sha: d199e9a8c9da0c3b2e75883c4a25b13444c0f50f
+  size_lines: 53
+  pr_state: MERGED
+  source_review:
+    task: cto-d03e-i491-sol-r1-opus
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:1750
+    answer: Read-only runs whose provider failed without output are reclassified as no_deliverable, hiding real provider failures from lane health and pool-exhaustion detection, which count only failed.
+    source:
+      finding: F1
+      fix_commits:
+      - 0e5ee595a77b3c6207d5eb74f5445ee407ffea85
+      resolved_at: 0e5ee595a77b3c6207d5eb74f5445ee407ffea85
+- id: machinery-548
+  repository: learn-ukrainian/machinery
+  pr: 548
+  base_sha: 97fdf80a29f6ed463ffbd9be71b502ce2b8571ac
+  head_sha: 50844ebefb0331da33cdf7a03e337336ea626ba2
+  size_lines: 106
+  pr_state: MERGED
+  source_review:
+    task: cto-dd33-closeoutsettle-r1-opus
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/worker.py:1175
+    answer: Settlement runs merge_closeout even when the worktree is retained, which always fails while the worktree is registered, stores the failure permanently and blocks the settle_left_worktrees retry.
+    source:
+      finding: F1-closeout-on-retained-tree
+      fix_commits:
+      - 75e3ec13509599af32a2a5ced884cef86468de50
+      resolved_at: 75e3ec13509599af32a2a5ced884cef86468de50
+- id: machinery-560
+  repository: learn-ukrainian/machinery
+  pr: 560
+  base_sha: c985aac212a5f785b2eb337cfe6b6277fb3dc99d
+  head_sha: f5a70616a3ba66543d29a47b11a82d997ba905a5
+  size_lines: 410
+  pr_state: MERGED
+  source_review:
+    task: cto-3651-b557-opus-review-r2
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/dispatcher/write_boundary.py:1512
+    answer: Host-side pool operations verify the queue and holder directories once and then re-resolve mutable path components, so a worker can swap in a symlink while the host waits on the mutex and redirect host deletion and record creation outside the pool.
+    source:
+      finding: F1
+      fix_commits:
+      - 6413b33cc49ac7f1bb2ff1b8787ee026e620c5f4
+      resolved_at: 6413b33cc49ac7f1bb2ff1b8787ee026e620c5f4
+  - id: D2
+    severity: P2
+    location: lu_machinery/dispatcher/write_boundary.py:1645
+    answer: The launcher selects the new pool bind from silently defaulted governor settings rather than the host configuration, so configured dispatches can use a different pool or capacity than host tests.
+    source:
+      finding: F2
+      fix_commits:
+      - 6413b33cc49ac7f1bb2ff1b8787ee026e620c5f4
+      resolved_at: 6413b33cc49ac7f1bb2ff1b8787ee026e620c5f4
+- id: machinery-590
+  repository: learn-ukrainian/machinery
+  pr: 590
+  base_sha: dac2525c672910167f29c7ab7d1aa241af62b348
+  head_sha: b4cb0993e8d233c0fe70cab4f3cf32eda6dbd877
+  size_lines: 698
+  pr_state: MERGED
+  source_review:
+    task: cto-5039-pushtrust-opus-review-r2
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/dispatcher/write_boundary.py:489
+    answer: The private-route exemption is verified against the scanner's Git environment while the push runs with a separately sanitized environment, so a matching argv[0] does not prove the push uses the verified TLS configuration.
+    source:
+      finding: F1
+      fix_commits:
+      - de3811981638b9193e66e24fa0868a589777e51c
+      resolved_at: 0b48a239094f20c346dce502108bf1e5f898b338
+- id: machinery-595
+  repository: learn-ukrainian/machinery
+  pr: 595
+  base_sha: 8ec4041ec14ea7af63052a1465b532202c94da5b
+  head_sha: fcd94d41ea9fadbfb570c6be9f188974300e77a5
+  size_lines: 883
+  pr_state: MERGED
+  source_review:
+    task: cto-5039-i594-opus-review-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/fleet_comms/authority.py:259
+    answer: Recipient standing treats a record with missing or malformed lifecycle status, or a lane roster left incomplete by suppressed errors, as proof of settlement, so damaged authority data expires mail and ends live subscriptions.
+    source:
+      finding: F1
+      fix_commits:
+      - 3bc47558e11637bd954a319faf10209db6b62d3a
+      resolved_at: 3bc47558e11637bd954a319faf10209db6b62d3a
+- id: machinery-617
+  repository: learn-ukrainian/machinery
+  pr: 617
+  base_sha: cb76775ff429db3a78fbf4eb35853669128c2e50
+  head_sha: 810bf978b7a79a690641aae41be97fe989fdc8f7
+  size_lines: 88
+  pr_state: MERGED
+  source_review:
+    task: cto-1cad-stalelabel-sol-review-r1
+    model: claude-sonnet-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/api/state_router.py:2199
+    answer: The new age-based diagnostics.stale assignment overwrites the compute-time probe-stale flag, so a failed-probe or stale last-good snapshot is reported fresh whenever its age is at most 900 s.
+    source:
+      finding: F1
+      fix_commits:
+      - a20a3aefe1cff1c3a6e54e01674def95c80a7d9f
+      resolved_at: a20a3aefe1cff1c3a6e54e01674def95c80a7d9f
+- id: machinery-622
+  repository: learn-ukrainian/machinery
+  pr: 622
+  base_sha: a64bc0e47b1d57614aac36c9e2b4d76aa7c5bc88
+  head_sha: db1b9fbdb1ee948a3d6f66562a68fe6e2cee9a9e
+  size_lines: 58
+  pr_state: MERGED
+  source_review:
+    task: cto-1cad-testselect-sol-review-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/ci/pr_affected_tests.py:438
+    answer: In the over-cap branch the planner admits importer tests while cheaper directly changed tests stay deferred, contradicting the rule that changed tests fill the budget first.
+    source:
+      finding: F1
+      fix_commits:
+      - 926007a93456ea980288ef90bfcc7f69dd90d5f9
+      resolved_at: 926007a93456ea980288ef90bfcc7f69dd90d5f9
+- id: machinery-653
+  repository: learn-ukrainian/machinery
+  pr: 653
+  base_sha: 1eaf522ad2ff331b19beadb48b62d8e1ef44ed7e
+  head_sha: 7946447df1471cca785844d74125eb6baa986042
+  size_lines: 625
+  pr_state: MERGED
+  source_review:
+    task: cto-9069-auditwheel2-opus-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: lu_machinery/ci/audit_dependencies.py:355
+    answer: 'Isolated build dependencies are not bound to the hash-checked wheel: PIP_FIND_LINKS only adds candidates and PIP_CONSTRAINT does not constrain isolated build resolution, so a competing index build can be selected.'
+    source:
+      finding: F1
+      fix_commits:
+      - e0e14bcc0c99e37bb6e94939dd567a1969196cab
+      resolved_at: e0e14bcc0c99e37bb6e94939dd567a1969196cab
+  - id: D2
+    severity: P1
+    location: lu_machinery/ci/audit_dependencies.py:211
+    answer: The requirement classifier accepts pinned and VCS lines that pip resolves to an existing local directory, so a path-shadowed install is treated as a named requirement and its pyproject.toml is never audited.
+    source:
+      finding: F2
+      fix_commits:
+      - e0e14bcc0c99e37bb6e94939dd567a1969196cab
+      resolved_at: e0e14bcc0c99e37bb6e94939dd567a1969196cab
+- id: machinery-678
+  repository: learn-ukrainian/machinery
+  pr: 678
+  base_sha: 8ef8addcf7fc22ab3fcb75cb29aee5472f2f581a
+  head_sha: 78b478487d0a950b9c02641b90ebe53fb046578e
+  size_lines: 94
+  pr_state: MERGED
+  source_review:
+    task: cto-4d9a-fcroot-r1
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/fleet_comms/cold_start_board.py:890
+    answer: The cold-start-board CLI turns an omitted repo_root into the caller's cwd before default_plane_root(), so the configured authority anchor and its missing-configuration refusal never apply.
+    source:
+      finding: F1
+      fix_commits:
+      - a3fc7aad432c707a15e298b8830d3ff02a79d032
+      resolved_at: a3fc7aad432c707a15e298b8830d3ff02a79d032
+- id: machinery-682
+  repository: learn-ukrainian/machinery
+  pr: 682
+  base_sha: e57c5906c4c08f3606b8d3989f5189d1fc55b668
+  head_sha: 05b3a255fc0ac7af23e8c2cbef37dcca913162b6
+  size_lines: 4470
+  pr_state: OPEN
+  source_review:
+    task: cto-33f8-m1uv-r1-sol
+    model: gpt-6.1-sol
+    family: openai
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P1
+    location: .github/actions/uv-python/action.yml:63
+    answer: Activating an unseeded uv venv makes python resolve to an interpreter without pip, so the installed-wheel job's python -m pip download fails in both matrix entries.
+    source:
+      finding: F1
+      fix_commits:
+      - b535249b6c80fdbf2af1fe86501ef3ebf5baaa73
+      resolved_at: b535249b6c80fdbf2af1fe86501ef3ebf5baaa73
+  - id: D2
+    severity: P2
+    location: .github/workflows/tests.yml:191
+    answer: The test wheel is installed with --no-index --no-deps but no expected hash, dropping the hash verification the previous consumer-lock install enforced.
+    source:
+      finding: F2
+      fix_commits:
+      - b535249b6c80fdbf2af1fe86501ef3ebf5baaa73
+      resolved_at: b535249b6c80fdbf2af1fe86501ef3ebf5baaa73
+- id: machinery-688
+  repository: learn-ukrainian/machinery
+  pr: 688
+  base_sha: e248a9d24bfdff3cfa931c59daa811746f0db4b4
+  head_sha: 9f1d612af320a26467429cbd6fc7886db2a79a69
+  size_lines: 137
+  pr_state: MERGED
+  source_review:
+    task: cto-2817-ownverify-rev-r1
+    model: claude-opus-5-5
+    family: anthropic
+    verdict: CHANGES_REQUESTED
+    recorded: cf-verdict PR comment
+  defects:
+  - id: D1
+    severity: P2
+    location: lu_machinery/dispatcher/git.py:127
+    answer: Changing the shared Git fetch wrapper's exception type lets fetch failures escape the salvage push gate's OSError/SubprocessError suppression, so a transient fetch error becomes a permanent, never-retried opsec_refused disposition.
+    source:
+      finding: F1
+      fix_commits:
+      - a28a1d8c0beb0dd6b9d64ed0c9b5c3af5e2d2976
+      resolved_at: d859fa03e65f41803635c10ec274d3bd4ee4f120

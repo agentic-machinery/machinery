@@ -1,0 +1,40 @@
+# Frozen protocol for the reviewer-grading run (operator order VERIFY-ADOPT item 4). See README.md.
+# lu_machinery.bakeoff.review_eval reads this file; changing it after the CTO's approval voids the
+# approval, as does changing known-answers.yaml or controls.yaml.
+schema_version: 1
+frozen_on: '2026-11-17'
+
+# Fleet repository keys (lu_machinery/config/fleet_repos.yaml) for the repositories in the set.
+repositories:
+  learn-ukrainian/machinery: machinery
+  learn-ukrainian/learn-ukrainian.github.io: public
+
+# Review seats under evaluation. Each seat reviews every planned case once, read-only, at the
+# case's exact head, with the code-review findings schema bound. review_role: true seats run the
+# dispatcher's formal review path (--review-profile code --require-review-verdict); Carbon holds no
+# review role in the model catalog, so it runs as today's parallel Carbon reviews do, read-only with
+# the same schema bound through --output-schema. attested_model is the identity the task record
+# must show: the stream-reported model for Cursor and AGY (Cursor reports a display name, which the
+# catalog maps to grok-4.7 for the grok-4.7-high pin), the requested model elsewhere.
+# usd_per_review is an assumed API-equivalent planning figure, not a measurement: these seats run
+# on subscription allowances. The canary step measures the real usage before the full run.
+seats:
+  sol: {review_role: true, agent: codex, model: gpt-6.1-sol, attested_model: gpt-6.1-sol, family: openai, effort: high, minutes_per_review: 15, usd_per_review: 3.0}
+  opus: {review_role: true, agent: claude, model: claude-opus-5-5, attested_model: claude-opus-5-5, family: anthropic, effort: high, minutes_per_review: 15, usd_per_review: 4.0}
+  grok: {review_role: true, agent: cursor, model: grok-4.7-high, attested_model: grok-4.7, family: xai, effort: high, minutes_per_review: 12, usd_per_review: 2.0}
+  carbon: {review_role: false, agent: agy, model: gemini-4-carbon-medium, attested_model: gemini-4-carbon-medium, family: google, effort: high, minutes_per_review: 12, usd_per_review: 2.0}
+
+# Judges, in order of preference. A reviewer's findings are judged by the first judge whose family
+# differs from the reviewer's family. Judges only map findings to answer keys; they never review.
+judges:
+  - {seat: opus, agent: claude, model: claude-opus-5-5, family: anthropic, minutes_per_judgement: 3, usd_per_judgement: 0.5}
+  - {seat: sol, agent: codex, model: gpt-6.1-sol, family: openai, minutes_per_judgement: 3, usd_per_judgement: 0.4}
+
+# Hard limits the runner enforces. A seat whose planned cost exceeds its ceiling is refused before
+# any dispatch; a seat stops after max_consecutive_failures failed reviews in a row.
+limits:
+  usd_ceiling_per_seat: 300
+  max_consecutive_failures: 3
+  review_hard_timeout_s: 3600
+  judge_hard_timeout_s: 900
+  attempts_per_review: 2
