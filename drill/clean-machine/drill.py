@@ -548,30 +548,26 @@ ADMISSION_POLICY = {
     "content_sha256": "1ccc53ccd3aa2409611673006bcfe0ed76c6d0b4591878399c72f6b60093ff56",
 }
 
-SOURCES_SERVER_STANDIN = '''"""Drill stand-in for the product's Sources MCP server (declarations the dispatcher parses).
-
-The drill's loopback Sources stand-in answers /health and verify_word from a four-word public
-VESUM sample; this file only declares the read-only tool surface.
-"""
+FIXTURES = KIT / "fixtures"
 
 
-class ToolAnnotations:
-    def __init__(self, **hints):
-        self.hints = hints
+def sources_server_standin(tools: dict[str, list[str]]) -> str:
+    """Declaration-only stand-in for the product's Sources MCP server, from the extracted tool list."""
+    calls = [f"_tool(name={name!r})" for name in tools["read_only"]]
+    calls += [
+        f"_tool(name={name!r}, annotations=PERSISTING)" for name in tools["persisting"]
+    ]
+    body = ",\n        ".join(calls)
+    return (
+        '"""Drill stand-in for the product\'s Sources MCP server: tool declarations only.\n\n'
+        "Generated from fixtures/sources-tools.json (names parsed from the real server, never executed).\n"
+        '"""\n\n\n'
+        "class ToolAnnotations:\n    def __init__(self, **hints):\n        self.hints = hints\n\n\n"
+        "READ_ONLY = ToolAnnotations(readOnlyHint=True)\nPERSISTING = ToolAnnotations(readOnlyHint=False)\n\n\n"
+        'def _tool(**kwargs):\n    kwargs.setdefault("annotations", READ_ONLY)\n    return kwargs\n\n\n'
+        f"async def list_tools():\n    return [\n        {body},\n    ]\n"
+    )
 
-
-READ_ONLY = ToolAnnotations(readOnlyHint=True)
-PERSISTING = ToolAnnotations(readOnlyHint=False)
-
-
-def _tool(**kwargs):
-    kwargs.setdefault("annotations", READ_ONLY)
-    return kwargs
-
-
-async def list_tools():
-    return [_tool(name="verify_word"), _tool(name="verify_words"), _tool(name="mcp_server_identity")]
-'''
 
 START_CLAUDE_STANDIN = """#!/usr/bin/env bash
 # Drill stand-in for the product's start script: it sources the installed release's launcher core.
@@ -648,16 +644,14 @@ def git_env(home: Path) -> dict[str, str]:
 
 
 def task_record(
-    task_id: str, status: str, finished: datetime, product: Path
+    index: int, extract: dict[str, str], finished: datetime, product: Path
 ) -> dict[str, Any]:
+    """One dispatcher record: scrubbed real status, mode, agent and model; synthetic id, path and times."""
     stamp = finished.strftime("%Y-%m-%dT%H:%M:%SZ")
     return {
         "schema_version": 2,
-        "task_id": task_id,
-        "agent": "claude",
-        "model": "drill-model",
-        "status": status,
-        "mode": "read-only",
+        "task_id": task_id_for(index),
+        **{key: extract[key] for key in ("agent", "model", "status", "mode")},
         "created_at": stamp,
         "started_at": stamp,
         "finished_at": stamp,
@@ -666,6 +660,11 @@ def task_record(
         "cwd": str(product),
         "worker_pid": None,
     }
+
+
+def task_id_for(index: int) -> str:
+    """Records 1 and 2 are thirty days old; record 3 finished now."""
+    return f"drill-old-{index}" if index < 3 else f"drill-fresh-{index}"
 
 
 def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
@@ -705,7 +704,9 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
     )
     (product / ".mcp" / "servers" / "sources").mkdir(parents=True)
     (product / ".mcp" / "servers" / "sources" / "server.py").write_text(
-        SOURCES_SERVER_STANDIN
+        sources_server_standin(
+            json.loads((FIXTURES / "sources-tools.json").read_text())
+        )
     )
     start = product / "start-claude.sh"
     start.write_text(START_CLAUDE_STANDIN)
@@ -749,14 +750,11 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
     tasks = product / "batch_state" / "tasks"
     tasks.mkdir(parents=True)
     old = datetime.now(UTC) - timedelta(days=30)
-    for task_id, status, finished in (
-        ("drill-old-done", "done", old),
-        ("drill-old-failed", "failed", old),
-        ("drill-fresh-done", "done", datetime.now(UTC)),
-    ):
-        (tasks / f"{task_id}.json").write_text(
-            json.dumps(task_record(task_id, status, finished, product), indent=1)
-        )
+    extracts = json.loads((FIXTURES / "task-records.json").read_text())
+    for index, extract in enumerate(extracts[:3], start=1):
+        finished = old if index < 3 else datetime.now(UTC)
+        record = task_record(index, extract, finished, product)
+        (tasks / f"{record['task_id']}.json").write_text(json.dumps(record, indent=1))
     git(["init", "-q", "-b", "main"], product, env)
     git(["add", "-A"], product, env)
     git(["commit", "-q", "-m", "drill: synthetic product"], product, env)
@@ -807,24 +805,9 @@ def build_world(workdir: Path, base_python: str) -> dict[str, Path]:
         "".join(json.dumps(line) + "\n" for line in lines)
     )
 
-    # Lane data for the tmux lane rows: one synthetic lane, no real launcher.
-    lanes = {
-        "schema_version": 1,
-        "lanes": [
-            {
-                "session": "drill-lane",
-                "lane": "drill-lane",
-                "cwd": str(product),
-                "command": ["/bin/true"],
-                "context_guard": False,
-            }
-        ],
-    }
-    (world / "fixtures" / "driver_lanes.json").write_text(json.dumps(lanes, indent=1))
-
-    # Sources stand-in data: a few public, VESUM-attested everyday words (lemma, tag).
-    (world / "fixtures" / "vesum-standin.tsv").write_text(
-        "мова\tnoun:inanim:f:v_naz\nкнига\tnoun:inanim:f:v_naz\nхата\tnoun:inanim:f:v_naz\nвода\tnoun:inanim:f:v_naz\n"
+    # Sources stand-in data: the scrubbed VESUM sample (word form, lemma, part of speech, tags).
+    shutil.copyfile(
+        FIXTURES / "vesum-sample.tsv", world / "fixtures" / "vesum-standin.tsv"
     )
     (world / "tmp").mkdir()
     (world / "scratchroot").mkdir()
@@ -972,7 +955,7 @@ def sources_routes() -> dict[str, tuple[int, str, bytes]]:
     health = {
         "status": "ok",
         "service": "drill-sources-standin",
-        "corpus": "vesum-standin",
+        "corpus": "vesum-sample",
     }
     return {"/health": (200, "application/json", json.dumps(health).encode())}
 
@@ -1446,7 +1429,7 @@ def summarize(
             "failed_rows": failed,
             "seconds": round(sum(r["duration_s"] for r in receipts), 1),
         }
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = dict.fromkeys(data["classes"], 0)
     for row in data["rows"]:
         counts[row["class"]] = counts.get(row["class"], 0) + 1
     summary["classification"] = counts
@@ -1510,6 +1493,80 @@ def phase_main(args: argparse.Namespace) -> int:
     return 0 if all(r["status"] == "pass" for r in receipts) else 1
 
 
+COMPACT_LIMIT = 15 * 1024
+
+
+def _failure_line(receipt: dict[str, Any]) -> str:
+    detail = ""
+    for line in reversed(receipt["stdout_tail"].splitlines()):
+        if line.startswith('{"probe"'):
+            try:
+                detail = json.dumps(json.loads(line).get("detail"), ensure_ascii=False)
+            except ValueError:
+                detail = line
+            break
+    reasons = "; ".join(receipt["failures"])
+    return f"  {receipt['row']} {receipt['probe']}: {reasons} {detail[:300]}".rstrip()
+
+
+def compact_summary(
+    summary: dict[str, Any], phases: dict[str, list[dict[str, Any]]]
+) -> str:
+    """Plain-text summary for a reply limited to 16 KiB; the receipts keep every detail."""
+    lines = [
+        f"lu-machinery clean-machine drill: {summary['result'].upper()} at {summary['finished_utc']}"
+    ]
+    for phase, info in summary["phases"].items():
+        lines.append(
+            f"{phase} v{info['version']}: {info['pass']}/{info['rows']} rows pass in {info['seconds']} s"
+        )
+        lines += [
+            _failure_line(r) for r in phases.get(phase, []) if r["status"] != "pass"
+        ]
+    checks = ", ".join(
+        f"{name} {'ok' if item.get('ok') else 'FAIL'} ({item.get('checked', 0)} files, {item.get('problem_count', '?')} problems)"
+        for name, item in summary["integrity"].items()
+    )
+    lines.append(f"RECORD checks: {checks}")
+    receipts = [r for rows in phases.values() for r in rows]
+    violations = sum(r["origin"].get("violation_count", 0) for r in receipts)
+    lines.append(
+        f"origin: {summary['environment']['strace'] and 'strace' or 'not checked'}, {violations} violations; isolation: {summary['environment']['isolation']}"
+    )
+    lines.append(
+        "classes: "
+        + ", ".join(f"{k} {v}" for k, v in sorted(summary["classification"].items()))
+    )
+    lines.append(
+        "wheels sha256: " + ", ".join(f"v{v} {h}" for v, h in summary["wheels"].items())
+    )
+    env = summary["environment"]
+    lines.append(
+        f"environment: python {env['python']}, {env['platform']}, {env['git']}"
+    )
+    if summary.get("partial"):
+        lines.append("partial run (--only or --forward-only): not a drill result")
+    text = "\n".join(lines) + "\n"
+    if len(text.encode()) > COMPACT_LIMIT:
+        text = (
+            text.encode()[: COMPACT_LIMIT - 64].decode(errors="ignore")
+            + "\n[truncated; see out/summary.json]\n"
+        )
+    return text
+
+
+def clean_workdir(workdir: Path, phases: dict[str, list[dict[str, Any]]]) -> None:
+    """Delete everything the drill built except out/, and the traces of rows that passed."""
+    for name in ("venv", "world", "wheels"):
+        shutil.rmtree(workdir / name, ignore_errors=True)
+    for phase, receipts in phases.items():
+        for receipt in receipts:
+            if receipt["status"] == "pass":
+                (
+                    workdir / "out" / "traces" / phase / f"{receipt['row']}.strace"
+                ).unlink(missing_ok=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -1521,9 +1578,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--workdir",
-        required=True,
         type=Path,
-        help="Empty or drill-owned directory for every artifact",
+        help="Empty or drill-owned directory for every artifact (default: a new ./lu-drill-<UTC time>)",
+    )
+    parser.add_argument(
+        "--keep-work",
+        action="store_true",
+        help="Keep the venv, mock world, wheels and every trace (default: keep only out/)",
     )
     parser.add_argument(
         "--version", default="0.1.28", help="Forward release (default 0.1.28)"
@@ -1577,6 +1638,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"drill: phase failed: {exc}", file=sys.stderr)
             return 2
 
+    if args.workdir is None:
+        args.workdir = (
+            Path.cwd() / f"lu-drill-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        )
+        if args.workdir.exists():
+            print(f"drill: {args.workdir} already exists", file=sys.stderr)
+            return 2
     workdir = args.workdir.resolve()
     use_strace = not args.no_strace
     isolation = args.isolation
@@ -1688,12 +1756,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     summary["result"] = "pass" if ok else ("partial" if summary["partial"] else "fail")
     (out / "summary.json").write_text(json.dumps(summary, indent=1) + "\n")
-    print(
-        json.dumps(
-            {k: summary[k] for k in ("result", "phases", "classification")}, indent=1
-        )
+    compact = compact_summary(summary, phases)
+    (out / "summary.txt").write_text(compact)
+    if not args.keep_work:
+        clean_workdir(workdir, phases)
+    print(compact, end="")
+    log(
+        f"receipts in {out / 'receipts'}; summary {out / 'summary.json'} and {out / 'summary.txt'}"
     )
-    log(f"receipts in {out / 'receipts'}; summary {out / 'summary.json'}")
     return 0 if ok else 1
 
 

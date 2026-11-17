@@ -6,13 +6,15 @@ runs every consumer row against that install, rolls back to the previous release
 again, and writes one JSON receipt per row per phase.
 
 Rows that need things only a production host has run against mocks instead: a synthetic product
-checkout, synthetic stores, fake credentials, stub command-line tools (`gh`, `systemctl`, `tmux`,
-`sudo`, provider CLIs) and two loopback stand-ins (Monitor on 127.0.0.1:8765, Sources on
-127.0.0.1:8766). `rows.json` lists every row with its class and mocks.
+checkout, small scrubbed extracts of real stores (`fixtures/`), fake credentials, stub command-line
+tools (`gh`, `systemctl`, `tmux`, `sudo`, provider CLIs) and two loopback stand-ins (Monitor on
+127.0.0.1:8765, Sources on 127.0.0.1:8766). `rows.json` lists every row with its class and mocks.
+No real secret and no private data is used anywhere.
 
 ## What you need
 
-- Linux with CPython 3.12 or newer (`python3 --version`).
+- Linux with CPython 3.12 or newer (`python3 --version`). Debian 13's Python 3.13 works. If the
+  dependency install fails on it, pass `--python "$(uv python find 3.12)"`.
 - `git` and `bash`.
 - `strace`. Each row runs under it, and any machinery code loaded from outside the installed
   release fails the row. `--no-strace` skips this check, and the receipts then say the origin
@@ -22,7 +24,7 @@ checkout, synthetic stores, fake credentials, stub command-line tools (`gh`, `sy
   and no other checkout on the machine. Without it, ports 8765 and 8766 must be free and the kit
   must not sit inside a machinery checkout.
 - Network access to github.com (release downloads) and pypi.org (dependencies) during setup only.
-- About 1 GB of disk space and 10 minutes.
+- About 1 GB of free disk space while it runs, under 1 GB of memory, and 10 to 15 minutes.
 
 On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bubblewrap`.
 
@@ -44,31 +46,29 @@ On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bu
    ls   # drill.py  probes.py  rows.json  README.md
    ```
 
-3. Run the whole drill in a new, empty work directory:
+3. Run the whole drill. With no `--workdir` it creates a new `./lu-drill-<UTC time>` directory and
+   touches nothing outside it (pip's cache and every row's home directory live inside it too):
 
    ```sh
-   python3 -I drill.py all --workdir ~/drill-work --version 0.1.28 --rollback-to 0.1.27
+   python3 -I drill.py all --version 0.1.28 --rollback-to 0.1.27
    ```
 
    The kit downloads both wheels and `SHA256SUMS` from the GitHub release, checks the sums,
    installs v0.1.28, checks every installed file against the wheel's RECORD, runs all rows, rolls
    back to v0.1.27 (RECORD check again), runs all rows again, then rolls forward to v0.1.28 and
-   checks RECORD once more.
+   checks RECORD once more. At the end it deletes the venv, the mock world, the wheels and the
+   traces of rows that passed, and keeps `out/` (pass `--keep-work` to keep everything).
 
-4. Read the result. The last lines printed are the summary. The exit code is 0 when every row
-   passed in both phases and every RECORD check passed, 1 when anything failed, and 2 when setup
-   failed.
+4. Read the result. The kit prints `out/summary.txt` last: one screen of text, always under
+   16 KiB, with the per-phase counts, each failed row with its reason, the RECORD checks, the
+   origin check and the environment. The exit code is 0 when every row passed in both phases and
+   every RECORD check passed, 1 when anything failed, and 2 when setup failed.
 
-   ```sh
-   cat ~/drill-work/out/summary.json
-   ls ~/drill-work/out/receipts/forward ~/drill-work/out/receipts/rollback
-   ```
-
-5. Send back `out/summary.json` and the receipts of any failed row
-   (`out/receipts/<phase>/<row>.json`). Receipts hold paths inside the work directory only.
+5. Reply with the text of `out/summary.txt`. Every detail stays on disk in `out/summary.json` and
+   `out/receipts/<phase>/<row>.json`; receipts hold paths inside the work directory only.
 
 To re-run some rows, add `--only R005` (a row id) or `--only api` (a probe id), with
-`--reuse-venv` to keep the installed venv. A run with `--only` or `--forward-only` is reported as
+`--workdir <earlier dir> --keep-work --reuse-venv` to keep the installed venv. A run with `--only` or `--forward-only` is reported as
 `partial`, never as a pass.
 
 ## Receipts
@@ -93,6 +93,22 @@ checks; and the environment (Python, platform, git, strace, isolation).
 Rows whose real consumer does not use machinery at all run a stand-in that proves exactly that:
 its interpreter cannot import the release, or it loads no release code. Rows that run as root on a
 production host run through the `sudo` stand-in as the current user.
+
+## Fixtures: scrubbed extracts of real stores
+
+`fixtures/` is built on a host that has the product checkout, never on the tester's machine, by
+`extract_fixtures.py` (run it with `bash -c 'ulimit -v 2000000; python3 -I extract_fixtures.py
+--product-root <product checkout>'`). It opens every store read-only and writes nothing back:
+
+| File | Source | Kept | Dropped |
+|---|---|---|---|
+| `vesum-sample.tsv` | VESUM (`forms_all`, read through the lemma index, `LIMIT` per lemma) | word form, lemma, part of speech and tags for ten common words | row and entry ids, source comments and locations |
+| `sources-tools.json` | the Sources MCP server's `server.py`, parsed with `ast`, never executed | tool names and whether each is read-only | everything else in the file |
+| `task-records.json` | three terminal dispatcher records (schema 2) | status, mode, agent and model | ids, prompts, paths, branches, accounts, PIDs, hosts, timestamps and every other field |
+
+The drill gives the task records synthetic ids, paths and timestamps. The extractor refuses output
+that names a home directory, an e-mail address or a non-loopback IPv4 address. Credentials are
+always fake. Session transcripts are never extracted: the digest rows use a synthetic session.
 
 ## What a pass does not prove
 

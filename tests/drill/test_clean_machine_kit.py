@@ -11,6 +11,7 @@ import ast
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -199,10 +200,22 @@ HOST_PATTERNS = {
 }
 
 
-@pytest.mark.parametrize("path", sorted(p.name for p in KIT.iterdir() if p.is_file()))
+def _tracked_kit_files() -> list[str]:
+    root = KIT.parents[1]
+    listed = subprocess.run(
+        ["git", "ls-files", "--", "drill/clean-machine"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    return sorted(str((root / name).relative_to(KIT)) for name in listed)
+
+
+@pytest.mark.parametrize("path", _tracked_kit_files())
 def test_kit_holds_no_host_specific_strings(path):
-    """Defect class: the public kit leaking a host's paths, private repositories, deployed
-    unit names, addresses, accounts or credentials (the repository is public)."""
+    """Defect class: the public kit or its extracted fixtures leaking a host's paths, private
+    repositories, deployed unit names, addresses, accounts or credentials (the repository is public)."""
     text = (KIT / path).read_text()
     found = {
         label: pattern.findall(text)[:3]
@@ -210,3 +223,16 @@ def test_kit_holds_no_host_specific_strings(path):
         if pattern.search(text)
     }
     assert not found, f"{path}: {found}"
+
+
+def test_extracted_task_records_keep_only_scrubbed_fields():
+    """Defect class: a fixture extract carrying private task data (prompts, paths, ids, accounts)
+    instead of the scrubbed status, mode, agent and model."""
+    records = json.loads((KIT / "fixtures" / "task-records.json").read_text())
+    assert len(records) >= 3
+    assert all(
+        set(record) == {"status", "mode", "agent", "model"} for record in records
+    )
+    assert (
+        sum(path.stat().st_size for path in (KIT / "fixtures").iterdir()) < 1024 * 1024
+    )

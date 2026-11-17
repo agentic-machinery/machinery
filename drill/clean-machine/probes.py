@@ -515,7 +515,7 @@ def linked_worktree(_: list[str]) -> tuple[bool, dict]:
         ids = sorted(item.get("task_id") for item in json.loads(result.stdout))
     except (ValueError, AttributeError):
         ids = []
-    ok = result.returncode == 0 and "drill-old-done" in ids
+    ok = result.returncode == 0 and "drill-old-1" in ids
     return ok, {"rc": result.returncode, "tasks": ids[:10], "err": result.stderr[-300:]}
 
 
@@ -926,8 +926,8 @@ def stale_records(_: list[str]) -> tuple[bool, dict]:
         else []
     )
     ok = result.returncode == 0 and archived == [
-        "drill-old-done.json",
-        "drill-old-failed.json",
+        "drill-old-1.json",
+        "drill-old-2.json",
     ]
     return ok, {
         "rc": result.returncode,
