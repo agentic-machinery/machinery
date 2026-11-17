@@ -1144,10 +1144,11 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
-            # #586: Hydrogen is an AGY work model with no review or advisory role, so it joins
-            # no seat, review route, ladder or ranking; its row is pinned and every other field stays frozen.
+            # #586 + USE-HYDROGEN-1117 / HYDROGEN-COUNCIL-ALL-1117: Hydrogen is an AGY work model
+            # with advisory and non-record surface_review roles for council and parallel review
+            # evaluation; it joins no review-of-record seat, ladder or ranking, and its row is pinned.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
-            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "d65beae8f847d7d054ff7fba403215567fd7da70817ae873d9c3fd637612e3d4"
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "b9ee6e05ec63288cb8ae81df94b0935098fddd0e7f2366508c5e562e54fc2f07"
         assert value == expected, f"current surface differs: {surface}"
 
 

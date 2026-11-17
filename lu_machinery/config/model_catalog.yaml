@@ -766,9 +766,10 @@ models:
     # -medium is the routing wire id; -low, -high and -xhigh are runtime ids for
     # explicit selection and identity attestation, not aliases.
     runtime_model_ids: [gemini-4-hydrogen-low, gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh]
-    # Work roles only, as Carbon. No review, Ukrainian review or advisory role
-    # until a held-out evaluation reports.
-    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
+    # Work roles plus advisory and non-record surface_review for the 2026-11-17
+    # evaluation period (USE-HYDROGEN-1117, HYDROGEN-COUNCIL-ALL-1117); stays out
+    # of review_ladders (not a review-of-record seat).
+    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis, advisory, surface_review]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels, lower_price_than_carbon]
     weaknesses:
@@ -787,9 +788,14 @@ models:
       evaluation ran -medium and -high through AGY. Dispatch: `python -m
       lu_machinery.dispatch dispatch --agent agy --model
       gemini-4-hydrogen-medium`; -low, -high and -xhigh are explicit selections
-      only. Hydrogen holds no review role, so it is refused for any review of
-      record; review ladders, the Ukrainian review route and the certified
-      Gemini driver seat are unchanged. Model card (2026-11-12):
+      only. Under operator orders USE-HYDROGEN-1117 and HYDROGEN-COUNCIL-ALL-1117
+      (2026-11-17), Hydrogen is in an evaluation period for data collection and
+      re-evaluation: it holds advisory and non-record surface_review roles so it
+      serves as a standing member of every council and runs parallel non-record
+      reviews, while staying out of the review-of-record ladders (council answers
+      and parallel reviews are input, not designated approval or review of
+      record); the Ukrainian review route and the certified Gemini driver seat
+      are unchanged. Model card (2026-11-12):
       adapted from Gemini 4 Carbon, one 1M-token window shared by input and
       output (64K synchronous output by default), knowledge cutoff March 2026,
       four thinking levels, occasional slowness or timeouts and higher token use
