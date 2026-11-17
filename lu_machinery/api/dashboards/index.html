@@ -739,8 +739,11 @@ function payloadFreshness(url, data, receivedAt) {
   // A timestamp of the attempt does not make a failed collection usable: availability is the payload's own status.
   const status = typeof data.status === "string" ? data.status : typeof data.state === "string" ? data.state : null;
   // "pending" is a body with no observation yet, so it is unavailable too; "partial" is populated but degraded.
+  // A partial list in which no repository answered is a total outage, not partial data.
+  const repos = Array.isArray(data.repositories) ? data.repositories : [];
+  const nobody = status === "partial" && repos.length > 0 && repos.every(repo => repo.status !== "ok");
   const failed = status !== null && status !== "ok" && status !== "partial";
-  return own && {...own, unavailable: failed, partial: status === "partial"};
+  return own && {...own, unavailable: failed || nobody, partial: status === "partial"};
 }
 
 function payloadAge(url, data, receivedAt) {

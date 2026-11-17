@@ -501,6 +501,8 @@ assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', r
 assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
   repositories: [{status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound 900s$/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
+assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 0, stale: false,
+  repositories: [{status: 'unknown'}, {status: 'unknown'}]}}).text, /· unavailable ·/);
 assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'pending', accounts: []}}).text, /· unavailable ·/);
 // An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
 const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
