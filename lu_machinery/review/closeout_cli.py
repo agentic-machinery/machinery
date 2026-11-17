@@ -935,21 +935,34 @@ _CHECKLIST_EVIDENCE_LIMIT = 5
 # Renames and copies, including copies of a file the diff leaves unchanged; both diff passes use
 # the same options so every patch header names a file the status list holds.
 _CHECKLIST_DETECTION = ("-M", "-C", "--find-copies-harder")
-# What judges a change: the checklist and ownership map, the review tiers, budget and parameters,
-# the model catalog that seats the reviewer, the review package (this CLI, the resolver, the reply
-# contract and parser, the recorder), the verifier, the reply schema and its binding, the review
-# skills and brief template, and the rules. A diff touching any of them changes its own judge, so it
-# gets the built-in judge-change item, which no checklist edit removes.
+# What judges a change, as a class: the checklist and ownership map; review configuration and the
+# catalog and substitutions that seat the reviewer; the review package (this CLI, the resolver, the
+# reply contract, parser and recorder); the verifier; the reply schema, its binding and the provider
+# and adapter code that runs a reviewer and validates its structured reply; the publication and
+# finalization of verdicts; the gates that let a verdict land a PR; the review skills and brief
+# template; and the rules. A diff touching any of them changes its own judge, so it gets the built-in
+# judge-change item, which no checklist edit removes.
 _JUDGE_PATHS = (
     "**/config/reliability_checklist.yaml",
     "**/config/code_owners.yaml",
     "**/config/review_*.yaml",
     "**/config/model_catalog.yaml",
+    "**/config/agent_fallback_substitutions.yaml",
     "lu_machinery/review/**",
     "scripts/review/**",
     "**/verify_review.py",
-    "**/schemas/code-review-findings.v1.schema.json",
+    "**/schemas/code-review-*",
     "**/dispatcher/output_schema.py",
+    "**/dispatcher/worker.py",
+    "**/dispatcher/review_attempt.py",
+    "**/dispatcher/providers/**",
+    "**/agent_runtime/adapters/**",
+    "**/ai_agent_bridge/_review_safety.py",
+    "**/fleet_comms/review_publication.py",
+    "**/fleet_comms/formal_review_finalize.py",
+    "**/ci/queue_review_gate.py",
+    "**/orchestration/integration_sweep.py",
+    "**/orchestration/merge_queue_keeper.py",
     "agents_extensions/**/skills/review-loop/**",
     "agents_extensions/**/skills/local-code-review/**",
     "agents_extensions/**/skills/drive-epic/references/review-merge-cleanup.md",
@@ -1000,7 +1013,7 @@ def _glob_regex(pattern: str) -> re.Pattern[str]:
         parts.append(body if last else body + "/")
     try:
         return re.compile("".join(parts), re.DOTALL)
-    except re.error as exc:
+    except (re.error, OverflowError, RecursionError) as exc:
         raise CloseoutStateError(f"checklist path glob invalid: {pattern!r}") from exc
 
 
@@ -1093,7 +1106,8 @@ def _load_yaml(raw: bytes, what: str) -> Any:
             return loader.get_single_data()
         finally:
             loader.dispose()
-    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+    except (UnicodeDecodeError, yaml.YAMLError, ValueError, OverflowError, TypeError, RecursionError) as exc:
+        # A SafeLoader scalar can still raise ValueError (an impossible date) or OverflowError.
         raise CloseoutStateError(f"{what} is not valid YAML") from exc
 
 
@@ -1172,7 +1186,7 @@ def _checklist_items(raw: bytes, areas: Mapping[str, Any]) -> list[dict[str, Any
                 else:
                     try:
                         compiled[key] = [re.compile(value) for value in values]
-                    except re.error as exc:
+                    except (re.error, OverflowError, RecursionError) as exc:
                         raise CloseoutStateError(f"checklist item {item_id} {key} regex invalid") from exc
             triggers.append(compiled)
         items.append(
@@ -1353,7 +1367,12 @@ def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, An
         "areas": touched,
         "unmapped": [path for path in changed_paths if path not in mapped],
     }
-    schema_changed = schema_source["path"] in judge_changed
+    schema_text = None
+    if schema_source["path"] in judge_changed:
+        try:
+            schema_text = schema.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CloseoutStateError(f"{schema_source['path']} at the merge-base is not UTF-8") from exc
     return {
         "base": base_sha,
         "head": head_sha,
@@ -1366,7 +1385,7 @@ def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, An
         "matched": matched,
         "code_owners": owner_report,
         "brief_section": _checklist_brief(
-            merge_base, head_sha, source, matched, owner_report, schema if schema_changed else None
+            merge_base, head_sha, source, matched, owner_report, schema_text
         ),
     }
 
@@ -1384,7 +1403,7 @@ def _checklist_brief(
     source: dict[str, str],
     matched: list[dict[str, Any]],
     owners: dict[str, Any],
-    changed_schema: bytes | None,
+    changed_schema: str | None,
 ) -> str:
     def origin(read: dict[str, str]) -> str:
         where = f"merge-base `{merge_base}`" if read["kind"] == "merge-base" else "the installed release"
@@ -1431,14 +1450,22 @@ def _checklist_brief(
             f"The reply schema as the merge-base holds it (this diff changes `{_checkout_relative(_SCHEMA_RELATIVE)}`):",
             "",
             "```json",
-            changed_schema.decode("utf-8").rstrip("\n"),
+            changed_schema.rstrip("\n"),
             "```",
         ]
     return "\n".join(lines) + "\n"
 
 
 def _cmd_checklist(args: argparse.Namespace) -> int:
-    print(json.dumps(reliability_checklist(args.repo_root, args.base, args.head), indent=2))
+    try:
+        report = reliability_checklist(args.repo_root, args.base, args.head)
+    except CloseoutStateError:
+        raise
+    except Exception as exc:
+        # Every input this command reads (Git objects, both YAML files, the diff) is parsed here;
+        # whatever escapes a specific check still fails closed as a typed refusal, never a traceback.
+        raise CloseoutStateError(f"checklist failed closed: {type(exc).__name__}: {exc}") from exc
+    print(json.dumps(report, indent=2))
     return 0
 
 
