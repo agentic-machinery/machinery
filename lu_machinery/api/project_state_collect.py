@@ -82,14 +82,16 @@ def resolve_work_private_root(primary_root: Path) -> Path:
     return (primary_root.parent / "learn-ukrainian-infra-private").resolve()
 
 
-def origin_main_age_s(repo_root: Path) -> float:
+def origin_main_age_s(repo_root: Path) -> float | None:
+    """Seconds since the last fetch (FETCH_HEAD mtime), or ``None`` when the checkout was never fetched."""
     fetch_head = repo_root / ".git" / "FETCH_HEAD"
     if not fetch_head.is_file():
-        git_dir = _git(repo_root, "rev-parse", "--git-dir")
+        # Absolute: a relative --git-dir would resolve against this process's cwd, not repo_root.
+        git_dir = _git(repo_root, "rev-parse", "--absolute-git-dir")
         if git_dir:
             fetch_head = Path(git_dir) / "FETCH_HEAD"
     if not fetch_head.is_file():
-        return float("inf")
+        return None
     return max(0.0, time.time() - fetch_head.stat().st_mtime)
 
 
@@ -114,10 +116,11 @@ def collect_primary_state(repo_root: Path) -> dict[str, Any] | None:
     dirty_count = 0
     if status is not None:
         dirty_count = sum(1 for line in status.splitlines() if line.strip())
+    age = origin_main_age_s(repo_root)
     return {
         "head_sha": head,
         "origin_main_sha": origin_main,
-        "origin_main_age_s": round(origin_main_age_s(repo_root), 2),
+        "origin_main_age_s": None if age is None else round(age, 2),
         "ahead": ahead,
         "behind": behind,
         "dirty_count": dirty_count,
