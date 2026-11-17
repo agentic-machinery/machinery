@@ -35,9 +35,10 @@ __all__ = ["MAX_DEPTH_CEILING", "check_depth", "loads", "raw_decode"]
 # walks an accepted value recursively cannot hit RecursionError either.
 MAX_DEPTH_CEILING = 512
 
-# A JSON string token, or one bracket. An unterminated string runs to the end of the text,
-# so a failed match never rescans the rest (no quadratic backtracking).
-_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\Z)|[\[\]{}]', re.DOTALL)
+# A JSON string token, or one bracket. An unterminated string, including one that ends in a
+# lone backslash, runs to the end of the text, so a string token never fails to match and
+# never rescans the rest (no quadratic backtracking).
+_TOKEN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)|[\[\]{}]', re.DOTALL)
 _OPENERS = "[{"
 # JSON whitespace, as json.loads skips it around a document (json.decoder.WHITESPACE).
 _WHITESPACE = re.compile(r"[ \t\n\r]*")
