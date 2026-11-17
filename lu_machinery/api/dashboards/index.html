@@ -64,7 +64,7 @@
     td br { display: none; }
     /* The subscriptions table stacks instead: every account is a card, so no column sits off-screen. */
     #subs table, #subs tbody, #subs tr, #subs td, #subs th { display: block; white-space: normal; }
-    #subs thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+    #subs thead { display: none; }
     #subs tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
     #subs tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
     #subs th[colspan] { border: 0; padding: 0; }
@@ -176,7 +176,8 @@ function bar(left) {
 }
 
 // A cell carries its column name, so a stacked (card) layout can show it beside the value.
-const labelled = (cells, headers) => cells.map((cell, index) => headers[index]
+// The first cell is the card's own heading, so it keeps no label.
+const labelled = (cells, headers) => cells.map((cell, index) => index && headers[index]
   ? cell.replace(/^<td/, `<td data-label="${escapeHtml(headers[index])}"`) : cell).join("");
 
 function table(headers, rows, stacked = false) {
