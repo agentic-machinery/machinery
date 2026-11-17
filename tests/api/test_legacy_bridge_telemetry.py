@@ -11,12 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from lu_machinery.ai_agent_bridge import _acp_compat
-from lu_machinery.api import telemetry_router
-from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.telemetry import legacy_comms
 from lu_machinery.telemetry import legacy_bridge
 
@@ -287,7 +283,7 @@ def test_retention_permissions_and_complete_window_truth(telemetry_db: Path) -> 
 def test_http_and_bridge_tables_coexist_in_one_private_store(telemetry_db: Path) -> None:
     now = datetime(2026, 8, 2, 0, 30, tzinfo=UTC)
     legacy_comms.record_legacy_route_usage(
-        "messages", "GET", "canary", 200, db_path=telemetry_db, now=now
+        "acknowledge", "POST", "canary", 410, db_path=telemetry_db, now=now
     )
     token = legacy_bridge.record_bridge_invocation_start(
         "glm", "codex", db_path=telemetry_db, now=now
@@ -308,21 +304,12 @@ def test_http_and_bridge_tables_coexist_in_one_private_store(telemetry_db: Path)
 def test_read_only_api_returns_all_targets_and_rejects_invalid_window(
     telemetry_db: Path,
 ) -> None:
-    app = FastAPI()
-    app.state.ctx = fixture_context(telemetry_db.parent.parent)
-    app.include_router(telemetry_router.router)
-    with TestClient(app) as client:
-        response = client.get("/api/telemetry/legacy-bridge-asks?window=1h")
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["started"] == 0
-        assert payload["window_fully_observed"] is False
-        assert [item["target"] for item in payload["targets"]] == list(
-            legacy_bridge._TARGETS
-        )
-        assert client.get(
-            "/api/telemetry/legacy-bridge-asks?window=forever"
-        ).status_code == 422
+    payload = legacy_bridge.bridge_usage_summary("1h", db_path=telemetry_db)
+    assert payload["started"] == 0
+    assert payload["window_fully_observed"] is False
+    assert [item["target"] for item in payload["targets"]] == list(legacy_bridge._TARGETS)
+    with pytest.raises(KeyError):
+        legacy_bridge.bridge_usage_summary("forever", db_path=telemetry_db)
 
 
 def test_worktree_served_api_call_hits_primary_store(
@@ -345,24 +332,12 @@ def test_worktree_served_api_call_hits_primary_store(
     )
     legacy_bridge.record_bridge_invocation_finish(token, succeeded=True)
 
-    app = FastAPI()
-    # #92: the API reads legacy telemetry from its context's shared state root (the configured
-    # primary checkout), not from the checkout it serves. A worktree-served API has the
-    # worktree as its project root and the primary as its state root.
-    app.state.ctx = fixture_context(tmp_path).with_roots(
-        state_root=primary, project_root=worktree, live_repo_root=worktree
-    )
-    app.include_router(telemetry_router.router)
-
-    with TestClient(app) as client:
-        response = client.get("/api/telemetry/legacy-bridge-asks?window=1h")
-        assert response.status_code == 200
-        payload = response.json()
-        assert payload["started"] == 1
-        assert payload["succeeded"] == 1
-        glm = next(item for item in payload["targets"] if item["target"] == "glm")
-        assert glm["started"] == 1
-        assert glm["by_caller_family"] == {"openai": 1}
+    payload = legacy_bridge.bridge_usage_summary("1h", db_path=primary_db)
+    assert payload["started"] == 1
+    assert payload["succeeded"] == 1
+    glm = next(item for item in payload["targets"] if item["target"] == "glm")
+    assert glm["started"] == 1
+    assert glm["by_caller_family"] == {"openai": 1}
 
     assert not (worktree / "data" / "telemetry" / "legacy_comms_routes.db").exists()
 

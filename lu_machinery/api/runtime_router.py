@@ -28,7 +28,6 @@ from lu_machinery.agent_runtime.adapters.gemini import has_gemini_oauth_credenti
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_ACCOUNT_REFUSAL_CODES
 from lu_machinery.agent_runtime.failure_codes import RUNTIME_FAILURE_CODES
 from lu_machinery.agent_runtime.usage import _iter_usage_records as _iter_usage_file_records
-from lu_machinery.agent_runtime.usage import has_headroom
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.control_plane import storage
 from lu_machinery.fleet_comms import message_plane
@@ -1478,17 +1477,6 @@ async def runtime_agents(ctx: MonitorContext = Depends(get_ctx)):
     return {"agents": agents, "unreadable": _unreadable_summary(unreadable)}
 
 
-@router.get("/usage")
-async def runtime_usage(
-    agent: str | None = Query(None),
-    entrypoint: str | None = Query(None),
-    days: int = Query(7, ge=1, le=30),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    return await asyncio.to_thread(
-        summarize_runtime_usage, days=days, agent=agent, entrypoint=entrypoint, ctx=ctx
-    )
-
 
 @router.get("/acp/conversations")
 @swr_route("runtime-acp-conversations", ACP_CONVERSATIONS_TTL_S, vary=("limit",))
@@ -1532,27 +1520,6 @@ async def runtime_acp_conversation_transcript(
     return JSONResponse(content=transcript, headers=no_store)
 
 
-@router.get("/headroom")
-async def runtime_headroom(
-    agent: str | None = Query(None),
-    model: str | None = Query(None),
-):
-    if not agent or not model:
-        raise HTTPException(status_code=400, detail="Both 'agent' and 'model' query params are required")
-    unreadable: dict[str, int] = {"files": 0, "lines": 0, "records": 0}
-    ok, reason = await asyncio.to_thread(has_headroom, agent, model, unreadable=unreadable)
-    return {
-        "agent": agent,
-        "model": model,
-        "has_headroom": ok,
-        "reason": reason,
-        "unreadable": _unreadable_summary(unreadable),
-    }
-
-
-@router.get("/recent")
-async def runtime_recent(limit: int = Query(50, ge=1, le=500), ctx: MonitorContext = Depends(get_ctx)):
-    return await asyncio.to_thread(recent_runtime_records, limit=limit, ctx=ctx)
 
 
 @router.get("/routing-assignments")

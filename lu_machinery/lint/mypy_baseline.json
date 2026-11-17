@@ -1124,33 +1124,8 @@
     },
     {
       "path": "lu_machinery/api/comms_router.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"append\" of \"list\" has incompatible type \"int\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"kill\" has incompatible type \"Any | None\"; expected \"int\""
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"PathLike[str]\", variable has type \"Path\")"
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"float\", target has type \"int\")"
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"float\", variable has type \"int\")"
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"list[str]\", target has type \"int\")"
     },
     {
       "path": "lu_machinery/api/comms_router.py",
@@ -1218,16 +1193,6 @@
       "message": "Item \"None\" of \"None | dict[str, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/api/discussions_router.py",
-      "code": "arg-type",
-      "message": "Argument \"key\" to \"sort\" of \"list\" has incompatible type \"Callable[[dict[str, object]], object]\"; expected \"Callable[[dict[str, object]], SupportsDunderGT[Any] | SupportsDunderLT[Any]]\""
-    },
-    {
-      "path": "lu_machinery/api/discussions_router.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"object\", expected \"SupportsDunderGT[Any] | SupportsDunderLT[Any]\")"
-    },
-    {
       "path": "lu_machinery/api/docs_router.py",
       "code": "var-annotated",
       "message": "Need type annotation for \"meta\" (hint: \"meta: dict[<type>, <type>] = ...\")"
@@ -1286,16 +1251,6 @@
       "path": "lu_machinery/api/fleet_router.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"list[str]\", target has type \"None | dict[str, int] | int | list[dict[str, Any]] | str\")"
-    },
-    {
-      "path": "lu_machinery/api/fleet_router.py",
-      "code": "no-redef",
-      "message": "Name \"clauses\" already defined on line 2318"
-    },
-    {
-      "path": "lu_machinery/api/fleet_router.py",
-      "code": "no-redef",
-      "message": "Name \"params\" already defined on line 2319"
     },
     {
       "path": "lu_machinery/api/fleet_router.py",

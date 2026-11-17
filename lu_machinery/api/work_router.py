@@ -987,7 +987,7 @@ async def work_capabilities() -> dict[str, Any]:
         "class4_endpoints": [
             "GET /api/delegate/active",
             "GET /api/delegate/tasks?status=all&limit<=500",
-            "GET /api/fleet/reviews",
+            "in-process formal-review summaries",
         ],
         "github_enumerations_per_refresh": 2,
         "private_source": private_capability_seam(),

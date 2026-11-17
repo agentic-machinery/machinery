@@ -342,17 +342,15 @@ def test_unsupported_probe_is_not_database_absence(monkeypatch, tmp_path):
 @pytest.mark.parametrize("command", ["metrics", "backlog", "dead-letters"])
 @pytest.mark.parametrize("outcome", ["success", "connect_failure", "query_failure", "missing_dsn"])
 def test_pg_sibling_cli_and_facade_collectors_agree(monkeypatch, tmp_path, capsys, command, outcome):
-    from lu_machinery.api import fleet_router
-    from lu_machinery.api.monitor_context import fixture_context
     from lu_machinery.control_plane.storage import ControlPlanePgConnectError, ControlPlanePgDsnMissingError
     from lu_machinery.fleet_comms import cli
     from lu_machinery.fleet_comms.efficiency_metrics import EfficiencyMetricsReadError
 
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "pg")
     names = {
-        "metrics": ("collect_efficiency_metrics_authority", "_facade_authority_payload"),
-        "backlog": ("collect_delivery_backlog_authority", "_facade_backlog_payload"),
-        "dead-letters": ("collect_dead_letters_authority", "_facade_dead_letters_payload"),
+        "metrics": "collect_efficiency_metrics_authority",
+        "backlog": "collect_delivery_backlog_authority",
+        "dead-letters": "collect_dead_letters_authority",
     }
     called = []
 
@@ -367,16 +365,12 @@ def test_pg_sibling_cli_and_facade_collectors_agree(monkeypatch, tmp_path, capsy
             raise errors[outcome]("SYNTHETIC_PRIVATE_DRIVER_DETAIL")
         return {"total": 0}
 
-    name, facade_name = names[command]
+    name = names[command]
     monkeypatch.setattr(cli, name, collector)
-    monkeypatch.setattr(fleet_router, name, collector)
     assert cli.main([command, "--root", str(tmp_path / "absent")]) == cli.EXIT_OK
     cli_result = json.loads(capsys.readouterr().out)
-    facade = getattr(fleet_router, facade_name)
-    ctx = fixture_context(tmp_path)
-    api_result = facade(collector, ctx) if command == "metrics" else facade(10, ctx)
-    assert len(called) == 2
-    for payload in (cli_result, api_result):
+    assert len(called) == 1
+    for payload in (cli_result,):
         assert payload["authority"] == "pg"
         assert payload["store"]["reachable"] is (outcome == "success")
         assert not payload.get("db_missing")
@@ -425,19 +419,17 @@ def test_api_and_cli_status_fail_closed_without_driver_details(monkeypatch, tmp_
     with TestClient(app) as client:
         health = client.get("/api/fleet/health").json()
         overview = client.get("/api/fleet/overview").json()
-        facade = client.get("/api/fleet/facade/status").json()
     assert health["ok"] is False
-    assert facade["health"]["healthy"] is False
     monkeypatch.setattr(fleet_overview, "build_fleet_overview", lambda **kwargs: {"available": False})
     assert cli.main(["fleet", "status", "--root", str(tmp_path / "absent")]) == cli.EXIT_OK
     captured = capsys.readouterr()
     cli_result = json.loads(captured.out)
     assert cli_result["health"]["healthy"] is False
-    for status in (health, overview["health"], facade["plane_status"], cli_result["plane_status"]):
+    for status in (health, overview["health"], cli_result["plane_status"]):
         assert status["schema"]["db_error"] == expected
         assert status["store"]["reachable"] is False
         assert status["schema"]["store"]["reachable"] is False
         assert "authority_unsupported_component" not in json.dumps(status)
-    public_output = json.dumps([health, overview, facade, cli_result]) + captured.err + caplog.text
+    public_output = json.dumps([health, overview, cli_result]) + captured.err + caplog.text
     assert marker not in public_output
     assert "Traceback" not in public_output

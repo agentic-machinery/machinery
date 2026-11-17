@@ -1,7 +1,6 @@
 """FastAPI router for local telemetry persistence.
 
-This router owns per-tool timing telemetry from local hooks and the legacy
-comms/bridge usage summaries. Module-build token telemetry
+This router owns per-tool timing telemetry from local hooks. Module-build token telemetry
 (``/api/telemetry/module-builds*``) is a product route in
 ``scripts.project_api.module_builds`` under the same prefix (Monitor split,
 C-4687).
@@ -14,18 +13,14 @@ from collections import defaultdict
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from lu_machinery.common.repo_root import state_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
-from lu_machinery.telemetry.legacy_bridge import bridge_usage_summary
 
 from .monitor_context import MonitorContext, get_ctx, resolve_context
-from .telemetry.legacy_comms import db_path_for_root as legacy_comms_db_path_for_root
-from .telemetry.legacy_comms import legacy_comms_summary
 
 router = APIRouter(prefix="/api/telemetry", tags=["telemetry"])
 _WINDOWS = {
@@ -50,11 +45,6 @@ class ToolTimingIngest(BaseModel):
 def _tool_timings_path(ctx: MonitorContext | None = None) -> Path:
     return resolve_context(ctx).roots.state_root / "data" / "telemetry" / "tool_timings.db"
 
-
-def _legacy_comms_db_path(ctx: MonitorContext | None = None) -> Path:
-    context = resolve_context(ctx)
-    root = context.roots.state_root if context.root is not None else state_root()
-    return legacy_comms_db_path_for_root(root)
 
 
 def _open_telemetry_db(ctx: MonitorContext, path: Path) -> SQLiteConnection:
@@ -201,19 +191,3 @@ def read_tool_timings(
     return sorted(results, key=lambda item: (-item["count"], item["tool_name"]))
 
 
-@router.get("/legacy-comms-routes")
-def read_legacy_comms_routes(
-    window: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    """Return body-free legacy-route aggregates with explicit coverage truth."""
-    return legacy_comms_summary(window, db_path=_legacy_comms_db_path(ctx))
-
-
-@router.get("/legacy-bridge-asks")
-def read_legacy_bridge_asks(
-    window: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
-    _ctx: MonitorContext = Depends(get_ctx),
-):
-    """Return body-free one-shot bridge usage and coverage truth."""
-    return bridge_usage_summary(window, db_path=_legacy_comms_db_path(_ctx))
