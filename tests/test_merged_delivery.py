@@ -277,9 +277,10 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         assert (record["status"], record["error"]) == expected
         assert "delivery_pr" not in record
         if tree == "clean":
-            # Every candidate's history is now verified before aggregate publication proof.
+            # Exact-branch candidates reach history verification. Replacement candidates
+            # with another head are filtered by association before any fetch.
             assert record["merged_delivery_lookup"] == (
-                "error:VerificationFetchError" if case == "merged-other-head" else "no_match")
+                "error:VerificationFetchError" if case == "merged-other-head" and not replacement else "no_match")
 
 
 def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, monkeypatch):
