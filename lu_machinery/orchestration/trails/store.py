@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 from .models import (
     DeviationRefusedError,
     PreparedInvocation,
@@ -178,7 +180,7 @@ class TrailStore:
 
     @staticmethod
     def _run_from_row(row: sqlite3.Row) -> TrailRun:
-        spec = json.loads(row["pinned_spec_json"])
+        spec = json_depth.loads(row["pinned_spec_json"], max_depth=512)
         return TrailRun(
             run_id=str(row["run_id"]),
             trail_id=str(row["trail_id"]),
@@ -187,7 +189,7 @@ class TrailStore:
             spec=spec,
             seat=str(row["seat"]),
             task_family=str(row["task_family"]),
-            params=json.loads(row["params_json"]),
+            params=json_depth.loads(row["params_json"], max_depth=512),
             state=str(row["state"]),
             cursor_step_id=row["cursor_step_id"],
             cursor_generation=int(row["cursor_generation"]),
@@ -286,7 +288,7 @@ class TrailStore:
             ).fetchone()
             if prior is not None:
                 if prior["status"] == "complete" and prior["result_json"] is not None:
-                    return "replay", json.loads(prior["result_json"])
+                    return "replay", json_depth.loads(prior["result_json"], max_depth=512)
                 run = self._get_run_locked(connection, run_id)
                 connection.execute(
                     """
@@ -583,18 +585,18 @@ class TrailStore:
                 "step_id": str(row["step_id"]),
                 "cursor_generation": int(row["cursor_generation"]),
                 "idempotency_key": str(row["idempotency_key"]),
-                "resolved_command": json.loads(row["resolved_command_json"]),
+                "resolved_command": json_depth.loads(row["resolved_command_json"], max_depth=512),
                 "resolved_command_digest": str(row["resolved_command_digest"]),
                 "prepared_at": str(row["prepared_at"]),
                 "completed_at": row["completed_at"],
                 "status": str(row["status"]),
                 "command_receipt": (
-                    json.loads(row["command_receipt_json"])
+                    json_depth.loads(row["command_receipt_json"], max_depth=512)
                     if row["command_receipt_json"] is not None
                     else None
                 ),
                 "command_receipt_digest": row["command_receipt_digest"],
-                "result": json.loads(row["result_json"]) if row["result_json"] else None,
+                "result": json_depth.loads(row["result_json"], max_depth=512) if row["result_json"] else None,
             }
             for row in rows
         ]
@@ -606,7 +608,7 @@ class TrailStore:
                 "SELECT receipt_json FROM trail_step_receipts WHERE invocation_id = ?",
                 (invocation_id,),
             ).fetchone()
-        return json.loads(row["receipt_json"]) if row is not None else None
+        return json_depth.loads(row["receipt_json"], max_depth=512) if row is not None else None
 
     def list_summons(self, run_id: str) -> list[dict[str, Any]]:
         """Return summon records for status and test-only atomicity inspection."""
@@ -724,7 +726,7 @@ class TrailStore:
         return [
             {
                 **dict(row),
-                "receipt": json.loads(str(row["receipt_json"])),
+                "receipt": json_depth.loads(str(row["receipt_json"]), max_depth=512),
             }
             for row in rows
         ]
@@ -740,7 +742,7 @@ class TrailStore:
         if row is None:
             return None
         return {
-            "attestation": json.loads(str(row["attestation_json"])),
+            "attestation": json_depth.loads(str(row["attestation_json"]), max_depth=512),
             "attestation_digest": str(row["attestation_digest"]),
             "committed_at": str(row["committed_at"]),
         }
@@ -761,7 +763,7 @@ class TrailStore:
                 # difference from turning an idempotent terminal replay into a
                 # competing closure claim.
                 return {
-                    "attestation": json.loads(str(existing["attestation_json"])),
+                    "attestation": json_depth.loads(str(existing["attestation_json"]), max_depth=512),
                     "attestation_digest": str(existing["attestation_digest"]),
                     "committed_at": str(existing["committed_at"]),
                 }

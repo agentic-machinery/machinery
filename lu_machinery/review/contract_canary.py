@@ -30,7 +30,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 # The machinery package's directory name, which a change lists its files under, from this module's
 # unresolved location: a symlinked package keeps its checkout name, and a short import spelling
@@ -269,7 +269,7 @@ def refusal(paths: Iterable[str], head: str, root: Path | None = None) -> str | 
     missing: list[str] = []
     for route in routes:
         try:
-            receipt = json.loads(_receipt_path(head, route, root).read_text(encoding="utf-8"))
+            receipt = json_depth.loads(_receipt_path(head, route, root).read_text(encoding="utf-8"), max_depth=512)
         except FileNotFoundError:
             missing.append(route)
             continue
@@ -492,7 +492,7 @@ def run(args: argparse.Namespace) -> int:
             ["gh", "pr", "view", str(args.pr), "--repo", repository["github"], "--json", "headRefOid"],
             cwd=source, env=env, text=True, capture_output=True, check=True,
         )
-        head = json.loads(result.stdout)["headRefOid"]
+        head = json_depth.loads(result.stdout, max_depth=512)["headRefOid"]
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise CanaryError("--head must be a full lowercase 40-character commit SHA")
     if args.hard_timeout <= 0:

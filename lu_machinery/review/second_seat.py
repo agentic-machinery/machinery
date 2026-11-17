@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -195,7 +197,7 @@ def _findings_of(conn: SQLiteConnection, attempt: sqlite3.Row) -> list[dict[str,
         "SELECT finding_json FROM findings WHERE review_id = ? AND attempt_id = ? ORDER BY rowid",
         (attempt["review_id"], attempt["attempt_id"]),
     ).fetchall()
-    return [json.loads(row["finding_json"]) for row in rows]
+    return [json_depth.loads(row["finding_json"], max_depth=512) for row in rows]
 
 
 def record_agreement(

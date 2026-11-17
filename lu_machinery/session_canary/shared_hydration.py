@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.session_streams.hooks import lease_from_environment
 from lu_machinery.session_streams.model import parse_timestamp, validate_stream_id
@@ -323,7 +324,7 @@ def _fetch_remote_stream(stream_id: str, *, deadline: float) -> dict[str, Any]:
                     raise LookupError("Monitor stream response incomplete")
                 break
         remaining()
-        payload = json.loads(body)
+        payload = json_depth.loads(body, max_depth=512)
         if not isinstance(payload, dict):
             raise LookupError("Monitor stream response malformed")
         return payload

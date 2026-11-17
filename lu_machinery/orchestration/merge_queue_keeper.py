@@ -17,6 +17,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -206,7 +208,7 @@ class GitHub:
 
     def json(self, *args: str | Request) -> Any:
         try:
-            return json.loads(self.call(*args))
+            return json_depth.loads(self.call(*args), max_depth=512)
         except ValueError as exc:
             raise KeeperError("invalid GitHub JSON") from exc
 
@@ -549,7 +551,7 @@ def _throttled(state_path: Path, seconds: int, now: datetime | None = None) -> b
     if seconds <= 0:
         return False
     try:
-        observed = datetime.fromisoformat(json.loads(state_path.read_text())["observed"])
+        observed = datetime.fromisoformat(json_depth.loads(state_path.read_text(), max_depth=512)["observed"])
     except (OSError, ValueError, KeyError, TypeError):
         return False
     if observed.tzinfo is None:
@@ -562,7 +564,7 @@ def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"queued": {}, "drops": {}}
     try:
-        data = json.loads(path.read_text())
+        data = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError) as exc:
         raise KeeperError("keeper state unreadable") from exc
     if (

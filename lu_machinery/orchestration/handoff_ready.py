@@ -31,7 +31,7 @@ import subprocess
 import urllib.request
 
 from lu_machinery.ci.advisory_checks import is_advisory, load_advisory_checks
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.github_check_rollup import collapse_status_rollup
 
@@ -70,7 +70,7 @@ def _gh_json(*args: str) -> tuple[int, object]:
     if proc.returncode != 0:
         return proc.returncode, proc.stderr.strip()
     try:
-        return 0, json.loads(proc.stdout or "null")
+        return 0, json_depth.loads(proc.stdout or "null", max_depth=512)
     except json.JSONDecodeError:
         return 1, proc.stdout.strip()
 
@@ -89,7 +89,7 @@ def check_tree_clean() -> tuple[str, str]:
 def check_no_inflight() -> tuple[str, str]:
     try:
         with urllib.request.urlopen(DELEGATE_ACTIVE_URL, timeout=6) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except Exception as exc:
         return UNKNOWN, f"delegate API unreachable: {exc!r}"
     total = int(data.get("total", 0))

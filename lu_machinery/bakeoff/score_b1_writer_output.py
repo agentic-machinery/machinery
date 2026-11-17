@@ -19,6 +19,8 @@ from typing import Any, cast
 
 import yaml
 
+from lu_machinery.common import json_depth
+
 
 def _product_hooks() -> Any:
     """Load the product hook named by the product checkout's bakeoff configuration.
@@ -30,7 +32,7 @@ def _product_hooks() -> Any:
     from lu_machinery.ops.product_entry import load_configured_module
 
     root = product_root()
-    payload = json.loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"))
+    payload = json_depth.loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"), max_depth=512)
     return load_configured_module(payload["module"], product_root=root)
 
 
@@ -142,7 +144,7 @@ def _hard_failed(checks: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
 
 
 def _artifact_name_from_info(info: str, hooks: Any) -> str | None:
@@ -170,7 +172,7 @@ def _best_effort_artifacts(raw_output: str, hooks: Any) -> dict[str, str]:
             artifacts[name] = body + "\n"
             continue
         try:
-            parsed = json.loads(body)
+            parsed = json_depth.loads(body, max_depth=512)
         except json.JSONDecodeError:
             artifacts[name] = body + "\n"
         else:

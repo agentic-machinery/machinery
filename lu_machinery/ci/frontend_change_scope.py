@@ -17,13 +17,14 @@ Stdlib only so GitHub runners can invoke it with system ``python3`` before
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import subprocess
 import sys
 from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
+
+from lu_machinery.common import json_depth
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -61,7 +62,7 @@ def denominator_path(root: Path | None = None) -> Path:
 
 def load_denominator(path: Path | None = None) -> dict:
     target = path or denominator_path()
-    data = json.loads(target.read_text(encoding="utf-8"))
+    data = json_depth.loads(target.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(data, dict):
         raise ValueError(f"{target}: expected a JSON object")
     paths = data.get("paths")
@@ -211,7 +212,7 @@ def resolve_script_command(command: str, scripts: dict[str, str], *, _stack: fro
 def resolve_hydrate_entrypoints(package_json: Path | None = None) -> list[str]:
     """Resolve hydrate entrypoints that ``site/package.json`` actually invokes."""
     path = package_json or (repo_root() / PACKAGE_JSON_REL)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     scripts = data.get("scripts")
     if not isinstance(scripts, dict):
         raise ValueError(f"{path}: missing scripts object")

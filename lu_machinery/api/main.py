@@ -10,7 +10,6 @@ import asyncio
 import functools
 import html
 import importlib.metadata
-import json
 import logging
 import os
 import re
@@ -36,6 +35,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 import lu_machinery.github_rest_cache as github_rest
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
 from lu_machinery.common.repo_root import ProductRootError, machinery_path
@@ -1212,7 +1212,7 @@ def _tmp_usability_canary() -> dict:
 def _backup_last_run_health(batch_state_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
     receipt = batch_state_dir / "backups" / "last-run.json"
     try:
-        data = json.loads(receipt.read_text(encoding="utf-8"))
+        data = json_depth.loads(receipt.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return {"status": "unknown", "reason": "no_receipt"}
     except (OSError, ValueError):

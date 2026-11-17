@@ -48,6 +48,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import _PRODUCT_TREE
 from lu_machinery.docs import store_census  # imports this module back; each side uses the other only at call time
 from lu_machinery.docs.docs_inventory import EXCLUDED_PARTS
@@ -743,7 +744,7 @@ def _supersession_errors(links: dict[str, str], follow: dict[str, str], by_id: d
 def coverage(repo: Path, catalogue_path: Path | None = None) -> Report:
     """Validate the repository's catalogue against its own Git index."""
     catalogue_path = catalogue_path or repo / CATALOGUE_PATH
-    schema = json.loads((repo / SCHEMA_PATH).read_text(encoding='utf-8'))
+    schema = json_depth.loads((repo / SCHEMA_PATH).read_text(encoding='utf-8'), max_depth=512)
     return validate(load(catalogue_path), schema, tracked_files(repo), owner_keys(repo))
 
 
@@ -1357,7 +1358,7 @@ def store_registry_errors(repo: Path, catalogue: dict, files: dict[str, IndexEnt
     if store_census.ALLOWLIST_PATH not in sources:
         return [f'{store_census.ALLOWLIST_PATH}: not readable from the index, so registry backup facts are unchecked']
     try:
-        allowlist = json.loads(sources.pop(store_census.ALLOWLIST_PATH))
+        allowlist = json_depth.loads(sources.pop(store_census.ALLOWLIST_PATH), max_depth=512)
     except json.JSONDecodeError as exc:
         return [f'{store_census.ALLOWLIST_PATH}: not JSON ({exc.msg}), so registry backup facts are unchecked']
     return store_census.registry_errors(catalogue, set(files), owner_keys(repo), allowlist, sources, literals)
@@ -1637,7 +1638,7 @@ def census_root(path: Path | None, repo: Path) -> Path:
 def _census_command(args: argparse.Namespace) -> int:
     repo = toplevel(args.repo)
     catalogue = load(repo / CATALOGUE_PATH)
-    schema = json.loads((repo / SCHEMA_PATH).read_text(encoding='utf-8'))
+    schema = json_depth.loads((repo / SCHEMA_PATH).read_text(encoding='utf-8'), max_depth=512)
     if (found := schema_errors(catalogue, schema)) or control_string_errors(catalogue):
         raise CatalogueLoadError('schema', f'the catalogue fails validation ({len(found)} schema errors); run check')
     result = store_census.census(census_root(args.root, repo), catalogue, expect_present=args.expect_present)

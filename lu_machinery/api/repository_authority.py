@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.release_layout import MANIFEST_NAME, is_release_root
 from lu_machinery.guardrails.worktree_containment import classify_repo_path
@@ -100,7 +101,7 @@ def _release_identity(project_root: Path) -> dict[str, str | None]:
     if is_release_root(project_root):
         manifest_path = project_root / MANIFEST_NAME
         try:
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = json_depth.loads(manifest_path.read_text(encoding="utf-8"), max_depth=512)
             release_sha = str(payload["sha"])
             tree_sha256 = str(payload["tree_sha256"])
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:

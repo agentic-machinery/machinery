@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMMON = frozenset({"secret-scan", "hydrate-release-assets", "checks", "dependency-audit", "pr-affected", "frontend"})
 FULL = frozenset({"refresh-pytest-durations", "pytest", "pytest-report"})
@@ -110,7 +112,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         event = os.environ["EVENT_NAME"]
-        payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        payload = json_depth.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"), max_depth=512)
         actual = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True, timeout=30
         ).stdout.strip()
@@ -132,7 +134,7 @@ def main() -> int:
                 stream.write(f"full-suite={decision}\n")
             print(f"full-suite={decision}")
             return 0
-        results = json.loads(os.environ["NEEDS_JSON"])
+        results = json_depth.loads(os.environ["NEEDS_JSON"], max_depth=512)
         # A workflow without the pr-scope job keeps the PR tier it had before that job:
         # a consumer adopts a release by changing its lock alone, then adds the job.
         if set(results) - {SCOPE} != COMMON | FULL | {"queue-metadata-scan"}:

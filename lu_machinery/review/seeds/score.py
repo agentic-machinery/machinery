@@ -53,6 +53,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, open_readonly
 from lu_machinery.review import findings_db
@@ -408,7 +409,7 @@ def _observe(
         if result is None:
             return None
         extra = {"detected": bool(result["planted_found"]), "blocking": bool(result["planted_blocking"])}
-    classes = Counter(item["class"] for item in json.loads(result["mapping_json"]))
+    classes = Counter(item["class"] for item in json_depth.loads(result["mapping_json"], max_depth=512))
     return Observation(**common, **extra, classes=dict(sorted(classes.items())))
 
 
@@ -585,7 +586,7 @@ def agreement_by_seat_pair(
                     side[0] == seat and (model is None or side[1] == model) for side in pair
                 ):
                     continue
-                blocking = sum(1 for entry in json.loads(row["disagreed_json"]) if entry.get("blocking"))
+                blocking = sum(1 for entry in json_depth.loads(row["disagreed_json"], max_depth=512) if entry.get("blocking"))
                 latest[(pair, row["level"], row["slug"], row["lesson_n"])] = (bool(row["agreed"]), blocking)
         finally:
             conn.close()

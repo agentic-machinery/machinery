@@ -20,7 +20,7 @@ from lu_machinery.agent_runtime.errors import (
     AgentUnavailableError,
     RateLimitedError,
 )
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.scratch import ensure_scratch_root
 
 from . import _config
@@ -291,7 +291,7 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
     import json
 
     try:
-        payload = json.loads(raw or "")
+        payload = json_depth.loads(raw or "", max_depth=512)
     except json.JSONDecodeError as exc:
         raise GeminiChangedPathListError("gh pr view returned invalid JSON") from exc
     if not isinstance(payload, dict):
@@ -661,7 +661,7 @@ def process_for_agy(
         effort_reason=effort_reason,
     )
     if identity_state:
-        provenance = json.loads(provenance_data)
+        provenance = json_depth.loads(provenance_data, max_depth=512)
         provenance.update(
             actual_model=identity_state["resolved_model"] if identity_state["resolved_model_known"] else None,
             actual_model_known=identity_state["resolved_model_known"],
@@ -729,7 +729,7 @@ def _extract_target_model(msg: dict) -> str | None:
     if not data:
         return None
     try:
-        payload = json.loads(data)
+        payload = json_depth.loads(data, max_depth=512)
     except (json.JSONDecodeError, TypeError):
         return None
     if not isinstance(payload, dict):
@@ -755,7 +755,7 @@ def _handle_agy_error(msg: dict, message_id: int, reason: str) -> None:
         identity=None, task_id=msg["task_id"], run_nonce=None,
     )
     if identity_state:
-        provenance = json.loads(data)
+        provenance = json_depth.loads(data, max_depth=512)
         provenance.update(from_model="unattested-harness", actual_model=None,
                           actual_model_known=False, actual_family=None, model_identity=None)
         data, from_model = json.dumps(provenance, sort_keys=True), "unattested-harness"

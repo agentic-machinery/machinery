@@ -14,6 +14,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from lu_machinery.common import json_depth
+
 DEFAULT_BASE = "http://localhost:8765"
 TIMEOUT_S = 5.0
 RULES_PATH = "/api/rules?format=json"
@@ -24,7 +26,7 @@ def _get(path: str) -> dict | list | None:
     url = DEFAULT_BASE + path
     try:
         with urllib.request.urlopen(url, timeout=TIMEOUT_S) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            return json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         print(f"<!-- monitor api unreachable: {exc} -->", file=sys.stderr)
         return None

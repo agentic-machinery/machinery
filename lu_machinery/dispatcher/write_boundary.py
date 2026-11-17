@@ -33,6 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, main_checkout_root
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.dispatcher import agy_sandbox
@@ -226,7 +227,7 @@ def broker_call(verb: str, payload: dict) -> dict:
         while chunk := connection.recv(65536):
             chunks.append(chunk)
     try:
-        reply = json.loads(b"".join(chunks))
+        reply = json_depth.loads(b"".join(chunks), max_depth=512)
     except ValueError:
         reply = None
     if not isinstance(reply, dict):
@@ -327,7 +328,7 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
     """The boundary evidence and the refusal that fails the run, if any."""
     path = receipt_file(task_file)
     try:
-        receipt = json.loads(path.read_text(encoding="utf-8"))
+        receipt = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return {"status": "missing"}, "write_boundary_unproven: no boundary receipt"
     summary = {key: receipt.get(key) for key in (
@@ -647,7 +648,7 @@ def github_networks() -> tuple:
 
     try:
         proc = github_client.run(["gh", "api", "meta"], capture_output=True, text=True, check=False, timeout=60)
-        meta = json.loads(proc.stdout) if proc.returncode == 0 else None
+        meta = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         meta = None
     networks = []
@@ -771,7 +772,7 @@ class _Broker:
             if not self._peer_inside(connection):
                 raise _BrokerRefusal("the peer is not a process of this write boundary")
             try:
-                request = json.loads(b"".join(chunks))
+                request = json_depth.loads(b"".join(chunks), max_depth=512)
             except ValueError:
                 request = None
             if not isinstance(request, dict) or set(request) != {"verb", "request_id", "payload"}:
@@ -843,7 +844,7 @@ class _Broker:
         proc = github_client.run(["gh", *argv], capture_output=True, text=True, check=False,
                                  timeout=_BROKER_TIMEOUTS["gh"], fresh=True)
         try:
-            return json.loads(proc.stdout) if proc.returncode == 0 else None
+            return json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
         except (TypeError, ValueError):
             return None
 
@@ -1243,6 +1244,7 @@ class _Boundary:
         # Reviews read GitHub through the host's read-only gh relay: the reviewer holds
         # no GitHub login and the egress proxy refuses GitHub, so without it ``gh pr view``/``pr checks`` fail.
         (boundary / "bin").mkdir(mode=0o700)
+        _write_private(boundary / "json_depth.py", Path(json_depth.__file__).read_bytes(), 0o400)
         _write_private(boundary / "bin" / "gh", agy_sandbox._GH_SHIM.format(interpreter=interpreter).encode(), 0o500)
         self.gh = agy_sandbox._GhBroker(boundary / "gh.sock", self.worktree)
         try:
@@ -1356,7 +1358,7 @@ class _Boundary:
             data = path.read_bytes()
             if name == _CLAUDE_GLOBAL_CONFIG:
                 try:
-                    config = json.loads(data)
+                    config = json_depth.loads(data, max_depth=512)
                 except ValueError:
                     raise Refused("the Claude global config is not JSON") from None
                 if not isinstance(config, dict):
@@ -1368,7 +1370,7 @@ class _Boundary:
             copies[path] = data
         reads = []
         try:
-            helper = json.loads(copies.get(login / "settings.json", b"{}")).get("apiKeyHelper")
+            helper = json_depth.loads(copies.get(login / "settings.json", b"{}"), max_depth=512).get("apiKeyHelper")
         except (ValueError, AttributeError):
             helper = None
         if helper is not None:
@@ -1576,7 +1578,7 @@ class _Boundary:
             chunk = os.read(descriptor, 65536)
             if not chunk:
                 with contextlib.suppress(ValueError):
-                    report = json.loads(b"".join(chunks))
+                    report = json_depth.loads(b"".join(chunks), max_depth=512)
                     return report.get("probes") if isinstance(report, dict) else None
                 return None
             chunks.append(chunk)
@@ -1640,7 +1642,7 @@ def call_main(argv: list[str]) -> int:
         print("write boundary broker: not inside a write boundary", file=sys.stderr)
         return 2
     try:
-        payload = json.loads(sys.stdin.read() or "{}")
+        payload = json_depth.loads(sys.stdin.read() or "{}", max_depth=512)
     except ValueError:
         payload = None
     if not isinstance(payload, dict):

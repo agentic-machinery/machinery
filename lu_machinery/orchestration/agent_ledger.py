@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
 SCHEMA_VERSION = 1
@@ -112,7 +113,7 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def read_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -376,7 +377,7 @@ def _json_arg(raw: str | None) -> dict[str, Any] | None:
     if not raw:
         return None
     try:
-        data = json.loads(raw)
+        data = json_depth.loads(raw, max_depth=512)
     except json.JSONDecodeError as exc:
         raise LedgerError(f"invalid JSON object: {exc.msg}") from exc
     if not isinstance(data, dict):

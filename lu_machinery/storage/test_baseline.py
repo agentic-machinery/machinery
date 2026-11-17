@@ -22,6 +22,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 
 def _machinery_top() -> str:
     # Unresolved package directory (design-v1 amendment 1). Never __package__.
@@ -125,7 +127,7 @@ def capture_junit(
 
 def _load_baseline(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise BaselineError(f"cannot read baseline {path}: {exc}") from exc
     if not isinstance(value, dict) or not isinstance(value.get("jobs"), dict):
@@ -410,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         old, new = _load_baseline(args.old), _load_baseline(args.new)
         try:
-            dispositions = json.loads(args.dispositions.read_text(encoding="utf-8"))
+            dispositions = json_depth.loads(args.dispositions.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise BaselineError(f"cannot read dispositions {args.dispositions}: {exc}") from exc
         if not isinstance(dispositions, dict):

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.guardrails.worktree_containment import _require_real_directories, classify_repo_path
 
@@ -494,7 +495,7 @@ class MuseAdapter:
             for line in jsonl_lines(stdout.removesuffix("\n")):
                 if terminal is not None:
                     raise ValueError("muse_event_after_terminal")
-                record = json.loads(line, object_pairs_hook=_unique_object)
+                record = json_depth.loads(line, object_pairs_hook=_unique_object, max_depth=512)
                 if (
                     not isinstance(record, dict)
                     or type(record.get("schema_version")) is not int

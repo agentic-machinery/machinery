@@ -67,6 +67,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 
 def _load_sibling(module_name: str, filename: str):
     """Load a sibling module by FILE PATH — see the identical helper (and its
@@ -239,7 +241,7 @@ def check_sentinel_imports(python_exe: Path, *, timeout: float = 30.0) -> tuple[
     if proc.returncode != 0:
         return [], f"probe subprocess exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
     try:
-        return json.loads(proc.stdout.strip() or "[]"), None
+        return json_depth.loads(proc.stdout.strip() or "[]", max_depth=512), None
     except json.JSONDecodeError as exc:
         return [], f"probe produced unparseable output: {exc}"
 

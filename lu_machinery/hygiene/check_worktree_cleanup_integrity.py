@@ -33,6 +33,8 @@ from pathlib import Path
 from typing import Any
 from xml.parsers.expat import ExpatError
 
+from lu_machinery.common import json_depth
+
 
 def _load_sibling(module_name: str, filename: str):
     """Load a sibling module by FILE PATH — see check_venv_integrity.py."""
@@ -123,7 +125,7 @@ def latest_receipt_observed_at(receipts: Path) -> datetime | None:
     newest: datetime | None = None
     for path in receipts.glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError):
             continue
         raw = payload.get("observed_at")

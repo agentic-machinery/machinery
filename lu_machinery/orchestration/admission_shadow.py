@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
 # are also its directories in checkout-relative paths.
@@ -101,7 +103,7 @@ def _tail(path: Path) -> dict[str, Any]:
             handle.seek(0, 2)
             handle.seek(max(0, handle.tell() - MAX_ROW_BYTES))
             last_line = handle.read(MAX_ROW_BYTES).rstrip(b"\n").rsplit(b"\n", 1)[-1]
-        row = json.loads(last_line)
+        row = json_depth.loads(last_line, max_depth=512)
         if not isinstance(row, dict) or row.get("schema") != SCHEMA or row.get("candidate") != CANDIDATE:
             return {}
         psi = row.get("psi")
@@ -163,7 +165,7 @@ def compare_day(directory: Path, day: str) -> dict[str, Any]:
             try:
                 if len(raw) > MAX_ROW_BYTES:
                     raise ValueError
-                row = json.loads(raw)
+                row = json_depth.loads(raw, max_depth=512)
                 stamp = row["timestamp"]
                 if row["schema"] != SCHEMA or not start <= stamp < start + 86400:
                     raise ValueError

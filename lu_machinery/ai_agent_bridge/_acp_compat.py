@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from lu_machinery.agent_runtime.target_admission import (
     COMPAT_TARGETS as _TARGETS,  # noqa: F401  (legacy ask names, read-only)
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 from . import _config
@@ -381,7 +382,7 @@ def _result_receipt(
 def _replay_result(raw: bytes) -> object:
     from lu_machinery.agent_runtime.result import Result
 
-    payload = json.loads(raw)
+    payload = json_depth.loads(raw, max_depth=512)
     if not isinstance(payload, dict):
         raise RuntimeError("terminal ACP result receipt is not an object")
     if "ok" not in payload:

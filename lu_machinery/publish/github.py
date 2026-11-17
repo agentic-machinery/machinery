@@ -18,12 +18,13 @@ import sys
 import tempfile
 import time
 import zipfile
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
 import yaml
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import PRODUCT_ROOT_ENV, product_root
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.guardrails.worktree_containment import NotAGitRepositoryError, resolve_main_root_without_git
@@ -538,7 +539,7 @@ def _squash_text(gh_repo, fields, dest, temp, runner, cwd, environment):
             check=False,
             timeout=15,
         )
-        pull = json.loads(result.stdout)["data"]["repository"]["pullRequest"] if result.returncode == 0 else None
+        pull = json_depth.loads(result.stdout, max_depth=512)["data"]["repository"]["pullRequest"] if result.returncode == 0 else None
         subject, body = pull["viewerMergeHeadlineText"], pull["viewerMergeBodyText"]
         if not (
             isinstance(subject, str)
@@ -580,7 +581,7 @@ def _confirm_enqueued(gh_repo, number, head, dest, temp, readers, cwd, environme
             ["gh", "api", "--method", "POST", "graphql", "--input", str(query), *_hostname_flag(dest)],
             cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=15,
         )
-        document = json.loads(result.stdout) if result.returncode == 0 else None
+        document = json_depth.loads(result.stdout, max_depth=512) if result.returncode == 0 else None
         pull = document["data"]["repository"]["pullRequest"]
         if document.get("errors") or type(pull["isInMergeQueue"]) is not bool or not isinstance(pull["headRefOid"], str):
             raise ValueError
@@ -650,7 +651,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
             )
             if result.returncode:
                 raise ValueError
-            documents.append(json.loads(result.stdout))
+            documents.append(json_depth.loads(result.stdout, max_depth=512))
         pages, files, identity = documents
         login = identity.get("login") if isinstance(identity, dict) else None
         if not all(isinstance(paged, list) and all(isinstance(page, list) for page in paged) for paged in (pages, files)):
@@ -698,7 +699,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         env.update(NO_COLOR="1", CLICOLOR="0")
         try:
             result = runner(argv, cwd=cwd, env=env, capture_output=True, text=True, check=False, timeout=30)
-            bound = json.loads(result.stdout)
+            bound = json_depth.loads(result.stdout, max_depth=512)
             rows = bound["statusCheckRollup"]
             # The rollup and its head arrive in one response, so these rows are the judged head's.
             if result.returncode or bound["headRefOid"].lower() != head.lower() or not isinstance(rows, list):
@@ -749,7 +750,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                         members = archive.infolist()
                         if len(members) != 1 or members[0].filename != "queue-candidate.json" or members[0].file_size > 16384:
                             raise ValueError("queue candidate archive malformed")
-                        return json.loads(archive.read(members[0]))
+                        return json_depth.loads(archive.read(members[0]), max_depth=512)
             result = read(
                 name,
                 repo=dest,
@@ -766,7 +767,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             refusal = github_client.refusal_of(result, injected=runner is not None)
             if refusal is not None:
                 raise refusal
-            value = json.loads(result.stdout)
+            value = json_depth.loads(result.stdout, max_depth=512)
             if name in {"comments", "timeline"}:
                 return [item for page in value for item in page]
             if name == "pr-files":
@@ -879,7 +880,7 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment):
     )
     if result.returncode:
         return None
-    document = json.loads(result.stdout)
+    document = json_depth.loads(result.stdout, max_depth=512)
     if document.get("state") != "open" or "pull_request" in document or not isinstance(document.get("node_id"), str):
         return None
     return document["node_id"]
@@ -1174,7 +1175,7 @@ def _transfer_resolution(endpoint, number, reader, cwd, environment):
     )
     if result.returncode:
         raise ValueError("issue unreadable")
-    document = json.loads(result.stdout)
+    document = json_depth.loads(result.stdout, max_depth=512)
     resolved = {
         "repository": None, "number": document["number"], "node_id": document["node_id"],
         "state": document["state"], "url": document["html_url"], "pull_request": "pull_request" in document,
@@ -1210,7 +1211,7 @@ def _transfer_label_connection(query, variables, select, reader, cwd, environmen
         )
         if result.returncode:
             raise ValueError("label read unreadable")
-        document = json.loads(result.stdout)
+        document = json_depth.loads(result.stdout, max_depth=512)
         if not isinstance(document, dict) or document.get("errors"):
             raise ValueError("label read errors")
         current, page = select(document["data"]["repository"])
@@ -1468,7 +1469,7 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
             environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True, check=False,
             timeout=60,
         )
-        document = json.loads(result.stdout) if result.returncode == 0 else None
+        document = json_depth.loads(result.stdout, max_depth=512) if result.returncode == 0 else None
         moved = document["data"]["transferIssue"]["issue"] if isinstance(document, dict) else None
         if not isinstance(document, dict) or document.get("errors") or not isinstance(moved, dict):
             raise ValueError
@@ -1508,7 +1509,7 @@ def _ruleset_get(runner, endpoint, cwd, environment):
     if result.returncode:
         raise gate.PublishBlocked("OPSEC: ruleset read failed.")
     try:
-        document = json.loads(result.stdout)
+        document = json_depth.loads(result.stdout, max_depth=512)
     except (TypeError, json.JSONDecodeError):
         raise gate.PublishBlocked("OPSEC: ruleset read failed.") from None
     if not isinstance(document, dict):
@@ -1689,7 +1690,7 @@ def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, 
     result = runner(argv, cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30)
     if result.returncode:
         raise ValueError("dismissal evidence unavailable")
-    value = result.stdout if raw else json.loads(result.stdout)
+    value = result.stdout if raw else json_depth.loads(result.stdout, max_depth=512)
     if pages:
         if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
             raise ValueError("dismissal pagination unavailable")
@@ -2199,7 +2200,7 @@ def publish(
             )
             if identity.returncode:
                 raise ValueError("queue identity unavailable")
-            identity = json.loads(identity.stdout)
+            identity = json_depth.loads(identity.stdout, max_depth=512)
             result = read(
                 "queue-status", repo=gh_repo, number=fields["number"], branch=identity["baseRefName"],
                 runner=readiness_runner if runner is not None else None,
@@ -2209,7 +2210,7 @@ def publish(
             refusal = github_client.refusal_of(result, injected=runner is not None)
             if result.returncode or refusal is not None or (observation is not None and observation.stale):
                 raise ValueError("queue state unavailable")
-            document = json.loads(result.stdout)
+            document = json_depth.loads(result.stdout, max_depth=512)
             current = document["data"]["repository"]["pullRequest"]
             if document.get("errors") or not isinstance(current, dict) or current.get("headRefOid") != identity["headRefOid"]:
                 raise ValueError("queue state unavailable or head changed")
@@ -2240,7 +2241,7 @@ def publish(
                 )
                 if result.returncode:
                     raise ValueError(f"{name} unavailable")
-                value = json.loads(result.stdout)
+                value = json_depth.loads(result.stdout, max_depth=512)
                 documents[name] = value if name == "identity" else [row for page in value for row in page]
             jumped = priority_jump(
                 labels, documents["timeline"], documents["comments"], fields["match_head"],
@@ -2373,7 +2374,7 @@ def publish(
                     )
                     if result.returncode:
                         raise ValueError
-                    documents.append(json.loads(result.stdout))
+                    documents.append(json_depth.loads(result.stdout, max_depth=512))
                 comment, identity = documents
                 body, login = comment["body"], identity["login"]
                 if (
@@ -2849,7 +2850,7 @@ def main(argv=None, *, runner=None):
             elif kind in {"number", "count"}:
                 kwargs["type"] = int
             if kind == "workflow_inputs":
-                kwargs["type"] = json.loads
+                kwargs["type"] = partial(json_depth.loads, max_depth=512)
             if kind in ENUMS:
                 kwargs["choices"] = sorted(ENUMS[kind])
             sub.add_argument("--" + key.replace("_", "-"), **kwargs)
@@ -2904,7 +2905,7 @@ def main(argv=None, *, runner=None):
     for key in ("branches", "cursors", "body_roots", "numbers", "batch"):
         read_parser.add_argument(
             "--" + key.replace("_", "-"),
-            type=json.loads,
+            type=partial(json_depth.loads, max_depth=512),
             default=argparse.SUPPRESS,
             help=f"{key} as JSON; omitted by default",
         )
@@ -3188,7 +3189,7 @@ def read(
             )
         if result.returncode == 0:
             try:
-                document = json.loads(result.stdout)
+                document = json_depth.loads(result.stdout, max_depth=512)
                 count = document["data"]["repository"]["issues"]["totalCount"]
                 if document.get("errors") or type(count) is not int or count < 0:
                     raise ValueError
@@ -3354,7 +3355,7 @@ def read(
             remaining = result.stdout.strip()
             rows, pages = [], 0
             while remaining:
-                page, end = json.JSONDecoder().raw_decode(remaining)
+                page, end = json_depth.raw_decode(remaining, max_depth=512, decoder=json.JSONDecoder())
                 if not isinstance(page, list):
                     raise ValueError
                 rows.extend(page)

@@ -60,6 +60,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, main_checkout_root, product_root
 from lu_machinery.common.scratch import ensure_scratch_root
 
@@ -126,7 +127,9 @@ _GH_OPERAND = re.compile(r"#?[A-Za-z0-9._/-]+")
 # The one value --repo/-R accepts: OWNER/REPO on github.com. HOST/OWNER/REPO and URLs name another host.
 _GH_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 _GH_SHIM = '''#!{interpreter} -I
-import json, os, socket, sys
+import json, os, runpy, socket, sys
+_json_loads = runpy.run_path(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir,
+    "json_depth.py"))["loads"]
 directory = os.open(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir), os.O_RDONLY)
 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as relay:
     relay.connect(f"/proc/self/fd/{{directory}}/gh.sock")  # avoids the sockaddr_un length limit
@@ -134,7 +137,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as relay:
     selectors = {{name: os.environ[name] for name in ("GH_REPO", "GH_HOST") if name in os.environ}}
     relay.sendall(json.dumps({{"argv": sys.argv[1:], "environment": selectors}}).encode())
     relay.shutdown(socket.SHUT_WR)
-    reply = json.loads(b"".join(iter(lambda: relay.recv(65536), b"")))
+    reply = _json_loads(b"".join(iter(lambda: relay.recv(65536), b"")), max_depth=512)
 sys.stdout.write(reply["stdout"])
 sys.stdout.flush()
 sys.stderr.write(reply["stderr"])
@@ -234,7 +237,7 @@ def _inputs_from_spec(spec) -> list[dict]:
     if not raw:
         return []
     try:
-        items = json.loads(raw)
+        items = json_depth.loads(raw, max_depth=512)
     except ValueError as exc:
         raise ValueError("agy_input_refused: input record invalid") from exc
     if not isinstance(items, list) or not all(
@@ -349,7 +352,7 @@ def _input_mismatch(record: dict, receipt: dict) -> str | None:
     if not raw:
         return None
     try:
-        expected = json.loads(raw)
+        expected = json_depth.loads(raw, max_depth=512)
     except ValueError:
         return "agy_read_only_boundary: input digest mismatch"
     if not isinstance(expected, list):
@@ -383,7 +386,7 @@ def apply_tool_results(stdout_path: Path, final_file: Path, task_id: str) -> tup
     saved: list[dict] = []
     if export.is_file():
         try:
-            payload = json.loads(export.read_text(encoding="utf-8"))
+            payload = json_depth.loads(export.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError):
             payload = None
         if (
@@ -417,7 +420,7 @@ def verify(final_file: Path, task_id: str, record: dict) -> tuple[dict, int | No
     supplies a count.
     """
     try:
-        receipt = json.loads(receipt_file(final_file).read_text(encoding="utf-8"))
+        receipt = json_depth.loads(receipt_file(final_file).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return {}, None, "agy_read_only_boundary: receipt missing or unreadable"
     if not isinstance(receipt, dict) or receipt.get("schema") != SCHEMA or receipt.get("task_id") != task_id:
@@ -656,7 +659,7 @@ class SourcesRelay:
                         break
                     if not line.strip():
                         continue
-                    message = json.loads(line)
+                    message = json_depth.loads(line, max_depth=512)
                     if not isinstance(message, dict):
                         break  # batches and non-objects end the connection
                     if self._admit(message, pending, pending_lock, reply):
@@ -673,7 +676,7 @@ class SourcesRelay:
         try:
             while line := process.stdout.readline():
                 try:
-                    message = json.loads(line)
+                    message = json_depth.loads(line, max_depth=512)
                 except ValueError:
                     continue
                 if isinstance(message, dict) and (message := self._settle(message, pending, pending_lock)) is not None:
@@ -1126,7 +1129,7 @@ class _GhBroker:
             chunks.append(chunk)
             size += len(chunk)
         try:
-            request = json.loads(b"".join(chunks))
+            request = json_depth.loads(b"".join(chunks), max_depth=512)
             argv, environment = request["argv"], request.get("environment")
         except (ValueError, KeyError, TypeError, AttributeError):
             argv = environment = None
@@ -1267,6 +1270,7 @@ class _Boundary:
         interpreter = Path(sys.executable).resolve(strict=True)
         projected = {name: source.read_bytes() for name, source in _PROJECTED.items()}
         projected["bin/gh"] = _GH_SHIM.format(interpreter=interpreter).encode()
+        projected["json_depth.py"] = machinery_path("common/json_depth.py").read_bytes()
         # The canary imports these trusted contracts, never branch-controlled code.
         # They keep their package-relative places under the machinery package's own name.
         for relative in ("storage/topology.py", "lib/readonly_sqlite.py", "common/repo_root.py", "common/json_depth.py"):
@@ -1498,7 +1502,7 @@ class _Boundary:
             chunk = os.read(descriptor, 65536)
             if not chunk:
                 with contextlib.suppress(ValueError):
-                    return json.loads(b"".join(chunks))
+                    return json_depth.loads(b"".join(chunks), max_depth=512)
                 return None
             chunks.append(chunk)
         raise Refused("the sandbox canary did not report in time")

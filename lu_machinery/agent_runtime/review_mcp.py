@@ -100,6 +100,7 @@ from types import MappingProxyType
 from typing import Any
 
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import StateRootError, product_root, state_root
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.review.product_hooks import attempt_hooks
@@ -154,7 +155,7 @@ def check_review_tool_requirements(brief: str, review_access: str = "isolated") 
         try:
             if len(declarations) != 1:
                 raise ValueError("duplicate declaration")
-            declared = json.loads(declarations[0])
+            declared = json_depth.loads(declarations[0], max_depth=512)
             if not isinstance(declared, list) or any(
                 not isinstance(name, str) or not _SOURCES_TOOL_NAME.fullmatch(name) for name in declared
             ):
@@ -724,7 +725,7 @@ def _populate_agy_review_home(
         from lu_machinery.agent_runtime.agy_hook_config import GUARD_NAME, guard_registration
 
         _create_file("hooks.json", config_fd, json.dumps({GUARD_NAME: guard_registration()}).encode())
-        access = json.loads(config_bytes)["mcpServers"]["sources"].get("env", {}).get("LU_REVIEW_ACCESS")
+        access = json_depth.loads(config_bytes, max_depth=512)["mcpServers"]["sources"].get("env", {}).get("LU_REVIEW_ACCESS")
         _create_file(
             "settings.json", app_data_fd, json.dumps(agy_review_settings(access, checkout_root=checkout_root)).encode()
         )
@@ -1225,13 +1226,13 @@ def verify_codex_review_effective_mcp(
     except (OSError, ReviewDirectoryError):
         raise refuse(_ATTEMPT_PATHS_CHANGED) from None
     try:
-        expected = json.loads(_read_attempt_file(config.parent, config.name))["mcpServers"]["sources"]
+        expected = json_depth.loads(_read_attempt_file(config.parent, config.name), max_depth=512)["mcpServers"]["sources"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise refuse(
             f"cannot read the attempt MCP config {_echo_identifier(config.name)!r}: {_exc_reason(exc, diagnostics)}"
         ) from exc
     if boundary:
-        expected = json.loads(Path(boundary.tool_config["mcp_config_path"]).read_bytes())["mcpServers"]["sources"]
+        expected = json_depth.loads(Path(boundary.tool_config["mcp_config_path"]).read_bytes(), max_depth=512)["mcpServers"]["sources"]
         expected.setdefault("env", {})
     if not (codex_home / "config.toml").is_file():
         raise refuse("the scoped CODEX_HOME has no config.toml")
@@ -1256,7 +1257,7 @@ def verify_codex_review_effective_mcp(
     if proc.returncode != 0:
         raise refuse(f"`codex mcp list` exited {proc.returncode}: {_untrusted('stderr', proc.stderr, diagnostics)}")
     try:
-        servers = json.loads(proc.stdout)
+        servers = json_depth.loads(proc.stdout, max_depth=512)
     except ValueError as exc:
         raise refuse(
             f"`codex mcp list --json` did not return JSON: {_exc_reason(exc, diagnostics)}; "
@@ -1374,7 +1375,7 @@ def _strict_json_object(text: str) -> Any:
             raise ValueError(f"duplicate JSON keys: {_describe_names(keys)}")
         return dict(pairs)
 
-    return json.loads(text, object_pairs_hook=no_duplicates)
+    return json_depth.loads(text, object_pairs_hook=no_duplicates, max_depth=512)
 
 
 def verify_agy_review_effective_mcp(
@@ -1414,7 +1415,7 @@ def verify_agy_review_effective_mcp(
     except (OSError, ReviewDirectoryError):
         raise refuse(_ATTEMPT_PATHS_CHANGED) from None
     try:
-        expected = json.loads(_read_attempt_file(config.parent, config.name))["mcpServers"]["sources"]
+        expected = json_depth.loads(_read_attempt_file(config.parent, config.name), max_depth=512)["mcpServers"]["sources"]
         command = expected["command"]
         args = list(expected["args"])
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -1422,7 +1423,7 @@ def verify_agy_review_effective_mcp(
             f"cannot read the attempt MCP config {_echo_identifier(config.name)!r}: {_exc_reason(exc, diagnostics)}"
         ) from exc
     if boundary:
-        expected = json.loads(Path(boundary.tool_config["mcp_config_path"]).read_bytes())["mcpServers"]["sources"]
+        expected = json_depth.loads(Path(boundary.tool_config["mcp_config_path"]).read_bytes(), max_depth=512)["mcpServers"]["sources"]
         command, args = expected["command"], list(expected["args"])
     else:
         recording_env = expected.get("env")

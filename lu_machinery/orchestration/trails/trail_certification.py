@@ -23,6 +23,7 @@ from typing import Any, Literal
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.trails.executor import TrailExecutor
 from lu_machinery.orchestration.trails.models import (
@@ -188,7 +189,7 @@ def _load_schema_validator() -> Draft202012Validator:
     global _ATTESTATION_VALIDATOR
     if _ATTESTATION_VALIDATOR is None:
         try:
-            schema = json.loads(CERTIFICATION_ATTESTATION_SCHEMA_PATH.read_text(encoding="utf-8"))
+            schema = json_depth.loads(CERTIFICATION_ATTESTATION_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise TrailCertificationError("certification attestation schema is unavailable") from exc
         _ATTESTATION_VALIDATOR = Draft202012Validator(schema, format_checker=FormatChecker())

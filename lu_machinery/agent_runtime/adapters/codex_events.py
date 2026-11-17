@@ -19,11 +19,12 @@ anything unfamiliar or conflicting stays ``provider_error``.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
+
+from lu_machinery.common import json_depth
 
 from ..jsonl import jsonl_lines
 from ..tool_calls import tool_call_record
@@ -113,7 +114,7 @@ def parse_exec_stream(stdout: str) -> CodexExecStream:
         if not line.strip(" \t\r"):
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except (ValueError, RecursionError):
             malformed += 1
             continue
@@ -276,7 +277,7 @@ def tool_calls_from_items(items: Iterable[Mapping[str, Any]]) -> list[dict[str, 
 def mcp_tool_event(line: str) -> tuple[str, str] | None:
     """Return ``(server, tool)`` when one stdout line is a typed MCP call event."""
     try:
-        event = json.loads(line)
+        event = json_depth.loads(line, max_depth=512)
     except (ValueError, RecursionError):
         return None
     if not isinstance(event, dict) or event.get("type") not in {"item.started", "item.completed"}:

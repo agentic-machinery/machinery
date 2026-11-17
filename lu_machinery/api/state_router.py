@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 from lu_machinery.agent_identity import normalize_seat, seat_read_aliases
 from lu_machinery.agent_runtime.acp_health import probe_acp_health
 from lu_machinery.agent_runtime.usage import summarize_fleet_burn, summarize_lane_runtime
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.fleet import capacity_pick, credit_lane
 from lu_machinery.fleet.reset_reserve import (
@@ -1907,7 +1908,7 @@ def _task_file_codex_account(tasks_dir: Path, task_id: str) -> object:
     if resolved.parent != root or not resolved.is_file():
         return None
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
+        payload = json_depth.loads(resolved.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):

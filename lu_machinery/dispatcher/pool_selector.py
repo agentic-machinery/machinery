@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 
 
@@ -205,7 +206,7 @@ def config_path() -> Path:
 
 
 def read_policy(path: Path | None = None) -> Policy:
-    data = json.loads((path or config_path()).read_text())
+    data = json_depth.loads((path or config_path()).read_text(), max_depth=512)
     pools = []
     for row in data["pools"]:
         pool = Pool(**{**row, "required_windows": tuple(row["required_windows"]),
@@ -240,7 +241,7 @@ def read_budget() -> dict:
     """Reuse Monitor's cache-only reading. No provider probe or refresh is started."""
     base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
     with urllib.request.urlopen(base + "/api/state/routing-budget", timeout=2) as response:
-        data = json.load(response)
+        data = json_depth.load(response, max_depth=512)
     if not isinstance(data, dict):
         raise ValueError("invalid budget snapshot")
     return data
@@ -343,7 +344,7 @@ def _provider_exhausted(record: dict) -> bool:
             lines = jsonl_lines(stream.read(1024 * 1024).decode("utf-8", errors="replace"))
         for line in lines:
             try:
-                event = json.loads(line)
+                event = json_depth.loads(line, max_depth=512)
             except ValueError:
                 continue
             if not isinstance(event, dict):

@@ -1,0 +1,140 @@
+"""Refuse unbounded stdlib JSON readers in machinery.
+
+There is no exception baseline. Only common/json_depth.py implements decoding;
+callers use its explicit max_depth limit. References as well as calls are
+checked so assigning json.loads to another name cannot hide a reader. Literal
+Python scripts embedded in source are checked too, without executing them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import sys
+from pathlib import Path
+
+_HELPER = Path("common/json_depth.py")
+_BOUNDED = "lu_machinery.common.json_depth"
+_READERS = {"json.load", "json.loads", "json.JSONDecoder().decode", "json.JSONDecoder().raw_decode"}
+
+
+def _name(node: ast.AST, names: dict[str, str]) -> str:
+    if isinstance(node, ast.Name):
+        return names.get(node.id, node.id).replace("json.decoder.JSONDecoder", "json.JSONDecoder")
+    if isinstance(node, ast.Attribute):
+        return f"{_name(node.value, names)}.{node.attr}".replace("json.decoder.JSONDecoder", "json.JSONDecoder")
+    if isinstance(node, ast.Call):
+        if _name(node.func, names) == "getattr" and len(node.args) >= 2:
+            field = node.args[1]
+            if isinstance(field, ast.Constant) and isinstance(field.value, str):
+                return f"{_name(node.args[0], names)}.{field.value}"
+        return f"{_name(node.func, names)}()"
+    return ""
+
+
+def violations(source: str, *, embedded: bool = True) -> list[tuple[int, str]]:
+    """Return line/reason pairs; invalid Python raises SyntaxError to the caller."""
+    tree = ast.parse(source)
+    names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                names[item.asname or item.name.partition(".")[0]] = item.name if item.asname else item.name.partition(".")[0]
+        elif isinstance(node, ast.ImportFrom):
+            for item in node.names:
+                names[item.asname or item.name] = f"{node.module}.{item.name}"
+    assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
+    # Finite fixed point: each assignment can add a name once. No execution or
+    # inference of arbitrary function return values is needed for reader aliases.
+    while True:
+        added = False
+        for node in assignments:
+            if node.value is None:
+                continue
+            value = _name(node.value, names)
+            if not value.startswith(("json.", "lu_machinery.common.json_depth")) and value != "json":
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in names:
+                    names[target.id] = value
+                    added = True
+        if not added:
+            break
+    found: set[tuple[int, str]] = set()
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+    for node in ast.walk(tree):
+        name = _name(node, names)
+        if isinstance(node, (ast.Attribute, ast.Name, ast.Call)) and (
+            name in _READERS
+            or (isinstance(node, ast.Attribute) and node.attr == "raw_decode" and name != f"{_BOUNDED}.raw_decode")
+        ):
+            found.add((node.lineno, "unbounded_json_reader: use lu_machinery.common.json_depth with max_depth"))
+        if (
+            isinstance(node, ast.ImportFrom) and node.module in {"json", "json.decoder"}
+            and any(item.name == "*" for item in node.names)
+        ):
+            found.add((node.lineno, "unbounded_json_import: wildcard JSON imports hide readers"))
+        if embedded and isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            # Parse only strings that might contain a JSON reader, then use the
+            # same AST check. Ordinary prose and incomplete format fragments
+            # are not executable Python scripts.
+            if "import" not in node.value or "json" not in node.value or not any(word in node.value for word in ("load", "decode")):
+                continue
+            try:
+                nested = violations(node.value, embedded=False)
+            except (SyntaxError, ValueError):
+                continue
+            for line, reason in nested:
+                found.add((node.lineno, f"embedded line {line}: {reason}"))
+    return sorted(found)
+
+
+def check(root: Path) -> list[str]:
+    """Scan one machinery package directory, failing closed on missing/unreadable source."""
+    paths = sorted(root.rglob("*.py"))
+    if not root.is_dir() or not paths or not (root / _HELPER).is_file():
+        return [f"{root}: json_reader_scan_incomplete: package or bounded helper missing"]
+    errors: list[str] = []
+    for path in paths:
+        if path.relative_to(root) == _HELPER:
+            continue
+        try:
+            for line, reason in violations(path.read_text(encoding="utf-8")):
+                errors.append(f"{path}:{line}: {reason}")
+        except (OSError, UnicodeError, SyntaxError, ValueError, RecursionError) as exc:
+            errors.append(f"{path}: json_reader_scan_incomplete: {type(exc).__name__}")
+    return errors
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=("Reject unbounded JSON readers in lu_machinery.\n"
+                     "Use in CI or after adding a reader; this scans source and does not parse application data."),
+        epilog=("Examples:\n  .venv/bin/python -m lu_machinery.lint.json_readers\n"
+                "  .venv/bin/python -m lu_machinery.lint.json_readers --root lu_machinery\n"
+                "Outputs: diagnostics on stderr or a pass on stdout; no files written.\n"
+                "Exit codes: 0 clean; 1 bare readers or incomplete scan; 2 invalid options.\n"
+                "Related: lu_machinery/common/json_depth.py; M1c JSON depth migration."),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--root", type=Path, default=Path("lu_machinery"),
+                        help="Machinery package directory to scan, e.g. lu_machinery (default: lu_machinery)")
+    args = parser.parse_args(argv)
+    errors = check(args.root)
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        return 1
+    print("JSON reader lint passed: no unbounded readers")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

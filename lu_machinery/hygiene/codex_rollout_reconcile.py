@@ -22,6 +22,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 try:
     from lu_machinery.common.repo_root import MachineryConfigError, state_root
     from lu_machinery.path_safety import assert_delete_target
@@ -171,7 +173,7 @@ def _load_pins(home: Path) -> tuple[set[str], list[str]]:
     if not path.exists():
         return set(), []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         return set(), [f"cannot read pinned-thread state: {exc.__class__.__name__}"]
     values = payload.get("pinned-thread-ids", payload.get("pinned_thread_ids")) if isinstance(payload, dict) else None

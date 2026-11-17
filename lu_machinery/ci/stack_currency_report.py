@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -147,7 +149,7 @@ def _read_json(url: str, opener: Callable[..., Any], headers: Mapping[str, str])
         raw = response.read(_MAX_BODY + 1)
     if len(raw) > _MAX_BODY:
         raise ValueError("response too large")
-    return json.loads(raw.decode("utf-8"))
+    return json_depth.loads(raw.decode("utf-8"), max_depth=512)
 
 
 def has_upstream(name: str) -> bool:
@@ -296,7 +298,7 @@ def render_body(report: Mapping[str, Any]) -> str:
 
 def _load_report(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise PinFileError("stack currency report could not be read") from exc
     if not isinstance(data, dict):

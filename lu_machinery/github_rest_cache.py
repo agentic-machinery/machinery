@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 # (path, request headers, timeout seconds) -> (status, response headers, body)
 RestTransport = Callable[[str, dict[str, str], float], tuple[int, dict[str, str], bytes]]
@@ -254,7 +254,7 @@ class GitHubRestCache:
             if status != 200:
                 raise GitHubRestError("GitHub login lookup failed", status=status)
             try:
-                payload = json.loads(body.decode("utf-8"))
+                payload = json_depth.loads(body.decode("utf-8"), max_depth=512)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise GitHubRestError("GitHub login lookup returned invalid JSON") from exc
             login = payload.get("login") if isinstance(payload, dict) else None
@@ -366,7 +366,7 @@ class GitHubRestCache:
             raise GitHubRestError(f"GitHub REST {status} for {path}", status=status)
 
         try:
-            parsed = json.loads(body.decode("utf-8"))
+            parsed = json_depth.loads(body.decode("utf-8"), max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GitHubRestError("invalid GitHub JSON") from exc
 

@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from lu_machinery.common import json_depth
+
 # Launchers invoke this file directly, without a repository PYTHONPATH.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -1579,8 +1581,8 @@ def _main() -> int:
         import json
 
         try:
-            context = json.loads(args.role_context_file.read_text()) if args.role_context_file else None
-            health = json.loads(args.role_health_file.read_text()) if args.role_health_file else None
+            context = json_depth.loads(args.role_context_file.read_text(), max_depth=512) if args.role_context_file else None
+            health = json_depth.loads(args.role_health_file.read_text(), max_depth=512) if args.role_health_file else None
             resolution = resolve_role(args.resolve_role, purpose=args.purpose, transport=args.transport,
                                       family=args.family, context=context, health=health)
         except (ModelCatalogError, ValueError, OSError) as exc:

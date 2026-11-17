@@ -48,6 +48,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import _PRODUCT_TREE, machinery_path, product_root, product_tree_path
 
 
@@ -508,7 +509,7 @@ def _parse_rename_map(raw: bytes, recorded: str, prefix: str, digest_name: str) 
     if actual != line.group("digest"):
         raise ValueError(f"{prefix}: sha256 {actual} does not match the recorded {line.group('digest')}")
     try:
-        data = json.loads(raw)
+        data = json_depth.loads(raw, max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{prefix}: not valid JSON: {exc}") from exc
     if not isinstance(data, dict) or not data:
@@ -835,7 +836,7 @@ def _payload_entries(
 
 
 def load_entries(path: Path, root: Path | None = None) -> list[MypyError]:
-    return _payload_entries(json.loads(path.read_text(encoding="utf-8")), str(path), root)
+    return _payload_entries(json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512), str(path), root)
 
 
 def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
@@ -889,7 +890,7 @@ def _baseline_at(root: Path, ref: str, rel: str) -> list[MypyError] | None:
     raw = _git_show(root, ref, rel)
     if raw is None:
         return None
-    return _payload_entries(json.loads(raw), f"{ref}:{rel}", root, _spelling_at(root, ref, rel))
+    return _payload_entries(json_depth.loads(raw, max_depth=512), f"{ref}:{rel}", root, _spelling_at(root, ref, rel))
 
 
 def _is_subset(current: Sequence[MypyError], previous: Sequence[MypyError]) -> bool:

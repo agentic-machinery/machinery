@@ -72,7 +72,9 @@ def main() -> int:
         if len(sys.argv) != 2:
             raise ValueError("one fleet guard path required")
         argv = guard_argv(sys.argv[1])
-        payload = json.load(sys.stdin)
+        from lu_machinery.common import json_depth
+
+        payload = json_depth.load(sys.stdin, max_depth=512)
         if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
             raise ValueError("invalid PreToolUse event")
         tool_name = _TOOL_NAMES.get(payload.get("toolName"))

@@ -19,6 +19,7 @@ from typing import Any
 
 from lu_machinery.agent_runtime.retired_seat_admission import ACP_MODE
 from lu_machinery.agent_runtime.target_admission import resolve_and_admit, stored_kimi_request
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneUnsupportedComponentError,
@@ -484,7 +485,7 @@ class RequestExecutor:
         spec: dict[str, Any] = {}
         if row and row["invocation_spec_json"]:
             try:
-                loaded = json.loads(str(row["invocation_spec_json"]))
+                loaded = json_depth.loads(str(row["invocation_spec_json"]), max_depth=512)
                 if isinstance(loaded, dict):
                     spec = loaded
             except json.JSONDecodeError:

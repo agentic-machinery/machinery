@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 REGISTRY_SCHEMA_PATH = (
@@ -102,7 +103,7 @@ def _load_yaml_or_json(path: Path) -> dict[str, Any]:
     try:
         content = path.read_text(encoding="utf-8")
         data = (
-            json.loads(content)
+            json_depth.loads(content, max_depth=512)
             if path.suffix == ".json"
             else yaml.load(content, Loader=_StringTimestampSafeLoader)
         )
@@ -117,7 +118,7 @@ def _load_schema(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise RedCIKnownFailuresValidationError(f"Schema file not found: {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except Exception as exc:
         raise RedCIKnownFailuresValidationError(f"JSON parse error in schema {path}: {exc}") from exc
     if not isinstance(data, dict):

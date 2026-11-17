@@ -33,6 +33,7 @@ from lu_machinery.agent_runtime.codex_accounts import (
     CodexAccountRefused,
     codex_account_home,
 )
+from lu_machinery.common import json_depth
 
 DEFAULT_LABEL = "local"
 DEFAULT_REPO = Path.home() / "projects" / "learn-ukrainian"
@@ -227,7 +228,7 @@ def strings_from_line(line: str) -> list[str]:
     if not stripped:
         return []
     try:
-        payload = json.loads(stripped)
+        payload = json_depth.loads(stripped, max_depth=512)
     except json.JSONDecodeError:
         return [stripped]
     if isinstance(payload, (dict, list, str)):

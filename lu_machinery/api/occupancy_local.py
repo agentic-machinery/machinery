@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -269,7 +271,7 @@ def _iter_marker_payloads(root: Path) -> Iterator[dict[str, Any]]:
         return
     for path in candidates:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError, UnicodeError) as exc:
             raise OSError from exc
         if isinstance(raw, list):

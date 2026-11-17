@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -36,12 +38,12 @@ def read_report(path: Path) -> dict:
     """Reject incomplete/non-branch reports instead of silently comparing empty sets."""
     manifest_path = path.with_name("manifest.json")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json_depth.loads(manifest_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError) as error:
         raise ValueError(f"{manifest_path}: expected a readable manifest with complete: true") from error
     if not isinstance(manifest, dict) or manifest.get("complete") is not True:
         raise ValueError(f"{manifest_path}: expected complete: true before comparing coverage")
-    report = json.loads(path.read_text(encoding="utf-8"))
+    report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if report.get("meta", {}).get("branch_coverage") is not True or not report.get("files"):
         raise ValueError(f"{path}: expected a non-empty branch coverage JSON report")
     for name, data in report["files"].items():

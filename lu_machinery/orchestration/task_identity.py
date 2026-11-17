@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Mapping
 from copy import deepcopy
@@ -10,6 +9,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import github_slug, machinery_path
 
 IDENTITY_SCHEMA_VERSION = "task-identity.v1"
@@ -31,7 +31,7 @@ NATIVE_TITLE_HARNESSES = frozenset({"codex-app"})
 
 # The schema ships inside the machinery package.
 _SCHEMA_PATH = machinery_path("schemas/task-identity.v1.schema.json")
-_IDENTITY_SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+_IDENTITY_SCHEMA = json_depth.loads(_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
 _IDENTITY_VALIDATOR = Draft202012Validator(_IDENTITY_SCHEMA, format_checker=FormatChecker())
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)

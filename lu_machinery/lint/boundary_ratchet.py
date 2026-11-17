@@ -55,6 +55,7 @@ from lu_machinery.ci.components import (
     scan_imports,
     scan_runtime_edges,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import _PRODUCT_TREE, product_root, product_tree_path
 
 
@@ -461,7 +462,7 @@ def _entries_from_rows(rows: object, where: str) -> Counter[tuple[str, str]]:
 
 
 def load_baseline(path: Path) -> Counter[tuple[str, str]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{path}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), str(path))
@@ -502,7 +503,7 @@ def _baseline_at(root: Path, ref: str, rel: str) -> Counter[tuple[str, str]] | N
     )
     if result.returncode != 0:
         return None
-    payload = json.loads(result.stdout)
+    payload = json_depth.loads(result.stdout, max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{ref}:{rel}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), f"{ref}:{rel}")

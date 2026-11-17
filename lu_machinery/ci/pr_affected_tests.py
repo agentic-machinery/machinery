@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 from lu_machinery.ci.gate import event_tier
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root, product_tree_path
 
 # The runtime package supplies the CLI module name; data belongs to the product.
@@ -374,7 +375,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     for entry in guards:
         if "::" in entry:
             validate_node(entry)
-    durations = json.loads(product_tree_path(*DURATIONS.parts).read_text(encoding="utf-8"))
+    durations = json_depth.loads(product_tree_path(*DURATIONS.parts).read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(durations, dict):
         raise ValueError("invalid duration record")
     # A pinned id always runs: its whole file may be deferred by cost even when it changed.
@@ -512,7 +513,7 @@ def main() -> int:
     try:
         os.chdir(product_root())
         actual = git("rev-parse", "HEAD").decode().strip()
-        payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+        payload = json_depth.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"), max_depth=512)
         tier = event_tier(os.environ["EVENT_NAME"], payload, os.environ["GITHUB_SHA"], os.environ["GITHUB_REF"], actual)
         if tier != "admission":
             print("Full tier: required full-suite jobs provide pytest proof.")

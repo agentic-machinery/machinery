@@ -45,7 +45,7 @@ from typing import Any
 
 import yaml
 
-from lu_machinery.common import repo_root
+from lu_machinery.common import json_depth, repo_root
 from lu_machinery.ops.product_entry import load_configured_module
 
 logger = logging.getLogger("research.registry")
@@ -85,7 +85,7 @@ def research_check_config(*, product_root: Path | None = None) -> dict[str, str]
     """
     path = _check_config_path(_selected_product_root(product_root))
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError("research check config is unreadable") from exc
     if not isinstance(payload, dict) or payload.get("schema") != _CHECK_SCHEMA:
@@ -234,7 +234,7 @@ def is_enabled(*, root: Path | None = None) -> bool:
         return False
     try:
         raw = flag_path.read_text("utf-8")
-        data = json.loads(raw)
+        data = json_depth.loads(raw, max_depth=512)
     except (OSError, ValueError) as exc:
         logger.warning(
             "research registry: live flag %s is unreadable/malformed (%s); disabled",

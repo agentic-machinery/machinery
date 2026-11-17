@@ -28,6 +28,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 ENV_NEEDLES_FILE = "LU_OPSEC_NEEDLES_FILE"
 NEEDLES_FILE_NAME = "opsec-needles.json"
 SCHEMA_VERSION = 1
@@ -115,7 +117,7 @@ def load_needles(path: Path | None = None, *, environ: Mapping[str, str] | None 
     if not target.is_file():
         raise NeedlesError(f"{_LABEL}: location exists but is not a readable regular file")
     try:
-        data = json.loads(target.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys)
+        data = json_depth.loads(target.read_text(encoding="utf-8"), object_pairs_hook=_unique_keys, max_depth=512)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise NeedlesError(f"{_LABEL}: unreadable ({type(exc).__name__})") from None
     if not isinstance(data, dict) or not _is_schema_version(data.get("schema_version")):

@@ -29,6 +29,7 @@ from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_ACCOUNT_REFUSAL_C
 from lu_machinery.agent_runtime.failure_codes import RUNTIME_FAILURE_CODES
 from lu_machinery.agent_runtime.usage import _iter_usage_records as _iter_usage_file_records
 from lu_machinery.agent_runtime.usage import has_headroom
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.control_plane import storage
 from lu_machinery.fleet_comms import message_plane
@@ -1041,7 +1042,7 @@ def _acp_identifier(value: Any) -> str | None:
 def _acp_discussion_participants(value: Any) -> tuple[str, str]:
     """Return a privacy-safe enabled pair, tolerating legacy stored shapes."""
     try:
-        decoded = json.loads(value) if isinstance(value, str) else value
+        decoded = json_depth.loads(value, max_depth=512) if isinstance(value, str) else value
     except (TypeError, ValueError, json.JSONDecodeError):
         decoded = None
     enabled: list[str] = []

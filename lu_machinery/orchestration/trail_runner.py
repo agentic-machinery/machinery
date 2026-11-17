@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.orchestration.trails.executor import TrailExecutor
 from lu_machinery.orchestration.trails.models import ExitClass, TrailRunnerError, TrailRunResult
@@ -69,7 +70,7 @@ def load_params(path_value: str) -> dict[str, Any]:
     """Load the required JSON params object without accepting raw inline JSON."""
     path = Path(path_value)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise TrailRunnerError(f"cannot read --params JSON file '{path}': {exc}") from exc
     if not isinstance(payload, dict):

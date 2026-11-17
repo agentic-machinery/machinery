@@ -37,6 +37,8 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -209,7 +211,7 @@ def _fetch_json_fail_open(url: str, *, timeout_seconds: float = 2.0) -> dict[str
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             body = resp.read().decode("utf-8")
-        payload = json.loads(body) if body else {}
+        payload = json_depth.loads(body, max_depth=512) if body else {}
         if isinstance(payload, dict):
             return {"available": True, "payload": payload}
         return {"available": False, "reason": "non_object_json"}
@@ -758,7 +760,7 @@ def cmd_authority_import(args: argparse.Namespace) -> int:
                 record_path = Path(args.records_jsonl).expanduser()
                 try:
                     lines = split_jsonl_lines(record_path.read_text(encoding="utf-8"))
-                    records = [json.loads(line) for line in lines if line.strip()]
+                    records = [json_depth.loads(line, max_depth=512) for line in lines if line.strip()]
                 except (OSError, json.JSONDecodeError) as exc:
                     raise FleetCommsCliError("authority_import_records_unreadable") from exc
                 if not all(isinstance(record, dict) for record in records):
@@ -983,7 +985,7 @@ def _json_object(value: str | None) -> dict[str, Any]:
     if value is None:
         return {}
     try:
-        parsed = json.loads(value)
+        parsed = json_depth.loads(value, max_depth=512)
     except json.JSONDecodeError as exc:
         raise FleetCommsCliError("metadata_json_invalid") from exc
     if not isinstance(parsed, dict):

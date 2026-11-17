@@ -11,11 +11,18 @@ from __future__ import annotations
 import errno
 import json
 import os
+import runpy
 import socket
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
+
+if __package__:
+    from lu_machinery.common.json_depth import load as _json_load
+else:
+    # The parent stages this stdlib-only helper beside the projected canary.
+    _json_load = runpy.run_path(str(Path(__file__).with_name("json_depth.py")))["load"]
 
 
 @dataclass(frozen=True)
@@ -111,7 +118,7 @@ def main() -> int:
     if sys.argv[2] != "--" or not command:
         return 125
     with open(plan_path, encoding="utf-8") as handle:
-        plan = json.load(handle)
+        plan = _json_load(handle, max_depth=512)
     outcomes = [
         {**probe, "outcome": _attempt(probe["op"], probe["path"], probe.get("port"), probe.get("store"))}
         for probe in plan["probes"]

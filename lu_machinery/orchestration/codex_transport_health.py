@@ -20,6 +20,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -110,7 +112,7 @@ def load_receipt(receipt_path: Path | None = None) -> dict[str, Any] | None:
     if receipt_path is None:
         receipt_path = state_root() / "batch_state" / "runtime" / "codex-transport-health.json"
     try:
-        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(receipt_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:

@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import os
 import re
 import subprocess
@@ -48,6 +47,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+from lu_machinery.common import json_depth
 
 STATUS_CONTEXT = "fleet/cross-family-review"
 GITHUB_HTTPS = "https://github.com/"
@@ -238,7 +239,7 @@ def graphql_post() -> Post:
         if completed.returncode != 0:
             raise Retryable(f"GraphQL request failed (exit {completed.returncode})")
         try:
-            document: object = json.loads(completed.stdout)
+            document: object = json_depth.loads(completed.stdout, max_depth=512)
         except ValueError:
             raise Retryable("GraphQL response undecodable") from None
         return document
@@ -489,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         if not event_file or not token:
             raise GateError("GITHUB_EVENT_PATH (or --event-file) and GITHUB_TOKEN are required")
         try:
-            payload = json.loads(Path(event_file).read_text(encoding="utf-8"))
+            payload = json_depth.loads(Path(event_file).read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError) as error:
             raise GateError(f"event file unreadable: {type(error).__name__}") from None
         event = parse_event(payload)

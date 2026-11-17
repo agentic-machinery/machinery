@@ -12,6 +12,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import (
     configure_native_hook_roots,
     machinery_path,
@@ -178,7 +179,7 @@ def _read_config(path: Path) -> dict:
         return data
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members)
+        data = json_depth.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_members, max_depth=512)
     except FileNotFoundError:
         raise AgyHookConfigError("missing_file") from None
     except (OSError, UnicodeError, ValueError):
@@ -378,7 +379,7 @@ def provision_workspace_guard(cwd: Path) -> None:
             with os.fdopen(fd, "r", encoding="utf-8", newline="") as handle:
                 original = handle.read()
         try:
-            data = json.loads(original)
+            data = json_depth.loads(original, max_depth=512)
         except (ValueError, UnicodeError):
             raise AgyHookConfigError("invalid_json") from None
         if not isinstance(data, dict):

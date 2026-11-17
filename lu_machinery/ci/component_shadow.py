@@ -20,7 +20,7 @@ from lu_machinery.ci import dependency_change_scope as dependency
 from lu_machinery.ci._location import checkout_relative, module_name
 from lu_machinery.ci.deploy_paths import POLICY_REL
 from lu_machinery.ci.junit_results import parse_junit
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root
 
 SCHEMA = "component-shadow.v1"
@@ -255,7 +255,7 @@ def report(args) -> dict:
     try:
         selection = select(args.base, args.head, args.event, args.root)
         results = read_full_results(args.results, args.root, args.shards)
-        cost = json.loads(args.cost.read_text()) if args.cost else None
+        cost = json_depth.loads(args.cost.read_text(), max_depth=512) if args.cost else None
         receipt |= selection | results | {"projected_cost_after_lost_reuse": projected_cost(
             selection, results, cost, getattr(args, "cost_unknown_reason", "matched-pr-queue-cost-inputs-not-supplied"))}
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
@@ -265,8 +265,8 @@ def report(args) -> dict:
 
 
 def gh_pages(endpoint: str, key: str) -> list[dict]:
-    data = json.loads(github_client.run(["gh", "api", "--paginate", "--slurp", endpoint],
-                                    check=True, capture_output=True, text=True, timeout=180).stdout)
+    data = json_depth.loads(github_client.run(["gh", "api", "--paginate", "--slurp", endpoint],
+                                    check=True, capture_output=True, text=True, timeout=180).stdout, max_depth=512)
     rows = [row for page in data for row in page[key]]
     if data and len(rows) != data[0]["total_count"]:
         raise ValueError("incomplete GitHub census")
@@ -281,8 +281,8 @@ def inventory(repository: str, created: str, *, first_attempts: bool = False) ->
         if run["event"] not in {"pull_request", "merge_group"}:
             continue
         if first_attempts:
-            run = json.loads(github_client.run(["gh", "api", f"repos/{repository}/actions/runs/{run['id']}/attempts/1"],
-                                            check=True, capture_output=True, text=True, timeout=60).stdout)
+            run = json_depth.loads(github_client.run(["gh", "api", f"repos/{repository}/actions/runs/{run['id']}/attempts/1"],
+                                            check=True, capture_output=True, text=True, timeout=60).stdout, max_depth=512)
             endpoint = f"repos/{repository}/actions/runs/{run['id']}/attempts/1/jobs?per_page=100"
         else:
             endpoint = f"repos/{repository}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100"
@@ -340,7 +340,7 @@ def check(registration: dict, directory: Path, *, now: str | None = None) -> dic
         or instant(registration["stop_at"]) != registered + timedelta(days=30)):
         raise ValueError("registration does not bind the required rules/denominators")
     census_path = directory / "runs.json"
-    census = json.loads(census_path.read_text()) if census_path.exists() else {}
+    census = json_depth.loads(census_path.read_text(), max_depth=512) if census_path.exists() else {}
     if census.get("complete") is not True or census.get("first_attempts") is not True:
         unresolved.append("live-run-census-missing-or-incomplete")
     rows = [r for r in census.get("runs", []) if r["event"] == "pull_request"
@@ -362,7 +362,7 @@ def check(registration: dict, directory: Path, *, now: str | None = None) -> dic
     for path in directory.rglob("*.json"):
         if path == census_path:
             continue
-        receipt = json.loads(path.read_text())
+        receipt = json_depth.loads(path.read_text(), max_depth=512)
         if receipt.get("schema") != SCHEMA:
             continue
         if receipt.get("kind") == "base":
@@ -519,11 +519,11 @@ def main(argv: list[str] | None = None) -> int:
             result = inventory(args.repository, args.created, first_attempts=args.first_attempts)
             write_json(args.output, result)
         elif args.command == "register":
-            result = register(json.loads(args.baseline.read_text()), args.root,
+            result = register(json_depth.loads(args.baseline.read_text(), max_depth=512), args.root,
                               minimum_narrowed_cases=args.minimum_narrowed_cases)
             write_json(args.output, result, exclusive=True)
         else:
-            result = check(json.loads(args.registration.read_text()), args.receipts, now=args.now)
+            result = check(json_depth.loads(args.registration.read_text(), max_depth=512), args.receipts, now=args.now)
             print(json.dumps(result, sort_keys=True))
             return int(result["unresolved_count"] > 0 or result["missed_failure_count"] > 0)
         print(json.dumps(result, sort_keys=True))

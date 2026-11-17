@@ -290,7 +290,7 @@ def _looks_like_findings(source: str) -> bool:
                 # A cut inside the key itself may still name the whole field.
                 token = re.split(r"[\r\n]", source[position:], maxsplit=1)[0]
                 try:
-                    return json.loads(token + '"') in _FINDINGS_ENVELOPE_KEYS
+                    return json_depth.loads(token + '"', max_depth=_JSON_MAX_DEPTH) in _FINDINGS_ENVELOPE_KEYS
                 except ValueError:
                     pass
             return False

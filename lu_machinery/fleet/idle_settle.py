@@ -31,6 +31,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -715,7 +717,7 @@ def load_events(path: Path) -> list[dict[str, Any]]:
         if not text:
             continue
         try:
-            payload = json.loads(text)
+            payload = json_depth.loads(text, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
@@ -873,7 +875,7 @@ def format_admission(state: AdmissionState) -> str:
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON object required: {path}")
     return payload

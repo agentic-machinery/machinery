@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
+from lu_machinery.common import json_depth
 from lu_machinery.review.product_hooks import attempt_hooks
 from lu_machinery.secret_redactor import redact_text
 
@@ -137,7 +138,7 @@ def _codex_config_layers(
                         pending += chunk
                         while b"\n" in pending:
                             line, pending = pending.split(b"\n", 1)
-                            reply = _json.loads(line)
+                            reply = json_depth.loads(line, max_depth=512)
                             if reply.get("id") == 2:
                                 layers = reply.get("result", {}).get("layers")
                                 if not isinstance(layers, list) or not layers:
@@ -631,7 +632,7 @@ class CodexAdapter:
                     if tool_config.get("review_write_root")
                     else schema_path.parent.resolve(),
                 )
-                schema = _json.loads(payload.decode("utf-8"))
+                schema = json_depth.loads(payload.decode("utf-8"), max_depth=512)
             except (OSError, UnicodeDecodeError, _json.JSONDecodeError) as exc:
                 raise ValueError(f"CodexAdapter: invalid output schema JSON: {exc}") from exc
             if not isinstance(schema, dict):
@@ -825,7 +826,7 @@ class CodexAdapter:
         lines = list(stdout_lines)
         last_line = next((line for line in reversed(lines) if line.strip()), "")
         try:
-            last_event = _json.loads(last_line)
+            last_event = json_depth.loads(last_line, max_depth=512)
         except (ValueError, RecursionError):
             return False
         if not isinstance(last_event, dict) or last_event.get("type") != "turn.completed":

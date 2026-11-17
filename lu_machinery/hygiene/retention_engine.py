@@ -26,6 +26,8 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 PLAN_DIR_REL = Path("batch_state") / "fleet-comms" / "retention"
 DEFAULT_ARCHIVE_ROOT = Path.home() / "Library" / "Application Support" / "learn-ukrainian" / "retention-archives"
 GATE5_TARGET_DAYS = 7
@@ -276,7 +278,7 @@ def record_gate5_observation(
         log: dict[str, Any]
         if log_path.is_file():
             try:
-                raw = json.loads(log_path.read_text(encoding="utf-8"))
+                raw = json_depth.loads(log_path.read_text(encoding="utf-8"), max_depth=512)
                 log = raw if isinstance(raw, dict) else {}
             except (OSError, json.JSONDecodeError, UnicodeError):
                 log = {}

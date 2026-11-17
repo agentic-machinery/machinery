@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lu_machinery.ai_agent_bridge.broker_indexes import apply as apply_broker_indexes
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import ControlPlaneError
 from lu_machinery.fleet_comms.agent_success_metrics import collect_agent_success
 from lu_machinery.fleet_comms.efficiency_metrics import (
@@ -324,7 +325,7 @@ def _append_event_snapshot(activity: dict[str, dict], row, limit: int) -> None:
     payload = {}
     if row["payload_json"]:
         try:
-            payload = json.loads(row["payload_json"])
+            payload = json_depth.loads(row["payload_json"], max_depth=512)
         except json.JSONDecodeError:
             payload = {}
     event_agents = {agent for agent in (row["to_agent"], payload.get("agent")) if agent in activity}
@@ -569,7 +570,7 @@ async def active_processes(ctx: MonitorContext = Depends(get_ctx)):
     processes = []
     for pf in sorted(pid_dir.glob("*.json")):
         try:
-            data = json.loads(pf.read_text())
+            data = json_depth.loads(pf.read_text(), max_depth=512)
             pid = data.get("pid", 0)
             alive = False
             try:
@@ -702,7 +703,7 @@ async def detect_zombies(
     if pid_dir.exists():
         for pf in pid_dir.glob("*.json"):
             try:
-                data = json.loads(pf.read_text())
+                data = json_depth.loads(pf.read_text(), max_depth=512)
                 pid = data.get("pid", 0)
                 try:
                     os.kill(pid, 0)
@@ -811,7 +812,7 @@ async def broker_health(ctx: MonitorContext = Depends(get_ctx)):
     if pid_dir.exists():
         for pf in pid_dir.glob("*.json"):
             try:
-                data = json.loads(pf.read_text(encoding="utf-8"))
+                data = json_depth.loads(pf.read_text(encoding="utf-8"), max_depth=512)
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 logger.warning("comms health: failed to load pid file %s: %s", pf.name, exc)
                 errors.append(f"{pf.name}: {type(exc).__name__}")
@@ -896,7 +897,7 @@ def _scan_live_activity(ctx: MonitorContext, minutes: int = 15) -> list[dict]:
                 continue
 
             try:
-                state = json.loads(recent_state_file.read_text())
+                state = json_depth.loads(recent_state_file.read_text(), max_depth=512)
             except (json.JSONDecodeError, OSError):
                 continue
 
@@ -1303,7 +1304,7 @@ async def list_channel_messages(
                 "from_model": r["from_model"],
                 "kind": r["kind"],
                 "body": r["body"],
-                "attachments": (json.loads(r["attachments"]) if r["attachments"] else None),
+                "attachments": (json_depth.loads(r["attachments"], max_depth=512) if r["attachments"] else None),
                 "context_rev_shared": r["context_rev_shared"],
                 "context_rev_channel": r["context_rev_channel"],
                 "created_at": r["created_at"],

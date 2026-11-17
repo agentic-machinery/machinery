@@ -38,6 +38,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
@@ -1047,7 +1049,7 @@ def _query_pr_by_number(
     if proc.returncode != 0:
         return [], f"{rest_error}; gh pr view failed: {worktree_git._format_failure(proc)}"
     try:
-        item = json.loads(proc.stdout or "{}")
+        item = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         return [], f"gh pr view returned invalid JSON: {exc}"
     if not isinstance(item, dict):

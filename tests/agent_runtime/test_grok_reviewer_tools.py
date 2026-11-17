@@ -716,7 +716,9 @@ def test_main_denies_interpreter_level_input_errors(tracked_review_root, monkeyp
     def fail(*args, **kwargs):
         raise error("private input error")
 
-    monkeypatch.setattr(policy.json, "load", fail)
+    from lu_machinery.common import json_depth
+
+    monkeypatch.setattr(json_depth, "load", fail)
     monkeypatch.setattr(sys, "argv", ["guard", "--review-root", str(tracked_review_root)])
     assert policy.main() == 2
     assert capsys.readouterr().err.startswith(policy.REFUSAL_CODE + ":")

@@ -228,7 +228,7 @@ def refusal_of(observed, *, injected=False):
         return None
     for stream in (getattr(observed, "stdout", None), getattr(observed, "stderr", None)):
         try:
-            detail = json.loads(stream)
+            detail = json_depth.loads(stream, max_depth=_JSON_MAX_DEPTH)
         except (TypeError, ValueError):
             continue
         if isinstance(detail, dict) and detail.get("error") == "github_rate_limited":
@@ -1059,7 +1059,7 @@ def parse_http(raw):
 
 
 def _cached_value(cached):
-    return cached[0] if json.loads(cached[1]).get("_github_binary") else json.loads(cached[0])
+    return cached[0] if json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary") else json_depth.loads(cached[0], max_depth=_JSON_MAX_DEPTH)
 
 
 def _store_budget(db, scope, resource, remaining, reset, now=None):
@@ -1565,7 +1565,7 @@ class GitHubClient:
                 if cacheable
                 else None
             )
-            if not cacheable or (cached and json.loads(cached[1]).get("_github_binary")):
+            if not cacheable or (cached and json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary")):
                 cached = None
             return cached, _admit(db, self.scope, normalized, now)
 
@@ -1582,7 +1582,7 @@ class GitHubClient:
                     value=_cached_value(cached),
                     stale=True,
                     age_seconds=max(0, now - cached[2]),
-                    headers=json.loads(cached[1]),
+                    headers=json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH),
                 )
             return _limited(reason, reset)
 
@@ -1590,7 +1590,7 @@ class GitHubClient:
             return deferred(*refusal)
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", **(headers or {})}
         if cached and method == "GET":
-            old_headers = json.loads(cached[1])
+            old_headers = json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH)
             if old_headers.get("etag"):
                 headers["If-None-Match"] = old_headers["etag"]
         response = self._send(method, endpoint, headers, raw, timeout)
@@ -1623,7 +1623,7 @@ class GitHubClient:
             if response.status == 304:
                 if not cached or self.clock() - cached[2] >= self.cache_ttl_seconds:
                     return Result(status=304, error="github_cache_miss", headers=h)
-                merged = {**json.loads(cached[1]), **h}
+                merged = {**json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH), **h}
                 return Result(_cached_value(cached), status=304, headers=merged)
             if result.error == "github_rate_limited":
                 return deferred("pool_exhausted", result.reset_at)
@@ -1648,7 +1648,7 @@ class GitHubClient:
                                 return Result(status=304, error="github_cache_miss", headers=h)
                             # 304 is authoritative freshness; its remaining header is used,
                             # never decremented locally.
-                            h = {**json.loads(cached[1]), **h}
+                            h = {**json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH), **h}
                             db.execute(
                                 "UPDATE cache SET at=?,headers=? WHERE scope=? AND key=? AND at<=? "
                                 "AND at=? AND body=? AND headers=?",
@@ -3645,7 +3645,7 @@ def _run_command(args, *, runner=None, client=None, fresh=False, allow_stale=Fal
             # A source this client will not read stays gh's own, inside the same admission.
             return _native_command(args, client, runner, kwargs)
         if "--input" in options:
-            json.loads(payload)
+            json_depth.loads(payload, max_depth=_JSON_MAX_DEPTH)
         method = call.method
         if "--paginate" in options and method == "GET":
             # gh applies --jq to each page, and prints a non-list page as its
@@ -3831,14 +3831,14 @@ def _rest_read(operation, repo, fields, *, runner=None, env=None, cwd=None, **kw
             if optional and runner is not None:
                 # Command adapters may serialize the client's typed result.
                 with suppress(ValueError, TypeError):
-                    detail = json.loads(proc.stdout)
+                    detail = json_depth.loads(proc.stdout, max_depth=_JSON_MAX_DEPTH)
                     if detail.get("error") == "github_http_error" and detail.get("status") == 404:
                         return None
             refusal = refusal_of(proc, injected=runner is not None)
             if refusal is not None:
                 raise refusal
             raise RuntimeError("GitHub REST read failed")
-        return json.loads(proc.stdout)
+        return json_depth.loads(proc.stdout, max_depth=_JSON_MAX_DEPTH)
 
     root = f"repos/{repo}"
     try:
@@ -4101,7 +4101,7 @@ def _response_result(response, headers, *, graphql, raw_response, reset_at, now)
     if raw_response and success and not graphql:
         return Result(response.body, status=response.status, headers=headers)
     try:
-        value = json.loads(response.body) if response.body else None
+        value = json_depth.loads(response.body, max_depth=_JSON_MAX_DEPTH) if response.body else None
     except ValueError:
         value = response.body
     if graphql and isinstance(value, dict):

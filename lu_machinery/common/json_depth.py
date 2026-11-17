@@ -26,9 +26,9 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import IO, Any
 
-__all__ = ["MAX_DEPTH_CEILING", "check_depth", "loads", "raw_decode"]
+__all__ = ["MAX_DEPTH_CEILING", "check_depth", "load", "loads", "raw_decode"]
 
 # Below 3.12's decoder limit (about 9,998 levels at top level) with headroom for the
 # caller's own stack, and below the default Python recursion limit (1,000), so code that
@@ -121,6 +121,14 @@ def loads(s: str | bytes | bytearray, *, max_depth: int, **kwargs: Any) -> Any:
     if end != len(text):
         raise json.JSONDecodeError("Extra data", text, end)
     return value
+
+
+def load(fp: IO[str] | IO[bytes], *, max_depth: int, **kwargs: Any) -> Any:
+    """``json.load(fp, **kwargs)`` with the same explicit limit as :func:`loads`.
+
+    Like the stdlib, read the stream once and pass decoder options unchanged.
+    """
+    return loads(fp.read(), max_depth=max_depth, **kwargs)
 
 
 def raw_decode(

@@ -12,6 +12,8 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
+
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -47,7 +49,7 @@ def _load_schema(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FleetTaxonomyValidationError(f"Schema file not found: {path}")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except Exception as exc:
         raise FleetTaxonomyValidationError(f"JSON parse error in schema {path}: {exc}") from exc
     if not isinstance(data, dict):

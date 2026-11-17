@@ -10,7 +10,6 @@ owns destination admission, blocking policy and masked diagnostics.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import re
 import subprocess
@@ -20,6 +19,8 @@ from collections.abc import Mapping
 from functools import wraps
 from itertools import pairwise
 from pathlib import Path
+
+from lu_machinery.common import json_depth
 
 # The directory holding the package, put on sys.path so a short ``opsec.prepublish`` import can
 # still import ``lu_machinery``; an import bootstrap only, never a root for files or state.
@@ -235,8 +236,8 @@ def _load_matcher(tooling: Path):
     import io
 
     try:
-        rules = json.loads((tooling / "rules.json").read_bytes())
-        policy = json.loads(POLICY.read_bytes())
+        rules = json_depth.loads((tooling / "rules.json").read_bytes(), max_depth=512)
+        policy = json_depth.loads(POLICY.read_bytes(), max_depth=512)
         identities = {}
         for level, group in rules.items():
             for row in group["patterns"]:

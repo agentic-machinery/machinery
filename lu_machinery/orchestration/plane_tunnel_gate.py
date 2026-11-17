@@ -17,6 +17,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
+
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
 # are also its directories in checkout-relative paths.
@@ -40,7 +42,7 @@ def _monitor_base() -> str:
 def _get_json(path: str, *, timeout: float) -> dict[str, Any]:
     url = f"{_monitor_base()}{path}"
     with urllib.request.urlopen(url, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+        payload = json_depth.loads(response.read().decode("utf-8"), max_depth=512)
     if not isinstance(payload, dict):
         raise ValueError("monitor payload is not an object")
     return payload

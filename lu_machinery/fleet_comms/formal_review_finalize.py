@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.fleet_comms.formal_review_jobs import (
     FormalReviewJobsError,
     FormalReviewJobService,
@@ -100,7 +101,7 @@ def resolve_verdict_token(
             raise FormalReviewFinalizeError(str(exc)) from exc
     if findings_path is not None:
         try:
-            payload = json.loads(findings_path.read_text(encoding="utf-8"))
+            payload = json_depth.loads(findings_path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise FormalReviewFinalizeError(f"findings_unreadable: {exc}") from exc
         try:
@@ -185,7 +186,7 @@ def finalize_formal_review_verdict(
     review_evidence: ReviewEvidence | None = None
     if findings_path is not None:
         try:
-            findings_payload = json.loads(findings_path.read_text(encoding="utf-8"))
+            findings_payload = json_depth.loads(findings_path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise FormalReviewFinalizeError(f"findings_unreadable: {exc}") from exc
         if not isinstance(findings_payload, dict):

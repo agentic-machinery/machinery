@@ -2,6 +2,7 @@
 
 import json
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher.providers.stream_json import model_observer as _observe
 from lu_machinery.dispatcher.providers.stream_json import one_model
@@ -96,7 +97,7 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             error = "cursor: invalid JSON stream"
             continue

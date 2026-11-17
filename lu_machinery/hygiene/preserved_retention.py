@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -52,7 +54,7 @@ def landed_reason(head: str, branch: str) -> str | None:
         result = pr_identity._run_gh(["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "all", "--json", "number,state,headRefName,headRefOid,isCrossRepository"], cwd=repo_root, timeout=30)
         if result.returncode != 0:
             return None
-        rows = json.loads(result.stdout)
+        rows = json_depth.loads(result.stdout, max_depth=512)
         if not isinstance(rows, list) or not rows:
             return None
         for row in rows:
@@ -170,9 +172,9 @@ def measure(fd: int, *, newest: list[int] | None = None) -> tuple[int, bool]:
 
 def task_record(batch: Path, name: str) -> tuple[dict, bool]:
     try:
-        return json.loads(read_text(batch / "tasks" / f"{name}.json")), False
+        return json_depth.loads(read_text(batch / "tasks" / f"{name}.json"), max_depth=512), False
     except FileNotFoundError:
-        return json.loads(read_text(batch / "tasks" / "archive" / f"{name}.json")), True
+        return json_depth.loads(read_text(batch / "tasks" / "archive" / f"{name}.json"), max_depth=512), True
 
 
 def keep_names(path: Path) -> set[str]:
@@ -198,7 +200,7 @@ def eligible(fd: int, name: str, batch: Path, cutoff: datetime, release_cutoff: 
     records = {}
     for manifest in manifests:
         try:
-            record = json.loads(read_at(fd, manifest))
+            record = json_depth.loads(read_at(fd, manifest), max_depth=512)
         except (OSError, ValueError):
             return "manifest_unreadable"
         if not isinstance(record, dict) or record.get("task_id") != name:

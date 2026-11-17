@@ -86,6 +86,7 @@ from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
 
+from lu_machinery.common import json_depth
 from lu_machinery.secret_redactor import redact_text
 
 from ..failure_codes import provider_failure_code, provider_stderr_error
@@ -290,7 +291,7 @@ def _guard_agent_definition(
         raise RuntimeError(f"Grok hook bridge unavailable: {wrapper}")
     # Launched through this process's interpreter: an installed package has no execute bit on the bridge.
     launcher = shlex.join([sys.executable, "-I", "-m", "lu_machinery.agent_runtime.grok_hook_bridge"])
-    groups = json.loads(_worker_guard_settings(publish_guard=publish_guard))["hooks"]["PreToolUse"]
+    groups = json_depth.loads(_worker_guard_settings(publish_guard=publish_guard), max_depth=512)["hooks"]["PreToolUse"]
     lines = [
         "---",
         f"name: {name}",
@@ -469,7 +470,7 @@ def _permission_cancellation(envelope: dict | None, plan: InvocationPlan | None,
             for line in stream:
                 if not line.strip():
                     continue
-                event = json.loads(line)
+                event = json_depth.loads(line, max_depth=512)
                 if not isinstance(event, dict):
                     return False
                 if event.get("type") == "turn_ended":
@@ -1149,7 +1150,7 @@ def _complete_json_objects(stdout: str) -> list[dict]:
         if not stripped.startswith("{"):
             continue
         try:
-            value = json.loads(stripped)
+            value = json_depth.loads(stripped, max_depth=512)
         except ValueError:
             continue
         if isinstance(value, dict):
@@ -1449,7 +1450,7 @@ def _parse_json_object(stdout: str) -> dict | None:
     if not text:
         return None
     try:
-        value = json.loads(text)
+        value = json_depth.loads(text, max_depth=512)
         return value if isinstance(value, dict) else None
     except ValueError:
         pass
@@ -1457,7 +1458,7 @@ def _parse_json_object(stdout: str) -> dict | None:
     end = text.rfind("}")
     if start != -1 and end > start:
         try:
-            value = json.loads(text[start : end + 1])
+            value = json_depth.loads(text[start : end + 1], max_depth=512)
             return value if isinstance(value, dict) else None
         except ValueError:
             return None

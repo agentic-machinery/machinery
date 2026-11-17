@@ -32,6 +32,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, overload
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -674,7 +676,7 @@ def _parse_issue_timeline(
         if line.lower().startswith("link:") and 'rel="next"' in line.lower():
             return None, "issue timeline is incomplete"
     try:
-        events = json.loads(body or "null")
+        events = json_depth.loads(body or "null", max_depth=512)
     except json.JSONDecodeError as exc:
         return None, f"issue timeline is not JSON: {exc}"
     if not isinstance(events, list):
@@ -1640,7 +1642,7 @@ def _parse_archive_receipts(body: bytes) -> list[dict[str, object]]:
     if not body.endswith(b"\n"):
         raise RuntimeError(f"{reason}: truncated tail")
     try:
-        parsed = [json.loads(line) for line in jsonl_lines(body.decode("utf-8"))[:-1]]
+        parsed = [json_depth.loads(line, max_depth=512) for line in jsonl_lines(body.decode("utf-8"))[:-1]]
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"{reason}: record is not valid JSON") from exc
     if any(not isinstance(row, dict) for row in parsed):
@@ -1728,7 +1730,7 @@ def _archive_pr_snapshot(
     if result.returncode:
         return unavailable
     try:
-        payload = json.loads(result.stdout)
+        payload = json_depth.loads(result.stdout, max_depth=512)
         if not isinstance(payload, dict) or payload.get("errors"):
             return unavailable
         data = payload["data"]["repository"]

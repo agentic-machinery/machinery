@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit
 from lu_machinery.publish.github import read
@@ -150,7 +151,7 @@ def _gh_issue_observation(issue: IssueRef) -> IssueObservation:
         raise IssueLookupUnavailable("GitHub issue authority is unavailable")
 
     try:
-        payload = json.loads(proc.stdout)
+        payload = json_depth.loads(proc.stdout, max_depth=512)
         node = payload["data"]["repository"]["issue"]
         if not isinstance(node, Mapping) or node.get("number") != issue.number:
             raise ValueError("issue response does not identify the requested issue")

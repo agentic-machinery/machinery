@@ -114,6 +114,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -843,7 +845,7 @@ def _read_alert_state(descriptor: int) -> dict[str, Any]:
     while chunk := os.read(descriptor, 65536):
         raw += chunk
     try:
-        state = json.loads(raw) if raw.strip() else {}
+        state = json_depth.loads(raw, max_depth=512) if raw.strip() else {}
     except ValueError:
         # An unreadable record must not silence alerts: treat it as none.
         return {}

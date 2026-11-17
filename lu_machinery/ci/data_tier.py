@@ -33,7 +33,7 @@ from typing import cast, get_args
 import pytest
 
 from lu_machinery.ci._location import module_name
-from lu_machinery.common import github_client, test_slots
+from lu_machinery.common import github_client, json_depth, test_slots
 from lu_machinery.common.repo_root import (
     ProductRootError,
     main_checkout_root,
@@ -146,7 +146,7 @@ def _product_json(checkout: Path, relative: PurePosixPath) -> tuple[dict, str]:
     except FileNotFoundError as error:
         raise DataTierError(f"tested checkout has no {relative}") from error
     try:
-        value = json.loads(raw)
+        value = json_depth.loads(raw, max_depth=512)
     except ValueError as error:
         raise DataTierError(f"{relative} in the tested checkout is not valid JSON") from error
     if not isinstance(value, dict):
@@ -521,7 +521,7 @@ def bulk_status(checkout: Path, project_python: Path) -> tuple[str | None, str]:
     if result.returncode:
         return None, "storage status unavailable"
     try:
-        bulk = json.loads(result.stdout)["bulk_root"]
+        bulk = json_depth.loads(result.stdout, max_depth=512)["bulk_root"]
     except (ValueError, KeyError, TypeError):
         return None, "storage status invalid"
     if not bulk.get("available") or not bulk.get("path"):
@@ -757,7 +757,7 @@ def _gh(args: list[str], *, input_text: str | None = None) -> str:
 
 
 def report(summary: dict, baseline: dict[str, int]) -> str:
-    issues = json.loads(
+    issues = json_depth.loads(
         _gh(
             [
                 "issue",
@@ -771,7 +771,7 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
                 "--json",
                 "number,title,state",
             ]
-        )
+        ), max_depth=512
     )
     matching = [issue for issue in issues if issue["title"] == ISSUE_TITLE]
     if len(matching) > 1:
@@ -789,7 +789,7 @@ def report(summary: dict, baseline: dict[str, int]) -> str:
         )
         return f"created {created.strip()}"
     if issue and issue["state"] == "OPEN":
-        comments = json.loads(_gh(["issue", "view", str(issue["number"]), "--json", "comments"]))["comments"]
+        comments = json_depth.loads(_gh(["issue", "view", str(issue["number"]), "--json", "comments"]), max_depth=512)["comments"]
         marker = f"Data-tier clean run `{summary['run_key']}`"
         if not any(marker in comment["body"] for comment in comments):
             _gh(
@@ -931,7 +931,7 @@ def run(args: argparse.Namespace) -> int:
                 "run_key": run_key,
                 "pytest_exit": pytest_exit,
                 "selection_cases": selection["class_c_merge_group"],
-                "collected": len(json.loads(collected_data)) if collected_data is not None else 0,
+                "collected": len(json_depth.loads(collected_data, max_depth=512)) if collected_data is not None else 0,
             }
         )
         if pytest_exit and not summary["failed"]:

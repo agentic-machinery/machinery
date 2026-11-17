@@ -28,6 +28,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from lu_machinery.common import json_depth
+
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -223,7 +225,7 @@ def _live_task_codex_account(task_id: object) -> str | None:
         resolved = path.resolve()
         if resolved.parent != root.resolve() or not resolved.is_file():
             return None
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
+        payload = json_depth.loads(resolved.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -237,7 +239,7 @@ def fetch_active_in_flight(*, timeout: float = 2.0) -> dict[str, int] | None:
     url = f"{_monitor_base()}/api/delegate/active"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = json_depth.loads(response.read().decode("utf-8"), max_depth=512)
     except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict):

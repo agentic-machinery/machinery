@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import project_interpreter
 
 from .retired_seat_admission import format_refusal
@@ -186,7 +187,7 @@ def assert_trail_isolation_config(tool_config: Mapping[str, Any], *, profile: st
     if root.is_symlink() or config_path.is_symlink() or resolved_config != resolved_root / ".mcp.json":
         raise TrailIsolationError("trail isolation MCP configuration path is invalid")
     try:
-        payload = json.loads(resolved_config.read_text(encoding="utf-8"))
+        payload = json_depth.loads(resolved_config.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise TrailIsolationError("trail isolation MCP configuration is invalid JSON") from exc
     servers = payload.get("mcpServers") if isinstance(payload, dict) else None

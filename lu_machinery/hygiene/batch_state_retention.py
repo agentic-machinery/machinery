@@ -61,7 +61,7 @@ def default_batch_root() -> Path:
 def load_holds(path: Path) -> list[dict[str, Any]]:
     """Read and validate held paths; every entry names a repo-relative batch_state path."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except (OSError, ValueError) as error:
         raise RetentionListError(f"unreadable retention list: {error}") from error
     if not isinstance(data, dict) or data.get("schema") != SCHEMA or not isinstance(data.get("holds"), list):
