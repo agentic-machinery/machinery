@@ -940,24 +940,24 @@ _CHECKLIST_DETECTION = ("-M", "-C", "--find-copies-harder")
 #   parsing, recording, publication, finalization and ground truth, the review MCP, review configs,
 #   the reply schema, the queue review gate, the reviewer guard hooks, the review skills);
 # - the harnesses that launch a reviewer and validate its reply: the agent runtime and its adapters,
-#   the dispatcher and its providers, and the agent bridge;
+#   the dispatcher, its entry module and its providers, and the agent bridge;
 # - what accepts a verdict or lets it land a PR: the Fleet authority's formal-review acceptance and its
 #   finalize command, the publisher, the integration sweep, the keeper;
 # - what seats the reviewer: the model catalog, substitutions, runtime failover and routing defaults;
 # - the rules, and this checklist and ownership map.
+# Code that only reports or counts verdicts (dashboards, metrics, stalled-work reports) is outside.
 # A diff touching any of them changes its own judge, so it gets the built-in judge-change item, which
 # no checklist edit removes.
 _JUDGE_PATHS = (
-    "lu_machinery/**/*review*",
-    "lu_machinery/**/*review*/**",
-    "lu_machinery/**/*verdict*",
-    "scripts/**/*review*",
-    "scripts/**/*review*/**",
-    "scripts/**/*verdict*",
-    "agents_extensions/**/*review*",
-    "agents_extensions/**/*review*/**",
+    *(
+        f"{tree}/**/*{name}*{rest}"
+        for tree in ("lu_machinery", "scripts", "agents_extensions")
+        for name in ("review", "verdict")
+        for rest in ("", "/**")
+    ),
     "**/agent_runtime/**",
     "**/dispatcher/**",
+    "**/dispatch.py",
     "**/ai_agent_bridge/**",
     "**/publish/**",
     "**/orchestration/integration_sweep.py",
@@ -1234,7 +1234,8 @@ def _git_path(raw: str) -> str:
 
 def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[str, Any]]:
     """Every changed file of ``merge_base..head``: its paths, change kind, and added and removed lines."""
-    status = _checklist_git(repo_root, "diff", "--no-ext-diff", "--name-status", "-z", *_CHECKLIST_DETECTION, merge_base, head, "--")
+    status_flags = ("--no-ext-diff", "--no-relative", "--name-status", "-z", *_CHECKLIST_DETECTION)
+    status = _checklist_git(repo_root, "diff", *status_flags, merge_base, head, "--")
     fields = status.decode("utf-8", "surrogateescape").split("\x00")
     files: dict[str, dict[str, Any]] = {}
     index = 0
@@ -1255,7 +1256,21 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
             "added": [],
             "removed": [],
         }
-    patch_flags = ("--no-ext-diff", "--no-color", "-U0", *_CHECKLIST_DETECTION)
+    # Content is matched as text whatever the checkout's attributes say: `-diff`, `binary` and
+    # textconv drivers come from the change under review and could hide its lines. Prefixes,
+    # relativity and hunk merging are fixed so local diff configuration cannot reshape the patch.
+    patch_flags = (
+        "--no-ext-diff",
+        "--no-textconv",
+        "--text",
+        "--no-color",
+        "--no-relative",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--inter-hunk-context=0",
+        "-U0",
+        *_CHECKLIST_DETECTION,
+    )
     patch = _checklist_git(repo_root, "-c", "core.quotePath=true", "diff", *patch_flags, merge_base, head, "--")
     patch_text = patch.decode("utf-8", "surrogateescape")
     current: dict[str, Any] | None = None
@@ -1273,6 +1288,8 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
                     current["added"].append((new_line, line[1:]))
                 new_line += 1
                 new_left -= 1
+            elif line.startswith(" ") and old_left and new_left:
+                old_line, new_line, old_left, new_left = old_line + 1, new_line + 1, old_left - 1, new_left - 1
             elif not line.startswith("\\"):
                 raise CloseoutStateError("diff hunk ended early")
             continue
@@ -1300,14 +1317,29 @@ def _checklist_diff(repo_root: Path, merge_base: str, head: str) -> list[dict[st
     return list(files.values())
 
 
+_PLAIN_PATH = re.compile(r"[A-Za-z0-9._/@+=,~-]+")
+
+
+def _path_label(path: str) -> str:
+    """``path`` as one line of inert brief text: itself when plain, else a JSON string literal.
+
+    A path comes from the change under review, so it may hold backticks, newlines, Markdown or
+    bidi controls. The literal escapes every control and non-ASCII character and the backtick,
+    so the label cannot leave its code span or add a line to the brief; it decodes back exactly.
+    """
+    if _PLAIN_PATH.fullmatch(path):
+        return path
+    return json.dumps(path, ensure_ascii=True).replace("`", "\\u0060")
+
+
 def _checklist_match(trigger: dict[str, Any], changed: dict[str, Any]) -> list[str]:
-    """Evidence (``path`` or ``path:line``) that ``trigger`` fires on one changed file; empty when it does not."""
+    """Evidence (a path label, with ``:line`` for a line) that ``trigger`` fires on one file; empty when it does not."""
     paths = trigger.get("paths")
     if paths is not None and not any(glob.fullmatch(path) for glob in paths for path in changed["paths"]):
         return []
     if "change" in trigger and changed["change"] not in trigger["change"]:
         return []
-    name = changed["path"]
+    name = _path_label(changed["path"])
     if "added" not in trigger and "removed" not in trigger:
         return [f"{name} ({changed['change']})"]
     evidence = [
@@ -1347,7 +1379,7 @@ def reliability_checklist(repo_root: Path, base: str, head: str) -> dict[str, An
                 "area": _JUDGE_CHANGE_AREA,
                 "check": _JUDGE_CHANGE_CHECK,
                 "incident": _JUDGE_CHANGE_INCIDENT,
-                "evidence": judge_changed,
+                "evidence": [_path_label(path) for path in judge_changed],
             }
         )
     for item in items:
@@ -1446,9 +1478,11 @@ def _checklist_brief(
     ]
     for area in owners["areas"]:
         extra = "".join(f"; {key.replace('_', ' ')} {area[key]}" for key in ("ui_qa", "note") if key in area)
-        lines.append(f"- **{area['area']}**: owner {area['owner']}{extra}; {_shown(area['paths'])}")
+        labels = [_path_label(path) for path in area["paths"]]
+        lines.append(f"- **{area['area']}**: owner {area['owner']}{extra}; {_shown(labels)}")
     if owners["unmapped"]:
-        lines.append(f"- no area (owner {owners['main_owner']}): {_shown(owners['unmapped'])}")
+        labels = [_path_label(path) for path in owners["unmapped"]]
+        lines.append(f"- no area (owner {owners['main_owner']}): {_shown(labels)}")
     if changed_schema is not None:
         lines += [
             "",
