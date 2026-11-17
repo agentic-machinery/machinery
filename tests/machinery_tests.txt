@@ -266,6 +266,7 @@ tests/api/test_fleet_dashboard_contract.py
 tests/api/test_fleet_health_runtime_activity.py
 tests/api/test_fleet_workers_sanitize.py
 tests/api/test_fleet_workers_unmocked.py
+tests/api/test_get_routes_no_5xx.py
 tests/api/test_git_cleanup_router.py
 tests/api/test_git_hygiene_endpoint.py
 tests/api/test_git_no_optional_locks.py
