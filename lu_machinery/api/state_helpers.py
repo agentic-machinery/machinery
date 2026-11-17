@@ -47,14 +47,53 @@ _ttl_clock: Callable[[], float] = time.monotonic
 
 T = TypeVar("T")
 
+# A background refresher runs only while its result is being read. Two minutes
+# spans four 30 s page polls, so an open page never lets its panels go dormant.
+DEMAND_WINDOW_S = 120.0
+# A read that finds a snapshot writer dormant waits this long, off the event
+# loop, for one fresh collection. Callers that act on the list (worktree
+# cleanup, hand-off readiness) never get a minutes-old observation that way.
+# It matches the Retry-After of a snapshot that has no observation yet.
+DORMANT_READ_WAIT_S = 2.0
+
+
+class Demand:
+    """When a refresher's result was last read. Without recent reads it does no work."""
+
+    def __init__(self) -> None:
+        self._last_read = float("-inf")
+
+    def touch(self) -> bool:
+        """Record a read. True when the refresher had gone dormant before this read."""
+        now = _ttl_clock()
+        dormant = now - self._last_read >= DEMAND_WINDOW_S
+        self._last_read = now
+        return dormant
+
+    def active(self) -> bool:
+        return _ttl_clock() - self._last_read < DEMAND_WINDOW_S
+
 
 class PeriodicSnapshot[T]:
-    """One lifespan-owned writer; readers never collect or wait for a refresh."""
+    """One lifespan-owned writer; readers never collect.
+
+    The writer refreshes every ``interval`` only while the snapshot is read
+    (:data:`DEMAND_WINDOW_S`). Unread, it sleeps until the next read. That read
+    wakes it and, off the event loop, waits up to :data:`DORMANT_READ_WAIT_S`
+    for the fresh collection; otherwise it gets the last observation with its
+    true age. Reads while the writer is active never wait.
+    """
 
     def __init__(self, compute: Callable[[], T], interval: float):
         self.compute = compute
         self.interval = interval
         self._entry: tuple[float, T] | None = None
+        self._demand = Demand()
+        self._demand.touch()  # the startup collection
+        self._wake: asyncio.Event | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._attempts = 0
+        self._settled = threading.Condition()
 
     def refresh(self) -> None:
         # Age includes collection time, rather than making a slow scan look new.
@@ -63,6 +102,8 @@ class PeriodicSnapshot[T]:
         self._entry = (started, value)
 
     def read(self) -> tuple[T, float]:
+        if self._demand.touch():
+            self._await_fresh()
         entry = self._entry
         if entry is None:
             raise HTTPException(
@@ -70,6 +111,26 @@ class PeriodicSnapshot[T]:
                 headers={"X-Snapshot-Age-S": "unknown", "Retry-After": "2", "Cache-Control": "no-store"},
             )
         return entry[1], max(0.0, _ttl_clock() - entry[0])
+
+    def _await_fresh(self) -> None:
+        """Wake the dormant writer and, off its event loop, wait for its next attempt."""
+        loop, wake = self._loop, self._wake
+        if loop is None or wake is None:
+            return
+        with self._settled:
+            attempts = self._attempts
+        try:
+            loop.call_soon_threadsafe(wake.set)
+        except RuntimeError:  # the loop already closed at shutdown
+            return
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            return  # the writer needs this thread; answer from the last observation
+        with self._settled:
+            self._settled.wait_for(lambda: self._attempts != attempts, timeout=DORMANT_READ_WAIT_S)
 
     async def _refresh(self) -> None:
         work = asyncio.create_task(asyncio.to_thread(self.refresh))
@@ -84,16 +145,26 @@ class PeriodicSnapshot[T]:
     @asynccontextmanager
     async def lifespan(self):
         ready = asyncio.Event()
+        wake = asyncio.Event()
+        self._loop, self._wake = asyncio.get_running_loop(), wake
 
         async def repeat() -> None:
             while True:
+                wake.clear()
+                if not self._demand.active():
+                    await wake.wait()
+                    continue
                 try:
                     await self._refresh()
                 except Exception:
                     _cache_log.warning("snapshot refresh failed", exc_info=True)
                 finally:
                     ready.set()
-                await asyncio.sleep(self.interval)
+                    with self._settled:
+                        self._attempts += 1
+                        self._settled.notify_all()
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(wake.wait(), timeout=self.interval)
 
         task = asyncio.create_task(repeat(), name="monitor-snapshot-refresh")
         try:

@@ -103,7 +103,7 @@ from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
 from .session_streams_router import router as session_streams_router
-from .state_helpers import cache_get, cache_get_stored, cache_invalidate, cache_set, ctx_cache_scope
+from .state_helpers import Demand, cache_get, cache_invalidate, cache_set, ctx_cache_scope
 from .state_router import router as state_router
 from .state_router import schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -338,7 +338,8 @@ ORIENT_SECTION_TTLS: dict[str, float] = {
     "delegate": 30.0,
     "capacity": 15.0,
     "bridge_pending": 15.0,
-    "rollovers": 15.0,
+    # One rollover audit costs about 5 s of CPU, and rollovers change rarely.
+    "rollovers": 120.0,
     "health": 15.0,
     "session_hints": 60.0,
 }
@@ -359,7 +360,10 @@ ORIENT_SECTION_SOURCES: dict[str, str] = {
 ORIENT_SECTION_HARD_TIMEOUT_S = 5.0
 
 IDLE_PR_THRESHOLD_S = 60 * 60
-IDLE_PR_FETCH_TIMEOUT_S = 4.0
+# Only the detached worker waits on this read, never a request. One conditional
+# read per open PR takes several seconds (7-8 s for 11 PRs), so a 4 s bound
+# failed every attempt and retried the whole fan-out every 30 s.
+IDLE_PR_FETCH_TIMEOUT_S = 60.0
 IDLE_PR_REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
 IDLE_PR_CACHE_KEY = "orient_idle_prs"
 IDLE_PR_SUCCESSFUL_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED"})
@@ -425,6 +429,9 @@ _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
 _detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
 _detached_orient_last_error: dict[str, str] = {}
+# Recent orient reads by section cache key. The warmer refreshes only those
+# sections; one agent's orient no longer keeps every section warm forever.
+_orient_demand: dict[str, Demand] = {}
 
 # The idle-PR feed is deliberately cache-first. A live GitHub request is run by
 # one detached daemon worker, never by the ASGI request path. The last successful
@@ -806,6 +813,8 @@ def reset_detached_orient_state_for_tests() -> None:
         _detached_orient_threads.clear()
     _detached_orient_last_good.clear()
     _detached_orient_last_error.clear()
+    _orient_demand.clear()
+    _integrity_verdicts.clear()
 
 
 def _schedule_detached_orient_refresh(
@@ -1239,6 +1248,25 @@ def _backup_last_run_health(batch_state_dir: Path, *, now: datetime | None = Non
     }
 
 
+# The filesystem integrity canaries detect slow-changing host damage (a broken
+# venv, a looping symlink). One pass of them costs seconds of CPU: while it
+# alerts, the venv canary parses every task record (about 14 s for 15,000) and
+# starts a cold import probe. Each health refresh reuses a verdict this young.
+INTEGRITY_CANARY_TTL_S = 300.0
+_integrity_verdicts: dict[str, tuple[bool, float]] = {}
+
+
+def _integrity_verdict(name: str, canary: Callable[..., bool], ctx: MonitorContext) -> bool:
+    key = f"{name}{_ctx_cache_scope(ctx)}"
+    cached = _integrity_verdicts.get(key)
+    now = _orient_clock()
+    if cached is not None and now - cached[1] < INTEGRITY_CANARY_TTL_S:
+        return cached[0]
+    ok = canary(ctx=ctx)
+    _integrity_verdicts[key] = (ok, now)
+    return ok
+
+
 def _collect_health_orient_data(
     ctx: MonitorContext | None = None,
     product_health: Callable[[MonitorContext], Mapping[str, Any]] | None = None,
@@ -1247,11 +1275,11 @@ def _collect_health_orient_data(
     mcp_sources_ok = _port_open("127.0.0.1", 8766, 0.2)
     tmp_usability = _tmp_usability_canary()
     core_bare_ok = _core_bare_canary(ctx=resolved_ctx)
-    self_symlink_ok = _self_symlink_canary(ctx=resolved_ctx)
-    primary_integrity_ok = _primary_integrity_canary(ctx=resolved_ctx)
-    node_modules_integrity_ok = _node_modules_integrity_canary(ctx=resolved_ctx)
-    venv_integrity_ok = _venv_integrity_canary(ctx=resolved_ctx)
-    worktree_cleanup_integrity_ok = _worktree_cleanup_integrity_canary(ctx=resolved_ctx)
+    self_symlink_ok = _integrity_verdict("self_symlink", _self_symlink_canary, resolved_ctx)
+    primary_integrity_ok = _integrity_verdict("primary", _primary_integrity_canary, resolved_ctx)
+    node_modules_integrity_ok = _integrity_verdict("node_modules", _node_modules_integrity_canary, resolved_ctx)
+    venv_integrity_ok = _integrity_verdict("venv", _venv_integrity_canary, resolved_ctx)
+    worktree_cleanup_integrity_ok = _integrity_verdict("worktree_cleanup", _worktree_cleanup_integrity_canary, resolved_ctx)
     fields: dict[str, Any] = {
         "api": True,
         "mcp_sources": mcp_sources_ok,
@@ -1543,19 +1571,26 @@ async def _collect_orient_sections(
     ))
 
 
+def _orient_section_demanded(key: str, ctx: MonitorContext | None) -> bool:
+    demand = _orient_demand.get(f"orient_{key}{_ctx_cache_scope(ctx)}")
+    return demand is not None and demand.active()
+
+
 async def refresh_orient_periodically(ctx: MonitorContext, product: ProductContribution) -> None:
-    """Keep section caches warm between infrequent agent polls, without stacking TTLs."""
+    """Keep the sections agents are reading warm between their polls, without stacking TTLs."""
+    startup = True
     while True:
         try:
             layout = _orient_layout(product)
-            # Warm expensive product scans at startup. Other sections are kept
-            # warm once used; an app nobody orients against must not start
-            # unsolicited GitHub or host-health probes.
-            selected = [key for key in layout.keys if key in layout.product or
-                        cache_get_stored(f"orient_{key}{_ctx_cache_scope(ctx)}") is not None]
+            # Warm expensive product scans once at startup. Afterwards a section
+            # is refreshed only while requests read it: an app nobody orients
+            # against runs no task-store scans, GitHub reads or host probes.
+            selected = [key for key in layout.keys if (startup and key in layout.product) or
+                        _orient_section_demanded(key, ctx)]
             await _collect_orient_sections(ctx, layout, selected)
         except Exception:
             logger.warning("Orient refresh failed", exc_info=True)
+        startup = False
         await asyncio.sleep(ORIENT_REFRESH_INTERVAL_S)
 
 
@@ -1665,6 +1700,9 @@ async def orient(
     # invocation made all 14 collectors fall back to production_context(),
     # defeating create_app() isolation (and rebuilding contexts per call).
     request_ctx = get_ctx(request)
+    scope = _ctx_cache_scope(request_ctx)
+    for key in selected:
+        _orient_demand.setdefault(f"orient_{key}{scope}", Demand()).touch()
     gather_results = await _collect_orient_sections(request_ctx, layout, selected)
 
     section_data: dict[str, Any] = {}

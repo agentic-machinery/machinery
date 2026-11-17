@@ -1256,7 +1256,10 @@ def test_overlapping_rebuild_after_wait_timeout_discards_late_result(monkeypatch
 
 @pytest.mark.parametrize("hung_first_build", [False, True])
 def test_periodic_refresh_keeps_idle_next_warm(monkeypatch, tmp_path, hung_first_build):
-    """#7697: lifespan timer rebuilds after TTL with no intervening HTTP calls.
+    """#7697: lifespan timer rebuilds after TTL between a reader's HTTP calls.
+
+    The timer works only while Work is read (``DEMAND_WINDOW_S``); one read
+    at the start keeps it running for the whole test.
 
     A caller timeout does not start a second build. The hung build's own
     completion is the cache stamp, and lifespan exit must cancel the timer
@@ -1293,6 +1296,7 @@ def test_periodic_refresh_keeps_idle_next_warm(monkeypatch, tmp_path, hung_first
     monkeypatch.setattr(state_helpers, "_ttl_clock", clock)
 
     ctx = fixture_context(tmp_path)
+    work_router._work_demand(ctx).touch()  # a reader polled Work at cache time 0
     key = work_router.projection_cache_key({}, ctx)
     payload = build_projection(_next_sections(), repository_id=REPO)
     # Seeded under the manual clock, so the entry is exactly 0s old.

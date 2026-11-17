@@ -750,6 +750,9 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         monkeypatch.setattr(delegate_router, "active_delegate_tasks", forbidden)
         monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1e12)
         try:
+            # The clock jump left the writer unread past the demand window; a
+            # read answers from the snapshot and wakes it.
+            assert snapshot.read()[0] == expected
             assert entered.wait(5), "periodic refresh never ran"
             for _ in range(2):
                 response = running.get("/api/delegate/active")
@@ -828,6 +831,55 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
     assert cold.read()[0] == {"ready": True}
 
 
+def test_periodic_snapshot_refreshes_only_while_read(monkeypatch):
+    """Defect class: a snapshot writer rescanned the task store every interval with no readers.
+
+    Unread past the demand window, the writer stops. The next read wakes it and
+    gets that fresh collection, never the minutes-old observation.
+    """
+    import asyncio
+    import threading
+
+    from lu_machinery.api import state_helpers
+
+    now = [0.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
+    lock = threading.Lock()
+    calls = []
+
+    def compute():
+        with lock:
+            calls.append(now[0])
+            if len(calls) == 3:
+                # Nobody reads for a whole window. Advancing inside the third
+                # collection means no later refresh can start before the jump.
+                now[0] += state_helpers.DEMAND_WINDOW_S
+            return len(calls)
+
+    def count():
+        with lock:
+            return len(calls)
+
+    async def until(predicate, timeout=5.0):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            assert asyncio.get_running_loop().time() < deadline, "condition never held"
+            await asyncio.sleep(0.01)
+
+    async def scenario():
+        snapshot = state_helpers.PeriodicSnapshot(compute, 0.01)
+        async with snapshot.lifespan():
+            await until(lambda: count() >= 3)  # demanded at startup: refreshes repeat
+            await asyncio.sleep(0.3)  # thirty intervals without a reader
+            assert count() == 3, "an unread snapshot kept refreshing"
+
+            # Handlers read in the thread pool, as production routes do.
+            value, age = await asyncio.to_thread(snapshot.read)
+            assert (value, age) == (4, 0.0), "a dormant read returned the old observation"
+
+    asyncio.run(scenario())
+
+
 def test_snapshot_age_includes_collection_and_failed_refresh(tmp_path, monkeypatch):
     """Both endpoints expose advancing observation age, including refresh failures."""
     import asyncio
@@ -842,7 +894,7 @@ def test_snapshot_age_includes_collection_and_failed_refresh(tmp_path, monkeypat
     clock = [100.0]
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock[0])
     for snapshot, route, payload in (
-        (delegate_router.active_snapshot(ctx), lambda: asyncio.run(delegate_router.delegate_active(ctx)), {"tasks": []}),
+        (delegate_router.active_snapshot(ctx), lambda: delegate_router.delegate_active(ctx), {"tasks": []}),
         (fleet_workers_router.workers_snapshot(ctx), lambda: fleet_workers_router.get_workers(None, ctx), {None: {}, "": {}}),
     ):
         def fail():

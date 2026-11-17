@@ -206,6 +206,7 @@ def test_unreadable_ring_returns_path_free_error(tmp_path):
 @pytest.mark.parametrize("fails", [False, True])
 def test_existing_periodic_collector_samples_even_with_warm_projection(tmp_path, monkeypatch, fails):
     ctx = fixture_context(tmp_path)
+    work_router._work_demand(ctx).touch()  # Work was read, so the tick also refreshes PRs
     calls = []
 
     async def tick(_):
@@ -225,3 +226,26 @@ def test_existing_periodic_collector_samples_even_with_warm_projection(tmp_path,
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(work_router.refresh_projection_cache_periodically(ctx))
     assert calls == ["sample", "prs"]
+
+
+def test_periodic_work_refresh_skips_github_without_recent_work_reads(tmp_path, monkeypatch):
+    """Defect class: an unread Work board kept a GitHub fan-out and a projection build running every tick.
+
+    With no Work read in the demand window, the tick still samples host load
+    but reads no pull requests and builds nothing, even with the cache expired.
+    """
+    ctx = fixture_context(tmp_path)
+    calls = []
+
+    async def tick(_):
+        if calls:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(work_router.asyncio, "sleep", tick)
+    monkeypatch.setattr(work_router, "sample_host_load", lambda _path: calls.append("sample"))
+    monkeypatch.setattr(work_router, "fetch_open_prs", lambda: calls.append("prs"))
+    monkeypatch.setattr(work_router, "cache_get_with_age", lambda *_: None)
+    monkeypatch.setattr(work_router, "_get_or_create_build_task", lambda *_: calls.append("build"))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(work_router.refresh_projection_cache_periodically(ctx))
+    assert calls == ["sample"]
