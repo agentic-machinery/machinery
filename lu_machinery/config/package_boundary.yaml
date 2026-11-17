@@ -334,9 +334,6 @@ modules:
   fix_external_resources.py:
     reason: Shim for scripts/tools, which is shared.
     role: shared
-  fleet_repos.py:
-    reason: Shim for scripts/orchestration, which is machinery.
-    role: machinery
   gemini_output.py:
     reason: Shim for scripts/tools, which is shared.
     role: shared
@@ -388,9 +385,6 @@ modules:
   lexical_sandbox.py:
     reason: Shim for scripts/vocab, which is product.
     role: product
-  lint_ipa.py:
-    reason: Shim for scripts/lint, which is machinery.
-    role: machinery
   lint_prompts.py:
     reason: Shim for scripts/lint, which is machinery.
     role: machinery
@@ -436,9 +430,6 @@ modules:
   rehash_module.py:
     reason: Shim for scripts/migrate, which is product.
     role: product
-  research_quality.py:
-    reason: Shim for scripts/research, which is machinery.
-    role: machinery
   rewrite_activity_hints.py:
     reason: Rewrites activity hints in curriculum plans.
     role: product
