@@ -42,9 +42,12 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from lu_machinery.common import github_client
+from lu_machinery.model_families import canonical_cursor_model
 
 SPLITS = ("tune", "test")
 BLOCKING = frozenset({"P0", "P1", "P2"})
+# Routes whose task record carries the model the provider's own stream reported.
+STREAM_ATTESTED_AGENTS = frozenset({"cursor", "agy"})
 FINDINGS_SCHEMA = "lu_machinery/schemas/code-review-findings.v1.schema.json"
 
 Judge = Callable[[dict[str, Any], dict[str, Any], list[dict[str, Any]]], dict[str, str | None]]
@@ -78,6 +81,27 @@ def _require(item: dict[str, Any], keys: Iterable[str], where: str) -> None:
         raise EvalError(f"{where}: missing {', '.join(missing)}")
 
 
+CLEAN_WINDOW = dt.timedelta(days=14)
+
+
+def _check_control(control: dict[str, Any], now: dt.datetime) -> None:
+    """Refuse a control unless its evidence covers a whole, closed 14-day window and is clean."""
+    where = control["id"]
+    merged = dt.datetime.fromisoformat(control["merged_at"])
+    ends = dt.datetime.fromisoformat(control["clean_window_ends"])
+    if merged.tzinfo is None or ends.tzinfo is None:
+        raise EvalError(f"{where}: merged_at and clean_window_ends need a time zone")
+    if ends - merged != CLEAN_WINDOW or ends > now:
+        raise EvalError(f"{where}: clean window is not a closed 14 days after merge")
+    check = control.get("clean_check") or {}
+    if (check.get("window_closed_at_check") is not True or not _is_sha(check.get("checked_tip"))
+            or not _is_sha(control.get("merge_commit"))):
+        raise EvalError(f"{where}: no clean check covering the whole 14-day window")
+    for counter in ("later_commits_citing_pr", "fix_commits_touching_lost_lines"):
+        if check.get(counter) != 0:
+            raise EvalError(f"{where}: clean_check.{counter} must be 0 for a clean control")
+
+
 def load_set(set_dir: Path) -> EvalSet:
     """Load and validate the frozen set; raise EvalError on any malformed entry."""
     try:
@@ -101,7 +125,8 @@ def _load_set(set_dir: Path) -> EvalSet:
     controls = raw["controls.yaml"]["controls"]
     protocol = raw["protocol.yaml"]
     for name, seat in protocol["seats"].items():
-        _require(seat, ("agent", "model", "family", "effort", "minutes_per_review", "usd_per_review"), f"seat {name}")
+        _require(seat, ("agent", "model", "attested_model", "family", "effort", "minutes_per_review", "usd_per_review"),
+                 f"seat {name}")
         if not isinstance(seat.get("review_role"), bool):
             raise EvalError(f"seat {name}: review_role must be true or false")
     seen: set[tuple[str, int]] = set()
@@ -132,11 +157,9 @@ def _load_set(set_dir: Path) -> EvalSet:
             fixes = defect["source"].get("fix_commits")
             if not isinstance(fixes, list) or not fixes or not all(_is_sha(c) for c in fixes):
                 raise EvalError(f"{case['id']} {defect['id']}: fix_commits must list full SHAs of the fixing commits")
+    now = dt.datetime.now(dt.UTC)
     for control in controls:
-        check = control.get("clean_check") or {}
-        if (check.get("window_closed_at_check") is not True or not _is_sha(check.get("checked_tip"))
-                or not _is_sha(control.get("merge_commit"))):
-            raise EvalError(f"{control['id']}: no clean check covering the whole 14-day window")
+        _check_control(control, now)
     return EvalSet(cases=cases, controls=controls, protocol=protocol, digests=digests)
 
 
@@ -351,7 +374,7 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
     for seat in seats:
         family = evalset.protocol["seats"][seat]["family"]
         hit = total = hit_other = total_other = 0
-        alarms = controls = failed = missing = transport = 0
+        alarms = controls = failed = missing = 0
         minutes: list[float] = []
         for item in (i for i in items if i.seat == seat):
             row = by_case.get((seat, item.entry["id"]), {})
@@ -362,7 +385,6 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
             if row.get("minutes") is not None:
                 minutes.append(row["minutes"])
             ok = row.get("status") == "done"
-            transport += int(ok and row.get("task_status") != "done")
             if item.kind == "defect":
                 n = len(item.entry["defects"])
                 got = len(row.get("matched", {})) if ok else 0
@@ -387,7 +409,6 @@ def score(evalset: EvalSet, items: list[Item], rows: list[dict[str, Any]]) -> di
             "controls_scored": controls,
             "reviews_failed": failed,
             "reviews_missing": missing,
-            "scored_replies_from_failed_tasks": transport,
             "minutes_median": round(statistics.median(minutes), 1) if minutes else None,
             "minutes_total": round(sum(minutes), 1),
         }
@@ -467,29 +488,37 @@ def attempt(
     """Return (parsed reply or None, last settlement) for one review or judgement.
 
     A recorded valid settlement is reused; a recorded dispatch that never settled is waited on
-    rather than started again; otherwise up to ``attempts`` new dispatches start.
+    rather than started again; otherwise up to ``attempts`` new dispatches start. Every new task
+    id takes the next number after every id ever recorded for the key, refused starts included,
+    because the dispatcher refuses a task id that already exists.
     """
     dispatches, settlements = journal.history(key)
+    prefix = f"{base_id}-"
+    numbers = [int(e["task_id"][len(prefix):]) for e in dispatches + settlements
+               if e["task_id"].startswith(prefix) and e["task_id"][len(prefix):].isdigit()]
+    next_number = max(numbers, default=0) + 1
     for event in settlements:
         if event["parsed"] is not None:
             return event["parsed"], event
     last: dict[str, Any] = settlements[-1] if settlements else {}
     settled_ids = {e["task_id"] for e in settlements}
     pending = [e for e in dispatches if e["task_id"] not in settled_ids]
-    for number in range(len(dispatches) + 1, len(dispatches) + 1 + attempts):
+    for _ in range(attempts):
         if pending:
             event = pending.pop(0)
             task_id, nonce = event["task_id"], event["nonce"]
         else:
-            task_id = f"{base_id}-{number}"
-            nonce, error = dispatcher.start(argv_for(task_id), task_id)
-            if nonce is None:
-                last = {"status": "refused", "error": error}
-                journal.settled(key, task_id, last, None)
+            task_id = f"{prefix}{next_number}"
+            next_number += 1
+            started, error = dispatcher.start(argv_for(task_id), task_id)
+            if started is None:
+                journal.settled(key, task_id, {"status": "refused", "error": error}, None)
+                last = journal.events[-1]
                 continue
+            nonce = started
             journal.dispatched(key, task_id, nonce)
         record, text = dispatcher.collect(task_id, nonce, hard_timeout)
-        parsed = accept(record, text) if text else None
+        parsed = accept(record, text) if record.get("status") == "done" and text else None
         journal.settled(key, task_id, record, parsed)
         last = journal.events[-1]
         if parsed is not None:
@@ -524,16 +553,26 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def accept_review(model: str, validator: Any, record: dict[str, Any], text: str) -> dict[str, Any] | None:
-    """A valid conclusive reply from the seat's own model, whatever the task's final status.
+def attested(seat: dict[str, Any], record: dict[str, Any]) -> bool:
+    """Whether the task ran the seat's model.
 
-    A task whose stream attests a different model is refused. A task that settled as failed after
-    returning a complete, schema-valid reply (an AGY transport error at exit) is scored and
-    flagged through its row's ``task_status``.
+    Cursor and AGY records carry the model their stream reported; it must be known and, after
+    the catalog's Cursor display-name mapping (``Grok 4.7 256K High`` is ``grok-4.7``), equal the
+    seat's ``attested_model``. Other routes run the requested model, recorded as ``model``.
     """
-    if record.get("resolved_model_known") is True and record.get("resolved_model") != model:
-        return None
-    return valid_review(text, validator)
+    if seat["agent"] in STREAM_ATTESTED_AGENTS:
+        if record.get("resolved_model_known") is not True:
+            return False
+        reported = record.get("resolved_model")
+        if seat["agent"] == "cursor":
+            reported = canonical_cursor_model(reported)
+        return bool(reported == seat["attested_model"])
+    return bool(record.get("model") == seat["attested_model"])
+
+
+def accept_review(seat: dict[str, Any], validator: Any, record: dict[str, Any], text: str) -> dict[str, Any] | None:
+    """A valid conclusive reply from a task attested to the seat's model, else None."""
+    return valid_review(text, validator) if attested(seat, record) else None
 
 
 def execute(evalset: EvalSet, items: list[Item], out: Path, dispatcher: Dispatcher) -> int:
@@ -558,7 +597,7 @@ def execute(evalset: EvalSet, items: list[Item], out: Path, dispatcher: Dispatch
         reply, settled = attempt(
             journal, dispatcher, f"{item.task_id}:review", f"{item.task_id}-a", limits["attempts_per_review"],
             limits["review_hard_timeout_s"], functools.partial(review_argv, evalset, item, brief),
-            functools.partial(accept_review, seat["model"], validator))
+            functools.partial(accept_review, seat, validator))
         duration = settled.get("duration_s")
         row: dict[str, Any] = {
             "seat": item.seat, "model": seat["model"], "case_id": item.entry["id"], "kind": item.kind,
@@ -636,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
         for seat, items in plans.items():
             for item in items:
                 brief = Path("<out>/briefs") / f"{item.task_id}.review.md"
-                cmd = [args.python, "-m", "lu_machinery.dispatch", *review_argv(evalset, item, brief, f"{item.task_id}-a1")]
+                cmd = [args.python, "-m", "lu_machinery.dispatch", *review_argv(evalset, item, brief, f"{item.task_id}-a-1")]
                 print(f"{seat}\t{item.kind}\t{item.entry['id']}\t{shlex.join(cmd)}")
         print(json.dumps({**report, "refusals": refusals}, indent=2))
         return 0

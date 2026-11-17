@@ -48,8 +48,10 @@ frozen criteria below.
 
 - **Semantic success.** A review counts only when its reply holds a findings object that is valid
   against `lu_machinery/schemas/code-review-findings.v1.schema.json` and conclusive (`correct` or
-  `incorrect`), and the task's stream does not attest a different model. A BLOCKED reply is a
-  failed review. A seat finds a defect when a judge from another family maps one of the seat's
+  `incorrect`), the dispatch task settled `done`, and the task attests the seat's
+  `attested_model`. Cursor and AGY tasks must carry a known stream-reported model, with
+  Cursor's display name mapped by `canonical_cursor_model`; other routes record the requested
+  model. A BLOCKED reply, or a task that failed after replying, is a failed review. A seat finds a defect when a judge from another family maps one of the seat's
   returned findings to that answer key: same root cause, same faulty behaviour, at or near the
   same code. Each finding counts for at most one defect. A control raises a false alarm when the
   seat returns any P0, P1 or P2 finding on it.
@@ -65,10 +67,12 @@ frozen criteria below.
   parses as a findings object at the attested model and exact head, and that the judge returns a
   matches object. A canary that fails these checks stops that seat's run.
 - **Stop criteria (enforced by the runner).** A seat is refused before any dispatch when its
-  worst-case cost (every review retried once) exceeds `usd_ceiling_per_seat` ($300). A seat stops
-  after 3 failed reviews in a row. The run stops when a judge fails twice. `journal.jsonl`
-  records every dispatch before its wait, so a rerun waits on an unsettled dispatch, reuses a
-  settled review, and retries only failed or unfinished cases.
+  worst-case cost (every review retried once) exceeds `usd_ceiling_per_seat` ($300). The set is
+  refused when a control's window is not a closed 14 days after merge or its clean check found
+  anything. A seat stops after 3 failed reviews in a row, and the run stops when a judge fails
+  twice. `journal.jsonl` records every dispatch before its wait, so a rerun waits on an
+  unsettled dispatch, reuses a settled review, retries only failed or unfinished cases, and
+  never reuses a task id.
 - **Cost.** Per seat on the test split: 33 reviews and up to 23 judgements. The planning
   estimate is $77.5 to $141.2 per seat ($155 to $282.4 worst case), from the assumed figures in
   `protocol.yaml`; these seats run on subscription allowances, so the canary measures real
@@ -89,13 +93,18 @@ frozen criteria below.
 A Claude-hosted caller strips its own `CLAUDE*` and `ANTHROPIC*` variables first, or the
 dispatcher refuses the Opus seat with `claude_account_ambient_conflict`.
 
+Rerun the same command with the same `--out` and `--run-label` to resume. A fresh output
+directory needs a new `--run-label`: the dispatcher refuses task ids that already exist, and
+`journal.jsonl` in the output directory is the only record of the ids a run has used.
+
 ## Limits
 
 - Small denominators: 95% Wilson intervals are reported because a difference of a few defects is
   inside the noise at n = 28 defects and 10 controls.
 - Controls come from the public repository only, and the largest size band is thin.
-- A task that settles as failed after returning a complete, valid reply (an AGY transport error
-  at exit) is scored, and `scored_replies_from_failed_tasks` counts these per seat.
+- A task that settles as failed after returning a complete reply (an AGY transport error at
+  exit, as Carbon's first review of this PR did) is a failed review. Its retry usually recovers
+  it; failures are reported per seat.
 - The answer keys come from recorded reviewers, mostly Sol. Defects that no recorded reviewer
   found are missing from the key, so a seat that finds them gets no credit. On defect cases, only
   recall is scored.
