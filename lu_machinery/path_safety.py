@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -11,13 +12,42 @@ from pathlib import Path
 # build entrypoints) — a hard ``scripts.*`` import breaks that flavor.
 from lu_machinery.common.release_layout import LIVE_DATA_PATHS, MANIFEST_NAME, is_release_root
 
+# Unicode categories refused anywhere in a path component, as one class:
+# controls (Cc: C0, DEL, C1, including NUL), format characters (Cf: bidi
+# embeddings, overrides and isolates, LRM/RLM, ALM, zero-width characters),
+# and line and paragraph separators (Zl, Zp). They spoof how a path reads in
+# logs, terminals and UIs, or split a line where a consumer expects one.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+
 
 def _validate_component(value: str) -> None:
     """Reject clearly unsafe path components."""
     if value == "" or value in {".", ".."}:
         raise ValueError("Invalid path component")
-    if "\x00" in value or ":" in value or "\\" in value or "/" in value:
+    if ":" in value or "\\" in value or "/" in value:
         raise ValueError("Invalid path component")
+    # ``str.isprintable`` is False for every character in the refused
+    # categories (and for some allowed ones, such as NBSP), so it is only a
+    # fast path; the category test below is the decision.
+    if not value.isprintable() and any(unicodedata.category(c) in _UNSAFE_CATEGORIES for c in value):
+        raise ValueError("Invalid path component: control, format or separator character")
+
+
+def _clean_parts(parts: tuple[str | Path, ...]) -> list[str]:
+    """Split relative ``parts`` into validated components."""
+    clean_parts: list[str] = []
+    for part in map(str, parts):
+        if not part:
+            raise ValueError("Invalid path component")
+        if "\x00" in part:
+            raise ValueError("Null byte in user path")
+        candidate = Path(part)
+        if candidate.is_absolute():
+            raise ValueError("Absolute path input is not allowed")
+        for component in candidate.parts:
+            _validate_component(component)
+            clean_parts.append(component)
+    return clean_parts
 
 
 def _is_within(root: Path, target: Path) -> bool:
@@ -92,21 +122,9 @@ def safe_join(base: Path, *parts: str | Path) -> Path:
     # while callers retain the logical path below.
     resolved_base = Path(os.path.abspath(str(base))).resolve()
 
-    # Join and normalize the target path
-    # We still validate components individually to prevent embedded '..'
-    # before joining, as an extra layer of defense.
-    clean_parts = []
-    for part in map(str, parts):
-        if not part:
-            raise ValueError("Invalid path component")
-        if "\x00" in part:
-            raise ValueError("Null byte in user path")
-        candidate = Path(part)
-        if candidate.is_absolute():
-            raise ValueError("Absolute path input is not allowed")
-        for component in candidate.parts:
-            _validate_component(component)
-            clean_parts.append(component)
+    # Validate components individually to refuse an embedded '..' and unsafe
+    # characters before joining, as an extra layer of defense.
+    clean_parts = _clean_parts(parts)
 
     # Resolve the candidate too: lexical normalization alone would accept a
     # child symlink that points outside an otherwise trusted base directory.
@@ -134,7 +152,8 @@ def trusted_join(base: Path, *parts: str | Path) -> Path:
     release live-data containment contract. ``trusted_join`` exists for hot
     internal scanners (orient/pipeline module iteration joins config-derived
     slugs onto repo roots thousands of times per request); it validates
-    components lexically (no ``..``, no absolute parts, no separators, no NUL)
+    components lexically (no ``..``, no absolute parts, no separators, no
+    control, format or line/paragraph-separator characters)
     and enforces commonpath containment, but performs NO filesystem
     resolution, so a planted child symlink is not detected. That trade is
     sound only when both the base and every component come from repo-internal
@@ -144,18 +163,7 @@ def trusted_join(base: Path, *parts: str | Path) -> Path:
         return Path(os.path.abspath(str(base)))
 
     abs_base = os.path.abspath(str(base))
-    clean_parts: list[str] = []
-    for part in map(str, parts):
-        if not part:
-            raise ValueError("Invalid path component")
-        if "\x00" in part:
-            raise ValueError("Null byte in user path")
-        candidate = Path(part)
-        if candidate.is_absolute():
-            raise ValueError("Absolute path input is not allowed")
-        for component in candidate.parts:
-            _validate_component(component)
-            clean_parts.append(component)
+    clean_parts = _clean_parts(parts)
 
     target = os.path.abspath(os.path.join(abs_base, *clean_parts))
     try:
