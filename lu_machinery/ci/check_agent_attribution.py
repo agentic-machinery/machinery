@@ -138,9 +138,9 @@ _MARKDOWN = MarkdownIt("commonmark")
 _TRAILER_LINE = re.compile(r"[A-Za-z][A-Za-z0-9-]*: \S(?:.*\S)?", re.ASCII)
 _ATTRIBUTION_KEY = "x-agent"
 _VERIFIED_KEY = "x-verified"
-_WELL_FORMED = re.compile(r"^X-Agent: (?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+)$")
 _VERIFIED_NONE = re.compile(r"^X-Verified: none \((?P<reason>[^()\s](?:[^()]*[^()\s])?)\)\Z", re.ASCII)
 _VERIFIED_COMMANDS = re.compile(r"^X-Verified: (?P<value>\S(?:.*\S)?)\Z", re.ASCII)
+_WELL_FORMED = re.compile(r"^X-Agent: (?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+)$")
 _LINE_BREAKS = ("softbreak", "hardbreak")
 # The squash headline ends in the PR number; earlier "(#N)" references are issues.
 _PR_SUFFIX = re.compile(r"\(#(?P<number>[1-9][0-9]*)\)$")
@@ -182,24 +182,6 @@ class Attribution:
 
 
 @dataclass(frozen=True)
-class Verification:
-    """One message's ``X-Verified`` commands, explicit-none reasons, malformed count and refusal."""
-
-    commands: tuple[str, ...]
-    explicit_none: tuple[str, ...]
-    malformed: int
-    refusal: str | None = None
-
-
-@dataclass(frozen=True)
-class VerifiedRow:
-    """Classification of one commit. ``status`` is missing, none, present, malformed, mixed or refused."""
-
-    commit: str
-    status: str
-
-
-@dataclass(frozen=True)
 class Paragraph:
     """A declaration paragraph: its parser line map and the LF-split source lines it covers."""
 
@@ -213,8 +195,6 @@ class Report:
     mode: str
     checked: int = 0
     violations: list[Violation] = field(default_factory=list)
-    verified: list[Violation] = field(default_factory=list)
-    verified_rows: list[VerifiedRow] = field(default_factory=list)
 
 
 def _normalised(message: str) -> str:
@@ -318,6 +298,32 @@ def extract_attribution(message: str) -> Attribution:
             if strict is not None and strict.group("value") not in values:
                 values.append(strict.group("value"))
     return Attribution(tuple(values), malformed)
+
+
+@dataclass(frozen=True)
+class Verification:
+    """One message's ``X-Verified`` commands, explicit-none reasons, malformed count and refusal."""
+
+    commands: tuple[str, ...]
+    explicit_none: tuple[str, ...]
+    malformed: int
+    refusal: str | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedRow:
+    """Classification of one commit. ``status`` is missing, none, present, malformed, mixed or refused."""
+
+    commit: str
+    status: str
+
+
+@dataclass
+class VerifiedReport(Report):
+    """Attribution report plus the ``X-Verified`` findings for the same commits."""
+
+    verified: list[Violation] = field(default_factory=list)
+    verified_rows: list[VerifiedRow] = field(default_factory=list)
 
 
 def _is_verified_candidate(line: str) -> bool:
@@ -558,7 +564,7 @@ def _bad_attribution(attribution: Attribution, sha: str, pr: int | None) -> Viol
 
 def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repository: str | None = None) -> Report:
     """Every non-merge commit in ``base..head`` carries a well-formed line or is a verified bot's."""
-    report = Report("pr")
+    report = VerifiedReport("pr")
     try:
         base_sha, head_sha = _resolve_commit(base), _resolve_commit(head)
     except GitFailure as exc:
@@ -608,7 +614,7 @@ def check_merge_group(
     repository: str | None = None,
 ) -> Report:
     """Each squash commit in the queue chain carries its PR's complete attribution."""
-    report = Report("merge-group")
+    report = VerifiedReport("merge-group")
     try:
         base_sha, head_sha = _resolve_commit(base), _resolve_commit(head)
         _git("merge-base", "--is-ancestor", base_sha, head_sha)
@@ -798,7 +804,7 @@ def check_verified_report(range_spec: str) -> Report:
     A git error or an empty range is a hard failure of the query (``report.violations``),
     not a missing line. The classification itself is in ``report.verified_rows``.
     """
-    report = Report("verified-report")
+    report = VerifiedReport("verified-report")
     if not range_spec or range_spec.startswith("-") or any(character in range_spec for character in "\n\r\t "):
         report.violations.append(Violation("GIT_ERROR", "range is empty or not a single revision range"))
         return report
