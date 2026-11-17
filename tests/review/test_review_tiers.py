@@ -11,6 +11,9 @@ import pytest
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
+from tests.helpers import product_tree
+
+configured_roots = product_tree.configured_roots
 
 
 def test_low_same_family_non_author_approve_passes_recorder_and_landing(low_review, tmp_path):
@@ -330,12 +333,14 @@ def _release_cut() -> list[dict[str, str]]:
     ]
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_docs_only_pr_is_trivial():
     """Defect class: root documentation for people still demands a review of record."""
     assert classify_pr_files([_modified("CHANGELOG.md"), _modified("README.md")]) == "trivial"
     assert classify_pr_files([{"filename": "SECURITY.md", "status": "removed"}]) == "trivial"
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_trivial_doc_plus_code_takes_code_tier():
     """Defect class: mixing a Trivial file into a code change lowers the code change's review."""
     assert classify_pr_files([_modified("README.md"), _modified("lu_machinery/common/x.py")]) == "medium"
@@ -345,6 +350,7 @@ def test_trivial_doc_plus_code_takes_code_tier():
     assert classify_pr_files([lock, _modified(".github/workflows/ci.yml")]) == "high"
 
 
+@pytest.mark.usefixtures("configured_roots")
 @pytest.mark.parametrize(
     "path",
     [
@@ -371,6 +377,7 @@ def test_agents_extensions_and_model_facing_docs_are_not_trivial(path):
     assert classify_pr_files([_modified(path)]) != "trivial"
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_release_adoption_lock_bump_is_trivial():
     """Defect class: the product's adoption of an accepted release still needs a review."""
     assert classify_pr_files([_modified("requirements-machinery.lock", LOCK_BUMP)]) == "trivial"
@@ -382,6 +389,7 @@ def test_release_adoption_lock_bump_is_trivial():
     assert classify_pr_files(_release_cut()) == "high"
 
 
+@pytest.mark.usefixtures("configured_roots")
 @pytest.mark.parametrize(
     ("path", "patch"),
     [
@@ -444,6 +452,7 @@ def test_version_file_with_dependency_change_is_not_trivial(path, patch):
         assert classify_pr_files(rows) != "trivial"
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_version_downgrade_or_missing_patch_is_not_trivial():
     """Defect class: a lowered, disagreeing or unreadable version change passes as a release cut."""
     downgrade = LOCK_BUMP.replace("0.1.25", "0.1.X").replace("0.1.26", "0.1.25").replace("0.1.X", "0.1.26")

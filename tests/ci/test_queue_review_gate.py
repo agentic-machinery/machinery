@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.ci import queue_review_gate as gate
+from tests.helpers import product_tree
 
+configured_roots = product_tree.configured_roots
 _GIT_BIN = os.environ.get("AGENT_REAL_GIT", "git")  # the agent shim refuses some plumbing
 REPOSITORY = "owner/repo"
 ENQUEUED_AT = "2026-11-11T10:00:00Z"
@@ -320,6 +322,7 @@ def _first_member_changes(candidate: Candidate, files: dict[str, str]) -> None:
     candidate.s2 = candidate.squash(candidate.s1, candidate.heads[2], 2)
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_trivial_member_passes_without_review_status(
     candidate: Candidate, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -338,6 +341,7 @@ def test_trivial_member_passes_without_review_status(
     assert _run(candidate, github) == 1
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_non_trivial_member_still_needs_status(candidate: Candidate, capsys: pytest.CaptureFixture[str]) -> None:
     """Defect class: a code change rides into the queue on a Trivial file's exemption."""
     _first_member_changes(candidate, {"README.md": "1\n", "tool.py": "print(1)\n"})
