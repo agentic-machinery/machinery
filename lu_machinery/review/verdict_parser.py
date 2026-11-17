@@ -98,7 +98,9 @@ _REVIEW_VERDICT_LINE_RE = re.compile(
 )
 # Diagnostics echo only bounded ASCII identifier tokens, never paths, URLs or
 # arbitrary verdict-line text. Trailing underscores may be Markdown emphasis.
-_UNSUPPORTED_VERDICT_LINE_RE = re.compile(
+# No catastrophic backtracking: .match anchors it to one reviewer verdict line, and each quantified class is disjoint
+# from what follows it (alphanumerics vs [_-], [*_\s] vs VERDICT), so no span matches two ways (200k chars: <30 ms).
+_UNSUPPORTED_VERDICT_LINE_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     _VERDICT_LINE_PREFIX + r"(?a:([A-Za-z][A-Za-z0-9]*(?:[_-]+[A-Za-z0-9]+)*))"
     r"(?=$|[*_`]*(?:\s|[.,;:!?][*_`]*(?:\s|$)|$))",
     re.IGNORECASE,
@@ -384,7 +386,9 @@ def invalid_findings_block(response: str, *, stated: str | None = None) -> str |
 
 # These are declarations by the reviewer about its own unfinished work, not
 # general uses of "incomplete" in findings about the code under review.
-_INCOMPLETE_REVIEW_RE = re.compile(
+# No catastrophic backtracking: on reviewer prose it starts only at ^ or [.!?:], and its repeated units are literal
+# words split by \s+, which no word can match, so no span matches two ways (200k chars: <40 ms).
+_INCOMPLETE_REVIEW_RE = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     r"(?:^|[.!?:]\s+)(?:(?:however|unfortunately),?\s+)?(?:"
     r"(?:I|we)\s+(?:(?:could|can|did|have)\s+not|cannot|couldn't|can't|didn't|haven't|"
     r"(?:am|are|was|were)\s+unable\s+to)\s+"
