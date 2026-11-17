@@ -122,12 +122,18 @@ def test_a_5xx_route_fails_and_a_fast_200_does_not(monkeypatch, tmp_path) -> Non
 def test_installed_wheel_ships_loopback_target_inside_the_package(tmp_path: Path) -> None:
     """Defect class: an installed wheel omits the loopback target, so host verify reports it unreadable."""
     wheel = release_wheel(_REPO, tmp_path)
-    source = (_REPO / _LOOPBACK).read_bytes()
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         assert _LOOPBACK in names
         assert "packaging/systemd/learn-ukrainian-loopback.target" not in names
-        assert archive.read(_LOOPBACK) == source
+        shipped = archive.read(_LOOPBACK)
+    # The pytest job removes checkout lu_machinery before the test runs and
+    # points LU_TEST_WHEEL at the wheel built from that tree. Compare the
+    # installed text with the wheel bytes. When the checkout file is still
+    # present, it must be those same bytes.
+    checkout = _REPO / _LOOPBACK
+    if checkout.is_file():
+        assert shipped == checkout.read_bytes()
     python = install_release(wheel, tmp_path / "consumer")
     ran = subprocess.run(
         [str(python), "-I", "-c", _INSTALLED_PROBE],
@@ -145,7 +151,7 @@ def test_installed_wheel_ships_loopback_target_inside_the_package(tmp_path: Path
     assert located["is_file"] is True
     assert located["inside_package"] is True
     assert located["legacy_exists"] is False
-    assert located["text"] == source.decode()
+    assert located["text"] == shipped.decode()
     assert located["units"] == [
         "learn-ukrainian-api.service",
         "learn-ukrainian-sources.service",
