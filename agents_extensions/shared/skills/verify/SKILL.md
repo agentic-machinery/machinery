@@ -17,6 +17,6 @@ Pass means exit 0 and `"ok": true` in the receipt.
 
 - **api.** Every `all_page_contracts()` URL, every concrete HTTP route-contract path, and every parameter-free GET under those contracts. Each must answer in under 1 second with no 5xx.
 - **sources.** The running Sources server's `/health` answers within 1 second, then one `verify_word` returns a VESUM match. This talks to the server the unit runs. It does not start a second process.
-- **host.** Every unit in `Requires=` of `packaging/systemd/learn-ukrainian-loopback.target` reports `active`.
+- **host.** Every unit in `Requires=` of `lu_machinery/packaging/systemd/learn-ukrainian-loopback.target` reports `active`.
 
 Repeat `--area` to check more than one area in one receipt.

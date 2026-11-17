@@ -373,7 +373,7 @@
  "packaging/systemd/learn-ukrainian-issue-quality-report.service": "machinery",
  "packaging/systemd/learn-ukrainian-issue-quality-report.timer": "machinery",
  "packaging/systemd/learn-ukrainian-lane-relaunch.service": "product",
- "packaging/systemd/learn-ukrainian-loopback.target": "product",
+ "packaging/systemd/learn-ukrainian-loopback.target": "machinery",
  "packaging/systemd/learn-ukrainian-merge-queue-keeper.service": "product",
  "packaging/systemd/learn-ukrainian-merge-queue-keeper.timer": "product",
  "packaging/systemd/learn-ukrainian-opencode-retention.service": "product",
