@@ -93,6 +93,8 @@ class PeriodicSnapshot[T]:
         self._wake: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._attempts = 0
+        # Attempt count when a read woke the dormant writer; None once it settles.
+        self._pending: int | None = None
         self._settled = threading.Condition()
 
     def refresh(self) -> None:
@@ -102,8 +104,7 @@ class PeriodicSnapshot[T]:
         self._entry = (started, value)
 
     def read(self) -> tuple[T, float]:
-        if self._demand.touch():
-            self._await_fresh()
+        self._join_wake_refresh()
         entry = self._entry
         if entry is None:
             raise HTTPException(
@@ -112,16 +113,29 @@ class PeriodicSnapshot[T]:
             )
         return entry[1], max(0.0, _ttl_clock() - entry[0])
 
-    def _await_fresh(self) -> None:
-        """Wake the dormant writer and, off its event loop, wait for its next attempt."""
+    def _join_wake_refresh(self) -> None:
+        """Wake a dormant writer; off its event loop, wait for that refresh to settle.
+
+        Every reader that arrives before the wake-up refresh settles joins it,
+        not only the one that woke the writer.
+        """
         loop, wake = self._loop, self._wake
         if loop is None or wake is None:
+            self._demand.touch()
             return
         with self._settled:
-            attempts = self._attempts
-        try:
-            loop.call_soon_threadsafe(wake.set)
-        except RuntimeError:  # the loop already closed at shutdown
+            woke = self._demand.touch() and self._pending is None
+            if woke:
+                self._pending = self._attempts
+            pending = self._pending
+        if woke:
+            try:
+                loop.call_soon_threadsafe(wake.set)
+            except RuntimeError:  # the loop already closed at shutdown
+                with self._settled:
+                    self._pending = None
+                return
+        if pending is None:
             return
         try:
             on_loop = asyncio.get_running_loop() is loop
@@ -130,7 +144,7 @@ class PeriodicSnapshot[T]:
         if on_loop:
             return  # the writer needs this thread; answer from the last observation
         with self._settled:
-            self._settled.wait_for(lambda: self._attempts != attempts, timeout=DORMANT_READ_WAIT_S)
+            self._settled.wait_for(lambda: self._attempts != pending, timeout=DORMANT_READ_WAIT_S)
 
     async def _refresh(self) -> None:
         work = asyncio.create_task(asyncio.to_thread(self.refresh))
@@ -162,6 +176,7 @@ class PeriodicSnapshot[T]:
                     ready.set()
                     with self._settled:
                         self._attempts += 1
+                        self._pending = None
                         self._settled.notify_all()
                 with suppress(TimeoutError):
                     await asyncio.wait_for(wake.wait(), timeout=self.interval)
@@ -179,6 +194,9 @@ class PeriodicSnapshot[T]:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            with self._settled:  # no reader waits on a writer that has stopped
+                self._loop = self._wake = self._pending = None
+                self._settled.notify_all()
 
 
 def ctx_cache_scope(ctx: MonitorContext | None) -> str:

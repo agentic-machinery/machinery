@@ -749,6 +749,8 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "active_delegate_tasks", forbidden)
         monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1e12)
+        # Reads join the held wake-up refresh only briefly, then answer from the snapshot.
+        monkeypatch.setattr(state_helpers, "DORMANT_READ_WAIT_S", 0.05)
         try:
             # The clock jump left the writer unread past the demand window; a
             # read answers from the snapshot and wakes it.
@@ -835,7 +837,8 @@ def test_periodic_snapshot_refreshes_only_while_read(monkeypatch):
     """Defect class: a snapshot writer rescanned the task store every interval with no readers.
 
     Unread past the demand window, the writer stops. The next read wakes it and
-    gets that fresh collection, never the minutes-old observation.
+    gets that fresh collection, never the minutes-old observation, and so does
+    a reader that overlaps the wake-up collection.
     """
     import asyncio
     import threading
@@ -846,15 +849,20 @@ def test_periodic_snapshot_refreshes_only_while_read(monkeypatch):
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
     lock = threading.Lock()
     calls = []
+    waking, release = threading.Event(), threading.Event()
 
     def compute():
         with lock:
             calls.append(now[0])
-            if len(calls) == 3:
+            n = len(calls)
+            if n == 3:
                 # Nobody reads for a whole window. Advancing inside the third
                 # collection means no later refresh can start before the jump.
                 now[0] += state_helpers.DEMAND_WINDOW_S
-            return len(calls)
+        if n == 4:  # the wake-up collection, held open for an overlapping reader
+            waking.set()
+            assert release.wait(5), "the test never released the wake-up collection"
+        return n
 
     def count():
         with lock:
@@ -874,8 +882,14 @@ def test_periodic_snapshot_refreshes_only_while_read(monkeypatch):
             assert count() == 3, "an unread snapshot kept refreshing"
 
             # Handlers read in the thread pool, as production routes do.
-            value, age = await asyncio.to_thread(snapshot.read)
-            assert (value, age) == (4, 0.0), "a dormant read returned the old observation"
+            first = asyncio.ensure_future(asyncio.to_thread(snapshot.read))
+            await until(waking.is_set)  # the first read woke the writer
+            second = asyncio.ensure_future(asyncio.to_thread(snapshot.read))
+            await asyncio.sleep(0.2)
+            assert not second.done(), "an overlapping read returned the dormant observation"
+            release.set()
+            assert await first == (4, 0.0), "a dormant read returned the old observation"
+            assert await second == (4, 0.0)
 
     asyncio.run(scenario())
 
