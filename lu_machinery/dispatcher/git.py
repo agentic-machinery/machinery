@@ -81,7 +81,7 @@ class VerificationFetchError(subprocess.CalledProcessError):
         http = re.search(r"The requested URL returned error: ([45][0-9]{2})\b", stderr)
         self.reason = (f"HTTP {http[1]}" if http else
                        next((reason for marker, reason in reasons if marker in stderr), "unclassified transport error"))
-        super().__init__(code, [GIT_BINARY, "fetch"], output="", stderr=self.reason)
+        super().__init__(code, ["git", "fetch"], output="", stderr=self.reason)
 
     def __str__(self) -> str:
         return f"git fetch failed (exit {self.returncode}; {self.reason})"
