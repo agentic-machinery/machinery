@@ -321,7 +321,6 @@ tests/api/test_test_slots_route.py
 tests/api/test_transcript_tokens_usage.py
 tests/api/test_usage_probe_extras.py
 tests/audit/test_check_tmp_usability.py
-tests/bench/test_cli_tail_timeouts.py
 tests/ci/test_audit_dependencies.py
 tests/ci/test_check_large_files.py
 tests/ci/test_ci_cache_hygiene.py

@@ -270,7 +270,6 @@
   "tests/api/test_transcript_tokens_usage.py": 0.163,
   "tests/api/test_usage_probe_extras.py": 3.012,
   "tests/audit/test_check_tmp_usability.py": 0.117,
-  "tests/bench/test_cli_tail_timeouts.py": 0.061,
   "tests/ci/test_audit_dependencies.py": 0.782,
   "tests/ci/test_check_large_files.py": 5.047,
   "tests/ci/test_ci_cache_hygiene.py": 0.686,

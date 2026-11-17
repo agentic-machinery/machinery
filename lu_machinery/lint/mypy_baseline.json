@@ -2513,31 +2513,6 @@
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/bench/writer_matrix.py",
-      "code": "arg-type",
-      "message": "Argument \"stderr\" to \"CompletedProcess\" has incompatible type \"str\"; expected \"None | bytes\""
-    },
-    {
-      "path": "lu_machinery/bench/writer_matrix.py",
-      "code": "arg-type",
-      "message": "Argument \"stdout\" to \"CompletedProcess\" has incompatible type \"str\"; expected \"None | bytes\""
-    },
-    {
-      "path": "lu_machinery/bench/writer_matrix.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/bench/writer_matrix.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"failed\" (hint: \"failed: list[<type>] = ...\")"
-    },
-    {
-      "path": "lu_machinery/bench/writer_matrix.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"passed\" (hint: \"passed: list[<type>] = ...\")"
-    },
-    {
       "path": "lu_machinery/ci/advisory_checks.py",
       "code": "misc",
       "message": "Cannot infer type of lambda"
