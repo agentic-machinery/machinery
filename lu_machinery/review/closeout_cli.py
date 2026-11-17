@@ -935,24 +935,47 @@ _CHECKLIST_EVIDENCE_LIMIT = 5
 # Renames and copies, including copies of a file the diff leaves unchanged; both diff passes use
 # the same options so every patch header names a file the status list holds.
 _CHECKLIST_DETECTION = ("-M", "-C", "--find-copies-harder")
-# Judge inputs: what a reviewer reads to judge a change. These are the checklist and the ownership
-# map, the review policy configuration, the reply schema, the review skills and brief template, the
-# rules, and this CLI, which renders them into the brief. A diff touching any of them changes its
-# own judge, so it gets the built-in judge-change item, which no checklist edit removes. Code that
-# launches a reviewer or accepts its verdict is a separate class, outside this tuple.
+# What judges a change, as classes rather than a file list (a list kept missing siblings):
+# - anything named for review or verdicts in the code and agent trees (the review package, verdict
+#   parsing, recording, publication, finalization and ground truth, the review MCP, review configs,
+#   the reply schema, the queue review gate, the reviewer guard hooks, the review skills);
+# - the harnesses that launch a reviewer and validate its reply: the agent runtime and its adapters,
+#   the dispatcher and its providers, and the agent bridge;
+# - what accepts a verdict or lets it land a PR: the Fleet authority's formal-review acceptance and its
+#   finalize command, the publisher, the integration sweep, the keeper;
+# - what seats the reviewer: the model catalog, substitutions, runtime failover and routing defaults;
+# - the rules, and this checklist and ownership map.
+# A diff touching any of them changes its own judge, so it gets the built-in judge-change item, which
+# no checklist edit removes.
 _JUDGE_PATHS = (
+    "lu_machinery/**/*review*",
+    "lu_machinery/**/*review*/**",
+    "lu_machinery/**/*verdict*",
+    "scripts/**/*review*",
+    "scripts/**/*review*/**",
+    "scripts/**/*verdict*",
+    "agents_extensions/**/*review*",
+    "agents_extensions/**/*review*/**",
+    "**/agent_runtime/**",
+    "**/dispatcher/**",
+    "**/ai_agent_bridge/**",
+    "**/publish/**",
+    "**/orchestration/integration_sweep.py",
+    "**/orchestration/merge_queue_keeper.py",
+    "**/fleet_comms/authority.py",
+    "**/fleet_comms/cli.py",
+    "**/config/model_catalog.yaml",
+    "**/config/agent_fallback_substitutions.yaml",
+    "**/config/agent_runtime_failover.yaml",
+    "**/config/routing_defaults.yaml",
     "**/config/reliability_checklist.yaml",
     "**/config/code_owners.yaml",
-    "**/config/review_*.yaml",
-    "**/review/closeout_cli.py",
-    "**/schemas/code-review-*",
-    "agents_extensions/**/skills/*review*/**",
-    "agents_extensions/**/skills/drive-epic/references/review-merge-cleanup.md",
+    "**/verify_review.py",
     "agents_extensions/**/rules/**",
 )
 _JUDGE_CHANGE_ID = "judge-change"
 _JUDGE_CHANGE_CHECK = (
-    "This diff changes what reviewers read to judge a change. Is every changed judge file "
+    "This diff changes what reviewers read or how a review is judged. Is every changed judge file "
     "reviewed against its merge-base copy (`git show <merge-base>:<path>`), never the head copy, and "
     "does the PR cite the designated approval (rules core P6) that a review policy, reply schema, "
     "rules or checklist change needs?"

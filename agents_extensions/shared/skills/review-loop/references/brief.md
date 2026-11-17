@@ -36,8 +36,8 @@ It reads `lu_machinery/config/reliability_checklist.yaml` and `lu_machinery/conf
 from the merge-base, matches every checklist item against `merge-base..head` (changed paths,
 change kind, added and removed lines), and prints the matching items, each with its incident and
 owning area, the owner of every area the diff touches, and the `judge-change` item when the diff
-touches a judge input (the checklist, the ownership map, the review policy configuration, the
-reply schema, the review skills, the brief template, the rules or this command). Its JSON output's `brief_section` is the text the brief carries.
+touches a judge file (the checklist, the ownership map, the reply schema, the review skills, the
+brief template or the rules). Its JSON output's `brief_section` is the text the brief carries.
 The reviewer answers each item with file:line or test evidence. Run it from the installed
 release, not from a checkout of the change: it refuses a package copy inside the checkout under
 review. Exit 1 (a malformed checklist or map at the merge-base, an unreadable diff) is
