@@ -115,7 +115,6 @@ CORE_SENTINEL_MODULES: dict[str, str] = {
     "filelock": "filelock",
     "rapidfuzz": "rapidfuzz",
     "ukrainian_word_stress": "ukrainian-word-stress",
-    "zeroconf": "zeroconf",
 }
 
 # Console-script launcher name -> owning distribution, for the (rare) cases
