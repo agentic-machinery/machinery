@@ -415,7 +415,7 @@
     {
       "path": "lu_machinery/agent_runtime/env_sanitize.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/grok_hook_bridge.py",
@@ -520,7 +520,7 @@
     {
       "path": "lu_machinery/agent_runtime/registry.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/review_mcp.py",
@@ -640,12 +640,12 @@
     {
       "path": "lu_machinery/agent_runtime/telemetry.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/telemetry.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/telemetry.py",
@@ -670,17 +670,17 @@
     {
       "path": "lu_machinery/agent_runtime/tool_config.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"NATIVE_GROK_SEAT\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"NATIVE_GROK_SEAT\""
     },
     {
       "path": "lu_machinery/agent_runtime/tool_config.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"is_native_grok_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/tool_config.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"normalize_seat\""
     },
     {
       "path": "lu_machinery/agent_runtime/tool_config.py",
@@ -4450,7 +4450,7 @@
     {
       "path": "lu_machinery/fleet/capacity_pick.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"RETIRED_AGENT_ALIASES\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"RETIRED_AGENT_ALIASES\""
     },
     {
       "path": "lu_machinery/fleet/capacity_pick.py",
@@ -5270,37 +5270,37 @@
     {
       "path": "lu_machinery/fleet_comms/__init__.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"AssistantSegment\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"AssistantSegment\""
     },
     {
       "path": "lu_machinery/fleet_comms/__init__.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"CompletionState\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
     },
     {
       "path": "lu_machinery/fleet_comms/__init__.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
     },
     {
       "path": "lu_machinery/fleet_comms/__init__.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"AssistantSegment\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"AssistantSegment\""
     },
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"CompletionState\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
     },
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
     },
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
@@ -5450,27 +5450,27 @@
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.pg_schema\" has no attribute \"PG_BLOB_TABLE\""
+      "message": "Module \"lu_machinery.fleet_comms.pg_schema\" has no attribute \"PG_BLOB_TABLE\""
     },
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.pg_schema\" has no attribute \"PgSchemaError\""
+      "message": "Module \"lu_machinery.fleet_comms.pg_schema\" has no attribute \"PgSchemaError\""
     },
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.pg_schema\" has no attribute \"apply_pg_schema\""
+      "message": "Module \"lu_machinery.fleet_comms.pg_schema\" has no attribute \"apply_pg_schema\""
     },
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.pg_schema\" has no attribute \"verify_pg_schema\""
+      "message": "Module \"lu_machinery.fleet_comms.pg_schema\" has no attribute \"verify_pg_schema\""
     },
     {
       "path": "lu_machinery/fleet_comms/artifacts.py",
@@ -5550,7 +5550,7 @@
     {
       "path": "lu_machinery/fleet_comms/authority.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/authority.py",
@@ -5715,12 +5715,12 @@
     {
       "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"CompletionState\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
     },
     {
       "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
@@ -5745,7 +5745,7 @@
     {
       "path": "lu_machinery/fleet_comms/message_plane.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"CompletionState\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
     },
     {
       "path": "lu_machinery/fleet_comms/message_plane.py",
@@ -5760,22 +5760,22 @@
     {
       "path": "lu_machinery/fleet_comms/request_executor.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"CompletionState\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"CompletionState\""
     },
     {
       "path": "lu_machinery/fleet_comms/request_executor.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"ResponseEnvelope\""
     },
     {
       "path": "lu_machinery/fleet_comms/request_executor.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/request_executor.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.pg_schema\" has no attribute \"apply_pg_schema\""
+      "message": "Module \"lu_machinery.fleet_comms.pg_schema\" has no attribute \"apply_pg_schema\""
     },
     {
       "path": "lu_machinery/fleet_comms/request_executor.py",
@@ -5805,7 +5805,7 @@
     {
       "path": "lu_machinery/fleet_comms/review_publisher.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/routing_reservations.py",
@@ -5820,7 +5820,7 @@
     {
       "path": "lu_machinery/fleet_comms/routing_reservations.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.fleet_comms.contracts\" has no attribute \"new_id\""
+      "message": "Module \"lu_machinery.fleet_comms.contracts\" has no attribute \"new_id\""
     },
     {
       "path": "lu_machinery/fleet_comms/routing_reservations.py",
@@ -6555,7 +6555,7 @@
     {
       "path": "lu_machinery/inbox_pending.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"seat_read_aliases\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"seat_read_aliases\""
     },
     {
       "path": "lu_machinery/inbox_pending.py",
@@ -8480,12 +8480,12 @@
     {
       "path": "lu_machinery/review/reviewer_resolver.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"SEAT_ALIASES\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"SEAT_ALIASES\""
     },
     {
       "path": "lu_machinery/review/reviewer_resolver.py",
       "code": "attr-defined",
-      "message": "Module \"scripts.agent_runtime.agent_identity\" has no attribute \"resolve_retired_agent_alias\""
+      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"resolve_retired_agent_alias\""
     },
     {
       "path": "lu_machinery/review/reviewer_resolver.py",
