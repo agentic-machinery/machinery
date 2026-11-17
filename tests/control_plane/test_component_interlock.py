@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneError,
@@ -18,8 +19,8 @@ from lu_machinery.control_plane.storage import (
     assert_component_supported,
 )
 
-
 _ENV = "LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS"
+pytestmark = pytest.mark.usefixtures("fleet_comms_primary")
 
 
 @pytest.fixture(autouse=True)
