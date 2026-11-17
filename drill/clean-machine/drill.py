@@ -95,7 +95,10 @@ def fetch(url: str, dest: Path) -> None:
         url, headers={"User-Agent": "lu-clean-machine-drill"}
     )
     with (
-        urllib.request.urlopen(request, timeout=120) as response,
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected
+        urllib.request.urlopen(
+            request, timeout=120
+        ) as response,  # fixed https GitHub release URL
         dest.open("wb") as out,
     ):
         shutil.copyfileobj(response, out)
@@ -135,7 +138,7 @@ def obtain_wheel(version: str, wheel_dir: Path, offline_dir: Path | None) -> Pat
 def run_checked(
     argv: list[str], *, env: dict[str, str], cwd: Path, what: str, timeout: int = 1800
 ) -> str:
-    result = subprocess.run(
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit - argv list, no shell
         argv,
         check=False,
         env=env,
@@ -151,12 +154,28 @@ def run_checked(
     return result.stdout
 
 
+PYPI_INDEX = "https://pypi.org/simple"
+
+
 def base_env(home: Path) -> dict[str, str]:
+    """Setup environment: home and temp files inside the world, pip limited to PyPI.
+
+    ``PIP_CONFIG_FILE=/dev/null`` makes pip skip every configuration file, including a
+    machine-wide one that could name another index or carry credentials.
+    """
+    tmp = home.parent / "setup-tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
     return {
         "HOME": str(home),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "TMPDIR": str(tmp),
+        "TMP": str(tmp),
+        "TEMP": str(tmp),
+        "PIP_CONFIG_FILE": os.devnull,
+        "PIP_INDEX_URL": PYPI_INDEX,
+        "PIP_NO_INPUT": "1",
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
         "PYTHONNOUSERSITE": "1",
     }
@@ -174,7 +193,18 @@ def create_venv(python: str, venv: Path, home: Path) -> Path:
 
 def install_wheel(py: Path, wheel: Path, home: Path) -> None:
     run_checked(
-        [str(py), "-I", "-m", "pip", "install", "--quiet", "--no-input", str(wheel)],
+        [
+            str(py),
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--quiet",
+            "--no-input",
+            "--index-url",
+            PYPI_INDEX,
+            str(wheel),
+        ],
         env=base_env(home),
         cwd=py.parent,
         what=f"pip install {wheel.name}",
@@ -220,7 +250,7 @@ sys.exit(0 if dist.version == want and not problems else 1)
 
 
 def check_integrity(py: Path, version: str, home: Path) -> dict[str, Any]:
-    result = subprocess.run(
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit - argv list, no shell
         [str(py), "-I", "-c", INTEGRITY_PROBE, version],
         check=False,
         env=base_env(home),
@@ -1007,39 +1037,102 @@ def strace_usable() -> bool:
     return result.returncode == 0
 
 
-_TRACE_LINE = re.compile(
-    r'\b(openat|open|execve|execveat)\((?:AT_FDCWD, |\d+, )?"((?:[^"\\]|\\.)*)"'
+_OPEN_DONE = re.compile(
+    r"\b(?:open|openat|openat2)\(.*= \d+<(.*)>\s*$|<\.\.\. (?:open|openat|openat2) resumed>.*= \d+<(.*)>\s*$"
 )
+_EXEC_CALL = re.compile(
+    r'^(\d+)\s+(execve|execveat)\((?:(?:AT_FDCWD|\d+)<((?:[^>\\]|\\.)*)>, )?"((?:[^"\\]|\\.)*)"'
+)
+_EXEC_RESUMED = re.compile(r"^(\d+)\s+<\.\.\. execve(?:at)? resumed>.*\) = 0\s*$")
+_ESCAPES = {
+    "n": 10,
+    "t": 9,
+    "r": 13,
+    "v": 11,
+    "f": 12,
+    "a": 7,
+    "b": 8,
+    "\\": 92,
+    '"': 34,
+    "'": 39,
+}
+
+
+def strace_bytes(text: str) -> bytes:
+    """Undo strace's C-style escaping (octal, hex and single-letter escapes) back to raw bytes."""
+    out = bytearray()
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != "\\" or index + 1 == len(text):
+            out += char.encode("utf-8", "surrogateescape")
+            index += 1
+            continue
+        nxt = text[index + 1]
+        if nxt == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", text[index + 2 : index + 4]):
+            out.append(int(text[index + 2 : index + 4], 16))
+            index += 4
+        elif nxt in "01234567":
+            digits = re.match(r"[0-7]{1,3}", text[index + 1 :]).group(0)
+            out.append(int(digits, 8) & 0xFF)
+            index += 1 + len(digits)
+        else:
+            out.append(_ESCAPES.get(nxt, ord(nxt)))
+            index += 2
+    return bytes(out)
 
 
 def origin_findings(trace: Path, site: Path) -> tuple[list[str], int]:
-    """Code files with a guarded segment outside site-packages, and how many release files ran."""
-    violations: list[str] = []
-    loaded = 0
+    """Code files with a guarded segment outside site-packages, and how many release files ran.
+
+    The trace comes from ``strace -f -y``: a successful open carries the opened file's resolved
+    path as ``= fd</path>`` (on the completed or the resumed line), so relative paths and
+    directory descriptors need no reconstruction and failed or unfinished calls never count. An
+    exec counts only once it returned 0; a relative exec path stays relative and so cannot
+    prove that it came from the release.
+    """
     if not trace.exists():
         return ["trace missing"], 0
     site_real = os.path.realpath(site)
     seen: set[str] = set()
-    for line in trace.read_text(errors="replace").splitlines():
-        match = _TRACE_LINE.search(line)
-        if not match or re.search(r"\) = -1 ", line):
+    events: list[tuple[str, bool]] = []
+    pending: dict[str, str] = {}
+    for line in trace.read_text(
+        encoding="utf-8", errors="surrogateescape"
+    ).splitlines():
+        opened = _OPEN_DONE.search(line)
+        if opened:
+            events.append(
+                (
+                    opened.group(1) if opened.group(1) is not None else opened.group(2),
+                    False,
+                )
+            )
             continue
-        call, raw = match.group(1), match.group(2)
-        path = (
-            os.path.realpath(raw.encode().decode("unicode_escape", errors="replace"))
-            if "\\" in raw
-            else os.path.realpath(raw)
-        )
+        call = _EXEC_CALL.match(line)
+        if call:
+            pid, _, base, raw = call.groups()
+            path = raw if base is None or raw.startswith("/") else base + "/" + raw
+            if line.rstrip().endswith(") = 0"):
+                events.append((path, True))
+            elif "<unfinished ...>" in line:
+                pending[pid] = path
+            continue
+        resumed = _EXEC_RESUMED.match(line)
+        if resumed and resumed.group(1) in pending:
+            events.append((pending.pop(resumed.group(1)), True))
+    violations: list[str] = []
+    loaded = 0
+    for raw, executed in events:
+        path = os.path.normpath(os.fsdecode(strace_bytes(raw)))
         if path in seen:
             continue
         seen.add(path)
-        is_code = call.startswith("execve") or path.endswith(CODE_SUFFIXES)
-        if not is_code:
+        if not (executed or path.endswith(CODE_SUFFIXES)):
             continue
-        segments = Path(path).parts
-        if not any(segment in GUARDED_SEGMENTS for segment in segments):
+        if not any(segment in GUARDED_SEGMENTS for segment in Path(path).parts):
             continue
-        if path.startswith(site_real + os.sep):
+        if os.path.isabs(path) and path.startswith(site_real + os.sep):
             loaded += 1
         else:
             violations.append(path)
@@ -1120,8 +1213,9 @@ def run_row(
             "-qq",
             "-s",
             "4096",
+            "-y",
             "-e",
-            "trace=open,openat,execve,execveat",
+            "trace=open,openat,openat2,execve,execveat",
             "-o",
             str(trace),
             "--",
@@ -1131,13 +1225,14 @@ def run_row(
     started_utc = now_utc()
     timed_out = False
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit - row argv from the kit's rows.json, no shell
             run_argv,
             check=False,
             env=env,
             cwd=cwd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=probe.get("timeout", 180),
             stdin=subprocess.DEVNULL,
         )
@@ -1225,6 +1320,33 @@ def run_row(
     return receipt
 
 
+def crash_receipt(
+    row: dict[str, Any], phase: str, version: str, out: Path, exc: Exception
+) -> dict[str, Any]:
+    receipt = {
+        "schema": RECEIPT_SCHEMA,
+        "row": row["id"],
+        "class": row["class"],
+        "kind": row["kind"],
+        "probe": row["probe"],
+        "mocks": [],
+        "phase": phase,
+        "version": version,
+        "status": "fail",
+        "failures": [f"runner error: {type(exc).__name__}: {exc}"[:500]],
+        "exit_code": None,
+        "started_utc": now_utc(),
+        "duration_s": 0.0,
+        "origin": {"method": "none", "note": "row did not complete"},
+        "stdout_tail": "",
+        "stderr_tail": "",
+    }
+    dest = out / "receipts" / phase / f"{row['id']}.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(receipt, indent=1, ensure_ascii=False) + "\n")
+    return receipt
+
+
 def run_phase(
     data: dict[str, Any],
     names: dict[str, str],
@@ -1264,16 +1386,19 @@ def run_phase(
         for row in data["rows"]:
             if only and row["id"] not in only and row["probe"] not in only:
                 continue
-            receipt = run_row(
-                row,
-                data["probes"][row["probe"]],
-                local,
-                phase,
-                version,
-                out,
-                use_strace,
-                site,
-            )
+            try:
+                receipt = run_row(
+                    row,
+                    data["probes"][row["probe"]],
+                    local,
+                    phase,
+                    version,
+                    out,
+                    use_strace,
+                    site,
+                )
+            except Exception as exc:  # noqa: BLE001 - a row that crashes the runner is a failed row, never a missing one
+                receipt = crash_receipt(row, phase, version, out, exc)
             mark = "PASS" if receipt["status"] == "pass" else "FAIL"
             log(
                 f"{phase} {row['id']} {row['probe']} {mark} {receipt['duration_s']}s"
@@ -1319,49 +1444,88 @@ def seed_world(names: dict[str, str]) -> None:
 # Isolation and orchestration
 # ---------------------------------------------------------------------------------------------
 
-HIDDEN_ROOTS = ("/home", "/tmp", "/var/tmp", "/opt", "/srv", "/mnt", "/media")
+SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc")
+PRIVATE_ROOTS = ("/tmp", "/var/tmp", "/run")
 
 
 def bwrap_usable() -> bool:
     if shutil.which("bwrap") is None:
         return False
-    probe = subprocess.run(
-        ["bwrap", "--dev-bind", "/", "/", "--unshare-net", "--", "/bin/true"],
+    probe = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        [
+            "bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-net",
+            "--",
+            "/bin/true",
+        ],  # fixed argv, no shell
         check=False,
         capture_output=True,
     )
     return probe.returncode == 0
 
 
-def bwrap_prefix(workdir: Path, base_python: str) -> list[str]:
-    """A private network namespace (own loopback, no route out) and empty /home, /tmp and friends.
+def interpreter_roots(base_python: str) -> list[str]:
+    """Directories the selected base interpreter needs: its executable's directory and its prefixes."""
+    script = "import os, sys; print(os.path.realpath(sys.base_prefix)); print(os.path.realpath(sys.base_exec_prefix))"
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        [
+            base_python,
+            "-I",
+            "-c",
+            script,
+        ],  # the operator-selected interpreter, no shell
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    roots = {str(Path(os.path.realpath(base_python)).parent), *result.stdout.split()}
+    return sorted(roots)
 
-    Only the kit, the workdir and the base interpreter's installation are bound back, so no
-    checkout elsewhere on the machine is even visible to a row.
+
+def bwrap_prefix(workdir: Path, roots: list[str]) -> list[str]:
+    """An allowlisted sandbox: the host is not bound, only what a row needs.
+
+    Read-only: the system directories (``SYSTEM_ROOTS``), the kit and the base interpreter's
+    installation. Writable: the work directory alone. Private: ``/proc`` (own PID namespace),
+    a minimal ``/dev``, empty ``/tmp``, ``/var/tmp`` and ``/run``, its own network namespace
+    (loopback only) and IPC namespace. No home directory, host socket or other checkout is
+    reachable from a row.
     """
     argv = [
         "bwrap",
-        "--dev-bind",
-        "/",
-        "/",
         "--unshare-net",
         "--unshare-pid",
-        "--proc",
-        "/proc",
+        "--unshare-ipc",
         "--die-with-parent",
     ]
-    for root in HIDDEN_ROOTS:
-        if Path(root).is_dir() and not Path(root).is_symlink():
-            argv += ["--tmpfs", root]
-    keep = {str(workdir): "--bind", str(KIT): "--ro-bind"}
-    real = Path(os.path.realpath(base_python))
-    for item in (
-        real.parent,
-        Path(os.path.realpath(sys.base_prefix)),
-        Path(os.path.realpath(sys.base_exec_prefix)),
-    ):
-        keep.setdefault(str(item), "--ro-bind")
+    argv += ["--proc", "/proc", "--dev", "/dev"]
+    for root in SYSTEM_ROOTS:
+        path = Path(root)
+        if path.is_symlink():
+            argv += ["--symlink", os.readlink(root), root]
+        elif path.is_dir():
+            argv += ["--ro-bind", root, root]
+    for root in PRIVATE_ROOTS:
+        argv += ["--tmpfs", root]
+    keep = {
+        str(KIT): "--ro-bind",
+        **dict.fromkeys(roots, "--ro-bind"),
+        str(workdir): "--bind",
+    }
+    covered = [
+        root
+        for root in SYSTEM_ROOTS
+        if Path(root).is_dir() and not Path(root).is_symlink()
+    ]
     for path, flag in sorted(keep.items(), key=lambda item: len(item[0])):
+        if flag == "--ro-bind" and any(
+            path == root or path.startswith(root + "/") for root in covered
+        ):
+            continue
         argv += [flag, path, path]
     return [*argv, "--"]
 
@@ -1456,22 +1620,47 @@ def run_isolated_phase(
     for item in only:
         argv += ["--only", item]
     if isolation == "bwrap":
-        argv = bwrap_prefix(workdir, names["base_py"]) + argv
+        argv = bwrap_prefix(workdir, names["interpreter_roots"]) + argv
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "LANG": "C.UTF-8",
         "HOME": names["home"],
     }
-    result = subprocess.run(argv, check=False, env=env, cwd=workdir)
-    if result.returncode not in (0, 1):
-        raise DrillError(f"phase {phase} runner exited {result.returncode}")
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        argv, check=False, env=env, cwd=workdir
+    )
     receipts_dir = workdir / "out" / "receipts" / phase
     receipts = [
         json.loads(path.read_text()) for path in sorted(receipts_dir.glob("*.json"))
     ]
-    if not receipts:
-        raise DrillError(f"phase {phase} wrote no receipts")
+    expected = selected_rows(load_rows(KIT / "rows.json"), set(only))
+    got = sorted(receipt["row"] for receipt in receipts)
+    if got != sorted(expected):
+        missing = sorted(set(expected) - set(got))
+        raise DrillError(
+            f"phase {phase} runner exited {result.returncode} with {len(got)} of {len(expected)} receipts (missing {missing[:10]})"
+        )
+    wrong = [
+        r["row"] for r in receipts if r["phase"] != phase or r["version"] != version
+    ]
+    if wrong:
+        raise DrillError(
+            f"phase {phase} receipts name another phase or version: {wrong[:10]}"
+        )
+    failed = any(receipt["status"] != "pass" for receipt in receipts)
+    if result.returncode != (1 if failed else 0):
+        raise DrillError(
+            f"phase {phase} runner exited {result.returncode}, inconsistent with its receipts"
+        )
     return receipts
+
+
+def selected_rows(data: dict[str, Any], only: set[str]) -> list[str]:
+    return [
+        row["id"]
+        for row in data["rows"]
+        if not only or row["id"] in only or row["probe"] in only
+    ]
 
 
 def phase_main(args: argparse.Namespace) -> int:
@@ -1714,6 +1903,7 @@ def main(argv: list[str] | None = None) -> int:
             "fixtures": str(paths["world"] / "fixtures"),
             "strace": "1" if use_strace else "0",
             "isolation": isolation,
+            "interpreter_roots": interpreter_roots(base_py),
         }
         (out / "names.json").write_text(json.dumps(names, indent=1))
         seed_world(names)

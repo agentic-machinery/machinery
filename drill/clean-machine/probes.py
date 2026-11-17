@@ -39,6 +39,7 @@ def run(
     timeout: int = 120,
     stdin: str | None = None,
 ) -> subprocess.CompletedProcess:
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit (argv list, no shell)
     return subprocess.run(
         argv,
         check=False,
@@ -64,6 +65,7 @@ def scratch() -> Path:
 
 
 def resource(relative: str) -> str:
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     return str(files("lu_machinery").joinpath(relative))
@@ -217,6 +219,7 @@ def scheduled_backup(args: list[str]) -> tuple[bool, dict]:
 @probe("agent-deploy")
 def agent_deploy(args: list[str]) -> tuple[bool, dict]:
     """Deploy release agent resources into a consumer, verify with --check, optionally run a hook."""
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     root = clone_product("deploy-consumer")
@@ -664,6 +667,8 @@ def shipped_units(_: list[str]) -> tuple[bool, dict]:
     """Every unit the release ships names a module or resource the release itself provides."""
     import importlib.util
     import re
+
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     units = sorted(
@@ -708,6 +713,12 @@ def cli_help(_: list[str]) -> tuple[bool, dict]:
     return not failed, {"checked": len(commands), "failed": failed}
 
 
+PRODUCT_IMPORT_SCRIPT = (
+    "import sys, json, drill_product_pkg; print(json.dumps({'root': str(drill_product_pkg.ROOT), 'machinery': "
+    + "sorted({m.__file__ for n, m in sys.modules.items() if n.startswith('lu_machinery') and getattr(m, '__file__', None)})}))"
+)
+
+
 @probe("product-import")
 def product_import(_: list[str]) -> tuple[bool, dict]:
     """A product package imports the release in-process; every machinery module comes from the venv."""
@@ -726,10 +737,7 @@ def product_import(_: list[str]) -> tuple[bool, dict]:
         [
             PY,
             "-c",
-            (
-                "import sys, json, drill_product_pkg; print(json.dumps({'root': str(drill_product_pkg.ROOT), "
-                "'machinery': sorted({m.__file__ for n, m in sys.modules.items() if n.startswith('lu_machinery') and getattr(m, '__file__', None)})}))"
-            ),
+            PRODUCT_IMPORT_SCRIPT,
         ],
         cwd=str(scratch()),
     )
@@ -756,6 +764,7 @@ def product_import(_: list[str]) -> tuple[bool, dict]:
 @probe("skill-cli")
 def skill_cli(_: list[str]) -> tuple[bool, dict]:
     """One fleet CLI (plane status) and one shipped skill file, both from the release."""
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     status = module("lu_machinery.fleet_comms", "plane-status", cwd=product())
@@ -952,6 +961,7 @@ def api(_: list[str]) -> tuple[bool, dict]:
         "sys.argv[1:1] = ['--log-config', str(machinery_path('api/logging.json'))]; uvicorn.main()"
     )
     log = (scratch() / "api.log").open("w")
+    # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit (fixed argv, no shell)
     server = subprocess.Popen(
         [
             PY,
@@ -971,6 +981,7 @@ def api(_: list[str]) -> tuple[bool, dict]:
 
     def get(path: str, timeout: float = 20.0) -> tuple[int, bytes]:
         try:
+            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected (loopback URL on the port this probe bound)
             with urllib.request.urlopen(base + path, timeout=timeout) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
@@ -985,6 +996,7 @@ def api(_: list[str]) -> tuple[bool, dict]:
             status, _ = get("/api/health", timeout=2)
             if status == 200:
                 break
+            # nosemgrep: python.lang.best-practice.arbitrary-sleep (bounded readiness poll of the server it started)
             time.sleep(0.5)
         if status != 200:
             return False, {
@@ -1092,6 +1104,8 @@ def stand_in_venv(_: list[str]) -> tuple[bool, dict]:
 def no_launcher_for_copy(_: list[str]) -> tuple[bool, dict]:
     """Backup copies stay unlaunched: nothing the release ships or deploys names a .bak file."""
     import re
+
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     hits = []
@@ -1108,6 +1122,7 @@ def no_launcher_for_copy(_: list[str]) -> tuple[bool, dict]:
 @probe("retired-unit")
 def retired_unit(_: list[str]) -> tuple[bool, dict]:
     """A retired unit stays retired: the release ships no unit file for the worktree reaper."""
+    # nosemgrep: python.lang.compatibility.python37-compatibility-importlib2 (the kit requires Python 3.12+)
     from importlib.resources import files
 
     units = [

@@ -19,11 +19,14 @@ No real secret and no private data is used anywhere.
 - `strace`. Each row runs under it, and any machinery code loaded from outside the installed
   release fails the row. `--no-strace` skips this check, and the receipts then say the origin
   was not checked.
-- `bwrap` (bubblewrap), recommended. It runs the rows in a private network namespace with empty
-  `/home`, `/tmp`, `/var/tmp`, `/opt`, `/srv`, `/mnt` and `/media`, so a row can reach no network
-  and no other checkout on the machine. Without it, ports 8765 and 8766 must be free and the kit
-  must not sit inside a machinery checkout.
+- `bwrap` (bubblewrap), recommended. Each row then runs in a sandbox that binds nothing of the
+  host except the system directories (`/usr`, `/etc` and the `/bin`, `/lib` links) read-only, the
+  kit and the Python installation read-only, and the work directory read-write. `/tmp`,
+  `/var/tmp` and `/run` are empty, the network namespace has only loopback, and home directories,
+  host sockets and other checkouts are not visible. Without bwrap, ports 8765 and 8766 must be
+  free and the kit must not sit inside a machinery checkout.
 - Network access to github.com (release downloads) and pypi.org (dependencies) during setup only.
+  pip ignores every pip configuration file on the machine and uses only pypi.org.
 - About 1 GB of free disk space while it runs, under 1 GB of memory, and 10 to 15 minutes.
 
 On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bubblewrap`.

@@ -160,27 +160,37 @@ def test_receipt_records_pass_fail_version_and_timing(tmp_path, drill):
     assert bad["failures"] == ["stdout lacks /answer 42/"]
 
 
+def _escaped(path: Path) -> str:
+    """Spell a path the way strace prints it: non-ASCII bytes as octal escapes."""
+    return "".join(
+        f"\\{byte:03o}" if byte > 127 else chr(byte) for byte in str(path).encode()
+    )
+
+
 def test_origin_oracle_flags_machinery_code_outside_the_release(tmp_path, drill):
     """Defect class: accidental dependence, a checkout or copy of machinery code loaded instead
-    of the installed release, passing the drill unnoticed."""
-    site = tmp_path / "venv" / "site-packages"
+    of the installed release, passing the drill unnoticed; or a failed open counted as a load."""
+    site = tmp_path / "тест" / "site-packages"
     (site / "lu_machinery").mkdir(parents=True)
     checkout = tmp_path / "checkout" / "lu_machinery"
     checkout.mkdir(parents=True)
+    hook = tmp_path / "checkout" / "agents_extensions" / "hook.sh"
+    init = site / "lu_machinery" / "__init__.py"
     trace = tmp_path / "trace"
     trace.write_text(
-        f'10 openat(AT_FDCWD, "{site}/lu_machinery/__init__.py", O_RDONLY|O_CLOEXEC) = 3\n'
-        f'10 openat(AT_FDCWD, "{checkout}/dispatch.py", O_RDONLY|O_CLOEXEC) = 4\n'
-        f'10 openat(AT_FDCWD, "{checkout}/missing.py", O_RDONLY) = -1 ENOENT (No such file or directory)\n'
-        f'11 execve("{tmp_path}/checkout/agents_extensions/hook.sh", ["hook.sh"], 0x0 /* 3 vars */) = 0\n'
-        f'10 openat(AT_FDCWD, "{tmp_path}/product/state.json", O_RDONLY) = 5\n'
+        f'10 openat(AT_FDCWD<{tmp_path}>, "{_escaped(init)}", O_RDONLY|O_CLOEXEC) = 3<{_escaped(init)}>\n'
+        f'10 openat(7<{checkout}>, "dispatch.py", O_RDONLY|O_CLOEXEC) = 4<{checkout}/dispatch.py>\n'
+        f'10 openat(AT_FDCWD<{tmp_path}>, "{site}/lu_machinery/gone.py", O_RDONLY <unfinished ...>\n'
+        "10 <... openat resumed>) = -1 ENOENT (No such file or directory)\n"
+        f'10 openat(AT_FDCWD<{tmp_path}>, "{checkout}/missing.py", O_RDONLY) = -1 ENOENT (No such file or directory)\n'
+        f'11 execve("{hook}", ["hook.sh"], 0x0 /* 3 vars */ <unfinished ...>\n'
+        "11 <... execve resumed>) = 0\n"
+        f'12 execve("{checkout}/never.sh", ["never.sh"], 0x0 /* 3 vars */) = -1 ENOENT (No such file or directory)\n'
+        f'10 openat(AT_FDCWD<{tmp_path}>, "state.json", O_RDONLY) = 5<{tmp_path}/product/state.json>\n'
     )
     violations, loaded = drill.origin_findings(trace, site)
     assert loaded == 1
-    assert violations == [
-        str(checkout / "dispatch.py"),
-        str(tmp_path / "checkout" / "agents_extensions" / "hook.sh"),
-    ]
+    assert violations == [str(checkout / "dispatch.py"), str(hook)]
 
 
 HOST_PATTERNS = {
