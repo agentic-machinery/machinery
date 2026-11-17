@@ -5,7 +5,9 @@ Defect class: a plain GET against a checkout that has ``origin/main`` and no
 an artifacts page, returned HTTP 500 (#722, releases 0.1.27 and 0.1.28). The
 clean-machine drill's API probe and ``verify_run`` are what request these
 routes on a release. This test requests that same set through the app's test
-client, on a fixture, with no network and no live service.
+client, on a fixture, with no network and no live service. TCP connects,
+including loopback, are refused for the fixture's lifetime, so a handler
+cannot reach Alertmanager, the live Monitor, or the sources port.
 
 The drill's set is every OpenAPI path that has a GET and no ``{``.
 ``verify_run`` adds the page URLs and the concrete route-contract paths. A
@@ -15,9 +17,11 @@ in the set, because that is what ``verify_run`` calls.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -125,6 +129,61 @@ def _offline_bin(directory: Path) -> None:
         script.chmod(0o755)
 
 
+# Ports the handlers open themselves: Alertmanager, the live Monitor, Sources.
+# The suite's socket guard allows loopback, so this fixture refuses it too.
+_OFFLINE_PORTS = (9093, 8765, 8766)
+
+
+class _OfflineSockets:
+    """Refuse TCP connects for the fixture's lifetime. Unix sockets still work.
+
+    The route handlers stay the real ones. A refused connect is the offline
+    result they already return (unreachable, probe skipped, port closed).
+    """
+
+    def __init__(self) -> None:
+        self.attempted: set[int] = set()
+        self.completed: list[object] = []
+        self._connect = socket.socket.connect
+        self._connect_ex = socket.socket.connect_ex
+        self._create = socket.create_connection
+
+    def install(self) -> None:
+        socket.socket.connect = self._refuse_connect  # type: ignore[method-assign]
+        socket.socket.connect_ex = self._refuse_connect_ex  # type: ignore[method-assign]
+        socket.create_connection = self._refuse_create  # type: ignore[method-assign]
+
+    def restore(self) -> None:
+        socket.socket.connect = self._connect  # type: ignore[method-assign]
+        socket.socket.connect_ex = self._connect_ex  # type: ignore[method-assign]
+        socket.create_connection = self._create  # type: ignore[method-assign]
+
+    def _note(self, address: object) -> None:
+        if isinstance(address, tuple) and len(address) >= 2 and isinstance(address[1], int):
+            self.attempted.add(address[1])
+
+    def _unix(self, sock: socket.socket, address: object) -> bool:
+        if isinstance(address, (str, bytes)) or address is None:
+            return True
+        return getattr(sock, "family", None) == getattr(socket, "AF_UNIX", None)
+
+    def _refuse_connect(self, sock: socket.socket, address: object) -> object:
+        if self._unix(sock, address):
+            return self._connect(sock, address)
+        self._note(address)
+        raise OSError(errno.ECONNREFUSED, "offline fixture refused the connection")
+
+    def _refuse_connect_ex(self, sock: socket.socket, address: object) -> int:
+        if self._unix(sock, address):
+            return self._connect_ex(sock, address)
+        self._note(address)
+        return errno.ECONNREFUSED
+
+    def _refuse_create(self, address: object, *_args: object, **_kwargs: object) -> socket.socket:
+        self._note(address)
+        raise OSError(errno.ECONNREFUSED, "offline fixture refused the connection")
+
+
 def _parameter_free_gets(app: FastAPI) -> list[str]:
     document = app.openapi()
     paths = document.get("paths") if isinstance(document, dict) else None
@@ -183,8 +242,11 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
     }
     previous_env = {key: os.environ.get(key) for key in offline}
     os.environ.update(offline)
+    sockets = _OfflineSockets()
+    sockets.install()
     previous_health: dict[str, object] | None = None
     previous_snapshot: str | None = None
+    ran = False
     try:
         app = create_app(fixture_context(repo), lifespan=_no_lifespan, product=ProductContribution())
         with epics_router._REGISTRY_HEALTH_LOCK:
@@ -197,8 +259,15 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
             ctx=app.state.ctx,
         )
         with TestClient(app, raise_server_exceptions=False) as client:
-            yield client, repo
+            ran = True
+            yield client, repo, sockets
     finally:
+        sockets.restore()
+        missing = sorted(set(_OFFLINE_PORTS) - sockets.attempted)
+        if ran and (missing or sockets.completed):
+            raise AssertionError(
+                f"offline sockets missed ports {missing}; completed {sockets.completed}"
+            )
         reset_local_document_cache()
         reset_workers_payload_cache()
         if previous_health is not None:
@@ -215,13 +284,13 @@ def fresh_client(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Tes
 
 def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
     route: str,
-    fresh_client: tuple[TestClient, Path],
+    fresh_client: tuple[TestClient, Path, _OfflineSockets],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defect class: plain GET 500 on a never-fetched checkout or a missing artifacts page (#722)."""
     if route in _SKIPS:
         pytest.skip(_SKIPS[route])
-    client, repo = fresh_client
+    client, repo, sockets = fresh_client
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(repo))
     monkeypatch.setenv("LEARN_UKRAINIAN_BATCH_STATE_DIR", str(repo / "batch_state"))
@@ -238,3 +307,4 @@ def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
     _hold_audit_cooldown(repo)
     response = client.get(route)
     assert response.status_code < 500, f"{route} -> HTTP {response.status_code}"
+    assert not sockets.completed, f"{route} opened a connection: {sockets.completed}"
