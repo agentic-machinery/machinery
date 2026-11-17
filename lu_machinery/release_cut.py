@@ -544,7 +544,17 @@ class Cut:
         self.step = "wheelhouse"
         house = self.work / "wheelhouse"
         house.mkdir()
-        lock = self.work / "src/requirements-machinery.lock"
+        # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
+        # group, with every hash (ci-gate.yml's dependency-audit and installed-wheel jobs export the
+        # same). --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
+        # required-version refuses any other uv release.
+        uv = shutil.which("uv")
+        if uv is None:
+            raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
+        lock = self.work / "runtime-requirements.txt"
+        exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
+                             "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
+        lock.write_text(exported, encoding="utf-8")
         self.run([self.host_python, "-I", "-m", "pip", "download", "--no-cache-dir", "--disable-pip-version-check",
                   "--no-input", "--require-hashes", "--only-binary=:all:", "--no-deps", "--dest", house,
                   "--requirement", lock])

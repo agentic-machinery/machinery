@@ -7,8 +7,8 @@
 
 ### 2. Use Python venv
 **ALWAYS** `.venv/bin/python`, **NEVER** `python3` or `python` directly.
-- pyenv Python 3.12.15 with `--enable-loadable-sqlite-extensions`
-- Recreate: `rm -rf .venv && ~/.pyenv/versions/3.12.15/bin/python -m venv .venv`
+- uv-managed CPython at the version in the checkout's `.python-version`; its SQLite loads extensions
+- Recreate: `rm -rf .venv && uv venv --managed-python --python "$(cat .python-version)" .venv`, then install the checkout's locked dependencies
 
 ### 3. Language Settings
 **English**: all technical work. **Ukrainian**: curriculum content only.
