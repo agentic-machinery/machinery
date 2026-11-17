@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -175,20 +176,31 @@ _ALERT_NAMES = frozenset({
 
 
 ALERT_SUMMARY_MAX_CHARS = 200
+# A rule template may interpolate any label of its alert, so the summary is shown only when
+# every label value it contains is one of these vetted, public ones (stripped before the prose
+# check) and the rest is plain prose: no path, address, assignment or other label value.
+_SUMMARY_VETTED_LABELS = frozenset({"pool", "route", "owner_lane", "stack"})
+_SUMMARY_LABEL_VALUE = re.compile(r"[A-Za-z0-9:._/-]{1,80}")
+_SUMMARY_PROSE = re.compile(r"[A-Za-z0-9 .,;:()%'+-]*")
 
 
 def _alert_summary(annotations: dict, labels: dict) -> str | None:
     """The rule's own one-line summary, or None when it is not plainly safe to show.
 
-    Only a single printable line is admitted, one the OPSEC scanner finds nothing in
-    and that does not echo the alert's host or scrape-target labels. The caller offers
-    it for allow-listed rule names only, whose templates are ours.
+    The caller offers it for allow-listed rule names only, whose templates are ours.
     """
     value = annotations.get("summary")
     if not isinstance(value, str) or not 0 < len(value) <= ALERT_SUMMARY_MAX_CHARS or not value.isprintable():
         return None
-    targets = [labels[key] for key in ("instance", "job") if isinstance(labels.get(key), str) and labels[key]]
-    if any(target in value for target in targets) or scan_text(value, canaries=targets):
+    prose, others = value, []
+    for key, label in labels.items():
+        if key in {"alertname", "severity"} or not isinstance(label, str) or not label:
+            continue
+        if key in _SUMMARY_VETTED_LABELS and _SUMMARY_LABEL_VALUE.fullmatch(label) and ".." not in label:
+            prose = prose.replace(label, "")
+        else:
+            others.append(label)
+    if any(other in value for other in others) or not _SUMMARY_PROSE.fullmatch(prose) or scan_text(value):
         return None
     return value
 

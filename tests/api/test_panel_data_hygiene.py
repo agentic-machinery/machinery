@@ -230,18 +230,23 @@ def test_panel_known_probe_reasons_remain_typed_codes(panel_client, monkeypatch)
 
 
 @pytest.mark.parametrize("summary", ("/home/synthetic-private/data.json", "account@example.invalid", "192.0.2.17",
-                                     "line one\nline two", "X" * 4096, "down at fixture-host.invalid:9100"))
+                                     "line one\nline two", "X" * 4096, "down at fixture-host.invalid:9100",
+                                     "Disk /etc/synthetic-private/config is almost full", "api_key=synthetic-secret-123456",
+                                     "Disk on /mnt/synthetic-private/data is almost full"))
 def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_client, monkeypatch, summary):
-    """Defect class: a rule template echoes a path, address, scrape target or multi-line text through the public alert summary."""
+    """Defect class: a rule template echoes a path, address, assignment or label value through the public alert summary."""
     client, _ctx = panel_client
-    raw = [{"labels": {"alertname": "PROpenOver60m", "severity": "warning", "instance": "fixture-host.invalid:9100"},
+    raw = [{"labels": {"alertname": "DiskAlmostFull", "severity": "warning", "instance": "fixture-host.invalid:9100",
+                       "mountpoint": "/mnt/synthetic-private/data", "route": "/api/fixture"},
             "annotations": {"summary": summary}, "startsAt": STAMP, "status": {"state": "active"}}]
     connection = SimpleNamespace(request=lambda *_args, **_kwargs: None, close=lambda: None,
                                  getresponse=lambda: SimpleNamespace(status=200, read=lambda _limit: json.dumps(raw).encode()))
     monkeypatch.setattr(ops_router.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
     state_helpers.cache_invalidate()
     row = client.get("/api/ops/v1/alerts").json()["alerts"][0]
-    assert row["alertname"] == "PROpenOver60m" and row["summary"] is None
-    raw[0]["annotations"]["summary"] = "An unowned PR has had no activity for over 60 minutes"
-    state_helpers.cache_invalidate()
-    assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == raw[0]["annotations"]["summary"]
+    assert row["alertname"] == "DiskAlmostFull" and row["summary"] is None
+    # Plain prose and a vetted label's own value (here the route) still show.
+    for shown in ("Monitor API route /api/fixture p95 latency is above 1s", "A disk is almost full."):
+        raw[0]["annotations"]["summary"] = shown
+        state_helpers.cache_invalidate()
+        assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == shown

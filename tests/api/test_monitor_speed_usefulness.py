@@ -482,6 +482,14 @@ for (const [age, heading, row] of [[51, /fresh · source age 51s · bound 900s/,
 assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text, /· fresh · source age 27s · bound 60s$/);
 assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text, /· freshness unknown · source age unknown · bound unknown$/);
 assert.match(line({data: null, age: null, snapshot: false}).text, /· unavailable · source age unknown/);
+// A failed collection stamped with the attempt time stays unavailable; its age does not make it healthy.
+assert.match(line({url: '/api/ops/v1/alerts', age: 0, bound: 60, state: 'unavailable',
+  data: {status: 'unknown', reason_code: 'alertmanager_unreachable', observed_at: new Date(now).toISOString(), stale_after_s: 60}}).text, /· unavailable · source age 0s/);
+// One account with no reading keeps the aggregate from reading fresh, as its row says NO READING.
+const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51),
+  {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
+assert.match(line({url: '/api/runtime/subscriptions', data: partial}).text, /· STALE · source age 51s · bound 900s$/);
+assert.match(subscriptionRows(partial, null).groups, /NO READING/);
 // Alerts carry their own bound in the body.
 const observed = new Date(now - 5000).toISOString();
 assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);
@@ -489,7 +497,7 @@ assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: 
 
 
 def test_home_alerts_show_their_summary_and_keep_same_named_alerts_apart():
-    """Defect class: alerts of one rule collapse into a single anonymous row because the summary that tells them apart is dropped."""
+    """Defect class: the rule's summary is folded into the title's generic key list, or unescaped, instead of shown as its own line."""
     code = _script("index.html", "function escapeHtml", "// ---- Summary chips ----")
     _node(_DOM + code + r"""
 const pool = (name, extra = {}) => ({alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning',

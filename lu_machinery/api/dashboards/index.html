@@ -727,13 +727,21 @@ const finiteAge = value => typeof value === "number" && Number.isFinite(value) &
 // by the same readingState() the rows use.
 function rowsFreshness(rows, bound) {
   const ages = rows.map(row => finiteAge(row.age)).filter(age => age !== null);
-  const flag = rows.some(row => row.state === "stale") ? "stale" : rows.some(row => row.state === "last_good") ? "last_good"
-    : ages.length ? "fresh" : null;
+  // A row with no usable reading (missing, unknown) is not fresh, so it cannot leave the heading fresh.
+  const flag = rows.some(row => row.state !== "fresh" && row.state !== "last_good") ? "stale"
+    : rows.some(row => row.state === "last_good") ? "last_good" : ages.length ? "fresh" : null;
   return {age: ages.length ? Math.max(...ages) : null, bound, flag};
 }
 
 // Where each panel source keeps its own age. Returns null when the payload has none.
 function payloadFreshness(url, data, receivedAt) {
+  const own = payloadAge(url, data, receivedAt);
+  // A timestamp of the attempt does not make a failed collection usable: availability is the payload's own status.
+  const failed = typeof data.status === "string" && data.status !== "ok" && data.status !== "partial";
+  return own && {...own, unavailable: failed};
+}
+
+function payloadAge(url, data, receivedAt) {
   const since = value => {
     const moment = toDate(value);
     return moment ? Math.max(0, (receivedAt - moment.getTime()) / 1000) : null;
@@ -764,14 +772,14 @@ function freshnessOf(reading) {
   if (!reading || !reading.data) return {age: null, bound: null, flag: null, unavailable: true};
   const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
   const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
-  if (own && own.age !== null) return {...own, bound: own.bound ?? headerBound, unavailable: false};
+  if (own && own.age !== null) return {...own, bound: own.bound ?? headerBound};
   const flag = reading.state === "stale" ? "stale" : null;
   return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
 }
 
 // fresh | stale | last_good | unknown | unavailable; `elapsed` is the time since the reading was received.
 function freshnessState(fresh, elapsed = 0) {
-  if (fresh.unavailable && fresh.age === null) return "unavailable";
+  if (fresh.unavailable) return "unavailable";
   if (fresh.flag === "stale") return "stale";
   const age = fresh.age === null ? null : fresh.age + elapsed;
   if (age !== null && fresh.bound !== null && age > fresh.bound) return "stale";
