@@ -105,6 +105,7 @@ from importlib.metadata import version as distribution_version
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import (
     machinery_path,
     machinery_root,
@@ -122,6 +123,9 @@ from .deepseek import DEEPSEEK_OPENCODE_MODEL_ROUTES, DeepSeekAdapter
 from .glm import assert_glm_egress_allowed
 
 _logger = logging.getLogger(__name__)
+
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 
 # Env var gating the transport. ``shadow`` is the comparison path; ``active``
 # is accepted only inside the controller-owned context below. Unset, ``off``,
@@ -354,8 +358,8 @@ def _normalize_grok_sealed_result(result: object, *, tool_name: str) -> object:
     if not isinstance(serialized, str):
         return result
     try:
-        decoded = json.loads(serialized)
-    except json.JSONDecodeError:
+        decoded = json_depth.loads(serialized, max_depth=_JSON_MAX_DEPTH)
+    except (json.JSONDecodeError, RecursionError):
         return result
     return decoded if isinstance(decoded, dict) else result
 
@@ -380,8 +384,8 @@ def _validate_sealed_review_mcp_config(raw: object, *, adapter_label: str) -> st
     ):
         raise AcpxShadowRefusalError(f"{adapter_label}: sealed review MCP config ownership/mode/size is unsafe")
     try:
-        config = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        config = json_depth.loads(payload, max_depth=_JSON_MAX_DEPTH)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise AcpxShadowRefusalError(f"{adapter_label}: sealed review MCP config is malformed") from exc
     if not isinstance(config, dict) or set(config) != {"mcpServers"}:
         raise AcpxShadowRefusalError(f"{adapter_label}: sealed review MCP config has unsupported keys")
@@ -459,14 +463,14 @@ def _claude_sealed_review_max_turns(config_path: str) -> int:
     smaller-chunk recovery without enabling retries at the prompt layer.
     """
     try:
-        config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        config = json_depth.loads(Path(config_path).read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         server = config["mcpServers"][0]
         server_args = server["args"]
         change_evidence_only = len(server_args) == 5 and server_args[4] == "change-evidence-only"
         snapshot = Path(server_args[3]).resolve(strict=True)
-        manifest = json.loads((snapshot / ".review-bundle" / "manifest.json").read_text(encoding="utf-8"))
+        manifest = json_depth.loads((snapshot / ".review-bundle" / "manifest.json").read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         changed_paths = manifest["changed_paths"]
-    except (IndexError, KeyError, OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (IndexError, KeyError, OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise AcpxShadowRefusalError(
             "AcpxClaudeShadowAdapter: sealed review evidence manifest is invalid",
             failure_code="acp_review_evidence_invalid",
@@ -1009,7 +1013,7 @@ def node_prefix() -> Path:
         return _NODE_PREFIX
     contract = _node_contract()
     lock_digest = hashlib.sha256((contract / "package-lock.json").read_bytes()).hexdigest()
-    release = json.loads((contract / "package.json").read_bytes())["version"]
+    release = json_depth.loads((contract / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)["version"]
     if (
         contract == Path(sys.prefix) / "share" / "lu-machinery" / "node-contract"
         and release != distribution_version("lu-machinery")
@@ -1185,7 +1189,7 @@ def _check_node_peer_providers(prefix: Path, packages: Mapping[str, Any], host_o
         if not location or not (prefix / location).exists():
             # Validation has already refused an absent package that applies to this host.
             continue
-        manifest = json.loads((prefix / location / "package.json").read_bytes())
+        manifest = json_depth.loads((prefix / location / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
         declared: set[str] = set()
         for source in (package, manifest):
             for field in ("peerDependencies", "peerDependenciesMeta"):
@@ -1217,8 +1221,8 @@ def validate_node_dependencies() -> Path:
         modules = prefix / "node_modules"
         _check_node_artifact(modules, directory=True)
         _check_node_artifact(prefix / "archives", directory=True)
-        lock = json.loads((prefix / "package-lock.json").read_bytes())
-        direct = json.loads((prefix / "package.json").read_bytes())["dependencies"]
+        lock = json_depth.loads((prefix / "package-lock.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
+        direct = json_depth.loads((prefix / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)["dependencies"]
         host_os, host_cpu = _node_host_target()
         expected: set[Path] = set()
         for location, package in lock["packages"].items():
@@ -1238,11 +1242,11 @@ def validate_node_dependencies() -> Path:
                 expected.add(target)
                 if _node_file_digest(target, _node_file_signature(target)) != expected_digest:
                     raise AcpxShadowRefusalError(f"Node dependency integrity mismatch: {target}", failure_code="acp_adapter_incompatible")
-            manifest = json.loads((root / "package.json").read_bytes())
+            manifest = json_depth.loads((root / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
             if manifest.get("version") != package["version"]:
                 raise AcpxShadowRefusalError(f"Node dependency version mismatch: {location}")
         for name, required in direct.items():
-            if json.loads((modules / name / "package.json").read_bytes()).get("version") != required:
+            if json_depth.loads((modules / name / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH).get("version") != required:
                 raise AcpxShadowRefusalError(f"Incompatible Node dependency: {name}")
         _check_node_peer_providers(prefix, lock["packages"], host_os, host_cpu)
         for path in modules.rglob("*"):
@@ -1255,7 +1259,7 @@ def validate_node_dependencies() -> Path:
             elif path not in expected and path != modules / ".package-lock.json":
                 raise AcpxShadowRefusalError(f"Unexpected Node dependency artifact: {path}")
         return prefix
-    except (OSError, ValueError, KeyError, tarfile.TarError) as exc:
+    except (OSError, ValueError, KeyError, RecursionError, tarfile.TarError) as exc:
         raise AcpxShadowRefusalError(
             f"Machinery Node dependency admission refused: {exc}; "
             "run the Node dependency install and seal commands in docs/release.md",
@@ -1307,7 +1311,7 @@ def seal_node_dependencies(*, cache: Path) -> Path:
         return validate_node_dependencies()
     cache = cache.resolve(strict=True)
     archives.mkdir(mode=0o755)
-    lock = json.loads((prefix / "package-lock.json").read_bytes())
+    lock = json_depth.loads((prefix / "package-lock.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
     for location, package in lock["packages"].items():
         if not location or not (prefix / location).exists():
             continue
@@ -1330,7 +1334,7 @@ def _required_node_major(*, adapter_label: str = "ACPX") -> int:
         if not raw.isdigit():
             raise ValueError("expected an integer Node major")
         return int(raw)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise AcpxShadowRefusalError(
             f"{adapter_label}: cannot read machinery Node major: {exc}; "
             "run the Node dependency install and seal commands in docs/release.md"
@@ -1750,7 +1754,7 @@ def _node_adapter_command(participant: str) -> str:
     package = prefix / "node_modules" / "@agentclientprotocol" / f"{participant}-agent-acp"
     if participant == "codex":
         package = prefix / "node_modules" / "@agentclientprotocol" / "codex-acp"
-    manifest = json.loads((package / "package.json").read_bytes())
+    manifest = json_depth.loads((package / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
     executable = package / manifest["bin"]["codex-acp" if participant == "codex" else "claude-agent-acp"]
     if not executable.resolve(strict=True).is_relative_to(package):
         raise AcpxShadowRefusalError("ACP adapter escapes its locked package")
@@ -1853,8 +1857,8 @@ def _require_local_claude_acp_adapter(
     )
 
     try:
-        manifest = json.loads(manifest_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        manifest = json_depth.loads(manifest_bytes, max_depth=_JSON_MAX_DEPTH)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise AcpxShadowRefusalError(
             f"{adapter_label}: project-local {_CLAUDE_ACP_PACKAGE} manifest is malformed",
             failure_code="acp_adapter_incompatible",
@@ -2683,8 +2687,8 @@ def _claude_session_transcript_version(stdout: str) -> str | None:
     session_id = None
     for line in jsonl_lines(stdout):
         try:
-            message = json.loads(line)
-        except ValueError:
+            message = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (ValueError, RecursionError):
             continue
         result = message.get("result") if isinstance(message, dict) else None
         if isinstance(result, dict) and isinstance(result.get("sessionId"), str):
@@ -2701,8 +2705,8 @@ def _claude_session_transcript_version(stdout: str) -> str | None:
                     if not raw:
                         break
                     try:
-                        entry = json.loads(raw)
-                    except ValueError:
+                        entry = json_depth.loads(raw, max_depth=_JSON_MAX_DEPTH)
+                    except (ValueError, RecursionError):
                         continue
                     if isinstance(entry, dict) and isinstance(entry.get("version"), str):
                         return entry["version"]
@@ -3424,8 +3428,8 @@ class AcpxAdapter:
         events: list[dict[str, Any]] = []
         for index, line in enumerate(lines):
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
+                event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+            except (json.JSONDecodeError, RecursionError) as exc:
                 return self._closed(f"malformed NDJSON at line {index + 1}: {exc}", stderr)
             if not isinstance(event, dict) or not ({"method", "result", "error"} & event.keys()):
                 return self._closed(f"unrecognized NDJSON schema at line {index + 1}", stderr)
@@ -3500,8 +3504,8 @@ class AcpxAdapter:
                     if raw_input is not None:
                         if isinstance(raw_input, str):
                             try:
-                                raw_input = json.loads(raw_input)
-                            except json.JSONDecodeError:
+                                raw_input = json_depth.loads(raw_input, max_depth=_JSON_MAX_DEPTH)
+                            except (json.JSONDecodeError, RecursionError):
                                 raw_input = {"_raw": raw_input}
                         record["arguments"] = raw_input if isinstance(raw_input, dict) else {"_raw": raw_input}
                     status = update.get("status")

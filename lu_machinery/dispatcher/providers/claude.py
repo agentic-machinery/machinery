@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
@@ -40,6 +41,8 @@ _READ_TOOLS = "Read,Grep,Glob,LS,WebFetch,WebSearch,Bash"
 # server annotates read-only are allowed, so authors, judges and fixers can check their own words; the
 # ones that persist fetched entries (sources_read_only.sources_tool_sets) are denied by name.
 _SOURCES_SERVER = SOURCES_SERVER
+# Deepest JSON this module reads (json_depth): free-form provider output.
+_JSON_MAX_DEPTH = 512
 _WRITE_TOOLS = "Bash,Read,Edit,Write,Grep,Glob,LS,WebFetch,WebSearch"
 _READ_DENIES = (
     "Edit,Write,NotebookEdit,Bash(git push *),Bash(git commit *),Bash(git merge *),"
@@ -97,10 +100,10 @@ def managed_policy(env: Mapping[str, str]) -> str | None:
         return f"managed policy in /etc/claude-code is {state}"
     config = Path(env.get("CLAUDE_CONFIG_DIR") or Path(env.get("HOME") or Path.home()) / ".claude")
     try:
-        cached = json.loads((config / "remote-settings.json").read_text(encoding="utf-8"))
+        cached = json_depth.loads((config / "remote-settings.json").read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError:
         cached = {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return "the server-managed settings cache cannot be read"
     if cached != {}:
         return "the server-managed settings cache holds a policy"
@@ -125,7 +128,7 @@ def _sources_mcp_config(mode: str) -> str:
         server = {"type": "stdio", "command": command, "args": args}
     else:
         try:
-            servers = json.loads((product_root() / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
+            servers = json_depth.loads((product_root() / ".mcp.json").read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)["mcpServers"]
         except FileNotFoundError:
             servers = {}
         server = servers.get(_SOURCES_SERVER)
@@ -175,8 +178,8 @@ def executor_failure(spec: TaskSpec, stdout: str) -> tuple[str | None, str | Non
     approved, result = model_id(spec.model), {}
     for line in jsonl_lines(stdout):
         try:
-            event = json.loads(line)
-        except ValueError:
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (ValueError, RecursionError):
             continue
         if isinstance(event, dict) and event.get("type") == "result":
             result = event
@@ -276,8 +279,8 @@ def parse(
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
-        except ValueError:
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (ValueError, RecursionError):
             error = "claude: invalid JSON stream"
             stream_clean = False
             continue

@@ -1286,6 +1286,22 @@ def test_parse_response_malformed_line_fails_closed():
     assert "malformed NDJSON" in result.stderr_excerpt
 
 
+def test_parse_response_too_deep_line_fails_closed_with_the_depth_refusal():
+    """Defect class: a bare json.loads accepts a 600-deep NDJSON line (CPython 3.12 and 3.14 alike)."""
+    deep_line = '{"jsonrpc":"2.0","method":"session/update","params":' + "[" * 599 + "]" * 599 + "}"
+    assert json.loads(deep_line)["method"] == "session/update"  # valid JSON: only its depth is refused
+    adapter = AcpxAdapter()
+    result = adapter.parse_response(
+        stdout=_MALFORMED_LINE_NDJSON.splitlines(keepends=True)[0] + deep_line + "\n",
+        stderr="",
+        returncode=0,
+        output_file=None,
+    )
+    assert result.ok is False
+    assert result.response == ""
+    assert result.stderr_excerpt.startswith("malformed NDJSON at line 2: JSON nesting exceeds 512 levels")
+
+
 def test_parse_response_unrecognized_schema_fails_closed():
     adapter = AcpxAdapter()
     result = adapter.parse_response(
