@@ -1668,6 +1668,25 @@
           ".cursor/skills/thread-rollover/references/resume.md"
         ]
       }
+    },
+    "skills/verify/SKILL.md": {
+      "mode": 420,
+      "owner": "fleet",
+      "targets": {
+        "agy": [
+          ".agent/skills/verify/SKILL.md",
+          ".agents/skills/verify/SKILL.md"
+        ],
+        "claude": [
+          ".claude/skills/verify/SKILL.md"
+        ],
+        "codex": [
+          ".agents/skills/verify/SKILL.md"
+        ],
+        "cursor": [
+          ".cursor/skills/verify/SKILL.md"
+        ]
+      }
     }
   },
   "provider_replacements": {

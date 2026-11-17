@@ -49,11 +49,16 @@ _TARGET_NAME = "learn-ukrainian-loopback.target"
 
 
 class VerifyFailure(Exception):
-    """One check could not be set up. ``detail`` is safe to put in the receipt."""
+    """One check could not be set up. ``detail`` is safe to put in the receipt.
 
-    def __init__(self, detail: str) -> None:
+    ``check`` is the measured check when the failure is itself a request, so the
+    receipt keeps that target, status, and elapsed time.
+    """
+
+    def __init__(self, detail: str, *, check: dict[str, Any] | None = None) -> None:
         super().__init__(detail)
         self.detail = detail
+        self.check = check
 
 
 def select_api_targets(
@@ -251,14 +256,21 @@ def discover_api_paths(
     )
     ok, detail = _judge(status, elapsed, detail, budget=budget)
     if not ok or status != 200:
-        raise VerifyFailure(detail or "openapi.json did not answer")
+        reason = detail or "openapi.json did not answer"
+        raise VerifyFailure(reason, check=_openapi_check(status, elapsed, reason))
     try:
         document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise VerifyFailure("openapi.json was not JSON") from exc
+        raise VerifyFailure(
+            "openapi.json was not JSON",
+            check=_openapi_check(status, elapsed, "openapi.json was not JSON"),
+        ) from exc
     paths = document.get("paths") if isinstance(document, dict) else None
     if not isinstance(paths, dict):
-        raise VerifyFailure("openapi.json has no paths")
+        raise VerifyFailure(
+            "openapi.json has no paths",
+            check=_openapi_check(status, elapsed, "openapi.json has no paths"),
+        )
     gets = [
         path for path, item in paths.items() if isinstance(item, dict) and "get" in item
     ]
@@ -507,10 +519,15 @@ def _area(name: str, checks: list[dict[str, Any]], **extra: Any) -> dict[str, An
     return body
 
 
-def _failed_area(name: str, detail: str, **extra: Any) -> dict[str, Any]:
-    return _area(
-        name, [_check(name, ok=False, status=None, elapsed=0.0, detail=detail)], **extra
-    )
+def _openapi_check(status: int | None, elapsed: float, detail: str) -> dict[str, Any]:
+    return _check("/openapi.json", ok=False, status=status, elapsed=elapsed, detail=detail)
+
+
+def _failed_area(
+    name: str, detail: str, *, check: dict[str, Any] | None = None, **extra: Any
+) -> dict[str, Any]:
+    item = check or _check(name, ok=False, status=None, elapsed=0.0, detail=detail)
+    return _area(name, [item], **extra)
 
 
 def build_receipt(areas: list[dict[str, Any]]) -> dict[str, Any]:
@@ -549,7 +566,9 @@ def run(
                 )
             except VerifyFailure as exc:
                 results.append(
-                    _failed_area("api", exc.detail, base_url=base_url, budget_s=budget)
+                    _failed_area(
+                        "api", exc.detail, check=exc.check, base_url=base_url, budget_s=budget
+                    )
                 )
         elif area == "sources":
             try:
