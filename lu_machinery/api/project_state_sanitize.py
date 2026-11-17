@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
@@ -139,8 +140,12 @@ def validate_report_document(document: dict[str, Any]) -> None:
         sha = primary.get(key)
         if not isinstance(sha, str) or not _FULL_SHA_RE.fullmatch(sha):
             raise ProjectStateValidationError(f"invalid {key}")
-    age = primary.get("origin_main_age_s")
-    if not isinstance(age, (int, float)) or age < 0:
+    # null: the checkout was never fetched, so the age of origin/main is unknown. The key
+    # stays required, and a non-finite number (an older reporter's inf) cannot be served as JSON.
+    if "origin_main_age_s" not in primary:
+        raise ProjectStateValidationError("invalid origin_main_age_s")
+    age = primary["origin_main_age_s"]
+    if age is not None and (not isinstance(age, (int, float)) or not math.isfinite(age) or age < 0):
         raise ProjectStateValidationError("invalid origin_main_age_s")
     for key in ("ahead", "behind", "dirty_count"):
         val = primary.get(key)

@@ -70,7 +70,8 @@ under `~/.codex/project-state-reporter/logs/`.
   unknown`).
 - `origin_main_age_s` comes from local `refs/remotes/origin/main` plus
   `FETCH_HEAD` mtime; values above **3600** seconds degrade every drift verdict
-  to `unknown` and add a `stale_upstream` attention item.
+  to `unknown` and add a `stale_upstream` attention item. A checkout that was
+  never fetched has no `FETCH_HEAD`: its age is `null` and counts as stale.
 - Per service: `state != running` ⇒ drift `unknown`; sibling `work` repo ⇒
   `not_applicable`; release mode compares `serving_sha` to `origin_main_sha`;
   checkout mode compares `checkout_sha` and reports `checkout` as its
