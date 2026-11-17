@@ -77,8 +77,9 @@ def _first_too_deep(text: str, start: int, max_depth: int) -> int | None:
     # At most one bracket per level can be open, so a short text cannot be too deep.
     if text.count("[", start) + text.count("{", start) <= max_depth:
         return None
-    # A long text is usually shallow: confirm that at C speed before the per-match scan.
-    view = _structure_depth(text, start)
+    # A long text is usually shallow: confirm that at C speed before the per-match scan. A
+    # negative start slices from the end but the scan clamps it to 0, so it skips the view.
+    view = _structure_depth(text, start) if start >= 0 else None
     if view is not None and view <= max_depth:
         return None
     depth = 0
