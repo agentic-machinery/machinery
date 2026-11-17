@@ -13,7 +13,10 @@
 # - Jobs: Ruff over lu_machinery/ with the source repository's Ruff version and
 #   lint settings (the extracted tree has no Ruff configuration yet); compileall
 #   of lu_machinery on Python 3.12; the mypy ratchet (lu_machinery.lint.mypy_ratchet:
-#   new errors fail, the baseline only shrinks); actionlint (with a pinned ShellCheck) and zizmor (offline) over
+#   new errors fail, the baseline only shrinks); the test-wait lint L4
+#   (lu_machinery.lint.lint_test_waits: a new sleep, timer poll, flaky or rerun
+#   mark, rerun option, or non-strict xfail fails, and the baseline only shrinks);
+#   actionlint (with a pinned ShellCheck) and zizmor (offline) over
 #   .github/workflows/; the TruffleHog secret scan and the Semgrep SAST scan;
 #   dependency-audit (pip-audit of requirements-machinery.lock, npm audit of
 #   package-lock.json). The secret-scan and sast jobs below are the only
@@ -28,7 +31,8 @@
 #   merge_group, unmatched push and workflow_dispatch. pull_request calls that workflow
 #   as pr-affected and does not run the full suite.
 # - The mypy job imports lu_machinery from the checkout: it runs the ratchet
-#   module. installed-wheel imports only the installed wheel.
+#   module. The test-wait job does the same for lu_machinery.lint.lint_test_waits.
+#   installed-wheel imports only the installed wheel.
 # - Every job counts its targets first and fails on zero, because the tools
 #   exit 0 on an empty or missing target. Each job prints what it inspected.
 # - CI Gate needs every other job, runs even when one of them fails, and passes
@@ -608,6 +612,65 @@ jobs:
           # the checkout, so it does not run isolated (-I).
           LEARN_UKRAINIAN_PYTHON="$venv/bin/python" \
             env -u PYTHONPATH -u MYPYPATH "$venv/bin/python" -m lu_machinery.lint.mypy_ratchet
+
+  test-waits:
+    needs: [main-proof]
+    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
+    name: Test wait lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The shrink check reads the baseline at HEAD^ as well as HEAD and
+          # origin/main, and skips a ref it cannot read.
+          fetch-depth: 2
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: false
+
+      - name: Fetch origin/main for the shrink check
+        run: |
+          set -euo pipefail
+          # No --depth: on a push to main the checkout is the main tip, and a
+          # depth-1 fetch of it would move the shallow boundary to HEAD and
+          # drop HEAD^. The introducing PR has no baseline on origin/main yet;
+          # the lint skips the shrink check until that blob exists.
+          git fetch --no-tags --no-recurse-submodules origin \
+            +refs/heads/main:refs/remotes/origin/main
+          for ref in HEAD HEAD^ origin/main; do
+            if ! git rev-parse --verify --quiet "${ref}^{commit}" > /dev/null; then
+              echo "::error::${ref} is not available; the baseline shrink check would be skipped"
+              exit 1
+            fi
+          done
+          if git cat-file -e "origin/main:lu_machinery/lint/test_waits_baseline.json"; then
+            echo "origin/main has the test-wait baseline; growth against it fails."
+          else
+            echo "origin/main has no test-wait baseline yet; this landing freezes the census."
+          fi
+
+      - name: Run test-wait lint L4
+        run: |
+          set -euo pipefail
+          if [ ! -f lu_machinery/lint/lint_test_waits.py ]; then
+            echo "::error::lu_machinery/lint/lint_test_waits.py is missing; the lint would not run"
+            exit 1
+          fi
+          if [ ! -f lu_machinery/lint/test_waits_baseline.json ]; then
+            echo "::error::lu_machinery/lint/test_waits_baseline.json is missing; nothing would be compared"
+            exit 1
+          fi
+          python_files="$(find tests -type f -name '*.py' | wc -l)"
+          echo "The lint checks tests/, which holds ${python_files} Python file(s)."
+          if [ "$python_files" -eq 0 ]; then
+            echo "::error::tests/ holds no Python files; the lint would check nothing"
+            exit 1
+          fi
+          python -m lu_machinery.lint.lint_test_waits
 
   actionlint:
     needs: [main-proof]
@@ -1880,7 +1943,7 @@ jobs:
     # always(): a job skipped because a dependency failed would otherwise count
     # as a passing required check.
     if: always()
-    needs: [main-proof, ruff, compileall, mypy, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
+    needs: [main-proof, ruff, compileall, mypy, test-waits, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1900,7 +1963,7 @@ jobs:
           # results all fail this gate. A matched push requires only main-proof;
           # it has already checked the run/tree and preserved main-scope archives.
           optional=()
-          common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan verified-trailer zizmor)
+          common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan test-waits verified-trailer zizmor)
           case "$EVENT_NAME" in
             pull_request)
               must_succeed=(pr-affected "${common[@]}")
@@ -1909,7 +1972,7 @@ jobs:
             push)
               if [ "$REUSE" = true ]; then
                 must_succeed=(main-proof secret-scan verified-trailer)
-                must_skip=(pytest pr-affected actionlint compileall dependency-audit installed-wheel mypy ruff sast zizmor)
+                must_skip=(pytest pr-affected actionlint compileall dependency-audit installed-wheel mypy ruff sast test-waits zizmor)
               else
                 must_succeed=(pytest "${common[@]}")
                 must_skip=(pr-affected)

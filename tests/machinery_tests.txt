@@ -701,6 +701,7 @@ tests/publish/test_merge_queue_keeper_untrusted_text.py
 tests/lint/test_boundary_ratchet.py
 tests/lint/test_lint_fleet_roster.py
 tests/lint/test_lint_prompts.py
+tests/lint/test_lint_test_waits.py
 tests/lint/test_mypy_ratchet.py
 tests/lint/test_orchestrator_track_sparse_worktree.py
 tests/opsec/test_gh_snapshot.py
