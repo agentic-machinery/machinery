@@ -38,6 +38,15 @@
           }
         }
       }
+    },
+    "external_recipients": {
+      "description": "Agents outside the launcher fleet whose Fleet Comms inbox an external bridge drains; recipient admission only, never launcher slots.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      }
     }
   }
 }

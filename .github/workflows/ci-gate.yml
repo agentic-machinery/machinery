@@ -1605,6 +1605,80 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/installed-wheel"
 
+  # X-Verified in observe mode. The CI Gate job has no checkout, so this check
+  # is its own required job. Observe logs a missing line and does not fail.
+  verified-trailer:
+    name: Verified trailer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          check-latest: false
+
+      - name: Install the declaration parser (hash-pinned wheels)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          venv="$RUNNER_TEMP/verified-trailer-venv"
+          rm -rf "$venv"
+          python -I -m venv "$venv"
+          requirements="$RUNNER_TEMP/verified-trailer-requirements.txt"
+          cat > "$requirements" <<'REQUIREMENTS'
+          markdown-it-py==4.2.0 \
+              --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+          mdurl==0.1.2 \
+              --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+          REQUIREMENTS
+          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
+            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+
+      - name: Check the verification line
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
+          HEAD_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ZERO_SHA: "0000000000000000000000000000000000000000"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          py="$RUNNER_TEMP/verified-trailer-venv/bin/python"
+          "$py" -c 'import lu_machinery.ci.check_agent_attribution as checker; raise SystemExit(0 if checker.DEFAULT_VERIFIED_MODE == "observe" else 1)'
+          case "$EVENT_NAME" in
+            pull_request)
+              mode=(--pr)
+              ;;
+            merge_group)
+              mode=(--merge-group)
+              ;;
+            push)
+              if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "$ZERO_SHA" ]; then
+                echo "verified-trailer: push has no prior SHA; nothing to check"
+                exit 0
+              fi
+              mode=(--pr)
+              ;;
+            workflow_dispatch)
+              "$py" -m lu_machinery.ci.check_agent_attribution --verified-mode observe --verified-report HEAD~20..HEAD
+              exit 0
+              ;;
+            *)
+              echo "::error::Unsupported event ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+            echo "::error::Missing base or head SHA for the verification line in ${EVENT_NAME}"
+            exit 1
+          fi
+          "$py" -m lu_machinery.ci.check_agent_attribution --verified-mode observe "${mode[@]}" "$BASE_SHA" "$HEAD_SHA"
+
   # Full six-shard suite. Skipped on pull_request; CI Gate then requires that
   # skip, and requires pr-affected instead. A skip on merge_group fails the gate.
   pytest:
@@ -1628,7 +1702,7 @@ jobs:
     # always(): a job skipped because a dependency failed would otherwise count
     # as a passing required check.
     if: always()
-    needs: [ruff, compileall, mypy, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, pytest, pr-affected]
+    needs: [ruff, compileall, mypy, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -1644,7 +1718,7 @@ jobs:
           # suite and must succeed; pr-affected must be skipped. On pull_request
           # the reverse holds. Failed, cancelled, skipped and missing required
           # results all fail this gate.
-          common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan zizmor)
+          common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan verified-trailer zizmor)
           case "$EVENT_NAME" in
             pull_request)
               must_succeed=(pr-affected "${common[@]}")

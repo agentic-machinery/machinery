@@ -406,9 +406,11 @@ review alone.** If the frozen target touches any user-visible surface (a CLI
 flag, an HTTP endpoint, UI, or a generated artifact like deployed skill
 mirrors or built docs), drive it exactly as a source-blind user would and
 record what you actually observed — not what the diff implies should
-happen. There is no repo-wide "verify" skill or tool that does this for
-you generically; do not invoke or reference one that doesn't exist. Use
-whatever real, product-specific surface applies:
+happen. For the Monitor API, the Sources server, and the pinned host units,
+run `.venv/bin/python -m lu_machinery.ops.verify_run --area api`, `--area sources`,
+or `--area host`, as mapped in `agents_extensions/shared/skills/verify/SKILL.md`,
+and record the receipt. For every other surface, use whatever real,
+product-specific surface applies:
 
 Record each surface through the canonical closeout state; do not hand-author
 `--behavior-proof-json`. This binds the proof to the frozen target and derives

@@ -19,7 +19,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -61,7 +61,7 @@ from .agent_monitor_router import router as agent_monitor_router
 from .cluster_router import router as cluster_router
 from .codexbar_usage import scheduler_status, start_periodic_refresh, stop_periodic_refresh
 from .comms_prometheus import CommsCollector
-from .comms_router import ensure_broker_db_ready, warm_panel_metrics
+from .comms_router import ensure_broker_db_ready, refresh_panel_metrics_periodically, warm_panel_metrics
 from .comms_router import router as comms_router
 from .coordination_router import router as coordination_router
 from .delegate_router import router as delegate_router
@@ -103,7 +103,7 @@ from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
 from .session_streams_router import router as session_streams_router
-from .state_helpers import cache_get, cache_invalidate, cache_set, ctx_cache_scope
+from .state_helpers import cache_get, cache_get_stored, cache_invalidate, cache_set, ctx_cache_scope
 from .state_router import router as state_router
 from .state_router import schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -134,6 +134,8 @@ async def _lifespan(_app: FastAPI):
     ctx = _app.state.ctx
     product: ProductContribution = _app.state.product
     projection_refresh_task = None
+    panel_refresh_task = None
+    orient_refresh_task = None
     try:
         # Reuse assert_component_supported; do not add a second allow-list.
         # ControlPlaneUnsupportedComponentError names the store and authority
@@ -165,9 +167,19 @@ async def _lifespan(_app: FastAPI):
         projection_refresh_task = asyncio.create_task(
             refresh_projection_cache_periodically(ctx), name="work-projection-refresh"
         )
+        panel_refresh_task = asyncio.create_task(refresh_panel_metrics_periodically(ctx), name="comms-metrics-refresh")
+        orient_refresh_task = asyncio.create_task(refresh_orient_periodically(ctx, product), name="orient-refresh")
         start_periodic_refresh()
         yield
     finally:
+        if orient_refresh_task is not None:
+            orient_refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await orient_refresh_task
+        if panel_refresh_task is not None:
+            panel_refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await panel_refresh_task
         if projection_refresh_task is not None:
             projection_refresh_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -407,9 +419,11 @@ _ORIENT_SYNC_EXECUTOR = ThreadPoolExecutor(
 # same request; a live hang returns fallback immediately after this wait.
 DETACHED_ORIENT_SECTION_KEYS: frozenset[str] = frozenset({"capacity", "health", "delegate", "rollovers"})
 DETACHED_ORIENT_INLINE_WAIT_S = 0.4
+ORIENT_REFRESH_INTERVAL_S = 10.0
+_orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
-_detached_orient_last_good: dict[str, tuple[Any, str]] = {}
+_detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
 _detached_orient_last_error: dict[str, str] = {}
 
 # The idle-PR feed is deliberately cache-first. A live GitHub request is run by
@@ -794,7 +808,9 @@ def reset_detached_orient_state_for_tests() -> None:
     _detached_orient_last_error.clear()
 
 
-def _schedule_detached_orient_refresh(key: str, collector: Callable[[], Any], cache_key: str | None = None) -> bool:
+def _schedule_detached_orient_refresh(
+    key: str, collector: Callable[[], Any], cache_key: str | None = None, *, ttl: float | None = None,
+) -> bool:
     """Start a single-flight worker for ``key``. Return True if this call started it."""
     with _detached_orient_lock:
         state_key = cache_key or f"orient_{key}"
@@ -803,7 +819,7 @@ def _schedule_detached_orient_refresh(key: str, collector: Callable[[], Any], ca
             return False
         worker = threading.Thread(
             target=_run_detached_orient_refresh,
-            args=(key, collector, state_key),
+            args=(key, collector, state_key, ttl),
             daemon=True,
             name=f"orient-{key}-refresh",
         )
@@ -812,14 +828,16 @@ def _schedule_detached_orient_refresh(key: str, collector: Callable[[], Any], ca
         return True
 
 
-def _run_detached_orient_refresh(key: str, collector: Callable[[], Any], cache_key: str) -> None:
-    ttl = ORIENT_SECTION_TTLS.get(key, 60.0)
+def _run_detached_orient_refresh(
+    key: str, collector: Callable[[], Any], cache_key: str, ttl: float | None = None,
+) -> None:
+    ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     try:
         value = collector()
         generated_at = _isoformat_z(datetime.now(UTC))
         if ttl > 0:
             cache_set(cache_key, (value, generated_at))
-        _detached_orient_last_good[cache_key] = (value, generated_at)
+        _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
         _detached_orient_last_error.pop(cache_key, None)
     except Exception as exc:
         _detached_orient_last_error[cache_key] = str(exc)
@@ -831,6 +849,9 @@ async def _cached_detached_orient_section(
     fallback: Any,
     *,
     ctx: MonitorContext | None = None,
+    ttl: float | None = None,
+    source: str | None = None,
+    is_async: bool = False,
 ) -> tuple[Any, dict]:
     """Cache-first section: never let a hung collector pin the gather.
 
@@ -840,9 +861,12 @@ async def _cached_detached_orient_section(
     Overlapping requests and live hangs return last-good or fallback with
     honest ``meta.error``.
     """
-    ttl = ORIENT_SECTION_TTLS.get(key, 60.0)
-    source = ORIENT_SECTION_SOURCES.get(key, "fs")
-    collector = functools.partial(collector, ctx)
+    ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
+    source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
+
+    def compute() -> Any:
+        return asyncio.run(collector(ctx)) if is_async else collector(ctx)
+
     cache_key = f"orient_{key}{_ctx_cache_scope(ctx)}"
     if ttl > 0:
         cached = cache_get(cache_key, ttl=ttl)
@@ -855,7 +879,7 @@ async def _cached_detached_orient_section(
                 "cache": "hit",
             }
 
-    started = _schedule_detached_orient_refresh(key, collector, cache_key)
+    started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
     thread = _detached_orient_threads.get(cache_key)
     if started and thread is not None and thread.is_alive():
         loop = asyncio.get_running_loop()
@@ -878,13 +902,20 @@ async def _cached_detached_orient_section(
 
     last_good = _detached_orient_last_good.get(cache_key)
     if last_good is not None:
-        value, generated_at = last_good
+        value, generated_at, stored_at = last_good
+        age = _orient_clock() - stored_at
+        # Product sections may use their own TTL (including zero). Last-good
+        # is a bounded stale fallback, never another freshness window.
+        if age >= max(120.0, ttl * 2):
+            last_good = None
+    if last_good is not None:
+        value, generated_at, _stored_at = last_good
         meta: dict[str, Any] = {
             "generated_at": generated_at,
             "stale_after_s": ttl,
             "source": source,
             "cache": "miss",
-            "stale": True,
+            "stale": (thread is not None and thread.is_alive()) or cache_key in _detached_orient_last_error,
             "refreshing": thread is not None and thread.is_alive(),
         }
         last_error = _detached_orient_last_error.get(cache_key)
@@ -1337,6 +1368,7 @@ async def _cached_orient_section(
     ctx: MonitorContext | None = None,
     ttl: float | None = None,
     source: str | None = None,
+    background: bool = False,
 ) -> tuple[Any, dict]:
     """Run one orient collector with TTL cache + hard timeout + fallback.
 
@@ -1353,8 +1385,10 @@ async def _cached_orient_section(
     """
     if key == "idle_prs":
         return _cached_idle_pr_section(collector, fallback, ctx=ctx)  # type: ignore[arg-type]
-    if key in DETACHED_ORIENT_SECTION_KEYS:
-        return await _cached_detached_orient_section(key, collector, fallback, ctx=ctx)  # type: ignore[arg-type]
+    if background or key in DETACHED_ORIENT_SECTION_KEYS:
+        return await _cached_detached_orient_section(
+            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async,
+        )  # type: ignore[arg-type]
 
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
@@ -1494,6 +1528,37 @@ def _orient_section_specs(product: ProductContribution) -> dict[str, tuple[Calla
     }
 
 
+async def _collect_orient_sections(
+    ctx: MonitorContext, layout: OrientLayout, selected: Sequence[str],
+) -> list[tuple[Any, dict]]:
+    """Requests and the lifespan warmer share the same section collectors."""
+    return await asyncio.gather(*(
+        _cached_orient_section(
+            key, layout.specs[key][0], layout.specs[key][1], is_async=layout.specs[key][2], ctx=ctx,
+            ttl=layout.product[key].ttl_s if key in layout.product else None,
+            source=layout.product[key].source if key in layout.product else None,
+            background=key in layout.product,
+        )
+        for key in selected
+    ))
+
+
+async def refresh_orient_periodically(ctx: MonitorContext, product: ProductContribution) -> None:
+    """Keep section caches warm between infrequent agent polls, without stacking TTLs."""
+    while True:
+        try:
+            layout = _orient_layout(product)
+            # Warm expensive product scans at startup. Other sections are kept
+            # warm once used; an app nobody orients against must not start
+            # unsolicited GitHub or host-health probes.
+            selected = [key for key in layout.keys if key in layout.product or
+                        cache_get_stored(f"orient_{key}{_ctx_cache_scope(ctx)}") is not None]
+            await _collect_orient_sections(ctx, layout, selected)
+        except Exception:
+            logger.warning("Orient refresh failed", exc_info=True)
+        await asyncio.sleep(ORIENT_REFRESH_INTERVAL_S)
+
+
 def _cap_lean_orient(response: dict[str, Any]) -> dict[str, Any]:
     """Keep the lean preset inside the orientation byte bound.
 
@@ -1596,25 +1661,11 @@ async def orient(
 
     layout = _orient_layout(request.app.state.product)
     selected = _parse_orient_sections(sections, lean=lean, layout=layout)
-    section_specs = layout.specs
     # #7494: thread THIS app's context into every collector — the zero-arg
     # invocation made all 14 collectors fall back to production_context(),
     # defeating create_app() isolation (and rebuilding contexts per call).
     request_ctx = get_ctx(request)
-    gather_results = await asyncio.gather(
-        *[
-            _cached_orient_section(
-                key,
-                section_specs[key][0],
-                section_specs[key][1],
-                is_async=section_specs[key][2],
-                ctx=request_ctx,
-                ttl=layout.product[key].ttl_s if key in layout.product else None,
-                source=layout.product[key].source if key in layout.product else None,
-            )
-            for key in selected
-        ]
-    )
+    gather_results = await _collect_orient_sections(request_ctx, layout, selected)
 
     section_data: dict[str, Any] = {}
     section_metas: dict[str, dict[str, Any]] = {}

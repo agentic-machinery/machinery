@@ -221,6 +221,7 @@
  "agents_extensions/shared/skills/track-completion/scripts/bounded_completion.py": "product",
  "agents_extensions/shared/skills/track-completion/scripts/certification_evidence.py": "product",
  "agents_extensions/shared/skills/track-completion/scripts/track_completion.py": "product",
+ "agents_extensions/shared/skills/verify/SKILL.md": "machinery",
  "docs/best-practices/fleet-role-scorecard.md": "machinery",
  "docs/best-practices/fleet-shared-doctrine.md": "machinery",
  "docs/runbooks/acp-capability-refusals.md": "machinery",
