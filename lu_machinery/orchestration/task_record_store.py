@@ -268,11 +268,16 @@ def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Pat
     for directory in directories:
         try:
             with os.scandir(directory) as entries:
-                names = sorted(
-                    entry.name for entry in entries
-                    if entry.name.endswith(".json") and entry.is_file()
-                    and not entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
-                )
+                names = []
+                for entry in entries:
+                    if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
+                        continue
+                    try:
+                        if entry.is_file():
+                            names.append(entry.name)
+                    except OSError:
+                        continue  # one broken entry must not hide the other records
+                names.sort()
         except OSError:
             continue
         yield from (directory / name for name in names)

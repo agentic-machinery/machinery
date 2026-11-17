@@ -25,6 +25,7 @@ def test_task_record_cache_rereads_changed_records(tmp_path, monkeypatch):
     from lu_machinery.orchestration import task_record_store
 
     monkeypatch.setattr(task_store_paths, "_record_cache", OrderedDict())
+    monkeypatch.setattr(task_store_paths, "_record_cache_bytes", 0)
     path = tmp_path / "cached.json"
     path.write_text('{"schema_version":2,"task_id":"cached","status":"running"}')
     parsed = []
@@ -68,6 +69,17 @@ def test_task_record_cache_rereads_changed_records(tmp_path, monkeypatch):
     with pytest.raises(FileNotFoundError):
         task_store_paths.read_cached_task_record(path, tasks_dir=tmp_path)
 
+    # The same cache also releases retained content when its byte budget fills.
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text('{"schema_version":2,"task_id":"first","status":"done"}')
+    second.write_text('{"schema_version":2,"task_id":"second","status":"done"}')
+    monkeypatch.setattr(task_store_paths, "TASK_RECORD_CACHE_MAX_BYTES", second.stat().st_size)
+    assert task_store_paths.read_cached_task_record(first, tasks_dir=tmp_path)["task_id"] == "first"
+    assert task_store_paths.read_cached_task_record(second, tasks_dir=tmp_path)["task_id"] == "second"
+    assert list(task_store_paths._record_cache) == [str(second)]
+    assert task_store_paths._record_cache_bytes == second.stat().st_size
+
 
 def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path, monkeypatch):
     """Defect class: malformed records repeat retry sleeps on every projection."""
@@ -106,7 +118,7 @@ def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path,
     from lu_machinery.common import task_store_paths
 
     delegate_router._TASK_STATE_CACHE.pop(str(valid))
-    task_store_paths._record_cache.pop(str(valid))
+    task_store_paths._discard_cached_record(str(valid))
     failures = []
     original_open = task_store_paths.os.open
 

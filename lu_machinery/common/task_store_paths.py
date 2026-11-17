@@ -14,9 +14,19 @@ from lu_machinery.common.repo_root import state_root
 # Keep one version per path, including foreign-file classifications. The bound
 # covers the historical inventory without retaining an unbounded number of runs.
 TASK_RECORD_CACHE_MAX_ENTRIES = 65_536
+TASK_RECORD_CACHE_MAX_BYTES = 64 * 1024 * 1024
 _RecordStamp = tuple[int, int, int, int, int]
-_record_cache: OrderedDict[str, tuple[_RecordStamp, dict[str, Any] | None | ValueError]] = OrderedDict()
+_record_cache: OrderedDict[str, tuple[_RecordStamp, dict[str, Any] | None | ValueError, int]] = OrderedDict()
 _record_cache_lock = threading.Lock()
+_record_cache_bytes = 0
+
+
+def _discard_cached_record(key: str) -> None:
+    """Drop a version and its charged bytes; the caller holds the cache lock."""
+    global _record_cache_bytes
+    cached = _record_cache.pop(key, None)
+    if cached is not None:
+        _record_cache_bytes -= cached[2]
 
 
 def _record_stamp(info: os.stat_result) -> _RecordStamp:
@@ -39,9 +49,13 @@ def read_cached_task_record(
     Containment is checked here, beside the stat/open sinks, while ``path``
     retains the filename used by task-identity classification. Structural
     failures are memoized as ValueError messages; transient I/O stays retryable.
-    Optional byte limits apply to cached versions too; non-regular files are
+    The LRU bounds both entries and charged source bytes plus metadata; an
+    oversized entry is served without retention. Optional per-read byte limits
+    apply to cached versions too; non-regular files are
     refused, and nonblocking opens prevent a concurrent FIFO swap from hanging.
     """
+    global _record_cache_bytes
+
     from lu_machinery.orchestration.task_record_store import parse_task_record
 
     path = Path(os.path.abspath(path))
@@ -64,7 +78,7 @@ def read_cached_task_record(
             _record_cache.move_to_end(key)
         else:
             # Drop stale bytes before attempting a read, including failed reads.
-            _record_cache.pop(key, None)
+            _discard_cached_record(key)
             fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
             with os.fdopen(fd, "rb") as handle:
                 opened = os.fstat(handle.fileno())
@@ -84,9 +98,16 @@ def read_cached_task_record(
                 record = ValueError(str(exc))
             # Do not memoize a concurrent rewrite under the earlier stat key.
             if stamp == opened_stamp == finished_stamp:
-                _record_cache[key] = (stamp, record)
-                while len(_record_cache) > TASK_RECORD_CACHE_MAX_ENTRIES:
-                    _record_cache.popitem(last=False)
+                # Bound serialized content as well as the metadata entry count;
+                # parsed-object overhead is measured separately in the RSS proof.
+                cost = len(raw) if isinstance(record, dict) else len(str(record).encode("utf-8"))
+                if cost <= TASK_RECORD_CACHE_MAX_BYTES:
+                    _record_cache[key] = (stamp, record, cost)
+                    _record_cache_bytes += cost
+                    while (len(_record_cache) > TASK_RECORD_CACHE_MAX_ENTRIES
+                           or _record_cache_bytes > TASK_RECORD_CACHE_MAX_BYTES):
+                        _, evicted = _record_cache.popitem(last=False)
+                        _record_cache_bytes -= evicted[2]
         if isinstance(record, ValueError):
             raise ValueError(str(record))
         if record is not None and record.get("schema_version", 1) > 2 and not display_unknown_schema:
