@@ -12,6 +12,9 @@ from lu_machinery.review import closeout_cli
 from lu_machinery.review.capacity import review_capacity, review_capacity_action
 from lu_machinery.review.reviewer_resolver import ResolverInputs, resolve_reviewer
 from tests.claude_route_accounts import HOST_ACCOUNT
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 def snapshot(*, remaining=54, short=96, stale=False, **lane):
@@ -37,7 +40,7 @@ def snapshot(*, remaining=54, short=96, stale=False, **lane):
 
 
 def inputs(data):
-    return ResolverInputs(author_model="gpt-6.1-sol", risk="critical", language_lane=True, routing_snapshot=data, claude_account=HOST_ACCOUNT)
+    return ResolverInputs(author_model=CURRENT_SOL, risk="critical", language_lane=True, routing_snapshot=data, claude_account=HOST_ACCOUNT)
 
 
 def test_c6b_pace_only_selects_opus_without_attesting_missing_health():
@@ -175,7 +178,7 @@ def run_cli(tmp_path, capsys, *extra):
             str(tmp_path / "state.json"),
             "resolve-reviewer",
             "--author-model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "--risk",
             "critical",
             "--owned-path",
@@ -316,7 +319,7 @@ def test_sole_pace_only_reviewer_cannot_exceed_durable_reservation_limits(tmp_pa
                 authority_key=f"head-{index}",
                 idempotency_key=f"request-{index}",
                 initiator="codex",
-                author_model="gpt-6.1-sol",
+                author_model=CURRENT_SOL,
                 author_family="openai",
                 requested_role="formal-review",
                 requested_profile="code",
@@ -458,7 +461,7 @@ def test_unresolved_default_account_removes_only_claude_seats(tmp_path, capsys, 
     code, result = _claude_author_cli(tmp_path, capsys, data)
 
     assert code == 0
-    assert result["selected"]["concrete_model"] == "gpt-6.1-sol"
+    assert result["selected"]["concrete_model"] == CURRENT_SOL
     assert result["claude_account_unresolved"] == "claude_account_default_file_invalid"
     assert result["fail_closed_reason"] is None
     # The default-account output keys are untouched: no claude_account block.
@@ -474,7 +477,7 @@ def test_unbound_default_account_removes_only_claude_seats(tmp_path, capsys, mon
     code, result = _claude_author_cli(tmp_path, capsys, data)
 
     assert code == 0
-    assert result["selected"]["concrete_model"] == "gpt-6.1-sol"
+    assert result["selected"]["concrete_model"] == CURRENT_SOL
     assert result["claude_account_unresolved"] == "claude_account_binding_missing"
     assert "claude_account" not in result
 

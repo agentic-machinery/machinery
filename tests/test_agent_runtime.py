@@ -72,6 +72,9 @@ from lu_machinery.agent_runtime.watchdog import (
     stop_watchdog,
     tail_liveness_file_for_debug,
 )
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
 _TEST_PYTHON = project_python()
@@ -1154,7 +1157,7 @@ def test_invoke_refuses_catalog_retired_model_on_every_adapter(tmp_path, agent_n
         pytest.raises(
             ValueError,
             match=re.escape(
-                f"Agent {agent_name!r}: model {model!r} is retired in the model catalog ({model}); use gpt-6.1-sol"
+                f"Agent {agent_name!r}: model {model!r} is retired in the model catalog ({model}); use {CURRENT_SOL}"
             ),
         ),
     ):
@@ -1602,7 +1605,7 @@ def test_invoke_hard_timeout_recovers_from_session_file(tmp_path, monkeypatch):
 
     adapter = SimpleNamespace(
         name="codex",
-        default_model="gpt-6.1-sol",
+        default_model=CURRENT_SOL,
         supported_modes=frozenset({"read-only"}),
         resume_policy="never",
         build_invocation=lambda **kwargs: InvocationPlan(cmd=["fixture-provider"], cwd=tmp_path),

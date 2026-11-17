@@ -153,7 +153,7 @@ curl -s 'http://localhost:8765/api/state/routing-budget?fresh_codexbar=true' \
   > /tmp/routing-snapshot.json
 
 .venv/bin/python -m lu_machinery.review.closeout_cli --state-file "$STATE_FILE" resolve-reviewer \
-  --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.1-sol, grok-4.7>" \
+  --author-model "<the author's actual model/seat, e.g. claude-opus-5-5, gpt-6.2-sol, grok-4.7>" \
   --review-profile "<same profile as Step 2>" \
   --risk "<same risk as Step 2>" \
   --domain "<code|infra>" \
@@ -206,7 +206,7 @@ and you must supply better input before proceeding.
 
 Read the `selected` field for the formal, blocking reviewer. Read `advisory`
 for consult-only candidates — most notably `openai_frontier`: it always
-resolves to a concrete model (currently `gpt-6.1-sol`), and it is
+resolves to a concrete model (currently `gpt-6.2-sol`), and it is
 **advisory-only** when the author is OpenAI-family. An advisory verdict is
 useful input; it is never a substitute for the formal gate. `trace` shows
 every candidate walked and why it was excluded/selected/advisory — quote

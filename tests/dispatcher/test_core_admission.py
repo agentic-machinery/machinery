@@ -14,6 +14,9 @@ from lu_machinery.dispatcher import git, providers, store, worker
 from lu_machinery.dispatcher.types import Invocation, TaskSpec
 from tests.dispatcher.conftest import run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -670,14 +673,14 @@ def test_admission_refuses_off_allowlist_model_on_credit_balance_lane(admission_
     assert admission_dispatch.dispatch(model=model, mode="read-only") == 2
     err = capsys.readouterr().err
     assert "❌ dispatch refused: CREDIT_PERIOD_MODEL_REFUSED: lane codex is credit_balance_present" in err
-    assert f"model {model} is outside the credit-period allowlist [gpt-6.1-sol, gpt-6-luna]" in err
+    assert f"model {model} is outside the credit-period allowlist [{CURRENT_SOL}, gpt-6-luna]" in err
     assert "credit_lanes.yaml" in err
     assert not admission_dispatch.spawned
     assert not (admission_dispatch.box.repo / ".worktrees").exists()
     assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
 
 
-@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6-luna", "codex:gpt-6-luna", "GPT-6.1-Sol", None])
+@pytest.mark.parametrize("model", [CURRENT_SOL, "gpt-6-luna", "codex:gpt-6-luna", CURRENT_SOL.upper(), None])
 def test_admission_accepts_allowlisted_and_default_models_without_reading_state(monkeypatch, model):
     """Ported from tests/test_credit_lane.py::test_admission_accepts_allowlisted_and_default_models_without_reading_state."""
     from lu_machinery.dispatcher import host_admission as admission
@@ -685,6 +688,25 @@ def test_admission_accepts_allowlisted_and_default_models_without_reading_state(
 
     monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **_k: pytest.fail("must not read state"))
     assert admission.credit_period_refusal("codex", model) is None
+
+
+@pytest.mark.parametrize(
+    "model,effort,offered",
+    [("gpt-6.2-astra", "xhigh", "high"), ("gpt-6.2-astra", "medium", "high"),
+     (CURRENT_SOL, "max", "medium, high"), (CURRENT_SOL, "xhigh", "medium, high")],
+)
+def test_codex_effort_outside_model_efforts_refused(model, effort, offered):
+    """Defect class: a model silently run at an effort the operator excluded (2026-11-17).
+
+    The refusal names the catalog list and never maps the effort; offered efforts and an
+    omitted effort (the adapter default) still pass admission.
+    """
+    from lu_machinery.dispatcher.checks import check_model_admission
+
+    with pytest.raises(ValueError, match=rf"does not offer effort '{effort}'; offered: {offered} \(model catalog"):
+        check_model_admission("codex", model, "read-only", {"effort": effort}, b"")
+    for allowed in (*offered.split(", "), None):
+        check_model_admission("codex", model, "read-only", {"effort": allowed}, b"")
 
 
 def test_force_admission_records_the_reason(admission_dispatch, monkeypatch, capsys):
@@ -949,7 +971,7 @@ def test_runtime_headroom_gates_each_codex_account_on_its_own_events(tmp_path, m
     monkeypatch.setattr(worker, "_reap_settled", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(git, "snapshot_delivery", lambda *_args, **_kwargs: {})
     usage._reset_rate_limit_cache_for_tests()
-    model = "gpt-6.1-sol"
+    model = CURRENT_SOL
     real = headroom.check_runtime
     seen = {}
 
@@ -982,7 +1004,7 @@ def test_runtime_headroom_gates_each_codex_account_on_its_own_events(tmp_path, m
     spared = settle("b-spared", "codex", "b-sub")
     assert seen == {"codex_account": "b-sub", "admitted": True}
     assert spared["status"] == "rate_limited"
-    assert spared["error"] == "codex/gpt-6.1-sol rate limited: headroom-admitted"
+    assert spared["error"] == f"codex/{CURRENT_SOL} rate limited: headroom-admitted"
     assert spared["provider_pgid"] is None
     blocked_a = settle("a-blocked", "codex", "sub")
     assert seen == {"codex_account": "sub", "admitted": False}

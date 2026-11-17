@@ -428,11 +428,11 @@ def _build_codex_usage_report(window: str, entrypoint: str) -> dict:
     from lu_machinery.agent_runtime.usage import has_headroom
 
     unreadable_headroom = {"files": 0, "lines": 0, "records": 0}
-    has_room, headroom_reason = has_headroom("codex", "gpt-6.1-sol", unreadable=unreadable_headroom)
+    has_room, headroom_reason = has_headroom("codex", "gpt-6.2-sol", unreadable=unreadable_headroom)
     if any(unreadable_headroom.values()):
         logging.getLogger(__name__).warning(
             "Codex headroom check for %s: unreadable usage records %s",
-            "gpt-6.1-sol",
+            "gpt-6.2-sol",
             unreadable_headroom,
         )
     return {
@@ -446,7 +446,7 @@ def _build_codex_usage_report(window: str, entrypoint: str) -> dict:
         "by_account": dict(sorted(by_account.items())),
         "recent_rate_limits": sorted(recent_rate_limits),
         "headroom": {
-            "model": "gpt-6.1-sol",
+            "model": "gpt-6.2-sol",
             # The account this process runs on; headroom counts only its limits.
             "codex_account": runtime_usage.current_codex_account() or "unattributed",
             "has_headroom": has_room,

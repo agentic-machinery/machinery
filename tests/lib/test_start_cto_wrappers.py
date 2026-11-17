@@ -24,6 +24,9 @@ from tests.lib.test_launcher_contract import REPO as REPO, _core_canary_failure_
 from tests.lib.test_launcher_driver_scope import scope_sandbox as scope_sandbox
 from tests.rules_core_view import _build_view as _build_view
 import shutil
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 WRAPPERS = ("start-claude-cto.sh", "start-codex-cto.sh")
 launch_with_usage = _usage_fixture
@@ -49,7 +52,7 @@ def clean_selection(monkeypatch: pytest.MonkeyPatch, _launcher_parent_environmen
 @pytest.mark.parametrize("name", WRAPPERS)
 @pytest.mark.parametrize("case", ("default", "model", "effort", "environment", "precedence"))
 def test_cto_selection_and_dry_run(name: str, case: str, launch_with_usage) -> None:
-    model = "claude-sonnet-5-5" if name == WRAPPERS[0] else "gpt-6.1-sol"
+    model = "claude-sonnet-5-5" if name == WRAPPERS[0] else CURRENT_SOL
     alternate = "claude-fable-5-1" if name == WRAPPERS[0] else model
     args: tuple[str, ...] = ()
     env: dict[str, str] = {}
@@ -61,8 +64,10 @@ def test_cto_selection_and_dry_run(name: str, case: str, launch_with_usage) -> N
     elif case == "environment":
         env, expected_model, effort = {"LAUNCHER_MODEL": alternate, "LAUNCHER_EFFORT": "medium"}, alternate, "medium"
     elif case == "precedence":
+        # The current Sol offers only medium and high (models.<id>.efforts), so its CLI effort is medium.
+        cli_effort = "xhigh" if name == WRAPPERS[0] else "medium"
         env = {"LAUNCHER_MODEL": "not-certified", "LAUNCHER_EFFORT": "low"}
-        args, effort = ("--model=" + model, "--effort", "xhigh"), "xhigh"
+        args, effort = ("--model=" + model, "--effort", cli_effort), cli_effort
     result = launch_with_usage("0", *args, name=name, env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     command = shlex.split(
@@ -223,7 +228,7 @@ def test_cto_epics_refusal_gates_execute_without_dry_run(
 
 @pytest.mark.parametrize(
     "name, model",
-    ((WRAPPERS[0], "claude-sonnet-5-5"), (WRAPPERS[0], "claude-opus-5-5[1m]"), (WRAPPERS[1], "gpt-6.1-sol")),
+    ((WRAPPERS[0], "claude-sonnet-5-5"), (WRAPPERS[0], "claude-opus-5-5[1m]"), (WRAPPERS[1], CURRENT_SOL)),
 )
 def test_scope_reentry_preserves_cto_defaults_and_explicit_opus(tmp_path: Path, name: str, model: str) -> None:
     root, env = _runtime_checkout(tmp_path)
@@ -246,7 +251,7 @@ launcher_load_rules_core() { printf 'REENTRY:%s|%s|%s|%s\\n' "${0##*/}" "$LC_EPI
     (
         (WRAPPERS[0], (), "claude-sonnet-5-5"),
         (WRAPPERS[0], ("--model", "opus"), "claude-opus-5-5[1m]"),
-        (WRAPPERS[1], (), "gpt-6.1-sol"),
+        (WRAPPERS[1], (), CURRENT_SOL),
     ),
 )
 def test_supervisor_successor_reenters_cto_wrapper(

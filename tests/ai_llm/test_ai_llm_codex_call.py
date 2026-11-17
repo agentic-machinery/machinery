@@ -9,6 +9,9 @@ import pytest
 
 from lu_machinery.agent_runtime.result import Result
 from lu_machinery.ai_llm.codex_call import call_codex_with_fallback
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 def _result(
@@ -16,7 +19,7 @@ def _result(
     ok: bool,
     response: str = "",
     stderr_excerpt: str | None = None,
-    model: str = "gpt-6.1-sol",
+    model: str = CURRENT_SOL,
 ) -> Result:
     return Result(
         ok=ok,
@@ -103,7 +106,7 @@ def test_retry_exhaustion_never_falls_back_to_gpt5(tmp_path):
         )
     assert result.error_message == "broken"
     assert invoke.call_count == 2
-    assert {call.kwargs["model"] for call in invoke.call_args_list} == {"gpt-6.1-sol"}
+    assert {call.kwargs["model"] for call in invoke.call_args_list} == {CURRENT_SOL}
     assert {call.kwargs["effort"] for call in invoke.call_args_list} == {"high"}
 
 

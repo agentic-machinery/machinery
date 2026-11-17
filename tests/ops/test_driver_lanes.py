@@ -14,6 +14,9 @@ import pytest
 from lu_machinery.ops import driver_lanes as dl
 
 from tests._host_path_guard import assert_no_host_facts
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -74,7 +77,7 @@ def test_live_codex_lanes_are_registered_under_their_tmux_sessions(session: str,
     assert (lane.kind, lane.epic, lane.sender) == ("codex", epic, session)
     assert lane.goal == f".claude/{epic}-epic/DRIVER-STATE.md"
     assert dl.generic_argv(lane) == (
-        "./start-codex-driver.sh", "--epic", epic, "--model", "gpt-6.1-sol", "--effort", "high",
+        "./start-codex-driver.sh", "--epic", epic, "--model", CURRENT_SOL, "--effort", "high",
     )
     assert lane.account_env == ("CODEX_HOME",)
 

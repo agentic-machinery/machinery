@@ -66,7 +66,10 @@ from tests.agent_runtime.product_roots import (  # noqa: F401
     agent_runtime_roots,
     configured_roots,
 )
+from tests.helpers import current_sol
 from tests.wait_helpers import wait_for_line, wait_until
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
 
@@ -966,7 +969,7 @@ def test_build_invocation_argv_is_fully_confined(tmp_path, monkeypatch):
     assert "--no-fs" in plan.cmd
     assert "--no-terminal" in plan.cmd
     assert "--json-strict" in plan.cmd
-    assert ("--model", "gpt-6.1-sol") in pairs
+    assert ("--model", CURRENT_SOL) in pairs
     assert plan.env_overrides["CODEX_PATH"] == "/installed/codex"
     assert plan.metadata["codex_cli_version"] == "0.159.2"
     assert plan.metadata["codex_cli_source"] == "installed"
@@ -2305,7 +2308,7 @@ def test_acp_consult_route_refuses_a_fable_pin_before_dispatch(participant, mode
 @pytest.mark.parametrize(
     "participant,model",
     # No cursor row: Cursor's only pin, grok-4.7, is retired (GROK-CANCEL-1110).
-    [("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol"), ("codex", "gpt-6-luna")],
+    [("claude", "claude-opus-5-5"), ("codex", CURRENT_SOL), ("codex", "gpt-6-luna")],
 )
 def test_acp_consult_route_still_admits_opus_sol_and_recon_pins(participant, model):
     from lu_machinery.agent_runtime import runner

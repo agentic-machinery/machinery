@@ -13,6 +13,9 @@ from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.review_lineage import LineageRefused, ReviewRun, check_lineage
 from lu_machinery.review.verdict_parser import recognized_verdicts
 from tests.review.record_support import BRANCH, OTHER, SHA, recorded_verdict, setup_record
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -68,7 +71,7 @@ def run_record(*, sha=EARLIER, reply=None, **updates):
         "schema_version": 2,
         "worktree_base_sha": sha,
         "pinned_head": sha,
-        "model": "gpt-6.1-sol",
+        "model": CURRENT_SOL,
         "agent": "codex",
         "review_mode": "cross_family",
         "started_at": STARTED,
@@ -109,7 +112,7 @@ def test_a_structured_blocked_with_zero_findings_and_a_declared_capability_quali
         sha=EARLIER,
         result_sha256=record["result_sha256"],
         capability="test-execution",
-        model="gpt-6.1-sol",
+        model=CURRENT_SOL,
         family="openai",
         authority="claude-cto",
     )
@@ -304,7 +307,7 @@ def test_a_blocked_with_a_finding_keeps_todays_treatment_even_with_an_event():
     record, reply = run_record(reply=reply)
     forged = cf.CapabilityFailure(
         "review-blocked", STARTED, "nonce-one", EARLIER, record["result_sha256"], "test-execution",
-        "gpt-6.1-sol", "openai", "claude-cto",
+        CURRENT_SOL, "openai", "claude-cto",
     )
     with pytest.raises(LineageRefused, match=r"evidence refused: CAPABILITY_FAILURE_REFUSED\[findings\]"):
         lineage(approve, ReviewRun("review-blocked", record, reply), comments=[verdict, event_comment(forged)])
@@ -395,7 +398,7 @@ def test_the_recorder_refuses_a_verdict_for_a_classified_run(monkeypatch, tmp_pa
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     failure = cf.CapabilityFailure(
         "review-one", "2026-09-23T12:00:00.000001+00:00", "nonce-one", SHA, UNIT_DIGEST, "test-execution",
-        "gpt-6.1-sol", "openai", "claude-cto",
+        CURRENT_SOL, "openai", "claude-cto",
     )
     comments.append(event_comment(failure))
     with pytest.raises(cf.CapabilityFailureRefused, match="recorded as a capability failure; it has no verdict"):

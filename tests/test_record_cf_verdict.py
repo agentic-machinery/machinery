@@ -21,6 +21,9 @@ from lu_machinery.review.ukrainian_seats import required_ukrainian_seats
 from tests.review.record_support import SHA as SHA, setup_record as _setup_record
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 def test_repair_receipts_stay_private_on_admission_and_consumption(tmp_path, monkeypatch):
     """Defect class: receipt replacement leaks evidence, leaves partial files or fails on stale PID temps."""
@@ -67,7 +70,7 @@ def test_same_family_refused(monkeypatch, low_review, tmp_path):
     assert comments == [] and statuses == []
 
 
-@pytest.mark.parametrize("model,family", [("claude-opus-5-5", "anthropic"), ("gpt-6.1-sol", "openai")])
+@pytest.mark.parametrize("model,family", [("claude-opus-5-5", "anthropic"), (CURRENT_SOL, "openai")])
 def test_formal_reviewer_still_admits_opus_and_sol(model, family):
     recorder._require_formal_reviewer(cursor=False, reported=model, model=model, family=family)
 
@@ -111,7 +114,7 @@ def test_head_and_branch_mismatch_refused(monkeypatch, low_review, tmp_path):
 
     # R08: after both code seats approve, missing learner seats keep the status pending.
     comments[0]["body"] = recorder.build_comment(**{**marker_fields, "task_id": "carbon", "second_review": True})
-    task.update(model="gpt-6.1-sol", agent="codex")
+    task.update(model=CURRENT_SOL, agent="codex")
     (tasks / "review-one.json").write_text(json.dumps(task))
     # This fixture's product-independent policy must be shared with the recorder as well.
     monkeypatch.setattr(sweep, "changes_learner_content", lambda paths: any(p.startswith("curriculum/") for p in paths))
@@ -621,11 +624,11 @@ def test_real_refusal_publishes_only_skeleton(scanned_recorder, tmp_path, detail
     body = comments[0]["body"]
     assert body == (
         f"### Cross-family review\nhead: {SHA}\nReviewer family: openai\nVERDICT: {verdict}\n"
-        "Reviewer model: gpt-6.1-sol\nReview score: absent\nAuthored by: gemini-3.8-flash-high\n"
+        f"Reviewer model: {CURRENT_SOL}\nReview score: absent\nAuthored by: gemini-3.8-flash-high\n"
         "Task id: review-one\n\nWithheld findings: unknown\n"
         "Findings are held privately.\n\n"
         f"<!-- cf-verdict v1 sha={SHA} task=review-one started=2026-09-23T12:00:00.000001+00:00 "
-        f"verdict={verdict} model=gpt-6.1-sol family=openai -->"
+        f"verdict={verdict} model={CURRENT_SOL} family=openai -->"
     )
     assert sent == [body]
     assert detail not in body and "SYNTHETIC-DETAIL" not in body
@@ -652,12 +655,12 @@ def test_clean_publication_bytes_unchanged(scanned_recorder, tmp_path):
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     expected = (
         f"### Cross-family review\nhead: {SHA}\nReviewer family: openai\nVERDICT: APPROVED\n"
-        "Reviewer model: gpt-6.1-sol\nReview score: 8/10\nAuthored by: gemini-3.8-flash-high\n"
+        f"Reviewer model: {CURRENT_SOL}\nReview score: 8/10\nAuthored by: gemini-3.8-flash-high\n"
         "Task id: review-one\n\n"
         "<details><summary>Reviewer's reply</summary>\n\n"
         + reply + "\n\n</details>\n\n"
         f"<!-- cf-verdict v1 sha={SHA} task=review-one started=2026-09-23T12:00:00.000001+00:00 "
-        "verdict=APPROVED model=gpt-6.1-sol family=openai -->"
+        f"verdict=APPROVED model={CURRENT_SOL} family=openai -->"
     )
     assert comments[0]["body"].encode() == expected.encode()
     assert sent == [expected] and calls == {"posts": 1, "statuses": 1}
@@ -914,7 +917,7 @@ def test_p3_downgrade_refuses_every_reply_but_one_findings_object(name):
     assert reading == recorder.P3Reading(reason=_P3_REASONS.get(name, recorder.P3_NOT_ONE_OBJECT))
     body = recorder.build_comment(
         sha=SHA, task_id="review-one", started="2026-09-23T12:00:00+00:00", verdict="CHANGES_REQUESTED",
-        model="gpt-6.1-sol", family="openai", reply=reply,
+        model=CURRENT_SOL, family="openai", reply=reply,
     )
     assert sweep.recorded_p3_residuals(body) is None
     assert sweep.recorded_p3_residuals(body.replace(reply, _P3_OBJECT)) == ("F1",)
@@ -996,7 +999,7 @@ def test_unavailable_structured_count_is_unknown(payload, expected):
 def test_skeleton_preserves_complete_marker_metadata(metadata):
     body = recorder.build_comment(
         sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gpt-6.1-sol", family="openai", reply="",
+        verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="",
         withheld_findings=2, **metadata,
     )
     marker = sweep.parse_marker(body)
@@ -1375,7 +1378,7 @@ def test_a_ukrainian_seat_approving_an_older_head_does_not_count(monkeypatch, tm
     monkeypatch.setattr(recorder, "post_commit_status", lambda **kwargs: statuses.append(kwargs))
     older = recorder.build_comment(
         sha=OTHER, task_id="review-old", started="2026-09-23T11:00:00.000001+00:00", verdict="APPROVED",
-        model="gpt-6.1-sol", family="openai", reply="VERDICT: APPROVE",
+        model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3,
         author_models=("gemini-3.8-flash-high",),
     )
@@ -1429,7 +1432,7 @@ def test_sol_authored_gemini_approval_passes_and_gemini_author_needs_sol(monkeyp
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_a_blank_author_beside_an_attested_marker_still_needs_both_seats():
     """One missing attestation is not dropped when another marker names an author."""
-    known = {"author_models": ("gpt-6.1-sol",)}
+    known = {"author_models": (CURRENT_SOL,)}
     blanks = (
         {},
         {"author_models": None},
@@ -1458,7 +1461,7 @@ def test_a_blank_author_beside_an_attested_marker_still_needs_both_seats():
     named = recorder.build_comment(
         sha=SHA, task_id="review-named", started="2026-09-23T12:00:01.000001+00:00",
         verdict="APPROVED", model="gemini-3.8-flash-high", family="google", reply="VERDICT: APPROVE",
-        review_profile="ukrainian", sources_mcp_call_count=3, author_models=("gpt-6.1-sol",),
+        review_profile="ukrainian", sources_mcp_call_count=3, author_models=(CURRENT_SOL,),
     )
     alone = sweep.lookup_verdict([comment(bare, 1)], SHA, "fleet")
     assert alone.state == sweep.NEEDS_SEAT
@@ -1544,7 +1547,7 @@ def test_task_classification_cannot_bypass_sources_gate(tmp_path, count, classif
 def test_parse_marker_extracts_optional_integer_count(mode, profile, count):
     body = recorder.build_comment(
         sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gpt-6.1-sol", family="openai", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
         review_mode=mode, review_profile=profile, sources_mcp_call_count=count,
     )
     marker = recorder.parse_marker(body)
@@ -1564,7 +1567,7 @@ def test_ukrainian_marker_without_positive_count_refused(monkeypatch, tmp_path, 
     valid = comments[0]
     body = recorder.build_comment(
         sha=SHA, task_id="later", started="2026-09-23T12:00:01.000001+00:00",
-        verdict=verdict, model="gpt-6.1-sol", family="openai", reply=f"VERDICT: {verdict}",
+        verdict=verdict, model=CURRENT_SOL, family="openai", reply=f"VERDICT: {verdict}",
         review_mode=mode, review_profile="ukrainian", sources_mcp_call_count=3,
     )
     body = body.replace(" sources_calls=3", "" if count is None else f" sources_calls={count}")
@@ -1582,7 +1585,7 @@ def test_ukrainian_marker_without_positive_count_refused(monkeypatch, tmp_path, 
 def test_sources_marker_must_match_published_count(replacement):
     body = recorder.build_comment(
         sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gpt-6.1-sol", family="openai", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3,
     ).replace("sources_calls=3", replacement)
     assert recorder.parse_marker(body) is None
@@ -1593,7 +1596,7 @@ def test_sources_marker_must_match_published_count(replacement):
 def test_removing_profile_marker_cannot_hide_missing_sources_count():
     body = recorder.build_comment(
         sha=SHA, task_id="review-one", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gpt-6.1-sol", family="openai", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3,
     ).replace(" review_profile=ukrainian sources_calls=3", "")
     assert recorder.parse_marker(body) is None
@@ -1652,11 +1655,11 @@ def test_recorded_round_stores_score_with_reviewer_and_author_models(scanned_rec
     assert sent == [body]
     assert result["score"] == score and result["verdict"] == "CHANGES_REQUESTED"
     assert (
-        "Reviewer family: openai\nVERDICT: CHANGES_REQUESTED\nReviewer model: gpt-6.1-sol\n"
+        f"Reviewer family: openai\nVERDICT: CHANGES_REQUESTED\nReviewer model: {CURRENT_SOL}\n"
         f"Review score: {f'{score}/10' if score else 'absent'}\nAuthored by: gemini-3.8-flash-high\n"
     ) in body
     marker = sweep.parse_marker(body)
-    assert (marker["verdict"], marker["model"], marker["family"]) == ("CHANGES_REQUESTED", "gpt-6.1-sol", "openai")
+    assert (marker["verdict"], marker["model"], marker["family"]) == ("CHANGES_REQUESTED", CURRENT_SOL, "openai")
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
@@ -2057,7 +2060,7 @@ def test_mixed_family_branch_resolves_one_seat_per_family(tmp_path, monkeypatch)
     target = run("target", "--mode", "branch", "--branch", "feature", "--base", "origin/main",
                  "--repo-root", str(repo.root))
     assert target.returncode == 0, target.stderr
-    args = ("resolve-reviewer", "--author-model", "gpt-6.1-sol", "--repository", REPOSITORY,
+    args = ("resolve-reviewer", "--author-model", CURRENT_SOL, "--repository", REPOSITORY,
             "--task-root", str(tmp_path / "tasks"), "--risk", "low", "--domain", "infra",
             "--review-profile", "infra", "--routing-snapshot-file", str(snapshot))
     resolved = run(*args)
@@ -2067,7 +2070,7 @@ def test_mixed_family_branch_resolves_one_seat_per_family(tmp_path, monkeypatch)
     assert len(payload["quorum"]) == 2
     seats = {seat["family"]: seat for seat in payload["quorum"]}
     assert set(seats) == {"anthropic", "openai"}
-    assert {seat["concrete_model"] for seat in seats.values()} == {"claude-opus-5-5", "gpt-6.1-sol"}
+    assert {seat["concrete_model"] for seat in seats.values()} == {"claude-opus-5-5", CURRENT_SOL}
     assert seats["anthropic"]["scope"] == {
         "reviewer_family": "anthropic", "author_family": "openai", "commits": [openai], "context_head": openai,
     }
@@ -2150,7 +2153,7 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
         github._refuse_incomplete_seats(REPOSITORY, 42, moved, None, tmp_path, {})
 
     approved = list(comments)
-    for agent, model in (("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol")):
+    for agent, model in (("claude", "claude-opus-5-5"), ("codex", CURRENT_SOL)):
         comments[:] = approved
         write_task(tasks, task_id="review-reject", agent=agent, model=model, worktree_base_sha=head,
                    review_risk="critical", reply="VERDICT: REQUEST_CHANGES\nA blocking defect remains.")
@@ -2174,7 +2177,7 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
 
     with pytest.raises(ReviewAdmissionRefused, match="SELF_REVIEW_DETECTED"):
         resolve_and_admit(
-            ("codex",), model="gpt-6.1-sol", mode="read-only", review_dispatch=True,
+            ("codex",), model=CURRENT_SOL, mode="read-only", review_dispatch=True,
             review_risk="critical", review_task_id="review-one", review_facts=facts, claude_account=HOST_ACCOUNT,
         )
     monkeypatch.setattr(recorder, "_pr", lambda *_a, **_k: {"number": 42, "headRefName": "codex/42", "headRefOid": moved})
@@ -2192,7 +2195,7 @@ def test_single_family_branch_resolution_unchanged(tmp_path, monkeypatch):
     from tests.claude_route_accounts import HOST_ACCOUNT
     from tests.agent_runtime.test_authoring_review_feasibility import OPUS, REPOSITORY, SOL, mini_repo
 
-    for trailer, model, expected in ((OPUS, "claude-opus-5-5", "openai"), (SOL, "gpt-6.1-sol", "anthropic")):
+    for trailer, model, expected in ((OPUS, "claude-opus-5-5", "openai"), (SOL, CURRENT_SOL, "anthropic")):
         directory = tmp_path / expected
         directory.mkdir()
         repo = mini_repo(directory, monkeypatch)

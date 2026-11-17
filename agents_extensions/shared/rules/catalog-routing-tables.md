@@ -17,8 +17,8 @@ Excluded candidates can appear in a ladder; membership never grants admission.
 | seat | model_id | effort | escalate_model_id | escalate_effort |
 | --- | --- | --- | --- | --- |
 | agy | gemini-3.8-flash-high | high | gemini-3.8-flash-high | high |
-| claude | claude-opus-5-5 | high | gpt-6.1-sol | high |
-| codex | gpt-6.1-sol | high | gpt-6.1-sol | high |
+| claude | claude-opus-5-5 | high | gpt-6.2-sol | high |
+| codex | gpt-6.2-sol | high | gpt-6.2-sol | high |
 
 ## Review ladders
 
@@ -26,23 +26,23 @@ Rank follows the catalog; entries at the same rank are peers.
 
 | risk | rank | candidate | model_id |
 | --- | --- | --- | --- |
-| critical | 1 | openai_frontier_b | gpt-6.1-sol |
-| critical | 2 | openai_frontier | gpt-6.1-sol |
+| critical | 1 | openai_frontier_b | gpt-6.2-sol |
+| critical | 2 | openai_frontier | gpt-6.2-sol |
 | critical | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | critical | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
-| high | 1 | openai_frontier_b | gpt-6.1-sol |
-| high | 2 | openai_frontier | gpt-6.1-sol |
+| high | 1 | openai_frontier_b | gpt-6.2-sol |
+| high | 2 | openai_frontier | gpt-6.2-sol |
 | high | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | high | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
-| medium | 1 | openai_frontier_b | gpt-6.1-sol |
-| medium | 2 | openai_frontier | gpt-6.1-sol |
+| medium | 1 | openai_frontier_b | gpt-6.2-sol |
+| medium | 2 | openai_frontier | gpt-6.2-sol |
 | medium | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | medium | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
 | medium | 5 | claude-sonnet-5-5 | claude-sonnet-5-5 |
 | medium | 6 | claude-sonnet-5-5-agy | claude-sonnet-5-5 |
 | medium | 7 | gemini-3.8-flash-high | gemini-3.8-flash-high |
-| low | 1 | openai_frontier_b | gpt-6.1-sol |
-| low | 2 | openai_frontier | gpt-6.1-sol |
+| low | 1 | openai_frontier_b | gpt-6.2-sol |
+| low | 2 | openai_frontier | gpt-6.2-sol |
 | low | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | low | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
 | low | 5 | claude-sonnet-5-5 | claude-sonnet-5-5 |

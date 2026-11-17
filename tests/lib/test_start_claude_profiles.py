@@ -9,12 +9,15 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.review.model_catalog import load_model_catalog
+from tests.helpers import current_sol
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.launcher_sandbox import launcher_toolchain_path
 from tests.lib.test_launcher_contract import (
     _core_driver_exit_fixture,
     run_launcher,
 )
+
+CURRENT_SOL = current_sol()
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor")]
 
@@ -64,7 +67,7 @@ def test_claude_interactive_injects_effort_when_explicit() -> None:
     assert "would exec claude --model claude-fable-5-1 --effort xhigh" in both.stdout
 
 
-@pytest.mark.parametrize("model", ("not-certified", "gpt-6.1-sol"))
+@pytest.mark.parametrize("model", ("not-certified", CURRENT_SOL))
 def test_claude_rejects_models_outside_native_profile(model: str) -> None:
     result = run_launcher("start-claude.sh", "--model", model)
     assert result.returncode == 2

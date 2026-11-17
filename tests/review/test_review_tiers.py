@@ -11,7 +11,9 @@ import pytest
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
-from tests.helpers import product_tree
+from tests.helpers import current_sol, product_tree
+
+CURRENT_SOL = current_sol()
 
 configured_roots = product_tree.configured_roots
 
@@ -99,7 +101,7 @@ def _record_of_record(comments):
         "body": recorder.build_comment(
             sha="a" * 40, task_id="review-opus", started="2026-09-23T12:00:00.000001+00:00",
             verdict="APPROVED", model="claude-opus-5-5", family="anthropic", reply="VERDICT: APPROVE",
-            author_models=("gpt-6.1-sol",),
+            author_models=(CURRENT_SOL,),
         ),
     })
 

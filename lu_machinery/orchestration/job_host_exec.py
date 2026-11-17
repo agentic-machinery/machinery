@@ -549,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             f"  .venv/bin/python {_PACKAGE_DIR}/job_host_exec.py -- "
             f".venv/bin/python {_MACHINERY}/dispatch.py dispatch --agent codex "
-            "--model gpt-6.1-sol --task-id review-123 --prompt-file brief.md --mode read-only\n"
+            "--model gpt-6.2-sol --task-id review-123 --prompt-file brief.md --mode read-only\n"
             f"  .venv/bin/python {_PACKAGE_DIR}/job_host_exec.py "
             "--host-id host-job -- .venv/bin/python -m pytest tests/orchestration/test_job_host_exec.py\n\n"
             "Outputs:\n"

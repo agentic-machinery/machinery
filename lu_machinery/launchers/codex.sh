@@ -7,12 +7,22 @@ export GIT_OPTIONAL_LOCKS=0
 
 launcher_adapter_validate() {
   case "$LC_MODEL" in
-    gpt-6.1-sol|gpt-6-luna) ;;
+    gpt-6.2-sol|gpt-6-luna) ;;
     *)
-      launcher_error "Codex model $LC_MODEL rejected; approved models are gpt-6-luna, gpt-6.1-sol."
+      launcher_error "Codex model $LC_MODEL rejected; approved models are gpt-6-luna, gpt-6.2-sol."
       exit 2
       ;;
   esac
+  # Operator 2026-11-17 (model catalog models.gpt-6.2-sol.efforts): refused, never mapped.
+  if [ "$LC_MODEL" = gpt-6.2-sol ]; then
+    case "${LC_EFFORT:-}" in
+      ''|medium|high) ;;
+      *)
+        launcher_error "gpt-6.2-sol does not offer effort '$LC_EFFORT'; offered: medium, high."
+        exit 2
+        ;;
+    esac
+  fi
   local forwarded
   for forwarded in "${LC_FORWARD_ARGS[@]}"; do
     case "$forwarded" in
@@ -138,7 +148,7 @@ launcher_codex_native_profile_preflight() {
 launcher_codex_transport_probe() {
   local py
   py="$(launcher_project_python)" || exit 3
-  local probe=("$py" -m lu_machinery.orchestration.codex_transport_health probe --ttl-seconds "${CODEX_TRANSPORT_PROBE_TTL_SECONDS:-900}" --timeout-seconds "${CODEX_TRANSPORT_PROBE_TIMEOUT_SECONDS:-120}" --model "$LC_MODEL" --effort low --json)
+  local probe=("$py" -m lu_machinery.orchestration.codex_transport_health probe --ttl-seconds "${CODEX_TRANSPORT_PROBE_TTL_SECONDS:-900}" --timeout-seconds "${CODEX_TRANSPORT_PROBE_TIMEOUT_SECONDS:-120}" --model "$LC_MODEL" --effort medium --json)
   if [ "$LC_DRY_RUN" = 1 ]; then printf 'codex adapter: would probe '; printf '%q ' "${probe[@]}"; printf '\n'; return 0; fi
   if ! "${probe[@]}"; then
     launcher_error 'Codex transport is degraded; do not retry Codex, route this cycle through the external fleet/epic roster.'

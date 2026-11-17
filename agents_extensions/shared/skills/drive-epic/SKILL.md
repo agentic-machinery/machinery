@@ -6,7 +6,7 @@ effort: xhigh
 
 # Drive an epic lane
 
-For GPT-6.1 Sol (`gpt-6.1-sol`), use `high`, including advisory and
+For GPT-6.2 Sol (`gpt-6.2-sol`), use `high`, including advisory and
 escalation turns. This overrides the shared effort above for Sol only;
 other providers retain their effort rules and explicit overrides.
 
@@ -157,9 +157,9 @@ Sol drivers follow its Sol driver row for plain messages, bounded reads and outp
 
 ## Escalate — do NOT decide these solo
 
-Seek **Opus 5.5 / Sol 6.1** for review, critique and design input. Route the decisions
+Seek **Opus 5.5 / Sol 6.2** for review, critique and design input. Route the decisions
 below for approval to the **operator**, or to **designated approval**: `claude-opus-5-5` and
-`gpt-6.1-sol` agree; when one of them authored the proposal, the other's approval completes
+`gpt-6.2-sol` agree; when one of them authored the proposal, the other's approval completes
 it, and a proposal by any other agent needs both; if they disagree, the operator decides
 (#9583, #9616). Never resolve them from the loop:
 

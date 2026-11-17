@@ -13,6 +13,9 @@ import pytest
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.review import contract_canary as canary
 from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 GIB = 2**30
 
@@ -40,7 +43,7 @@ RECEIPT = json.dumps({
 MODELS = {
     "agy": "gemini-3.8-flash-high",
     "claude": "claude-sonnet-5-5",
-    "codex": "gpt-6.1-sol",
+    "codex": CURRENT_SOL,
     "cursor": "grok-4.7-high",
     "muse": "muse-wonder-full-1.0",
 }

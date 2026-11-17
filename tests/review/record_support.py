@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.review import record_cf_verdict as recorder
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -47,7 +50,7 @@ def task(**updates):
         "repository": REPOSITORY,
         "worktree_branch": BRANCH,
         "worktree_base_sha": SHA,
-        "model": "gpt-6.1-sol",
+        "model": CURRENT_SOL,
         "agent": "codex",
         "started_at": "2026-09-23T12:00:00.000001+00:00",
         "status": "done",

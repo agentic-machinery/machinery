@@ -31,6 +31,9 @@ from lu_machinery.agent_runtime import runner
 from lu_machinery.agent_runtime.adapters.base import InvocationPlan
 from lu_machinery.agent_runtime.result import ParseResult
 from tests.agent_runtime.attempt_boundary_support import attempt_config, manifest_world, world  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 # Liveness guard (#9549): the longest a test waits on a child process, socket or
 # event-loop call before declaring it hung. It is never a performance
@@ -394,7 +397,7 @@ def test_bound_attempt_runs_only_inside_the_attempt_boundary_with_the_exact_prom
     from lu_machinery.review.render_contract import trusted_core_context
 
     destination_limit = 256
-    args = cli.build_parser().parse_args(["dispatch", "--agent", "sol", "--model", "gpt-6.1-sol", *attempt,
+    args = cli.build_parser().parse_args(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, *attempt,
                                           "--review-access", "full"])
     binding = store.review_binding(vars(args))
     prefix, dependency = trusted_core_context()
@@ -403,7 +406,7 @@ def test_bound_attempt_runs_only_inside_the_attempt_boundary_with_the_exact_prom
     prompt.content = rendered
     workspace = tmp_path / "checkout"
     workspace.mkdir()
-    spec = TaskSpec("task", harness, "gpt-6.1-sol", "high", "read-only", workspace, prompt,
+    spec = TaskSpec("task", harness, CURRENT_SOL, "high", "read-only", workspace, prompt,
                     tmp_path / "tasks" / "task.result", options=dict(review_attempt=str(tmp_path / "manifest.yaml")))
     record = store.new_record(spec, dict(key="public", github="example/public"), "codex/task", "a" * 40,
                               dict(vars(args), research_owned_path=[]), binding=binding)

@@ -380,7 +380,7 @@ launcher_defaults() {
       LC_HARNESS="${LAUNCHER_HARNESS:-claude-code}"
       ;;
     codex)
-      LC_MODEL="${LAUNCHER_MODEL:-gpt-6.1-sol}"
+      LC_MODEL="${LAUNCHER_MODEL:-gpt-6.2-sol}"
       LC_HARNESS="${LAUNCHER_HARNESS:-codex}"
       ;;
     gemini)
@@ -837,10 +837,10 @@ launcher_validate_mode() {
       launcher_require_registered_slot "$LC_PROVIDER" "$LC_EPIC" || exit 2
     fi
     if [ "$LC_MODEL" = gpt-6-luna ]; then
-      launcher_error "gpt-6-luna is a scouting model, not a governor model. Use gpt-6.1-sol."
+      launcher_error "gpt-6-luna is a scouting model, not a governor model. Use gpt-6.2-sol."
       exit 4
     fi
-    LC_MODEL="${LC_MODEL:-gpt-6.1-sol}"
+    LC_MODEL="${LC_MODEL:-gpt-6.2-sol}"
     unset SESSION_EPIC
     LC_GOVERNOR_PROMPT="Follow agents_extensions/shared/prompts/dynamic-area-epic-fleet-governor.md for one bounded supervision cycle. TARGET=$LC_EPIC GOAL=AUTO"
     LC_FORWARD_ARGS=("$LC_GOVERNOR_PROMPT" "${LC_FORWARD_ARGS[@]}")
@@ -912,7 +912,7 @@ launcher_validate_driver_certification() {
     return 0
   fi
   case "$LC_PROVIDER:$LC_MODEL" in
-    claude:claude-opus-5-5|claude:claude-opus-5-5\[1m\]|claude:claude-fable-5-1|claude:claude-fable-5-2|claude:claude-sonnet-5-5|codex:gpt-6.1-sol|gemini:gemini-3.8-flash-high|muse:muse-wonder-full-1.0)
+    claude:claude-opus-5-5|claude:claude-opus-5-5\[1m\]|claude:claude-fable-5-1|claude:claude-fable-5-2|claude:claude-sonnet-5-5|codex:gpt-6.2-sol|gemini:gemini-3.8-flash-high|muse:muse-wonder-full-1.0)
       return 0
       ;;
     *)

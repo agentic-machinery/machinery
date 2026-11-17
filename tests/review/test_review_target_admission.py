@@ -24,6 +24,9 @@ from lu_machinery.ai_agent_bridge import _channels, _db
 from lu_machinery.orchestration import slot_routing
 from tests.claude_route_accounts import HOST_ACCOUNT
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -156,7 +159,7 @@ def test_a_quota_substitute_is_admitted_like_any_target(tmp_path):
     config.write_text("dispatch_fallbacks:\n  codex: cursor\n  claude: kimi\n  grok: nobody\n", encoding="utf-8")
 
     (target,) = resolve_and_admit(
-        ("codex",), mode=ACP_MODE, model="gpt-6.1-sol", compat=True, substitute="rate_limited", fallbacks_path=config
+        ("codex",), mode=ACP_MODE, model=CURRENT_SOL, compat=True, substitute="rate_limited", fallbacks_path=config
     )
     assert (target.recipient, target.model, target.reason) == ("cursor", None, "substitute:codex:rate_limited")
     with pytest.raises(KimiAdmissionRefused, match=_TOKEN):
@@ -206,7 +209,7 @@ def test_the_original_request_is_gated_before_the_launch_route_runs(tmp_path, ag
 def test_a_launch_route_onto_kimi_is_refused_after_it_resolves():
     route, calls = _recording_route("kimi", "kimi-code/k3")
     with pytest.raises(KimiAdmissionRefused, match=_TOKEN):
-        resolve_and_admit(("codex",), model="gpt-6.1-sol", mode="read-only", route=route)
+        resolve_and_admit(("codex",), model=CURRENT_SOL, mode="read-only", route=route)
     assert len(calls) == 1
 
 
@@ -269,7 +272,7 @@ def test_a_non_kimi_request_resolves_unchanged():
 
 @pytest.mark.parametrize("seat", ["agy", "gemini"])
 @pytest.mark.parametrize("model", [None, "gemini-3.8-flash-high"])
-@pytest.mark.parametrize("author", [None, "gpt-6.1-sol"])
+@pytest.mark.parametrize("author", [None, CURRENT_SOL])
 def test_explicit_review_risk_dispatch_refuses_before_target_reads(seat, model, author):
     """D1: omission refuses before target reads, alias resolution and route probes."""
 
@@ -351,7 +354,7 @@ def test_explicit_review_risk_selected_agy_cannot_bypass_declaration(monkeypatch
     with pytest.raises(ReviewAdmissionRefused, match="explicit --review-risk"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
             route=None if stage == "registry" else route,
@@ -373,7 +376,7 @@ def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
             model="gemini-3.8-flash-high",
             mode="read-only",
             review_dispatch=True,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk=risk,
             review_attempt=True,
             **paths,
@@ -387,9 +390,9 @@ def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
         ("agy", "gemini-3.8-flash-high", "dispatch", "ukrainian"),
         ("agy", "gemini-3.8-flash-high", "mode", "ukrainian"),
         ("agy", "gemini-3.8-flash-high", "flag", "ukrainian"),
-        ("codex", "gpt-6.1-sol", "dispatch", "code"),
-        ("codex", "gpt-6.1-sol", "mode", "code"),
-        ("codex", "gpt-6.1-sol", "flag", "code"),
+        ("codex", CURRENT_SOL, "dispatch", "code"),
+        ("codex", CURRENT_SOL, "mode", "code"),
+        ("codex", CURRENT_SOL, "flag", "code"),
         ("claude", "claude-opus-5-5", "dispatch", "code"),
         ("claude", "claude-opus-5-5", "mode", "code"),
         ("claude", "claude-opus-5-5", "flag", "code"),
@@ -497,7 +500,7 @@ def test_review_admission_uses_complete_branch_authorship_like_the_recorder(tmp_
     trusted = {
         "mode": "read-only",
         "review_dispatch": True,
-        "review_author_model": "gpt-6.1-sol",
+        "review_author_model": CURRENT_SOL,
         "review_risk": "medium",
     }
 
@@ -529,10 +532,10 @@ def test_review_mode_requires_known_mode_and_complete_task_facts(mode):
     with pytest.raises(ReviewAdmissionRefused, match=r"unsupported review mode|requires branch author facts"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk="critical",
             review_mode=mode,
             claude_account=HOST_ACCOUNT,
@@ -541,7 +544,7 @@ def test_review_mode_requires_known_mode_and_complete_task_facts(mode):
 
 def test_red_team_mode_alone_cannot_type_a_non_review_dispatch():
     with pytest.raises(ReviewAdmissionRefused, match="requires a review dispatch"):
-        resolve_and_admit(("codex",), model="gpt-6.1-sol", mode="read-only", review_mode="red_team")
+        resolve_and_admit(("codex",), model=CURRENT_SOL, mode="read-only", review_mode="red_team")
 
 
 @pytest.mark.parametrize(
@@ -560,10 +563,10 @@ def test_red_team_author_identity_refused_before_qualification(monkeypatch, revi
     with pytest.raises(ReviewAdmissionRefused, match="SELF_REVIEW_DETECTED"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk="critical",
             review_mode="red_team",
             review_task_id=reviewer_id,
@@ -589,7 +592,7 @@ def test_red_team_different_same_family_model_keeps_qualification_floor(monkeypa
             model="gpt-6-luna",
             mode="read-only",
             review_dispatch=True,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk="critical",
             review_mode="red_team",
             review_task_id="other-task",
@@ -617,7 +620,7 @@ def test_red_team_cross_seat_author_identity_refused(monkeypatch, seat, reviewer
     with pytest.raises(ReviewAdmissionRefused, match="SELF_REVIEW_DETECTED"):
         resolve_and_admit(
             (seat,),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
             review_mode="red_team",
@@ -634,14 +637,14 @@ def test_red_team_language_lane_refused(scope):
     with pytest.raises(ReviewAdmissionRefused, match="RED_TEAM_REFUSED: Ukrainian-language reviews stay cross-family"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
             review_profile="code",
             review_mode="red_team",
             review_task_id="other-task",
             review_facts=facts_for({"openai"}),
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk="critical",
             **scope,
             claude_account=HOST_ACCOUNT,
@@ -664,7 +667,7 @@ def test_red_team_author_record_own_id_refused(tmp_path, monkeypatch, archived):
             {
                 "repository": REPOSITORY,
                 "agent": "codex",
-                "model": "gpt-6.1-sol",
+                "model": CURRENT_SOL,
                 "task_id": " CODEX/Original Author! ",
             }
         )
@@ -681,10 +684,10 @@ def test_red_team_author_record_own_id_refused(tmp_path, monkeypatch, archived):
     with pytest.raises(ReviewAdmissionRefused, match="SELF_REVIEW_DETECTED"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
-            review_author_model="gpt-6.1-sol",
+            review_author_model=CURRENT_SOL,
             review_risk="critical",
             review_mode="red_team",
             review_task_id="original-author",
@@ -694,7 +697,7 @@ def test_red_team_author_record_own_id_refused(tmp_path, monkeypatch, archived):
 
 
 @pytest.mark.parametrize(
-    "seat,model", [("codex", "gpt-6.1-sol"), ("cursor", "gpt-6.1-sol"), ("claude", "gpt-6.1-sol[1m]")]
+    "seat,model", [("codex", CURRENT_SOL), ("cursor", CURRENT_SOL), ("claude", f"{CURRENT_SOL}[1m]")]
 )
 def test_red_team_same_model_any_harness_refused(seat, model):
     from tests.review.record_support import facts_for
@@ -707,7 +710,7 @@ def test_red_team_same_model_any_harness_refused(seat, model):
             review_dispatch=True,
             review_mode="red_team",
             review_task_id="other-task",
-            review_author_model="codex:gpt-6.1-sol-high",
+            review_author_model=f"codex:{CURRENT_SOL}-high",
             review_facts=facts_for({"openai"}),
             claude_account=HOST_ACCOUNT,
         )
@@ -723,7 +726,7 @@ def test_red_team_no_validated_author_refused_without_comparison_model():
     ):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
             review_mode="red_team",
@@ -746,7 +749,7 @@ def test_red_team_admission_known_author_with_unknown_history(monkeypatch, expli
         ),
     )
     options = dict(
-        model="gpt-6.1-sol",
+        model=CURRENT_SOL,
         mode="read-only",
         review_dispatch=True,
         review_mode="red_team",
@@ -767,7 +770,7 @@ def test_red_team_admission_known_author_with_unknown_history(monkeypatch, expli
             resolve_and_admit(("codex",), **options, claude_account=HOST_ACCOUNT)
     else:
         (target,) = resolve_and_admit(("codex",), **options, claude_account=HOST_ACCOUNT)
-        assert target.recipient == "codex" and target.model == "gpt-6.1-sol"
+        assert target.recipient == "codex" and target.model == CURRENT_SOL
 
 
 def test_red_team_malformed_routing_diagnostics_is_typed_refusal():
@@ -776,7 +779,7 @@ def test_red_team_malformed_routing_diagnostics_is_typed_refusal():
     with pytest.raises(ReviewAdmissionRefused, match="RED_TEAM_REFUSED: routing state unavailable"):
         resolve_and_admit(
             ("codex",),
-            model="gpt-6.1-sol",
+            model=CURRENT_SOL,
             mode="read-only",
             review_dispatch=True,
             review_profile="code",

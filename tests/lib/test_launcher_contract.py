@@ -40,6 +40,9 @@ from tests.rules_core_view import (
     install_loader_bypass,
     rules_core_absent_when_marked,  # noqa: F401  (autouse: serves @rules_core_absent)
 )
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = [pytest.mark.usefixtures("configured_roots"), pytest.mark.usefixtures("hermetic_monitor"), pytest.mark.usefixtures("isolated_monitor_state")]
 
@@ -285,7 +288,7 @@ def test_driver_requires_certified_model_and_valid_epic() -> None:
 
 
 def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
-    sustained = run_launcher("start-codex-driver.sh", "--epic", "devops", "--model", "gpt-6.1-sol")
+    sustained = run_launcher("start-codex-driver.sh", "--epic", "devops", "--model", CURRENT_SOL)
     assert sustained.returncode == 0, sustained.stderr
     assert "would probe" in sustained.stdout
     assert sustained.stdout.index("would claim lease") < sustained.stdout.index("would mint and bootstrap")
@@ -307,7 +310,7 @@ def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
 
     governor = run_launcher("start-codex-driver.sh", "--governor", "AUTO", env={"SESSION_EPIC": "foreign"})
     assert governor.returncode == 0, governor.stderr
-    assert "--model gpt-6.1-sol" in governor.stdout
+    assert f"--model {CURRENT_SOL}" in governor.stdout
     assert "governor SESSION_EPIC=<unset>" in governor.stdout
     assert "would claim lease" not in governor.stdout
 
@@ -315,9 +318,10 @@ def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
 @pytest.mark.parametrize(
     ("launcher", "args", "model", "effort"),
     [
-        ("start-codex.sh", [], "gpt-6.1-sol", "high"),
-        ("start-codex-driver.sh", ["--epic", "devops"], "gpt-6.1-sol", "high"),
-        ("start-codex.sh", ["--model", "gpt-6.1-sol", "--effort", "max"], "gpt-6.1-sol", "max"),
+        ("start-codex.sh", [], CURRENT_SOL, "high"),
+        ("start-codex-driver.sh", ["--epic", "devops"], CURRENT_SOL, "high"),
+        # A non-default effort the current Sol offers (models.<id>.efforts); max is refused.
+        ("start-codex.sh", ["--model", CURRENT_SOL, "--effort", "medium"], CURRENT_SOL, "medium"),
     ],
 )
 def test_codex_launchers_pin_roles_and_preserve_explicit_effort(launcher, args, model, effort):

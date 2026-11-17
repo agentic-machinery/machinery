@@ -75,18 +75,18 @@ lint: #5642 / `lu_machinery/lint/lint_fleet_roster.py`.
 
 | Seat | Default (loop) | Escalate (deep) | Cross-family CF as *reviewer* |
 | --- | --- | --- | --- |
-| **claude** | `claude-opus-5-5` @ high (operator 2026-09-22) | **`gpt-6.1-sol` @ high** (cross-family) | yes (`ask-claude --type review`; Sonnet default, Opus 5.5 escalation) |
-| **codex** | `gpt-6.1-sol` @ high | **`gpt-6.1-sol` @ high** | yes (`ask-codex --type review`) |
+| **claude** | `claude-opus-5-5` @ high (operator 2026-09-22) | **`gpt-6.2-sol` @ high** (cross-family) | yes (`ask-claude --type review`; Sonnet default, Opus 5.5 escalation) |
+| **codex** | `gpt-6.2-sol` @ high | **`gpt-6.2-sol` @ high** | yes (`ask-codex --type review`) |
 | **grok** | `grok-4.7` @ high | same SKU (Cursor = avail. fallback) | yes (`ask-grok --type review`) |
 | **agy** | `gemini-3.8-flash-high` @ high | **`gemini-3.8-flash-high` @ high** | no until #5555 — still *requests* CF |
-| **cursor** | `grok-4.7` @ high (or `composer-2.5`; Auto only for a well-defined coding dispatch) | **`gpt-6.1-sol` @ high** | no — formal CF requires attested `resolved_model` |
+| **cursor** | `grok-4.7` @ high (or `composer-2.5`; Auto only for a well-defined coding dispatch) | **`gpt-6.2-sol` @ high** | no — formal CF requires attested `resolved_model` |
 
 <!-- fleet-roster-projection:begin orchestrator_seats -->
 | seat | model_id | effort | escalate_model_id | escalate_effort |
 | --- | --- | --- | --- | --- |
 | agy | gemini-3.8-flash-high | high | gemini-3.8-flash-high | high |
-| claude | claude-opus-5-5 | high | gpt-6.1-sol | high |
-| codex | gpt-6.1-sol | high | gpt-6.1-sol | high |
+| claude | claude-opus-5-5 | high | gpt-6.2-sol | high |
+| codex | gpt-6.2-sol | high | gpt-6.2-sol | high |
 <!-- fleet-roster-projection:end orchestrator_seats -->
 
 Escalate when: architecture, hard multi-file judgment, high-stakes synthesis — not routine queue.
@@ -97,7 +97,7 @@ Escalate when: architecture, hard multi-file judgment, high-stakes synthesis —
 # Claude escalate
 .venv/bin/python lu_machinery/dispatch.py dispatch --agent claude --model claude-opus-5-5 ...
 # Codex named advisor escalate
-.venv/bin/python lu_machinery/dispatch.py dispatch --agent codex --model gpt-6.1-sol ...
+.venv/bin/python lu_machinery/dispatch.py dispatch --agent codex --model gpt-6.2-sol ...
 ```
 
 ## Formal CF defaults (orchestrator-ready)

@@ -308,7 +308,7 @@ report-only.
 
 1. **Precondition.** The operator confirms the 2026-10-08 change to `BLANK` was not
    deliberate. If it was, the operator decides and this procedure stops.
-2. **Designated approval.** Opus 5.5 and Sol 6.1 agree on `PR_TITLE` /
+2. **Designated approval.** Opus 5.5 and Sol 6.2 agree on `PR_TITLE` /
    `COMMIT_MESSAGES` (the amended design is endorsed by both).
 3. **Apply and read back.** The operator records the old values, sets
    `squash_merge_commit_title=PR_TITLE` and `squash_merge_commit_message=COMMIT_MESSAGES`,

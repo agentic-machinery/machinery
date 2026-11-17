@@ -24,8 +24,10 @@ from lu_machinery.review.model_catalog import (
     apply_cursor_model_pins,
     canonical_model_id,
     cursor_pinned_models,
+    effort_refusal,
     is_cursor_auto_selector,
     load_model_catalog,
+    mode_refusal,
     retired_model_refusal,
     unknown_model_refusal,
 )
@@ -156,6 +158,9 @@ def _normalize_native_claude_alias(agent: str, model: str) -> str:
     return resolved
 
 
+_REPEATABLE_SELECTORS = frozenset({"subject_seat", "subject_family", "review_subject_seats", "review_subject_families"})
+
+
 def check_model_admission(agent: str, model: str, mode: str, options: dict, prompt: bytes) -> None:
     """Refuse an unknown model, a reviewer without a review role, and keep the temporary reviewer exception closed.
 
@@ -194,13 +199,24 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
             names = sorted(name for name in listed if canonical_model_id(name, catalog) == identity)
             raise ValueError(f"model {model!r} is not an AGY selector the model catalog lists for "
                              f"{identity}; listed: {', '.join(names) or 'none'}")
+    # Operator 2026-11-17: an effort outside the model's catalog list is refused, never mapped.
+    if refusal := effort_refusal(identity, options.get("effort"), catalog):
+        raise ValueError(refusal)
+    if refusal := mode_refusal(identity, mode, catalog):
+        raise ValueError(refusal)
     if not catalog["models"].get(identity, {}).get("red_team_only"):
         # Every role refuses a retired catalog model, not only review (product #12946).
         if refusal := retired_model_refusal(model, catalog):
             raise ValueError(refusal)
         # Review typing is the one dispatch role admission infers: every review flag, --risk,
         # --review-mode, --language-lane, the subject selectors and a review research role.
-        reviewed = identity is not None and "review" in dispatch_roles(options)
+        # Provider re-checks read the task's str()-serialized options, where an unused repeatable
+        # selector (--subject-seat, --subject-family) arrives as "[]"; that empty selector must not
+        # type the run as a review. Only those list fields are normalized: a scalar review flag
+        # given the literal value "[]" (--review-mode '[]') still types the run as a review.
+        typed = {key: value for key, value in options.items()
+                 if key not in _REPEATABLE_SELECTORS or value not in ([], "[]")}
+        reviewed = identity is not None and "review" in dispatch_roles(typed)
         if reviewed and (refusal := activity_role_refusal(identity, REVIEW_ACTIVITY, catalog)):
             raise ValueError(refusal)
         return

@@ -16,7 +16,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from tests.helpers import current_sol
 from tests.helpers.wheel import install_release, release_wheel
+
+CURRENT_SOL = current_sol()
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 _PRODUCT_TREE = REPO_ROOT / "tests" / "fixtures" / "product_tree"
@@ -90,7 +93,7 @@ def test_installed_dispatch_from_linked_product_worktree_stays_installed(tmp_pat
             "--agent",
             "sol",
             "--model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "--effort",
             "high",
             "--mode",
