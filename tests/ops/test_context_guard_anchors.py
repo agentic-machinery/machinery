@@ -139,15 +139,15 @@ def test_db_handoff_note_lets_a_lane_with_stale_markdown_exit(
         "statement": "1. Render then check first.\n2. Settle the held review.\n3. Dispatch the next worker.\n",
         "done_when": "The successor verifies the exact lineage.",
     }
-    reads: list[tuple[str, str]] = []
+    reads: list[str] = []
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
-    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane, owner: reads.append((lane, owner)) or note)
+    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane) or note)
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.tick(LANE)
     assert h.fake.typed(LANE) == ["/quit"]
     assert alerts(h) == []
-    assert reads and set(reads) == {("atlas", SENDER)}
+    assert reads and set(reads) == {"atlas"}
 
 
 @pytest.mark.parametrize(
@@ -337,7 +337,7 @@ def launcher_selection(repo: Path):
         epic="atlas",
         stream_id="lane-test",
         stream_entries=list(STREAM),
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas", slot=SENDER),
+        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
     )
 
 
@@ -349,7 +349,7 @@ def test_shared_verdict_agrees_with_the_launcher_selector(tmp_path: Path, launch
     verdict = handoff_select.check_handoff_anchors(
         repo=repo,
         epic="atlas",
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas", slot=SENDER),
+        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
         stream_id="lane-test",
         stream_entries=STREAM,
     )
@@ -383,7 +383,7 @@ def test_absent_handoff_is_reported_as_no_handoff_for_the_fail_open_path(tmp_pat
     verdict = handoff_select.check_handoff_anchors(
         repo=repo,
         epic="atlas",
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas", slot=SENDER),
+        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
         stream_id="lane-test",
         stream_entries=STREAM,
     )
@@ -427,7 +427,7 @@ def test_ambient_session_stream_from_another_lane_cannot_exit_a_short_handoff(
             epic=EPIC,
             stream_id=lane_stream,
             stream_entries=entries(lane_stream),
-            candidates=handoff_select.load_codex_mint_candidates(repo, EPIC, slot=SENDER),
+            candidates=handoff_select.load_codex_mint_candidates(repo, EPIC),
         ).reason
     )
     assert not launcher_ok

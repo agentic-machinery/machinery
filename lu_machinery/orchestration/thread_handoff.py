@@ -3671,6 +3671,7 @@ def render_bootstrap_prompt(
                 "",
                 "Rules:",
                 "- Continue from the durable packet exactly; do not fork, continue, or resume provider conversation history.",
+                "- For a launcher-bound lane, handoff content is its DB note (`lu-driver-state render --lane <lane>`, then `lu-driver-state show <its ID>`), not the packet or role handoff files above.",
                 f"- Keep the invoking checkout clean at prepared HEAD {replacement.get('source_checkout', {}).get('full_head', 'unknown')} through resume and confirmation (clean fast-forward advances are tolerated).",
                 "- Keep the main checkout read-only; thread rollover state belongs in gitignored .agent/ files.",
                 "- Use dispatch worktrees for implementation work: .worktrees/dispatch/<agent>/<task>/.",
@@ -6486,7 +6487,7 @@ def render_session_start_context(
         [
             f".venv/bin/python {_PACKAGE_DIR}/thread_handoff.py confirm-replacement -a {agent} -l {lineage_id} -r {rollover_id}{stream_arg}",
             "```",
-            "Read the durable handoff before confirming. A different replacement ID fails closed.",
+            "Read the handoff before confirming; a lane reads its DB note (lane banner), never this packet. A different replacement ID fails closed.",
         ]
     )
     if candidate.get("excluded_terminal"):
