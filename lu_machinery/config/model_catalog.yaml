@@ -721,9 +721,11 @@ models:
     # selection only. They are not aliases: dispatch rewrites an alias to the wire
     # id, so an alias would run -medium.
     runtime_model_ids: [gemini-4-carbon-high, gemini-4-carbon-low]
-    # Gemini work defaults to gemini-4-hydrogen (operator 2026-11-17). Carbon
-    # holds no review-of-record seat or ladder entry.
-    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
+    # Not a Gemini work route: Gemini work defaults to gemini-4-hydrogen
+    # (operator 2026-11-17). The advisory (consult) role admits ACP asks;
+    # read-only review dispatches without review typing need no role. It holds
+    # no review role, seat or ladder entry, so it is never a review of record.
+    roles: [advisory]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, terminal_bench_coding]
     weaknesses:
@@ -736,8 +738,8 @@ models:
       - agy_selector_thinking_level_mapping_unverified
     notes: >-
       Operator orders 2026-11-17: Gemini 4 Carbon is used for read-only review
-      and security-review dispatches outside the review-of-record ladders, and
-      not as a Gemini work route; Gemini work defaults to Gemini 4 Hydrogen at
+      and security-review dispatches outside the review-of-record ladders and
+      for advisory asks, and not as a Gemini work route; Gemini work defaults to Gemini 4 Hydrogen at
       medium. Review ladders, review seats, the Ukrainian review route and the
       certified Gemini driver seat (orchestrator_seats.agy) are unchanged. Live
       `agy models` probes on 2026-11-10 (19:50Z and 20:03Z) list
@@ -771,10 +773,8 @@ models:
     # -medium is the routing wire id; -low, -high and -xhigh are runtime ids for
     # explicit selection and identity attestation, not aliases.
     runtime_model_ids: [gemini-4-hydrogen-low, gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh]
-    # Work roles plus advisory and non-record surface_review for council answers
-    # and parallel non-record reviews (USE-HYDROGEN-1117, HYDROGEN-COUNCIL-ALL-1117);
-    # stays out of review_ladders and seats (not a review-of-record seat).
-    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis, advisory, surface_review]
+    # Work roles only: no review, Ukrainian review or advisory role.
+    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels, lower_price_than_carbon]
     weaknesses:
@@ -793,12 +793,10 @@ models:
       gemini-4-hydrogen-xhigh, gemini-4-hydrogen-medium and
       gemini-4-hydrogen-low. Dispatch: `python -m lu_machinery.dispatch dispatch
       --agent agy --model gemini-4-hydrogen-medium`; -low, -high and -xhigh are
-      explicit selections only. Under operator orders USE-HYDROGEN-1117 and
-      HYDROGEN-COUNCIL-ALL-1117 (2026-11-17) it also holds advisory and
-      non-record surface_review roles for council answers and parallel
-      non-record reviews, which are input, never designated approval or review
-      of record; it stays out of the review-of-record ladders, and the Ukrainian
-      review route and the certified Gemini driver seat are unchanged. Model card (2026-11-12):
+      explicit selections only. Hydrogen holds no review role, so it is refused
+      for any review of record; it is not a council member. Review ladders, the
+      Ukrainian review route and the certified Gemini driver seat are unchanged.
+      Model card (2026-11-12):
       adapted from Gemini 4 Carbon, one 1M-token window shared by input and
       output (64K synchronous output by default), knowledge cutoff March 2026,
       four thinking levels, occasional slowness or timeouts and higher token use
