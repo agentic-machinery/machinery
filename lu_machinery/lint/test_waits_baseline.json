@@ -1,0 +1,607 @@
+{
+  "schema": "test-waits-baseline.v1",
+  "entries": [
+    {
+      "path": "tests/agent_runtime/test_acpx_adapter.py",
+      "kind": "sleep",
+      "scope": "test_r75_runner_cancellation_releases_the_copy.cancel",
+      "fingerprint": "5635b66178ae2139081cfb3b90ebceaa5fd70a8dbca0c1a9db5d8cf13e2868cd",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_attempt_network.py",
+      "kind": "timer-poll",
+      "scope": "test_resolver_hang_and_cancellation_reap_child",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_attempt_network.py",
+      "kind": "timer-poll",
+      "scope": "test_success_is_byte_only_and_logs_no_payload",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_delegate_readonly_guard.py",
+      "kind": "sleep",
+      "scope": "test_read_only_agy_cwd_pin_fails_when_child_anchors_outside",
+      "fingerprint": "efc8863a3ce5b2dd08e4fef4aa6f192783b3915f1dc366ff11cfc0c4a357a16b",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_delegate_readonly_guard.py",
+      "kind": "timer-poll",
+      "scope": "test_read_only_agy_cwd_pin_allows_late_settle",
+      "fingerprint": "46e07dd7394583c2f60cccd4cbba45c0eaade5bab2d4360e0b903d9e2c3797ec",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_pty_subprocess_wrap.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_line",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/agent_runtime/test_pty_subprocess_wrap.py",
+      "kind": "timer-poll",
+      "scope": "test_pty_streamer_handles_utf8_split_across_read_boundary",
+      "fingerprint": "b7cfb5647f47bcc212d89ab6e700c37072f80a026483ee9dfefeba94c2438d5d",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ai_agent_bridge/test_ab_channel_watch.py",
+      "kind": "sleep",
+      "scope": "test_run_inbox_emits_watch_events_with_heartbeat._slow_invoke",
+      "fingerprint": "ca5e2d1241b1486f679a90745426a32a4caf01eefc6192f73cfdfc56165e11b1",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ai_agent_bridge/test_openai_proxy_healthz.py",
+      "kind": "sleep",
+      "scope": "_make_probes._make._probe",
+      "fingerprint": "547a641a5bbd6b09d4ca944f655ab52f10b54c975d33099b13a40f07865b4f4b",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_account_logins.py",
+      "kind": "timer-poll",
+      "scope": "test_incomplete_probe_is_unknown_and_leaves_no_process_or_reader",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_claude_account_usage.py",
+      "kind": "timer-poll",
+      "scope": "_gone_within",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_delegate_api.py",
+      "kind": "sleep",
+      "scope": "test_active_snapshot_never_collects_on_requests.failing_collection_still_closes",
+      "fingerprint": "8266f0295d2dc07dcb7d645ab37da68a38b87e0ab05c4b54b2cc15c29723575f",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_delegate_api.py",
+      "kind": "sleep",
+      "scope": "test_periodic_snapshot_refreshes_only_while_read.scenario",
+      "fingerprint": "42515b21ba17de138b2f18f01b08a208f91c160d45a6e9a7d58464fdfd922276",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_delegate_api.py",
+      "kind": "sleep",
+      "scope": "test_periodic_snapshot_refreshes_only_while_read.scenario",
+      "fingerprint": "e6ba0cb800a0c9101b990df69ca70cb409e0522ac2bd809906eb75c76709b73c",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_delegate_api.py",
+      "kind": "timer-poll",
+      "scope": "_snapshot_client",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_delegate_api.py",
+      "kind": "timer-poll",
+      "scope": "test_periodic_snapshot_refreshes_only_while_read.until",
+      "fingerprint": "8266f0295d2dc07dcb7d645ab37da68a38b87e0ab05c4b54b2cc15c29723575f",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_fleet_workers_unmocked.py",
+      "kind": "timer-poll",
+      "scope": "_snapshot_client",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_github_graphql_budget.py",
+      "kind": "sleep",
+      "scope": "test_ttl_cache_and_single_flight",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_model_stats.py",
+      "kind": "sleep",
+      "scope": "test_per_model_figures_survive_settlement_backfill_and_retention",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_model_stats.py",
+      "kind": "timer-poll",
+      "scope": "test_cold_request_waits_for_the_collect_instead_of_a_poll",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_model_stats.py",
+      "kind": "timer-poll",
+      "scope": "test_cold_request_waits_for_the_collect_instead_of_a_poll.settled",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_orient_ctx_isolation.py",
+      "kind": "timer-poll",
+      "scope": "test_orient_warmer_skips_sections_without_recent_reads.until",
+      "fingerprint": "8266f0295d2dc07dcb7d645ab37da68a38b87e0ab05c4b54b2cc15c29723575f",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_project_state_collect.py",
+      "kind": "timer-poll",
+      "scope": "test_running_release_keeps_serving_archived_code_after_checkout_mutation",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_release_snapshot.py",
+      "kind": "timer-poll",
+      "scope": "test_product_release_serves_product_from_snapshot_and_machinery_from_install",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_routing_budget_endpoint.py",
+      "kind": "timer-poll",
+      "scope": "test_task_directory_aba_during_compute_refreshes_without_marking_source_stale.settle_refresh",
+      "fingerprint": "8266f0295d2dc07dcb7d645ab37da68a38b87e0ab05c4b54b2cc15c29723575f",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/api/test_routing_budget_endpoint.py",
+      "kind": "timer-poll",
+      "scope": "test_task_rewrite_serves_warm_snapshot_while_recompute_is_blocked.scenario",
+      "fingerprint": "8266f0295d2dc07dcb7d645ab37da68a38b87e0ab05c4b54b2cc15c29723575f",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ci/test_pytest_test_slots.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_files",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ci/test_pytest_test_slots.py",
+      "kind": "timer-poll",
+      "scope": "test_a_worker_that_cannot_join_its_controllers_hold_runs_no_test",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ci/test_pytest_test_slots.py",
+      "kind": "timer-poll",
+      "scope": "test_a_worker_that_cannot_join_its_controllers_hold_runs_no_test",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 1
+    },
+    {
+      "path": "tests/ci/test_test_env_sh.py",
+      "kind": "timer-poll",
+      "scope": "test_marker_is_never_visible_while_its_write_is_in_flight",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/ci/test_test_env_sh.py",
+      "kind": "timer-poll",
+      "scope": "test_marker_is_never_visible_while_its_write_is_in_flight",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/common/test_conftest_worktree_guard.py",
+      "kind": "timer-poll",
+      "scope": "test_popen_never_waited_is_reported_when_the_destination_appears",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/common/test_pytest_scratch_readonly.py",
+      "kind": "timer-poll",
+      "scope": "test_a_terminated_session_removes_its_run",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/common/test_test_slots_review_hold.py",
+      "kind": "timer-poll",
+      "scope": "test_slots_stay_taken_while_a_review_test_run_outlives_its_holder",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/common/wait_helpers.py",
+      "kind": "timer-poll",
+      "scope": "wait_for_line",
+      "fingerprint": "6d96900c7eeda6d1696e265c69e46f22ce51969dfe85b1f0f4824dfb6de96891",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/common/wait_helpers.py",
+      "kind": "timer-poll",
+      "scope": "wait_until",
+      "fingerprint": "51b050b25b8f4978e351449cd8c087dc19b8c82e9a574ee2e00bf51e623d1c1c",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/conftest.py",
+      "kind": "flaky",
+      "scope": "pytest_collection_modifyitems",
+      "fingerprint": "ba8e94ce07496c65c048edba4fa6f709b270f6b79049f13396a9fe00cb0a4994",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/conftest.py",
+      "kind": "timer-poll",
+      "scope": "await_file",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/conftest.py",
+      "kind": "timer-poll",
+      "scope": "sandbox.settle",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/stub_provider.py",
+      "kind": "sleep",
+      "scope": "main",
+      "fingerprint": "e2cee8d3ffa7ce445d86e2c153d1b6818b3fa25e2198d54b64d01294ea5f36e1",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/stub_provider.py",
+      "kind": "timer-poll",
+      "scope": "main",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_agy_readonly_inputs.py",
+      "kind": "timer-poll",
+      "scope": "test_ro_bind_records_digest",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_core_branch_start.py",
+      "kind": "timer-poll",
+      "scope": "test_scheduled_recovery_settles_terminal_task_left_by_crash",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_core_branch_start.py",
+      "kind": "timer-poll",
+      "scope": "test_scheduled_recovery_settles_terminal_task_left_by_crash",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 1
+    },
+    {
+      "path": "tests/dispatcher/test_core_review_gate_supervision.py",
+      "kind": "timer-poll",
+      "scope": "_killed_review_supervisor",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_core_review_gate_supervision.py",
+      "kind": "timer-poll",
+      "scope": "test_a_governed_turn_in_flight_keeps_its_slots_past_a_killed_supervisor_and_nothing_new_joins",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_core_review_gate_supervision.py",
+      "kind": "timer-poll",
+      "scope": "test_a_slot_holding_preload_starts_no_thread_pool_that_keeps_the_review_hold",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_core_scope_verification.py",
+      "kind": "timer-poll",
+      "scope": "TestHooksAndSettlementShareScope.test_paused_task_resumes_in_same_worktree_and_wait_reports_usage",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_providers_b.py",
+      "kind": "timer-poll",
+      "scope": "test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_providers_b.py",
+      "kind": "timer-poll",
+      "scope": "test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 1
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_crash_recovery_keeps_worktree_while_the_orphaned_provider_runs",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_crash_recovery_keeps_worktree_while_the_orphaned_provider_runs",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 1
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_crash_recovery_keeps_worktree_while_the_orphaned_provider_runs",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 2
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_settlement_keeps_a_worktree_that_a_live_task_borrowed",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_settlement_keeps_a_worktree_that_a_live_task_borrowed",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 1
+    },
+    {
+      "path": "tests/dispatcher/test_retention_inventory.py",
+      "kind": "timer-poll",
+      "scope": "test_settlement_keeps_a_worktree_that_a_live_task_borrowed",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 2
+    },
+    {
+      "path": "tests/epics_monitor_stub.py",
+      "kind": "timer-poll",
+      "scope": "epics_monitor_stub",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/fleet_comms/test_pg_schema_ledger.py",
+      "kind": "timer-poll",
+      "scope": "test_apply_pg_schema_waits_for_concurrent_migration",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/lib/test_launcher_contract.py",
+      "kind": "sleep",
+      "scope": "test_launcher_death_stops_renewal_with_live_provider",
+      "fingerprint": "0b22ec6b15c65dd519ea10716969b5f4c2fd9f43de0eb525e7f1cfedc59e5a2c",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/lib/test_launcher_contract.py",
+      "kind": "sleep",
+      "scope": "test_launcher_death_stops_renewal_with_live_provider",
+      "fingerprint": "df9eabdd75d6f96cd79481a80cc1be3fc9714073721064faf47f2d0a3c021466",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/lib/test_launcher_contract.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_launcher_readiness",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/lib/test_launcher_contract.py",
+      "kind": "timer-poll",
+      "scope": "test_launcher_death_stops_renewal_with_live_provider",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/lib/test_launcher_contract.py",
+      "kind": "timer-poll",
+      "scope": "test_restarted_watcher_retains_same_delivery_until_successor_cli_recovers",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/task_family/test_rollover.py",
+      "kind": "timer-poll",
+      "scope": "test_advisory_lock_blocks_a_second_process_until_release",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/task_family/test_rollover.py",
+      "kind": "timer-poll",
+      "scope": "test_advisory_lock_honors_hook_deadline",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_claudex_supervisor.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_log",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_claudex_supervisor.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_runtime",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_dispatch_isolation.py",
+      "kind": "timer-poll",
+      "scope": "_scope_is_gone",
+      "fingerprint": "53cdb121e64c5147f8cd9fbed11dc6df103232abfbaa06f95dee129102710fde",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_dispatch_isolation.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_child_ready",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_dispatch_isolation.py",
+      "kind": "timer-poll",
+      "scope": "test_worker_image_at_timeout_is_kept",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_scheduled_worktree_cleanup.py",
+      "kind": "timer-poll",
+      "scope": "test_maintenance_timeout_terminates_git_tree_and_recovers",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/orchestration/test_worker_leftovers.py",
+      "kind": "timer-poll",
+      "scope": "test_live_worker_server_shaped_process_is_selected_and_terminated_through_proc",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/storage/test_reactivation.py",
+      "kind": "timer-poll",
+      "scope": "test_reactivation_reader_waits_for_complete_a_and_k",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/test_agent_runtime.py",
+      "kind": "sleep",
+      "scope": "test_invoke_early_reap_fires_and_recovers_response.poll_tick",
+      "fingerprint": "b293e5c56bf2e1ec062c5575d43cc60f775c6bb4a43c3f72398a5f8845de4154",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/test_agent_runtime.py",
+      "kind": "timer-poll",
+      "scope": "test_typed_publisher_cleans_snapshots_and_child_on_sigterm",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/tools/test_detach_session_task.py",
+      "kind": "timer-poll",
+      "scope": "_stop_process",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/tools/test_detach_session_task.py",
+      "kind": "timer-poll",
+      "scope": "_wait_for_text",
+      "fingerprint": "da9c4ea4f018461403459401ce1d1c47aecb7d9a8cb03d8b8a0e890cdea407ed",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/wait_helpers.py",
+      "kind": "timer-poll",
+      "scope": "wait_for_line",
+      "fingerprint": "6d96900c7eeda6d1696e265c69e46f22ce51969dfe85b1f0f4824dfb6de96891",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/wait_helpers.py",
+      "kind": "timer-poll",
+      "scope": "wait_until",
+      "fingerprint": "51b050b25b8f4978e351449cd8c087dc19b8c82e9a574ee2e00bf51e623d1c1c",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "sleep",
+      "scope": "test_overlapping_rebuild_after_wait_timeout_discards_late_result",
+      "fingerprint": "7d93e7c7fc165e9dd7e5793c5d8835c82fa9a8acb70d9687699520d913bc3e54",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "sleep",
+      "scope": "test_overlapping_rebuild_after_wait_timeout_discards_late_result",
+      "fingerprint": "efc8863a3ce5b2dd08e4fef4aa6f192783b3915f1dc366ff11cfc0c4a357a16b",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "sleep",
+      "scope": "test_periodic_refresh_keeps_idle_next_warm",
+      "fingerprint": "6cc0d4e84dec7b8de0c6afe846f6b36e804e3cf711bca62d3f51844616065217",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "sleep",
+      "scope": "test_periodic_refresh_keeps_idle_next_warm",
+      "fingerprint": "f9019effb240932d6db923dff7dc7c7138a7856322f668fab0ec31f4c0d320af",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "sleep",
+      "scope": "test_projection_timeout_fallback_downgrades_decision_fields",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_api.py",
+      "kind": "timer-poll",
+      "scope": "test_periodic_refresh_keeps_idle_next_warm",
+      "fingerprint": "9dc9815d3efae707cc3d93b6db18997fd32e0ee5f00d7af94ad60d10ae671a94",
+      "occurrence": 0
+    },
+    {
+      "path": "tests/work/test_work_contract.py",
+      "kind": "sleep",
+      "scope": "test_work_projection_single_flight_under_concurrent_load.slow_build",
+      "fingerprint": "23ad923543e1dd1e2b8bc805ea8abf22c163f1d1790b570dc1f0292ec2300977",
+      "occurrence": 0
+    }
+  ]
+}

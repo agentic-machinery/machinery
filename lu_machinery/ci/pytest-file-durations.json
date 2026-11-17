@@ -67,7 +67,6 @@
   "tests/agent_runtime/test_gemini_adapter_auth.py": 1.738,
   "tests/agent_runtime/test_gemini_retired_agy_alias.py": 0.191,
   "tests/agent_runtime/test_git_shim_guard.py": 164.372,
-  "tests/agent_runtime/test_glm_lane_session_canary.py": 8.354,
   "tests/agent_runtime/test_grok_build_adapter.py": 2.696,
   "tests/agent_runtime/test_grok_hook_bridge_release.py": 0.073,
   "tests/agent_runtime/test_grok_message_boundaries.py": 0.505,

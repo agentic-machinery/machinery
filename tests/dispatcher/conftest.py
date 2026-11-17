@@ -379,7 +379,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
     from lu_machinery.orchestration import pr_ownership
 
     world = SimpleNamespace(
-        prs={}, files={}, listed=[], published=(None, True), lookup_error=None,
+        prs={}, files={}, messages={}, listed=[], search_listed=None, closed_pages=None, published=(None, True), lookup_error=None,
         record={
             "task_id": "merge-probe", "agent": "claude", "mode": "workspace-write", "status": "done", "error": None,
             "owned_paths": ["docs/owned.md"], "worktree_remote_url": "https://github.com/org/repo.git",
@@ -394,16 +394,30 @@ def merged_delivery_world(tmp_path, monkeypatch):
         if world.lookup_error:
             raise world.lookup_error
         words = args[1:]
-        out = (json.dumps([{"number": pr["number"],
-                            "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
-                            "base": {"repo": {"full_name": "other/repo" if pr["isCrossRepository"] else "org/repo"}}}
-                           for pr in world.listed if "headRefOid" in pr])
-               if words[0] == "api" and words[2].endswith("/pulls")
-               else json.dumps("deliver\n\nX-Agent: claude/merge-probe")
-               if words[0] == "api" and words[2].endswith("/commits")
-               else json.dumps(world.listed) if words[:2] == ["pr", "list"]
-               else json.dumps(world.prs[int(words[2])]) if words[:2] == ["pr", "view"]
-               else "\n".join(json.dumps(name) for name in world.files[int(words[2].split("/")[4])]))
+        if words[0] == "api" and "pulls?state=closed" in words[1]:
+            page = int(words[1].rsplit("page=", 1)[1])
+            listed = (world.closed_pages.get(page, []) if world.closed_pages is not None else [
+                {"number": pr["number"], "head": {"ref": pr["headRefName"]},
+                 "merged_at": world.prs[pr["number"]].get("mergedAt"),
+                 "updated_at": world.prs[pr["number"]].get("mergedAt", "2026-10-29T09:00:00Z")}
+                for pr in world.listed] if page == 1 else [])
+            out = json.dumps(listed)
+        elif words[:2] == ["pr", "view"]:
+            number = int(words[2])
+            branch = next((pr["headRefName"] for pr in world.listed if pr["number"] == number),
+                          world.record["worktree_branch"])
+            out = json.dumps({"headRefName": branch, **world.prs[number]})
+        else:
+            out = (json.dumps([{"number": pr["number"],
+                                "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
+                                "base": {"repo": {"full_name": "other/repo" if pr["isCrossRepository"] else "org/repo"}}}
+                               for pr in world.listed if "headRefOid" in pr])
+                   if words[0] == "api" and words[2].endswith("/pulls")
+                   else json.dumps(world.messages.get(int(words[2].split("/")[4]), "deliver\n\nX-Agent: claude/merge-probe"))
+                   if words[0] == "api" and words[2].endswith("/commits")
+                   else json.dumps(world.search_listed if "--search" in words and world.search_listed is not None
+                                   else world.listed) if words[:2] == ["pr", "list"]
+                   else "\n".join(json.dumps(name) for name in world.files[int(words[2].split("/")[4])]))
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     state = tmp_path / "state.json"

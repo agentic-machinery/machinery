@@ -50,7 +50,6 @@ def _run_hook(
         "__init__.py",
         "codex_lane.py",
         "gemini_lane.py",
-        "glm_lane.py",
         "grok_lane.py",
         "handoff_select.py",
         "shared_hydration.py",

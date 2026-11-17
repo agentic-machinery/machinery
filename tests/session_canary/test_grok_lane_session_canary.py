@@ -12,6 +12,7 @@ from lu_machinery.common.repo_root import machinery_path
 import pytest
 from lu_machinery.session_canary import diary
 from lu_machinery.session_canary import grok_lane as gl
+from lu_machinery.session_canary import handoff_select
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -69,7 +70,7 @@ def test_build_facts_exactly_ten_from_stream_and_handoff() -> None:
 - Other lanes' queues
 - Primary checkout writes for product code
 """
-    facts = gl._build_facts(
+    facts = handoff_select.build_facts(
         epic="atlas",
         stream_id="epic:4387",
         stream_entries=stream,
@@ -86,7 +87,7 @@ def test_build_facts_exactly_ten_from_stream_and_handoff() -> None:
 
 def test_build_facts_fails_when_insufficient(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="could only derive"):
-        gl._build_facts(
+        handoff_select.build_facts(
             epic="atlas",
             stream_id="epic:4387",
             stream_entries=[{"type": "state", "body": "only one"}],
@@ -100,8 +101,8 @@ def test_mint_score_roundtrip_pass_and_fail(tmp_path: Path, monkeypatch: pytest.
     monkeypatch.setattr(diary, "try_stream_state_note", lambda *a, **k: None)
     monkeypatch.setattr(diary, "try_stream_tail_text", lambda *a, **k: "")
     monkeypatch.setattr(
-        gl,
-        "_load_stream_entries",
+        handoff_select,
+        "load_stream_entries",
         lambda *a, **k: (
             [
                 {"type": "binding_order", "body": f"Pinned binding order text {i} with enough content."}
@@ -224,7 +225,7 @@ def test_score_offline_preserves_handback_and_launcher_instructions(
     notes = []
     monkeypatch.setattr(diary, "try_stream_state_note", lambda *a, **k: notes.append(a))
     monkeypatch.setattr(diary, "try_stream_tail_text", lambda *a, **k: "")
-    monkeypatch.setattr(gl, "_load_stream_entries", lambda *a, **k: [])
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *a, **k: [])
     monkeypatch.setenv("SESSION_STREAM_ID", "epic:999999")
 
     def offline_scorer(command, **kwargs):

@@ -68,11 +68,14 @@ def test_merged_task_survives_missing_branch_search_and_provider_error(
 
     def gh(args, **_):
         words = args[1:]
-        if words[:2] == ["pr", "list"]:
+        if words[0] == "api" and "pulls?state=closed" in words[1]:
+            out = "[]"
+        elif words[:2] == ["pr", "list"]:
             out = "[]"  # Neither the recorded branch nor indexed SHA search discovers the replacement PR.
         elif words[:2] == ["pr", "view"]:
             out = json.dumps({"state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-11T18:55:00Z",
-                              "headRefOid": head, "mergeCommit": {"oid": merge}, "isCrossRepository": False})
+                              "headRefOid": head, "headRefName": record["worktree_branch"],
+                              "mergeCommit": {"oid": merge}, "isCrossRepository": False})
         elif f"commits/{head}/pulls" in words[2]:
             out = json.dumps([{"number": number, "head": {"sha": head, "repo": {"full_name": "org/repo"}},
                                "base": {"repo": {"full_name": "org/repo"}}}])
@@ -170,6 +173,7 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     pr = {"state": "OPEN" if case == "open" else "MERGED", "baseRefName": "other" if case == "wrong-base" else "main",
           "mergedAt": "2026-11-08T12:00:00Z" if case == "before-start" else "2026-11-08T12:50:00Z",
           "headRefOid": "b" * 40 if case == "merged-other-head" else head,
+          "headRefName": branch,
           "mergeCommit": None if case == "missing-merge" else {"oid": _git(work, "rev-parse", "main")},
           "isCrossRepository": case == "foreign-repository"}
 
@@ -185,7 +189,9 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
 
     def gh(args, **kwargs):
         words = args[1:]
-        if words[:2] == ["pr", "list"]:
+        if words[0] == "api" and "pulls?state=closed" in words[1]:
+            out = "[]"
+        elif words[:2] == ["pr", "list"]:
             if "--search" in words:
                 assert words[words.index("--search") + 1] == head
                 assert words[words.index("--state") + 1] == "merged"
@@ -257,7 +263,8 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         _git(work, "commit", "-am", "further work")
     worker._enforce_delivery(record)
     if case == "commit-unavailable":
-        assert association_requests == ([f"repos/org/repo/commits/{head}/pulls"] if replacement else [])
+        # Aggregation inspects association candidates even after an exact-branch match.
+        assert association_requests == [f"repos/org/repo/commits/{head}/pulls"]
     if (case in {"merged", "accepted-foreign-trailer", "accepted-reset"} or (case == "commit-unavailable" and not replacement)
             ) and tree in {"clean", "untracked"}:
         assert (record["status"], record["error"], record["delivery_pr"]) == ("done", None, "org/repo#7")
@@ -270,7 +277,10 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         assert (record["status"], record["error"]) == expected
         assert "delivery_pr" not in record
         if tree == "clean":
-            assert record["merged_delivery_lookup"] == "no_match"
+            # Exact-branch candidates reach history verification. Replacement candidates
+            # with another head are filtered by association before any fetch.
+            assert record["merged_delivery_lookup"] == (
+                "error:VerificationFetchError" if case == "merged-other-head" and not replacement else "no_match")
 
 
 def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, monkeypatch):
@@ -337,11 +347,16 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
 
     def gh(args, **_kwargs):
         words = args[1:]
-        if words[:2] == ["pr", "list"]:
+        if words[0] == "api" and "pulls?state=closed" in words[1]:
+            out = "[]"
+        elif words[:2] == ["pr", "list"]:
             out = json.dumps([{"number": 1250, "isCrossRepository": False, "headRefName": branch}])
         elif words[:2] == ["pr", "view"]:
             out = json.dumps({"state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-16T08:18:10Z",
-                              "headRefOid": head, "mergeCommit": {"oid": merge}, "isCrossRepository": False})
+                              "headRefOid": head, "headRefName": branch,
+                              "mergeCommit": {"oid": merge}, "isCrossRepository": False})
+        elif words[2].endswith("/pulls"):
+            out = "[]"
         elif words[2].endswith("/commits"):
             out = json.dumps("deliver\n\nX-Agent: claude/rescue-stacked\n")
         else:

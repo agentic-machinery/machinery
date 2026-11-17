@@ -8,9 +8,9 @@ import subprocess
 import pytest
 import yaml
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.session_canary import codex_lane, gemini_lane, glm_lane, grok_lane
+from lu_machinery.session_canary import codex_lane, gemini_lane, grok_lane, handoff_select
 
-LANES = (codex_lane, gemini_lane, glm_lane, grok_lane)
+LANES = (codex_lane, gemini_lane, grok_lane)
 
 
 def _selectors() -> list[str]:
@@ -54,7 +54,7 @@ def test_stream_precedence(lane, explicit, environment, expected, monkeypatch) -
 @pytest.mark.parametrize("selector", ["unknown-lane", "eval-harness", "infra.a1-upgrade", "$(exit 0)"])
 def test_unknown_and_retired_selectors_raise_typed_error(lane, selector, monkeypatch) -> None:
     monkeypatch.delenv("SESSION_STREAM_ID", raising=False)
-    with pytest.raises(grok_lane.StreamResolutionError, match="unresolved-stream-selector") as error:
+    with pytest.raises(handoff_select.StreamResolutionError, match="unresolved-stream-selector") as error:
         lane._stream_id(argparse.Namespace(epic=selector, stream=None))
     assert error.value.reason == "unresolved-stream-selector"
 
@@ -65,7 +65,7 @@ def test_resolver_reads_registry_changes_and_new_keys(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("HANDOFF_ISSUE_STREAMS_YAML", str(registry))
     monkeypatch.delenv("SESSION_STREAM_ID", raising=False)
     for selector in ("open-model-data", "infra.open-model-data", "new-lane", "infra.new-lane"):
-        assert grok_lane.resolve_stream_id(selector) == _shell_stream(selector)
+        assert handoff_select.resolve_stream_id(selector) == _shell_stream(selector)
 
 
 @pytest.mark.parametrize("failure", [OSError("unavailable"), subprocess.TimeoutExpired("bash", 1)])
@@ -75,6 +75,6 @@ def test_unavailable_resolver_raises_typed_error(failure, monkeypatch) -> None:
     def unavailable(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr(grok_lane.subprocess, "run", unavailable)
-    with pytest.raises(grok_lane.StreamResolutionError):
-        grok_lane.resolve_stream_id("open-model-data")
+    monkeypatch.setattr(handoff_select.subprocess, "run", unavailable)
+    with pytest.raises(handoff_select.StreamResolutionError):
+        handoff_select.resolve_stream_id("open-model-data")
