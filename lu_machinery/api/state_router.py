@@ -2525,20 +2525,6 @@ async def routing_budget(
     return _routing_budget_response(payload)
 
 
-def dispatch_routing_budget(ctx: MonitorContext) -> dict[str, Any]:
-    """The dispatch routing budget from the route's own cache entry.
-
-    Orient's ``capacity`` section reads the value ``GET /api/state/routing-budget``
-    and its startup warmup store, so the budget is computed once for both.
-    """
-    _observed, value = cache_get_or_compute(
-        _ctx_cache_key(ctx, "routing-budget", "dispatch", 0),
-        ROUTING_BUDGET_TTL_S,
-        _routing_budget_compute(ctx, "dispatch", False),
-    )
-    return value
-
-
 def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
     diagnostics = payload.get("diagnostics", {})
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
@@ -2556,7 +2542,8 @@ async def github_budget():
     An expired reading is served at once with its true age (``X-Snapshot-Age-S``)
     while one refresh asks GitHub again.
     """
-    value, age = await cache_read_swr("github_graphql_budget", GITHUB_BUDGET_TTL_S, probe_graphql_budget)
+    # A failed probe is kept for the minute too, as before: an outage must not send every read to GitHub.
+    value, age, _stored = await cache_read_swr("github_graphql_budget", GITHUB_BUDGET_TTL_S, probe_graphql_budget)
     return JSONResponse(content=value, headers=panel_values.snapshot_headers(age, GITHUB_BUDGET_TTL_S))
 
 

@@ -474,33 +474,68 @@ def _queue_swr_refresh(key: str, ttl: float, compute: Callable[[], object]) -> N
     _swr_refresh_executor.submit(_run)
 
 
-async def cache_read_swr(key: str, ttl: float, compute: Callable[[], T]) -> tuple[T, float]:  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-param support here
+class _Unstorable(Exception):
+    """A computed value that reports its own failure: served to its reader, never stored."""
+
+    def __init__(self, value: object) -> None:
+        super().__init__("value reports a failure")
+        self.value = value
+
+
+async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-param support here
+    key: str, ttl: float, compute: Callable[[], T], *, storable: Callable[[T], bool] | None = None,
+) -> tuple[T, float, bool]:
     """Stale-while-revalidate read: the stored value at once, with its true age.
 
-    A value older than ``ttl`` is still returned, with its real age, and one
-    background refresh is queued on the shared refresh threads. A value that
-    went unread past :data:`DEMAND_WINDOW_S` after it expired is dormant: that
-    read starts (or joins) one refresh and waits for it, off the event loop, up
-    to :data:`SWR_DORMANT_READ_WAIT_S`; a slower refresh leaves it the stored
-    value with its true age. Only the first read of a key waits for the whole
-    computation, which concurrent first reads share. A failed refresh keeps the
-    previous value, which keeps ageing. The age is the time since the value was
-    stored.
+    Returns ``(value, age, stored)``. A value older than ``ttl`` is still
+    returned, with its real age, and one background refresh is queued on the
+    shared refresh threads. A value that went unread past
+    :data:`DEMAND_WINDOW_S` after it expired is dormant: that read starts (or
+    joins) one refresh and waits for it, off the event loop, up to
+    :data:`SWR_DORMANT_READ_WAIT_S`; a slower refresh leaves it the stored value
+    with its true age. Only the first read of a key waits for the whole
+    computation, which concurrent first reads share. The age is the time since
+    the value was stored.
+
+    A refresh that fails, or whose value ``storable`` rejects (the value reports
+    its own failure), leaves the previous value in place, still ageing. When
+    nothing is stored yet, such a value is returned with ``stored`` False and
+    is not kept.
     """
-    stored = cache_get_stored(key)
-    if stored is not None and stored[1] >= ttl + DEMAND_WINDOW_S:
-        # This read starts or joins the refresh itself; nothing more to queue.
-        dormant = await asyncio.to_thread(cache_get_or_refresh, key, ttl, compute, wait_s=SWR_DORMANT_READ_WAIT_S)
-        if dormant is not None:
-            return dormant  # type: ignore[return-value]
-        stored = None
-    if stored is None:
-        first = await cache_get_or_compute_async(key, ttl, compute)
+
+    def guarded() -> T:
+        value = compute()
+        if storable is not None and not storable(value):
+            raise _Unstorable(value)
+        return value
+
+    try:
         stored = cache_get_stored(key)
-        return first, 0.0 if stored is None else stored[1]
+        if stored is not None and stored[1] >= ttl + DEMAND_WINDOW_S:
+            # This read starts or joins the refresh itself; nothing more to queue.
+            dormant = await asyncio.to_thread(cache_get_or_refresh, key, ttl, guarded, wait_s=SWR_DORMANT_READ_WAIT_S)
+            if dormant is not None:
+                return dormant[0], dormant[1], True  # type: ignore[return-value]
+            stored = None
+        if stored is None:
+            first = await cache_get_or_compute_async(key, ttl, guarded)
+            stored = cache_get_stored(key)
+            return first, 0.0 if stored is None else stored[1], True
+    except _Unstorable as failed:
+        return failed.value, 0.0, False  # type: ignore[return-value]
     if stored[1] >= ttl:
-        _queue_swr_refresh(key, ttl, compute)
-    return stored  # type: ignore[return-value]
+        _queue_swr_refresh(key, ttl, guarded)
+    return stored[0], stored[1], True  # type: ignore[return-value]
+
+
+def reports_failure(value: object) -> bool:
+    """Whether a route payload reports its own failure (``error``, or an unusable ``availability``)."""
+    if not isinstance(value, dict):
+        return False
+    return bool(value.get("error")) or value.get("availability") in _FAILED_AVAILABILITY
+
+
+_FAILED_AVAILABILITY = frozenset({"unavailable", "malformed", "schema_read_failed", "db_missing", "db_error"})
 
 
 def swr_route(
@@ -512,7 +547,10 @@ def swr_route(
     part of the cache key. A call that sets any other parameter away from its
     default is not cached: it runs the handler as before. Every cached
     response carries the snapshot freshness headers with the value's true age
-    (``X-Snapshot-Age-S``), marked ``stale`` past ``ttl``.
+    (``X-Snapshot-Age-S``), marked ``stale`` past ``ttl``. A payload that
+    reports its own failure (:func:`reports_failure`) is never stored: a failed
+    refresh leaves the last good value ageing, and a failed first read is
+    returned as ``unavailable``.
     """
 
     def decorate(handler: Callable[..., T]) -> Callable[..., Awaitable[T]]:
@@ -538,8 +576,10 @@ def swr_route(
             # Every root, not just the project root: two contexts never share a value.
             key = ctx_scoped_ttl_key(ctx, "swr", name, repr(ctx.roots),
                                      *(f"{param}={kwargs.get(param)!r}" for param in vary))
-            value, age = await cache_read_swr(key, ttl, functools.partial(handler, **kwargs))
-            _swr_response.headers.update(snapshot_headers(age, ttl))
+            value, age, stored = await cache_read_swr(
+                key, ttl, functools.partial(handler, **kwargs), storable=lambda value: not reports_failure(value),
+            )
+            _swr_response.headers.update(snapshot_headers(age, ttl, unavailable=not stored))
             return value
 
         response_param = inspect.Parameter("_swr_response", inspect.Parameter.KEYWORD_ONLY, annotation=Response)

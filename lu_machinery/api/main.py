@@ -38,7 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import lu_machinery.github_rest_cache as github_rest
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
-from lu_machinery.common.repo_root import ProductRootError
+from lu_machinery.common.repo_root import ProductRootError, machinery_path
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.guardrails import worktree_containment
@@ -998,7 +998,14 @@ def _collect_delegate_orient_data(ctx: MonitorContext | None = None) -> dict:
 
 
 def _collect_capacity_orient_data(ctx: MonitorContext | None = None) -> dict:
-    budget = state_api.dispatch_routing_budget(resolve_context(ctx))
+    resolved_ctx = resolve_context(ctx)
+    budget = state_api.compute_routing_budget(
+        budget_config_path=machinery_path("config/agent_budgets.yaml"),
+        tasks_dir=resolved_ctx.roots.batch_state_dir / "tasks",
+        project_root=resolved_ctx.roots.project_root,
+        curriculum_root=resolved_ctx.roots.curriculum_root,
+        batch_state_dir=resolved_ctx.roots.batch_state_dir,
+    )
     lanes_summary = {}
     agents = budget.get("agents", {})
     in_flight = budget.get("in_flight", {})
