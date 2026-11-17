@@ -1,6 +1,7 @@
 """Exercise the inbox hook's embedded stdlib SQLite probe (#9662)."""
 
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -78,22 +79,44 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
     assert (db.read_bytes() if db.exists() else None) == before
     assert list(tmp_path.iterdir()) == ([] if state == "missing" else [db])
 
-    if state == "empty":
+    if state in ("empty", "missing"):
         # The installed entry must reach the empty-inbox fast path with only
         # the configured primary, rather than its own path.
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
         nested = tmp_path / "nested"
         nested.mkdir()
+        # Defect class: a hook in a worktree imports its branch package. Both
+        # cwd and PYTHONPATH contain a tripwire; the fallback must still execute
+        # the installed module under isolated Python.
+        shadow = nested / "lu_machinery"
+        shadow.mkdir()
+        tripwire = tmp_path / "branch-imported"
+        (shadow / "__init__.py").write_text(
+            f"from pathlib import Path\nPath({str(tripwire)!r}).touch()\nraise RuntimeError('branch imported')\n"
+        )
+        calls = tmp_path / "python-args"
+        interpreter = tmp_path / "python-probe"
+        interpreter.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INBOX_PROBE_ARGS"\n'
+            f'exec {shlex.quote(sys.executable)} "$@"\n'
+        )
+        interpreter.chmod(0o755)
         result = subprocess.run(
-            ["bash", str(HOOK)], input="{}", text=True, capture_output=True,
+            ["bash", str(HOOK)], check=False, input="{}", text=True, capture_output=True,
             cwd=nested, env={
                 "PATH": os.environ["PATH"], "HOME": str(tmp_path),
-                "LEARN_UKRAINIAN_PYTHON": sys.executable,
+                "LEARN_UKRAINIAN_PYTHON": str(interpreter),
                 "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(tmp_path),
                 "AB_DB_PATH": str(db), "LEARN_UK_HOOK_RECIPIENT": "codex",
+                "FLEET_COMMS_ROOT": str(tmp_path / "plane"),
+                "PYTHONPATH": str(nested), "INBOX_PROBE_ARGS": str(calls),
             }, timeout=15,
         )
         assert result.returncode == 0, result.stderr
         assert result.stdout == ""
         assert result.stderr == ""
-        assert db.read_bytes() == before
+        if state == "empty":
+            assert db.read_bytes() == before
+        assert not tripwire.exists()
+        if state == "missing":
+            assert "-I -m lu_machinery.ai_agent_bridge inbox --for codex" in calls.read_text().splitlines()

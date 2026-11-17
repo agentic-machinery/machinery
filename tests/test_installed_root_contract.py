@@ -116,12 +116,16 @@ elif scenario == 'hooks':
                        env={**os.environ, 'PATH':str(binaries)+':'+os.defpath, 'ROOT_PROOF':str(proof)})
         assert proof.read_text().strip() == str(primary)
 elif scenario == 'alert':
-    # The real Fleet child selects its plane from cwd; site-packages is refused.
+    # Both the copied package and the real Fleet child own an explicit fixture
+    # plane. A package outside the primary venv cannot open its default store.
     from lu_machinery.fleet_comms.authority import AuthorityService
-    with AuthorityService(root=primary / 'batch_state/fleet-comms/v1') as service:
+    plane = primary / 'test-fleet-plane'
+    os.environ['FLEET_COMMS_ROOT'] = str(plane)
+    with AuthorityService(root=plane) as service:
         service.create_channel(admission.DISK_ALERT_CHANNEL)
     admission.post_disk_alert('installed layout proof', 'installed-root-proof')
-    assert (primary / 'batch_state/fleet-comms/v1/comms.sqlite3').is_file()
+    assert (plane / 'comms.sqlite3').is_file()
+    assert not (primary / 'batch_state/fleet-comms').exists()
     assert not (Path(site) / 'batch_state').exists()
 elif scenario == 'drift':
     from lu_machinery.ops import host_stack_drift as drift

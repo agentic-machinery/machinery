@@ -55,7 +55,11 @@ from lu_machinery.control_plane.storage import (
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.contracts import new_id
 from lu_machinery.fleet_comms.migrations import apply_migrations
-from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL, default_plane_root
+from lu_machinery.fleet_comms.paths import (
+    DEFAULT_ROOT_REL,
+    assert_store_write_allowed,
+    default_plane_root,
+)
 from lu_machinery.fleet_comms.paths import validate_plane_root as validate_plane_root
 from lu_machinery.fleet_comms.pg_schema import (
     PG_BLOB_TABLE,
@@ -865,6 +869,8 @@ class ArtifactStore:
         self.blob_root = self.root / "blobs" / "sha256"
         self.db_path = self.root / "comms.sqlite3"
         self._readonly = bool(readonly)
+        if not self._readonly:
+            assert_store_write_allowed(self.db_path, package_file=__file__)
         self._authority = assert_component_supported(StoreId.FLEET_COMMS, "artifact_store")
         if self._authority is Authority.PG:
             # Byte-plane slice (#603): connect first, touch no local disk.
