@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from contextlib import suppress
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -215,3 +216,59 @@ def test_orient_lifespan_warms_shared_sections_and_cancels_timer(monkeypatch, tm
         assert cancelled.is_set()
     finally:
         _join_refresh(ctx)
+
+
+def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path):
+    """Defect class: one orient kept every section it named warm forever, so an unread API ran scans nonstop.
+
+    The warmer refreshes the product scans once at startup and, after that, only
+    sections an /api/orient request read within the demand window.
+    """
+    from lu_machinery.api import state_helpers
+
+    now = [0.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
+    monkeypatch.setattr(api_main, "_orient_demand", {})
+    ctx = fixture_context(tmp_path)
+    product = _product(lambda context: {"summary": {}})
+    warmer: list[list[str]] = []
+
+    async def collect(context, layout, selected):
+        if asyncio.current_task().get_name() == "warmer":
+            warmer.append(list(selected))
+        return [({}, {"generated_at": "2026-01-01T00:00:00Z"}) for _ in selected]
+
+    monkeypatch.setattr(api_main, "_collect_orient_sections", collect)
+    monkeypatch.setattr(api_main, "ORIENT_REFRESH_INTERVAL_S", 0.01)
+    client = TestClient(api_main.create_app(ctx, product=product))
+
+    async def until(predicate):
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not predicate():
+            assert asyncio.get_running_loop().time() < deadline, f"warmer selections: {warmer}"
+            await asyncio.sleep(0.01)
+
+    assert client.get("/api/orient?sections=runtime").status_code == 200
+
+    async def scenario():
+        task = asyncio.create_task(api_main.refresh_orient_periodically(ctx, product), name="warmer")
+        try:
+            await until(lambda: len(warmer) >= 3)
+            assert sorted(warmer[0]) == ["pipeline", "runtime"]  # startup product warm + the read section
+            assert warmer[1] == ["runtime"]  # product scans are not re-warmed unread
+
+            now[0] += state_helpers.DEMAND_WINDOW_S  # nobody orients for a whole window
+            await until(lambda: warmer[-1] == [])
+            unread = len(warmer)
+            await until(lambda: len(warmer) >= unread + 3)
+            assert all(selected == [] for selected in warmer[unread:]), "an unread section was refreshed"
+
+            response = await asyncio.to_thread(client.get, "/api/orient?sections=runtime")
+            assert response.status_code == 200
+            await until(lambda: warmer[-1] == ["runtime"])  # a new read resumes warming
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
