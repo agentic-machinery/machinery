@@ -177,7 +177,7 @@ class Subject(keeper.GitHub):
     def created_at(self, number: int) -> str:
         return "2026-09-01T00:00:00Z"
 
-    def runs(self, since: str) -> list[dict[str, Any]]:
+    def runs(self, since: str, sha: str | None = None) -> list[dict[str, Any]]:
         return self.run_rows
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:

@@ -88,6 +88,7 @@ NON_CI_REMOVALS = frozenset({"manual", "merge_conflict", "behind"})
 PASSED_RUN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
 FAILED_JOB_CONCLUSIONS = frozenset({"failure", "timed_out"})
 REMOVAL_PAGES = 20
+HEAD_HISTORY = 256  # heads recorded per PR; a longer history resets to charging every removal
 TEST_FAILED_NOTE = (
     " A failing test is never infrastructure (rules core P4), so the keeper does not re-enqueue this head:"
     " fix the test or the code, or delete the test with the reason in the commit and a note on its issue,"
@@ -429,15 +430,16 @@ class GitHub:
             raise KeeperError("PR creation time invalid") from exc
         return stamp
 
-    def runs(self, since: str) -> list[dict[str, Any]]:
+    def runs(self, since: str, sha: str | None = None) -> list[dict[str, Any]]:
+        """merge_group runs created since ``since``; only those of queue commit ``sha`` when given."""
         end = datetime.now(UTC).replace(microsecond=0)
         try:
             start = datetime.fromisoformat(since.replace("Z", "+00:00")).astimezone(UTC).replace(microsecond=0)
         except ValueError:
             start = end - timedelta(days=1)
-        return self._runs_window(start, end)
+        return self._runs_window(start, end, sha)
 
-    def _runs_window(self, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    def _runs_window(self, start: datetime, end: datetime, sha: str | None = None) -> list[dict[str, Any]]:
         if start > end:
             return []
         pages = self.json(
@@ -446,6 +448,7 @@ class GitHub:
                 repo=self.repository,
                 start=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 end=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                **({"sha": sha} if sha is not None else {}),
                 paginate=True,
                 slurp=True,
             )
@@ -460,7 +463,7 @@ class GitHub:
             if start == end:
                 raise KeeperError("merge_group run cap exceeded within one second")
             middle = start + timedelta(seconds=int((end - start).total_seconds()) // 2)
-            return self._runs_window(start, middle) + self._runs_window(middle + timedelta(seconds=1), end)
+            return self._runs_window(start, middle, sha) + self._runs_window(middle + timedelta(seconds=1), end, sha)
         if not all(isinstance(item, dict) for item in runs) or not pages or pages[0].get("total_count") != len(runs):
             raise KeeperError("merge_group run page incomplete")
         return runs
@@ -577,7 +580,9 @@ def _ejection_gate(
     gh: GitHub, number: int, since: str, drop_key: str, previous: dict[str, Any], observed: str
 ) -> tuple[str | None, dict[str, Any]]:
     """The ejection hold for a head about to enter the queue, recording a failing test for good."""
-    verdict, evidence = _ejection_evidence(gh, number, since)
+    # A queue exit this keeper saw for this head (still undiagnosed or diagnosed) must be on record.
+    observed_exit = drop_key in previous.get("ejections", {}) or drop_key in previous.get("undiagnosed", {})
+    verdict, evidence = _ejection_evidence(gh, number, since, observed_exit)
     if verdict == "clear":
         return None, evidence
     if verdict == "test-failed":
@@ -637,6 +642,7 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("squash_revoked", {}), dict)
         or not isinstance(data.get("pending_comments", {}), dict)
         or not isinstance(data.get("defect_reports", {}), dict)
+        or not isinstance(data.get("heads", {}), dict)
         or not isinstance(data.get("last_removal", {}), dict)
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
@@ -798,30 +804,44 @@ def _stamp(value: Any) -> datetime | None:
     return when if when is not None and when.tzinfo is not None else None
 
 
-def _head_since(check_rows: Sequence[Any], head: str) -> str:
-    """When the head's first check run started; empty when unknown.
+def _head_since(previous: dict[str, Any], key: str, head: str, observed: str) -> str:
+    """The time from which queue removals are charged to ``head``; empty means every removal.
 
-    A head enters the queue only after its own checks ran, so every queue removal of this head
-    comes later, and a removal before it belonged to an earlier head.
+    The keeper records, per PR, the head it last saw and when, and for every head the PR has
+    had the boundary of its first appearance. A new head is charged every removal after the
+    last sighting of the head before it; a head that returns keeps its first boundary, so the
+    removals of its earlier stay and of any head between are charged to it. A first sighting
+    or an unreadable record charges every removal.
     """
-    stamps = [
-        row["started_at"] for row in check_rows
-        if isinstance(row, dict) and row.get("head_sha") == head and _stamp(row.get("started_at")) is not None
-    ]
-    return min(stamps, key=lambda stamp: _stamp(stamp) or datetime.max.replace(tzinfo=UTC)) if stamps else ""
+    heads = previous.setdefault("heads", {})
+    record = heads.get(key)
+    seen: dict[str, str] = {}
+    last = ""
+    if isinstance(record, dict) and isinstance(record.get("head"), str) and _stamp(record.get("at")) is not None:
+        raw = record.get("seen")
+        if isinstance(raw, dict) and len(raw) < HEAD_HISTORY and all(
+            isinstance(name, str) and isinstance(value, str) for name, value in raw.items()
+        ):
+            seen, last = dict(raw), str(record["at"])
+    if not seen:
+        seen = {head: ""}
+    seen.setdefault(head, last)
+    heads[key] = {"head": head, "at": observed, "seen": seen}
+    return seen[head]
 
 
-def _ejection_evidence(gh: GitHub, number: int, since: str) -> tuple[str, dict[str, Any]]:
+def _ejection_evidence(gh: GitHub, number: int, since: str, observed_exit: bool) -> tuple[str, dict[str, Any]]:
     """Whether the queue removals charged to a head prove that no test node failed (rules core P4).
 
-    Removals at or after ``since`` (the head's first check run, ``_head_since``; empty or
-    unreadable means every removal) are charged to the head, whether or not a pass saw it in
-    the queue; a removal whose time is unreadable is charged too.
-    Each removal's queue commit is the ``head_sha`` of the merge_group runs behind it. Every
-    failed job of every such run is read, whatever its name: a failing node, or a failed pytest
-    job, is a failing test. Returns ``("test-failed", {"runs", "tests"})``,
-    ``("ejection-undiagnosed", {"why"})`` while any evidence is missing (an unfinished run, an
-    unread page, a CI removal without a queue commit), or ``("clear", {"removed"})``.
+    Removals at or after ``since`` (``_head_since``) are charged to the head; one whose time is
+    unreadable is charged too. ``observed_exit`` says a pass saw this head leave the queue,
+    so its removal must be on record. Each removal's queue commit is the ``head_sha`` of the
+    merge_group runs behind it, listed by that commit over the PR's whole life. Every failed or
+    timed-out job of every such run is read, whatever its name: a failing node, or a failed
+    pytest job, is a failing test. Returns ``("test-failed", {"runs", "tests"})``,
+    ``("ejection-undiagnosed", {"why"})`` while any evidence is missing (an unfinished or
+    unlisted run, an unread page or log, a CI removal without a queue commit), or
+    ``("clear", {"removed"})``.
     """
 
     def unknown(why: str) -> tuple[str, dict[str, Any]]:
@@ -835,6 +855,8 @@ def _ejection_evidence(gh: GitHub, number: int, since: str) -> tuple[str, dict[s
         ]
     except KeeperError as exc:
         return unknown(f"queue removal history unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
+    if observed_exit and not removals:
+        return unknown("the queue exit this keeper saw has no removal record yet")
     reasons: dict[str, set[str]] = defaultdict(set)
     for item in removals:
         if item["commit"] is not None:
@@ -844,50 +866,59 @@ def _ejection_evidence(gh: GitHub, number: int, since: str) -> tuple[str, dict[s
     if not reasons:
         return "clear", {"removed": bool(removals)}
     try:
-        rows = gh.runs(since if start is not None else gh.created_at(number))
+        opened = gh.created_at(number)
     except KeeperError as exc:
-        return unknown(f"merge_group runs unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
+        return unknown(f"PR creation time unread: {display_text(str(exc), DISPLAY_REASON_LIMIT)}")
     missing = ""
-    runs = []
-    for row in rows:
-        if not isinstance(row, dict) or not isinstance(row.get("head_sha"), str):
-            missing = missing or "a merge_group run row is malformed"
-        elif row.get("event") == "merge_group" and row["head_sha"] in reasons:
-            runs.append(row)
-    if any(commit not in {row.get("head_sha") for row in runs} and not causes <= NON_CI_REMOVALS
-           for commit, causes in reasons.items()):
-        missing = "the merge_group run behind a queue removal is not visible yet"
     failing_runs: set[int] = set()
     tests: set[str] = set()
-    for row in runs:
-        run_id = row.get("id")
-        if type(run_id) is not int:
-            missing = missing or "a merge_group run has no id"
-            continue
-        if row.get("status") != "completed":
-            missing = missing or f"merge_group run {run_id} has not finished"
-            continue
-        if row.get("conclusion") in PASSED_RUN_CONCLUSIONS:
-            continue
+    for commit, causes in sorted(reasons.items()):
         try:
-            jobs = gh.jobs(run_id)
+            rows = gh.runs(opened, sha=commit)
         except KeeperError:
-            missing = missing or f"jobs of merge_group run {run_id} unread"
+            missing = missing or "merge_group runs of a queue commit unread"
             continue
-        for job in jobs:
-            if not isinstance(job, dict) or job.get("conclusion") not in FAILED_JOB_CONCLUSIONS:
+        runs = []
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("head_sha"), str):
+                missing = missing or "a merge_group run row is malformed"
+            elif row.get("event") == "merge_group" and row["head_sha"] == commit:
+                runs.append(row)
+        if not runs and not causes <= NON_CI_REMOVALS:
+            missing = missing or "the merge_group run behind a queue removal is not listed yet"
+        for row in runs:
+            run_id = row.get("id")
+            if type(run_id) is not int:
+                missing = missing or "a merge_group run has no id"
                 continue
-            if type(job.get("id")) is not int:
-                missing = missing or f"a failed job of merge_group run {run_id} has no id"
+            if row.get("status") != "completed":
+                missing = missing or f"merge_group run {run_id} has not finished"
+                continue
+            if row.get("run_attempt", 1) != 1:
+                # The jobs read shows only the latest attempt; an earlier one may have failed a test.
+                missing = missing or f"merge_group run {run_id} was re-run; its earlier attempts are unread"
+                continue
+            if row.get("conclusion") in PASSED_RUN_CONCLUSIONS:
                 continue
             try:
-                nodes = gh.failed_tests(job["id"])
+                jobs = gh.jobs(run_id)
             except KeeperError:
-                missing = missing or f"a failed job log of merge_group run {run_id} unread"
+                missing = missing or f"jobs of merge_group run {run_id} unread"
                 continue
-            if nodes or TEST_JOB_MARKER in str(job.get("name", "")):
-                failing_runs.add(run_id)
-                tests.update(nodes)
+            for job in jobs:
+                if not isinstance(job, dict) or job.get("conclusion") not in FAILED_JOB_CONCLUSIONS:
+                    continue
+                if type(job.get("id")) is not int:
+                    missing = missing or f"a failed job of merge_group run {run_id} has no id"
+                    continue
+                try:
+                    nodes = gh.failed_tests(job["id"])
+                except KeeperError:
+                    missing = missing or f"a failed job log of merge_group run {run_id} unread"
+                    continue
+                if nodes or TEST_JOB_MARKER in str(job.get("name", "")):
+                    failing_runs.add(run_id)
+                    tests.update(nodes)
     if failing_runs:
         return "test-failed", {"runs": sorted(failing_runs), "tests": sorted(tests)}
     if missing:
@@ -1161,7 +1192,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 detail = f" Queue removal diagnosis lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}."
         # The keeper's one re-enqueue of this head is spent; a queued head is left alone.
         requeued = queued is not True and drop_key in previous.get("keeper_requeues", {})
-        since = _head_since(check_rows, head)
+        since = _head_since(previous, key, head, observed)
         # P4: a head is re-enqueued only when its queue removals prove no failing test node; a
         # failing test holds it for good, and missing evidence holds it until a later pass.
         ejection_hold = "test-failed" if queued is not True and drop_key in previous.get("test_failures", {}) else None
@@ -1283,6 +1314,11 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     if fresh
                     else None
                 )
+                if revoke is None and fresh and queued is not True and armed:
+                    if ejection_hold != "test-failed" and evidence is None:
+                        ejection_hold, evidence = _ejection_gate(gh, number, since, drop_key, previous, observed)
+                    if ejection_hold == "test-failed":
+                        revoke = reason = "test-failed"
                 if revoke is None and fresh and queued is True:
                     blocked = gh.squash_blocked(number, head)
                     if blocked:
@@ -1388,7 +1424,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         previous["queued"] = queued_now
         previous["approved"] = approved_now
         previous["observed"] = observed
-        for name in ("squash_revoked", "undiagnosed", "pending_comments", "last_removal", *REQUEUE_STATE):
+        for name in ("squash_revoked", "undiagnosed", "pending_comments", "last_removal", "heads", *REQUEUE_STATE):
             if name in previous:
                 previous[name] = {
                     item: value for item, value in previous[name].items() if item.split(":", 1)[0] in open_numbers
