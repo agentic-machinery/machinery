@@ -499,7 +499,7 @@ assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_se
 assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
 // Populated but degraded data reads partial, and a body with no observation yet reads unavailable, whatever the header says.
 assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound 900s$/);
+  repositories: [{status: 'ok'}, {status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound 900s$/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 0, stale: false,
   repositories: [{status: 'unknown'}, {status: 'unknown'}]}}).text, /· unavailable ·/);
