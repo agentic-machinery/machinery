@@ -955,11 +955,6 @@
    "sha256": "c8fd43fbd53af741b7cf362fea2b5e1c4f9ae6d7fb9b9e9902b36d664440f909"
   },
   {
-   "path": "lu_machinery/agent_deploy/sync_agent_mirror.py",
-   "rule": "python.lang.security.audit.dangerous-os-exec-audit",
-   "sha256": "05b063ce008ccd123909d8fcd36ceed40b3f84efd4b45fd0d4511ea5923761fd"
-  },
-  {
    "path": "lu_machinery/agent_runtime/env_sanitize.py",
    "rule": "python.lang.security.audit.dangerous-os-exec-audit",
    "sha256": "cbec3a4655fbcc0c6a55ff0144c38a197c512093a8208e636a121b084bbebbcb"
