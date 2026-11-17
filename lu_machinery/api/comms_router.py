@@ -392,7 +392,7 @@ def _add_agent_activity_actions(activity: dict[str, dict]) -> None:
 
 
 @router.get("/messages", deprecated=True)
-async def list_messages(
+def list_messages(
     agent: str | None = Query(None, description="Filter by from_llm or to_llm"),
     task_id: str | None = Query(None),
     msg_type: str | None = Query(None),
@@ -461,7 +461,7 @@ async def list_messages(
 
 
 @router.get("/conversations", deprecated=True)
-async def list_conversations(
+def list_conversations(
     limit: int = Query(50, ge=1, le=200),
     ctx: MonitorContext = Depends(get_ctx),
 ):
@@ -497,7 +497,7 @@ async def list_conversations(
 
 
 @router.get("/conversation/{task_id}", deprecated=True)
-async def get_conversation(
+def get_conversation(
     task_id: str,
     limit: int = Query(100, ge=1, le=500),
     since: str | None = Query(None, description="Only messages with timestamp > this ISO-8601 value"),
@@ -560,7 +560,7 @@ async def get_conversation(
 
 
 @router.get("/active-processes")
-async def active_processes(ctx: MonitorContext = Depends(get_ctx)):
+def active_processes(ctx: MonitorContext = Depends(get_ctx)):
     """Live bridge PIDs with health status."""
     pid_dir = ctx.roots.pid_dir
     if not pid_dir.exists():
@@ -610,7 +610,7 @@ async def active_processes(ctx: MonitorContext = Depends(get_ctx)):
 
 
 @router.get("/zombies")
-async def detect_zombies(
+def detect_zombies(
     stale_hours: float = Query(2.0, description="Unacked messages older than this = stale"),
     pingpong_threshold: int = Query(5, description="Round-trips on same task in 1h = loop"),
     ctx: MonitorContext = Depends(get_ctx),
@@ -726,7 +726,7 @@ async def detect_zombies(
 
 
 @router.get("/stats")
-async def comms_stats(ctx: MonitorContext = Depends(get_ctx)):
+def comms_stats(ctx: MonitorContext = Depends(get_ctx)):
     """Message rate, latency, error %, per-agent breakdown."""
     conn = _get_db(ctx)
     if not conn:
@@ -779,7 +779,7 @@ def _is_probeable_pid(pid: object) -> bool:
 
 
 @router.get("/health")
-async def broker_health(ctx: MonitorContext = Depends(get_ctx)):
+def broker_health(ctx: MonitorContext = Depends(get_ctx)):
     """Broker DB writable, queue depth."""
     message_db = ctx.roots.message_db_path
     pid_dir = ctx.roots.pid_dir
@@ -843,7 +843,7 @@ async def broker_health(ctx: MonitorContext = Depends(get_ctx)):
 
 
 @router.get("/v1/plane-status")
-async def message_plane_status(ctx: MonitorContext = Depends(get_ctx)):
+def message_plane_status(ctx: MonitorContext = Depends(get_ctx)):
     """Read-only fleet message-plane status (PR-K-ish / #5512 parity surface).
 
     Reports ``FLEET_COMMS_MESSAGE_PLANE`` mode (default off), schema migration
@@ -1014,50 +1014,54 @@ async def live_activity(
         asyncio.to_thread(_scan_recent_completions, ctx, 60),
     )
 
-    # Also get recent broker messages for the dispatch feed
-    conn = _get_db(ctx)
-    dispatches = []
-    rows = []
-    if conn:
-        conditions = []
-        params: list = []
-        if since:
-            conditions.append("timestamp > ?")
-            params.append(since)
-        if cursor is not None:
-            conditions.append("id < ?")
-            params.append(cursor)
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        rows = conn.execute(
-            f"""
-            SELECT id, task_id, from_llm, to_llm, message_type,
-                   substr(content, 1, 200) as preview, timestamp
-            FROM messages
-            {where}
-            ORDER BY id DESC
-            LIMIT ?
-        """,
-            [*params, limit],
-        ).fetchall()
-        conn.close()
-        now_ts = datetime.now(UTC)
-        for r in rows:
-            try:
-                ts = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
-                age = (now_ts - ts).total_seconds()
-            except (ValueError, TypeError):
-                age = 0
-            dispatches.append(
-                {
-                    "id": r["id"],
-                    "task_id": r["task_id"],
-                    "from": r["from_llm"],
-                    "to": r["to_llm"],
-                    "type": r["message_type"],
-                    "preview": r["preview"],
-                    "seconds_ago": int(age),
-                }
-            )
+    def recent_dispatches():
+        # Also get recent broker messages for the dispatch feed
+        conn = _get_db(ctx)
+        dispatches = []
+        rows = []
+        if conn:
+            conditions = []
+            params: list = []
+            if since:
+                conditions.append("timestamp > ?")
+                params.append(since)
+            if cursor is not None:
+                conditions.append("id < ?")
+                params.append(cursor)
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            rows = conn.execute(
+                f"""
+                SELECT id, task_id, from_llm, to_llm, message_type,
+                       substr(content, 1, 200) as preview, timestamp
+                FROM messages
+                {where}
+                ORDER BY id DESC
+                LIMIT ?
+            """,
+                [*params, limit],
+            ).fetchall()
+            conn.close()
+            now_ts = datetime.now(UTC)
+            for r in rows:
+                try:
+                    ts = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00"))
+                    age = (now_ts - ts).total_seconds()
+                except (ValueError, TypeError):
+                    age = 0
+                dispatches.append(
+                    {
+                        "id": r["id"],
+                        "task_id": r["task_id"],
+                        "from": r["from_llm"],
+                        "to": r["to_llm"],
+                        "type": r["message_type"],
+                        "preview": r["preview"],
+                        "seconds_ago": int(age),
+                    }
+                )
+        return dispatches, rows
+
+    dispatches, rows = await asyncio.to_thread(recent_dispatches)
 
     return {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -1130,7 +1134,7 @@ class ChannelPostRequest(BaseModel):
 
 
 @router.get("/channels")
-async def list_channels_endpoint(ctx: MonitorContext = Depends(get_ctx)):
+def list_channels_endpoint(ctx: MonitorContext = Depends(get_ctx)):
     """List all channels with row counts and last activity.
 
     Read-only. Safe to poll from the frontend every few seconds.
@@ -1181,7 +1185,7 @@ async def list_channels_endpoint(ctx: MonitorContext = Depends(get_ctx)):
 
 
 @router.get("/channels/{name}")
-async def get_channel_endpoint(name: str, ctx: MonitorContext = Depends(get_ctx)):
+def get_channel_endpoint(name: str, ctx: MonitorContext = Depends(get_ctx)):
     """Channel metadata + context preview + pending delivery count."""
     from lu_machinery.ai_agent_bridge import _channels as _ch  # noqa: PLC0415 — canonical identity (#6812)
 
@@ -1255,7 +1259,7 @@ async def get_channel_endpoint(name: str, ctx: MonitorContext = Depends(get_ctx)
 
 
 @router.get("/channels/{name}/messages")
-async def list_channel_messages(
+def list_channel_messages(
     name: str,
     tail: int = Query(20, ge=1, le=500),
     ctx: MonitorContext = Depends(get_ctx),
@@ -1313,7 +1317,7 @@ async def list_channel_messages(
 
 
 @router.get("/channels/{name}/threads/{thread_id}")
-async def get_thread(name: str, thread_id: str, ctx: MonitorContext = Depends(get_ctx)):
+def get_thread(name: str, thread_id: str, ctx: MonitorContext = Depends(get_ctx)):
     """All messages in a thread, ordered by round_index then created_at."""
     conn = _get_db(ctx)
     if not conn:
@@ -1365,7 +1369,7 @@ async def get_thread(name: str, thread_id: str, ctx: MonitorContext = Depends(ge
 
 
 @router.get("/channels/{name}/deliveries")
-async def channel_deliveries(
+def channel_deliveries(
     name: str,
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(50, ge=1, le=500),
@@ -1430,7 +1434,7 @@ async def post_to_channel(name: str, req: ChannelPostRequest, request: Request):
     )
 
 @router.get("/by-module/{track}/{slug}")
-async def messages_by_module(
+def messages_by_module(
     track: str,
     slug: str,
     limit: int = 30,
@@ -1752,7 +1756,7 @@ def _authority_metrics_payload(
 
 
 @router.get("/v1/backlog")
-async def comms_v1_backlog(
+def comms_v1_backlog(
     limit: int = Query(100, ge=1, le=500),
     exclude_retired: bool = Query(True),
     ctx: MonitorContext = Depends(get_ctx),
@@ -1788,7 +1792,7 @@ async def comms_v1_backlog(
 
 
 @router.get("/v1/dead-letters")
-async def comms_v1_dead_letters(
+def comms_v1_dead_letters(
     limit: int = Query(100, ge=1, le=500),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> dict:
@@ -2009,7 +2013,7 @@ async def refresh_panel_metrics_periodically(ctx: MonitorContext) -> None:
 @router.get("/v1/metrics")
 async def comms_v1_metrics(ctx: MonitorContext = Depends(get_ctx), include_agent_success: bool = False) -> JSONResponse:
     """Local durable metrics, cached for 30 s; warm reads never wait for a scan."""
-    key = _metrics_cache_key(ctx, include_agent_success)
+    key = await asyncio.to_thread(_metrics_cache_key, ctx, include_agent_success)
 
     def compute() -> tuple[str, dict]:
         return _collect_panel_metrics(ctx, include_agent_success)

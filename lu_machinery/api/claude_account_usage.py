@@ -1325,13 +1325,13 @@ async def revalidated_routing_budget_fields(*, timeout_s: float = 1.0) -> dict[s
     admission's three-second HTTP timeout; a slow or refused revalidation
     still publishes the current unknown row. No usage probe is started here.
     """
-    fields = routing_budget_fields()
+    fields = await asyncio.to_thread(routing_budget_fields)
     thread = _revalidation
     if thread is not None and any(row["reason"] == "not_probed" for row in fields["claude_accounts"].values()):
         if thread.is_alive():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(asyncio.to_thread(thread.join, timeout=timeout_s), timeout=timeout_s)
-        return routing_budget_fields()
+        return await asyncio.to_thread(routing_budget_fields)
     return fields
 
 

@@ -118,7 +118,7 @@ def collect_active_discussions(
 
 
 @router.get("/active")
-async def active_discussions(
+def active_discussions(
     limit: int = Query(25, ge=1, le=100),
     lookback_days: int = Query(7, ge=1, le=30),
     ctx: MonitorContext = Depends(get_ctx),

@@ -1369,7 +1369,7 @@ async def api_index():
 
 
 @core_router.get("/api/health")
-async def health_check(request: Request, ctx: MonitorContext = Depends(get_ctx)):
+def health_check(request: Request, ctx: MonitorContext = Depends(get_ctx)):
     """Root health check — returns server status, API and lu-machinery versions, uptime."""
     now = datetime.now(UTC)
     uptime = now - _SERVER_START
@@ -1750,8 +1750,8 @@ async def orient(
         if isinstance(idle_prs_info, dict) and idle_prs_info.get("error"):
             response["idle_prs_error"] = idle_prs_info["error"]
 
-    _attach_cold_start_research(response, role)
-    body = add_json_telemetry(response, session_id=session_id_from_request(request))
+    await asyncio.to_thread(_attach_cold_start_research, response, role)
+    body = await asyncio.to_thread(add_json_telemetry, response, session_id=session_id_from_request(request))
     if lean and not (sections and sections.strip()):
         body = _cap_lean_orient(body)
     return body
@@ -1818,7 +1818,7 @@ def _safe_join(base: Path, *parts: str | Path) -> Path | None:
 
 
 @core_router.get("/{path:path}")
-async def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_ctx)):
+def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_ctx)):
     """Serve a machinery dashboard file, else a file the product declares (C-4687).
 
     Machinery files come from ``ctx.roots.dashboards_dir`` with traversal and

@@ -303,7 +303,7 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     fleet_router._safe_plane_status(ctx)
     fleet_router.fleet_facade_status(ctx)
     routing = runtime_router._routing_plane_status(ctx)
-    asyncio.run(comms_router.message_plane_status(ctx))
+    comms_router.message_plane_status(ctx)
     assert routing["mode"] == "off"
     assert seen == [state.resolve()] * 4
 

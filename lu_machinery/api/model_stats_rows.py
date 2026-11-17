@@ -34,8 +34,8 @@ from typing import Any
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.common import json_depth
-from lu_machinery.common.task_store_paths import tasks_dir
-from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
+from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
+from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import ContractError, parse_reviewer_json
 
@@ -483,7 +483,7 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
         try:
             # Stat first: a write after the stat is newer than this read, so its own row outranks this one.
             mtime_ns = os.stat(path).st_mtime_ns
-            record = read_task_record(path)
+            record = read_cached_task_record(path)
         except (OSError, ValueError, TypeError, RecursionError):
             counts["unreadable"] += 1
             continue

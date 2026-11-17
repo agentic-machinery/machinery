@@ -1,6 +1,5 @@
 """Fleet-comms observer routes keep their observer contract."""
 
-import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -35,7 +34,7 @@ def test_product_home_replaces_machinery_index_and_contract(tmp_path, monkeypatc
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
     for path in ("", "index.html"):
-        response = asyncio.run(main.serve_static(path, request, context))
+        response = main.serve_static(path, request, context)
         assert response.path == product_index
     contracts = [c for c in route_contracts.all_page_contracts(product) if c.file == "index.html"]
     # The product home replaces nothing at /machinery; a product contract for the same URL would.
@@ -44,7 +43,7 @@ def test_product_home_replaces_machinery_index_and_contract(tmp_path, monkeypatc
     assert [c for c in route_contracts.all_page_contracts(
         ProductContribution(static_files={}, page_contracts=(same_url,))) if c.file == "index.html"] == [same_url]
     request.app.state.product = EMPTY
-    assert asyncio.run(main.serve_static("", request, context)).body == b"machinery home"
+    assert main.serve_static("", request, context).body == b"machinery home"
 
 
 def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, monkeypatch):
@@ -60,6 +59,6 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     product = ProductContribution(static_files={"index.html": product_index})
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
-    assert asyncio.run(main.serve_static("", request, context)).path == product_index
+    assert main.serve_static("", request, context).path == product_index
     for path in ("machinery", "machinery/"):
-        assert asyncio.run(main.serve_static(path, request, context)).body == b"machinery home"
+        assert main.serve_static(path, request, context).body == b"machinery home"

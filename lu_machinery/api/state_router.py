@@ -13,7 +13,6 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -32,6 +31,7 @@ from lu_machinery.agent_identity import normalize_seat, seat_read_aliases
 from lu_machinery.agent_runtime.acp_health import probe_acp_health
 from lu_machinery.agent_runtime.usage import summarize_fleet_burn, summarize_lane_runtime
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
+from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.fleet import capacity_pick, credit_lane
 from lu_machinery.fleet.reset_reserve import (
     codex_is_threatened,
@@ -1908,8 +1908,8 @@ def _task_file_codex_account(tasks_dir: Path, task_id: str) -> object:
     if resolved.parent != root or not resolved.is_file():
         return None
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = read_cached_task_record(resolved)
+    except (OSError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -2483,7 +2483,7 @@ async def routing_budget(
     """
     if fresh_codexbar:
         trigger_background_refresh()
-    cache_key = _ctx_cache_key(ctx, "routing-budget", transport, int(fresh_codexbar))
+    cache_key = await asyncio.to_thread(_ctx_cache_key, ctx, "routing-budget", transport, int(fresh_codexbar))
     # Directory checks are cheap enough for warm reads. All-file validation
     # runs beside the request to detect in-place rewrites without pool waits.
     tasks_dir = ctx.roots.batch_state_dir / "tasks"
@@ -2495,7 +2495,7 @@ async def routing_budget(
     stored = cache_get_stored(cache_key)
     if stored is not None:
         (observed, value), age_s = stored
-        if observed.directory_token != delegate_api._dir_token(tasks_dir):
+        if observed.directory_token != await asyncio.to_thread(delegate_api._dir_token, tasks_dir):
             observed.invalidated.set()
 
         def _needs_refresh() -> bool:

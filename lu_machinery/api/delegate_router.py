@@ -21,9 +21,10 @@ from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
 from lu_machinery.agent_runtime.codex_accounts import CODEX_ACCOUNT_ALIASES, CODEX_ACCOUNT_LABELS, DEFAULT_CODEX_ACCOUNT
+from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME as TASK_ARCHIVE_DIR_NAME
-from lu_machinery.orchestration.task_record_store import iter_task_records, parse_task_record
+from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.work.sources_public import public_repository_id
 
@@ -157,8 +158,7 @@ def _read_task_state(
         return None
     for attempt in range(TASK_READ_RETRIES):
         try:
-            with open(fullpath, encoding="utf-8") as handle:
-                data = parse_task_record(Path(path), handle.read().encode("utf-8"), display_unknown_schema=True)
+            data = read_cached_task_record(Path(fullpath), display_unknown_schema=True)
         except (OSError, ValueError) as exc:
             if attempt + 1 == TASK_READ_RETRIES:
                 if raise_read_errors and isinstance(exc, OSError):

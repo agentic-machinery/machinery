@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import http.client
 import json
 import logging
@@ -27,7 +28,7 @@ def _plan_dir(ctx: MonitorContext) -> Path:
 
 
 @router.get("/v1/retention/latest")
-async def retention_latest(ctx: MonitorContext = Depends(get_ctx)) -> dict:
+def retention_latest(ctx: MonitorContext = Depends(get_ctx)) -> dict:
     """Return the latest retention plan JSON if present (no mutations)."""
     plan_dir = _plan_dir(ctx)
     latest = plan_dir / "latest.json"
@@ -63,7 +64,7 @@ async def retention_latest(ctx: MonitorContext = Depends(get_ctx)) -> dict:
 
 
 @router.get("/v1/retention/plan-dir")
-async def retention_plan_dir(ctx: MonitorContext = Depends(get_ctx)) -> dict:
+def retention_plan_dir(ctx: MonitorContext = Depends(get_ctx)) -> dict:
     """Expose the on-disk plan directory path (for operators)."""
     plan_dir = _plan_dir(ctx)
     return {
@@ -237,7 +238,7 @@ async def firing_alerts(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     ``status`` is ``unknown`` with a ``reason`` when Alertmanager cannot be read,
     so an outage never reads as "nothing firing".
     """
-    key = ctx_scoped_ttl_key(ctx, "ops", "alerts")
+    key = await asyncio.to_thread(ctx_scoped_ttl_key, ctx, "ops", "alerts")
     # This loopback read is cheap. Waiting for it on expiry avoids serving the
     # previous page refresh's reading on every 30-second UI cycle.
     reading = await cache_get_or_compute_async(key, ALERTS_TTL_S, _alerts_reading)

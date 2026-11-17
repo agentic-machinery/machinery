@@ -6,7 +6,7 @@ import errno
 import json
 import os
 import sqlite3
-from builtins import open as builtin_open
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -14,6 +14,56 @@ from fastapi.testclient import TestClient
 
 from lu_machinery.api import delegate_router, state_router
 from lu_machinery.api.monitor_context import fixture_context
+
+
+def test_task_record_cache_rereads_changed_records(tmp_path, monkeypatch):
+    """Defect class: stale changed records or repeated decoding of unchanged records."""
+    from collections import OrderedDict
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from lu_machinery.common import task_store_paths
+    from lu_machinery.orchestration import task_record_store
+
+    monkeypatch.setattr(task_store_paths, "_record_cache", OrderedDict())
+    path = tmp_path / "cached.json"
+    path.write_text('{"schema_version":2,"task_id":"cached","status":"running"}')
+    parsed = []
+    original = task_record_store.parse_task_record
+
+    def parse(*args, **kwargs):
+        parsed.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(task_record_store, "parse_task_record", parse)
+    barrier = Barrier(4)
+
+    def read():
+        barrier.wait(timeout=10)
+        return task_store_paths.read_cached_task_record(path)["status"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(lambda _: read(), range(4))) == ["running"] * 4
+    assert parsed == [path]
+    assert delegate_router._read_task_state(str(path), tasks_dir=tmp_path)["status"] == "running"
+    assert parsed == [path]
+
+    before = path.stat()
+    path.write_text('{"schema_version":2,"task_id":"cached","status":"failed!"}')
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert task_store_paths.read_cached_task_record(path)["status"] == "failed!"
+    assert parsed == [path, path]
+
+    replacement = tmp_path / "replacement"
+    replacement.write_text('{"schema_version":2,"task_id":"cached","status":"done"}')
+    replacement.replace(path)
+    assert task_store_paths.read_cached_task_record(path)["status"] == "done"
+    path.write_text('{"task_id":"cached","nested":' + '[' * 129 + '0' + ']' * 129 + '}')
+    with pytest.raises(ValueError):
+        task_store_paths.read_cached_task_record(path)
+    path.unlink()
+    with pytest.raises(FileNotFoundError):
+        task_store_paths.read_cached_task_record(path)
 
 
 def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path, monkeypatch):
@@ -50,16 +100,20 @@ def test_unchanged_failed_reads_are_cached_until_file_metadata_changes(tmp_path,
 
     # Transient I/O errors can recover without a metadata change; they must
     # remain retryable rather than becoming cached absent records.
+    from lu_machinery.common import task_store_paths
+
     delegate_router._TASK_STATE_CACHE.pop(str(valid))
+    task_store_paths._record_cache.pop(str(valid))
     failures = []
+    original_open = Path.open
 
     def flaky_open(path, *args, **kwargs):
-        if path == str(valid) and len(failures) < delegate_router.TASK_READ_RETRIES:
+        if path == valid and len(failures) < delegate_router.TASK_READ_RETRIES:
             failures.append(path)
             raise OSError("temporary read failure")
-        return builtin_open(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(delegate_router, "open", flaky_open, raising=False)
+    monkeypatch.setattr(Path, "open", flaky_open)
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 1
     assert str(valid) not in delegate_router._TASK_STATE_CACHE
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 2

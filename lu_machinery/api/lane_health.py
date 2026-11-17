@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import re
-import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,17 +14,11 @@ from typing import Any
 
 from lu_machinery.agent_identity import normalize_seat, seat_read_aliases
 from lu_machinery.api.lane_health_redaction import REDACTION_PLACEHOLDER_RE, redact_lane_health_diagnostics
-from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, iter_task_records, read_task_record
+from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, iter_task_records
 from lu_machinery.secret_redactor import redact_text
 
 logger = logging.getLogger("lane_health")
-
-# Name, mtime, ctime, size, inode. A matching fingerprint means the bytes have
-# not changed, so a later scan reuses the parsed record and still applies the
-# time window itself. This store is process-local: it is not the task index.
-_HealthFingerprint = tuple[str, int, int, int, int]
-_HEALTH_RECORD_CACHE: dict[str, tuple[_HealthFingerprint, dict[str, Any] | None]] = {}
-_HEALTH_RECORD_CACHE_LOCK = threading.Lock()
 
 # Constants per specification
 # Default window for scan is 120 minutes (M)
@@ -195,26 +188,6 @@ def compute_lane_health(
     ).records
 
 
-def _health_file_fingerprint(name: str, st: os.stat_result) -> _HealthFingerprint:
-    return (f"record-v1:{name}", st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino)
-
-
-def _cached_health_record(entry: Path, st: os.stat_result) -> tuple[str, dict[str, Any] | None]:
-    """Return a path key and a copy of the parsed record, reading only on a fingerprint miss."""
-    fingerprint = _health_file_fingerprint(entry.name, st)
-    path_key = os.path.normpath(str(entry))
-    with _HEALTH_RECORD_CACHE_LOCK:
-        cached = _HEALTH_RECORD_CACHE.get(path_key)
-        if cached is not None and cached[0] == fingerprint:
-            stored = cached[1]
-            return path_key, None if stored is None else dict(stored)
-    record = read_task_record(entry)
-    stored = dict(record) if isinstance(record, dict) else None
-    with _HEALTH_RECORD_CACHE_LOCK:
-        _HEALTH_RECORD_CACHE[path_key] = (fingerprint, None if stored is None else dict(stored))
-    return path_key, stored
-
-
 def scan_lane_health(
     batch_state_dir: Path | str,
     now: datetime | None = None,
@@ -248,7 +221,6 @@ def scan_lane_health(
     # 5 min buffer to prevent clock skew/file write delays from dropping edge files
     cutoff_timestamp = now.timestamp() - (window_minutes * 60) - 300
 
-    seen: set[str] = set()
     try:
         # The shared iterator omits unavailable directories. Probe readability
         # first so a failed scan cannot be reported as observed idle/healthy.
@@ -264,8 +236,7 @@ def scan_lane_health(
                 if stat.st_mtime < cutoff_timestamp:
                     continue
 
-                path_key, record = _cached_health_record(entry, stat)
-                seen.add(path_key)
+                record = read_cached_task_record(entry)
 
                 if not isinstance(record, dict):
                     continue
@@ -305,13 +276,6 @@ def scan_lane_health(
         return LaneHealthScan(
             observed=False, window_minutes=window_minutes, error=f"task record scan failed: {type(e).__name__}"
         )
-
-    # Drop entries this directory no longer needs. A failed scan returns above
-    # and keeps what it had. Another directory's entries stay.
-    root_prefix = os.path.normpath(str(tasks_path)) + os.sep
-    with _HEALTH_RECORD_CACHE_LOCK:
-        for stale in [key for key in _HEALTH_RECORD_CACHE if key.startswith(root_prefix) and key not in seen]:
-            _HEALTH_RECORD_CACHE.pop(stale, None)
 
     # Compute health per lane
     for lane, tasks in lane_tasks.items():

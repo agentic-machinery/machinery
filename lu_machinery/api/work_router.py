@@ -645,9 +645,9 @@ async def work_projection(
     # Forbidden keys fail before the lane check, so a private query is still
     # invalid_saved_view even when stream is absent.
     filters = _filters_from_request(request)
-    stream = _require_projection_stream(request, ctx)
+    stream = await asyncio.to_thread(_require_projection_stream, request, ctx)
     _work_demand(ctx).touch()
-    key = projection_cache_key(filters, ctx)
+    key = await asyncio.to_thread(projection_cache_key, filters, ctx)
 
     if not fresh:
         cached = cache_get_with_age(key, CACHE_TTL_S)
@@ -660,13 +660,13 @@ async def work_projection(
                 if any(
                     (s.get("sections", {}).get("prs") or {}).get("status") == "stale" for s in out.get("sources", [])
                 ):
-                    _get_or_create_build_task(key, filters, ctx)
+                    await asyncio.to_thread(_get_or_create_build_task, key, filters, ctx)
                 return JSONResponse(content=_lane_view(out, stream))
 
     if fresh:
         cache_invalidate(CACHE_KEY)
 
-    handle = _get_or_create_build_task(key, filters, ctx)
+    handle = await asyncio.to_thread(_get_or_create_build_task, key, filters, ctx)
     try:
         payload = await asyncio.wait_for(asyncio.shield(_follow_cfuture(handle)), timeout=TIMEOUT_S)
     except TimeoutError as exc:
@@ -789,7 +789,7 @@ def _next_rank_key(item: dict[str, Any]) -> tuple[int, str]:
 
 
 @router.get("/v1/next", response_model=None)
-async def work_next(
+def work_next(
     stream: str = Query(
         ...,
         min_length=1,
@@ -975,7 +975,7 @@ async def work_next(
 
 
 @router.get("/v1/capabilities")
-async def work_capabilities() -> dict[str, Any]:
+def work_capabilities() -> dict[str, Any]:
     """Public-safe capability + optional private-source seam metadata."""
     return {
         "schema_version": "work-projection.v1",
