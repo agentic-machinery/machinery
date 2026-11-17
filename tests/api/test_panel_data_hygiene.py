@@ -254,7 +254,11 @@ def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_clie
                             ({"route": "/api/orient"}, "Monitor /api/orient.fixture-host.invalid is slow"),
                             ({"route": "/api/home/synthetic-private"}, "Monitor /api/home/synthetic-private is slow"),
                             ({"instance": "fixture-host.invalid:9100"}, "down at fixture-host.invalid"),
-                            ({"instance": "fixture-host.invalid:9100"}, "down at fixture-host")):
+                            ({"instance": "fixture-host.invalid:9100"}, "down at fixture-host"),
+                            ({"instance": "api-ci:9100"}, "Disk on api-ci is almost full"),
+                            ({"instance": "web-01:9100"}, "Disk on web-01 is almost full"),
+                            ({"instance": "db:9100"}, "Disk on db is almost full"),
+                            ({"job": "ci"}, "Runner ci is almost full")):
         raw[0]["labels"] = {"alertname": "DiskAlmostFull", **{"severity": "warning", **hiding}}
         raw[0]["annotations"]["summary"] = summary
         state_helpers.cache_invalidate()
@@ -266,3 +270,8 @@ def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_clie
         raw[0]["annotations"]["summary"] = shown
         state_helpers.cache_invalidate()
         assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == shown
+    # A short host that only sits inside a longer word does not withhold a clean summary.
+    raw[0]["labels"] = {"alertname": "DiskAlmostFull", "severity": "warning", "instance": "db:9100"}
+    raw[0]["annotations"]["summary"] = "Feedback queue is almost full"
+    state_helpers.cache_invalidate()
+    assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == "Feedback queue is almost full"

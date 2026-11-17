@@ -738,8 +738,9 @@ function payloadFreshness(url, data, receivedAt) {
   const own = payloadAge(url, data, receivedAt);
   // A timestamp of the attempt does not make a failed collection usable: availability is the payload's own status.
   const status = typeof data.status === "string" ? data.status : typeof data.state === "string" ? data.state : null;
-  const failed = status !== null && !["ok", "partial", "pending"].includes(status);
-  return own && {...own, unavailable: failed};
+  // "pending" is a body with no observation yet, so it is unavailable too; "partial" is populated but degraded.
+  const failed = status !== null && status !== "ok" && status !== "partial";
+  return own && {...own, unavailable: failed, partial: status === "partial"};
 }
 
 function payloadAge(url, data, receivedAt) {
@@ -793,11 +794,12 @@ function freshnessState(fresh, elapsed = 0) {
   const age = fresh.age === null ? null : fresh.age + elapsed;
   if (age !== null && fresh.bound !== null && age > fresh.bound) return "stale";
   if (fresh.flag === "last_good") return "last_good";
+  if (fresh.partial) return "partial";
   if (age === null) return fresh.unavailable ? "unavailable" : "unknown";
   return fresh.flag === "fresh" || fresh.bound !== null ? "fresh" : "unknown";
 }
 
-const FRESHNESS_LABELS = {fresh: "fresh", stale: "STALE", last_good: "last good reading", unknown: "freshness unknown", unavailable: "unavailable"};
+const FRESHNESS_LABELS = {fresh: "fresh", stale: "STALE", last_good: "last good reading", partial: "partial data", unknown: "freshness unknown", unavailable: "unavailable"};
 
 function headingAge(readings, badOnFailure, attemptedAt = null) {
   const sources = Array.isArray(readings) ? readings : [];
@@ -811,7 +813,7 @@ function headingAge(readings, badOnFailure, attemptedAt = null) {
     const elapsed = reading?.receivedAt ? Math.max(0, Date.now() - reading.receivedAt) / 1000 : 0;
     const state = freshnessState(fresh, elapsed);
     bad ||= state === "stale" || state === "unavailable";
-    caution ||= state === "last_good" || state === "unknown";
+    caution ||= state === "last_good" || state === "unknown" || state === "partial";
     const prefix = sources.length > 1 ? `${["Usage", "API balances", "Sign-in"][index] || "Source"}: ` : "";
     // The age shown is the reading's own, as the rows show it; a stall since the fetch is named separately.
     const overdue = state === "stale" && freshnessState(fresh) !== "stale" ? " · refresh overdue" : "";

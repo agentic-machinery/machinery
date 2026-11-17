@@ -200,6 +200,13 @@ def _vetted_label(key: str, label: str) -> bool:
     return key == "route" and label in _declared_routes()
 
 
+def _mentions(text: str, other: str) -> bool:
+    """Whether ``text`` prints ``other``; a short value must stand as a whole word, not inside one."""
+    if len(other) >= 4:
+        return other in text
+    return bool(other) and re.search(rf"(?<![A-Za-z0-9]){re.escape(other)}(?![A-Za-z0-9])", text) is not None
+
+
 def _alert_summary(annotations: dict, labels: dict) -> str | None:
     """The rule's own one-line summary, or None when it is not plainly safe to show.
 
@@ -217,11 +224,12 @@ def _alert_summary(annotations: dict, labels: dict) -> str | None:
             # Only a whole token is exempt; a value inside a larger token stays and fails the prose check.
             prose = re.sub(rf"(?<![A-Za-z0-9./:_-]){re.escape(label)}(?![A-Za-z0-9/:_-])(?!\.[A-Za-z0-9])", "", prose)
         else:
-            # The whole value and its stems (host, domain, port-less): a template may print any of them.
+            # The whole value, its port-less host and its stems: a template may print any of them.
             others.append(label)
+            others.append(re.split(r"[:/]", label)[0])
             others.extend(part for part in re.split(r"[:/._-]", label) if len(part) >= 4)
     if (
-        any(other in value for other in others)
+        any(_mentions(value, other) for other in others)
         or not _SUMMARY_PROSE.fullmatch(prose)
         or scan_text(value)
         or redact_text(value) != value

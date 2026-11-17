@@ -497,6 +497,11 @@ assert.match(line({...young, url: '/api/git/pull-requests', data: {status: 'ok',
   repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text, /· STALE ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_seconds: null, stale: true}}).text, /· STALE ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
+// Populated but degraded data reads partial, and a body with no observation yet reads unavailable, whatever the header says.
+assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
+  repositories: [{status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound 900s$/);
+assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
+assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'pending', accounts: []}}).text, /· unavailable ·/);
 // An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
 const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
 assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 12s · bound 900s$/);
