@@ -56,6 +56,14 @@ def test_forwarder_finishes_close_and_reaps_children_after_repeated_signal(
     gate = tmp_path / "gate"
     os.mkfifo(gate)
     gate_fd = os.open(gate, os.O_RDWR | os.O_NONBLOCK)
+    # Bash runs a trap for a signal that arrives during a blocking read, but a
+    # signal that lands just before the read() call stays pending while the
+    # read blocks. The forwarder parks on its own FIFO, and the test writes it
+    # after each signal. Either the signal interrupts the read or the read
+    # returns the token, and in both cases Bash runs the trap.
+    park = tmp_path / "park"
+    os.mkfifo(park)
+    park_fd = os.open(park, os.O_RDWR | os.O_NONBLOCK)
     ready = tmp_path / "ready"
     received = tmp_path / "received"
     attempts = tmp_path / "attempts"
@@ -94,9 +102,9 @@ sleep 300 & LC_SUPERVISORY_WATCH_PID=$!
 sleep 300 & LC_DRIVER_RENEW_PID=$!
 trap 'launcher_forward_driver_signal {name} {expected}' {name}
 printf 'armed\\n' > armed
-IFS= read -r _ < "$TEST_GATE"
+IFS= read -r _ < "$TEST_PARK"
 """)
-    env = {**launcher_environment(), "TEST_GATE": str(gate), "TEST_ATTEMPTS": str(attempts),
+    env = {**launcher_environment(), "TEST_GATE": str(gate), "TEST_PARK": str(park), "TEST_ATTEMPTS": str(attempts),
            "TEST_CLOSED": str(closed), "TEST_CLIENT_PID": str(client_pid)}
     process = subprocess.Popen(["bash", str(launcher)], cwd=tmp_path, env=env, start_new_session=True,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -105,6 +113,7 @@ IFS= read -r _ < "$TEST_GATE"
                    message="provider and direct forwarder traps")
         sig = getattr(signal, f"SIG{name}")
         process.send_signal(sig)
+        os.write(park_fd, b"wake\n")
         wait_until(attempts.exists, timeout=DEADLINE_S, message="in-flight close client")
         assert not closed.exists()
         if delivery == "group":
@@ -135,14 +144,16 @@ IFS= read -r _ < "$TEST_GATE"
         assert received.read_text() == str(sig)
         assert attempts.read_text().splitlines() == ["close"]
         assert closed.read_text() == "closed\n"
+        # Every holder of the output pipes has exited; DEADLINE_S only guards a hang.
         wait_until(lambda: not _test_processes(tmp_path),
-                   timeout=5, message="provider and watcher cleanup")
+                   timeout=DEADLINE_S, message="provider and watcher cleanup")
         _assert_no_test_processes(tmp_path)
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
         process.communicate(timeout=10)
         os.close(gate_fd)
+        os.close(park_fd)
 
 
 def manager_guard(directory: Path) -> Path:
