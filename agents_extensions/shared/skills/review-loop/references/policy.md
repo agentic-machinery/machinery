@@ -12,7 +12,7 @@ simpler manual procedure beats new tooling.
 
 | Tier | Changes | Review before merge |
 | --- | --- | --- |
-| Trivial | Root documentation for people (README, CHANGELOG, LICENSE, SECURITY); the release cut's version bump and the product's adoption of that release | Required CI green only; no review of record, no review-loop |
+| Trivial | Root documentation for people (README, CHANGELOG, LICENSE, SECURITY); the product's lock bump adopting a new lu-machinery release | Required CI green only; no review of record, no review-loop |
 | Low | Deletions of unused code, test-only, data, `docs/**` | Required CI green + one quick red-team pass: one exact-head APPROVE from a qualified non-author reviewer (any family), `--risk low` |
 | Medium | Ordinary code changes | Required CI + one cross-family review |
 | High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review at critical depth (Opus or Sol) |
@@ -31,11 +31,11 @@ that path's tier; only deletions of other unused code are Low.
   Everything under `docs/` and every other text keeps its tier: code and agents read it as input
   or procedure (the review protocol, session handoffs, epics, the release procedure, the
   workstream registry, rules, skills and prompts), so no list of model-facing docs is complete;
-- a `release_version_files` entry (`pyproject.toml`, `package.json`, `package-lock.json`,
-  `requirements-machinery.lock`) whose patch changes only its own root version (the line under
-  the `[project]` or root-object name; for the lock, the `lu-machinery==` line and its hashes),
-  raised, with the same old and new version in every such file of the PR. Any other line in it, a lowered version or an unreadable patch keeps the
-  path's tier. CI installing the hash-pinned wheel proves the release exists.
+- `requirements-machinery.lock` whose patch is one hunk from line 1 that replaces only the
+  `lu-machinery==` line and its hashes, with a raised version. Any other line, a lowered version
+  or a missing patch keeps the path's tier. CI installing the hash-pinned wheel proves the
+  release exists. Machinery's post-release version bump (`pyproject.toml`, `package*.json`) is
+  not Trivial: a patch cannot prove TOML or JSON scope.
 
 Code comments are not Trivial; they keep their file's tier. A line that reads as a comment can
 sit inside a string or a prompt, and only a full-file tokenizer could tell them apart. A recorded

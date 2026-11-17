@@ -25,24 +25,15 @@ _RANK: dict[ReviewTier, int] = {"trivial": 0, "low": 1, "medium": 2, "ukrainian-
 _MATCH_ORDER: tuple[ReviewTier, ...] = ("high", "ukrainian-content", "trivial", "low")
 _STATUSES = {"added", "modified", "removed", "renamed", "copied", "changed", "unchanged"}
 _TABLE_KEYS = {"schema_version", "default", "tiers", "release_version_files"}
-_KINDS = {"pyproject", "package", "package-lock", "machinery-lock"}
+_KINDS = {"machinery-lock"}
 
-# The file's own version, proven by the two context lines above it: the root scope's
-# opening line, then its name. pyproject's [project] table; package.json's root object;
-# package-lock.json's root object and its packages[""] entry. A dependency's or another
-# table's version has a different scope line or indentation, so it never matches.
+# The product's lu-machinery lock (pip requirements, line-based, no multiline strings):
+# its first lines are the lu-machinery requirement and its hashes. A patch whose one
+# hunk starts at line 1 and replaces only that block proves, from the file start, that
+# nothing but the lu-machinery release changed. Version files whose scope a patch
+# cannot prove (pyproject.toml's TOML, package.json's JSON) are not exempt.
 _NUMERIC = r"([0-9]+(?:\.[0-9]+){1,3})"
-_TOP_SCOPE = (re.compile(r"\{"), re.compile(r'  "name": "[^"]+",'), re.compile(rf'  "version": "{_NUMERIC}",'))
-_ROOT_SCOPES: dict[str, tuple[tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]], ...]] = {
-    "pyproject": (
-        (re.compile(r"\[project\]"), re.compile(r'name = "[^"]+"'), re.compile(rf'version = "{_NUMERIC}"')),
-    ),
-    "package": (_TOP_SCOPE,),
-    "package-lock": (
-        _TOP_SCOPE,
-        (re.compile(r'    "": \{'), re.compile(r'      "name": "[^"]+",'), re.compile(rf'      "version": "{_NUMERIC}",')),
-    ),
-}
+_FIRST_HUNK = re.compile(r"@@ -1(,[0-9]+)? \+1(,[0-9]+)? @@.*")
 _LOCK_REQUIREMENT = re.compile(rf"lu-machinery=={_NUMERIC} \\")
 _LOCK_HASH = re.compile(r"    --hash=sha256:[0-9a-f]{64}( \\)?")
 
@@ -59,81 +50,47 @@ def review_satisfied(tier: ReviewTier, state: str) -> bool:
 
 
 class _NotTrivial(Exception):
-    """A release version file whose change is more than its own version."""
+    """A lock patch whose change is more than the lu-machinery release."""
 
 
 def _version(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split("."))
 
 
-def _blocks(patch: object) -> list[tuple[list[str], list[str], list[str], str | None]]:
-    """Each run of changed lines with the context lines before it (same hunk) and the one after.
+def _lock_bump(patch: object) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The (old, new) lu-machinery version a lock patch changes, and nothing else.
 
+    One hunk from line 1: the old requirement block, then the new one, then context.
     Lines GitHub or Git mark ``\\ No newline at end of file`` carry no content.
     """
-    if not isinstance(patch, str) or not patch.startswith("@@"):
+    if not isinstance(patch, str):
         raise _NotTrivial
-    blocks: list[tuple[list[str], list[str], list[str], str | None]] = []
-    before: list[str] = []
-    removed: list[str] = []
-    added: list[str] = []
-    for line in patch.split("\n"):
-        if line.startswith("\\"):
-            continue
-        op, text = line[:1], line[1:]
-        if op in {"-", "+"}:
-            if op == "-" and added:
-                raise _NotTrivial  # removals after additions: not one replacement
-            (removed if op == "-" else added).append(text)
-            continue
-        if op not in {" ", "@", ""}:
-            raise _NotTrivial
-        after = text if op == " " else None
-        if removed or added:
-            blocks.append((before, removed, added, after))
-            removed, added, before = [], [], []
-        before = [*before, text] if after is not None else []
-    if removed or added:
-        blocks.append((before, removed, added, None))
-    if not blocks:
+    header, *lines = [line for line in patch.split("\n") if not line.startswith("\\")]
+    if not _FIRST_HUNK.fullmatch(header):
         raise _NotTrivial
-    return blocks
-
-
-def _version_change(kind: str, patch: object) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """The one (old, new) version a release version file's patch changes, and nothing else."""
-    pairs: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
-    for before, removed, added, after in _blocks(patch):
-        if kind == "machinery-lock":
-            sides = []
-            for lines in (removed, added):
-                head = _LOCK_REQUIREMENT.fullmatch(lines[0]) if lines else None
-                hashes = lines[1:]
-                if (
-                    head is None or not hashes
-                    or any(_LOCK_HASH.fullmatch(line) is None for line in hashes)
-                    or any(not line.endswith(" \\") for line in hashes[:-1])
-                    or hashes[-1].endswith(" \\")
-                ):
-                    raise _NotTrivial
-                sides.append(_version(head.group(1)))
-            # A hash line left as context would keep an old hash on the new version.
-            if after is not None and _LOCK_HASH.fullmatch(after):
-                raise _NotTrivial
-            pairs.add((sides[0], sides[1]))
-            continue
-        if len(removed) != 1 or len(added) != 1 or len(before) < 2:
+    removed = [line[1:] for line in lines if line.startswith("-")]
+    added = [line[1:] for line in lines if line.startswith("+")]
+    context = lines[len(removed) + len(added):]
+    if lines[:len(removed)] != ["-" + line for line in removed] or any(
+        not line.startswith(" ") for line in context if line
+    ):
+        raise _NotTrivial  # changes after context, a second hunk, or interleaved lines
+    sides = []
+    for block in (removed, added):
+        head = _LOCK_REQUIREMENT.fullmatch(block[0]) if block else None
+        hashes = block[1:]
+        if (
+            head is None or not hashes
+            or any(_LOCK_HASH.fullmatch(line) is None for line in hashes)
+            or any(not line.endswith(" \\") for line in hashes[:-1])
+            or hashes[-1].endswith(" \\")
+        ):
             raise _NotTrivial
-        for scope, name, version in _ROOT_SCOPES[kind]:
-            old, new = version.fullmatch(removed[0]), version.fullmatch(added[0])
-            if scope.fullmatch(before[-2]) and name.fullmatch(before[-1]) and old and new:
-                pairs.add((_version(old.group(1)), _version(new.group(1))))
-                break
-        else:
-            raise _NotTrivial
-    if len(pairs) != 1:
+        sides.append(_version(head.group(1)))
+    # A hash line left as context would keep an old hash on the new version.
+    if context and _LOCK_HASH.fullmatch(context[0][1:]):
         raise _NotTrivial
-    return pairs.pop()
+    return sides[0], sides[1]
 
 
 def _load_table(table_path: Path | None) -> dict[str, object] | None:
@@ -167,10 +124,10 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
     """Classify a complete REST PR-files response; unknown input/table is High.
 
     Use the sweep's validator, including its rename and 3,000-file protections.
-    Patches are read only for the release version files, which are Trivial when
-    the change is their own version, raised, and the same version in every one
-    of them; anything else in them keeps their path's tier. Comment-only source
-    edits stay Medium: a line that looks like a comment can sit in a string.
+    Patches are read only for the product's lu-machinery lock, which is Trivial
+    when its change is the lu-machinery release, raised (``_lock_bump``); any
+    other change keeps its path's tier. Comment-only source edits keep their
+    file's tier: a line that looks like a comment can sit in a string.
     """
     try:
         paths = pr_file_paths(rows)
@@ -203,7 +160,7 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
                     tier = "low"
                 if path in versions and status == "modified" and row.get("filename") == path:
                     try:
-                        bumps.append((_version_change(versions[path], row.get("patch")), tier))
+                        bumps.append((_lock_bump(row.get("patch")), tier))
                         continue
                     except _NotTrivial:
                         pass

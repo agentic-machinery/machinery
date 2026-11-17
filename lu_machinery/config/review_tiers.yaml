@@ -164,12 +164,9 @@ tiers:
     - SECURITY.md
 # Removed High/content/Trivial paths keep their tier; all other removals are Low.
 
-# The release cut's version files. A modified one is Trivial only when its patch
-# changes nothing but its own root version (for the lock, the lu-machinery line and
-# its hashes), raised, and every such file in the pull request names the same
-# versions. Anything else in it keeps the path's tier above.
+# The release cut's files a patch can prove. The product's lu-machinery lock is
+# Trivial only when its one hunk, from line 1, replaces the lu-machinery line and its
+# hashes with a raised version. pyproject.toml and package*.json keep their tier: a
+# patch cannot prove TOML or JSON scope.
 release_version_files:
-  pyproject.toml: pyproject
-  package.json: package
-  package-lock.json: package-lock
   requirements-machinery.lock: machinery-lock

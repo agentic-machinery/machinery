@@ -340,8 +340,9 @@ def test_trivial_doc_plus_code_takes_code_tier():
     """Defect class: mixing a Trivial file into a code change lowers the code change's review."""
     assert classify_pr_files([_modified("README.md"), _modified("lu_machinery/common/x.py")]) == "medium"
     assert classify_pr_files([_modified("README.md"), _modified("tests/test_x.py")]) == "low"
-    assert classify_pr_files([*_release_cut(), _modified("lu_machinery/common/x.py")]) == "medium"
-    assert classify_pr_files([*_release_cut(), _modified(".github/workflows/ci.yml")]) == "high"
+    lock = _modified("requirements-machinery.lock", LOCK_BUMP)
+    assert classify_pr_files([lock, _modified("lu_machinery/common/x.py")]) == "medium"
+    assert classify_pr_files([lock, _modified(".github/workflows/ci.yml")]) == "high"
 
 
 @pytest.mark.parametrize(
@@ -377,11 +378,8 @@ def test_release_adoption_lock_bump_is_trivial():
     assert classify_pr_files([
         _modified("requirements-machinery.lock", LOCK_BUMP), _modified("tests/test_orient_api.py"),
     ]) == "low"
-
-
-def test_release_version_bump_with_changelog_is_trivial():
-    """Defect class: the release cut's version-and-changelog PR still needs a review."""
-    assert classify_pr_files(_release_cut()) == "trivial"
+    # Machinery's post-release bump keeps its review: a patch cannot prove TOML or JSON scope.
+    assert classify_pr_files(_release_cut()) == "high"
 
 
 @pytest.mark.parametrize(
@@ -414,6 +412,21 @@ def test_release_version_bump_with_changelog_is_trivial():
 -      "version": "0.1.28",
 +      "version": "0.1.29",
        "resolved": "https://registry.npmjs.org/x.tgz","""),
+        # The lock block below line 1, or a second hunk after it.
+        ("requirements-machinery.lock", LOCK_BUMP.replace("@@ -1,5 +1,5 @@", "@@ -3,5 +3,5 @@", 1)),
+        ("requirements-machinery.lock", LOCK_BUMP + "\n@@ -40,2 +40,2 @@\n-pyyaml==6.0.2 \\\n+pyyaml==6.0.3 \\"),
+        # A second hunk that only adds another package's hash.
+        ("requirements-machinery.lock", LOCK_BUMP + "\n@@ -40,2 +40,3 @@\n pyyaml==6.0.2 \\\n+    --hash=sha256:"
+         + "1" * 64 + " \\\n     --hash=sha256:" + "2" * 64),
+        # Valid nested JSON shaped like the root object (round-2 repro).
+        ("package-lock.json", """@@ -6,7 +6,7 @@
+     "node_modules/example":
+ {
+   "name": "example",
+-  "version": "9.1.0",
++  "version": "9.1.1",
+   "dev": true
+ }"""),
         # Another TOML table's name and version.
         ("pyproject.toml", """@@ -40,6 +40,6 @@
  [tool.poetry]
@@ -437,7 +450,5 @@ def test_version_downgrade_or_missing_patch_is_not_trivial():
     assert classify_pr_files([_modified("requirements-machinery.lock", downgrade)]) != "trivial"
     assert classify_pr_files([_modified("requirements-machinery.lock")]) != "trivial"
     assert classify_pr_files([_modified("pyproject.toml")]) == "high"
-    disagree = [*_release_cut()[:3], _modified("pyproject.toml", PYPROJECT_BUMP.replace("0.1.29", "0.1.30"))]
-    assert classify_pr_files(disagree) == "high"
     added = [{"filename": "requirements-machinery.lock", "status": "added", "patch": LOCK_BUMP}]
     assert classify_pr_files(added) != "trivial"
