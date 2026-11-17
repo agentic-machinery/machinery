@@ -117,9 +117,12 @@ def test_second_review_alone_never_approves():
         assert verdict.state == "needs-CF"
 
 
-def test_untokened_carbon_approval_is_not_a_reviewer_of_record():
-    """Defect class: a Carbon record without the historical token counts as the reviewer of record."""
-    untokened = record(task="review-carbon", model=CARBON, family="google")
+@pytest.mark.parametrize("model", [CARBON, "gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh"])
+def test_untokened_carbon_approval_is_not_a_reviewer_of_record(model):
+    """Defect class: an untokened record from a model with no catalog review role (Carbon, which
+    has a historical second-review token, or Hydrogen, which has none) counts as the reviewer of
+    record."""
+    untokened = record(task="review-carbon", model=model, family="google")
     assert sweep.lookup_verdict([untokened], SHA, "fleet").state == "needs-CF"
     rows = [record(task="review-sol"), untokened]
     assert sweep.lookup_verdict(rows, SHA, "fleet", second_review=True).state == "APPROVED"

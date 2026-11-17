@@ -117,6 +117,60 @@ def test_ownership_walk_ignores_worker_config_includes_and_ambient_git_env(sandb
     assert (record["status"], record["error"]) == ("done", None)
 
 
+def test_ownership_shallow_fetches_do_not_change_linked_worktree_primary(tmp_path, monkeypatch):
+    """Defect class: a shallow verification fetch truncates a linked worktree's shared history."""
+    primary, remote, linked = (tmp_path / name for name in ("primary", "remote.git", "linked"))
+    primary.mkdir()
+    run_git(primary, "init", "-b", "main")
+    run_git(primary, "config", "user.email", "fixture@example.invalid")
+    run_git(primary, "config", "user.name", "Fixture")
+    for value in ("ancestor", "base"):
+        (primary / "owned.txt").write_text(value)
+        run_git(primary, "add", "owned.txt")
+        with monkeypatch.context() as clock:
+            if value == "ancestor":
+                clock.setenv("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            run_git(primary, "commit", "-m", value)
+    base = run_git(primary, "rev-parse", "HEAD")
+    run_git(primary, "remote", "add", "origin", str(remote))
+    run_git(primary, "worktree", "add", "-b", "worker", str(linked))
+    (linked / "owned.txt").write_text("delivery")
+    run_git(linked, "add", "owned.txt")
+    run_git(linked, "commit", "-m", "delivery")
+    run_git(primary, "clone", "--bare", str(primary), str(remote))
+    record = dict(task_id="shallow-isolation", worktree_path=str(linked), worktree_remote_url=str(remote),
+                  worktree_base_ref="origin/main", worktree_base_sha=base, worktree_branch="worker",
+                  head_sha=run_git(linked, "rev-parse", "HEAD"))
+    common = primary / ".git"
+    refs = run_git(primary, "show-ref")
+    monkeypatch.setenv("GIT_DIR", run_git(linked, "rev-parse", "--absolute-git-dir"))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(common))
+    monkeypatch.setenv("GIT_WORK_TREE", str(primary))
+    monkeypatch.setenv("GIT_SHALLOW_FILE", str(common / "shallow"))
+    monkeypatch.chdir(linked)
+    original_fetch = git._ownership_fetch
+    phases = []
+
+    def fetch(run, *args, phase, **kwargs):
+        private = Path(run("rev-parse", "--absolute-git-dir"))
+        assert Path(run("rev-parse", "--git-common-dir")) == private
+        assert private != common
+        original_fetch(run, *args, phase=phase, **kwargs)
+        phases.append(phase)
+        assert not (common / "shallow").exists()
+
+    monkeypatch.setattr(git, "_ownership_fetch", fetch)
+    with git.ownership_git(record) as run:
+        private = Path(run("rev-parse", "--absolute-git-dir"))
+        assert run("rev-parse", "--is-shallow-repository") == "true"
+        assert run("merge-base", base, "refs/heads/delivery") == base
+        assert run("rev-parse", "refs/heads/delivery") == record["head_sha"]
+    assert phases == ["initial", "bounded-history"]
+    assert not private.exists()
+    assert git._verification_git(primary, "rev-parse", "--is-shallow-repository") == "false"
+    assert git._verification_git(primary, "show-ref") == refs
+
+
 def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_remote(
     sandbox, delivery_settle, monkeypatch, tmp_path,
 ):

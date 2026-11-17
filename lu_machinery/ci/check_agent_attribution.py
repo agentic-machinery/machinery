@@ -58,17 +58,47 @@ included) is ever echoed.
 
 Report-only switch
 ==================
-Violations fail the run (exit 1) only when ``ATTRIBUTION_ENFORCE=1``. Any other value
-prints the same findings as warnings and exits 0; invalid usage always exits 2. The
-switch downgrades violations only: a crash of the checker itself (an import error, an
-unexpected exception) exits non-zero in every mode. The step is documented in
-``docs/runbooks/agent-attribution.md``.
+``X-Agent`` violations fail the run (exit 1) only when ``ATTRIBUTION_ENFORCE=1``. Any
+other value prints the same findings as warnings and exits 0; invalid usage always
+exits 2. The switch downgrades violations only: a crash of the checker itself (an
+import error, an unexpected exception) exits non-zero in every mode. The step is
+documented in ``docs/runbooks/agent-attribution.md``.
+
+Verification line
+=================
+``X-Verified`` is a second key in the same declaration paragraph, not a Git trailer.
+``git log --format=%(trailers)`` and ``git interpret-trailers`` walk backward from the
+end of the message and miss a line once prose or GitHub's ``Co-authored-by`` block
+follows it. This checker parses the declaration paragraph instead.
+
+An exact line is one of:
+
+    X-Verified: <commands or receipt ids>
+    X-Verified: none (<reason>)
+
+``<reason>`` is non-empty, has no surrounding whitespace, and contains no parenthesis.
+A line whose key lowercases to ``x-verified`` and is not one of those two forms is
+malformed wherever it sits, including inside a fence. A fence, quote, list or heading
+never counts as a declaration. Commands and an explicit ``none`` cannot share a
+message, and a message carries at most one ``none`` line. Several command lines are
+one declaration; a repeated value counts once.
+
+``--verified-mode off|observe|enforce`` (default ``observe``) applies only to this key.
+``off`` does not check it. ``observe`` logs what ``enforce`` would block and exits 0.
+``enforce`` fails the run on a missing, malformed, mixed or refused line. It does not
+read ``ATTRIBUTION_ENFORCE``.
+
+``--verified-report RANGE`` classifies each first-parent commit in ``RANGE``. A git
+error or an empty range fails the query in every mode. ``observe`` prints ``status=missing``
+and does not fail; ``enforce`` fails when any commit is missing, malformed, mixed or refused.
 
 Examples
 ========
 
-    .venv/bin/python scripts/ci/check_agent_attribution.py --pr origin/main HEAD
-    .venv/bin/python scripts/ci/check_agent_attribution.py --merge-group "$BASE_SHA" "$HEAD_SHA"
+    .venv/bin/python -m lu_machinery.ci.check_agent_attribution --pr origin/main HEAD
+    .venv/bin/python -m lu_machinery.ci.check_agent_attribution --merge-group "$BASE_SHA" "$HEAD_SHA"
+    .venv/bin/python -m lu_machinery.ci.check_agent_attribution --verified-mode observe \\
+        --verified-report origin/main~20..origin/main
 """
 
 from __future__ import annotations
@@ -91,6 +121,9 @@ from lu_machinery.common import github_client
 from lu_machinery.review.app_bot_authorship import verified_app_bot_login
 
 ENFORCE_ENV = "ATTRIBUTION_ENFORCE"
+DEFAULT_VERIFIED_MODE = "observe"
+VERIFIED_MODES = ("off", "observe", "enforce")
+BLOCKING_VERIFIED_STATUS = frozenset({"missing", "malformed", "mixed", "refused"})
 GIT_TIMEOUT_SECONDS = 120
 API_TIMEOUT_SECONDS = 30
 _GITHUB_HTTPS = "https://github.com/"
@@ -104,6 +137,9 @@ _COMMENT_MARKERS = ("<!--", "-->")
 _MARKDOWN = MarkdownIt("commonmark")
 _TRAILER_LINE = re.compile(r"[A-Za-z][A-Za-z0-9-]*: \S(?:.*\S)?", re.ASCII)
 _ATTRIBUTION_KEY = "x-agent"
+_VERIFIED_KEY = "x-verified"
+_VERIFIED_NONE = re.compile(r"^X-Verified: none \((?P<reason>[^()\s](?:[^()]*[^()\s])?)\)\Z", re.ASCII)
+_VERIFIED_COMMANDS = re.compile(r"^X-Verified: (?P<value>\S(?:.*\S)?)\Z", re.ASCII)
 _WELL_FORMED = re.compile(r"^X-Agent: (?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+)$")
 _LINE_BREAKS = ("softbreak", "hardbreak")
 # The squash headline ends in the PR number; earlier "(#N)" references are issues.
@@ -264,6 +300,143 @@ def extract_attribution(message: str) -> Attribution:
     return Attribution(tuple(values), malformed)
 
 
+@dataclass(frozen=True)
+class Verification:
+    """One message's ``X-Verified`` commands, explicit-none reasons, malformed count and refusal."""
+
+    commands: tuple[str, ...]
+    explicit_none: tuple[str, ...]
+    malformed: int
+    refusal: str | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedRow:
+    """Classification of one commit. ``status`` is missing, none, present, malformed, mixed or refused."""
+
+    commit: str
+    status: str
+
+
+@dataclass
+class VerifiedReport(Report):
+    """Attribution report plus the ``X-Verified`` findings for the same commits."""
+
+    verified: list[Violation] = field(default_factory=list)
+    verified_rows: list[VerifiedRow] = field(default_factory=list)
+
+
+def _is_verified_candidate(line: str) -> bool:
+    key, colon, _ = line.partition(":")
+    return bool(colon) and key.lower() == _VERIFIED_KEY
+
+
+def _verified_kind(line: str) -> str | None:
+    """``commands`` or ``none`` when ``line`` is an exact declaration, else None."""
+    if _TRAILER_LINE.fullmatch(line) is None:
+        return None
+    if _VERIFIED_NONE.fullmatch(line) is not None:
+        return "none"
+    commands = _VERIFIED_COMMANDS.fullmatch(line)
+    if commands is None:
+        return None
+    value = commands.group("value")
+    if value == "none" or value.startswith("none "):
+        return None
+    return "commands"
+
+
+def extract_verification(message: str) -> Verification:
+    """Declared ``X-Verified`` commands and explicit-none reasons.
+
+    Values come only from declaration paragraphs. A candidate that is not an exact
+    line counts as malformed wherever it sits. See "Verification line" in the module docstring.
+    """
+    refusal = _refusal(message)
+    if refusal is not None:
+        return Verification((), (), 0, refusal)
+    text = _normalised(message)
+    lines = text.split("\n")
+    malformed = sum(1 for line in lines if _is_verified_candidate(line) and _verified_kind(line) is None)
+    tokens = _parse(text)
+    if tokens is None:
+        return Verification((), (), malformed, "HTML_BLOCK")
+    commands: list[str] = []
+    reasons: list[str] = []
+    for paragraph in _paragraphs(tokens, lines):
+        for index in paragraph.declared:
+            line = paragraph.lines[index]
+            kind = _verified_kind(line)
+            if kind == "commands":
+                value = line.split(": ", 1)[1]
+                if value not in commands:
+                    commands.append(value)
+            elif kind == "none":
+                match = _VERIFIED_NONE.fullmatch(line)
+                reason = "" if match is None else match.group("reason")
+                if reason and reason not in reasons:
+                    reasons.append(reason)
+    return Verification(tuple(commands), tuple(reasons), malformed)
+
+
+def classify_from_found(found: Verification) -> str:
+    """``missing``, ``none``, ``present``, ``malformed``, ``mixed`` or ``refused``."""
+    if found.refusal is not None:
+        return "refused"
+    if found.malformed:
+        return "malformed"
+    if (found.commands and found.explicit_none) or len(found.explicit_none) > 1:
+        return "mixed"
+    if found.explicit_none:
+        return "none"
+    if found.commands:
+        return "present"
+    return "missing"
+
+
+def classify_verification(message: str) -> str:
+    """Classification of ``message``. See :func:`classify_from_found`."""
+    return classify_from_found(extract_verification(message))
+
+
+def verification_tokens(found: Verification) -> tuple[str, ...]:
+    """Values a clean message declares, or nothing when the message is not clean."""
+    if classify_from_found(found) not in {"present", "none"}:
+        return ()
+    if found.explicit_none:
+        return tuple(f"none ({reason})" for reason in found.explicit_none)
+    return found.commands
+
+
+def verification_findings(message: str, sha: str, pr: int | None) -> list[Violation]:
+    """What ``enforce`` would block for this message. Details carry no message text."""
+    found = extract_verification(message)
+    status = classify_from_found(found)
+    if status == "refused":
+        return [
+            Violation(
+                "REFUSED_MESSAGE",
+                f"{found.refusal} (see the declaration grammar in docs/runbooks/agent-attribution.md)",
+                sha,
+                pr,
+            )
+        ]
+    if status == "malformed":
+        return [
+            Violation(
+                "MALFORMED_VERIFICATION",
+                f"{found.malformed} X-Verified line(s) do not match the declaration grammar",
+                sha,
+                pr,
+            )
+        ]
+    if status == "mixed":
+        return [Violation("MIXED_VERIFICATION", "message mixes verification forms", sha, pr)]
+    if status == "missing":
+        return [Violation("MISSING_VERIFICATION", "no X-Verified line", sha, pr)]
+    return []
+
+
 def pr_number_from_subject(subject: str) -> int | None:
     """The terminal ``(#N)`` of a squash headline, else None."""
     match = _PR_SUFFIX.search(subject.rstrip())
@@ -389,9 +562,9 @@ def _bad_attribution(attribution: Attribution, sha: str, pr: int | None) -> Viol
     return None
 
 
-def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repository: str | None = None) -> Report:
+def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repository: str | None = None) -> VerifiedReport:
     """Every non-merge commit in ``base..head`` carries a well-formed line or is a verified bot's."""
-    report = Report("pr")
+    report = VerifiedReport("pr")
     try:
         base_sha, head_sha = _resolve_commit(base), _resolve_commit(head)
     except GitFailure as exc:
@@ -428,6 +601,7 @@ def check_pr(base: str, head: str, *, github_get: GitHubGet | None = None, repos
             report.violations.append(
                 Violation("MISSING_ATTRIBUTION", "no X-Agent line and no verified app-bot authorship", sha)
             )
+        report.verified.extend(verification_findings(message, sha, None))
     return report
 
 
@@ -438,9 +612,9 @@ def check_merge_group(
     remote: str = "origin",
     github_get: GitHubGet | None = None,
     repository: str | None = None,
-) -> Report:
+) -> VerifiedReport:
     """Each squash commit in the queue chain carries its PR's complete attribution."""
-    report = Report("merge-group")
+    report = VerifiedReport("merge-group")
     try:
         base_sha, head_sha = _resolve_commit(base), _resolve_commit(head)
         _git("merge-base", "--is-ancestor", base_sha, head_sha)
@@ -465,9 +639,11 @@ def check_merge_group(
                 )
             )
             continue
-        report.violations.extend(
-            _check_squash(sha, parents[0], message, remote=remote, github_get=github_get, repository=repository)
+        attribution_problems, verified_problems = _check_squash(
+            sha, parents[0], message, remote=remote, github_get=github_get, repository=repository
         )
+        report.violations.extend(attribution_problems)
+        report.verified.extend(verified_problems)
     return report
 
 
@@ -479,38 +655,58 @@ def _check_squash(
     remote: str,
     github_get: GitHubGet | None,
     repository: str | None,
-) -> list[Violation]:
+) -> tuple[list[Violation], list[Violation]]:
+    """Attribution problems, then what ``X-Verified`` enforce would block.
+
+    The attribution list is the same list this function returned before verification
+    existed. Verification is collected on every return that has a message, including
+    when attribution already failed.
+    """
     subject = message.split("\n", 1)[0]
     pr = pr_number_from_subject(subject)
+    landed_verified = verification_findings(message, sha, pr)
+
+    def finish(
+        problems: list[Violation], extra: list[Violation] | None = None
+    ) -> tuple[list[Violation], list[Violation]]:
+        verified = list(landed_verified)
+        if extra:
+            verified.extend(extra)
+        return problems, verified
+
     if pr is None:
-        return [Violation("MISSING_PR_REFERENCE", "subject does not end in (#N)", sha)]
+        return finish([Violation("MISSING_PR_REFERENCE", "subject does not end in (#N)", sha)])
     landed = extract_attribution(message)
     bad = _bad_attribution(landed, sha, pr)
     if bad is not None:
-        return [bad]
+        return finish([bad])
     try:
         pr_head = _fetch_pr_head(remote, pr)
     except GitFailure as exc:
-        return [Violation("FETCH_FAILED", f"cannot read refs/pull/{pr}/head: {exc}", sha, pr)]
+        return finish([Violation("FETCH_FAILED", f"cannot read refs/pull/{pr}/head: {exc}", sha, pr)])
     if not _source_is_squash_of(sha, parent, pr_head):
-        return [
-            Violation(
-                "UNVERIFIABLE_SOURCE",
-                f"refs/pull/{pr}/head merged into the squash parent does not reproduce the squash tree",
-                sha,
-                pr,
-            )
-        ]
+        return finish(
+            [
+                Violation(
+                    "UNVERIFIABLE_SOURCE",
+                    f"refs/pull/{pr}/head merged into the squash parent does not reproduce the squash tree",
+                    sha,
+                    pr,
+                )
+            ]
+        )
     try:
         sources = _range_commits(parent, pr_head)
     except GitFailure as exc:
-        return [Violation("FETCH_FAILED", f"cannot list refs/pull/{pr}/head: {exc}", sha, pr)]
+        return finish([Violation("FETCH_FAILED", f"cannot list refs/pull/{pr}/head: {exc}", sha, pr)])
     if not sources:
-        return [Violation("EMPTY_SOURCE", f"refs/pull/{pr}/head adds no non-merge commit", sha, pr)]
+        return finish([Violation("EMPTY_SOURCE", f"refs/pull/{pr}/head adds no non-merge commit", sha, pr)])
 
     problems: list[Violation] = []
     expected: list[str] = []
     unattributed: list[str] = []
+    source_verified: list[Violation] = []
+    expected_verified: list[str] = []
     for source in sources:
         try:
             _, source_message = _commit(source)
@@ -521,19 +717,36 @@ def _check_squash(
         bad = _bad_attribution(attribution, source, pr)
         if bad is not None:
             problems.append(bad)
-            continue
-        if attribution.values:
+        elif attribution.values:
             expected.extend(v for v in attribution.values if v not in expected)
         else:
             unattributed.append(source)
+        source_verified.extend(verification_findings(source_message, source, pr))
+        for token in verification_tokens(extract_verification(source_message)):
+            if token not in expected_verified:
+                expected_verified.append(token)
+    landed_tokens = verification_tokens(extract_verification(message))
+    omitted = [token for token in expected_verified if token not in landed_tokens]
+    if omitted:
+        source_verified.append(
+            Violation(
+                "INCOMPLETE_VERIFICATION",
+                f"landed message omits {len(omitted)} of {len(expected_verified)} verification value(s)",
+                sha,
+                pr,
+            )
+        )
     if problems:
-        return problems
+        return finish(problems, source_verified)
 
     if not landed.values:
         # Exempt only when every PR commit is a verified app bot's (no agent commit to attribute).
         if not expected and all(_bot_verified(github_get, repository, s) for s in sources):
-            return []
-        return [Violation("MISSING_ATTRIBUTION", "landed message has no X-Agent line", sha, pr)]
+            return finish([], source_verified)
+        return finish(
+            [Violation("MISSING_ATTRIBUTION", "landed message has no X-Agent line", sha, pr)],
+            source_verified,
+        )
     for source in unattributed:
         if not _bot_verified(github_get, repository, source):
             problems.append(
@@ -554,7 +767,7 @@ def _check_squash(
                 pr,
             )
         )
-    return problems
+    return finish(problems, source_verified)
 
 
 def _github_get_from_env() -> GitHubGet | None:
@@ -585,22 +798,106 @@ def _github_get_from_env() -> GitHubGet | None:
     return get
 
 
+def check_verified_report(range_spec: str) -> VerifiedReport:
+    """Classify ``X-Verified`` on each first-parent commit in ``range_spec``.
+
+    A git error or an empty range is a hard failure of the query (``report.violations``),
+    not a missing line. The classification itself is in ``report.verified_rows``.
+    """
+    report = VerifiedReport("verified-report")
+    if not range_spec or range_spec.startswith("-") or any(character in range_spec for character in "\n\r\t "):
+        report.violations.append(Violation("GIT_ERROR", "range is empty or not a single revision range"))
+        return report
+    try:
+        shas = tuple(sha for sha in _git("rev-list", "--first-parent", range_spec).split() if sha)
+    except GitFailure as exc:
+        report.violations.append(Violation("GIT_ERROR", str(exc)))
+        return report
+    if not shas:
+        report.violations.append(Violation("EMPTY_CHAIN", "no commit in the range"))
+        return report
+    for sha in shas:
+        report.checked += 1
+        try:
+            _, message = _commit(sha)
+        except GitFailure as exc:
+            report.violations.append(Violation("GIT_ERROR", str(exc), sha))
+            continue
+        status = classify_verification(message)
+        report.verified_rows.append(VerifiedRow(sha, status))
+        if status in BLOCKING_VERIFIED_STATUS:
+            report.verified.extend(verification_findings(message, sha, None))
+    return report
+
+
+def _print_verified_report(report: VerifiedReport, mode: str) -> None:
+    for violation in report.violations:
+        print(f"::error title=verified-trailer::{violation.render()}")
+    missing = 0
+    blocked = 0
+    for row in report.verified_rows:
+        print(f"verified-report: commit={row.commit[:12]} status={row.status}")
+        if row.status == "missing":
+            missing += 1
+        if row.status in BLOCKING_VERIFIED_STATUS:
+            blocked += 1
+    print(
+        f"verified-report: mode={mode} commits={report.checked} missing={missing} "
+        f"enforce_would_block={blocked} run_blocked={1 if mode == 'enforce' and blocked else 0}"
+    )
+    if mode == "observe" and blocked:
+        print("verified-report: enforce would block these commits; observe does not fail the run")
+    if mode == "off":
+        print("verified-report: mode=off classifies only; it does not enforce")
+
+
+def _print_verified_findings(report: VerifiedReport, mode: str) -> None:
+    if mode == "off":
+        print(f"verified-trailer: mode=off commits={report.checked} findings=0")
+        return
+    level = "error" if mode == "enforce" else "warning"
+    for violation in report.verified:
+        print(f"::{level} title=verified-trailer::{violation.render()}")
+    print(f"verified-trailer: mode={mode} commits={report.checked} findings={len(report.verified)}")
+    if report.verified and mode == "observe":
+        print("verified-trailer: enforce would block these findings; observe does not fail the run")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--merge-group", nargs=2, metavar=("BASE", "HEAD"), help="check a merge queue chain")
     mode.add_argument("--pr", nargs=2, metavar=("BASE", "HEAD"), help="check every commit of a pull request")
+    mode.add_argument(
+        "--verified-report",
+        metavar="RANGE",
+        help="classify X-Verified on each first-parent commit in a git revision range",
+    )
     parser.add_argument("--remote", default="origin", help="remote that serves refs/pull/N/head (default: origin)")
     parser.add_argument(
         "--repository",
         default=os.environ.get("GITHUB_REPOSITORY"),
         help="OWNER/REPO for app-bot verification (default: $GITHUB_REPOSITORY)",
     )
+    parser.add_argument(
+        "--verified-mode",
+        choices=VERIFIED_MODES,
+        default=DEFAULT_VERIFIED_MODE,
+        help="X-Verified check: off skips enforcement, observe logs it, enforce fails (default: observe)",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None, *, github_get: GitHubGet | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.verified_report:
+        report = check_verified_report(args.verified_report)
+        _print_verified_report(report, args.verified_mode)
+        if report.violations:
+            return 1
+        blocked = sum(row.status in BLOCKING_VERIFIED_STATUS for row in report.verified_rows)
+        return 1 if args.verified_mode == "enforce" and blocked else 0
+
     get = github_get if github_get is not None else _github_get_from_env()
     if args.merge_group:
         report = check_merge_group(*args.merge_group, remote=args.remote, github_get=get, repository=args.repository)
@@ -615,7 +912,9 @@ def main(argv: list[str] | None = None, *, github_get: GitHubGet | None = None) 
     print(f"agent-attribution: mode={report.mode} commits={report.checked} violations={len(report.violations)} {state}")
     if report.violations and not enforce:
         print(f"agent-attribution: not failing the run; set {ENFORCE_ENV}=1 to enforce")
-    return 1 if report.violations and enforce else 0
+    _print_verified_findings(report, args.verified_mode)
+    verified_fails = bool(report.verified) and args.verified_mode == "enforce"
+    return 1 if (report.violations and enforce) or verified_fails else 0
 
 
 if __name__ == "__main__":

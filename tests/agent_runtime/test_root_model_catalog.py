@@ -197,6 +197,9 @@ def test_runtime_registry_defaults_resolve_to_catalog_model_or_alias():
     known = set(catalog["models"])
     for model_id, model in catalog["models"].items():
         known.update(model.get("aliases", []))
+        # A lane default may be the model's own routing wire id (the AGY default
+        # gemini-4-hydrogen-medium); the loop below proves each one resolves to its row.
+        known.update(wire for wire in (model.get("routing_wire_ids") or {}).values() if isinstance(wire, str))
         known.add(model_id)
 
     unresolved = {
@@ -278,7 +281,8 @@ def test_opus_sol_and_reviewers_are_admitted_every_activity(model, activity):
 def test_recon_models_consult_but_never_review():
 
     assert activity_role_refusal("gpt-6-luna", "consult") is None
-    assert activity_role_refusal("gemini-4-carbon-medium", "consult") is not None
+    assert activity_role_refusal("gemini-4-carbon-medium", "consult") is None
+    assert "holds no review" in activity_role_refusal("gemini-4-carbon-medium", "review")
     assert "holds no review" in activity_role_refusal("gpt-6-luna", "review")
 
 
@@ -1182,14 +1186,15 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
 
 @pytest.mark.parametrize(
     ("agent", "model"),
-    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium")],
+    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-carbon-medium"),
+     ("agy", "gemini-4-hydrogen-medium"), ("agy", "gemini-4-hydrogen-xhigh")],
 )
 def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent, model):
     """Defect class: a model with no catalog review role admitted to a review-typed dispatch.
 
     Dispatch admission must refuse it before any worktree or provider starts; the verdict
     recorder's later refusal only discards a run that already happened (#9583). The same
-    model stays admitted for work. Carbon is work-only: it is not a second reviewer.
+    model stays admitted for work. Carbon and Hydrogen hold no review role: neither is a second reviewer.
     """
     from lu_machinery.dispatcher import checks
 
@@ -1200,6 +1205,44 @@ def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent,
     with pytest.raises(ValueError, match="holds no review"):
         checks.check_model_admission(agent, model, "read-only", review, b"review the change")
     checks.check_model_admission(agent, model, "read-only", {}, b"implement the change")
+
+
+def test_unpinned_agy_review_runs_the_formal_review_default_not_the_work_model(monkeypatch):
+    """Defect class: an unpinned review-typed dispatch takes the lane's work default, which holds no review role.
+
+    An unpinned Ukrainian-profile agy review (bridge ask and review admission) must run the lane's
+    formal review default (``formal_cf_defaults.agy``); the registry work model stays refused for
+    review before launch.
+    """
+    from lu_machinery.agent_runtime import target_admission
+    from lu_machinery.agent_runtime.retired_seat_admission import REVIEW_MODE
+    from lu_machinery.ai_agent_bridge._dispatch_wrappers import build_ask_review_dispatch_command
+    from lu_machinery.review.model_catalog import substitution_default_model
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("admission must not launch a provider")
+
+    monkeypatch.setattr("subprocess.run", forbidden)
+    monkeypatch.setattr("subprocess.Popen", forbidden)
+    work = AGENTS["agy"]["default_model"]
+    formal = substitution_default_model("agy")
+    assert work != formal
+
+    (asked,) = target_admission.resolve_and_admit(("agy",), mode=REVIEW_MODE, review=True)
+    command = build_ask_review_dispatch_command(
+        asked, "ask-review", Path("ask-review.md"), effort=None, review_profile="ukrainian",
+    )
+    assert command[command.index("--model") + 1] == formal
+    (admitted,) = target_admission.resolve_and_admit(
+        ("agy",), mode="read-only", review_dispatch=True, review_profile="ukrainian", claude_account=HOST_ACCOUNT,
+    )
+    assert admitted.recipient == "agy"
+    assert target_admission.review_default_model(admitted.recipient) == formal
+
+    review = {"pr": 12935, "require_review_verdict": True, "review_profile": "ukrainian"}
+    checks.check_model_admission("agy", formal, "read-only", review, b"review the change")
+    with pytest.raises(ValueError, match="holds no review"):
+        checks.check_model_admission("agy", work, "read-only", review, b"review the change")
 
 
 @pytest.mark.parametrize(

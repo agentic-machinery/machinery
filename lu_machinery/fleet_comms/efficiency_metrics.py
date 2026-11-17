@@ -13,8 +13,12 @@ import re
 import sqlite3
 import stat
 import subprocess
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -994,7 +998,10 @@ def _task_record_paths(directory: Path, *, optional: bool) -> list[Path]:
     """
     try:
         with os.scandir(directory) as entries:
-            return sorted(directory / entry.name for entry in entries if entry.name.endswith(".json"))
+            # Sort the names, not Path objects: Path ordering is ~20x slower on a
+            # ledger of tens of thousands of records, and one directory orders the same.
+            names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
+        return [directory / name for name in names]
     except (FileNotFoundError, NotADirectoryError):
         if optional:
             return []
@@ -1041,6 +1048,100 @@ def _read_task_record(path: Path) -> tuple[object, str | None]:
         # integer-string-conversion limit; RecursionError covers deep nesting;
         # OSError covers vanished, dangling, looping and permission-denied files.
         return None, "task_record_unreadable"
+
+
+@dataclass(frozen=True, slots=True)
+class _DispatchSample:
+    """What one task record contributes to the dispatch span: a few fields, never content."""
+
+    error_kind: str | None = None
+    hard_timeout: int | None = None
+    identity: tuple[str | None, str | None] | None = None
+    started: datetime | None = None
+    finished: datetime | None = None
+
+
+def _dispatch_sample(path: Path) -> _DispatchSample:
+    """Read one record and project the dispatch-span fields, or the error kind it reports."""
+    record, read_error = _read_task_record(path)
+    if read_error is not None:
+        return _DispatchSample(error_kind=read_error)
+    if record is None:
+        return _DispatchSample()
+    if not isinstance(record, dict):
+        return _DispatchSample(error_kind="task_record_not_object")
+    raw_timeout = record.get("hard_timeout")
+    hard_timeout = (
+        raw_timeout
+        if isinstance(raw_timeout, int) and not isinstance(raw_timeout, bool) and 0 <= raw_timeout <= _MAX_HARD_TIMEOUT_S
+        else None
+    )
+    if "task_id" not in record:
+        return _DispatchSample(error_kind="not_a_task_record", hard_timeout=hard_timeout)
+    if record.get("started_at") is None:
+        return _DispatchSample(error_kind="missing_started_at", hard_timeout=hard_timeout)
+    started = _parse_timestamp(record.get("started_at"))
+    if started is None:
+        return _DispatchSample(error_kind="invalid_started_at", hard_timeout=hard_timeout)
+    # An active status is never a settled dispatch, even if an old or
+    # partially written record carries a finish timestamp.
+    finished_raw = None if record.get("status") in ("running", "spawning") else record.get("finished_at")
+    finished = _parse_timestamp(finished_raw)
+    if finished_raw not in (None, "") and finished is None:
+        return _DispatchSample(error_kind="invalid_finished_at", hard_timeout=hard_timeout)
+    if finished is not None and finished < started:
+        return _DispatchSample(error_kind="negative_duration", hard_timeout=hard_timeout)
+    return _DispatchSample(hard_timeout=hard_timeout, identity=_task_identity(record), started=started, finished=finished)
+
+
+# Per-process memo of dispatch samples, so a repeat scan parses only records that
+# changed (a cold scan json-parses every record: seconds on a large ledger). One map
+# per scanned tasks directory, path -> (stat identity, sample); each scan replaces
+# its map with exactly the files it saw, so deleted records drop out, and at most
+# _DISPATCH_SAMPLE_ROOTS directories are kept (least recently scanned evicted).
+_DispatchStatKey = tuple[int, int, int, int, int]
+_DISPATCH_SAMPLE_ROOTS = 4
+# Git's racy-clean rule: a file modified within this window of the scan is not
+# memoized, since a same-size rewrite inside one timestamp tick keeps its stat identity.
+_DISPATCH_SAMPLE_RACY_NS = 2_000_000_000
+_dispatch_sample_cache: OrderedDict[str, dict[str, tuple[_DispatchStatKey, _DispatchSample]]] = OrderedDict()
+_dispatch_sample_lock = threading.Lock()
+_wall_clock_ns: Callable[[], int] = time.time_ns
+
+
+def _dispatch_samples(tasks_dir: Path, paths: list[Path]) -> list[_DispatchSample]:
+    """Samples for ``paths`` in order; a record whose stat identity is unchanged is not re-read.
+
+    The identity is (device, inode, size, mtime_ns, ctime_ns): an atomic replace
+    changes the inode, an in-place write changes size or the timestamps, and ctime
+    cannot be set back by ``utime``. A path that cannot be stat-ed is read uncached
+    so it reports its own error kind.
+    """
+    root = os.fspath(tasks_dir)
+    with _dispatch_sample_lock:
+        previous = _dispatch_sample_cache.get(root, {})
+    current: dict[str, tuple[_DispatchStatKey, _DispatchSample]] = {}
+    samples: list[_DispatchSample] = []
+    now_ns = _wall_clock_ns()
+    for path in paths:
+        name = os.fspath(path)
+        try:
+            info = os.stat(name)
+        except OSError:
+            samples.append(_dispatch_sample(path))
+            continue
+        key: _DispatchStatKey = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        entry = previous.get(name)
+        sample = entry[1] if entry is not None and entry[0] == key else _dispatch_sample(path)
+        if now_ns - max(info.st_mtime_ns, info.st_ctime_ns) > _DISPATCH_SAMPLE_RACY_NS:
+            current[name] = (key, sample)
+        samples.append(sample)
+    with _dispatch_sample_lock:
+        _dispatch_sample_cache[root] = current
+        _dispatch_sample_cache.move_to_end(root)
+        while len(_dispatch_sample_cache) > _DISPATCH_SAMPLE_ROOTS:
+            _dispatch_sample_cache.popitem(last=False)
+    return samples
 
 
 def collect_stream_bottleneck_metrics(
@@ -1116,41 +1217,17 @@ def collect_stream_bottleneck_metrics(
                 task_paths.extend(_task_record_paths(directory, optional=optional))
             except OSError:
                 errors.append(_dispatch_error("tasks_dir_unreadable"))
-        for path in task_paths:
-            record, read_error = _read_task_record(path)
-            if read_error is not None:
-                errors.append(_dispatch_error(read_error))
+        for sample in _dispatch_samples(tasks_dir, task_paths):
+            if sample.hard_timeout is not None:
+                dispatch_hard_timeouts.append(sample.hard_timeout)
+            if sample.error_kind is not None:
+                errors.append(_dispatch_error(sample.error_kind))
                 continue
-            if record is None:
+            if sample.identity is None or sample.started is None:
                 continue
-            if not isinstance(record, dict):
-                errors.append(_dispatch_error("task_record_not_object"))
-                continue
-            hard_timeout = record.get("hard_timeout")
-            if isinstance(hard_timeout, int) and not isinstance(hard_timeout, bool) and 0 <= hard_timeout <= _MAX_HARD_TIMEOUT_S:
-                dispatch_hard_timeouts.append(hard_timeout)
-            if "task_id" not in record:
-                errors.append(_dispatch_error("not_a_task_record"))
-                continue
-            if record.get("started_at") is None:
-                errors.append(_dispatch_error("missing_started_at"))
-                continue
-            started = _parse_timestamp(record.get("started_at"))
-            if started is None:
-                errors.append(_dispatch_error("invalid_started_at"))
-                continue
-            # An active status is never a settled dispatch, even if an old or
-            # partially written record carries a finish timestamp.
-            finished_raw = None if record.get("status") in ("running", "spawning") else record.get("finished_at")
-            finished = _parse_timestamp(finished_raw)
-            if finished_raw not in (None, "") and finished is None:
-                errors.append(_dispatch_error("invalid_finished_at"))
-                continue
-            if finished is not None and finished < started:
-                errors.append(_dispatch_error("negative_duration"))
-                continue
+            started, finished = sample.started, sample.finished
             add(
-                _task_identity(record),
+                sample.identity,
                 "dispatch",
                 (finished - started).total_seconds() if finished else None,
                 max(0.0, (clock - started).total_seconds()) if finished is None else None,

@@ -1976,12 +1976,34 @@ def _collect_panel_metrics(ctx: MonitorContext, include_agent_success: bool) -> 
 
 def _metrics_cache_key(ctx: MonitorContext, include_agent_success: bool = False) -> str:
     return ctx_scoped_ttl_key(ctx, "comms-metrics", ctx.roots.state_root, ctx.roots.message_db_path,
-                              ctx.roots.batch_state_dir, resolve_metrics_source(), include_agent_success)
+                              ctx.roots.batch_state_dir, os.environ.get("FLEET_COMMS_ROOT", ""),
+                              resolve_metrics_source(), include_agent_success)
 
 
 def warm_panel_metrics(ctx: MonitorContext) -> None:
-    """Use the same single flight as requests; no second timer or collector."""
-    schedule_cache_refresh(_metrics_cache_key(ctx), COMMS_METRICS_TTL_S, lambda: _collect_panel_metrics(ctx, False))
+    """Refresh off-loop, sharing the dashboard's cache and single flight."""
+    key = _metrics_cache_key(ctx)
+    schedule_cache_refresh(
+        key, COMMS_METRICS_TTL_S, lambda: _collect_panel_metrics(ctx, False),
+        should_refresh=lambda: cache_get(key, COMMS_METRICS_TTL_S) is None,
+    )
+
+
+def cached_panel_metrics(ctx: MonitorContext) -> tuple[dict, float] | None:
+    """Read the shared snapshot without collecting or waiting on its writer."""
+    stored = cache_get_stored(_metrics_cache_key(ctx))
+    if stored is None:
+        return None
+    (observed_at, payload), age = cast(tuple[tuple[str, dict], float], stored)
+    # A slow aggregation must not make an old observation look newly sampled.
+    return payload, max(age, panel_values.observation_age_s(observed_at) or 0.0)
+
+
+async def refresh_panel_metrics_periodically(ctx: MonitorContext) -> None:
+    """Keep exporter data warm even when nobody visits the dashboard."""
+    while True:
+        warm_panel_metrics(ctx)
+        await asyncio.sleep(COMMS_METRICS_TTL_S)
 
 
 @router.get("/v1/metrics")

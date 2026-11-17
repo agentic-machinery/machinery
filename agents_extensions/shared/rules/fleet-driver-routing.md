@@ -30,7 +30,7 @@ and ≥2 tiers for 14 consecutive days. A review does not expire the standing ru
 | Operator name | Catalog tier | Role | Examples (confirm live ids in `model_catalog.yaml`) |
 | --- | --- | --- | --- |
 | **Big brain / advisor** | `frontier_authority` | One-shot judgment, **briefs**, contested design; high-stakes CF of record only on an eligible route, never from an advisory turn | **claude-opus-5-5** (Opus 5.5) / **gpt-6.1-sol** (Sol 6.1 @ high); bounded envelopes use Sol only (§2) |
-| **Hard implement / practical** | `frontier_practical` | Autonomous multi-file when scope is clear; standard CF | **GPT-6.1 Sol @ high** (Codex coding/review), Claude Opus 5.5 for hard Claude-lane coding, Gemini 3.8 Flash for well-defined work |
+| **Hard implement / practical** | `frontier_practical` | Autonomous multi-file when scope is clear; standard CF | **GPT-6.1 Sol @ high** (Codex coding/review), Claude Opus 5.5 for hard Claude-lane coding, Gemini 4 Hydrogen for well-defined work |
 | **Heap / volume** | `economical` / strong_efficient | Bounded routine implementation, scouting, and recon | **GPT-6 Luna @ high**, Flash-class, other volume seats |
 
 **Codex role boundary:** GPT-6.1 Sol (`gpt-6.1-sol`) @ `high` is the only Sol: the coding and
@@ -94,7 +94,7 @@ stampede one hot lane.
 | **Cursor, Other Models** | named third-party model, non-review work only; never a review (D-129, #10464) | Pin only an approved concrete slug from § Cursor pools. Draws the API pool. A review goes to the `resolve-reviewer` pick instead. |
 | **DeepSeek V4.1 Flash** | Latest `deepseek-v4.1-flash` coding through opencode | Direct DeepSeek API or OpenRouter with a named US provider allow-list; never private-repository content or secrets. Pro and older are retired. Review-of-record and Ukrainian work need measured evidence first. `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` until a named US provider allow-list exists. `ask-deepseek` remains consult-only for non-language work. |
 | **Kimi** | retired (OO-58, #11327) | do not dispatch; every Kimi id is refused |
-| **AGY Gemini Flash** | agentic scripts, language-lane content | `gemini-3.8-flash-high` |
+| **AGY Gemini** | agentic scripts; language-lane content review stays on `gemini-3.8-flash-high` | `gemini-4-hydrogen-medium` (work default, HYDROGEN-REPLACES-38) |
 | **Claude Sonnet** | routine judgment/CF | Opus 5.5 / Sol 6.1 for hard judgment; ~1 Claude driver |
 
 **OpenRouter:** use only active catalog routes with their data and provider restrictions.
@@ -198,7 +198,7 @@ driver-brief exception, Luna dispatches need a complete envelope from a finished
 otherwise (`BOUNDED_ENVELOPE_REQUIRED`), including after a budget substitution, and fails
 the worker at finalize when it exceeds the envelope ceilings (a completion gate checked after
 the worker exits, not a limit on what it does while running). The envelope's `owned_paths`
-must equal the worker's `--owned-path` set. `gemini-3.8-flash-high` on AGY is a general
+must equal the worker's `--owned-path` set. Gemini on AGY (`gemini-4-hydrogen-medium` by default) is a general
 read-only and workspace-write worker and does not take an advisory task (#12291). Outside the #10919 exception, a brief
 that is not a Sol envelope does not admit a bounded worker (the packet path used to be "Fable or Astra"; it is now the catalog
 advisor route only). Routine lockfile, pointer and smoke tasks take

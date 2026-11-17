@@ -69,6 +69,49 @@ X-Agent: codex/task-1
 
 Write `Refs: #10549`, or put a blank line between the two.
 
+## Verification line (`X-Verified`)
+
+A second key in that same declaration paragraph records how the change was checked.
+It is not a Git trailer. `git log --format=%(trailers)` walks backward from the end
+and stops at the first non-trailer paragraph, so a line above prose or above GitHub's
+`Co-authored-by` block is invisible to it. Query the line with the checker:
+
+```text
+.venv/bin/python -m lu_machinery.ci.check_agent_attribution --verified-mode observe \
+  --verified-report origin/main~20..origin/main
+```
+
+An exact line is one of:
+
+```text
+X-Verified: <commands or receipt ids>
+X-Verified: none (<reason>)
+```
+
+`<reason>` is non-empty, has no surrounding whitespace, and contains no parenthesis.
+A line whose key lowercases to `x-verified` and is not one of those forms is
+malformed wherever it sits. A fence, quote, list or heading is an example, not a
+declaration. Commands and `none` cannot share a message. A message carries at most
+one `none` line. Several distinct command lines are one declaration.
+
+`--verified-mode` is `off`, `observe` or `enforce`. The default is `observe`.
+`off` does not check the key. `observe` logs what `enforce` would block and exits 0.
+`enforce` fails the run on a missing, malformed, mixed or refused line. This mode
+does not read `ATTRIBUTION_ENFORCE`.
+
+`--verified-report RANGE` prints one `verified-report: commit=<12 hex> status=<status>`
+line per first-parent commit in `RANGE`. Status is `missing`, `none`, `present`,
+`malformed`, `mixed` or `refused`. The summary includes `missing=` and
+`run_blocked=`. A git error or an empty range fails the query in every mode. The
+report does not echo the line's text.
+
+| Code | Meaning |
+| --- | --- |
+| `MISSING_VERIFICATION` | No `X-Verified` line. |
+| `MALFORMED_VERIFICATION` | A line keyed `x-verified` is not an exact line. |
+| `MIXED_VERIFICATION` | Commands and `none` share a message, or more than one `none` line. |
+| `INCOMPLETE_VERIFICATION` | A merge-group landed message omits a value present on the PR's commits. |
+
 Source commits keep writing the trailer as today (`X-Agent: <agent>/<task-id>` in its own
 paragraph or beside other `Key: value` trailers). The repository setting below is what
 carries those lines into the landed message.
@@ -213,6 +256,26 @@ closure is the standard library and `scripts/` itself.
 - Do not move the step to a job that can be skipped or reused. A skipped required check
   counts as passing.
 
+## Machinery gate
+
+Machinery's required check is the `CI Gate` job in `.github/workflows/ci-gate.yml`.
+That job only reads the other jobs' results, so the checker is its own job,
+`verified-trailer`, and the gate requires it on every event. The job checks out
+full history, installs the pinned `markdown-it-py==4.2.0` and `mdurl==0.1.2`
+wheels, and runs `python -m lu_machinery.ci.check_agent_attribution` with
+`--verified-mode observe`.
+
+| Event | Invocation |
+| --- | --- |
+| `pull_request` | `--pr` base and head |
+| `merge_group` | `--merge-group` base and head |
+| `push` | `--pr` from the previous SHA to the pushed SHA, or a log line when the push has no previous SHA |
+| `workflow_dispatch` | `--verified-report HEAD~20..HEAD` |
+
+`X-Agent` stays on its own switch. This job does not set `ATTRIBUTION_ENFORCE`.
+A missing `X-Verified` line is a warning. A crash of the checker fails the job.
+Product CI is unchanged until a later change wires the same checker there.
+
 ## Replay before enforcing
 
 Run the checker over real history and explain every rejection before setting
@@ -303,3 +366,11 @@ Also inspect source messages and PR bodies for `Closes #N` text: with
 - **Live CI evidence.** Both event paths and the reused-tree path must be shown on real
   runs (run and job IDs) before #10736 closes; `docs/runbooks/ci-gate.md` should then
   list this step.
+- **Machinery starts in observe.** `.github/workflows/ci-gate.yml` job `verified-trailer`
+  runs this checker with `--verified-mode observe` on pull requests, merge groups and
+  pushes. A missing `X-Verified` line is a warning there. It does not fail the gate.
+  Product CI does not run this checker yet; that wiring is a later change. Switch
+  machinery to `enforce` only after a fresh report shows no unexplained blocks.
+- **Merge-group completeness is collected, not yet the gate.** A squash that drops a
+  source commit's `X-Verified` value is `INCOMPLETE_VERIFICATION`. Observe mode logs
+  it. The product repository's copy of the checker does not.

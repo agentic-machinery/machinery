@@ -64,6 +64,20 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    that could. Save command output (for example `dispatch.py wait` or `status`) only under
    `batch_state/tasks/<task-id>.artifacts/` or the session scratch, never as `*.json` beside the
    task records, which every ledger scan reads as records.
+
+   **X-Verified commit line.** Every commit adds one declaration line in the same
+   paragraph as `X-Agent`. It is not a Git trailer: `git log --format=%(trailers)`
+   does not show it.
+
+   ```text
+   X-Verified: <commands or receipt ids>
+   X-Verified: none (<reason>)
+   ```
+
+   Write the commands or receipt ids of the checks this commit ran. When there is
+   no runtime to exercise, write `none` and the reason in parentheses, for example
+   `X-Verified: none (docs only)`. Observe mode logs a missing line and does not
+   fail the run. Enforce mode blocks it.
 3. **Prove it** ([delivery](references/delivery.md#proof)): reproduce, fix, the same check
    passes; behaviour proof for a user-visible surface. Add a test only with the CTO's approval
    of that specific test.
@@ -177,6 +191,10 @@ first review of record, at most **one per PR lineage**.
   and confirmed defects follow the existing review-loop severity policy.
 - **Non-record status:** it is never a review of record and never satisfies or waives the
   cross-family gate. No change to reviewer choice, risk floors, or round budgets.
+
+## Run the change
+
+Before the commit, and again before enqueue, run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that enqueue. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
 
 ## Stop and escalate
 

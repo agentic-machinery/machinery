@@ -397,9 +397,7 @@ def resolve_and_admit(
                 retired_model_resolution = review_alias_model_resolver(review_seat, explicit_model)
                 review_model = retired_model_resolution[0]
             elif review_model is None:
-                from .telemetry import _default_model_for
-
-                review_model = _default_model_for(review_seat)
+                review_model = review_default_model(review_seat)
 
         def review_select(
             snapshot: Mapping[str, Any] | None,
@@ -508,7 +506,8 @@ def resolve_and_admit(
         if not review_activity:
             for requested_model in models:
                 refuse_model_roles(requested_model, roles)
-        for selected in (target_model or _seat_default_model(recipient, harness)
+        unpinned = review_default_model if review_activity else _seat_default_model
+        for selected in (target_model or unpinned(recipient, harness)
                          for recipient, target_model, _ in resolved):
             refuse_model_roles(selected, roles)
         # Operator pauses apply to new work only, never to messaging or to
@@ -521,24 +520,27 @@ def resolve_and_admit(
             _refuse_paused(models, claude_account=claude_account, check_headroom=False)
         for recipient, target_model, _ in resolved:
             _refuse_paused(
-                [target_model or _seat_default_model(recipient, harness)],
+                [target_model or unpinned(recipient, harness)],
                 claude_account=claude_account, review=review_activity, seat=recipient,
             )
     with _minting():
         return tuple(AdmittedTarget(recipient, target_model, reason) for recipient, target_model, reason in resolved)
 
 
-def seat_default_model(seat: str, harness: str | None = None) -> str | None:
-    """Return the default model used by admission for a seat and optional harness."""
-    return _seat_default_model(seat, harness)
+def review_default_model(seat: str, harness: str | None = None) -> str | None:
+    """The model a review-typed request runs on ``seat`` when it pins none.
 
-
-def _seat_default_model(seat: str, harness: str | None = None) -> str | None:
-    """The model a seat runs when the request pins none.
-
-    A harness may pick its own fixed default;
-    otherwise the registry default applies.
+    The registry default is the lane's work model, which may hold no review role
+    (agy). A harness's fixed model still applies; otherwise the lane's formal
+    review default (``formal_cf_defaults``) does, and a lane without one keeps the
+    seat default.
     """
+    from lu_machinery.review.model_catalog import substitution_default_model
+
+    return _harness_fixed_model(harness) or substitution_default_model(seat) or _seat_default_model(seat)
+
+
+def _harness_fixed_model(harness: str | None) -> str | None:
     if harness:
         try:
             from .adapters.acpx import ACPX_SUPPORTED_PARTICIPANTS
@@ -548,6 +550,17 @@ def _seat_default_model(seat: str, harness: str | None = None) -> str | None:
                 return str(fixed)
         except Exception:  # unknown harness: registry default
             pass
+    return None
+
+
+def _seat_default_model(seat: str, harness: str | None = None) -> str | None:
+    """The model a seat runs when the request pins none.
+
+    A harness may pick its own fixed default;
+    otherwise the registry default applies.
+    """
+    if fixed := _harness_fixed_model(harness):
+        return fixed
     try:
         from .registry import AGENTS
     except Exception:  # no registry: nothing to resolve
@@ -648,8 +661,6 @@ def _resolve_review_target(
     from lu_machinery.review.security_paths import effective_review_risk
     from lu_machinery.review.subject_seat import prepare_subject_exclusion, subject_exclusion_reason
 
-    from .telemetry import _default_model_for
-
     if snapshot:
         # #10630: a caller's snapshot is judged as the reviewer's account, already keyed or not.
         snapshot, _ = select_account(snapshot, account=claude_account)
@@ -666,7 +677,7 @@ def _resolve_review_target(
             raise ReviewAdmissionRefused("SELF_REVIEW_DETECTED: reviewer task equals a branch author task")
         risk = risk or "medium"
     _require_agy_code_review_risk(seat, risk, profile)
-    requested_model = model or _default_model_for(seat) or ""
+    requested_model = model or review_default_model(seat) or ""
     if review_mode == "red_team":
         refusal = red_team_seat_refusal(
             (requested_model,),
@@ -844,7 +855,7 @@ def _resolve_review_target(
     # initial admission. Its allowance and credit allowlist belong to that
     # admitted seat/model, independently of the original request.
     lane_info = lane_record(snapshot, budget_seat, account=claude_account)
-    budget_model = budget_model or (requested_model if budget_seat == seat else _default_model_for(budget_seat))
+    budget_model = budget_model or (requested_model if budget_seat == seat else review_default_model(budget_seat))
     budget_blocked, _ = review_capacity_action(
         budget_seat, lane_info, (snapshot or {}).get("diagnostics"), budget_model
     )

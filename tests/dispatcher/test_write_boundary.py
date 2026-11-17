@@ -449,7 +449,12 @@ def test_declared_resources_in_masked_roots_stay_read_only_without_host_socket_a
 
     repo, worktree, receipt = primary
     home = Path(os.environ["HOME"])
-    masked = tmp_path.parent / ("ro-" + hashlib.sha256(str(tmp_path).encode()).hexdigest()[:8])
+    # A short sibling of tmp_path: the AF_UNIX socket below it must fit in 108 bytes, so this
+    # cannot live under the numbered test directory. The case name is part of the hash because
+    # retention deletes a passed case's directory and the next case reuses that path.
+    masked = tmp_path.parent / (
+        "ro-" + hashlib.sha256(f"{login_root}\0{tmp_path}".encode()).hexdigest()[:8]
+    )
     # The selected login below HOME, or below an emptied root outside it, with its key helper's file beside it.
     login = home / ".claude" if login_root == "home" else masked / "logins" / "b"
     # The key file inside the login directory itself, or below an emptied root of its own.

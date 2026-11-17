@@ -984,7 +984,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "798d86044cd6ac4ded8e24b4a22a576c8421ac47eddfe764eed6368f54de4553",
+    "v2-baseline.json.gz": "79cb85208623d4c1be2f26c29060ca73f45496bed3878cbee42a5f275d0bb924",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1037,7 +1037,7 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "798d86044cd6ac4ded8e24b4a22a576c8421ac47eddfe764eed6368f54de4553"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "79cb85208623d4c1be2f26c29060ca73f45496bed3878cbee42a5f275d0bb924"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 def approved_hramatka_gemma_baseline(baseline):
     """Correct Gemma's use description without changing fleet routing or receipts."""
@@ -1144,11 +1144,10 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
-            # #586 + USE-HYDROGEN-1117 / HYDROGEN-COUNCIL-ALL-1117: Hydrogen is an AGY work model
-            # with advisory and non-record surface_review roles for council and parallel review
-            # evaluation; it joins no review-of-record seat, ladder or ranking, and its row is pinned.
+            # #586: Hydrogen is an AGY work model with work roles only; it joins no seat, review
+            # route, ladder or ranking, and its row is pinned.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
-            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "b9ee6e05ec63288cb8ae81df94b0935098fddd0e7f2366508c5e562e54fc2f07"
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "1ac63a61c73fbe0e7503d8a6ed0428c5633e4a4acb458690927f578a95d892bc"
         assert value == expected, f"current surface differs: {surface}"
 
 

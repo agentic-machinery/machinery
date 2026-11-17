@@ -96,9 +96,14 @@ _CONFIG_ROOT_CACHES = (
 
 
 def _forget_entry_modules() -> None:
-    for name, module in tuple(sys.modules.items()):
-        origin = getattr(module, "__file__", None) or ""
-        if (name == "scripts" or name.startswith("scripts.")) and origin.startswith(str(_SESSION_ROOTS)):
+    """Drop every cached product ``scripts`` package.
+
+    A test may import ``scripts`` from its own tmp. Dropping only the session-root
+    copies leaves that import in place after retention removes the tmp, and the
+    next product load then refuses the file.
+    """
+    for name in tuple(sys.modules):
+        if name == "scripts" or name.startswith("scripts."):
             del sys.modules[name]
 
 
@@ -134,6 +139,9 @@ def pytest_make_collect_report(collector: pytest.Collector):
 def _session_roots_for_this_test(monkeypatch):
     for name, value in _ROOT_VALUES.items():
         monkeypatch.setenv(name, value)
+    # A passed test may have cached config.PRODUCT_ROOT at its own tmp. Retention has
+    # removed that directory; drop the cache so this test reads the session roots above.
+    _forget_session_roots()
     state = _SESSION_ROOTS / _ROOT_VARIABLES["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]
     for child in state.iterdir():
         if child.name == ".git":

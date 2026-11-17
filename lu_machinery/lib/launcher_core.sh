@@ -130,7 +130,7 @@ launcher_usage() {
     gemini) provider_env='  AGY_*                    AGY-managed Gemini authentication and configuration.' ;;
   esac
   case "$LC_PROVIDER:$LC_MODE" in
-    gemini:interactive) example_three='./start-gemini.sh --model gemini-4-carbon-medium' ;;
+    gemini:interactive) example_three='./start-gemini.sh --model gemini-4-hydrogen-medium' ;;
     *:driver) example_three="./${name} --epic devops"$'\n'"  ./${name} --epic infra --force" ;;
     *) example_three="./start-${LC_PROVIDER}-driver.sh --epic devops" ;;
   esac
@@ -158,7 +158,7 @@ Options:
   --model MODEL              Provider model. Claude driver default: claude-opus-5-5[1m].
                              Gemini driver default: gemini-3.8-flash-high (only certified id);
                              Gemini interactive default:
-                             gemini-4-carbon-medium. Claude interactive: omit to use
+                             gemini-4-hydrogen-medium. Claude interactive: omit to use
                              project settings (Sonnet 5.5).
   --effort LEVEL             Session effort when supported (Claude Code/AGY --effort).
                              Gemini selects the matching model
@@ -385,11 +385,11 @@ launcher_defaults() {
       ;;
     gemini)
       # The driver keeps the certified Flash seat; interactive sessions use the
-      # Carbon medium work route (operator 2026-11-10).
+      # Gemini work default, Hydrogen at medium (operator 2026-11-15/17).
       if [ "$LC_MODE" = driver ]; then
         LC_MODEL="${LAUNCHER_MODEL:-gemini-3.8-flash-high}"
       else
-        LC_MODEL="${LAUNCHER_MODEL:-gemini-4-carbon-medium}"
+        LC_MODEL="${LAUNCHER_MODEL:-gemini-4-hydrogen-medium}"
       fi
       LC_HARNESS="${LAUNCHER_HARNESS:-agy}"
       ;;

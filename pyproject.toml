@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lu-machinery"
-version = "0.1.28"
+version = "0.1.29"
 description = "Shared agent orchestration and development tooling"
 requires-python = ">=3.12"
 # Direct third-party imports under lu_machinery/, including the CI tools it runs.
@@ -36,7 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["PyMuPDF==2.1"]
+test = ["hypothesis==6.170.15", "PyMuPDF==2.1"]
 
 [tool.setuptools]
 include-package-data = true
@@ -70,6 +70,9 @@ files = [
 "share/lu-machinery/node-contract" = ["package.json", "package-lock.json", ".nvmrc"]
 
 [tool.pytest.ini_options]
+# Retain only failures so passed tests' tmp dirs do not accumulate for the session.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 1
 markers = [
     "live_network: opt-out of socket-guard for integration tests requiring outbound network",
 ]

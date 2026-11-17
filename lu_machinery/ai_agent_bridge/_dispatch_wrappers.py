@@ -317,10 +317,11 @@ def build_ask_review_dispatch_command(
     ``target`` is the ``AdmittedTarget`` ``resolve_and_admit`` produced for
     the review seat; the command carries its seat and model.
     """
-    from lu_machinery.agent_runtime.target_admission import require_admitted, seat_default_model
+    from lu_machinery.agent_runtime.target_admission import require_admitted, review_default_model
 
     target = require_admitted(target)
-    model = target.model or seat_default_model(target.recipient)
+    # An unpinned review runs the lane's formal review default, not its work default.
+    model = target.model or review_default_model(target.recipient)
     if not model:
         raise ValueError(f"no default dispatch model for {target.recipient!r}")
     cmd = [

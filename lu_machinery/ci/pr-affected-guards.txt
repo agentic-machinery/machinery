@@ -2,3 +2,6 @@ tests/review/test_routing_consumers.py
 tests/agent_runtime/test_lane_probe.py
 tests/dispatcher/test_core.py::test_read_only_mode_denies_edits_on_every_provider
 tests/dispatcher/test_task_store_records.py
+tests/property/test_attribution_roundtrip_props.py
+tests/property/test_path_safety_props.py
+tests/property/test_publish_github_guards_props.py
