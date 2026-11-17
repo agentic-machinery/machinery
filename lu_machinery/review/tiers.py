@@ -24,21 +24,24 @@ ReviewTier = Literal["trivial", "low", "medium", "ukrainian-content", "high"]
 _RANK: dict[ReviewTier, int] = {"trivial": 0, "low": 1, "medium": 2, "ukrainian-content": 3, "high": 4}
 _MATCH_ORDER: tuple[ReviewTier, ...] = ("high", "ukrainian-content", "trivial", "low")
 _STATUSES = {"added", "modified", "removed", "renamed", "copied", "changed", "unchanged"}
-_TABLE_KEYS = {"schema_version", "default", "tiers", "model_facing", "release_version_files"}
+_TABLE_KEYS = {"schema_version", "default", "tiers", "release_version_files"}
 _KINDS = {"pyproject", "package", "package-lock", "machinery-lock"}
 
-# One changed line of each release version file kind. ``name`` lines anchor the
-# version to the file's own package: a dependency's version never follows one.
+# The file's own version, proven by the two context lines above it: the root scope's
+# opening line, then its name. pyproject's [project] table; package.json's root object;
+# package-lock.json's root object and its packages[""] entry. A dependency's or another
+# table's version has a different scope line or indentation, so it never matches.
 _NUMERIC = r"([0-9]+(?:\.[0-9]+){1,3})"
-_VERSION_LINE = {
-    "pyproject": re.compile(rf'version = "{_NUMERIC}"'),
-    "package": re.compile(rf'\s*"version": "{_NUMERIC}",?'),
-    "package-lock": re.compile(rf'\s*"version": "{_NUMERIC}",?'),
-}
-_NAME_LINE = {
-    "pyproject": re.compile(r'name = "[^"]+"'),
-    "package": re.compile(r'\s*"name": "[^"]+",'),
-    "package-lock": re.compile(r'\s*"name": "[^"]+",'),
+_TOP_SCOPE = (re.compile(r"\{"), re.compile(r'  "name": "[^"]+",'), re.compile(rf'  "version": "{_NUMERIC}",'))
+_ROOT_SCOPES: dict[str, tuple[tuple[re.Pattern[str], re.Pattern[str], re.Pattern[str]], ...]] = {
+    "pyproject": (
+        (re.compile(r"\[project\]"), re.compile(r'name = "[^"]+"'), re.compile(rf'version = "{_NUMERIC}"')),
+    ),
+    "package": (_TOP_SCOPE,),
+    "package-lock": (
+        _TOP_SCOPE,
+        (re.compile(r'    "": \{'), re.compile(r'      "name": "[^"]+",'), re.compile(rf'      "version": "{_NUMERIC}",')),
+    ),
 }
 _LOCK_REQUIREMENT = re.compile(rf"lu-machinery=={_NUMERIC} \\")
 _LOCK_HASH = re.compile(r"    --hash=sha256:[0-9a-f]{64}( \\)?")
@@ -63,15 +66,15 @@ def _version(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split("."))
 
 
-def _blocks(patch: object) -> list[tuple[str | None, list[str], list[str], str | None]]:
-    """Each run of changed lines with the context line before and after it.
+def _blocks(patch: object) -> list[tuple[list[str], list[str], list[str], str | None]]:
+    """Each run of changed lines with the context lines before it (same hunk) and the one after.
 
     Lines GitHub or Git mark ``\\ No newline at end of file`` carry no content.
     """
     if not isinstance(patch, str) or not patch.startswith("@@"):
         raise _NotTrivial
-    blocks: list[tuple[str | None, list[str], list[str], str | None]] = []
-    before: str | None = None
+    blocks: list[tuple[list[str], list[str], list[str], str | None]] = []
+    before: list[str] = []
     removed: list[str] = []
     added: list[str] = []
     for line in patch.split("\n"):
@@ -88,8 +91,8 @@ def _blocks(patch: object) -> list[tuple[str | None, list[str], list[str], str |
         after = text if op == " " else None
         if removed or added:
             blocks.append((before, removed, added, after))
-            removed, added = [], []
-        before = after
+            removed, added, before = [], [], []
+        before = [*before, text] if after is not None else []
     if removed or added:
         blocks.append((before, removed, added, None))
     if not blocks:
@@ -119,12 +122,15 @@ def _version_change(kind: str, patch: object) -> tuple[tuple[int, ...], tuple[in
                 raise _NotTrivial
             pairs.add((sides[0], sides[1]))
             continue
-        if len(removed) != 1 or len(added) != 1 or before is None or not _NAME_LINE[kind].fullmatch(before):
+        if len(removed) != 1 or len(added) != 1 or len(before) < 2:
             raise _NotTrivial
-        old, new = (_VERSION_LINE[kind].fullmatch(line) for line in (removed[0], added[0]))
-        if old is None or new is None:
+        for scope, name, version in _ROOT_SCOPES[kind]:
+            old, new = version.fullmatch(removed[0]), version.fullmatch(added[0])
+            if scope.fullmatch(before[-2]) and name.fullmatch(before[-1]) and old and new:
+                pairs.add((_version(old.group(1)), _version(new.group(1))))
+                break
+        else:
             raise _NotTrivial
-        pairs.add((_version(old.group(1)), _version(new.group(1))))
     if len(pairs) != 1:
         raise _NotTrivial
     return pairs.pop()
@@ -141,7 +147,7 @@ def _load_table(table_path: Path | None) -> dict[str, object] | None:
     tiers = table["tiers"]
     if not isinstance(tiers, dict) or set(tiers) != set(_MATCH_ORDER):
         return None
-    lists = [*tiers.values(), table["model_facing"]]
+    lists = list(tiers.values())
     if any(
         not isinstance(patterns, list) or not patterns
         or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
@@ -178,7 +184,6 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
         if table is None:
             return "high"
         tiers: Mapping[str, list[str]] = table["tiers"]  # type: ignore[assignment]
-        model_facing: list[str] = table["model_facing"]  # type: ignore[assignment]
         versions: Mapping[str, str] = table["release_version_files"]  # type: ignore[assignment]
         path_tiers: list[ReviewTier] = []
         # Release version files whose patch changes only their version: (version pair, path tier).
@@ -191,9 +196,7 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
                 return "high"
             for path in pr_file_paths([row]):
                 tier: ReviewTier = next(
-                    (tier for tier in _MATCH_ORDER
-                     if any(fnmatchcase(path, pattern) for pattern in tiers[tier])
-                     and not (tier == "trivial" and any(fnmatchcase(path, pattern) for pattern in model_facing))),
+                    (tier for tier in _MATCH_ORDER if any(fnmatchcase(path, pattern) for pattern in tiers[tier])),
                     "medium",
                 )
                 if status == "removed" and tier == "medium":

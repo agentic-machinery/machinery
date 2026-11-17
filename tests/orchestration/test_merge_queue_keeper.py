@@ -445,7 +445,7 @@ def test_trivial_head_is_ready_without_verdict(tmp_path: Path) -> None:
     """Defect class: the keeper holds or dequeues a Trivial head for a review it does not need."""
     for queued in (False, True):
         fake = FakeGitHub(pr(isInMergeQueue=queued))
-        fake.files = ["docs/decisions/example.md"]
+        fake.files = ["CHANGELOG.md"]
         fake.comments_rows = []
         lines, failed = keeper.run(fake, tmp_path / f"trivial-{queued}.json", apply=True)
         assert not failed
@@ -453,9 +453,18 @@ def test_trivial_head_is_ready_without_verdict(tmp_path: Path) -> None:
         assert mutations(fake) == ([] if queued else ["enqueue"])
     # One non-Trivial file makes the whole head wait for its review again.
     fake = FakeGitHub(pr())
-    fake.files = ["docs/decisions/example.md", "scripts/example.py"]
+    fake.files = ["CHANGELOG.md", "scripts/example.py"]
     fake.comments_rows = []
     lines, failed = keeper.run(fake, tmp_path / "mixed.json", apply=True)
     assert not failed
     assert "reason=needs-CF" in lines[0]
     assert "enqueue" not in mutations(fake)
+    # Unreadable evidence for a queued Trivial head removes it: no review status backs it in the queue gate.
+    fake = FakeGitHub(pr(isInMergeQueue=True))
+    fake.files = ["CHANGELOG.md"]
+    malformed = recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00")
+    malformed["body"] = malformed["body"].replace("verdict=APPROVED model", "verdict=MAYBE model")
+    fake.comments_rows = [malformed]
+    lines, failed = keeper.run(fake, tmp_path / "unknown.json", apply=True)
+    assert "#42 revoked: CF-unknown" in "\n".join(lines)
+    assert "dequeue" in mutations(fake)

@@ -129,19 +129,15 @@ tiers:
     - site/src/content/**
     - site/src/data/**
     - site/src/lib/lexicon/curated-heteronyms.ts
-  # Documentation for people. A path that also matches model_facing below is
-  # never Trivial and takes the next list it matches (docs/** is Low).
+  # Root documentation for people. Everything under docs/ keeps its tier: code and
+  # agents read it as input or procedure (the review protocol, session handoffs,
+  # epics, the release procedure, the workstream registry), and the product's docs
+  # tree is the same, so no denylist of model-facing docs can be complete.
   trivial:
-    - docs/**
     - README
     - README.md
     - README.rst
     - README.txt
-    - '**/README'
-    - '**/README.md'
-    - '**/README.rst'
-    - '**/README.txt'
-    - CONTRIBUTING.md
     - CHANGELOG.md
     - LICENSE
     - LICENSE.md
@@ -168,41 +164,10 @@ tiers:
     - SECURITY.md
 # Removed High/content/Trivial paths keep their tier; all other removals are Low.
 
-# Text a model reads as instructions: rules, skills, prompts, agent profiles,
-# plans, and the docs that rules and skills cite as norm or procedure.
-model_facing:
-  - agents_extensions/**
-  - '**/agents_extensions/**'
-  - '**/skills/**'
-  - '**/rules/**'
-  - '**/prompts/**'
-  - '**/*prompt*'
-  - CLAUDE.md
-  - '**/CLAUDE.md'
-  - AGENTS.md
-  - '**/AGENTS.md'
-  - GEMINI.md
-  - '**/GEMINI.md'
-  - '.claude/**'
-  - '.codex/**'
-  - '.gemini/**'
-  - '.agent/**'
-  - '.agents/**'
-  - plans/**
-  - docs/best-practices/**
-  - docs/runbooks/**
-  - docs/dispatch-briefs/**
-  - docs/agents/**
-  - docs/agent-channels/**
-  - lu_machinery/**
-  - scripts/**
-  - tests/**
-  - '**/tests/**'
-
 # The release cut's version files. A modified one is Trivial only when its patch
-# changes nothing but its own version (for the lock, the lu-machinery line and its
-# hashes), raised, and every such file in the pull request names the same versions.
-# Anything else in it keeps the path's tier above.
+# changes nothing but its own root version (for the lock, the lu-machinery line and
+# its hashes), raised, and every such file in the pull request names the same
+# versions. Anything else in it keeps the path's tier above.
 release_version_files:
   pyproject.toml: pyproject
   package.json: package

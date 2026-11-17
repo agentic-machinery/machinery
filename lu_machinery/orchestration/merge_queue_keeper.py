@@ -659,7 +659,8 @@ def _revoke_reason(
     """Fresh, positive blockers that may remove a queued or armed PR.
 
     A queued head with no cross-family approval at that head is removed, unless its
-    ``tier`` is Trivial, which needs none.
+    ``tier`` is Trivial, which needs none; a queued Trivial head whose verdict is
+    unreadable is removed.
     """
     if row.get("isDraft") is True:
         return "draft"
@@ -671,6 +672,9 @@ def _revoke_reason(
         return f"CF-{verdict.state.lower()}"
     if verdict_lookup_ok and verdict.state == "unknown" and approved_before:
         return "CF-unknown-after-approval"
+    if queued and verdict_lookup_ok and verdict.state == "unknown" and tier == "trivial":
+        # No review status backs a Trivial head in the queue gate, so unreadable evidence removes it here.
+        return "CF-unknown"
     if queued and verdict_lookup_ok and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state):
         return "needs-CF"
     return None

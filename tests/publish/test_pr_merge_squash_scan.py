@@ -229,7 +229,7 @@ def test_direct_merge_sends_explicit_text_instead_of_defaults(synthetic_opsec):
 def test_trivial_head_merges_without_recorded_approval(low_review):
     """Defect class: the merge gate demands a review of record the Trivial tier does not require."""
     _tasks, comments, _statuses, files, admit = low_review
-    files[:] = [{"filename": "docs/decisions/example.md", "status": "modified"}]
+    files[:] = [{"filename": "CHANGELOG.md", "status": "modified"}]
     assert comments == []
     assert admit() is None
 
@@ -239,7 +239,7 @@ def test_trivial_head_with_recorded_rejection_is_refused(low_review):
     from lu_machinery.review.record_cf_verdict import build_comment
 
     _tasks, comments, _statuses, files, admit = low_review
-    files[:] = [{"filename": "docs/decisions/example.md", "status": "modified"}]
+    files[:] = [{"filename": "CHANGELOG.md", "status": "modified"}]
     comments.append({
         "id": 1,
         "body": build_comment(

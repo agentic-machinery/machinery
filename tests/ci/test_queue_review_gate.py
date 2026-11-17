@@ -324,7 +324,7 @@ def test_trivial_member_passes_without_review_status(
     candidate: Candidate, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Defect class: the queue ejects a Trivial PR for a review status the Trivial tier does not require."""
-    _first_member_changes(candidate, {"docs/guide.md": "1\n"})
+    _first_member_changes(candidate, {"README.md": "1\n"})
     github = FakeGitHub(candidate.tip, [[candidate.entry(1), candidate.entry(2)]], {candidate.heads[2]: "SUCCESS"})
     assert _run(candidate, github) == 0
     out = capsys.readouterr().out
@@ -340,7 +340,7 @@ def test_trivial_member_passes_without_review_status(
 
 def test_non_trivial_member_still_needs_status(candidate: Candidate, capsys: pytest.CaptureFixture[str]) -> None:
     """Defect class: a code change rides into the queue on a Trivial file's exemption."""
-    _first_member_changes(candidate, {"docs/guide.md": "1\n", "tool.py": "print(1)\n"})
+    _first_member_changes(candidate, {"README.md": "1\n", "tool.py": "print(1)\n"})
     github = FakeGitHub(candidate.tip, [[candidate.entry(1), candidate.entry(2)]], {candidate.heads[2]: "SUCCESS"})
     assert _run(candidate, github) == 1
     out = capsys.readouterr().out

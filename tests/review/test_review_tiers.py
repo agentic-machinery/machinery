@@ -281,8 +281,7 @@ LOCK_BUMP = """@@ -1,5 +1,5 @@
  # lu-machinery release dependency lock: every transitive runtime dependency of
  # pyproject.toml, exact version and SHA-256 hashes of the accepted wheels.
  # docs/release.md is the procedure; a consumer's requirements-machinery.lock is"""
-PYPROJECT_BUMP = """@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
- 
+PYPROJECT_BUMP = """@@ -5,6 +5,6 @@
  [project]
  name = "lu-machinery"
 -version = "0.1.28"
@@ -332,15 +331,15 @@ def _release_cut() -> list[dict[str, str]]:
 
 
 def test_docs_only_pr_is_trivial():
-    """Defect class: documentation for people still demands a review of record."""
-    assert classify_pr_files([_modified("docs/decisions/x.md"), _modified("README.md")]) == "trivial"
-    assert classify_pr_files([{"filename": "docs/old.md", "status": "removed"}]) == "trivial"
+    """Defect class: root documentation for people still demands a review of record."""
+    assert classify_pr_files([_modified("CHANGELOG.md"), _modified("README.md")]) == "trivial"
+    assert classify_pr_files([{"filename": "SECURITY.md", "status": "removed"}]) == "trivial"
 
 
 def test_trivial_doc_plus_code_takes_code_tier():
     """Defect class: mixing a Trivial file into a code change lowers the code change's review."""
-    assert classify_pr_files([_modified("docs/x.md"), _modified("lu_machinery/common/x.py")]) == "medium"
-    assert classify_pr_files([_modified("docs/x.md"), _modified("tests/test_x.py")]) == "low"
+    assert classify_pr_files([_modified("README.md"), _modified("lu_machinery/common/x.py")]) == "medium"
+    assert classify_pr_files([_modified("README.md"), _modified("tests/test_x.py")]) == "low"
     assert classify_pr_files([*_release_cut(), _modified("lu_machinery/common/x.py")]) == "medium"
     assert classify_pr_files([*_release_cut(), _modified(".github/workflows/ci.yml")]) == "high"
 
@@ -358,6 +357,12 @@ def test_trivial_doc_plus_code_takes_code_tier():
         "CLAUDE.md",
         "lu_machinery/agent_runtime/profiles/README.md",
         "tests/fixtures/README.md",
+        # Code and agents read these as input or procedure: docs/ is never Trivial.
+        "docs/review-protocol.md",
+        "docs/session-state/current.md",
+        "docs/release.md",
+        "docs/decisions/x.md",
+        "drill/clean-machine/README.md",
     ],
 )
 def test_agents_extensions_and_model_facing_docs_are_not_trivial(path):
@@ -402,6 +407,20 @@ def test_release_version_bump_with_changelog_is_trivial():
             ' description = "Shared', '+dependencies = ["requests"]\n description = "Shared', 1,
         )),
         ("package.json", PACKAGE_BUMP.replace('   "private": true,', '+  "postinstall": "x",\n   "private": true,', 1)),
+        # A dependency entry that carries its own name line (an npm alias).
+        ("package-lock.json", """@@ -20,7 +20,7 @@
+     "node_modules/alias": {
+       "name": "some-dependency",
+-      "version": "0.1.28",
++      "version": "0.1.29",
+       "resolved": "https://registry.npmjs.org/x.tgz","""),
+        # Another TOML table's name and version.
+        ("pyproject.toml", """@@ -40,6 +40,6 @@
+ [tool.poetry]
+ name = "lu-machinery"
+-version = "0.1.28"
++version = "0.1.29"
+ description = "x\""""),
     ],
 )
 def test_version_file_with_dependency_change_is_not_trivial(path, patch):
