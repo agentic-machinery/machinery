@@ -2430,9 +2430,10 @@ def head_approval_context(repo_root: Path, head: str, *, repository: str, fetch:
     rows = [{"filename": path, "status": statuses.get(status, status)}
             for status, path in zip(fields[::2], fields[1::2], strict=True)]
     paths = pr_file_paths(rows)
+    # A review run on a Trivial head is held to Low's non-author rule.
     return {
         "second_review": False, "repository": repository,
-        "learner_content": _learner_content(paths), "low_tier": classify_pr_files(rows) == "low",
+        "learner_content": _learner_content(paths), "low_tier": classify_pr_files(rows) in {"trivial", "low"},
     }
 
 
@@ -3180,8 +3181,9 @@ def record(
     except SweepError:
         # Unavailable files never grant the Low-tier exception and never waive the second review.
         file_rows = None
+    # A review run on a Trivial head is held to Low's non-author rule.
     low_tier = file_rows is not None and not ukrainian and review_mode == "cross_family" and (
-        classify_pr_files(file_rows) == "low"
+        classify_pr_files(file_rows) in {"trivial", "low"}
     )
     learner_content = file_rows is None or _learner_content(pr_file_paths(file_rows))
     mixed_pair = (

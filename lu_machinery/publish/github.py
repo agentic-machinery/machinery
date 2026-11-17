@@ -619,7 +619,9 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
     review is outside the recorder's regime and is not refused here, unless the head's own
     rollup carries the recorder's status: then its record was removed or rewritten, and the
     status alone is unverifiable. A High-tier or security-sensitive change still needs that
-    one recorded approval where the recorder is off. There is no second seat. A PR whose
+    one recorded approval where the recorder is off. A Trivial head (``review/tiers.py``)
+    needs no recorded review in either regime; a recorded rejection or an unreadable
+    record still refuses it. There is no second seat. A PR whose
     files change learner content takes its Ukrainian seats even with no Ukrainian verdict
     recorded yet (#12181). Review-contract canaries are release acceptance, not a PR gate.
     """
@@ -630,7 +632,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         lookup_verdict,
         pr_file_paths,
     )
-    from lu_machinery.review.tiers import classify_pr_files
+    from lu_machinery.review.tiers import UNREVIEWED_STATES, classify_pr_files
 
     # The setting is explicit per repository; an absent, ambiguous or non-boolean one is unverifiable.
     rows = [
@@ -660,7 +662,8 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         file_rows = [item for page in files for item in page]
         paths = pr_file_paths(file_rows)
         tier = classify_pr_files(file_rows)
-        low_tier = tier == "low"
+        # A review run on a Trivial head is held to Low's non-author rule.
+        low_tier = tier in {"trivial", "low"}
         content = changes_learner_content(paths)
         verdict = lookup_verdict(
             [item for page in pages for item in page], head, login, learner_content=content, low_tier=low_tier,
@@ -674,9 +677,12 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         ) from None
     if state == NEEDS_SEAT:
         raise gate.PublishBlocked("OPSEC: merge refused: a Ukrainian review seat has not approved this head.")
+    if tier == "trivial" and state in UNREVIEWED_STATES:
+        # Trivial needs required CI only (review policy section 2): no review of this head is on record.
+        state = "needs-CF"
     if state not in {"APPROVED", "needs-CF"}:
         raise gate.PublishBlocked(f"OPSEC: merge refused: recorded review verdict is {state} at this head.")
-    needs_approval = bool(recorder) or tier == "high"
+    needs_approval = (bool(recorder) or tier == "high") and tier != "trivial"
     if not needs_approval:
         try:
             from lu_machinery.review.security_paths import is_security_sensitive_change

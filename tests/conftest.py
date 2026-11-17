@@ -4117,7 +4117,7 @@ def low_review(monkeypatch, tmp_path):
     }
     (tasks / "review-one.json").write_text(json.dumps(task))
     (tasks / "review-one.result").write_text("VERDICT: APPROVE")
-    files = [{"filename": "docs/example.md", "status": "modified"}]
+    files = [{"filename": "tests/example.py", "status": "modified"}]
     facts = recorder.BranchReviewFacts(
         repository=REPOSITORY, base_tip_sha=BASE, head_sha=HEAD, merge_base_sha=BASE,
         commits=(recorder.CommitAttribution(

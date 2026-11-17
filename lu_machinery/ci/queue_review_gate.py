@@ -23,7 +23,10 @@ therefore proven, never guessed:
    history or attribution; that residual is recorded on learn-ukrainian/machinery#100.
 5. GitHub's latest ``fleet/cross-family-review`` status on that head must be ``success``.
    GitHub keeps one current state per context (the newest wins), so an older success
-   never overrides a later failure, and a moved head carries no approval at all.
+   never overrides a later failure, and a moved head carries no approval at all. A head
+   with no status at all passes only when the member's own squash diff is Trivial
+   (``lu_machinery/review/tiers.py``; review policy section 2), which needs no review. That
+   classification needs PyYAML; where it cannot be imported the member fails as before.
 
 Any API error, unreadable Git object, malformed field or disagreement fails closed. API
 errors and membership disagreements (an entry merging between reads) are retried a
@@ -395,6 +398,22 @@ def head_facts(post: Post, event: Event, members: list[Member]) -> dict[str, Hea
     return facts
 
 
+def member_tier(member: Member) -> str:
+    """The review tier of the change this member lands: its squash commit against the queue parent.
+
+    ``includes_head`` has shown that diff is the PR's current head merged onto the parent.
+    Returns ``unreadable (<reason>)`` when the classifier or Git cannot decide.
+    """
+    try:
+        from lu_machinery.review.tiers import classify_pr_files, diff_file_rows
+
+        return classify_pr_files(diff_file_rows(Path.cwd(), member.squash.parent, member.squash.sha))
+    except ImportError as error:
+        return f"unreadable ({type(error).__name__}: {error.name})"
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        return f"unreadable ({type(error).__name__})"
+
+
 def evaluate(event: Event, post: Post) -> list[str]:
     """Findings for one complete read; an empty list means every member is approved."""
     tip, entries = read_queue(post, event)
@@ -413,7 +432,11 @@ def evaluate(event: Event, post: Post) -> list[str]:
             continue
         state = facts[member.head].state
         if state is None:
-            findings.append(f"{label}: no {STATUS_CONTEXT} status on the current head")
+            tier = member_tier(member)
+            if tier == "trivial":
+                print(f"{label}: Trivial tier, no review required")
+            else:
+                findings.append(f"{label}: no {STATUS_CONTEXT} status on the current head (tier {tier})")
         elif state != "SUCCESS":
             findings.append(f"{label}: latest {STATUS_CONTEXT} status is {state.lower()}, not success")
         else:
@@ -451,7 +474,8 @@ def main(argv: list[str] | None = None) -> int:
     module = module_name(__spec__, __file__)
     parser = argparse.ArgumentParser(
         description="Fail a merge-queue candidate unless every PR in it has an approved cross-family review\n"
-        f"({STATUS_CONTEXT} = success) on its current head. Use inside ci.yml on merge_group only.",
+        f"({STATUS_CONTEXT} = success) on its current head, or no status and a Trivial diff.\n"
+        "Use inside ci.yml on merge_group only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -460,7 +484,8 @@ def main(argv: list[str] | None = None) -> int:
             "Inputs: GITHUB_EVENT_NAME=merge_group, GITHUB_EVENT_PATH, GITHUB_TOKEN; a checkout of the candidate\n"
             "with full first-parent history and an origin remote.\n"
             "Outputs: one line per member PR on stdout, ::error:: annotations; fetches missing commits, no other writes.\n"
-            "Exit codes: 0 every member approved; 1 a member unapproved or the candidate unverifiable; 2 invalid arguments.\n"
+            "Exit codes: 0 every member approved or Trivial; 1 a member unapproved or the candidate unverifiable;\n"
+            "2 invalid arguments.\n"
             "Related: .github/workflows/ci.yml (CI Gate); docs/runbooks/ci-gate.md; lu_machinery/review/record_cf_verdict.py."
         ),
     )

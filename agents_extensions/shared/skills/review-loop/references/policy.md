@@ -12,15 +12,41 @@ simpler manual procedure beats new tooling.
 
 | Tier | Changes | Review before merge |
 | --- | --- | --- |
-| Low | Deletions of unused code, docs, data, test-only, comments | Required CI green + one exact-head APPROVE from a qualified non-author reviewer (any family); no cross-family seat required |
+| Trivial | Documentation for people; the release cut's version bump and the product's adoption of that release | Required CI green only; no review of record, no review-loop |
+| Low | Deletions of unused code, test-only, data, and docs a model reads as norm or procedure | Required CI green + one quick red-team pass: one exact-head APPROVE from a qualified non-author reviewer (any family), `--risk low` |
 | Medium | Ordinary code changes | Required CI + one cross-family review |
-| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers | Required CI + one exact-head cross-family review at critical depth (Opus or Sol) |
+| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review at critical depth (Opus or Sol) |
 | Ukrainian content | Learner-facing Ukrainian text | Gemini via AGY with Sources, seated by the [Ukrainian profile](ukrainian.md); deletions of learner-facing content keep this tier |
 
-The tier comes from the paths changed, never from the author. The path-to-tier table lives in
-one place, `lu_machinery/config/review_tiers.yaml`. A PR spanning tiers takes the highest tier it
-touches. Deleting a High-tier path or learner-facing content keeps that path's tier; only
-deletions of other unused code are Low.
+The tier comes from the files changed, never from the author. The path-to-tier table lives in
+one place, `lu_machinery/config/review_tiers.yaml`, and `lu_machinery/review/tiers.py` applies
+it for the recorder, the publisher's merge gate, the merge-queue keeper and the queue's CI review
+gate. A PR spanning tiers takes the highest tier it touches, so one non-Trivial file makes the
+whole PR non-Trivial. Deleting a High-tier path, learner-facing content or a Trivial doc keeps
+that path's tier; only deletions of other unused code are Low.
+
+**Trivial, exactly.** Every file is one of:
+
+- a `trivial` path in the table (`docs/**`, READMEs, `CHANGELOG.md`, `CONTRIBUTING.md`,
+  `LICENSE`, `SECURITY.md`) that matches no `model_facing` pattern. Rules, skills, prompts,
+  agent profiles, plans, `agents_extensions/**`, package and test trees, and the docs that rules
+  and skills cite (`docs/best-practices/**`, `docs/runbooks/**`) are model-facing and keep their
+  tier;
+- a `release_version_files` entry (`pyproject.toml`, `package.json`, `package-lock.json`,
+  `requirements-machinery.lock`) whose patch changes only its own version line (for the lock,
+  the `lu-machinery==` line and its hashes), raised, with the same old and new version in every
+  such file of the PR. Any other line in it, a lowered version or an unreadable patch keeps the
+  path's tier. CI installing the hash-pinned wheel proves the release exists.
+
+Code comments are not Trivial; they keep their file's tier. A line that reads as a comment can
+sit inside a string or a prompt, and only a full-file tokenizer could tell them apart. A recorded
+rejection still blocks a Trivial head, and a security-sensitive path is never Trivial.
+
+**Low is one quick red-team pass.** The reviewer tries to break the change and reports only
+break-it findings, each a P0-P2 reproducible failure (command, input, wrong output), never style
+or "consider". A recorded APPROVE, or a reply with no break-it finding (recorded as an approval),
+lets the PR land. A break-it finding is fixed, and the same reviewer confirms the fix in one delta round; that is the whole Low
+budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
 change, and the resolver seats only Opus or Sol at either. For `code` and `infra` reviews the
@@ -43,7 +69,8 @@ High and critical risk keep an Opus or Sol reviewer. There is no second review.
 
 ## 4. Convergence
 
-At most 3 charged rounds. A round is charged when a review is dispatched at a new head, whether
+At most 3 charged rounds; Low uses at most 2 (the red-team pass and one fix confirmation), and
+Trivial none. A round is charged when a review is dispatched at a new head, whether
 or not its verdict is recorded. The clean base merge, the repair round and the capability
 failure under [Recording the verdict](#recording-the-verdict) do not count against the 3.
 Round 1 is the full review; rounds 2-3 review only the diff since the last reviewed head. After

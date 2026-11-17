@@ -1,7 +1,16 @@
-"""The shared path/status classifier for recorded review and landing admission."""
+"""The shared path/status classifier for recorded review and landing admission.
+
+The tiers and what each requires before merge are ``agents_extensions/shared/skills/
+review-loop/references/policy.md`` section 2; the path lists are
+``lu_machinery/config/review_tiers.yaml``. A pull request takes the highest tier any
+of its files takes, so one non-Trivial file makes the whole change non-Trivial.
+"""
 
 from __future__ import annotations
 
+import re
+import subprocess
+from collections.abc import Mapping
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -11,17 +20,151 @@ import yaml
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.integration_sweep import pr_file_paths
 
-ReviewTier = Literal["low", "medium", "ukrainian-content", "high"]
-_RANK: dict[ReviewTier, int] = {"low": 0, "medium": 1, "ukrainian-content": 2, "high": 3}
-_MATCH_ORDER: tuple[ReviewTier, ...] = ("high", "ukrainian-content", "low")
+ReviewTier = Literal["trivial", "low", "medium", "ukrainian-content", "high"]
+_RANK: dict[ReviewTier, int] = {"trivial": 0, "low": 1, "medium": 2, "ukrainian-content": 3, "high": 4}
+_MATCH_ORDER: tuple[ReviewTier, ...] = ("high", "ukrainian-content", "trivial", "low")
 _STATUSES = {"added", "modified", "removed", "renamed", "copied", "changed", "unchanged"}
+_TABLE_KEYS = {"schema_version", "default", "tiers", "model_facing", "release_version_files"}
+_KINDS = {"pyproject", "package", "package-lock", "machinery-lock"}
+
+# One changed line of each release version file kind. ``name`` lines anchor the
+# version to the file's own package: a dependency's version never follows one.
+_NUMERIC = r"([0-9]+(?:\.[0-9]+){1,3})"
+_VERSION_LINE = {
+    "pyproject": re.compile(rf'version = "{_NUMERIC}"'),
+    "package": re.compile(rf'\s*"version": "{_NUMERIC}",?'),
+    "package-lock": re.compile(rf'\s*"version": "{_NUMERIC}",?'),
+}
+_NAME_LINE = {
+    "pyproject": re.compile(r'name = "[^"]+"'),
+    "package": re.compile(r'\s*"name": "[^"]+",'),
+    "package-lock": re.compile(r'\s*"name": "[^"]+",'),
+}
+_LOCK_REQUIREMENT = re.compile(rf"lu-machinery=={_NUMERIC} \\")
+_LOCK_HASH = re.compile(r"    --hash=sha256:[0-9a-f]{64}( \\)?")
+
+
+# Verdict states (``integration_sweep.lookup_verdict``) that mean no review is on record at
+# the head. A Trivial head needs none, so it lands on these; a rejection or an unreadable
+# record still stops it.
+UNREVIEWED_STATES = frozenset({"needs-CF", "CF-stale", "CF-unrecorded"})
+
+
+def review_satisfied(tier: ReviewTier, state: str) -> bool:
+    """Whether a head at ``tier`` whose verdict reads ``state`` meets the review the policy asks for."""
+    return state == "APPROVED" or (tier == "trivial" and state in UNREVIEWED_STATES)
+
+
+class _NotTrivial(Exception):
+    """A release version file whose change is more than its own version."""
+
+
+def _version(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split("."))
+
+
+def _blocks(patch: object) -> list[tuple[str | None, list[str], list[str], str | None]]:
+    """Each run of changed lines with the context line before and after it.
+
+    Lines GitHub or Git mark ``\\ No newline at end of file`` carry no content.
+    """
+    if not isinstance(patch, str) or not patch.startswith("@@"):
+        raise _NotTrivial
+    blocks: list[tuple[str | None, list[str], list[str], str | None]] = []
+    before: str | None = None
+    removed: list[str] = []
+    added: list[str] = []
+    for line in patch.split("\n"):
+        if line.startswith("\\"):
+            continue
+        op, text = line[:1], line[1:]
+        if op in {"-", "+"}:
+            if op == "-" and added:
+                raise _NotTrivial  # removals after additions: not one replacement
+            (removed if op == "-" else added).append(text)
+            continue
+        if op not in {" ", "@", ""}:
+            raise _NotTrivial
+        after = text if op == " " else None
+        if removed or added:
+            blocks.append((before, removed, added, after))
+            removed, added = [], []
+        before = after
+    if removed or added:
+        blocks.append((before, removed, added, None))
+    if not blocks:
+        raise _NotTrivial
+    return blocks
+
+
+def _version_change(kind: str, patch: object) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The one (old, new) version a release version file's patch changes, and nothing else."""
+    pairs: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+    for before, removed, added, after in _blocks(patch):
+        if kind == "machinery-lock":
+            sides = []
+            for lines in (removed, added):
+                head = _LOCK_REQUIREMENT.fullmatch(lines[0]) if lines else None
+                hashes = lines[1:]
+                if (
+                    head is None or not hashes
+                    or any(_LOCK_HASH.fullmatch(line) is None for line in hashes)
+                    or any(not line.endswith(" \\") for line in hashes[:-1])
+                    or hashes[-1].endswith(" \\")
+                ):
+                    raise _NotTrivial
+                sides.append(_version(head.group(1)))
+            # A hash line left as context would keep an old hash on the new version.
+            if after is not None and _LOCK_HASH.fullmatch(after):
+                raise _NotTrivial
+            pairs.add((sides[0], sides[1]))
+            continue
+        if len(removed) != 1 or len(added) != 1 or before is None or not _NAME_LINE[kind].fullmatch(before):
+            raise _NotTrivial
+        old, new = (_VERSION_LINE[kind].fullmatch(line) for line in (removed[0], added[0]))
+        if old is None or new is None:
+            raise _NotTrivial
+        pairs.add((_version(old.group(1)), _version(new.group(1))))
+    if len(pairs) != 1:
+        raise _NotTrivial
+    return pairs.pop()
+
+
+def _load_table(table_path: Path | None) -> dict[str, object] | None:
+    table = yaml.safe_load((table_path or machinery_path("config/review_tiers.yaml")).read_text(encoding="utf-8"))
+    if (
+        not isinstance(table, dict) or set(table) != _TABLE_KEYS
+        or type(table["schema_version"]) is not int or table["schema_version"] != 2
+        or table["default"] != "medium"
+    ):
+        return None
+    tiers = table["tiers"]
+    if not isinstance(tiers, dict) or set(tiers) != set(_MATCH_ORDER):
+        return None
+    lists = [*tiers.values(), table["model_facing"]]
+    if any(
+        not isinstance(patterns, list) or not patterns
+        or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
+        for patterns in lists
+    ):
+        return None
+    versions = table["release_version_files"]
+    if (
+        not isinstance(versions, dict) or not versions
+        or any(not isinstance(path, str) or kind not in _KINDS for path, kind in versions.items())
+    ):
+        return None
+    return table
 
 
 def classify_pr_files(rows: object, *, table_path: Path | None = None) -> ReviewTier:
     """Classify a complete REST PR-files response; unknown input/table is High.
 
     Use the sweep's validator, including its rename and 3,000-file protections.
-    No patch inspection: comment-only source edits conservatively stay Medium.
+    Patches are read only for the release version files, which are Trivial when
+    the change is their own version, raised, and the same version in every one
+    of them; anything else in them keeps their path's tier. Comment-only source
+    edits stay Medium: a line that looks like a comment can sit in a string.
     """
     try:
         paths = pr_file_paths(rows)
@@ -31,23 +174,15 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
             for path in paths
         ):
             return "high"
-        table = yaml.safe_load((table_path or machinery_path("config/review_tiers.yaml")).read_text(encoding="utf-8"))
-        if (
-            not isinstance(table, dict) or set(table) != {"schema_version", "default", "tiers"}
-            or type(table["schema_version"]) is not int or table["schema_version"] != 1
-            or table["default"] != "medium"
-        ):
+        table = _load_table(table_path)
+        if table is None:
             return "high"
-        tiers = table["tiers"]
-        if not isinstance(tiers, dict) or set(tiers) != {"high", "ukrainian-content", "low"}:
-            return "high"
-        if any(
-            not isinstance(patterns, list) or not patterns
-            or any(not isinstance(pattern, str) or not pattern for pattern in patterns)
-            for patterns in tiers.values()
-        ):
-            return "high"
-        result: ReviewTier = "low"
+        tiers: Mapping[str, list[str]] = table["tiers"]  # type: ignore[assignment]
+        model_facing: list[str] = table["model_facing"]  # type: ignore[assignment]
+        versions: Mapping[str, str] = table["release_version_files"]  # type: ignore[assignment]
+        path_tiers: list[ReviewTier] = []
+        # Release version files whose patch changes only their version: (version pair, path tier).
+        bumps: list[tuple[tuple[tuple[int, ...], tuple[int, ...]], ReviewTier]] = []
         # pr_file_paths validated the shape; every status must also be explicit.
         assert isinstance(rows, list)
         for row in rows:
@@ -57,13 +192,131 @@ def classify_pr_files(rows: object, *, table_path: Path | None = None) -> Review
             for path in pr_file_paths([row]):
                 tier: ReviewTier = next(
                     (tier for tier in _MATCH_ORDER
-                     if any(fnmatchcase(path, pattern) for pattern in tiers[tier])),
+                     if any(fnmatchcase(path, pattern) for pattern in tiers[tier])
+                     and not (tier == "trivial" and any(fnmatchcase(path, pattern) for pattern in model_facing))),
                     "medium",
                 )
-                if status == "removed" and tier not in {"high", "ukrainian-content"}:
+                if status == "removed" and tier == "medium":
                     tier = "low"
-                if _RANK[tier] > _RANK[result]:
-                    result = tier
+                if path in versions and status == "modified" and row.get("filename") == path:
+                    try:
+                        bumps.append((_version_change(versions[path], row.get("patch")), tier))
+                        continue
+                    except _NotTrivial:
+                        pass
+                path_tiers.append(tier)
+        pairs = {pair for pair, _tier in bumps}
+        if len(pairs) == 1 and (pair := pairs.pop())[1] > pair[0]:
+            # One version, raised, in every release version file: the release cut's own change.
+            path_tiers.append("trivial")
+        else:
+            path_tiers.extend(tier for _pair, tier in bumps)
+        result = max(path_tiers, key=_RANK.__getitem__)
+        if result == "trivial":
+            from lu_machinery.review.security_paths import is_security_sensitive_change
+
+            if is_security_sensitive_change(paths):
+                return "medium"
         return result
     except (OSError, UnicodeError, ValueError, TypeError, yaml.YAMLError):
         return "high"
+
+
+def diff_file_rows(repo_root: Path, base: str, head: str, *, timeout: float = 60) -> list[dict[str, object]]:
+    """REST-shaped file rows for ``base..head`` from local Git, with the patches the classifier reads.
+
+    Renames are split into a removal and an addition, so both names count. Raises
+    ``ValueError`` when Git fails or prints an unexpected status.
+    """
+    def git(*args: str) -> bytes:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), *args], capture_output=True, timeout=timeout, check=False,
+        )
+        if result.returncode:
+            raise ValueError("git diff failed")
+        return result.stdout
+
+    fields = git("diff", "--no-renames", "--no-ext-diff", "--name-status", "-z", base, head, "--").decode("utf-8")
+    parts = fields.split("\0")
+    if parts.pop() != "" or len(parts) % 2:
+        raise ValueError("git diff file statuses unavailable")
+    statuses = {"A": "added", "D": "removed", "M": "modified", "T": "changed"}
+    table = _load_table(None)
+    versions = table["release_version_files"] if table is not None else {}
+    rows: list[dict[str, object]] = []
+    for status, path in zip(parts[::2], parts[1::2], strict=True):
+        if status not in statuses:
+            raise ValueError("git diff file status unexpected")
+        row: dict[str, object] = {"filename": path, "status": statuses[status]}
+        if status == "M" and isinstance(versions, dict) and path in versions:
+            text = git("diff", "--no-ext-diff", "--no-color", "-U3", base, head, "--", path).decode("utf-8")
+            hunk = text.find("\n@@")
+            if hunk >= 0:
+                row["patch"] = text[hunk + 1:].removesuffix("\n")
+        rows.append(row)
+    return rows
+
+
+# What each tier asks for before merge; review policy section 2 is the text of record.
+REVIEW_REQUIRED: dict[ReviewTier, str] = {
+    "trivial": "none: required CI only; do not run review-loop",
+    "low": "one quick red-team pass: one non-author reviewer, --risk low, at most one fix confirmation",
+    "medium": "one cross-family review",
+    "ukrainian-content": "the Ukrainian profile's seats",
+    "high": "one cross-family review at --risk high or critical (Opus or Sol)",
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Print a pull request's review tier and the review it needs before merge.\n"
+        "Use before review-loop round 1; the merge gates compute the same tier themselves.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  .venv/bin/python -m lu_machinery.review.tiers --repository learn-ukrainian/machinery --pr 714\n"
+            "  .venv/bin/python -m lu_machinery.review.tiers --rows-file pr-files.json\n"
+            "Outputs: one JSON object on stdout: {\"tier\": ..., \"review\": ...}; no writes.\n"
+            "Exit codes: 0 tier printed (an unreadable file list or table prints high); 2 invalid arguments.\n"
+            "Related: lu_machinery/config/review_tiers.yaml; agents_extensions/shared/skills/review-loop/"
+            "references/policy.md section 2."
+        ),
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--pr", type=int, help="pull request number to read through gh (needs --repository)")
+    source.add_argument(
+        "--rows-file", type=Path,
+        help="JSON list of GitHub PR-files rows (filename, status, patch) instead of reading GitHub",
+    )
+    parser.add_argument("--repository", help="owner/name of the pull request's repository, e.g. learn-ukrainian/machinery")
+    args = parser.parse_args(argv)
+    if args.pr is not None and not args.repository:
+        parser.error("--pr needs --repository")
+    rows: object
+    try:
+        if args.rows_file is not None:
+            rows = json.loads(args.rows_file.read_text(encoding="utf-8"))
+        else:
+            from lu_machinery.orchestration.integration_sweep import (
+                GitHubAdapter,
+                SweepError,
+            )
+
+            try:
+                rows = GitHubAdapter(Path.cwd()).pr_file_rows(args.repository, args.pr)
+            except SweepError:
+                rows = None
+    except (OSError, ValueError):
+        rows = None
+    tier = classify_pr_files(rows)
+    json.dump({"tier": tier, "review": REVIEW_REQUIRED[tier]}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

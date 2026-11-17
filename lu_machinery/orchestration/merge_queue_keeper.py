@@ -44,7 +44,7 @@ from lu_machinery.orchestration.integration_sweep import (
     verdict_detail,
 )
 from lu_machinery.publish.github import Request, request_run
-from lu_machinery.review.tiers import classify_pr_files
+from lu_machinery.review.tiers import ReviewTier, classify_pr_files, review_satisfied
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -494,8 +494,12 @@ def _reason(
     check_state: str,
     ejected: bool,
     queue_enabled: bool | None,
+    *,
+    tier: ReviewTier = "high",
 ) -> str:
     """Why the head may not enter the queue, or ``ready``.
+
+    A Trivial ``tier`` head needs no recorded review (``review_satisfied``).
 
     The keeper enqueues only a PR that has never been in the merge queue (``ejected``
     otherwise; rules core P4): whether a test failed is the owner's diagnosis, and every
@@ -511,7 +515,7 @@ def _reason(
     hold = _hold(row)
     if hold is not False:
         return "hold" if hold else "hold-unknown"
-    if verdict.state != "APPROVED":
+    if not review_satisfied(tier, verdict.state):
         return "needs-CF" if verdict.state in MISSING_CF_STATES else f"CF-{verdict.state.lower()}"
     if check_state != "ok":
         return check_state
@@ -638,10 +642,12 @@ def _revoke_reason(
     verdict_lookup_ok: bool,
     *,
     queued: bool,
+    tier: ReviewTier = "high",
 ) -> str | None:
     """Fresh, positive blockers that may remove a queued or armed PR.
 
-    A queued head with no cross-family approval at that head is removed.
+    A queued head with no cross-family approval at that head is removed, unless its
+    ``tier`` is Trivial, which needs none.
     """
     if row.get("isDraft") is True:
         return "draft"
@@ -653,7 +659,7 @@ def _revoke_reason(
         return f"CF-{verdict.state.lower()}"
     if verdict_lookup_ok and verdict.state == "unknown" and approved_before:
         return "CF-unknown-after-approval"
-    if queued and verdict_lookup_ok and verdict.state in MISSING_CF_STATES:
+    if queued and verdict_lookup_ok and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state):
         return "needs-CF"
     return None
 
@@ -915,12 +921,14 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
         # Whether the PR changes learner content, which takes the Ukrainian seats; None when unread.
         learner_content: bool | None = None
         file_rows: list[dict[str, Any]] = []
+        tier: ReviewTier = "high"
         low_tier = False
         try:
             comments = gh.comments(number)
             file_rows = gh.pr_file_rows(number)
             files = pr_file_paths(file_rows)
-            low_tier = classify_pr_files(file_rows) == "low"
+            tier = classify_pr_files(file_rows)
+            low_tier = tier in {"trivial", "low"}
             learner_content = changes_learner_content(files)
             verdict = lookup_verdict(
                 comments, head, login, learner_content=learner_content, low_tier=low_tier,
@@ -987,7 +995,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 ejection_unknown = True
         # ``ejected`` names an exit of this head a pass saw; ``queued-before`` any other PR stay.
         held_as = "ejected" if exited else "queued-before"
-        reason = _reason(pr, verdict, checks, ejected, queue_enabled)
+        reason = _reason(pr, verdict, checks, ejected, queue_enabled, tier=tier)
         if reason == "ejected":
             reason = held_as
         if reason == "ready" and queued is not True and ejection_unknown:
@@ -1003,6 +1011,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             verdict,
             queued=queued if isinstance(queued, bool) else None,
             observed_at=observed,
+            tier=tier,
         )
         state = "ready" if reason == "ready" and not queued and not armed else report.state
         shown = ARMED_UNMET if reason == "ready" and armed and queued is not True else reason
@@ -1055,7 +1064,8 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                         file_rows = gh.pr_file_rows(number)
                         files = pr_file_paths(file_rows)
                         learner_content = changes_learner_content(files)
-                    low_tier = classify_pr_files(file_rows) == "low"
+                    tier = classify_pr_files(file_rows)
+                    low_tier = tier in {"trivial", "low"}
                     current_verdict = lookup_verdict(
                         current_comments, head, login, learner_content=learner_content, low_tier=low_tier,
                     )
@@ -1077,7 +1087,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 except KeeperError:
                     current_checks = "CI-unknown"
                 reason = (
-                    _reason(current, current_verdict, current_checks, ejected, queue_enabled)
+                    _reason(current, current_verdict, current_checks, ejected, queue_enabled, tier=tier)
                     if verdict_lookup_ok
                     else "fresh-evidence-unknown"
                 )
@@ -1105,6 +1115,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                         approved_before,
                         verdict_lookup_ok,
                         queued=queued is True,
+                        tier=tier,
                     )
                     if fresh
                     else None

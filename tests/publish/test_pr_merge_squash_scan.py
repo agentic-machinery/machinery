@@ -224,3 +224,30 @@ def test_direct_merge_sends_explicit_text_instead_of_defaults(synthetic_opsec):
         runner=transport(calls, body="* " + TOKEN, queue=False),
     )
     assert len(calls) == 1 and "--subject=clean" in calls[0]["argv"] and calls[0]["body"] == "clean"
+
+
+def test_trivial_head_merges_without_recorded_approval(low_review):
+    """Defect class: the merge gate demands a review of record the Trivial tier does not require."""
+    _tasks, comments, _statuses, files, admit = low_review
+    files[:] = [{"filename": "docs/decisions/example.md", "status": "modified"}]
+    assert comments == []
+    assert admit() is None
+
+
+def test_trivial_head_with_recorded_rejection_is_refused(low_review, tmp_path):
+    """Defect class: a Trivial head lands over a rejection recorded at that head."""
+    import hashlib
+
+    from lu_machinery.review import record_cf_verdict as recorder
+
+    tasks, _comments, _statuses, files, admit = low_review
+    files[:] = [{"filename": "docs/decisions/example.md", "status": "modified"}]
+    reply = b"VERDICT: CHANGES_REQUESTED\n\nThe example command in the doc deletes the checkout.\n"
+    task = json.loads((tasks / "review-one.json").read_text())
+    task["result_sha256"] = hashlib.sha256(reply).hexdigest()
+    (tasks / "review-one.json").write_text(json.dumps(task))
+    (tasks / "review-one.result").write_bytes(reply)
+    result = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == "CHANGES_REQUESTED"
+    with pytest.raises(publisher.gate.PublishBlocked, match="CHANGES_REQUESTED"):
+        admit()
