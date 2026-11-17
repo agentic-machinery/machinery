@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
@@ -177,16 +178,27 @@ _ALERT_NAMES = frozenset({
 
 
 ALERT_SUMMARY_MAX_CHARS = 200
-# A rule template may interpolate any label of its alert, so the summary is shown only when
-# every label value it contains is a vetted public one (stripped before the prose check) and the
-# rest is plain prose: no path, address, assignment or other label value. A vetted value is
-# checked by the shape its key allows, so an arbitrary value cannot hide text from the check.
-_SUMMARY_VETTED_LABELS = {
-    "pool": re.compile(r"[a-z]+(?::[a-z0-9]{1,16})?"),
-    "route": re.compile(r"/api(?:/[A-Za-z0-9_{}.-]{1,40}){1,8}"),
-}
-_SUMMARY_PROSE = re.compile(r"[A-Za-z0-9 .,;:()%'+-]*")
+# A rule template may interpolate any label of its alert, so a summary is shown only when it is a
+# positive grammar: plain prose in which a pool id or a declared Monitor route may stand as a
+# whole token, and nothing else. No label value, path, address, host, URL or assignment fits it.
+_SUMMARY_POOL = re.compile(r"[a-z]+(?::[a-z0-9]{1,16})?")
+# Words, digits and ordinary punctuation; a dot only ends a sentence or sits inside a number.
+_SUMMARY_PROSE = re.compile(r"(?:[A-Za-z0-9 ,;()%'+-]|(?<=[A-Za-z0-9)])\.(?=\s|$)|(?<=\d)\.(?=\d))*")
 _SEVERITIES = frozenset({"critical", "warning", "info", "none"})
+
+
+@lru_cache(maxsize=1)
+def _declared_routes() -> frozenset[str]:
+    from .route_contracts import all_route_contracts
+
+    return frozenset(contract.pattern for contract in all_route_contracts() if contract.match == "exact")
+
+
+def _vetted_label(key: str, label: str) -> bool:
+    """A label value that may appear verbatim: a pool id of a known agent, or a route the API declares."""
+    if key == "pool":
+        return _SUMMARY_POOL.fullmatch(label) is not None and label.split(":")[0] in panel_values.AGENTS
+    return key == "route" and label in _declared_routes()
 
 
 def _alert_summary(annotations: dict, labels: dict) -> str | None:
@@ -197,17 +209,18 @@ def _alert_summary(annotations: dict, labels: dict) -> str | None:
     value = annotations.get("summary")
     if not isinstance(value, str) or not 0 < len(value) <= ALERT_SUMMARY_MAX_CHARS or not value.isprintable():
         return None
-    prose, others = value, []
+    prose: str = value
+    others: list[str] = []
     for key, label in labels.items():
         if not isinstance(label, str) or not label or key == "alertname" or (key == "severity" and label in _SEVERITIES):
             continue
-        shape = _SUMMARY_VETTED_LABELS.get(key)
-        if shape is not None and shape.fullmatch(label) and (key != "pool" or label.split(":")[0] in panel_values.AGENTS):
-            prose = prose.replace(label, "")
+        if _vetted_label(key, label):
+            # Only a whole token is exempt; a value inside a larger token stays and fails the prose check.
+            prose = re.sub(rf"(?<![A-Za-z0-9./:_-]){re.escape(label)}(?![A-Za-z0-9/:_-])(?!\.[A-Za-z0-9])", "", prose)
         else:
-            # The whole value and its host, scheme-less and port-less stems: a template may print either.
+            # The whole value and its stems (host, domain, port-less): a template may print any of them.
             others.append(label)
-            others.extend(part for part in re.split(r"[:/]", label) if len(part) >= 4)
+            others.extend(part for part in re.split(r"[:/._-]", label) if len(part) >= 4)
     if (
         any(other in value for other in others)
         or not _SUMMARY_PROSE.fullmatch(prose)

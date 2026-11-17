@@ -759,12 +759,11 @@ function payloadAge(url, data, receivedAt) {
     const bound = finiteAge(data.diagnostics?.stale_threshold_s) || null;
     const rows = Object.values(data.api_accounts || {}).map(row => ({age: row.age_s,
       state: readingState(row.freshness, row.age_s, bound ?? undefined)}));
-    // The snapshot's own age and stale flag count beside the account rows: an old snapshot is stale however its rows read.
+    // The age is the rows' own, as the rows show it; the snapshot's age and stale flag only add a stale verdict
+    // (an old snapshot is stale however its account rows read) and stand in for the age when no row has one.
     const base = rowsFreshness(rows, bound), snapshotAge = finiteAge(data.diagnostics?.data_age_s);
-    const ages = [base.age, snapshotAge].filter(age => age !== null);
     const stale = data.diagnostics?.stale;
-    return {age: ages.length ? Math.max(...ages) : null, bound,
-      flag: stale === true ? "stale" : base.flag ?? (stale === false ? "fresh" : null)};
+    return {age: base.age ?? snapshotAge, bound, flag: stale === true ? "stale" : base.flag ?? (stale === false ? "fresh" : null)};
   }
   if (url === "/api/runtime/logins") return {age: since(data.read_at), bound: null, flag: null};
   if (url === "/api/git/pull-requests") {

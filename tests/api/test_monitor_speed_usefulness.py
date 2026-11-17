@@ -497,9 +497,9 @@ assert.match(line({...young, url: '/api/git/pull-requests', data: {status: 'ok',
   repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text, /· STALE ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_seconds: null, stale: true}}).text, /· STALE ·/);
 assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
-// An old routing-budget snapshot is stale though its account rows read fresh; unavailable rows are not fresh.
+// An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
 const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
-assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 1200s · bound 900s$/);
+assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 12s · bound 900s$/);
 assert.match(line(budget({data_age_s: 5, stale: false, stale_threshold_s: 900}, {x: {freshness: 'unavailable', age_s: null}})).text, /· STALE ·/);
 // Alerts carry their own bound in the body.
 const observed = new Date(now - 5000).toISOString();

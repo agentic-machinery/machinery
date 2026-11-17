@@ -238,7 +238,7 @@ def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_clie
     """Defect class: a rule template echoes a path, address, assignment or label value through the public alert summary."""
     client, _ctx = panel_client
     raw = [{"labels": {"alertname": "DiskAlmostFull", "severity": "warning", "instance": "fixture-host.invalid:9100",
-                       "mountpoint": "/mnt/synthetic-private/data", "route": "/api/fixture"},
+                       "mountpoint": "/mnt/synthetic-private/data", "route": "/api/orient"},
             "annotations": {"summary": summary}, "startsAt": STAMP, "status": {"state": "active"}}]
     connection = SimpleNamespace(request=lambda *_args, **_kwargs: None, close=lambda: None,
                                  getresponse=lambda: SimpleNamespace(status=200, read=lambda _limit: json.dumps(raw).encode()))
@@ -250,14 +250,19 @@ def test_alert_summary_of_a_known_rule_is_dropped_unless_plainly_safe(panel_clie
     for hiding, summary in (({"route": "/"}, "Disk /etc/synthetic-private/config is almost full"),
                             ({"route": "/etc/synthetic-private/config"}, "Disk /etc/synthetic-private/config is almost full"),
                             ({"pool": "synthetic-secret-123456"}, "Pool synthetic-secret-123456 is almost full"),
-                            ({"severity": "synthetic-secret-123456"}, "Severity synthetic-secret-123456 is almost full")):
+                            ({"severity": "synthetic-secret-123456"}, "Severity synthetic-secret-123456 is almost full"),
+                            ({"route": "/api/orient"}, "Monitor /api/orient.fixture-host.invalid is slow"),
+                            ({"route": "/api/home/synthetic-private"}, "Monitor /api/home/synthetic-private is slow"),
+                            ({"instance": "fixture-host.invalid:9100"}, "down at fixture-host.invalid"),
+                            ({"instance": "fixture-host.invalid:9100"}, "down at fixture-host")):
         raw[0]["labels"] = {"alertname": "DiskAlmostFull", **{"severity": "warning", **hiding}}
         raw[0]["annotations"]["summary"] = summary
         state_helpers.cache_invalidate()
         assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] is None, hiding
-    raw[0]["labels"] = {"alertname": "DiskAlmostFull", "severity": "warning", "route": "/api/fixture"}
+    raw[0]["labels"] = {"alertname": "DiskAlmostFull", "severity": "warning", "route": "/api/orient", "pool": "claude:b"}
     # Plain prose and a vetted label's own value (here the route) still show.
-    for shown in ("Monitor API route /api/fixture p95 latency is above 1s", "A disk is almost full."):
+    for shown in ("Monitor API route /api/orient p95 latency is above 1s", "Subscription pool claude:b is almost full.",
+                  "A disk is almost full."):
         raw[0]["annotations"]["summary"] = shown
         state_helpers.cache_invalidate()
         assert client.get("/api/ops/v1/alerts").json()["alerts"][0]["summary"] == shown
