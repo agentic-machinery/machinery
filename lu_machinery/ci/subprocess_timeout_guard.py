@@ -130,13 +130,25 @@ class _SubprocessCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def _dump_for_fingerprint(node: ast.AST) -> str:
+    """AST text whose bytes match CPython 3.12.
+
+    3.13+ omits empty lists unless ``show_empty`` is set. 3.12 always prints
+    them and rejects that keyword, so the flag is passed only when it exists.
+    """
+    if sys.version_info >= (3, 13):
+        return ast.dump(node, include_attributes=False, show_empty=True)
+    return ast.dump(node, include_attributes=False)
+
+
 def call_shape_hash(node: ast.Call) -> str:
     """Location-independent fingerprint of one Call AST.
 
     ``include_attributes=False`` drops lineno/col so a move inside the same
     function does not rotate identity. Changing callee or arguments does.
+    Empty lists stay in the text, so a 3.12 allowlist key still matches.
     """
-    payload = ast.dump(node, include_attributes=False)
+    payload = _dump_for_fingerprint(node)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:SHAPE_HASH_HEX_LEN]
 
 
