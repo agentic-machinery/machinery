@@ -130,8 +130,9 @@ def _offline_bin(directory: Path) -> None:
         script.chmod(0o755)
 
 
-# The handler dials this port itself. Checked on that request, not across the
-# module: CI splits the cases across workers, so one worker never sees all three.
+# The handler dials this port and no other. The log is per request: CI splits
+# the cases across workers, and a module-wide set would hide a second dial of
+# a port an earlier case already recorded.
 _ROUTE_PORTS = {
     "/api/ops/v1/alerts": 9093,
     "/api/fleet/facade/board": 8765,
@@ -147,7 +148,7 @@ class _OfflineSockets:
     """
 
     def __init__(self) -> None:
-        self.attempted: set[int] = set()
+        self.dialed: list[int] = []
         self.completed: list[object] = []
         self._connect = socket.socket.connect
         self._connect_ex = socket.socket.connect_ex
@@ -177,7 +178,7 @@ class _OfflineSockets:
 
     def _note(self, address: object) -> None:
         if isinstance(address, tuple) and len(address) >= 2 and isinstance(address[1], int):
-            self.attempted.add(address[1])
+            self.dialed.append(address[1])
 
     def _unix(self, sock: socket.socket, address: object) -> bool:
         if isinstance(address, (str, bytes)) or address is None:
@@ -330,10 +331,11 @@ def test_parameter_free_get_on_a_never_fetched_checkout_is_not_5xx(
     monkeypatch.chdir(repo)
     reset_local_document_cache()
     _hold_audit_cooldown(repo)
-    before = set(sockets.attempted)
+    start = len(sockets.dialed)
     response = client.get(route)
     assert response.status_code < 500, f"{route} -> HTTP {response.status_code} {response.text[:180]}"
     assert not sockets.completed, f"{route} opened a connection: {sockets.completed}"
     expected = _ROUTE_PORTS.get(route)
     if expected is not None:
-        assert expected in sockets.attempted - before, f"{route} did not dial port {expected}"
+        dialed = sockets.dialed[start:]
+        assert set(dialed) == {expected}, f"{route} dialed {dialed}, expected port {expected}"
