@@ -20,6 +20,9 @@
 #   Each needs the product checkout, which this repository does not hold.
 
 # [run]
+tests/property/test_path_safety_props.py
+tests/property/test_attribution_roundtrip_props.py
+tests/property/test_publish_github_guards_props.py
 tests/review/test_contract_canary_paths.py
 tests/ci/test_queue_review_gate.py
 # #501: dependency-closed ports from the deferred census.
@@ -732,6 +735,7 @@ tests/fleet_comms/test_pg_schema_ledger.py
 tests/fleet_comms/test_request_executor_pg.py
 tests/test_pg_skip_guard.py
 # [support]
+tests/property/conftest.py
 tests/fixtures/product_tree/agents_extensions/codex-home/AGENTS.md
 tests/fixtures/product_tree/agents_extensions/codex-home/agents/luna_coder_high.toml
 tests/fixtures/product_tree/agents_extensions/codex-home/agents/luna_explorer_high.toml
