@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.efficiency_metrics import (
@@ -345,7 +345,7 @@ def _probe_orient_lean(
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "fleet-comms-cold-start/1.0"})
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
             elapsed = (time.perf_counter() - start) * 1000.0
             return ProbeResult(
                 status="ok",
@@ -788,7 +788,7 @@ def _probe_gh_pr_list() -> ProbeResult:
         )
         elapsed = (time.perf_counter() - start) * 1000.0
         if proc.returncode == 0:
-            prs = json.loads(proc.stdout)
+            prs = json_depth.loads(proc.stdout, max_depth=512)
             return ProbeResult(
                 status="ok",
                 elapsed_ms=elapsed,

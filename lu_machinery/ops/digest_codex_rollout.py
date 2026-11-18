@@ -33,6 +33,7 @@ from lu_machinery.agent_runtime.codex_accounts import (
     CodexAccountRefused,
     codex_account_home,
 )
+from lu_machinery.common import json_depth
 
 DEFAULT_LABEL = "local"
 DEFAULT_REPO = Path.home() / "projects" / "learn-ukrainian"
@@ -94,6 +95,7 @@ _NOISE_RE = re.compile(
 )
 
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# nosemgrep: python.lang.security.audit.regex_dos -- every repeat is bounded; maximum match width is 39.
 _IPV6_RE = re.compile(r"\b(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\b", re.IGNORECASE)
 _USER_HOST_RE = re.compile(r"\b[\w.-]+@[\w.-]+\b")
 _SSH_HINT_RE = re.compile(r"(?i)\b(?:ssh|scp)\s+\S+")
@@ -227,7 +229,7 @@ def strings_from_line(line: str) -> list[str]:
     if not stripped:
         return []
     try:
-        payload = json.loads(stripped)
+        payload = json_depth.loads(stripped, max_depth=512)
     except json.JSONDecodeError:
         return [stripped]
     if isinstance(payload, (dict, list, str)):

@@ -17,6 +17,8 @@ import json
 import sys
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 
 def _norm(value: object) -> str:
     """Whitespace/case-insensitive normalization for fuzzy comparison."""
@@ -62,8 +64,8 @@ def _load_facts_spec(spec: str) -> object:
     long' OSError a caller hit when passing inline JSON to the file-only reader.
     """
     if spec.lstrip()[:1] in ("[", "{"):
-        return json.loads(spec)
-    return json.loads(Path(spec).read_text(encoding="utf-8"))
+        return json_depth.loads(spec, max_depth=512)
+    return json_depth.loads(Path(spec).read_text(encoding="utf-8"), max_depth=512)
 
 
 def cmd_mint(args: argparse.Namespace) -> int:
@@ -91,8 +93,8 @@ def cmd_mint(args: argparse.Namespace) -> int:
 
 def cmd_score(args: argparse.Namespace) -> int:
     try:
-        probe = json.loads(Path(args.probe).read_text(encoding="utf-8"))
-        answers = json.loads(Path(args.answers).read_text(encoding="utf-8"))
+        probe = json_depth.loads(Path(args.probe).read_text(encoding="utf-8"), max_depth=512)
+        answers = json_depth.loads(Path(args.answers).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeDecodeError) as exc:
         print(f"error: cannot read probe or answers: {exc}", file=sys.stderr)
         return 1

@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 from .authority import (
@@ -93,7 +94,7 @@ def _validator() -> Draft202012Validator:
     if _CLOSURE_ATTESTATION_VALIDATOR is not None:
         return _CLOSURE_ATTESTATION_VALIDATOR
     try:
-        schema = json.loads(CLOSURE_ATTESTATION_SCHEMA_PATH.read_text(encoding="utf-8"))
+        schema = json_depth.loads(CLOSURE_ATTESTATION_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise ClosureError(f"cannot load closure attestation schema: {exc}") from exc
     if not isinstance(schema, dict):

@@ -217,7 +217,7 @@ def _recovery_source(
     host_path, host = hosts[0]
     locator = host["worktree_abandon"]["creator_recovery"]
     try:
-        source = json.loads(_abandon_file(primary, locator))
+        source = json_depth.loads(_abandon_file(primary, locator), max_depth=_JSON_MAX_DEPTH)
     except (OSError, ValueError, RuntimeError):
         raise ValueError("creator recovery archived source digest invalid") from None
     source_path = primary / locator["path"]
@@ -866,7 +866,7 @@ def capture_abandon_output(
                 ).hexdigest(),
             }
         else:
-            saved = json.loads(location.with_suffix(".manifest.json").read_bytes())
+            saved = json_depth.loads(location.with_suffix(".manifest.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
             if "archive" in saved:
                 locator["archive"] = saved["archive"]
         verify_retrieval(primary, locator)
@@ -1047,7 +1047,7 @@ def terminal_abandon_creator(
         raise ValueError("terminal-abandon index.lock present; existing lock must be settled")
     if artifacts._git_paths(worktree, "--unmerged"):
         raise ValueError("terminal-abandon unmerged index cannot be preserved by ordinary patches")
-    manifest = json.loads(_abandon_file(primary, receipt.get("preservation")))
+    manifest = json_depth.loads(_abandon_file(primary, receipt.get("preservation")), max_depth=_JSON_MAX_DEPTH)
     if (
         not isinstance(manifest, dict)
         or manifest.get("schema") != "terminal-abandon-preservation.v1"
@@ -1492,7 +1492,7 @@ def _update_bound_task_record(
     """Recheck binding under the writer lock, including re-dispatch during copying."""
     with artifacts.task_state_lock(path):
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         except FileNotFoundError:
             return False
         if not isinstance(record, dict):
@@ -1530,7 +1530,7 @@ def _reusable_copy(
     """A manifest is a locator; verify the complete copy's names and bytes again."""
     for manifest in sorted(parent.glob("*.manifest.json")):
         try:
-            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            saved = json_depth.loads(manifest.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
             if (
                 not isinstance(saved, dict)
                 or saved.get("worktree_sha256") != hashlib.sha256(str(worktree).encode()).hexdigest()
@@ -1848,7 +1848,7 @@ def preserve_worktree_artifacts(
             location = _reusable_copy(parent, worktree, files, digest)
             reused = location is not None
             if reused:
-                saved = json.loads(location.with_suffix(".manifest.json").read_bytes())
+                saved = json_depth.loads(location.with_suffix(".manifest.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
                 if "archive" in saved:
                     metadata["archive"] = saved["archive"]
             if location is None:
@@ -1919,7 +1919,7 @@ def preserve_worktree_artifacts(
         # Recheck intent under the task writer lock. A concurrent record update
         # cannot have its keep flag overwritten by this gate's earlier snapshot.
         with artifacts.task_state_lock(record_path):
-            current = json.loads(record_path.read_text(encoding="utf-8"))
+            current = json_depth.loads(record_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
             if disposition is not None:
                 current_members = matching_worktree_records(
                     worktree, tasks_dir, repo_root=repo_root, publish_cache=False

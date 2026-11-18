@@ -18,6 +18,7 @@ from typing import Any
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     __package__ = "lu_machinery.orchestration.task_family"
+from lu_machinery.common import json_depth
 
 from . import codex_state, executor, git_safety
 from .graph import FamilyGraph, discover_task_family
@@ -69,7 +70,7 @@ def _repo_root(value: str) -> Path:
 def _load_manifest(path_value: str) -> TaskFamilyManifest:
     path = Path(path_value).expanduser()
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError as exc:
         raise CliError(f"manifest not found: {path}") from exc
     except json.JSONDecodeError as exc:

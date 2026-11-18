@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import calendar
 import contextlib
-import json
 import os
 import selectors
 import shutil
@@ -73,6 +72,7 @@ from lu_machinery.agent_runtime.codex_accounts import (
     CodexAccountRefused,
     codex_account_home,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.scratch import ensure_scratch_root
 
 from .claude_account_usage import _await_exit, _ProbeFailed, account_binding, child_env
@@ -219,7 +219,7 @@ def _claude_row(label: str) -> dict[str, Any]:
     if result is None:
         return {**row, "logged_in": None, "error": "probe_failed"}
     try:
-        data = json.loads(result[1])
+        data = json_depth.loads(result[1], max_depth=512)
     except ValueError:
         data = None
     # Claude exits 1 for its normal signed-out answer. No other failed probe is a reading.
@@ -414,7 +414,7 @@ def plan_facts(today: date | None = None) -> dict[str, Any]:
     except OSError:
         return {"pools": {}, "reason": "unreadable"}
     try:
-        data = json.loads(raw) if len(raw) <= _SUBSCRIPTION_ENDS_MAX_BYTES else None
+        data = json_depth.loads(raw, max_depth=512) if len(raw) <= _SUBSCRIPTION_ENDS_MAX_BYTES else None
     except ValueError:
         data = None
     if not isinstance(data, dict):

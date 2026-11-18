@@ -35,6 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.control_plane.storage import (
@@ -503,7 +504,7 @@ class MessagePlane:
         spec: dict[str, Any] = {}
         if row and row[0]:
             try:
-                loaded = json.loads(str(row[0]))
+                loaded = json_depth.loads(str(row[0]), max_depth=512)
                 if isinstance(loaded, dict):
                     spec = loaded
             except json.JSONDecodeError:
@@ -719,7 +720,7 @@ def _summarize_parity_telemetry(
         if not stripped:
             continue
         try:
-            loaded = json.loads(stripped)
+            loaded = json_depth.loads(stripped, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(loaded, dict):

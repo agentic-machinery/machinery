@@ -1304,7 +1304,7 @@ def default_state_dir(environ: dict[str, str] | None = None) -> Path:
 
 def load_state(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}

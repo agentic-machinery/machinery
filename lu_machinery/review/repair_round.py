@@ -56,6 +56,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.opsec import prepublish
 from lu_machinery.orchestration.integration_sweep import SHA
 from lu_machinery.review import record_cf_verdict as recorder
@@ -326,7 +327,7 @@ def _receipt_path(root: Path, key: str) -> Path:
 
 def _read_receipt(path: Path) -> dict[str, Any] | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError, ValueError) as exc:

@@ -78,6 +78,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, product_root
 
 SCHEMA = "learn-ukrainian.product-admission-policy"
@@ -316,7 +317,7 @@ def _decode(data: bytes, path: Path) -> Any:
     except UnicodeDecodeError:
         raise ProductPolicyError("policy_not_json", f"{path} is not UTF-8") from None
     try:
-        return json.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_reject_constant)
+        return json_depth.loads(text, object_pairs_hook=_no_duplicates, parse_constant=_reject_constant, max_depth=512)
     except json.JSONDecodeError as exc:
         raise ProductPolicyError("policy_not_json", f"{path}: {exc.msg} at line {exc.lineno}") from None
 

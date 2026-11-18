@@ -26,6 +26,7 @@ from typing import Any
 
 import jwt
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import http_open
 from lu_machinery.common.repo_root import ProductRootError, product_root
 
@@ -272,7 +273,7 @@ def mint_installation_token(
     try:
         open_request = urllib.request.urlopen if permissions is None else _restricted_opener(ssl_context).open
         with http_open(request, opener=open_request, timeout=15) as response:
-            payload: dict[str, Any] = json.loads(response.read().decode("utf-8"))
+            payload: dict[str, Any] = json_depth.loads(response.read().decode("utf-8"), max_depth=512)
         if not isinstance(payload, dict):
             raise ValueError("invalid response")
     except Exception as exc:  # HTTP errors deliberately contain no token in the message.

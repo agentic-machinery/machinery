@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import TaskRecordReadRefusal, read_cached_task_record
 from lu_machinery.control_plane.storage import (
     Authority,
@@ -787,7 +788,7 @@ def _load_merge_facts(path: Path | None) -> dict[str, str]:
     if path is None or not path.is_file():
         return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return {}
     if not isinstance(raw, dict):
@@ -927,7 +928,7 @@ def _fetch_merge_facts(
             if isinstance(stderr, bytes):
                 stderr = stderr.decode("utf-8", errors="replace")
             try:
-                payload = json.loads(stdout) if stdout.strip() else {}
+                payload = json_depth.loads(stdout, max_depth=512) if stdout.strip() else {}
             except json.JSONDecodeError as exc:
                 for key in batch:
                     fetched[key] = (None, f"json_decode: {exc}", None)
@@ -1038,7 +1039,7 @@ def _read_task_record(path: Path) -> tuple[object, str | None]:
                     raw = handle.read(_MAX_TASK_RECORD_BYTES + 1)
                 if len(raw) > _MAX_TASK_RECORD_BYTES:
                     return None, "task_record_too_large"
-                is_object = isinstance(json.loads(raw.decode("utf-8")), dict)
+                is_object = isinstance(json_depth.loads(raw.decode("utf-8"), max_depth=512), dict)
             except ValueError:
                 return None, "task_record_unreadable"
             return None, "not_a_task_record" if is_object else "task_record_not_object"

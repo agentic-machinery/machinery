@@ -51,6 +51,8 @@ from typing import Any
 
 from prometheus_client.core import GaugeMetricFamily
 
+from lu_machinery.common import json_depth
+
 from . import account_logins
 from .subscription_usage import (
     PROVIDER_ERROR,
@@ -285,7 +287,7 @@ def _read_cache() -> tuple[Mapping[str, Any], dict[str, Any]]:
     except OSError:
         return {}, {"status": "unreadable", "written_at": None}
     try:
-        data = json.loads(raw) if len(raw) <= _CACHE_MAX_BYTES else None
+        data = json_depth.loads(raw, max_depth=512) if len(raw) <= _CACHE_MAX_BYTES else None
     except ValueError:
         data = None
     if not isinstance(data, dict) or not isinstance(data.get("pools"), dict):

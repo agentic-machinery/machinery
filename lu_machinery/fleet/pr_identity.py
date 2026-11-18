@@ -34,7 +34,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = 30.0
 _REPO_SLUG_TIMEOUT_SECONDS = 15.0
@@ -161,7 +161,7 @@ def probe_open_pr_for_branch(
     if proc.returncode != 0:
         return None, f"gh pr list failed (exit {proc.returncode})"
     try:
-        rows = json.loads(proc.stdout or "[]")
+        rows = json_depth.loads(proc.stdout or "[]", max_depth=512)
     except json.JSONDecodeError:
         return None, "gh pr list returned invalid JSON"
     if not isinstance(rows, list):

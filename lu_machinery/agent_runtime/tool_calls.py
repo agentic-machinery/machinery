@@ -14,6 +14,8 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 from .jsonl import jsonl_lines
 
 OUTPUT_SUMMARY_LIMIT = 500
@@ -54,7 +56,7 @@ def parse_json_events(text: str, *, source: str, logger: logging.Logger) -> list
     stripped = text.strip()
     if stripped:
         try:
-            parsed = json.loads(stripped)
+            parsed = json_depth.loads(stripped, max_depth=512)
         except json.JSONDecodeError:
             parsed = None
         if isinstance(parsed, dict):
@@ -83,7 +85,7 @@ def parse_json_events(text: str, *, source: str, logger: logging.Logger) -> list
                 continue
             candidate = candidate[start : end + 1]
         try:
-            event = json.loads(candidate)
+            event = json_depth.loads(candidate, max_depth=512)
         except json.JSONDecodeError as exc:
             if _looks_like_tool_line(line):
                 logger.warning(
@@ -301,7 +303,7 @@ def _coerce_arguments(value: Any) -> dict[str, Any]:
         return sanitized if isinstance(sanitized, dict) else {}
     if isinstance(value, str) and value.strip():
         try:
-            parsed = json.loads(value)
+            parsed = json_depth.loads(value, max_depth=512)
         except json.JSONDecodeError:
             return {"_raw": summarize_tool_output(value)}
         if isinstance(parsed, Mapping):
@@ -335,7 +337,7 @@ def _parse_codex_output_envelope(value: str) -> Any | None:
         if not candidate:
             continue
         try:
-            parsed = json.loads(candidate)
+            parsed = json_depth.loads(candidate, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, (dict, list)):

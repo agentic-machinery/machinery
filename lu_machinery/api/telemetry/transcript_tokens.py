@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.lib.session_record import canonical_state_root, read_record
 
 
@@ -65,7 +66,7 @@ def parse_transcript_tokens(path: Path) -> TranscriptTelemetry | None:
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 try:
-                    obj = json.loads(line)
+                    obj = json_depth.loads(line, max_depth=512)
                 except json.JSONDecodeError:
                     continue
                 if obj.get("type") != "assistant":

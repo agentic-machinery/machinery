@@ -34,9 +34,8 @@ from urllib.parse import quote
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.ci._location import module_name
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 DEFAULT_WORKFLOW = "CI"
 DEFAULT_WORKFLOW_FILE = "ci.yml"
@@ -297,7 +296,7 @@ def gh_api_get(
         raise RuntimeError(f"gh api {path} failed (exit {completed.returncode}): {err_msg}")
 
     try:
-        return json.loads(completed.stdout)
+        return json_depth.loads(completed.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse JSON response from gh api {path}: {exc}") from exc
 
@@ -355,7 +354,7 @@ def load_runs_and_jobs_from_fixture(
         raise FileNotFoundError(f"Fixture file not found: {path}")
 
     with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+        data = json_depth.load(handle, max_depth=512)
 
     if isinstance(data, list):
         # Format: list of runs with nested jobs

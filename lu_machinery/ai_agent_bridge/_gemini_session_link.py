@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 _GEMINI_TMP_ROOT = Path.home() / ".gemini" / "tmp"
 _MAX_DRIFT_SECONDS = 30.0
 
@@ -82,7 +84,7 @@ def _iter_candidates(
     candidates: list[tuple[int, float, GeminiSessionRecovery]] = []
     for path in chats_dir.glob("session-*.json"):
         try:
-            data = json.loads(path.read_text("utf-8"))
+            data = json_depth.loads(path.read_text("utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError):
             continue
 

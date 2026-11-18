@@ -13,9 +13,9 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from lu_machinery.agent_runtime.agent_identity import seat_read_aliases
 from lu_machinery.ai_agent_bridge._channels import resolve_recipient_alias
+from lu_machinery.common import json_depth
 from lu_machinery.common.bridge_paths import configured_bridge_db_path
 from lu_machinery.common.repo_root import (
     HOOK_BOOTSTRAP_DIAGNOSTIC,
@@ -122,7 +122,7 @@ def _reject_constant(_value: str) -> None:
 def hook(stdin_text: str, recipient: str) -> dict:
     """Render one bounded ephemeral announcement, or silence for proven zero."""
     try:
-        payload = json.loads(stdin_text, parse_constant=_reject_constant)
+        payload = json_depth.loads(stdin_text, parse_constant=_reject_constant, max_depth=512)
         if not isinstance(payload, dict):
             raise ValueError
         result = probe(recipient)

@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.git_credentials import canonical_origins as canonical_origins
 from lu_machinery.common.git_credentials import verification_credentials
@@ -565,7 +566,7 @@ def registry_update(registry: Path, key: str, change, *, timeout: float | None =
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"worktree registry lock is held: {registry}") from None
                 time.sleep(0.05)
-        data = json.loads(registry.read_text(encoding="utf-8"))
+        data = json_depth.loads(registry.read_text(encoding="utf-8"), max_depth=512)
         if not isinstance(data, dict) or not isinstance(data.get("worktrees"), dict):
             raise ValueError(f"worktree registry has an invalid shape: {registry}")
         entry = change(data["worktrees"].get(key))
@@ -706,8 +707,8 @@ def _refresh_at_settlement(record: dict, tree: Path, head: str) -> str | None:
         with suppress(GitHubRefused, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
             slug, _ = _repo_and_base(record)
             branch = record["worktree_branch"]
-            listed = json.loads(_gh("pr", "list", "--repo", slug, "--head", branch, "--state", "open",
-                                    "--json", "number,headRefOid,headRefName")) if slug else []
+            listed = json_depth.loads(_gh("pr", "list", "--repo", slug, "--head", branch, "--state", "open",
+                                    "--json", "number,headRefOid,headRefName"), max_depth=512) if slug else []
             matching = [item["number"] for item in listed if item["headRefName"] == branch and item["headRefOid"] == head]
             pr = matching[0] if len(matching) == 1 else None
         return "refreshed" if refresh_worktree(registry, tree, pr) else "no_entry"
@@ -1033,13 +1034,13 @@ def _delivery_prs(record: dict, repo: str) -> list[int]:
     numbers = set(_accepted_prs(record["task_id"], repo))
     branches = sorted({record["worktree_branch"], record.get("publish_branch")} - {None})
     for branch in branches:
-        listed = json.loads(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "merged",
-                                "--json", "number,isCrossRepository,headRefName"))
+        listed = json_depth.loads(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "merged",
+                                "--json", "number,isCrossRepository,headRefName"), max_depth=512)
         numbers.update(pr["number"] for pr in listed if pr["headRefName"] == branch and not pr["isCrossRepository"])
     started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
     page = 1
     while True:
-        listed = json.loads(_gh("api", f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"))
+        listed = json_depth.loads(_gh("api", f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"), max_depth=512)
         if not listed:
             break
         updated = [datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00")) for pr in listed]
@@ -1065,7 +1066,7 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
     commits = record.get("commits_ahead")
     if head and isinstance(commits, int) and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         listed = _gh("api", "--paginate", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
-        for pr in json.loads(listed or "[]"):
+        for pr in json_depth.loads(listed or "[]", max_depth=512):
             if (pr["number"] not in seen and pr["head"]["sha"] == head
                     and (pr["head"]["repo"] or {}).get("full_name") == (pr["base"]["repo"] or {}).get("full_name")):
                 seen.add(pr["number"])
@@ -1146,8 +1147,8 @@ def merged_delivery(record: dict) -> dict | None:
             return name == accepted_default
 
         for number in _merged_delivery_candidates(record, repo):
-            pr = json.loads(_gh("pr", "view", str(number), "--repo", repo, "--json",
-                                "state,baseRefName,mergedAt,headRefOid,headRefName,mergeCommit,isCrossRepository"))
+            pr = json_depth.loads(_gh("pr", "view", str(number), "--repo", repo, "--json",
+                                "state,baseRefName,mergedAt,headRefOid,headRefName,mergeCommit,isCrossRepository"), max_depth=512)
             if (pr["state"] != "MERGED" or pr["isCrossRepository"] or not pr["mergeCommit"]
                     or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", pr["mergeCommit"]["oid"])
                     or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started
@@ -1161,7 +1162,7 @@ def merged_delivery(record: dict) -> dict | None:
                 messages = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/commits", "--jq",
                                ".[] | .commit.message | @json")
                 trailer = f"X-Agent: {record['agent']}/{record['task_id']}"
-                trailers = [line for message in messages.splitlines() for line in json.loads(message).splitlines()
+                trailers = [line for message in messages.splitlines() for line in json_depth.loads(message, max_depth=512).splitlines()
                             if line.startswith("X-Agent:")]
                 if trailer not in trailers:
                     continue
@@ -1184,7 +1185,7 @@ def merged_delivery(record: dict) -> dict | None:
                 commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
                 history = ownership.delivered_paths(
                     run, pr["headRefOid"], parent, start, commits_expected=commits_expected)
-            paths.update(json.loads(line) for line in changed.splitlines() if line)
+            paths.update(json_depth.loads(line, max_depth=512) for line in changed.splitlines() if line)
             paths.update(history)
             delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=pr["mergeCommit"]["oid"])
             deliveries.append(delivery)
@@ -1271,7 +1272,7 @@ def _merged_pr_contains(record: dict, run, pull_heads: dict[str, str], head: str
         ref = f"refs/pull/{number}/head"
         if ref not in pull_heads:
             continue
-        pr = json.loads(_gh("pr", "view", str(number), "--repo", repo, "--json", "state,baseRefName,headRefOid"))
+        pr = json_depth.loads(_gh("pr", "view", str(number), "--repo", repo, "--json", "state,baseRefName,headRefOid"), max_depth=512)
         if pr["state"] != "MERGED" or pr["baseRefName"] != base or pr["headRefOid"] != pull_heads[ref]:
             continue
         run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=tree:0", "--", "origin", f"+{ref}:{ref}",

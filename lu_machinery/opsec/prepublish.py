@@ -10,7 +10,6 @@ owns destination admission, blocking policy and masked diagnostics.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 import re
 import subprocess
@@ -31,6 +30,8 @@ _PACKAGE = Path(__file__).resolve().parents[1]
 # of the stdlib (it is often the cwd).
 if (__package__ or "").partition(".")[0] != _PACKAGE.name and str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from lu_machinery.common import json_depth
+
 POLICY = Path(__file__).with_name("blocking.json")
 # Dropped from every internal environment; only the private override authority may admit with it.
 OVERRIDE = "LU_OPSEC_OVERRIDE"
@@ -235,8 +236,8 @@ def _load_matcher(tooling: Path):
     import io
 
     try:
-        rules = json.loads((tooling / "rules.json").read_bytes())
-        policy = json.loads(POLICY.read_bytes())
+        rules = json_depth.loads((tooling / "rules.json").read_bytes(), max_depth=512)
+        policy = json_depth.loads(POLICY.read_bytes(), max_depth=512)
         identities = {}
         for level, group in rules.items():
             for row in group["patterns"]:

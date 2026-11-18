@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 
 # The machinery package's import name, which is also the directory its files have in checkout
@@ -136,7 +136,7 @@ def fetch_open_prs(slug: str) -> list[dict]:
     except (subprocess.SubprocessError, OSError) as exc:
         raise RuntimeError(f"cannot list open PRs of {slug}: {type(exc).__name__}") from exc
     try:
-        prs = json.loads(proc.stdout) if proc.returncode == 0 else None
+        prs = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
     except ValueError:
         prs = None
     if not isinstance(prs, list) or not all(_usable_pr(pr) for pr in prs):

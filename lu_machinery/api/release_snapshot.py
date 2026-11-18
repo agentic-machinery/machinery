@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.release_layout import (
     LIVE_DATA_PATHS,
@@ -333,7 +334,7 @@ def verify_release(release_dir: Path, sha: str | None = None) -> ReleaseManifest
     """Verify the recorded archive manifest before reuse or publication."""
     manifest_path = release_dir / MANIFEST_NAME
     try:
-        payload: dict[str, Any] = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload: dict[str, Any] = json_depth.loads(manifest_path.read_text(encoding="utf-8"), max_depth=512)
         recorded = ReleaseManifest(
             sha=_validate_sha(str(payload["sha"])),
             file_count=int(payload["file_count"]),

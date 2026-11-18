@@ -10,6 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 _AGY_APP_DATA_ENV = "AGY_APP_DATA_DIR"
@@ -119,7 +120,7 @@ def _codex_sanitize_server_config(server_config: dict) -> dict:
 def _load_mcp_config(mcp_config_path: Path) -> dict[str, Any] | None:
     """Load `.mcp.json` once per process for Codex MCP config shaping."""
     try:
-        raw = json.loads(mcp_config_path.read_text(encoding="utf-8"))
+        raw = json_depth.loads(mcp_config_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     return raw if isinstance(raw, dict) else None

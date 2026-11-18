@@ -8,6 +8,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any, TextIO
 
+from lu_machinery.common import json_depth
+
 from ._db import get_db
 
 VALID_CHANNEL_EVENTS = (
@@ -184,7 +186,7 @@ def read_channel_events(
     events: list[dict[str, Any]] = []
     for row in rows:
         payload_raw = row["payload_json"]
-        payload = json.loads(payload_raw) if payload_raw else {}
+        payload = json_depth.loads(payload_raw, max_depth=512) if payload_raw else {}
         event = {
             "event": row["event"],
             **payload,

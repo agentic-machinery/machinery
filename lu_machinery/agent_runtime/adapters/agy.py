@@ -104,6 +104,7 @@ from lu_machinery.agent_runtime.attempt_safe_read import (
     safe_attempt_file_size,
     safe_read_attempt_file,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.review.model_catalog import load_model_catalog, retired_model_refusal
 from lu_machinery.secret_redactor import redact_text
 
@@ -577,7 +578,7 @@ def _pre_model_failure(plan: InvocationPlan | None, stdout: str, bound: _Transcr
     # Only empty output or a lone provider error result can precede a model.
     if stdout.strip():
         try:
-            events = [json.loads(line) for line in jsonl_lines(stdout) if line.strip()]
+            events = [json_depth.loads(line, max_depth=512) for line in jsonl_lines(stdout) if line.strip()]
         except ValueError:
             return False
         if len(events) != 1 or not isinstance(events[0], dict) or events[0].get("event") != "result":
@@ -2351,7 +2352,7 @@ def _stream_result(
         if not line.strip():
             continue
         try:
-            event = json.loads(line, object_pairs_hook=unique_members if claude_identity else None)
+            event = json_depth.loads(line, object_pairs_hook=unique_members if claude_identity else None, max_depth=512)
         except json.JSONDecodeError:
             return None, "agy_stream_output_invalid: malformed NDJSON event"
         except ValueError:
@@ -2831,7 +2832,7 @@ def _read_transcript_events(
         if not raw_line.strip():
             continue
         try:
-            event = json.loads(raw_line.decode("utf-8"))
+            event = json_depth.loads(raw_line.decode("utf-8"), max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError):
             unreadable += 1
             continue
@@ -3482,7 +3483,7 @@ def merge_saved_step_outputs(stdout: str, saved: list[dict[str, Any]]) -> tuple[
             lines.append(line)
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             lines.append(line)
             continue
@@ -3538,7 +3539,7 @@ def _decode_jsonish(value: Any) -> Any:
     if not stripped:
         return ""
     try:
-        return json.loads(stripped)
+        return json_depth.loads(stripped, max_depth=512)
     except (ValueError, RecursionError):
         return stripped.strip('"')
 

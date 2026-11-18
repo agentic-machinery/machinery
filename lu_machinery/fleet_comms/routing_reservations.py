@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
@@ -243,7 +244,7 @@ def _mapping(value: Mapping[str, Any] | None, *, field: str) -> dict[str, Any]:
     if value is None:
         return {}
     try:
-        decoded = json.loads(_canonical_json(dict(value)))
+        decoded = json_depth.loads(_canonical_json(dict(value)), max_depth=512)
     except (TypeError, ValueError) as exc:
         raise RoutingReservationError(f"{field}_must_be_json_object") from exc
     if not isinstance(decoded, dict):  # pragma: no cover - dict() guarantees this
@@ -351,7 +352,7 @@ class RoutingReservationLedger:
                            WHERE reservation_id = ? AND event_type = 'authorized_substitution'""",
                         (str(idempotent["reservation_id"]),),
                     ).fetchone()
-                    if decision is None or json.loads(str(decision["evidence_json"])) != substitution_data:
+                    if decision is None or json_depth.loads(str(decision["evidence_json"]), max_depth=512) != substitution_data:
                         raise RoutingReservationError("substitution_idempotency_conflict")
                 return self._reservation_from_row(idempotent)
 
@@ -806,7 +807,7 @@ class RoutingReservationLedger:
             "SELECT evidence_json FROM routing_reservation_decisions WHERE reservation_id = ? AND event_type = 'reserved'",
             (prior_id,),
         ).fetchone()
-        envelope = json.loads(str(prior["evidence_json"])).get("authorization_envelope") if prior else None
+        envelope = json_depth.loads(str(prior["evidence_json"]), max_depth=512).get("authorization_envelope") if prior else None
         if not isinstance(envelope, dict):
             legacy_envelope = {
                 "required_capabilities": ["code_review", "sealed_evidence"],
@@ -903,7 +904,7 @@ class RoutingReservationLedger:
         ).fetchone()
         if reserved is None:
             return False
-        reserved_evidence = json.loads(str(reserved["evidence_json"]))
+        reserved_evidence = json_depth.loads(str(reserved["evidence_json"]), max_depth=512)
         if isinstance(reserved_evidence.get("authorization_envelope"), dict):
             return False
         # A pre-envelope row is accepted only when its historic semantic hash
@@ -1153,13 +1154,13 @@ class RoutingReservationLedger:
             credential_bucket=str(row["credential_bucket"]),
             policy_version=str(row["policy_version"]),
             estimated_input_bytes=int(row["estimated_input_bytes"]),
-            quota_snapshot=json.loads(str(row["quota_snapshot_json"])),
+            quota_snapshot=json_depth.loads(str(row["quota_snapshot_json"]), max_depth=512),
             quota_fresh_at=str(row["quota_fresh_at"]) if row["quota_fresh_at"] is not None else None,
             fallback_from=str(row["fallback_from"]) if row["fallback_from"] is not None else None,
             retry_attempt=int(row["retry_attempt"]),
             quota_source=str(row["quota_source"]),
             quota_headroom_band=str(row["quota_headroom_band"]),
-            trace=json.loads(str(row["trace_json"])),
+            trace=json_depth.loads(str(row["trace_json"]), max_depth=512),
             created_at=str(row["created_at"]),
             expires_at=str(row["expires_at"]),
             started_at=str(row["started_at"]) if row["started_at"] is not None else None,
@@ -1185,7 +1186,7 @@ class RoutingReservationLedger:
             reservation_id=str(row["reservation_id"]),
             event_type=str(row["event_type"]),
             state=str(row["state"]),
-            evidence=json.loads(str(row["evidence_json"])),
+            evidence=json_depth.loads(str(row["evidence_json"]), max_depth=512),
             created_at=str(row["created_at"]),
         )
 
@@ -1293,7 +1294,7 @@ def _routing_decision_projection(row: sqlite3.Row) -> dict[str, Any]:
         "authority_key": str(row["authority_key"]),
         "event_type": str(row["event_type"]),
         "state": str(row["state"]),
-        "evidence": json.loads(str(row["evidence_json"])),
+        "evidence": json_depth.loads(str(row["evidence_json"]), max_depth=512),
         "created_at": str(row["decision_created_at"]),
         "requested": {
             "initiator": str(row["initiator"]),
@@ -1314,12 +1315,12 @@ def _routing_decision_projection(row: sqlite3.Row) -> dict[str, Any]:
             "model": str(row["resolved_model"]),
             "family": str(row["resolved_family"]),
             "policy_version": str(row["policy_version"]),
-            "trace": json.loads(str(row["trace_json"])),
+            "trace": json_depth.loads(str(row["trace_json"]), max_depth=512),
         },
         "quota": {
             "bucket": str(row["quota_bucket"]),
             "credential_bucket": str(row["credential_bucket"]),
-            "snapshot": json.loads(str(row["quota_snapshot_json"])),
+            "snapshot": json_depth.loads(str(row["quota_snapshot_json"]), max_depth=512),
             "fresh_at": str(row["quota_fresh_at"]) if row["quota_fresh_at"] is not None else None,
             "source": str(row["quota_source"]),
             "headroom_band": str(row["quota_headroom_band"]),

@@ -13,6 +13,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root, project_interpreter
 
 _RUNNER_TIMEOUT_SECONDS = 90
@@ -57,7 +58,7 @@ def _run_runner(*args: str) -> dict[str, Any]:
         timeout=_RUNNER_TIMEOUT_SECONDS,
     )
     try:
-        payload = json.loads((completed.stdout or "").strip())
+        payload = json_depth.loads((completed.stdout or "").strip(), max_depth=512)
     except json.JSONDecodeError as exc:
         raise TrailMcpError("parent-owned TrailSpec runner emitted invalid JSON") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != "trail-run-result.v1":

@@ -11,6 +11,7 @@ from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.opsec.prepublish import PublishBlocked
 
 MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
@@ -92,7 +93,7 @@ def first_attempt(path: Path, repo: str, number: int, head: str) -> dict | None:
                     "SELECT attempt FROM recovery WHERE repo=? AND pr=? AND head=?", (repo.lower(), number, head)
                 ).fetchone()
                 if row:
-                    return json.loads(row[0])
+                    return json_depth.loads(row[0], max_depth=512)
         return None
     except (OSError, ValueError, AttributeError, sqlite3.Error):
         raise PublishBlocked("RECOVERY_RECORD_UNAVAILABLE: allowance unreadable") from None
@@ -121,7 +122,7 @@ def evidence_from_comments(
             continue
         for match in MARKER.finditer(str(comment.get("body", ""))):
             try:
-                evidence = json.loads(match[1])
+                evidence = json_depth.loads(match[1], max_depth=512)
             except ValueError:
                 continue
             if not isinstance(evidence, dict):
@@ -165,7 +166,7 @@ def consume(path: Path, repo: str, number: int, head: str, action: str, evidence
                 "SELECT attempt FROM recovery WHERE repo=? AND pr=? AND head=?", (repo.lower(), number, head)
             ).fetchone()
             if row:
-                raise PublishBlocked(spent_reason(json.loads(row[0])))
+                raise PublishBlocked(spent_reason(json_depth.loads(row[0], max_depth=512)))
             attempt = {**evidence, "action": action, "at": datetime.now(UTC).isoformat()}
             db.execute("INSERT INTO recovery VALUES (?, ?, ?, ?)", (repo.lower(), number, head, json.dumps(attempt)))
     except (OSError, ValueError, AttributeError, sqlite3.Error):

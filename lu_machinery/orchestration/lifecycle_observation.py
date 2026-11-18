@@ -7,7 +7,6 @@ The lifecycle API owns receipt appends; worktree removal stays with its callers.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -16,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.fleet import ignored_task_output
 from lu_machinery.orchestration import task_lifecycle as tl
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
@@ -63,7 +63,7 @@ def _source(path: Path, root: Path) -> tuple[dict[str, Any], dict[str, str]]:
         if path.resolve(strict=True) != path.absolute() or not path.is_file():
             raise ObservationRefusal("RECOVERY_INPUT_NOT_REGULAR")
         raw = path.read_bytes()
-        value = json.loads(raw)
+        value = json_depth.loads(raw, max_depth=512)
         if not isinstance(value, dict):
             raise ObservationRefusal("RECOVERY_INPUT_INVALID")
         return value, {"path": locator, "sha256": hashlib.sha256(raw).hexdigest()}

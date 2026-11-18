@@ -336,6 +336,9 @@ jobs:
           fi
           "$ruff" check --no-cache --config "$config" --output-format=github lu_machinery
 
+      - name: Refuse unbounded JSON readers
+        run: python -m lu_machinery.lint.json_readers
+
   compileall:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'

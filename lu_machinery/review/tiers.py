@@ -17,6 +17,7 @@ from typing import Literal
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.integration_sweep import pr_file_paths
 
@@ -270,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     rows: object
     try:
         if args.rows_file is not None:
-            rows = json.loads(args.rows_file.read_text(encoding="utf-8"))
+            rows = json_depth.loads(args.rows_file.read_text(encoding="utf-8"), max_depth=512)
         else:
             from lu_machinery.orchestration.integration_sweep import (
                 GitHubAdapter,

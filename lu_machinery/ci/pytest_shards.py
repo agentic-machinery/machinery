@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 import sys
 
+from lu_machinery.common import json_depth
+
 # Direct file execution runs pytest in this process, so this copy must put
 # nothing on the runner's import path. Its own directory (sys.path[0], absent
 # under -P) goes before any import can search it.
@@ -98,7 +100,7 @@ def _digest(nodeids: Iterable[str]) -> str:
 
 
 def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
 
 
 def _write_json(path: Path, value: Any) -> None:

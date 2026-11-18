@@ -36,6 +36,7 @@ from lu_machinery.ci.audit_dependencies import (
     load_pip_audit_ignores,
     pip_audit_requirement_env,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 ISSUE_LABEL = "dependency-advisory"
@@ -153,7 +154,7 @@ def _run_json_command(
         cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env
     )
     try:
-        data = json.loads(result.stdout)
+        data = json_depth.loads(result.stdout, max_depth=512)
     except (ValueError, TypeError) as exc:
         if result.stdout:
             print(result.stdout)
@@ -288,7 +289,7 @@ def write_github_output(values: dict[str, str], path: Path | None = None) -> Non
 
 
 def _load_findings(path: Path) -> list[Finding]:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(data, dict) or not isinstance(data.get("findings"), list):
         raise ValueError(f"{path}: expected an object with a 'findings' list")
     return [f for f in data["findings"] if isinstance(f, dict)]

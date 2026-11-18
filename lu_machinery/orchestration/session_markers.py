@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from lu_machinery.api.occupancy_sanitize import safe_field
+from lu_machinery.common import json_depth
 
 MARKER_SCHEMA = "monitor-notebook-session.v1"
 MARKER_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -171,7 +172,7 @@ def remove_session_marker(
     if expected_pid is not None:
         try:
             with path.open(encoding="utf-8") as handle:
-                marker = _normalise_marker(json.load(handle))
+                marker = _normalise_marker(json_depth.load(handle, max_depth=512))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return False
         if marker is None or marker.pid != expected_pid:
@@ -209,7 +210,7 @@ def iter_session_markers(
                 path.unlink(missing_ok=True)
                 continue
             with path.open(encoding="utf-8") as handle:
-                marker = _normalise_marker(json.load(handle))
+                marker = _normalise_marker(json_depth.load(handle, max_depth=512))
             started = _parse_started_at(marker.started_at) if marker else None
             too_old = started is None or current - started > timedelta(seconds=MARKER_MAX_AGE_SECONDS)
             if marker is None or too_old or not is_alive(marker.pid):

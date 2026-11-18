@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, product_root
 from lu_machinery.ops.product_entry import load_configured_module
 
@@ -94,7 +95,7 @@ def _read(path: Path) -> Any:
         raise EntryPointError(f"{path} has a non-finite number {token}")
 
     try:
-        return json.loads(data.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constants)
+        return json_depth.loads(data.decode("utf-8"), object_pairs_hook=no_duplicates, parse_constant=no_constants, max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise EntryPointError(f"{path} is not UTF-8 JSON: {exc}") from None
 

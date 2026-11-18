@@ -47,6 +47,8 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import json_depth
+
 SCHEMA_VERSION = "credit-lanes.v1"
 POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "credit_lanes.yaml"
 REFUSAL_CODE = "CREDIT_PERIOD_MODEL_REFUSED"
@@ -1348,7 +1350,7 @@ def read_routing_budget(*, timeout: float = 8.0) -> dict[str, Any] | None:
     base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
     try:
         with urllib.request.urlopen(f"{base}/api/state/routing-budget?fresh_codexbar=true", timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ValueError):
         return None
     return payload if isinstance(payload, dict) else None

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from datetime import UTC, datetime
@@ -13,7 +12,6 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.ci._location import checkout_relative, module_name
 from lu_machinery.ci.check_issue_task_quality import (
     FIELDS,
@@ -25,6 +23,7 @@ from lu_machinery.ci.check_issue_task_quality import (
     score_body,
     time_budget,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubClient, GitHubRateLimited
 
 MARKER = "<!-- issue-task-quality:v1 -->"
@@ -91,7 +90,7 @@ def check_current_issue(issue: dict, repo: str, number: int) -> dict:
 def _main() -> int:
     token = os.environ["GITHUB_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
-    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    event = json_depth.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"), max_depth=512)
     number = int(event["issue"]["number"])
     github = GitHubClient(env={**os.environ, "GH_TOKEN": token})
 

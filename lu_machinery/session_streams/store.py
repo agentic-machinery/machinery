@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -15,6 +14,8 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from lu_machinery.common import json_depth
 
 from .app_lifecycle import VerifiedAppLifecycleProof
 from .db import SessionStreamDatabase
@@ -1921,7 +1922,7 @@ class SessionStreamStore:
 
     @staticmethod
     def _rollover_bundle_payload(row: sqlite3.Row, *, include_blob: bool) -> dict[str, Any]:
-        manifest = json.loads(str(row["manifest_json"]))
+        manifest = json_depth.loads(str(row["manifest_json"]), max_depth=512)
         manifest["upload_seq"] = int(row["bundle_id"])
         payload: dict[str, Any] = {
             "manifest": manifest,

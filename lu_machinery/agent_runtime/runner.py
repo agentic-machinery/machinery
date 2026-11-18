@@ -72,6 +72,7 @@ from lu_machinery.ai_llm.fallback import (
     resolve_allowed_auth_modes,
     run_gemini_fallback_ladder,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, machinery_path, product_root, project_interpreter
 from lu_machinery.lib.readonly_sqlite import import_named_module
 from lu_machinery.secret_redactor import redact_value
@@ -489,7 +490,7 @@ def _bounded_acpx_progress_filter() -> Callable[[str], str | None]:
     def filter_line(line: str) -> str | None:
         nonlocal retained_progress_bytes
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             return line
         if not isinstance(event, dict) or event.get("method") != "progress":

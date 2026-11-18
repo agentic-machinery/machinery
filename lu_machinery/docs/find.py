@@ -68,6 +68,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from lu_machinery.common import json_depth
 from lu_machinery.docs import catalogue as cat
 
 MAX_QUERY_CHARS = 200
@@ -557,7 +558,7 @@ def _index_blob(repo: Path, entry: cat.IndexEntry | None) -> bytes:
 def _build_state(repo: Path, files: dict[str, cat.IndexEntry], raw: dict[str, bytes]) -> State:
     try:
         catalogue = cat.parse(raw[cat.CATALOGUE_PATH])
-        schema = json.loads(raw[cat.SCHEMA_PATH].decode('utf-8'))
+        schema = json_depth.loads(raw[cat.SCHEMA_PATH].decode('utf-8'), max_depth=512)
         owners = cat.owner_keys(repo)
     except (cat.CatalogueLoadError, ValueError, OSError, subprocess.SubprocessError) as exc:
         return State(repo, None, cat.Report(), files, load_error=f'{type(exc).__name__}: {str(exc)[:200]}')

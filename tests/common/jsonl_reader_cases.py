@@ -1,6 +1,6 @@
 """Fixtures for actual JSONL reader boundaries, without provider/corpus runs.
 
-Parser-boundary cases execute the real function up to json.loads, decode with
+Parser-boundary cases execute the real function up to json_depth.loads, decode with
 Python's real parser, and assert the exact string before stopping via a private
 BaseException. This keeps schema/ML/provider setup out of a line-boundary test;
 transport and artifact dependencies are fixture-only and never contacted.
@@ -193,7 +193,7 @@ def reader_case(module_name, function, site, ending, tmp_path, monkeypatch):
             },
         )
 
-    original = json.loads
+    original = module.json_depth.loads
 
     def loads(value, *a, **kw):
         parsed = original(value, *a, **kw)
@@ -202,6 +202,6 @@ def reader_case(module_name, function, site, ending, tmp_path, monkeypatch):
             raise _ParsedRecord
         return parsed
 
-    monkeypatch.setattr(json, "loads", loads)
+    monkeypatch.setattr(module.json_depth, "loads", loads)
     with pytest.raises(_ParsedRecord):
         fn(*args, **kwargs)

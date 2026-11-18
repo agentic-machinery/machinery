@@ -41,7 +41,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import main_checkout_root, product_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet import pr_identity
@@ -133,7 +133,7 @@ def _gh_issue(
     if proc.returncode != 0:
         raise GhUnavailable(f"gh api failed for {repo}#{number}")
     try:
-        data = json.loads(proc.stdout)
+        data = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         raise GhUnavailable(f"gh api returned malformed JSON for {repo}#{number}") from exc
     if not isinstance(data, dict) or data.get("number") != number or not isinstance(data.get("body"), str):

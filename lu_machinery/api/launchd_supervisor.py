@@ -26,6 +26,7 @@ from typing import Any
 from xml.parsers.expat import ExpatError
 
 from lu_machinery.api.release_snapshot import build_release, prune_releases
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, machinery_path, state_root
 from lu_machinery.common.safe_unit_install import (
     InstallError,
@@ -276,7 +277,7 @@ def _load_launch_config(repo_root: Path) -> tuple[bool, int]:
         installed = load_unit(_config_path(repo_root), home=repo_root.parent)
         if installed is None:
             return False, PORT
-        data = json.loads(installed[0])
+        data = json_depth.loads(installed[0], max_depth=512)
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise LaunchdError(f"invalid API launch configuration at {_config_path(repo_root)}") from exc
 

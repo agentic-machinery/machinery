@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_errors
 
@@ -99,7 +100,7 @@ def decode(blob: bytes) -> Any:
             result[key] = value
         return result
     try:
-        return json.loads(blob, object_pairs_hook=members)
+        return json_depth.loads(blob, object_pairs_hook=members, max_depth=512)
     except (ValueError, UnicodeError) as exc:
         raise Invalid("invalid JSON") from exc
 

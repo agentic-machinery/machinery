@@ -29,6 +29,7 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.dispatcher import store
 
 
@@ -226,7 +227,7 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
             entry["output_missing"] = call["output_missing"]
         elif call.get("result") is not None:
             entry["result"] = call["result"]
-        trace.append(_redacted(json.loads(json.dumps(entry, default=str))))
+        trace.append(_redacted(json_depth.loads(json.dumps(entry, default=str), max_depth=512)))
     record["sources_bodies_retained"] = retained_bodies
     record["sources_bodies_missing"] = missing_bodies
     return Outcome("done" if ok else "failed", error, response_text if ok else None,

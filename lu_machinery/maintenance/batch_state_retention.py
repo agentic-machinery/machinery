@@ -25,6 +25,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 # The package directory, from the unresolved file location. A literal scripts/
 # join is the machinery package name (design-v1 amendment 1). It and its parent go
 # on sys.path only for file-path invocation; neither is a state or product root.
@@ -407,7 +409,7 @@ def _phase_snapshots(snap_fd: int) -> tuple[dict[str, str], dict[str, str]] | No
         if raw is None:
             return None
         try:
-            payload = json.loads(raw)
+            payload = json_depth.loads(raw, max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(payload, dict):
@@ -451,7 +453,7 @@ def _read_record_at(parent_fd: int, record_name: str) -> dict[str, Any] | None:
     if raw is None:
         return None
     try:
-        loaded = json.loads(raw)
+        loaded = json_depth.loads(raw, max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return loaded if isinstance(loaded, dict) else None

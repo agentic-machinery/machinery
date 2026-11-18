@@ -39,6 +39,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from lu_machinery.common import json_depth
 
 # The machinery package's directory name, which is also its import name and the first component
 # of its files' checkout paths. Taken from this file's unresolved location, so neither a short
@@ -228,7 +229,7 @@ def parse_registry(data: Any) -> Registry:
 def load_registry(path: Path | None = None) -> Registry:
     source = path or DATA_FILE
     try:
-        data = json.loads(source.read_text(encoding="utf-8"))
+        data = json_depth.loads(source.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise LaneConfigError(f"cannot read lane data {source.name}: {exc}") from exc
     return parse_registry(data)
@@ -288,7 +289,7 @@ def load_local_config(path: Path) -> dict[str, dict[str, Any]]:
     if info.st_uid != os.getuid() or info.st_mode & 0o022:
         raise LaneConfigError("local lane config must be owned by this user and not group/world-writable")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise LaneConfigError(f"cannot read local lane config: {exc}") from exc
     lanes = data.get("lanes", {}) if isinstance(data, dict) else None

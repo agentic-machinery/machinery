@@ -64,6 +64,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 for _path in (Path(__file__).resolve().parents[2], Path(__file__).resolve().parents[1]):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
@@ -579,7 +581,7 @@ def _gh_pull_page(slug: str, page: int, *, state: str) -> list[dict[str, Any]]:
         raise github_client.GitHubRateLimited(observation.reset_at)
     if proc.returncode != 0:
         raise RuntimeError(f"gh api {endpoint} failed: {_failure_detail(proc)}")
-    loaded = json.loads(proc.stdout or "[]")
+    loaded = json_depth.loads(proc.stdout or "[]", max_depth=512)
     if not isinstance(loaded, list):
         raise RuntimeError(f"gh api {endpoint} returned {type(loaded).__name__}, not a list")
     return loaded
@@ -1035,7 +1037,7 @@ def _parse_delivery_declaration(response: str) -> dict[str, Any] | None:
     if line is None:
         return None
     try:
-        declaration = json.loads(line.removeprefix(_DELIVERY_DECLARATION_PREFIX).strip())
+        declaration = json_depth.loads(line.removeprefix(_DELIVERY_DECLARATION_PREFIX).strip(), max_depth=512)
     except json.JSONDecodeError:
         return None
     if not isinstance(declaration, dict) or declaration.get("outcome") not in _DELIVERY_OUTCOMES:

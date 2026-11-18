@@ -13,10 +13,9 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.ci._location import checkout_relative
 from lu_machinery.ci.junit_results import parse_junit
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.flake_quarantine import load_registry
 from lu_machinery.common.repo_root import product_root
 
@@ -33,7 +32,7 @@ def fetch_queue_junit(destination: Path, *, since: date) -> tuple[dict[int, list
         "--created", f">={since.isoformat()}",
         "--limit", "1000", "--json", "databaseId,createdAt",
     )
-    runs = json.loads(raw)
+    runs = json_depth.loads(raw, max_depth=512)
     if len(runs) == 1000:
         raise ValueError("queue run list reached the 1000-run limit; weekly denominator is incomplete")
     selected = {
@@ -66,7 +65,7 @@ def _reused_pytest(run_id: int) -> bool:
     ci.yml's Reuse check then succeeds and every pytest shard is skipped; such a
     run is outside the denominator, not a run with missing evidence.
     """
-    jobs = json.loads(_gh("run", "view", str(run_id), "--json", "jobs"))["jobs"]
+    jobs = json_depth.loads(_gh("run", "view", str(run_id), "--json", "jobs"), max_depth=512)["jobs"]
     shards = [job for job in jobs if job["name"].startswith("pytest (")]
     reuse = [job for job in jobs if job["name"] == "Reuse check"]
     return bool(shards) and all(job["conclusion"] == "skipped" for job in shards) and [
@@ -118,7 +117,7 @@ def update_issues(ledger: dict, *, dry_run: bool) -> list[str]:
         if not row["expired"] and not row["escalate"]:
             continue
         number = str(row["fix_issue"])
-        issue = json.loads(_gh("issue", "view", number, "--json", "state,labels,comments"))
+        issue = json_depth.loads(_gh("issue", "view", number, "--json", "state,labels,comments"), max_depth=512)
         marker = f"<!-- flake-expiry:{row['node_id']}:{row['expires_on']} -->"
         needs_expiry = row["expired"] and not any(marker in comment["body"] for comment in issue["comments"])
         needs_escalation = row["escalate"] and "priority:high" not in {label["name"] for label in issue["labels"]}

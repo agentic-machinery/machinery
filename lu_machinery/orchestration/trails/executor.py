@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.trail_predicates import (
     STOP_UNKNOWN,
     evaluate_named_table,
@@ -992,7 +993,7 @@ class TrailExecutor:
         path = self.store.projection_path(run_id=run_id, filename=filename)
         try:
             raw = path.read_bytes()
-            payload = json.loads(raw)
+            payload = json_depth.loads(raw, max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise ReceiptChainError(f"missing or invalid receipt projection {path}: {exc}") from exc
         expected = (canonical_json(payload) + "\n").encode("utf-8")

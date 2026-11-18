@@ -11,7 +11,7 @@ import subprocess
 from datetime import datetime
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 _GH_TIMEOUT_SECONDS = 30
 
@@ -74,7 +74,7 @@ def collect_github_pr_metrics(
             "search": search,
         }
     try:
-        rows = json.loads(proc.stdout or "[]")
+        rows = json_depth.loads(proc.stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         return {
             "content_included": False,

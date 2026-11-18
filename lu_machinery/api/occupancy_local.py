@@ -21,12 +21,12 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.api.occupancy_sanitize import occupant as _occupant
 from lu_machinery.api.occupancy_sanitize import opaque_host_id as _opaque_host_id
 from lu_machinery.api.occupancy_sanitize import producer_identity
 from lu_machinery.api.occupancy_sanitize import safe_field as _safe_field
 from lu_machinery.api.product_contribution import atlas_provider
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.session_streams.db import SessionStreamDatabase
 from lu_machinery.session_streams.model import parse_timestamp
@@ -269,7 +269,7 @@ def _iter_marker_payloads(root: Path) -> Iterator[dict[str, Any]]:
         return
     for path in candidates:
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError, UnicodeError) as exc:
             raise OSError from exc
         if isinstance(raw, list):

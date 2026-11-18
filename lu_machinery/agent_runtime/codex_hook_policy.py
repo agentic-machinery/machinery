@@ -91,7 +91,9 @@ def _emit(result: GuardResult) -> None:
 
 def _tool_name(payload: str) -> str:
     try:
-        decoded = json.loads(payload or "{}")
+        from lu_machinery.common import json_depth
+
+        decoded = json_depth.loads(payload or "{}", max_depth=512)
     except (json.JSONDecodeError, TypeError):
         return ""
     value = decoded.get("tool_name") if isinstance(decoded, dict) else None
@@ -199,7 +201,11 @@ def main() -> int:
     parser.add_argument("--canonical-root", type=Path, required=True)
     args = parser.parse_args()
     payload = sys.stdin.read()
-    tool_name = _tool_name(payload)
+    try:
+        tool_name = _tool_name(payload)
+    except (ImportError, RecursionError) as exc:
+        print(f"Codex hook input refused: {type(exc).__name__}", file=sys.stderr)
+        return 2
     if tool_name == "Bash":
         venv_result = _run_enforce_venv(
             args.hooks_dir,

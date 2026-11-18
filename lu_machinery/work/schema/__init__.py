@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+from lu_machinery.common import json_depth
 
 SCHEMA_FILENAME = "work_projection.v1.json"
 SCHEMA_VERSION = "work-projection.v1"
@@ -58,7 +59,7 @@ def schema_path() -> Path:
 
 @lru_cache(maxsize=1)
 def load_schema() -> dict[str, Any]:
-    return json.loads(schema_path().read_text(encoding="utf-8"))
+    return json_depth.loads(schema_path().read_text(encoding="utf-8"), max_depth=512)
 
 
 def schema_digest_sha256() -> str:

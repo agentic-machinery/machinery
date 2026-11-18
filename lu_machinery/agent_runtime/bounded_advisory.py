@@ -57,6 +57,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
 from lu_machinery.orchestration.worktree_paths import automatic_worktree_path
 from lu_machinery.review.model_catalog import (
@@ -215,7 +216,7 @@ def _result_envelope_sha256(result_text: str, fence: str) -> str | None:
     if len(blocks) != 1:
         return None
     try:
-        envelope = json.loads(blocks[0])
+        envelope = json_depth.loads(blocks[0], max_depth=512)
     except ValueError:
         return None
     return envelope_sha256(envelope) if isinstance(envelope, dict) else None
@@ -430,7 +431,7 @@ def fenced_object(result_text: str, fence: str) -> dict[str, Any]:
     if len(blocks) > 1:
         raise AdvisoryRefused(ENVELOPE_MISSING, f"the advisor result holds {len(blocks)} ```{fence} blocks")
     try:
-        value = json.loads(blocks[0])
+        value = json_depth.loads(blocks[0], max_depth=512)
     except ValueError as exc:
         raise AdvisoryRefused(ENVELOPE_INCOMPLETE, f"the envelope is not JSON: {exc}") from None
     if not isinstance(value, dict):
@@ -470,7 +471,7 @@ def parse_envelope(
 
 def _read_record(state_path: Path, advisor_task_id: str) -> dict[str, Any]:
     try:
-        record = json.loads(state_path.read_text(encoding="utf-8"))
+        record = json_depth.loads(state_path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         raise AdvisoryRefused(TASK_NOT_FOUND, f"no task record for advisory task {advisor_task_id!r}") from None
     except (OSError, ValueError) as exc:

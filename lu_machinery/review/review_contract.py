@@ -165,7 +165,7 @@ def load_schema(
     except OSError as exc:
         raise ContractError(f"schema_unavailable:{path}:{exc}", exit_code=EXIT_INVALID) from exc
     try:
-        return json.loads(text)
+        return json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
     except json.JSONDecodeError as exc:
         raise ContractError(
             f"schema_invalid_json:{path}:{exc.msg}",
@@ -1420,7 +1420,7 @@ def captured_sources_events(trace: str) -> tuple[dict[str, Any], ...]:
     captured = []
     for line in jsonl_lines(trace):
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
         except json.JSONDecodeError:
             continue
         if not isinstance(event, dict):
@@ -2014,7 +2014,7 @@ def parse_item_packet(text: str) -> dict[str, Any]:
     if len(bodies) != 1:
         raise ContractError("ITEM_PACKET_COUNT: the brief must contain one item packet")
     try:
-        payload = json.loads(bodies[0])
+        payload = json_depth.loads(bodies[0], max_depth=_JSON_MAX_DEPTH)
     except json.JSONDecodeError as exc:
         raise ContractError(f"ITEM_PACKET_MALFORMED: {exc.msg}") from None
     if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
@@ -2152,7 +2152,7 @@ def judge_item_reply(
     if len(bodies) != 1:
         raise ContractError("ITEM_JUDGMENTS_MISSING: a declared item denominator needs one judgment block")
     try:
-        payload = json.loads(bodies[0])
+        payload = json_depth.loads(bodies[0], max_depth=_JSON_MAX_DEPTH)
     except json.JSONDecodeError as exc:
         raise ContractError(f"ITEM_JUDGMENTS_MALFORMED: {exc.msg}") from None
     if not isinstance(payload, dict) or payload.get("schema") != JUDGMENT_SCHEMA:

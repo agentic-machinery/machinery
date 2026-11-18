@@ -13,6 +13,7 @@ from lu_machinery.agent_runtime.adapters.codex import _sources_read_only_flags
 from lu_machinery.agent_runtime.adapters.codex_events import classify_provider_message
 from lu_machinery.agent_runtime.attempt_safe_read import safe_read_attempt_file
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
@@ -180,7 +181,7 @@ def _workspace_sources_transport() -> list[str]:
     """
     from lu_machinery.dispatcher.providers.claude import _sources_mcp_config
 
-    server = json.loads(_sources_mcp_config("workspace-write"))["mcpServers"].get(SOURCES_SERVER)
+    server = json_depth.loads(_sources_mcp_config("workspace-write"), max_depth=512)["mcpServers"].get(SOURCES_SERVER)
     url = server.get("url") if isinstance(server, dict) else None
     if not isinstance(url, str) or not url.strip():
         return []
@@ -226,7 +227,7 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             error = error or "codex: invalid JSON stream"
             stream_clean = False

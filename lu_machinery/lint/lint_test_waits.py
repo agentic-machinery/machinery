@@ -39,6 +39,8 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 SCHEMA = "test-waits-baseline.v1"
 BASELINE_PATH = Path("lu_machinery/lint/test_waits_baseline.json")
 _KINDS = frozenset({"sleep", "timer-poll", "flaky", "xfail", "rerun"})
@@ -545,7 +547,7 @@ def _entries_from_rows(rows: object, where: str) -> list[WaitFinding]:
 
 
 def load_entries(path: Path) -> list[WaitFinding]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{path}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), str(path))
@@ -607,7 +609,7 @@ def _baseline_at(root: Path, ref: str, rel: str) -> list[WaitFinding] | None:
     raw = _git_show(root, ref, rel)
     if raw is None:
         return None
-    payload = json.loads(raw)
+    payload = json_depth.loads(raw, max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{ref}:{rel}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), f"{ref}:{rel}")
