@@ -9,6 +9,35 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.33"></a>
+## [0.1.33] - 2026-11-18
+
+### Added
+
+- Make --write-baseline a shrink-only mypy baseline pruner (#521) ([#792](https://github.com/learn-ukrainian/machinery/pull/792))
+- Split machinery runtime dependencies into extras ([#797](https://github.com/learn-ukrainian/machinery/pull/797))
+- Support uv locks in product consumer tools ([#802](https://github.com/learn-ukrainian/machinery/pull/802))
+
+### Changed
+
+- Reduce artifact listing and path redaction latency ([#785](https://github.com/learn-ukrainian/machinery/pull/785))
+- Migrate durable messaging consumers to Fleet Comms; supersedes #783 ([#784](https://github.com/learn-ukrainian/machinery/pull/784))
+- Run machinery on uv-managed CPython 3.14.8 (M1) ([#788](https://github.com/learn-ukrainian/machinery/pull/788))
+- Use one cache for Monitor and Work reads ([#789](https://github.com/learn-ukrainian/machinery/pull/789))
+- Keep /api/orient fast on cold and steady reads, ordered safely on a bare checkout ([#793](https://github.com/learn-ukrainian/machinery/pull/793))
+- Serve Prometheus scrapes from a background snapshot ([#800](https://github.com/learn-ukrainian/machinery/pull/800))
+
+### Fixed
+
+- Keep the review-head regex linear on long space runs ([#777](https://github.com/learn-ukrainian/machinery/pull/777))
+- Keep /api/git/cleanup working on non-UTF-8 git output ([#781](https://github.com/learn-ukrainian/machinery/pull/781))
+- Require bounded readers without repeated task parsing ([#782](https://github.com/learn-ukrainian/machinery/pull/782))
+- Qualify stream epics across fleet repositories ([#791](https://github.com/learn-ukrainian/machinery/pull/791))
+
+### Removed
+
+- Retire the legacy AGY worker and proxy ([#794](https://github.com/learn-ukrainian/machinery/pull/794))
+
 <a id="v0.1.32"></a>
 ## [0.1.32] - 2026-11-18
 
@@ -884,7 +913,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...HEAD
+[0.1.33]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...v0.1.33
 [0.1.32]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...v0.1.32
 [0.1.31]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.31
 [0.1.30]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.30

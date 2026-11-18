@@ -11,7 +11,10 @@ import pytest
 from lu_machinery.orchestration import merge_closeout as mc
 from lu_machinery.orchestration import task_lifecycle as tl
 from lu_machinery.orchestration import worktree_git as rw
+from tests.orchestration import closeout_fixtures
 from tests.orchestration.test_task_lifecycle import NOW, _identity
+
+bound_case = closeout_fixtures.bound_case
 
 _REAL_RUN = subprocess.run
 
@@ -416,7 +419,12 @@ def test_dry_run_does_not_delete_anything(tmp_path: Path, monkeypatch: pytest.Mo
     assert worktree.exists()
     assert git(repo, "rev-parse", "--verify", "codex/dry-run")
     assert git(repo, "ls-remote", "--heads", "origin", "codex/dry-run") != ""
-    assert result.ok is True
+    # A kept matched worktree is a residual a dry run must report, as apply refuses on it.
+    assert result.ok is False
+    assert any("worktree still registered" in error for error in result.errors)
+    applied = mc.run_merge_closeout(repo, 303, apply=True)
+    assert applied.ok is False
+    assert applied.errors[0] == result.errors[0]
 
 
 def test_apply_deletes_stale_remote_branch_when_no_worktree_remains(
@@ -840,7 +848,7 @@ def test_main_exits_nonzero_and_prints_json_when_pr_not_merged(
     assert "not MERGED" in payload["error"]
 
 
-def test_main_dry_run_default_reports_ok_without_deleting(
+def test_main_dry_run_default_reports_worktree_residual_without_deleting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     repo = init_repo(tmp_path)
@@ -857,11 +865,12 @@ def test_main_dry_run_default_reports_ok_without_deleting(
     )
     exit_code = mc.main(["606", "--repo-root", str(repo)])
 
-    assert exit_code == 0
+    assert exit_code == 1  # the kept matched worktree is a residual in dry-run too
     assert worktree.exists()
     out = capsys.readouterr().out
     assert "mode: dry-run" in out
-    assert "OK" in out
+    assert "worktree still registered" in out
+    assert "RESIDUAL / ERROR" in out
 
 
 def test_detached_earlier_pr_commit_matches_and_main_checkout_does_not(tmp_path: Path) -> None:
@@ -964,6 +973,30 @@ def test_criterion_receipts_skip_non_ledger_files(tmp_path: Path, monkeypatch: p
     )
 
     assert reports == []
+
+
+def test_merged_run_evidence_reads_the_repository_required_workflow(bound_case, tmp_path, monkeypatch) -> None:
+    """Defect class: a repository whose required gate is not ci.yml can never prove a merged run (#516 blocker)."""
+    ledger, observation, _, run, _ = bound_case
+    run["path"] = ".github/workflows/ci-gate.yml"
+    closeout_fixtures.fleet_row(monkeypatch, required_workflow=".github/workflows/ci-gate.yml")
+    monkeypatch.setattr(mc, "_closeout_api", closeout_fixtures.closeout_reads(bound_case, tmp_path))
+
+    _, report = mc.collect_merged_run_evidence(tmp_path, ledger, observation, now=NOW)
+
+    assert (report["run_id"], report["run_attempt"], report["merge_sha"]) == (123, 2, run["head_sha"])
+    assert report["execution"]["run"]["path"] == ".github/workflows/ci-gate.yml"
+
+
+def test_merged_run_evidence_default_workflow_still_refuses_other_runs(bound_case, tmp_path, monkeypatch) -> None:
+    """Defect class: a row without required_workflow accepting a run of some workflow other than ci.yml."""
+    ledger, observation, _, run, _ = bound_case
+    run["path"] = ".github/workflows/ci-gate.yml"
+    closeout_fixtures.fleet_row(monkeypatch)
+    monkeypatch.setattr(mc, "_closeout_api", closeout_fixtures.closeout_reads(bound_case, tmp_path))
+
+    with pytest.raises(mc.MergeCloseoutError, match="CLOSEOUT_MERGE_RUN_MISSING"):
+        mc.collect_merged_run_evidence(tmp_path, ledger, observation, now=NOW)
 
 
 def test_text_report_renders_cleanup_and_criterion_residuals():

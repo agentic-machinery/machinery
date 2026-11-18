@@ -10,7 +10,6 @@ gate, and the product's ``check-plan-immutability`` hook from its own pre-commit
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import shutil
@@ -296,14 +295,6 @@ def _commit_msg_product(tmp_path: Path, wheel: Path) -> tuple[Path, dict[str, st
     the product's configuration. The gate reads synthetic private OPSEC tooling where the
     installed catalog places it beside the configured primary, so no host rule is needed.
     """
-    if importlib.util.find_spec("pre_commit") is None:
-        # Known defect: .githooks/_lib.sh runs `python -m pre_commit` through the project
-        # interpreter, but no lu-machinery dependency or lock provides pre_commit, so a
-        # lock-only release interpreter refuses every commit. The fix is separate work.
-        pytest.skip(
-            "release dependency defect: the installed hook chain runs pre_commit, which no "
-            "lu-machinery dependency provides, and this interpreter has none to lend"
-        )
     env = _base_env()
     python = _installed_python(tmp_path, wheel, dependencies=True)
     env["LEARN_UKRAINIAN_PYTHON"] = str(python)

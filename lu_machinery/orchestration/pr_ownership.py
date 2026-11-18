@@ -347,7 +347,7 @@ def _message(kind: str, rows: list[dict[str, Any]]) -> str:
     lines = {
         "alert": "Ownerless PRs: no live owning task for 15 minutes. Seat one owner per PR, or record "
                  "custody with a reason and a decision owner "
-                 f"(python -m {_MODULE} accept --pr N --reason ... "
+                 f"(python -m {_MODULE} accept --pr N --repo OWNER/NAME --reason ... "
                  "--decision-owner ...). The alert stays outstanding until that acceptance is recorded.",
         "reminder": "Still ownerless PRs: no successor has accepted the handoff yet.",
         "cleared": "Ownerless-PR alerts cleared.",
@@ -1097,6 +1097,17 @@ def release_decision_custody(
     return {"released": True, "pr": key, "how": how}
 
 
+def _repo_slug(text: str) -> str:
+    """The repository exactly as named: ``owner/name``.
+
+    Empty text would let gh pick its own repository; a host, URL or ``.git`` spelling would key the ledger on text
+    no owner check ever produces.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", text) or text.endswith(".git"):
+        raise argparse.ArgumentTypeError(f"--repo must be owner/name, got {text!r}")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1108,19 +1119,21 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             f"  python -m {_MODULE} check\n"
             f"  python -m {_MODULE} status\n"
-            f"  python -m {_MODULE} accept --pr 42\n"
-            f"  python -m {_MODULE} accept --pr 42 --custody --from TASK\n"
-            f"  python -m {_MODULE} accept --pr 42 --reason REASON --decision-owner OWNER\n"
-            f"  python -m {_MODULE} accept --pr 42 --release\n"
-            f"  python -m {_MODULE} queue-exit --pr 42\n\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --custody --from TASK\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --reason REASON --decision-owner OWNER\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --release\n"
+            f"  python -m {_MODULE} queue-exit --pr 42 --repo OWNER/NAME\n\n"
             "accept --reason and --decision-owner records coordinator custody with no dispatch task.\n"
             "--release drops that custody. The PR is not alerted again while it stays open.\n"
             "Other accept and queue-exit act as the dispatch task named by LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
+            "accept and queue-exit need --repo OWNER/NAME: they never act on a repository they were not told.\n"
             "Outputs: JSON on stdout (check: one line per PR without a live owner);\n"
             "  only accept writes the shared ownership state.\n"
             "Exit codes: 0 accepted / may exit / every PR owned / status printed;\n"
             "  1 refused / keep waiting / a PR is ownerless;\n"
-            "  2 GitHub, task records or ownership state unreadable, or an owner unobservable (unknown).\n"
+            "  2 GitHub, task records or ownership state unreadable, an owner unobservable (unknown), or a usage\n"
+            "  error such as a missing --repo.\n"
             f"Related: {_MACHINERY}/fleet/pr_owner_check.py, {_PACKAGE_DIR}/merge_queue_keeper.py, "
             "full-send references/pr-watch.md, epic #10453."
         ),
@@ -1133,8 +1146,8 @@ def build_parser() -> argparse.ArgumentParser:
                        ("queue-exit", "Exit 0 when this waiting owner may end under queue custody")):
         sub = subs.add_parser(name, help=text)
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
-        sub.add_argument("--repo", default=None,
-                         help="owner/name (default: the default fleet repository)")
+        sub.add_argument("--repo", required=True, type=_repo_slug,
+                         help="owner/name of the PR's repository; never inferred from the checkout")
         if name == "accept":
             sub.add_argument("--custody", action="store_true",
                              help="Accept queue custody: ejection, stale approval, merge confirmation, closeout")
@@ -1164,7 +1177,7 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     repos = load_fleet_repos()
-    repo = args.repo or next(item.github for item in repos.values() if item.default)
+    repo = args.repo
     pr = _gh_pr(repo, args.pr)
     now = datetime.now(UTC)
     records = [] if args.release else store.list_tasks(strict=True)
@@ -1213,7 +1226,7 @@ def main(argv: list[str] | None = None) -> int:
         from lu_machinery.dispatcher import store
         from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-        repo = args.repo or next(r.github for r in load_fleet_repos().values() if r.default)
+        repo = args.repo
         records = store.list_tasks(strict=True)
         pr = _gh_pr(repo, args.pr)
         now = datetime.now(UTC)

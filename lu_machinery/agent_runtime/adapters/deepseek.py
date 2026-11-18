@@ -27,8 +27,7 @@ from ..routes import (
     deepseek_first_party_error,
     is_deepseek_first_party_forbidden_in_ci,
 )
-from ..trail_isolation import TrailIsolationError, trail_isolation_requested
-from .base import InvocationPlan
+from .base import InvocationPlan, refuse_retired_isolation
 
 _logger = logging.getLogger(__name__)
 
@@ -113,11 +112,7 @@ class DeepSeekAdapter:
         tool_config: dict | None = None,
         effort: str | None = None,
     ) -> InvocationPlan:
-        if trail_isolation_requested(tool_config):
-            raise TrailIsolationError(
-                "trail isolation refused for DeepSeek: opencode does not enforce tool restrictions"
-            )
-
+        refuse_retired_isolation(tool_config)
         if mode not in self.supported_modes:
             raise ValueError(f"DeepSeekAdapter: unsupported mode {mode!r} (supported: {sorted(self.supported_modes)})")
 

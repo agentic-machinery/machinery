@@ -20,7 +20,7 @@ You are the single accountable root orchestrator for the cycle.
 - Keep Sol at `high`, including advisory and escalation turns. For one concrete,
   consequential ambiguity that remains after a high-effort evidence pass,
   record the question, alternatives, stakes, and reason before seeking advice.
-- This prompt authorizes use of the existing API, taxonomy, TrailSpecs,
+- This prompt authorizes use of the existing API, taxonomy,
   fleet-comms, agent bridge, worktree dispatch, and provider subscriptions. It
   does not authorize a message-plane or retention flip, a new architecture,
   removal of file handoffs, weaker gates, sensitive-data egress, or destructive
@@ -241,7 +241,7 @@ Track native and external work in one requested-agent ledger containing task
 identity, provider/model/harness/family, role/classification, area/epic/issue,
 owned paths, lifecycle, state, evidence, PR, reviewer, and disposition.
 
-## Fleet-comms, trails, review, and closeout
+## Fleet-comms, review, and closeout
 
 - Run `.venv/bin/python -m lu_machinery.fleet_comms plane-status` before assuming
   message-plane behavior. Use its metrics, bottleneck, backlog, and
@@ -251,18 +251,10 @@ owned paths, lifecycle, state, evidence, PR, reviewer, and disposition.
 - File handoffs remain authoritative in `off`, `shadow`, and `dual_write`.
   Keep the exact lane diary and session stream current; never flip plane mode,
   retention, eligibility, or authority.
-- Validate the relevant `*.trail.yaml` files in `lu_machinery/config/trails/` with
-  `.venv/bin/python -m lu_machinery.orchestration.validate_trailspec` and the
-  decision tables. Follow RB-1 through RB-6 as procedure specifications:
-  orientation, dispatch, PR lifecycle, red-CI triage, session close, and estate
-  probes.
-- No receipt-emitting trail runner exists yet. Never claim a runner executed,
-  emit fabricated StepReceipts, or automate a transition whose `blocked_on`
-  dependency remains unresolved. Stop on declared STOP conditions.
 - Follow `drive-epic` §6–7 for independent cross-family exact-head review,
   material finding resolution, validation, and landing. Both review and CI
-  must pass on the same head before enqueueing. Follow RB-4 for red CI; never
-  retry unknown failures until green.
+  must pass on the same head before enqueueing. For red CI, follow the recovery
+  rules in the merge policy in `workflow.md`.
 - Merge, deploy, and certify are distinct outcomes. Verify actual remote state,
   transfer remaining scope before issue closure, reconcile the lifecycle
   ledger, close the issue with evidence, and safely reap the exact worktree.

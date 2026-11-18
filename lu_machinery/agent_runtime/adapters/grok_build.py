@@ -61,9 +61,6 @@ The operator-accepted bypass therefore stays the write mode for both, and
 ``danger`` keeps ``lu-write-worker`` so the fleet guards stay on. The shared
 argv is pinned by ``test_danger_argv_matches_workspace_write``.
 
-Trail and review isolation use their own explicit tool/deny policies; they do
-not inherit the ordinary write-dispatch approval grant.
-
 ``resume_policy`` is ``never`` in the registry: the CLI's ``--resume`` +
 cross-session memory risk worktree contamination — the same footgun as Codex.
 The grok CLI is Claude-Code-shaped, so this mirrors ``claude.py`` closely.
@@ -93,15 +90,8 @@ from ..failure_codes import provider_failure_code, provider_stderr_error
 from ..grok_reviewer_permissions import GROK_REVIEWER_TOOLS
 from ..jsonl import jsonl_lines
 from ..result import ParseResult
-from ..trail_isolation import (
-    GROK_TRAIL_DENY_TOOLS,
-    GROK_TRAIL_TOOLS,
-    TrailIsolationError,
-    assert_trail_isolation_config,
-    trail_isolation_requested,
-)
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
-from .base import InvocationPlan
+from .base import InvocationPlan, refuse_retired_isolation
 
 _logger = logging.getLogger(__name__)
 
@@ -214,17 +204,6 @@ GROK_ALLOWED_MODELS: frozenset[str] = frozenset({"grok-4.7"})
 GROK_SUPPORTED_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high"})
 GROK_BUILD_DEFAULT_MODEL = "grok-4.7"
 GROK_BUILD_DEFAULT_EFFORT = os.environ.get("LEARN_UK_GROK_BUILD_EFFORT", "high")
-_TRAIL_ISOLATION_TOOL_CONFIG_KEYS: frozenset[str] = frozenset(
-    {
-        "allowed_tools",
-        "mcp_config_path",
-        "setting_sources",
-        "strict_mcp_config",
-        "tools",
-        "trail_isolation",
-        "trail_isolation_cwd",
-    }
-)
 
 # plan.metadata keys for liveness bind (#6935). Snapshot is the set of
 # cwd-scoped session *directory names* that already existed at
@@ -510,21 +489,12 @@ class GrokBuildAdapter:
     ) -> InvocationPlan:
         if mode not in self.supported_modes:
             raise ValueError(f"GrokBuildAdapter: unsupported mode {mode!r} (supported: {sorted(self.supported_modes)})")
+        refuse_retired_isolation(tool_config)
         tc = tool_config or {}
-        trail_isolation = trail_isolation_requested(tc)
-        trail_cwd: Path | None = None
-        if trail_isolation:
-            if mode != "read-only":
-                raise TrailIsolationError("Grok trail isolation requires mode='read-only'")
-            unsupported = sorted(set(tc) - _TRAIL_ISOLATION_TOOL_CONFIG_KEYS)
-            if unsupported:
-                raise TrailIsolationError(f"Grok trail isolation refuses incompatible tool_config keys: {unsupported}")
-            trail_cwd = assert_trail_isolation_config(tc, profile="grok")
         review_isolation = bool(tc.get("review_isolation"))
         reviewer_tools = (
             mode == "read-only"
             and tc.get("reviewer_tools") is True
-            and not trail_isolation
             and not review_isolation
             and not tc.get("strict_mcp_config")
             and not tc.get("mcp_server_names")
@@ -566,7 +536,7 @@ class GrokBuildAdapter:
             guard_definition = _reviewer_agent_definition(cwd)
             guard_agent_suffix = ".grok-reviewer-agent.md"
             guard_agent_key = _META_REVIEWER_AGENT_FILE
-        elif mode in _UNATTENDED_WRITE_MODES and not trail_isolation and not review_isolation and not mcp_read_only:
+        elif mode in _UNATTENDED_WRITE_MODES and not review_isolation and not mcp_read_only:
             # Same tracked PreToolUse set Claude workers load, without the
             # reviewer publish guard. The push rewrite is env-only and stays
             # off this path.
@@ -588,7 +558,7 @@ class GrokBuildAdapter:
                     handle.write(guard_definition)
                     guard_agent_file = handle.name
                 cmd.extend(["--agent", guard_agent_file])
-            execution_cwd = trail_cwd or cwd
+            execution_cwd = cwd
             # Prompt: inline via -p when it fits in one argv element. A hyphen-leading
             # prompt is a clap flag, and a prompt above _INLINE_PROMPT_LIMIT_BYTES
             # cannot be exec'd (MAX_ARG_STRLEN, #10522). Both use a private
@@ -642,9 +612,7 @@ class GrokBuildAdapter:
             # parent-owned OS sandbox limits them to the sealed view; explicit deny
             # rules remove shell/write/nested execution even though headless tool
             # calls require an execution-capable permission mode.
-            if trail_isolation:
-                permission_mode = "default"
-            elif review_isolation:
+            if review_isolation:
                 permission_mode = str(tc.get("permission_mode") or "bypassPermissions")
             elif reviewer_tools:
                 permission_mode = _REVIEWER_PERMISSION_MODE
@@ -658,31 +626,17 @@ class GrokBuildAdapter:
                     cmd.extend(["--allow", rule])
                 for rule in ("MCPTool", "WebFetch", "WebSearch"):
                     cmd.extend(["--deny", rule])
-            if (mcp_read_only or mode in _UNATTENDED_WRITE_MODES) and not review_isolation and not trail_isolation:
+            if (mcp_read_only or mode in _UNATTENDED_WRITE_MODES) and not review_isolation:
                 cmd.append("--always-approve")
             if mcp_read_only and not review_isolation:
                 cmd.append("--no-plan")
                 cmd.append("--disable-web-search")
                 for rule in _MCP_REVIEW_DENY_RULES:
                     cmd.extend(["--deny", rule])
-            elif mode == "read-only" and not trail_isolation and not review_isolation:
+            elif mode == "read-only" and not review_isolation:
                 for rule in _READ_ONLY_DENY_RULES:
                     cmd.extend(["--deny", rule])
-            if trail_isolation:
-                cmd.extend(
-                    [
-                        "--no-plan",
-                        "--no-memory",
-                        "--no-subagents",
-                        "--disable-web-search",
-                        "--verbatim",
-                    ]
-                )
-                for rule in GROK_TRAIL_DENY_TOOLS:
-                    cmd.extend(["--deny", rule])
-                for rule in GROK_TRAIL_TOOLS:
-                    cmd.extend(["--allow", rule])
-            elif review_isolation:
+            if review_isolation:
                 cmd.extend(
                     [
                         "--always-approve",
@@ -702,7 +656,7 @@ class GrokBuildAdapter:
                 cmd.extend(["--effort", effective_effort])
 
             disallowed = tc.get("disallowed_tools")
-            if mode == "read-only" and not trail_isolation:
+            if mode == "read-only":
                 # search_replace is Grok's native editor tool ID, not a valid
                 # --deny prefix. Remove it explicitly in every read-only path.
                 if disallowed:

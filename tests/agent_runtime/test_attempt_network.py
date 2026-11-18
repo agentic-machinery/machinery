@@ -486,7 +486,6 @@ def test_bound_attempt_runs_only_inside_the_attempt_boundary_with_the_exact_prom
                                observed_model_source=None, failure_code=None, stderr_excerpt=None)
 
     monkeypatch.setattr(attempt_boundary, "prepare_attempt_boundary", prepare_boundary)
-    monkeypatch.setattr(runner, "prepare_trail_isolation", lambda **kwargs: None)
     monkeypatch.setattr(runner, "_invoke_impl", invoke_runtime)
     worker.supervise(path, {}, 60)
 

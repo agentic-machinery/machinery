@@ -10,7 +10,7 @@ it kept is reported here as a residual, never removed.
 
     .venv/bin/python -m lu_machinery.orchestration.merge_closeout <pr-number> --repo owner/name --apply
 
-Default is dry-run. See docs/runbooks/worktree-cleanup.md
+Default is dry-run; it reports a kept matched worktree as residual, as apply does. See docs/runbooks/worktree-cleanup.md
 § Immediate cleanup after merge.
 """
 
@@ -524,6 +524,7 @@ def collect_merged_run_evidence(
     """Freshly validate one bound ledger against its actual merged execution."""
     repository = ledger["identity"]["repository"]
     pr_number = ledger["pr"]["number"]
+    workflow = lifecycle_observation.required_merge_workflow(repository)
     pull = _closeout_api(repo_root, Request("read-pull", repo=repository, number=pr_number))
     if not isinstance(pull.get("head"), dict) or pull["head"].get("sha") != observation["github"]["pr"].get("head_sha"):
         raise MergeCloseoutError("CLOSEOUT_PR_HEAD_MOVED")
@@ -534,8 +535,7 @@ def collect_merged_run_evidence(
         repo_root, Request("read-runs", repo=repository, start=pull.get("created_at"), end=pull.get("merged_at"),
                            sha=merge_sha, paginate=True, slurp=True), "workflow_runs",
     )
-    candidates = [run for run in runs if run.get("path") == ".github/workflows/ci.yml"
-                  and run.get("head_sha") == merge_sha]
+    candidates = [run for run in runs if run.get("path") == workflow and run.get("head_sha") == merge_sha]
     if not candidates:
         raise MergeCloseoutError("CLOSEOUT_MERGE_RUN_MISSING")
     # Never fall back to an older green execution when the latest is red.
@@ -630,9 +630,10 @@ def run_merge_closeout(
 
     # The dispatcher removes a task's worktree when the task settles and keeps
     # it only for a reason (dirty, unpublished, live process ...). A kept
-    # worktree blocks a clean closeout; this command never removes it.
+    # worktree blocks a clean closeout; this command never removes it. The dry
+    # run reports it too: apply would refuse on it, so a dry run may not hide it.
     worktree_residuals: list[str] = []
-    if apply and matches:
+    if matches:
         still_present = {str(info.path) for info in rw.list_git_worktrees(repo_root)}
         for info in matches:
             path_str = str(info.path)
@@ -647,9 +648,9 @@ def run_merge_closeout(
         if branch_status.local_error:
             errors.append(f"local branch {branch_status.branch}: {branch_status.local_error}")
 
-    residual = apply and (
-        bool(worktree_residuals)
-        or (branch_status is not None and not (branch_status.remote_gone and branch_status.local_gone))
+    # A dry run deletes no branch, so only apply counts a surviving branch as residual.
+    residual = bool(worktree_residuals) or (
+        apply and branch_status is not None and not (branch_status.remote_gone and branch_status.local_gone)
     )
 
     criterion_receipts = collect_criterion_receipts(repo_root, pr, repo=repo) if apply else []

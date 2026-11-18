@@ -257,25 +257,9 @@ def test_danger_argv_matches_workspace_write(tmp_path):
         GrokBuildAdapter().cleanup_invocation(danger)
 
 
-def test_trail_isolation_does_not_inherit_write_approval(tmp_path):
-    tool_config = {
-        "trail_isolation": True,
-        "allowed_tools": "Read,Grep,Glob",
-        "mcp_config_path": str(tmp_path / ".mcp.json"),
-        "setting_sources": "",
-        "strict_mcp_config": True,
-        "tools": "Read,Grep,Glob",
-        "trail_isolation_cwd": str(tmp_path),
-    }
-    with patch(
-        "lu_machinery.agent_runtime.adapters.grok_build.assert_trail_isolation_config",
-        return_value=tmp_path,
-    ):
-        plan = _build("inspect trail", tmp_path, mode="read-only", tool_config=tool_config)
-
-    assert _val(plan.cmd, "--permission-mode") == "default"
-    assert "--always-approve" not in plan.cmd
-    assert "Bash" in [plan.cmd[index + 1] for index, item in enumerate(plan.cmd) if item == "--deny"]
+def test_retired_isolation_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="trail isolation refused"):
+        _build("inspect the sample", tmp_path, mode="read-only", tool_config={"trail_isolation": True})
 
 
 def test_review_isolation_keeps_its_existing_approval_and_denies(tmp_path):
