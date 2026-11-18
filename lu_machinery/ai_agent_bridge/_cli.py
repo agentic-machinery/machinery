@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -35,7 +36,9 @@ from ._opencode import (
 )
 from ._prompts import require_core_or_exit
 
-_FLEET = f".venv/bin/python -m {MACHINERY_PACKAGE}.fleet_comms"
+# The interpreter running this command: a hint copied from any checkout or worktree runs.
+_PY = shlex.quote(sys.executable)
+_FLEET = f"{_PY} -m {MACHINERY_PACKAGE}.fleet_comms"
 # Verbs of the removed legacy inbox, broker and channel stores (#515), each with
 # its Fleet Comms replacement. They stay registered so a caller gets this typed
 # refusal (exit 2) instead of an argparse "invalid choice".
@@ -61,15 +64,15 @@ RETIRED_VERBS = {
     "process-codex-all": _RECEIVE,
     "sync": _RECEIVE,
     "reconcile": f"{_FLEET} backlog",
-    "cleanup": f"{_FLEET} dead-letters",
+    "cleanup": f"{_FLEET} deliveries expire-stale (expiry sweep) or {_FLEET} dead-letters (inventory)",
     "status": f"{_FLEET} fleet status",
-    "converse": f".venv/bin/python -m {BRIDGE_ENTRY} ask-agy",
-    "interactive": f".venv/bin/python -m {BRIDGE_ENTRY} ask-<seat>",
+    "converse": f"{_PY} -m {BRIDGE_ENTRY} ask-agy",
+    "interactive": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat>",
 }
 # Verbs kept for Fleet request jobs that once also took a legacy integer message id.
 _JOB_ID_VERBS = {
     "read": RETIRED_VERBS["inbox"],
-    "process-ask": f".venv/bin/python -m {BRIDGE_ENTRY} ask-<seat>",
+    "process-ask": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat>",
 }
 
 
@@ -1594,8 +1597,15 @@ def main():
     """CLI entry point."""
     argv = sys.argv[1:]
     # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
-    if len(argv) >= 2 and argv[0] in _JOB_ID_VERBS and not argv[1].startswith("authority-job_"):
-        refuse_retired_verb(f"{argv[0]} <message-id>", _JOB_ID_VERBS[argv[0]])
+    # Options (``-h``) go to argparse; ``--`` only ends options before the id.
+    if argv and argv[0] in _JOB_ID_VERBS:
+        rest = argv[1:]
+        if rest[:1] == ["--"]:
+            rest = rest[1:]
+        elif rest[:1] and rest[0].startswith("-"):
+            rest = []
+        if rest and not rest[0].startswith("authority-job_"):
+            refuse_retired_verb(f"{argv[0]} <message-id>", _JOB_ID_VERBS[argv[0]])
     parser = _build_parser()
     args = parser.parse_args(argv)
     # A Kimi request stops here, before telemetry or any provider call.

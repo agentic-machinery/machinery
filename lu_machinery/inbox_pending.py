@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -64,7 +65,8 @@ def authority_inbox_notice(recipient: str | None, *, file: TextIO | None = None)
     target = slot or "<slot>"
     print(
         f"Fleet Comms deliveries for {target}: {count} queued; read them with "
-        f"`.venv/bin/python -m {_MACHINERY}.fleet_comms deliveries receive --recipient {target} --worker-id {target}`.",
+        f"`{shlex.quote(sys.executable)} -m {_MACHINERY}.fleet_comms deliveries receive "
+        f"--recipient {target} --worker-id {target}`.",
         file=file or sys.stdout,
     )
 
