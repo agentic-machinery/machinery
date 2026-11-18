@@ -167,7 +167,7 @@ def test_unregistered_recipient_admitted_publish_refuses_names_no_drain_reads(pl
 
 def test_declared_external_recipients_are_admitted_and_unknown_names_still_refused(plane, tasks, monkeypatch, tmp_path):
     """Defect class: an external agent declared for an external drain (eggbot, dot, mac-agent) is refused as unregistered."""
-    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery import agent_identity
 
     external = ("eggbot", "dot", "mac-agent")
     with AuthorityService(root=plane) as service:
@@ -177,10 +177,10 @@ def test_declared_external_recipients_are_admitted_and_unknown_names_still_refus
     assert sorted(tuple(row) for row in backlog(plane)) == sorted((name, "queued") for name in external)
 
     # Admission comes from the declared list, not a name in code: without it, the same name is refused.
-    text = _channels.ASSIGNMENTS_PATH.read_text(encoding="utf-8")
+    text = agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8")
     stripped = tmp_path / "area_assignments.yaml"
     stripped.write_text(text.replace("external_recipients:", "unused_external_recipients:"), encoding="utf-8")
-    monkeypatch.setattr(_channels, "ASSIGNMENTS_PATH", stripped)
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", stripped)
     with (
         AuthorityService(root=plane) as service,
         pytest.raises(AuthorityRecipientRefused, match=r"^recipient_not_registered: dot "),
@@ -289,11 +289,11 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
     plane, tasks, monkeypatch, tmp_path, unavailable,
 ):
     """Defect class: with one roster source unreadable, registered or unproven names lose mail and subscriptions (#594)."""
-    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery import agent_identity
     from lu_machinery.fleet_comms import authority
     from lu_machinery.ops import driver_lanes
 
-    slots = set(_channels._load_registry_slots(_channels.ASSIGNMENTS_PATH))
+    slots = set(agent_identity._load_registry_slots(agent_identity.ASSIGNMENTS_PATH))
     lane = next(item.sender for item in driver_lanes.load_registry().lanes if item.sender not in slots)
     worker = tasks("cto-6-i6-worker", "running")
     with AuthorityService(root=plane) as service:
@@ -306,7 +306,7 @@ def test_incomplete_roster_proves_no_name_unregistered_and_removes_nothing(
                 imported_recipients=("codex",), imported_source="test-legacy", idempotency_key="legacy-codex",
             )
     tasks(worker, "done")
-    target = (_channels, "ASSIGNMENTS_PATH") if unavailable == "slots" else (driver_lanes, "DATA_FILE")
+    target = (agent_identity, "ASSIGNMENTS_PATH") if unavailable == "slots" else (driver_lanes, "DATA_FILE")
     monkeypatch.setattr(*target, tmp_path / "unavailable")
     assert authority._roster_complete() is False
 

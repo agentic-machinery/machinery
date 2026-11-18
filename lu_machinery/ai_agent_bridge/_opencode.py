@@ -1,40 +1,14 @@
-"""Opencode transport for ai_agent_bridge — the multi-provider router.
+"""Retained OpenCode transport and Fleet-backed request lifecycle.
 
-``opencode run`` is a ROUTER that fronts many providers/models, so "opencode"
-is NOT itself a fleet member — you must name the model. Two bridge verbs ride
-this transport:
-
-- ``ask-opencode`` — generic escape hatch to ANY opencode-reachable model
-  (e.g. ``openrouter/qwen/qwen3.7-max``) for one-off cross-model reviews.
-- ``ask-pool`` — the first-class **poolside.ai** fleet member. Default model
-  ``poolside/poolside/laguna-s-2.1`` (Laguna **S 2.1**, gen-2 strongest). Also
-  ship gen-2 light ``laguna-xs-2.1`` and gen-1 fallback ``laguna-m.1`` (not
-  "laguna-s2" / not M 2.x). Clean cross-family CODE + web-verify specialist.
-  Rides opencode with ``--variant`` effort + NDJSON; browses via lightpanda MCP
-  in ``~/.config/opencode/opencode.jsonc``. See ``ask_pool`` below.
-- ``ask-glm`` — the first-class **Zhipu GLM** fleet member (model
-  ``zai-coding-plan/glm-5.3``): strong code authoring + review (its top axis)
-  and live web fact-checking, its own (China-lab) family. ⚠️ China-hosted →
-  prompt data EGRESSES TO CHINA → LOCAL-ONLY; ``ask_glm`` refuses to run under
-  CI as a backstop. See ``ask_glm`` below.
-
-Invocation:
-    ab ask-opencode <content> --task-id T --model openrouter/qwen/qwen3.7-max
-    ab ask-pool     <content> --task-id T [--variant high|max|minimal] [--data FILE]
-    ab ask-glm      <content> --task-id T [--data FILE]   # LOCAL-ONLY, no CI
-
-Under the hood: opencode run --model PROVIDER/MODEL [--variant V]
-    --format {default|json} [--file FILE --] "CONTENT"
-
-For glm/pool (reasoning lanes), the bridge also injects
-OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX (sourced from AB_* envs or
-per-model defaults of 128K+) into the subprocess to raise the output
-budget beyond the ~32k cap that produced step_finish reason=length.
-See _get_max_output_tokens and GLM/POOL_DEFAULT_MAX_OUTPUT_TOKENS.
+OpenCode carries explicit provider/model routes, including OpenRouter, Gemma
+and DeepSeek. Public ask helpers persist one request job, claim it with a
+fenced lease, and store a terminal result. Historical broker asks are never
+claimed by this worker.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -42,58 +16,38 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
+from lu_machinery.common.repo_root import project_interpreter, state_root
+from lu_machinery.contracts import new_id
+from lu_machinery.fleet_comms.artifacts import ArtifactStore
+from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
+from lu_machinery.fleet_comms.paths import default_plane_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
+from lu_machinery.orchestration.dispatch_isolation import DispatchIsolationError, spawn_detached_worker
+from lu_machinery.review.model_catalog import activity_role_refusal, load_model_catalog, resolve_catalog_model_id
+from lu_machinery.secret_redactor import redact_text, redact_value
 
-from . import _config
 from ._ask_contract import (
-    requested_effort,
     resolve_model_selection,
     response_provenance,
 )
-from ._ask_lifecycle import (
-    ask_attachment,
-    ask_sender_model,
-    ask_target_model,
-    fetch_ask_message,
-    launch_background_ask,
-    record_ask_failure,
-    record_ask_reply,
-    register_ask,
-)
-from ._messaging import acknowledge, send_message
 from ._prompts import require_core_or_exit, with_core_or_exit
-from ._reply_sidecar import write_reply_sidecar
 from ._review_safety import (
     ReviewSafetyError,
     assert_formal_review_ask_payload,
+    is_formal_review_ask,
     warn_missing_review_target,
 )
 
-# Default was qwen3.7-max (EXPENSIVE) until 2026-07-05 — a silent money trap
-# for every ask-opencode call without --model. Since 2026-07-07 (user order:
-# "we will use the free gemma for some time"; OR balance is a deliberate ~$2
-# buffer until things stabilize) the default is Gemma via Google AI Studio
-# DIRECT — $0 (Gemma has no paid SKU on the Gemini API; opencode reports
-# cost:0). The OR paid `-it` endpoint stays reachable via explicit --model.
+# Compatibility defaults; callers may select an explicit supported model.
 OPENCODE_DEFAULT_MODEL = "google-ais/gemma-4-31b-it"
 OPENCODE_DEFAULT_TIMEOUT_S = 900
 
-# poolside.ai fleet member. Use the NATIVE poolside provider path — it browses
-# via the lightpanda MCP; the ``openrouter/poolside/*`` path CANNOT browse.
-# Runs on the poolside subscription ("free" lane) — watch weekly limits on
-# parallel bursts.
-#
-# Laguna family (exact IDs — vendor spelling uses hyphen + minor "m.1"):
-#   poolside/laguna-s-2.1   — gen-2 strongest (DEFAULT formal/volume pin)
-#   poolside/laguna-xs-2.1  — gen-2 light/fast
-#   poolside/laguna-m.1     — gen-1 prior (fallback only; not "m2")
-# opencode route form is often poolside/poolside/<id>.
-# If the local opencode catalog lags, override --model (e.g. opencode/laguna-s-2.1-free).
+# Historical named helpers remain subject to catalog admission.
 POOL_MODEL = "poolside/poolside/laguna-s-2.1"
 POOL_MODEL_S = POOL_MODEL  # alias: Laguna S 2.1
 POOL_MODEL_XS = "poolside/poolside/laguna-xs-2.1"
@@ -109,16 +63,6 @@ _EFFORT_TO_VARIANT = {
     "max": "max",
 }
 
-# Zhipu GLM bridge consult pin: Coding Plan glm-5.3 (do not silently burn API +
-# Coding Plan on every ask). Implement dispatch defaults to Flash workhorse via
-# GlmAdapter (`zai/glm-5.3-flash`; `--model glm-5.3` keeps this Coding Plan pin).
-# Strong code + review + browsing; a distinct (China-lab) family → valid
-# cross-family reviewer.
-#
-# ⚠️ HARD DATA-GOVERNANCE CONSTRAINT: GLM is China-hosted (Zhipu/z.ai) → prompt
-# data EGRESSES TO CHINA. LOCAL-ONLY — never call it from CI / automated
-# pipelines or with sensitive data; prefer a Western-lab reviewer for
-# top-stakes work. ``ask_glm`` refuses to run under CI as a runtime backstop.
 GLM_MODEL = "zai-coding-plan/glm-5.3"
 GLM_DEFAULT_VARIANT = "high"  # default effort when --effort omitted (operator 2026-08-14)
 GLM_ADVISORY_VARIANT = "max"  # advisory / hard escalation effort for GLM-5.3
@@ -150,38 +94,7 @@ AB_OPENCODE_MAX_OUTPUT_TOKENS_ENV = "AB_OPENCODE_MAX_OUTPUT_TOKENS"
 AB_GLM_MAX_OUTPUT_TOKENS_ENV = "AB_GLM_MAX_OUTPUT_TOKENS"
 AB_POOL_MAX_OUTPUT_TOKENS_ENV = "AB_POOL_MAX_OUTPUT_TOKENS"
 
-# Google Gemma 4 fleet member (Apr 2026, Apache-2.0). Default pin since
-# 2026-07-07 = Google AI Studio DIRECT (`google-ais` opencode provider, user
-# key at ~/.secret/google-ais.key; user order: "we will use the free gemma
-# for some time"). Western-hosted + permissively licensed → NO egress guard
-# (unlike GLM).
-#
-# COST — $0, triple-verified 2026-07-07:
-#   1. ai.google.dev pricing: Gemma 4 free tier "Free of charge", paid tier
-#      "Not available" — there IS no paid SKU, no key tier can bill it.
-#   2. opencode per-run accounting reports ``cost: 0``.
-#   3. The `google-ais` provider block declares ONLY gemma models, and
-#      routing_guard refuses `google-ais/` non-gemma ids (the underlying
-#      Cloud project is postpay — Gemini models through this key WOULD bill).
-# The PAID OpenRouter ``-it`` endpoint (~$0.12/$0.35 per M tok) stays
-# reachable via explicit ``--model`` as a fallback — note the spend. The OR
-# ``:free`` route is pool-starved (2×300s dead-air, 2026-07-07) — avoid.
-# MUST run toolless (agent="chat"): gemma is not a tool-calling model.
-#
-# ROLE (user probes 2026-07-05, docs/projects/qg-quality-gate/model-evidence.md):
-# a cheap Google-family lane to OFFLOAD from the metered lanes (Claude / Codex).
-# Ukrainian is fluent + surface-clean (VESUM-valid, 0 russicisms). USE IT FOR:
-#   • cheap SURFACE review — reliably flags russicisms / calques, Latin-letter
-#     leakage, and imperial / decolonization framing problems;
-#   • SOURCE-CONSTRAINED wiki drafting — given a full source packet it produced
-#     concise markdown + YAML with NO invented sources and every factual
-#     sentence cited.
-# DO NOT USE IT AS:
-#   • a SOLE seminar writer — it adds unsupported details / inferences beyond
-#     the supplied source packet (fluent but over-generates);
-#   • a SOLE factual reviewer — not trustworthy on factual accuracy yet.
-# For seminar / factual content, gate it behind a NON-Gemma source/factual check.
-# Google-family → not a clean cross-family reviewer of agy / Gemini work.
+# Retained hramatka model, used toolless through OpenCode.
 GEMMA_MODEL = "google-ais/gemma-4-31b-it"
 GEMMA_DEFAULT_TIMEOUT_S = 900  # chat model (no browsing); MoE variants can be slow
 
@@ -516,76 +429,103 @@ def read_opencode_turn_status(
     )
 
 
-def _handle_opencode_incomplete_turn(
-    msg: dict[str, Any],
-    message_id: int,
-    target: str,
-    partial_text: str,
-    turn_status: OpencodeTurnStatus,
-    *,
-    actual_model: str,
-    effort: str | None = None,
-) -> None:
-    """Deliver captured native text only as an explicitly typed failed turn with a sidecar."""
-    outcome = turn_status.outcome
-    category = turn_status.cancellation_category or outcome
-    reason = turn_status.reason
-    detail = f"{outcome}/{category}"
-    banner = f"[Bridge Error] opencode turn aborted ({reason})"
+def read_opencode_result(job_id: str) -> dict:
+    """Read the durable result without initializing storage or invoking a provider."""
+    with ArtifactStore(readonly=True) as store, AuthorityService(store=store) as authority:
+        result = authority.read_job_result(job_id)
+        if result is None:
+            raise AuthorityServiceError("opencode_terminal_result_missing")
+        payload = json_depth.loads(result, max_depth=512)
+        if not isinstance(payload, dict):
+            raise AuthorityServiceError("opencode_terminal_result_invalid")
+        return payload
 
-    sidecar_rel_path: str | None = None
-    if partial_text and partial_text.strip():
+
+def print_authority_asks(task_id: str | None = None) -> None:
+    """List native request jobs, including queued and failed OpenCode asks."""
+    with ArtifactStore(readonly=True) as store, AuthorityService(store=store):
+        rows = store.connection.execute(
+            "SELECT j.job_id, j.state, j.created_at, j.payload_artifact_id "
+            "FROM authority_jobs j JOIN authority_message_metadata meta ON meta.message_id=j.subject_id "
+            "WHERE j.job_kind='request' AND (? IS NULL OR json_extract(meta.provenance_json, '$.task_id')=?) "
+            "ORDER BY j.created_at DESC, j.job_id DESC LIMIT 100", (task_id, task_id),
+        ).fetchall()
+        print("ID  TASK  TO  STATUS  SENT" if rows else "No tracked asks.")
+        for row in rows:
+            payload = json_depth.loads(store.read_bytes(row["payload_artifact_id"]), max_depth=512)
+            metadata = payload["metadata"]
+            print(f"{row['job_id']}  {metadata.get('task_id', '-')}  {payload['recipient']}  {row['state']}  {row['created_at']}")
+
+
+def _enqueue_opencode_ask(
+    content: str, task_id: str, target: str, *, model: str, variant: str | None,
+    effort: str | None, effort_reason: str | None, data: str | None,
+    msg_type: str, from_llm: str, from_model: str | None,
+    no_timeout: bool, background: bool,
+    on_message_created: Callable[[str], None] | None = None,
+) -> str:
+    """Use one Fleet request job as the durable OpenCode lifecycle.
+
+    The job ID replaces the broker's integer message ID. Repeating the same
+    task and inputs replays its result; a running lease cannot be stolen.
+    Background workers re-enter through process-ask and read only the job.
+    """
+    activity = "review" if is_formal_review_ask(msg_type=msg_type, task_id=task_id) else (
+        "consult" if msg_type.strip().lower() in {"advisory", "consult", "discussion"} else None
+    )
+    if activity:
+        catalog = load_model_catalog()
+        if resolve_catalog_model_id(model, catalog) is None:
+            raise ValueError(f"ask-{target}: model is not catalogued for {activity}")
+        if refusal := activity_role_refusal(model, activity, catalog):
+            raise ValueError(f"ask-{target}: {refusal}")
+    content = redact_text(content) or ""
+    attachment = Path(data).resolve() if data else None
+    metadata = {
+        "transport": "opencode", "target": target, "task_id": task_id,
+        "requested_model": model, "from_model": from_model, "effort": effort,
+        "variant": variant, "effort_reason": effort_reason,
+        "msg_type": msg_type, "no_timeout": no_timeout,
+    }
+    metadata = redact_value(metadata)
+    # Resolved file locators and generated integrity data must remain usable.
+    metadata["data"] = str(attachment) if attachment is not None else None
+    metadata["attachment_sha256"] = hashlib.sha256(attachment.read_bytes()).hexdigest() if attachment is not None else None
+    digest = hashlib.sha256(json.dumps(
+        {"sender": from_llm, "body": content, "metadata": metadata}, sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    with AuthorityService() as authority:
+        job = authority.enqueue_request(
+            recipient=target, sender=from_llm, body=content,
+            metadata=metadata, idempotency_key=f"opencode-ask:{digest}",
+        )
+    if on_message_created is not None:
+        on_message_created(job.job_id)
+    if background and job.state == "queued":
+        log_dir = default_plane_root() / "opencode-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
         try:
-            path = write_reply_sidecar(
-                partial_text,
-                task_id=msg.get("task_id"),
-                from_llm=target,
-                msg_type="error",
-            )
-            try:
-                sidecar_rel_path = path.resolve().relative_to(_config.REPO_ROOT.resolve()).as_posix()
-            except ValueError:
-                sidecar_rel_path = str(path)
-        except Exception:
-            pass
-
-    provenance_data, _ = response_provenance(
-        msg,
-        actual_model=actual_model,
-        harness="opencode",
-        effort_applied=effort,
-    )
-    try:
-        metadata = json_depth.loads(provenance_data, max_depth=512)
-    except (TypeError, json.JSONDecodeError):
-        metadata = {}
-
-    metadata.update(
-        {
-            "turn_outcome": outcome,
-            "cancellation_category": category,
-            "reason": reason,
-            "partial_response": True,
-            "sidecar_path": sidecar_rel_path,
-        }
-    )
-
-    error_content = banner
-    if sidecar_rel_path:
-        error_content += f"\n\nPartial narration preserved to sidecar: {sidecar_rel_path}"
-
-    send_message(
-        content=error_content,
-        task_id=msg.get("task_id", "no-task"),
-        msg_type="error",
-        from_llm=target,
-        to_llm=msg.get("from", "user"),
-        data=json.dumps(metadata, sort_keys=True),
-        from_model=actual_model,
-    )
-    # No ack on failure (#6915): an aborted turn leaves the inbound message
-    # unconsumed/retryable; only a completed reply consumes it.
-    record_ask_failure(message_id, f"opencode turn aborted ({detail}: {reason})")
+            with (log_dir / f"{job.job_id}.log").open("a", encoding="utf-8") as log:
+                # This allowlisted argv is never shell text or provider output.
+                command = [
+                    str(project_interpreter()), "-I", "-u", "-m", "lu_machinery.ai_agent_bridge",
+                    "process-ask", job.job_id, target,
+                ]
+                spawn_detached_worker(
+                    command, task_id=job.job_id, run_nonce=new_id("opencode-launch"),
+                    popen=partial(subprocess.Popen, cwd=str(state_root())),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    stderr_log=log_dir / f"{job.job_id}.log", env=os.environ.copy(),
+                )
+        except (OSError, DispatchIsolationError) as exc:
+            # Leave the durable request queued for explicit process-ask recovery.
+            raise AuthorityServiceError("opencode_worker_launch_failed_job_queued") from exc
+        print(f"OpenCode job queued: {job.job_id}")
+    elif not background:
+        process_for_opencode(job.job_id, target=target)
+    else:
+        print(f"OpenCode job {job.job_id}: {job.state}")
+    return job.job_id
 
 
 def ask_opencode(
@@ -600,66 +540,19 @@ def ask_opencode(
     effort: str | None = None,
     no_timeout: bool = False,
     background: bool = False,
-) -> int:
-    """Generic one-shot opencode call to an arbitrary opencode-reachable model.
-
-    Escape hatch for cross-model reviews where the target isn't a named fleet
-    member. To reach poolside.ai, prefer :func:`ask_pool` (opencode is a
-    router — "opencode" does not identify the model).
-    """
+) -> str:
+    """Queue an explicit OpenCode provider/model request through Fleet Comms."""
     require_core_or_exit("ask-opencode")
     effective_model = resolve_model_selection(
         lane="ask-opencode", to_model=to_model, model=model, default=OPENCODE_DEFAULT_MODEL
     )
     effective_variant, effort_reason = _resolve_opencode_effort(lane="ask-opencode", effort=effort)
-    msg_id = send_message(
-        content,
-        task_id,
-        msg_type,
-        data,
-        from_llm=from_llm,
-        to_llm="opencode",
-        from_model=from_model,
-        to_model=to_model or effective_model,
-        effort=effort,
+    return _enqueue_opencode_ask(
+        content, task_id, 'opencode', model=effective_model, variant=effective_variant,
+        effort=effort, effort_reason=effort_reason, data=data, msg_type=msg_type,
+        from_llm=from_llm, from_model=from_model, no_timeout=no_timeout,
+        background=background, on_message_created=None,
     )
-    register_ask(msg_id)
-    if background:
-        launch_background_ask(msg_id, "opencode", {"no_timeout": no_timeout})
-        return msg_id
-    print(f"\n🚀 Invoking opencode ({effective_model}) to process message #{msg_id}...")
-    try:
-        response = _invoke_opencode(
-            content, effective_model, variant=effective_variant, data=data, no_timeout=no_timeout
-        )
-    except OpencodeTurnError as exc:
-        msg = fetch_ask_message(msg_id, "opencode") or {
-            "task_id": task_id,
-            "from": from_llm,
-        }
-        _handle_opencode_incomplete_turn(
-            msg, msg_id, "opencode", exc.partial_text, exc.status, actual_model=effective_model, effort=effort
-        )
-        raise SystemExit(f"[Bridge Error] opencode turn aborted ({exc.status.reason})") from exc
-    provenance_data, actual_model = response_provenance(
-        {"data": json.dumps({"to_model": effective_model, "effort": effort})},
-        actual_model=effective_model,
-        harness="opencode",
-        effort_applied=effective_variant,
-        effort_reason=effort_reason,
-    )
-    reply_id = send_message(
-        content=response,
-        task_id=task_id,
-        msg_type="response",
-        from_llm="opencode",
-        to_llm=from_llm,
-        data=provenance_data, from_model=actual_model, to_model=from_model,
-    )
-    acknowledge(msg_id)
-    record_ask_reply(msg_id, reply_id)
-    return msg_id
-
 
 def ask_pool(
     content: str,
@@ -674,26 +567,10 @@ def ask_pool(
     from_model: str | None = None,
     no_timeout: bool = False,
     background: bool = False,
-    on_message_created: Callable[[int], None] | None = None,
+    on_message_created: Callable[[str], None] | None = None,
     review_pr_lifecycle: bool = False,
-) -> int:
-    """Send a message AND invoke poolside.ai (laguna-s-2.1) one-shot via opencode.
-
-    ``pool`` is a cross-family CODE + web-verification reviewer: use it for
-    cross-family code review, live web fact-checking (version/pricing/URL/
-    citation currency, "is this API still current"), and code authoring /
-    bug-fixing. Its own model family, so it's a clean reviewer of work authored
-    by OpenAI / Anthropic / Google. Its differentiator is being FREE + high
-    volume. It fact-checks the live web via the lightpanda MCP — note this is
-    an opencode-harness capability (any opencode-hosted model browses), not a
-    pool-only trait.
-
-    Do NOT use it for translation, non-English language work, prose/long-form
-    content, or pedagogy — it is a code model, weak on those.
-
-    ``model`` overrides the pinned ``POOL_MODEL`` (model tags drift — see the
-    "examples not constants" note in model-assignment.md).
-    """
+) -> str:
+    """Retain the historical named helper, subject to catalog admission."""
     require_core_or_exit("ask-pool")
     effective_variant, effort_reason = _resolve_opencode_effort(
         lane="ask-pool", effort=effort, variant=variant
@@ -702,68 +579,12 @@ def ask_pool(
     effective_model = resolve_model_selection(
         lane="ask-pool", to_model=to_model, model=model, default=POOL_MODEL
     )
-    msg_id = send_message(
-        content,
-        task_id,
-        msg_type,
-        data,
-        from_llm=from_llm,
-        to_llm="pool",
-        from_model=from_model,
-        to_model=effective_model,
-        effort=effort,
+    return _enqueue_opencode_ask(
+        content, task_id, 'pool', model=effective_model, variant=effective_variant,
+        effort=effort, effort_reason=effort_reason, data=data, msg_type=msg_type,
+        from_llm=from_llm, from_model=from_model, no_timeout=no_timeout,
+        background=background, on_message_created=on_message_created,
     )
-    register_ask(msg_id)
-    if on_message_created is not None:
-        on_message_created(msg_id)
-    if background:
-        launch_background_ask(
-            msg_id,
-            "pool",
-            {
-                "no_timeout": no_timeout,
-                "variant": effective_variant,
-                "review_pr_lifecycle": review_pr_lifecycle,
-            },
-        )
-        return msg_id
-    print(f"\n🚀 Invoking pool ({effective_model}, variant={effective_variant}) to process message #{msg_id}...")
-    try:
-        response = _invoke_opencode(
-            content,
-            effective_model,
-            variant=effective_variant,
-            output_format="json",
-            data=data,
-            no_timeout=no_timeout,
-            default_timeout_s=POOL_DEFAULT_TIMEOUT_S,
-        )
-    except OpencodeTurnError as exc:
-        msg = fetch_ask_message(msg_id, "pool") or {
-            "task_id": task_id,
-            "from": from_llm,
-        }
-        _handle_opencode_incomplete_turn(
-            msg, msg_id, "pool", exc.partial_text, exc.status, actual_model=effective_model, effort=effort
-        )
-        raise SystemExit(f"[Bridge Error] opencode turn aborted ({exc.status.reason})") from exc
-    provenance_data, actual_model = response_provenance(
-        {"data": json.dumps({"to_model": effective_model, "effort": effort})},
-        actual_model=effective_model, harness="opencode", effort_applied=effective_variant,
-        effort_reason=effort_reason,
-    )
-    reply_id = send_message(
-        content=response,
-        task_id=task_id,
-        msg_type="response",
-        from_llm="pool",
-        to_llm=from_llm,
-        data=provenance_data, from_model=actual_model, to_model=from_model,
-    )
-    acknowledge(msg_id)
-    record_ask_reply(msg_id, reply_id)
-    return msg_id
-
 
 def _assert_glm_egress_allowed(verb: str = "ask-glm") -> None:
     """Refuse to run China-hosted GLM in a CI / automated context (data egress).
@@ -795,26 +616,10 @@ def ask_glm(
     from_model: str | None = None,
     no_timeout: bool = False,
     background: bool = False,
-    on_message_created: Callable[[int], None] | None = None,
+    on_message_created: Callable[[str], None] | None = None,
     review_pr_lifecycle: bool = False,
-) -> int:
-    """Send a message AND invoke Zhipu GLM (glm-5.3) one-shot via opencode.
-
-    ``glm`` is a strong cross-family CODE + review specialist (its top axis —
-    deep security/bug review) that also browses for live fact-checks, plus a
-    reported edge in large-context / cross-file coherence auditing (finding
-    contradictions across many documents at once). Its own China-lab family →
-    clean reviewer of OpenAI / Anthropic / Google work.
-
-    ⚠️ China-hosted → prompt data EGRESSES TO CHINA. LOCAL-ONLY: never from CI /
-    automated pipelines or with sensitive data; prefer a Western-lab reviewer
-    for top-stakes work. Weak at Ukrainian (anglicizes/code-switches) and
-    long-form prose / pedagogy — do NOT use it there.
-
-    ``model`` overrides the pinned ``GLM_MODEL``. Any override MUST still be a
-    GLM model on ``zai/`` or ``zai-coding-plan/`` only — the China-egress guard
-    above is unconditional.
-    """
+) -> str:
+    """Retain the historical GLM helper and its egress and catalog guards."""
     require_core_or_exit("ask-glm")
     try:
         formal_review = assert_formal_review_ask_payload(
@@ -837,69 +642,12 @@ def ask_glm(
         effort = "max"
     effective_variant, effort_reason = _resolve_opencode_effort(lane="ask-glm", effort=effort)
     effective_variant = effective_variant or GLM_DEFAULT_VARIANT
-    msg_id = send_message(
-        content,
-        task_id,
-        msg_type,
-        data,
-        from_llm=from_llm,
-        to_llm="glm",
-        from_model=from_model,
-        to_model=effective_model,
-        effort=effort,
+    return _enqueue_opencode_ask(
+        content, task_id, 'glm', model=effective_model, variant=effective_variant,
+        effort=effort, effort_reason=effort_reason, data=data, msg_type=msg_type,
+        from_llm=from_llm, from_model=from_model, no_timeout=no_timeout,
+        background=background, on_message_created=on_message_created,
     )
-    register_ask(msg_id)
-    if on_message_created is not None:
-        on_message_created(msg_id)
-    if background:
-        launch_background_ask(
-            msg_id,
-            "glm",
-            {
-                "no_timeout": no_timeout,
-                "review_pr_lifecycle": review_pr_lifecycle,
-            },
-        )
-        return msg_id
-    print(
-        f"\n🚀 Invoking glm ({effective_model}) to process message #{msg_id}... [LOCAL-ONLY — data egresses to China]"
-    )
-    try:
-        response = _invoke_opencode(
-            content,
-            effective_model,
-            variant=effective_variant,
-            output_format="json",
-            data=data,
-            no_timeout=no_timeout,
-            default_timeout_s=GLM_DEFAULT_TIMEOUT_S,
-        )
-    except OpencodeTurnError as exc:
-        msg = fetch_ask_message(msg_id, "glm") or {
-            "task_id": task_id,
-            "from": from_llm,
-        }
-        _handle_opencode_incomplete_turn(
-            msg, msg_id, "glm", exc.partial_text, exc.status, actual_model=effective_model, effort=effort
-        )
-        raise SystemExit(f"[Bridge Error] opencode turn aborted ({exc.status.reason})") from exc
-    provenance_data, actual_model = response_provenance(
-        {"data": json.dumps({"to_model": effective_model, "effort": effort})},
-        actual_model=effective_model, harness="opencode", effort_applied=effective_variant,
-        effort_reason=effort_reason,
-    )
-    reply_id = send_message(
-        content=response,
-        task_id=task_id,
-        msg_type="response",
-        from_llm="glm",
-        to_llm=from_llm,
-        data=provenance_data, from_model=actual_model, to_model=from_model,
-    )
-    acknowledge(msg_id)
-    record_ask_reply(msg_id, reply_id)
-    return msg_id
-
 
 def ask_gemma(
     content: str,
@@ -913,184 +661,121 @@ def ask_gemma(
     from_model: str | None = None,
     no_timeout: bool = False,
     background: bool = False,
-) -> int:
-    """Send a message AND invoke Google Gemma 4 (31B-it) one-shot via opencode.
+) -> str:
+    """Queue a toolless hramatka Gemma request through Fleet Comms.
 
-    ``gemma`` is the $0 Google-family lane (Apache-2.0) to OFFLOAD from the
-    metered lanes (Claude / Codex). Default = Google AI Studio DIRECT
-    (``google-ais/gemma-4-31b-it``, user key minted 2026-07-07): Gemma has NO
-    paid SKU on the Gemini API (pricing verified 2026-07-07 — free tier "Free
-    of charge", paid tier "Not available"), and opencode's own accounting
-    reports ``cost: 0`` per run. Runs TOOLLESS via the ``chat`` opencode agent
-    (gemma is not a tool-calling model; the tool bundle made it flail). The
-    OpenRouter paid ``-it`` route stays reachable via ``model`` as a fallback
-    (~$0.12/$0.35 per M tok — note the spend); OR ``:free`` is pool-starved
-    (2×300s dead-air probes 2026-07-07), avoid. Ukrainian is fluent +
-    surface-clean (VESUM-valid, 0 russicisms). Cross-family to OpenAI /
-    Anthropic / DeepSeek.
-
-    USE IT FOR (user probes 2026-07-05, model-evidence.md):
-    - cheap SURFACE review — reliably flags russicisms / calques, Latin-letter
-      leakage, imperial / decolonization framing;
-    - SOURCE-CONSTRAINED wiki drafting — with a full source packet it cites every
-      factual sentence and invents no sources.
-
-    ⚠️ DO NOT use it as a SOLE seminar writer (it adds unsupported details beyond
-    the source packet) or a SOLE factual reviewer (not trustworthy on accuracy
-    yet). For seminar / factual content, gate it behind a NON-Gemma source /
-    factual check. Being Google-family, it is NOT a clean reviewer of agy / Gemini
-    work.
-
-    ``model`` overrides the pinned ``GEMMA_MODEL`` (default = AIS-direct
-    ``google-ais/gemma-4-31b-it``, $0) — e.g. ``google-ais/gemma-4-26b-a4b-it``
-    (also $0; the MoE is #1 on the lang-uk leaderboard) or the PAID
-    ``openrouter/google/gemma-4-31b-it`` fallback — while tags drift (see the
-    "examples not constants" note in model-assignment.md).
-    """
+    An explicit model selects an available OpenCode route; no provider
+    fallback changes the requested model or its attribution."""
     require_core_or_exit("ask-gemma")
     effective_model = resolve_model_selection(
         lane="ask-gemma", to_model=to_model, model=model, default=GEMMA_MODEL
     )
     effective_variant, effort_reason = _resolve_opencode_effort(lane="ask-gemma", effort=effort)
-    msg_id = send_message(
-        content,
-        task_id,
-        msg_type,
-        data,
-        from_llm=from_llm,
-        to_llm="gemma",
-        from_model=from_model,
-        to_model=effective_model,
-        effort=effort,
+    return _enqueue_opencode_ask(
+        content, task_id, 'gemma', model=effective_model, variant=effective_variant,
+        effort=effort, effort_reason=effort_reason, data=data, msg_type=msg_type,
+        from_llm=from_llm, from_model=from_model, no_timeout=no_timeout,
+        background=background, on_message_created=None,
     )
-    register_ask(msg_id)
-    if background:
-        launch_background_ask(msg_id, "gemma", {"no_timeout": no_timeout})
-        return msg_id
-    print(f"\n🚀 Invoking gemma ({effective_model}) to process message #{msg_id}...")
-    try:
-        response = _strip_gemma_thought(
-            _invoke_opencode(
-                content,
-                effective_model,
-                variant=effective_variant,
-                output_format="json",
-                data=data,
-                no_timeout=no_timeout,
-                default_timeout_s=GEMMA_DEFAULT_TIMEOUT_S,
-                agent="chat",
-            )
-        )
-    except OpencodeTurnError as exc:
-        msg = fetch_ask_message(msg_id, "gemma") or {
-            "task_id": task_id,
-            "from": from_llm,
-        }
-        _handle_opencode_incomplete_turn(
-            msg, msg_id, "gemma", exc.partial_text, exc.status, actual_model=effective_model, effort=effort
-        )
-        raise SystemExit(f"[Bridge Error] opencode turn aborted ({exc.status.reason})") from exc
-    provenance_data, actual_model = response_provenance(
-        {"data": json.dumps({"to_model": effective_model, "effort": effort})},
-        actual_model=effective_model, harness="opencode", effort_applied=effective_variant,
-        effort_reason=effort_reason,
-    )
-    reply_id = send_message(
-        content=response,
-        task_id=task_id,
-        msg_type="response",
-        from_llm="gemma",
-        to_llm=from_llm,
-        data=provenance_data, from_model=actual_model, to_model=from_model,
-    )
-    acknowledge(msg_id)
-    record_ask_reply(msg_id, reply_id)
-    return msg_id
-
 
 def process_for_opencode(
-    message_id: int,
-    *,
-    target: str,
-    no_timeout: bool = False,
+    message_id: str, *, target: str, no_timeout: bool | None = None,
     variant: str | None = None,
 ) -> None:
-    """Process an existing opencode-routed ask for sync and detached paths."""
-    msg = fetch_ask_message(message_id, target)
-    if not msg:
-        return
-    from ._ask_lifecycle import assert_ask_content_present
+    """Claim a Fleet job, invoke once, and persist success or typed failure.
 
-    # #4915: feed the model from the stored message body only (never inherited stdin).
-    content = assert_ask_content_present(msg, message_id=message_id, target=target)
-    model = ask_target_model(msg)
-    if not model:
-        raise ValueError(f"ask #{message_id} has no target model")
-    effort = requested_effort(msg)
-    effective_variant, effort_reason = _resolve_opencode_effort(
-        lane=f"ask-{target}", effort=effort, variant=variant
-    )
-
-    kwargs: dict[str, object] = {"data": ask_attachment(msg), "no_timeout": no_timeout}
-    try:
-        if target == "opencode":
-            response = _invoke_opencode(content, model, variant=effective_variant, **kwargs)
-        elif target == "pool":
-            response = _invoke_opencode(
-                content,
-                model,
-                variant=effective_variant or POOL_DEFAULT_VARIANT,
-                output_format="json",
-                default_timeout_s=POOL_DEFAULT_TIMEOUT_S,
-                **kwargs,
-            )
-        elif target == "glm":
-            _assert_glm_egress_allowed("process background ask-glm")
-            response = _invoke_opencode(
-                content,
-                model,
-                variant=effective_variant,
-                output_format="json",
-                default_timeout_s=GLM_DEFAULT_TIMEOUT_S,
-                **kwargs,
-            )
-        elif target == "gemma":
-            response = _strip_gemma_thought(
-                _invoke_opencode(
-                    content,
-                    model,
-                    variant=effective_variant,
-                    output_format="json",
-                    default_timeout_s=GEMMA_DEFAULT_TIMEOUT_S,
-                    agent="chat",
-                    **kwargs,
-                )
-            )
-        else:
-            raise ValueError(f"unsupported opencode ask target {target!r}")
-    except OpencodeTurnError as exc:
-        _handle_opencode_incomplete_turn(
-            msg, message_id, target, exc.partial_text, exc.status, actual_model=model, effort=effort
+    A terminal job replays without a provider call. A crashed worker's lease
+    is reclaimed only by the Fleet job state machine, preserving fencing.
+    """
+    if not isinstance(message_id, str) or not message_id.startswith("authority-job_"):
+        raise AuthorityServiceError("legacy_opencode_ask_not_claimable_use_fleet_job")
+    worker_id = new_id("opencode-worker")
+    with AuthorityService() as authority:
+        job = authority.get_job(message_id)
+        payload = json_depth.loads(authority.store.read_bytes(job.payload_artifact_id), max_depth=512)
+        metadata = payload["metadata"]
+        if job.job_kind != "request" or metadata.get("transport") != "opencode" or metadata.get("target") != target:
+            raise AuthorityServiceError("opencode_job_target_mismatch")
+        if job.state in {"complete", "failed", "expired", "dead_lettered"}:
+            raw = authority.read_job_result(job.job_id)
+            if raw is None:
+                raise AuthorityServiceError("opencode_terminal_result_missing")
+            receipt = json_depth.loads(raw, max_depth=512)
+            if job.state != "complete":
+                raise SystemExit(receipt.get("error") or "opencode job failed")
+            print(receipt["response"])
+            return
+        model = metadata["requested_model"]
+        if no_timeout is not None and no_timeout != metadata["no_timeout"]:
+            raise AuthorityServiceError("opencode_job_timeout_conflict")
+        if variant is not None and variant != metadata["variant"]:
+            raise AuthorityServiceError("opencode_job_variant_conflict")
+        timeout = {
+            "opencode": OPENCODE_DEFAULT_TIMEOUT_S, "gemma": GEMMA_DEFAULT_TIMEOUT_S,
+            "pool": POOL_DEFAULT_TIMEOUT_S, "glm": GLM_DEFAULT_TIMEOUT_S,
+        }.get(target)
+        if timeout is None:
+            raise AuthorityServiceError("unsupported_opencode_job_target")
+        lease = authority.claim_job(
+            job.job_id, worker_id, lease_seconds=86400 if metadata["no_timeout"] else timeout + 30,
         )
-        return
-
-    provenance_data, actual_model = response_provenance(
-        msg,
-        actual_model=model,
-        harness="opencode",
-        effort_applied=effective_variant,
-        effort_reason=effort_reason,
-    )
-    reply_id = send_message(
-        content=response,
-        task_id=msg["task_id"],
-        msg_type="response",
-        from_llm=target,
-        to_llm=msg["from"],
-        data=provenance_data, from_model=actual_model, to_model=ask_sender_model(msg),
-    )
-    acknowledge(message_id)
-    record_ask_reply(message_id, reply_id)
+        msg = {
+            "task_id": metadata["task_id"], "from": authority.get_message(job.subject_id).sender,
+            "data": json.dumps({"to_model": model, "effort": metadata["effort"]}),
+        }
+        provenance, actual_model = response_provenance(
+            msg, actual_model=model, harness="opencode", effort_applied=metadata["variant"],
+            effort_reason=metadata["effort_reason"],
+        )
+        receipt = {
+            "job_id": job.job_id, "request_message_id": job.subject_id,
+            "task_id": metadata["task_id"], "from": target, "to": msg["from"],
+            "from_model": actual_model, "to_model": metadata["from_model"],
+            "provenance": json_depth.loads(provenance, max_depth=512),
+        }
+        try:
+            content = authority.read_message_body(job.subject_id)
+            if not content.strip():
+                raise AuthorityServiceError("opencode_ask_content_empty")
+            attachment = metadata["data"]
+            if attachment and hashlib.sha256(Path(attachment).read_bytes()).hexdigest() != metadata["attachment_sha256"]:
+                raise AuthorityServiceError("opencode_attachment_changed")
+            if target == "glm":
+                _assert_glm_egress_allowed("process background ask-glm")
+            response = _invoke_opencode(
+                content, model, variant=metadata["variant"], data=metadata["data"],
+                no_timeout=metadata["no_timeout"], default_timeout_s=timeout,
+                output_format="default" if target == "opencode" else "json",
+                agent="chat" if target == "gemma" else None,
+            )
+            response = redact_text(response) or ""
+            if target == "gemma":
+                response = _strip_gemma_thought(response)
+            if not response.strip():
+                raise AuthorityServiceError("opencode_response_empty")
+        except BaseException as exc:
+            receipt.update(state="failed", error=f"OpenCode failed: {type(exc).__name__}")
+            if isinstance(exc, OpencodeTurnError):
+                receipt.update(
+                    error=f"[Bridge Error] opencode turn aborted ({exc.status.reason})",
+                    turn_outcome=exc.status.outcome,
+                    cancellation_category=exc.status.cancellation_category,
+                    partial_response=redact_text(exc.partial_text) or "",
+                )
+            authority.finish_job(
+                job.job_id, worker_id=worker_id, fence_token=lease.fence_token,
+                state="failed", result=json.dumps(receipt, sort_keys=True).encode("utf-8"),
+                failure={"phase": "provider", "code": "provider_error", "retryable": False},
+            )
+            if isinstance(exc, OpencodeTurnError):
+                raise SystemExit(receipt["error"]) from exc
+            raise
+        receipt.update(state="complete", response=response)
+        authority.finish_job(
+            job.job_id, worker_id=worker_id, fence_token=lease.fence_token,
+            state="complete", result=json.dumps(receipt, sort_keys=True).encode("utf-8"),
+        )
+        print(response)
 
 
 def _strip_gemma_thought(text: str) -> str:

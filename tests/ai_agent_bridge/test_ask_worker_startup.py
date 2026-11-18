@@ -13,9 +13,7 @@ handoff earlier the same day (#5773).
 
 from __future__ import annotations
 
-
 import pytest
-
 
 from lu_machinery.ai_agent_bridge import _ask_lifecycle as lifecycle
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -107,6 +105,7 @@ def test_launch_background_ask_is_actually_wired_to_the_check(tmp_path, monkeypa
     same day: "test the SessionStart wiring, not just the function — the pid can be
     wrong while every unit test passes."
     """
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     monkeypatch.setattr(lifecycle, "_ask_status", lambda _mid: "sent")
     monkeypatch.setattr(lifecycle, "_write_pid_file", lambda *a, **k: None)
     monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
@@ -135,6 +134,7 @@ def test_startup_death_does_not_print_success_banner_or_return_pid(tmp_path, mon
     Pre-fix shape printed ✅ and returned the dead PID after recording failure.
     Drivers keying on return value / success banner treated dispatch as OK.
     """
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     monkeypatch.setattr(lifecycle, "_ask_status", lambda _mid: "sent")
     monkeypatch.setattr(lifecycle, "_write_pid_file", lambda *a, **k: None)
     monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))

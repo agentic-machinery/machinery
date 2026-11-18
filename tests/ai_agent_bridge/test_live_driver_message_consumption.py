@@ -10,19 +10,19 @@ from unittest.mock import patch
 
 import pytest
 
-
 from lu_machinery.ai_agent_bridge import _ask_lifecycle, _cli, _db, _messaging
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
 @pytest.fixture(autouse=True)
-def isolate_db(tmp_path: Path):
-    """Keep legacy-message rows isolated for each consumption-state test."""
+def isolate_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep legacy rows and their shadow mode in one fixture lifetime."""
     db_file = tmp_path / "messages.db"
-    with patch.dict(os.environ, {"AB_DB_PATH": str(db_file)}):
-        _db.init_db().close()
-        yield db_file
+    monkeypatch.setenv("AB_DB_PATH", str(db_file))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+    _db.init_db().close()
+    return db_file
 
 
 def _run_cli(argv: list[str]) -> int:

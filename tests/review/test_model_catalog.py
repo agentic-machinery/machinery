@@ -922,7 +922,7 @@ def test_hook_failure_overlay_changes_only_worker_guard_settings(configuration):
     assert [i for i, row in enumerate(before["adapters"]) if "--settings" in row.get("value", {}).get("cmd", [])] == (
         HOOK_FAILURE_ROWS
     )
-    source = json.loads((Path(__file__).resolve().parents[2] / "agents_extensions/shared/settings.json").read_bytes())
+    source = json.loads((Path(__file__).resolve().parents[1] / "fixtures/product_tree/agents_extensions/shared/settings.json").read_bytes())
     tracked = {name: (timeout, on_failure) for _, name, timeout, on_failure in guard_policy(source)}
     for index in changed:
         old, new = before["adapters"][index], after["adapters"][index]
@@ -1123,6 +1123,13 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
+            # #513: pin the kept hramatka route independently; all remaining
+            # catalog bytes and every frozen resolver result must still match.
+            gemma = value["models"].pop("google-ais/gemma-4-31b-it")
+            assert hashlib.sha256(encode(gemma)).hexdigest() == "e54064e0f3dda40e5da1502b4a247819bbf9dd28fcc686aff332285318df9484"
+            previous_gemma = expected["models"].pop("google-ais/gemma-4-31b-it")
+            assert hashlib.sha256(encode(previous_gemma)).hexdigest() == "9066a74a9f417fad51e9b1bf60102032a07d880bb4275ee5613012b0f001a271"
+            expected["review_scheduler"]["activity_roles"]["review"].remove("surface_review")
             # #586: Hydrogen is an AGY work model with work roles only; it joins no seat, review
             # route, ladder or ranking, and its row is pinned.
             hydrogen = value["models"].pop("gemini-4-hydrogen")

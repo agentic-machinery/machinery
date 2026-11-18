@@ -23,6 +23,11 @@ genuinely different adapter, so it is resolve-only, never dual-read.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
+from lu_machinery.common.repo_root import machinery_path
+
 # Permanent CLI retirements: a dispatch agent whose native binary/subscription
 # is gone for good, mapped to the live adapter that now carries that provider
 # family's work. UNLIKE ``SEAT_ALIASES`` (a cosmetic rename of the SAME
@@ -142,3 +147,176 @@ def tools_writer_runtime_agent(writer_or_reviewer: str) -> str:
     if label.endswith("-tools"):
         return label.removesuffix("-tools")
     return normalize_seat(label) or label
+
+
+STATIC_VALID_AGENTS = (
+    "agy",
+    "claude",
+    "claude-infra",
+    "gemini",
+    "codex",
+    "grok",  # canonical native grok CLI seat
+    "grok-build",  # PERMANENT alias → grok (trailers, inbox, dispatch)
+    "glm",  # Zhipu GLM-5.3 (opencode / ask-glm)
+    "deepseek",
+    "qwen",
+    "cursor",
+    "claude-desktop",
+    "codex-desktop",
+)
+VALID_AGENTS = STATIC_VALID_AGENTS
+VALID_POST_AGENTS = (*VALID_AGENTS, "user")
+VALID_RECIPIENT_AGENTS = VALID_AGENTS
+
+ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_SLOTS_CACHE: dict[str, Any] = {"key": None, "slots": ()}
+
+
+def _load_registry_slots(assignments_path: Path | None = None) -> tuple[str, ...]:
+    """Load slot identities from area_assignments.yaml.
+
+    Lazy load, fail-open: returns empty tuple on missing file, parse error,
+    or missing PyYAML.
+    """
+    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    try:
+        if not path.is_file():
+            return ()
+        text = path.read_text(encoding="utf-8")
+        try:
+            import yaml
+
+            raw_data = yaml.safe_load(text)
+        except ImportError:
+            return ()
+        if not isinstance(raw_data, dict):
+            return ()
+        assignments = raw_data.get("assignments")
+        if not isinstance(assignments, dict):
+            return ()
+        slots: list[str] = []
+        for area_data in assignments.values():
+            if isinstance(area_data, dict):
+                area_slots = area_data.get("slots", [])
+                if isinstance(area_slots, (list, tuple)):
+                    for slot in area_slots:
+                        if isinstance(slot, str) and slot.strip() and slot.strip() not in slots:
+                            slots.append(slot.strip())
+        return tuple(slots)
+    except Exception:
+        return ()
+
+
+def get_valid_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]:
+    """Return valid agent identities: static tuple extended by registry-derived slots.
+
+    Keyed by file mtime+size to prevent stale caching in long-lived processes
+    while avoiding re-parsing unchanged files.
+    """
+    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    slots: tuple[str, ...] = ()
+    try:
+        st = path.stat()
+        cache_key = (str(path), st.st_mtime, st.st_size)
+        if cache_key == _SLOTS_CACHE.get("key"):
+            slots = _SLOTS_CACHE.get("slots", ())
+        else:
+            slots = _load_registry_slots(path)
+            _SLOTS_CACHE["key"] = cache_key
+            _SLOTS_CACHE["slots"] = slots
+    except Exception:
+        slots = ()
+
+    combined = list(STATIC_VALID_AGENTS)
+    for slot in slots:
+        if slot not in combined:
+            combined.append(slot)
+    return tuple(combined)
+
+
+def get_valid_post_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]:
+    valids = get_valid_agents(assignments_path=assignments_path)
+    if "user" not in valids:
+        return (*valids, "user")
+    return valids
+
+
+def get_valid_recipient_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]:
+    return get_valid_agents(assignments_path=assignments_path)
+
+
+def _load_empty_slot_areas(assignments_path: Path | None = None, *, provider: str | None = None) -> tuple[str, ...]:
+    """Areas retaining legacy bare-provider inbox aliases.
+
+    Empty rosters retain their historical fallback. The six legacy monitor
+    providers keep it when dedicated slots are added for other seats.
+
+    Same lazy fail-open contract as ``_load_registry_slots``: empty tuple on
+    missing file, parse error, or missing PyYAML.
+    """
+    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    try:
+        if not path.is_file():
+            return ()
+        text = path.read_text(encoding="utf-8")
+        try:
+            import yaml
+
+            raw_data = yaml.safe_load(text)
+        except ImportError:
+            return ()
+        if not isinstance(raw_data, dict):
+            return ()
+        assignments = raw_data.get("assignments")
+        if not isinstance(assignments, dict):
+            return ()
+        areas: list[str] = []
+        for name, area_data in assignments.items():
+            if not isinstance(name, str) or not isinstance(area_data, dict):
+                continue
+            area_slots = area_data.get("slots", [])
+            if isinstance(area_slots, (list, tuple)):
+                legacy_monitor = (
+                    name == "monitor"
+                    and provider in {"claude", "codex", "gemini", "grok", "cursor"}
+                    and all(isinstance(slot, str) and slot.strip() for slot in area_slots)
+                )
+                if not area_slots or legacy_monitor:
+                    areas.append(name.strip())
+        return tuple(areas)
+    except Exception:
+        return ()
+
+
+def resolve_recipient_alias(agent: str, *, assignments_path: Path | None = None) -> str:
+    """Resolve dedicated slot aliases and legacy bare-provider inbox aliases.
+
+    ``codex-curriculum-upgrade`` addresses the registered ``codex-core`` slot;
+    both names keep mail separate from the bare provider inbox.
+
+    Launchers used to mint SESSION_HANDOFF_AGENT names like
+    ``codex-monitor`` for areas whose area_assignments.yaml slots
+    roster is empty; those names were never valid inbox recipients, so
+    argparse rejected them and stranded the live session (#7597). Treat such
+    an already-minted name as an alias of the bare provider so the session
+    can drain. Legacy monitor providers retain that destination when Muse gets
+    a dedicated monitor slot. Registered slots and static identities pass through unchanged,
+    and unknown names pass through unchanged too so validators still reject
+    them (a typo of a registered lane must not silently read the provider
+    inbox).
+    """
+    if not agent:
+        return agent
+    valids = get_valid_agents(assignments_path=assignments_path)
+    if agent == "codex-curriculum-upgrade" and "codex-core" in valids:
+        return "codex-core"
+    if agent in valids:
+        return agent
+    provider, sep, area = agent.partition("-")
+    if not sep or not provider or not area:
+        return agent
+    if provider not in STATIC_VALID_AGENTS:
+        return agent
+    if area in _load_empty_slot_areas(assignments_path, provider=provider):
+        return provider
+    return agent

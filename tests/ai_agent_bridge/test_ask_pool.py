@@ -7,6 +7,7 @@ glm  = Zhipu glm-5.3 (code + review; ⚠️ China-hosted → LOCAL-ONLY, no CI).
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from lu_machinery.ai_agent_bridge._opencode import (
     _CI_ENV_VARS,
     GLM_MODEL,
@@ -26,28 +27,30 @@ from lu_machinery.lib import rules_core
 
 
 def test_invoke_opencode_passes_variant_and_json_format():
-    with patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"):
-        with patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock:
-            run_mock.return_value = MagicMock(
-                returncode=0,
-                stdout='{"type":"text","part":{"type":"text","text":"hi"}}',
-                stderr="",
-            )
-            out = _invoke_opencode(
-                "review this",
-                "deepseek/deepseek-v4.1-flash",
-                variant="high",
-                output_format="json",
-            )
-            argv = run_mock.call_args[0][0]
-            assert argv[:2] == ["/fake/opencode", "run"]
-            fmt_idx = argv.index("--format")
-            assert argv[fmt_idx + 1] == "json"
-            var_idx = argv.index("--variant")
-            assert argv[var_idx + 1] == "high"
-            assert "deepseek/deepseek-v4.1-flash" in argv
-            # NDJSON parsed down to the assistant text.
-            assert out == "hi"
+    with (
+        patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"),
+        patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock,
+    ):
+        run_mock.return_value = MagicMock(
+            returncode=0,
+            stdout='{"type":"text","part":{"type":"text","text":"hi"}}',
+            stderr="",
+        )
+        out = _invoke_opencode(
+            "review this",
+            "deepseek/deepseek-v4.1-flash",
+            variant="high",
+            output_format="json",
+        )
+        argv = run_mock.call_args[0][0]
+        assert argv[:2] == ["/fake/opencode", "run"]
+        fmt_idx = argv.index("--format")
+        assert argv[fmt_idx + 1] == "json"
+        var_idx = argv.index("--variant")
+        assert argv[var_idx + 1] == "high"
+        assert "deepseek/deepseek-v4.1-flash" in argv
+        # NDJSON parsed down to the assistant text.
+        assert out == "hi"
 
 
 # --- NDJSON parsing -------------------------------------------------------
@@ -112,12 +115,14 @@ def test_ask_glm_refuses_under_ci_before_any_egress(monkeypatch):
     for other in _CI_ENV_VARS:
         monkeypatch.delenv(other, raising=False)
     monkeypatch.setenv("CI", "true")
-    with patch("lu_machinery.ai_agent_bridge._opencode.send_message") as send_mock:
-        with patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock:
-            with pytest.raises(SystemExit, match="LOCAL-ONLY"):
-                ask_glm("audit this", task_id="t")
-            send_mock.assert_not_called()
-            run_mock.assert_not_called()
+    with (
+        patch("lu_machinery.ai_agent_bridge._opencode._enqueue_opencode_ask") as send_mock,
+        patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock,
+    ):
+        with pytest.raises(SystemExit, match="LOCAL-ONLY"):
+            ask_glm("audit this", task_id="t")
+        send_mock.assert_not_called()
+        run_mock.assert_not_called()
 
 
 def test_assert_glm_egress_allowed_raises_on_empty_ci_value(monkeypatch):
@@ -131,22 +136,24 @@ def test_assert_glm_egress_allowed_raises_on_empty_ci_value(monkeypatch):
 
 def test_invoke_opencode_always_separates_content_with_dashdash():
     # A leading-dash prompt arrives on stdin and can never be parsed as a flag.
-    with patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"):
-        with patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock:
-            run_mock.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-            _invoke_opencode("--- a/tricky diff line", "deepseek/deepseek-v4.1-flash", output_format="default")
-            argv = run_mock.call_args[0][0]
-            assert argv[-1] == "--"
-            prompt = rules_core.with_core("--- a/tricky diff line")
-            assert prompt not in argv
-            assert run_mock.call_args.kwargs["input"] == prompt
+    with (
+        patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"),
+        patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock,
+    ):
+        run_mock.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        _invoke_opencode("--- a/tricky diff line", "deepseek/deepseek-v4.1-flash", output_format="default")
+        argv = run_mock.call_args[0][0]
+        assert argv[-1] == "--"
+        prompt = rules_core.with_core("--- a/tricky diff line")
+        assert prompt not in argv
+        assert run_mock.call_args.kwargs["input"] == prompt
 
 
 # --- model override (churn-resistance; tags drift per model-assignment.md) --
 
 
 def test_retired_pool_override_is_refused_before_message_creation():
-    with patch("lu_machinery.ai_agent_bridge._opencode.send_message") as send:
+    with patch("lu_machinery.ai_agent_bridge._opencode._enqueue_opencode_ask") as send:
         with pytest.raises(ValueError, match="is retired in the model catalog"):
             ask_pool("hi", task_id="t", model="openrouter/poolside/laguna-s-2.1")
         send.assert_not_called()
@@ -157,15 +164,13 @@ def test_ask_glm_refuses_openrouter_glm_before_subprocess(monkeypatch):
     for var in _CI_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     with (
-        patch("lu_machinery.ai_agent_bridge._opencode.send_message", return_value=1),
-        patch("lu_machinery.ai_agent_bridge._opencode.acknowledge"),
+        patch("lu_machinery.ai_agent_bridge._opencode._enqueue_opencode_ask", return_value=1),
         patch(
             "lu_machinery.ai_agent_bridge._opencode.subprocess.run",
             side_effect=AssertionError("subprocess must not run for refused GLM route"),
-        ),
+        ),pytest.raises(ValueError, match="is retired in the model catalog")
     ):
-        with pytest.raises(ValueError, match="is retired in the model catalog"):
-            ask_glm("hi", task_id="t", model="openrouter/z-ai/glm-5.3")
+        ask_glm("hi", task_id="t", model="openrouter/z-ai/glm-5.3")
 
 
 # --- capture fix for multi-message streams (first vs last assistant msg) ---
@@ -244,7 +249,7 @@ def test_retired_glm_and_pool_create_no_messages_or_callbacks(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     for fn in (ask_glm, ask_pool):
         seen = []
-        with patch("lu_machinery.ai_agent_bridge._opencode.send_message") as send:
+        with patch("lu_machinery.ai_agent_bridge._opencode._enqueue_opencode_ask") as send:
             with pytest.raises(ValueError, match="is retired in the model catalog"):
                 fn("hi", task_id="t", on_message_created=seen.append)
             send.assert_not_called()

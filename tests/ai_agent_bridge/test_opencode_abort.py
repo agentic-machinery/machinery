@@ -1,16 +1,18 @@
 """Hermetic regression tests for opencode turn classification, failure handling, and standing notice (#5932)."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+
 from lu_machinery.agent_runtime.adapters.glm import GlmAdapter
-from lu_machinery.ai_agent_bridge._db import get_db
 from lu_machinery.ai_agent_bridge._opencode import (
     STANDING_TOOLLESS_NOTICE,
     _run_opencode,
     ask_opencode,
     read_opencode_turn_status,
 )
+from lu_machinery.fleet_comms.authority import AuthorityService
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
@@ -79,22 +81,25 @@ def test_read_opencode_turn_status_null_error_key_is_benign():
 
 
 def test_run_opencode_attaches_standing_notice_when_agent_chat():
-    with patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"):
-        with patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock:
-            run_mock.return_value = MagicMock(returncode=0, stdout='{"type":"text","part":{"text":"hi"}}', stderr="")
-            _run_opencode("hello", "deepseek/deepseek-v4.1-flash", agent="chat")
-            argv = run_mock.call_args[0][0]
-            assert "--agent" in argv
-            assert "chat" in argv
-            assert argv[-1] == "--"
-            prompt = run_mock.call_args.kwargs["input"]
-            assert STANDING_TOOLLESS_NOTICE in prompt
-            assert prompt not in argv
+    with (
+        patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"),
+        patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock,
+    ):
+        run_mock.return_value = MagicMock(returncode=0, stdout='{"type":"text","part":{"text":"hi"}}', stderr="")
+        _run_opencode("hello", "deepseek/deepseek-v4.1-flash", agent="chat")
+        argv = run_mock.call_args[0][0]
+        assert "--agent" in argv
+        assert "chat" in argv
+        assert argv[-1] == "--"
+        prompt = run_mock.call_args.kwargs["input"]
+        assert STANDING_TOOLLESS_NOTICE in prompt
+        assert prompt not in argv
 
 
 def test_opencode_permission_abort_fails_ask_loud_and_writes_sidecar(
     tmp_path, monkeypatch, isolated_bridge_db
 ):
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OPENCODE_HOME", str(tmp_path / ".local" / "share"))
 
@@ -103,34 +108,26 @@ def test_opencode_permission_abort_fails_ask_loud_and_writes_sidecar(
         '{"type":"tool","part":{"tool":"bash","state":{"status":"rejected"}}}\n'
     )
 
-    with patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"):
-        with patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock:
-            run_mock.return_value = MagicMock(returncode=0, stdout=permission_rejected_ndjson, stderr="")
-            with pytest.raises(SystemExit, match=r"\[Bridge Error\] opencode turn aborted"):
-                ask_opencode("Run a script", "t-5932", from_llm="claude", model="deepseek/deepseek-v4.1-flash")
+    with (
+        patch("lu_machinery.ai_agent_bridge._opencode.shutil.which", return_value="/fake/opencode"),
+        patch("lu_machinery.ai_agent_bridge._opencode.subprocess.run") as run_mock,
+    ):
+        run_mock.return_value = MagicMock(returncode=0, stdout=permission_rejected_ndjson, stderr="")
+        with pytest.raises(SystemExit, match=r"\[Bridge Error\] opencode turn aborted"):
+            ask_opencode("Run a script", "t-5932", from_llm="claude", model="deepseek/deepseek-v4.1-flash")
 
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, status FROM messages WHERE task_id = 't-5932' AND to_llm = 'opencode' ORDER BY id DESC LIMIT 1")
-    row = cursor.fetchone()
-    assert row is not None
-    ask_id, status = row
-    assert status.startswith("failed:")
-    assert "opencode turn aborted" in status
-
-    cursor.execute("SELECT message_type, content FROM messages WHERE task_id = 't-5932'")
-    rows = cursor.fetchall()
-    conn.close()
-
-    error_msgs = [r for r in rows if r[0] == "error"]
-    response_msgs = [r for r in rows if r[0] == "response"]
-
-    assert len(error_msgs) >= 1
-    assert len(response_msgs) == 0
-    assert "[Bridge Error]" in error_msgs[0][1]
-
-    from lu_machinery.ai_agent_bridge._ask_lifecycle import _is_clean_terminal_record
-    assert _is_clean_terminal_record(ask_id) is False
+    with AuthorityService() as authority:
+        rows = authority.store.connection.execute("SELECT job_id, state FROM authority_jobs").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["state"] == "failed"
+        receipt = json.loads(authority.read_job_result(rows[0]["job_id"]))
+        assert receipt["turn_outcome"] == "permission_rejected"
+        assert "opencode turn aborted" in receipt["error"]
+        assert receipt["from"] == "opencode"
+        assert receipt["to"] == "claude"
+        assert "I will run rm -rf /" in receipt["partial_response"]
+        assert "response" not in receipt
+        assert authority.store.connection.execute("SELECT COUNT(*) FROM authority_deliveries").fetchone()[0] == 0
 
 
 def test_glm_adapter_parse_response_incomplete_turn():

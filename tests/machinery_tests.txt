@@ -834,6 +834,10 @@ tests/fixtures/product_tree/start-gemini.sh
 tests/fixtures/product_tree/start-muse-driver.sh
 tests/fixtures/routing_baseline/baseline.json.gz
 tests/fixtures/routing_baseline/inputs.json
+tests/fixtures/routing_baseline/no-cli/SHA256SUMS
+tests/fixtures/routing_baseline/no-cli/baseline.json.gz
+tests/fixtures/routing_baseline/no-cli/inputs.json
+tests/fixtures/routing_baseline/no-cli/occurrences.json.gz
 tests/fixtures/routing_baseline/routing-10263.json.gz
 tests/fixtures/routing_baseline/v2-baseline.json.gz
 tests/flake_quarantine.yaml

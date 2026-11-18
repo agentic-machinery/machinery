@@ -128,7 +128,6 @@ review_scheduler:
       - security_review
       - factual_review
       - adversarial_review
-      - surface_review
       - strong_code_review
       - free_lane_code_review
       - cheap_volume_review
@@ -1246,19 +1245,18 @@ models:
     sources:
       - https://cursor.com/blog/composer-2-5
     retirement_reason: "Operator decision 2026-10-23: not subscribed; never route or select."
+  # Retained hramatka capability through OpenCode; never a review, advisory or language seat.
   google-ais/gemma-4-31b-it:
     family: google
     tier: specialist
-    lifecycle: retired
+    lifecycle: active
     aliases: [gemma-4-31b-it, gemma]
-    roles: [surface_review, source_constrained_drafting]
-    transports: []
-    strengths: [low_cost, surface_language_checks]
-    weaknesses: [not_sole_factual_or_critical_reviewer]
+    roles: [bounded_agentic_work]
+    transports: [opencode]
+    strengths: [low_cost]
+    weaknesses: [hramatka_only, not_review_advisory_or_language_seat]
     sources:
       - https://ai.google.dev/gemma/docs/core
-    retirement_reason: >-
-      Not a fleet route. Hramatka uses Gemma directly through its own AIS/OpenRouter HTTP client (operator keep-list 2026-11-07: keep Gemma for hramatka); never remove its code, config or docs.
   gpt-oss-120b:
     family: openai
     tier: specialist

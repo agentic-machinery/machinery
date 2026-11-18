@@ -5,10 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-
 from lu_machinery.agent_runtime.adapters.claude import ClaudeAdapter
 from lu_machinery.ai_agent_bridge import _channels, _channels_cli
 from lu_machinery.ai_agent_bridge._acp_compat import _discussion_failure_metadata, _failure_metadata
+from lu_machinery.fleet_comms.authority import AuthorityService
+from tests.ai_agent_bridge.conftest import acp_runs_in_product, bridge_wake_dir  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir", "acp_runs_in_product")
@@ -28,31 +29,21 @@ def test_discuss_round_four_prompt_preserves_root_and_all_thread_replies(
     truncator entirely. So the truncation marker is no longer expected;
     instead we assert that all thread messages survive verbatim.
     """
-    # A per-test broker database (#5247 xdist leak class); the bridge resolves
-    # ``_config.DB_PATH`` at each access, and ``AB_DB_PATH`` overrides it (#99).
-    db_path = tmp_path / "bridge.db"
-    monkeypatch.setenv("AB_DB_PATH", str(db_path))
-    monkeypatch.setattr(_channels, "fetch_monitor_state", lambda: None)
-    monkeypatch.setattr(_channels, "context_sha256", lambda path: "")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda channel: {"body": "", "revs": {}, "missing": []},
-    )
-
-    _channels.create_channel("architecture", exist_ok=False)
-    # Noisy non-thread messages — would have dominated the channel-tail
-    # window in the pre-#1808 behavior. Thread mode must ignore these.
-    for index in range(205):
-        _channels.post(
-            "architecture",
-            "user",
-            f"prior message {index}",
-            auto_snapshot=False,
-            verify_citations=False,
-        )
-
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
+    pinned_context = "PINNED FLEET CONTEXT: preserve the authoritative revision."
+    with AuthorityService() as authority:
+        authority.create_channel("architecture")
+        authority.set_channel_context("architecture", pinned_context)
+        for index in range(205):
+            authority.publish_message(
+                channel="architecture", sender="user", recipients=(),
+                body=f"prior message {index}",
+            )
+
+    def legacy_context_must_not_be_read(_channel):
+        raise AssertionError("discussion context must come from Fleet Comms")
+
+    monkeypatch.setattr(_channels, "load_channel_context", legacy_context_must_not_be_read)
     observed: dict[str, object] = {}
 
     def fake_discussion(**kwargs):
@@ -79,6 +70,8 @@ def test_discuss_round_four_prompt_preserves_root_and_all_thread_replies(
     assert observed["rounds"] == 3
     assert observed["participants"] == ("codex", "claude")
     assert root_body in str(observed["prompt"])
+    assert pinned_context in str(observed["prompt"])
+    assert "prior message 204" not in str(observed["prompt"])
     assert str(observed["task_id"]).startswith("discuss-architecture-")
     assert str(observed["reserved_conversation_id"]).startswith("conversation_")
 
@@ -142,6 +135,7 @@ def test_acp_result_preserves_only_closed_failure_code(code, expected) -> None:
 def test_only_registered_agy_pin_alias_resolves_and_other_gemini_fails() -> None:
     """The AGY compatibility route never silently downgrades an explicit model."""
     import pytest
+
     from lu_machinery.agent_runtime.adapters.acpx import ACPX_SUPPORTED_PARTICIPANTS
     from lu_machinery.ai_agent_bridge._acp_compat import resolve_compat_model
 

@@ -797,6 +797,12 @@ def cmd_deliveries(args: argparse.Namespace) -> int:
     from lu_machinery.fleet_comms.artifacts import ArtifactStoreError
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 
+    if args.deliveries_command == "pending":
+        from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
+
+        payload = pending_delivery_snapshot(args.recipient, root=_authority_root(args), limit=args.limit)
+        sys.stdout.write(_json_dump(payload))
+        return EXIT_OK if payload["probe"] == "ok" else EXIT_ERROR
     if args.deliveries_command in {"claim", "receive"}:
         _refuse_kimi_recipients((args.recipient,))
     try:
@@ -925,6 +931,15 @@ def _add_deliveries_parser(sub: Any) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     operations = deliveries.add_subparsers(dest="deliveries_command", required=True)
+    pending = operations.add_parser(
+        "pending", help="Read body-free pending counts and IDs without writes or claims",
+        description="Read the Fleet inbox without opening the retired broker or initializing storage.",
+        epilog="Outputs: JSON count, ids and probe; unknown storage exits 3. Related: deliveries receive.",
+    )
+    pending.add_argument("--root", default=None, help="Authority storage directory")
+    pending.add_argument("--recipient", required=True, help="Exact recipient identity")
+    pending.add_argument("--limit", type=int, default=5, help="Maximum IDs to return (1-500, default: 5)")
+    pending.set_defaults(func=cmd_deliveries)
     for name, summary in (
         ("claim", "Lease the next eligible delivery for a recipient"),
         ("receive", "Claim and read a reply, recovering your existing lease if present"),
