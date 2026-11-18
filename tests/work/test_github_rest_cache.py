@@ -144,25 +144,29 @@ def test_non_304_replaces_the_cached_body_and_etag(make_cache):
 
 
 def test_error_is_not_cached_and_the_previous_etag_is_replayed(make_cache):
-    def script(path, headers, timeout, n):
-        if n == 1:
-            return 200, {"etag": '"v1"'}, b'[{"ok": 1}]'
-        if n == 2:
-            return 500, {"etag": '"err"'}, b'{"message": "boom"}'
-        return 304, {"etag": '"v1"'}, b'[{"ok": 999}]'
-
-    calls, transport = _transport_from(script)
+    path = "repos/o/r/issues?state=open"
+    responses = [
+        (200, {"etag": '"v1"'}, b'[{"ok": 1}]'),
+        (500, {"etag": '"err"'}, b'{"message": "boom"}'),
+        (200, {"etag": '"empty"'}, b""),
+        (204, {"etag": '"empty"'}, b""),
+        (304, {"etag": '"v1"'}, b'[{"ok": 999}]'),
+    ]
+    calls, transport = _transport_from(lambda path, headers, timeout, n: responses[n - 1])
     cache = make_cache(transport)
 
-    first = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    with pytest.raises(github_rest.GitHubRestError):
-        cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    third = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-
+    first = cache.get_json(path, timeout=1)
     assert first.body == [{"ok": 1}]
-    assert third.body == [{"ok": 1}]
-    assert calls[1][1] == '"v1"'
-    assert calls[2][1] == '"v1"'
+    with pytest.raises(github_rest.GitHubRestError) as server_error:
+        cache.get_json(path, timeout=1)
+    assert server_error.value.status == 500
+    with pytest.raises(github_rest.GitHubRestError, match="invalid GitHub JSON"):
+        cache.get_json(path, timeout=1)
+    with pytest.raises(github_rest.GitHubRestError) as no_content:
+        cache.get_json(path, timeout=1)
+    assert no_content.value.status == 204
+    assert cache.get_json(path, timeout=1).body == first.body
+    assert calls == [(path, None)] + [(path, '"v1"')] * 4
 
 
 def test_issue_projection_keeps_only_fields_consumers_read():
@@ -840,6 +844,12 @@ def test_pagination_follows_next_and_a_page_cap_is_truncated(make_cache, monkeyp
     found = github_rest.list_open_issues(REPO, limit=1000, timeout=2.0, cache=cache)
     assert [item["number"] for item in found] == [9]
     assert found.truncated is False
+
+    first_page = pages[issues_path]
+    pages[issues_path] = ('"p3"', [], '<https://example.invalid/issues?page=2>; rel="next"')
+    with pytest.raises(github_rest.GitHubRestError, match="GitHub endpoint host mismatch"):
+        github_rest.list_open_issues(REPO, limit=1000, timeout=2.0, cache=cache)
+    pages[issues_path] = first_page
 
     monkeypatch.setattr(github_rest, "_MAX_PAGES", 1)
     capped = make_cache(transport)

@@ -1553,7 +1553,7 @@ class GitHubClient:
             cached = (
                 db.execute(
                     f"SELECT body,headers,at FROM cache WHERE scope=? AND key=? AND ({_CACHE_RESPONSE}) "
-                    "AND at>? AND (? IS NULL OR length(body)<=?)",
+                    "AND at>? AND length(body)>0 AND (? IS NULL OR length(body)<=?)",
                     (
                         self.scope,
                         key,
@@ -1606,6 +1606,9 @@ class GitHubClient:
             reset_at=budget[1] if budget else None,
             now=now,
         )
+        if cacheable and method == "GET" and response.status == 200 and not response.body:
+            # Keep a missing JSON document distinct from a valid JSON null.
+            result.value = response.body
         value = result.value
         # Counted once the call's own writes are committed, in a transaction of its own: a row SQLite
         # refuses, or space it takes, can never cost the budget observation. 599 is this client's own
@@ -1669,12 +1672,8 @@ class GitHubClient:
                                     and type(rate.get("reset")) is int
                                 ):
                                     _store_budget(db, self.scope, name, rate["remaining"], rate["reset"], now=now)
-                        if cacheable:
+                        if cacheable and response.body:
                             _store_cache(db, self.scope, key, response.body, h, now)
-                        else:
-                            # Any write can affect list/detail cache entries. Retain them
-                            # for stale status, but never treat them as fresh without GET.
-                            pass
                     break
                 except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as error:
                     if _transient_lock(error):

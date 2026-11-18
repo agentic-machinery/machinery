@@ -11,6 +11,7 @@ the ``gh --json`` objects the collectors already understood: ``createdAt``,
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable
@@ -92,7 +93,7 @@ class GitHubRestCache:
             raise GitHubRestTimeout(timeout) from exc
         except github_client.GitHubRateLimited as exc:
             raise GitHubRestRateLimited(exc.reset_at, exc.reason) from exc
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
             raise GitHubRestError(str(exc)) from exc
 
         if result.status == 404:
