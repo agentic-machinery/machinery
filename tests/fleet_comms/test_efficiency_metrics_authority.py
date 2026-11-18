@@ -15,48 +15,11 @@ from lu_machinery.fleet_comms.cli import EXIT_OK
 from lu_machinery.fleet_comms.cli import main as cli_main
 from lu_machinery.fleet_comms.efficiency_metrics import (
     DEAD_LETTER_CAUSES,
-    collect_dead_letters,
     collect_dead_letters_authority,
-    collect_delivery_backlog,
     collect_delivery_backlog_authority,
-    collect_efficiency_metrics,
     collect_efficiency_metrics_authority,
-    resolve_metrics_source,
 )
 from lu_machinery.fleet_comms.opsec_store import COMMS_RESPONSE_SCHEMA_VERSION
-
-
-def _seed_broker(db: Path) -> None:
-    conn = sqlite3.connect(db)
-    conn.executescript(
-        """
-        CREATE TABLE deliveries (
-          delivery_id TEXT PRIMARY KEY,
-          message_id TEXT,
-          to_agent TEXT,
-          status TEXT,
-          attempt_count INTEGER DEFAULT 0,
-          dispatched_at TEXT,
-          delivered_at TEXT
-        );
-        CREATE TABLE dead_letters (
-          dead_letter_id TEXT PRIMARY KEY,
-          request_id TEXT,
-          delivery_id TEXT,
-          reason TEXT NOT NULL,
-          successor TEXT,
-          original_expires_at TEXT,
-          created_at TEXT NOT NULL
-        );
-        INSERT INTO deliveries VALUES
-          ('broker-d1','m1','claude','pending',0,NULL,NULL),
-          ('broker-d2','m2','codex','dispatched',1,'2026-08-01T10:00:00',NULL);
-        INSERT INTO dead_letters VALUES
-          ('broker-dl1',NULL,'broker-d9','recipient_retired','agy',NULL,'2026-08-01T09:00:00');
-        """
-    )
-    conn.commit()
-    conn.close()
 
 
 def _seed_authority_plane(root: Path) -> Path:
@@ -152,26 +115,15 @@ def _run_cli(argv: list[str], capsys) -> dict:
     return json.loads(captured.out)
 
 
-def test_resolve_metrics_source_labels(monkeypatch) -> None:
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
-    assert resolve_metrics_source() == "authority"
-    assert resolve_metrics_source(force_legacy=True) == "legacy_forced"
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-    assert resolve_metrics_source() == "legacy"
-    assert resolve_metrics_source(force_legacy=True) == "legacy_forced"
-
-
 def test_backlog_defaults_authority_when_plane_authority(
     tmp_path: Path, capsys, monkeypatch
 ) -> None:
     plane_root = tmp_path / "plane"
     plane_db = _seed_authority_plane(plane_root)
-    broker = tmp_path / "broker.db"
-    _seed_broker(broker)
     monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
 
     payload = _run_cli(
-        ["backlog", "--root", str(plane_root), "--db", str(broker)],
+        ["backlog", "--root", str(plane_root)],
         capsys,
     )
     assert payload["source"] == "authority"
@@ -189,7 +141,7 @@ def test_backlog_defaults_authority_when_plane_authority(
     assert direct["total"] == 2
 
     metrics = _run_cli(
-        ["metrics", "--root", str(plane_root), "--db", str(broker)],
+        ["metrics", "--root", str(plane_root)],
         capsys,
     )
     assert metrics["source"] == "authority"
@@ -201,7 +153,7 @@ def test_backlog_defaults_authority_when_plane_authority(
     assert metrics["jobs"]["queued"] == 1
 
     dead = _run_cli(
-        ["dead-letters", "--root", str(plane_root), "--db", str(broker)],
+        ["dead-letters", "--root", str(plane_root)],
         capsys,
     )
     assert dead["source"] == "authority"
@@ -209,75 +161,6 @@ def test_backlog_defaults_authority_when_plane_authority(
     assert "db_path" not in dead
     assert dead["total"] == 1
     assert dead["by_reason"]["attempts_exhausted"] == 1
-
-
-def test_backlog_legacy_flag_forces_broker(tmp_path: Path, capsys, monkeypatch) -> None:
-    plane_root = tmp_path / "plane"
-    _seed_authority_plane(plane_root)
-    broker = tmp_path / "broker.db"
-    _seed_broker(broker)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
-
-    payload = _run_cli(
-        ["backlog", "--legacy", "--root", str(plane_root), "--db", str(broker)],
-        capsys,
-    )
-    assert payload["source"] == "legacy_forced"
-    assert payload["store"] == {"kind": "legacy-broker", "reachable": True}
-    assert "db_path" not in payload
-    assert payload["total"] == 2
-    assert payload["by_agent"] == {"claude": 1, "codex": 1}
-    assert payload["by_status"]["pending"] == 1
-    assert payload["by_status"]["dispatched"] == 1
-
-    dead = _run_cli(
-        ["dead-letters", "--legacy", "--db", str(broker), "--root", str(plane_root)],
-        capsys,
-    )
-    assert dead["source"] == "legacy_forced"
-    assert dead["store"]["kind"] == "legacy-broker"
-    assert "db_path" not in dead
-    assert dead["by_reason"]["recipient_retired"] == 1
-
-
-def test_backlog_unchanged_when_mode_off(tmp_path: Path, capsys, monkeypatch) -> None:
-    """Non-authority modes keep legacy collector shape; source is additive only."""
-    plane_root = tmp_path / "plane"
-    _seed_authority_plane(plane_root)
-    broker = tmp_path / "broker.db"
-    _seed_broker(broker)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-
-    baseline = collect_delivery_backlog(broker, exclude_retired=True)
-    payload = _run_cli(
-        ["backlog", "--db", str(broker), "--root", str(plane_root)],
-        capsys,
-    )
-    assert payload["source"] == "legacy"
-    stripped = {
-        k: v
-        for k, v in payload.items()
-        if k not in {"source", "store", "response_schema_version", "content_included"}
-    }
-    # CLI adds store/content_included/source; collector keys must match baseline.
-    for key, value in baseline.items():
-        assert stripped[key] == value
-
-    metrics_baseline = collect_efficiency_metrics(broker)
-    metrics = _run_cli(["metrics", "--db", str(broker)], capsys)
-    assert metrics["source"] == "legacy"
-    assert metrics["store"]["kind"] == "legacy-broker"
-    assert "db_path" not in metrics
-    for key, value in metrics_baseline.items():
-        assert metrics[key] == value
-
-    dead_baseline = collect_dead_letters(broker)
-    dead = _run_cli(["dead-letters", "--db", str(broker)], capsys)
-    assert dead["source"] == "legacy"
-    assert dead["store"]["kind"] == "legacy-broker"
-    assert "db_path" not in dead
-    for key, value in dead_baseline.items():
-        assert dead[key] == value
 
 
 def test_authority_collectors_are_read_only(tmp_path: Path) -> None:

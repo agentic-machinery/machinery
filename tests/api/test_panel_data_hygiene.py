@@ -10,8 +10,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from lu_machinery.api import (
-    comms_router, delegate_router, git_hygiene_router, ops_router,
-    runtime_router, state_helpers, state_router,
+    comms_router,
+    delegate_router,
+    git_hygiene_router,
+    ops_router,
+    runtime_router,
+    state_helpers,
+    state_router,
 )
 from lu_machinery.api.monitor_context import fixture_context
 from tests.opsec_fixtures import TOKEN
@@ -110,14 +115,10 @@ def _inputs(monkeypatch, ctx, dirty):
                                  getresponse=lambda: SimpleNamespace(status=200, read=lambda _limit: json.dumps(raw_alerts).encode()))
     monkeypatch.setattr(ops_router.http.client, "HTTPConnection", lambda *_args, **_kwargs: connection)
     metrics = {"deliveries": {"queued": 2, dirty: 3}, "jobs": {dirty: 1}, "requests": {dirty: 2},
-               "messages_legacy": {"by_status": {dirty: 4}, "by_message_type": {dirty: 5}},
                "dead_letters": 1, "db_error": dirty, "source": dirty,
                "latency_seconds": {dirty: dirty, "delivery_dispatch_to_done": {"n": 2, "avg": 3}},
                "store": {"kind": dirty, "reachable": True, "path": dirty}}
-    monkeypatch.setattr(comms_router, "resolve_metrics_source", lambda: "legacy")
-    ctx.roots.message_db_path.parent.mkdir(parents=True, exist_ok=True)
-    ctx.roots.message_db_path.touch()
-    monkeypatch.setattr(comms_router, "collect_efficiency_metrics", lambda _path: metrics)
+    monkeypatch.setattr(comms_router, "_authority_metrics_payload", lambda *_args, **_kwargs: dict(metrics))
     return metrics
 
 
@@ -158,15 +159,12 @@ def test_panel_response_never_echoes_unvetted_provider_values(panel_client, monk
         assert data["alerts"][0]["alertname"] == "UnrecognizedAlert"
     else:
         assert data["deliveries"] == {"queued": 2, "unknown": 3}
-        assert data["messages_legacy"]["by_status"] == {"unknown": 4}
 
 
-@pytest.mark.parametrize("source", ("authority", "legacy"))
-def test_metrics_optional_model_groups_cannot_echo_dirty_keys(panel_client, monkeypatch, source):
+def test_metrics_optional_model_groups_cannot_echo_dirty_keys(panel_client, monkeypatch):
     """Legacy status keys and optional task identity groups must not carry diagnostics."""
     client, ctx = panel_client
     metrics = _inputs(monkeypatch, ctx, TOKEN)
-    monkeypatch.setattr(comms_router, "resolve_metrics_source", lambda: source)
     monkeypatch.setattr(comms_router, "_authority_metrics_payload", lambda *_args, **_kwargs: metrics)
     monkeypatch.setattr(comms_router, "collect_agent_success", lambda **_kwargs: {
         "tasks": 2, "by_agent": {TOKEN: {"tasks": 1}, "codex": {"tasks": 1}},

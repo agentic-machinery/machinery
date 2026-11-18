@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from lu_machinery.ai_agent_bridge import _channels, _channels_cli
+from lu_machinery.ai_agent_bridge import _discuss
 from tests.helpers.product_tree import configured_roots  # noqa: F401, F811
 
 
@@ -27,11 +27,6 @@ def test_discuss_uses_acp_and_durable_authority_only(
     monkeypatch.setenv("AB_REPO_ROOT", str(configured_roots.primary))
     monkeypatch.setenv("LU_AGENT_COMM_TRANSPORT", "acp")
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-cutover")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda _channel: {"body": "", "revs": {}, "missing": []},
-    )
     observed: dict[str, object] = {}
 
     def fake_discussion(**kwargs):
@@ -59,7 +54,7 @@ def test_discuss_uses_acp_and_durable_authority_only(
         models=None,
         efforts=None,
     )
-    assert _channels_cli._handle_discuss(args) == 0
+    assert _discuss.handle_discuss(args) == 0
     assert observed["participants"] == ("codex", "claude")
     assert observed["source"] == "codex"
     assert "conversation: " in capsys.readouterr().out
@@ -73,11 +68,6 @@ def test_partial_discussion_reports_zero_completed_rounds_not_requested_rounds(
     monkeypatch.setenv("AB_REPO_ROOT", str(configured_roots.primary))
     monkeypatch.setenv("LU_AGENT_COMM_TRANSPORT", "acp")
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-partial")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda _channel: {"body": "", "revs": {}, "missing": []},
-    )
     monkeypatch.setattr(
         "lu_machinery.agent_runtime.acpx_discuss.run_discussion",
         lambda **_kwargs: {
@@ -97,7 +87,7 @@ def test_partial_discussion_reports_zero_completed_rounds_not_requested_rounds(
         efforts=None,
     )
 
-    assert _channels_cli._handle_discuss(args) == 1
+    assert _discuss.handle_discuss(args) == 1
 
     output = capsys.readouterr().out
     assert "state: PARTIAL_COMPLETE; rounds completed: 0" in output

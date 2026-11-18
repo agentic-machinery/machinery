@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from lu_machinery.ai_agent_bridge import _channels_cli
+from lu_machinery.ai_agent_bridge import _discuss
 
 
 def _args() -> SimpleNamespace:
@@ -31,7 +31,7 @@ def test_discuss_rejects_single_participant_before_provider_call(monkeypatch) ->
         raise AssertionError("provider must not be called")
 
     monkeypatch.setattr("lu_machinery.agent_runtime.acpx_discuss.run_discussion", fail_provider)
-    assert _channels_cli._handle_discuss(args) == 1
+    assert _discuss.handle_discuss(args) == 1
     assert called is False
 
 
@@ -43,7 +43,7 @@ def test_discuss_rejects_five_acp_seats_before_authority_creation(
     args = _args()
     args.with_agents = "codex,cursor,glm,claude,grok"
 
-    assert _channels_cli._handle_discuss(args) == 1
+    assert _discuss.handle_discuss(args) == 1
 
     error = capsys.readouterr().err
     assert "codex, cursor, glm, claude, grok" in error

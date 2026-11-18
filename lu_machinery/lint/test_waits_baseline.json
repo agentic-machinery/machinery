@@ -51,13 +51,6 @@
       "occurrence": 0
     },
     {
-      "path": "tests/ai_agent_bridge/test_ab_channel_watch.py",
-      "kind": "sleep",
-      "scope": "test_run_inbox_emits_watch_events_with_heartbeat._slow_invoke",
-      "fingerprint": "ca5e2d1241b1486f679a90745426a32a4caf01eefc6192f73cfdfc56165e11b1",
-      "occurrence": 0
-    },
-    {
       "path": "tests/api/test_account_logins.py",
       "kind": "timer-poll",
       "scope": "test_incomplete_probe_is_unknown_and_leaves_no_process_or_reader",

@@ -14,46 +14,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir", "acp_runs_in_product")
 
-@pytest.fixture(autouse=True)
-def _isolate_bridge_db_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Per-test isolation for the bridge broker database (#5247).
-
-    The bridge resolves ``_config.DB_PATH`` at each access, and ``AB_DB_PATH``
-    overrides it. A shared broker file would let a sibling worker/test make
-    ``create_channel`` / ``get_channel`` disagree, and ``ab discuss`` would
-    exit before ``runtime_invoke``.
-
-    Autouse so every test in this module — including future discuss
-    siblings — inherits isolation without reintroducing the leak.
-    """
-
-    db_path = tmp_path / "bridge.db"
-    monkeypatch.setenv("AB_DB_PATH", str(db_path))
-    monkeypatch.setattr(
-        "lu_machinery.fleet_comms.artifacts.default_plane_root",
-        lambda **_kwargs: tmp_path / "authority-plane",
-    )
-    return db_path
-
-
 @pytest.fixture
-def discuss_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub channel I/O for discuss tests; relies on ``_isolate_bridge_db_path``."""
-    from lu_machinery.ai_agent_bridge import _channels
-
-    monkeypatch.setattr(_channels, "fetch_monitor_state", lambda: None)
-    monkeypatch.setattr(_channels, "context_sha256", lambda path: "")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda channel: {"body": "", "revs": {}, "missing": []},
-    )
-    _channels.create_channel("shared", exist_ok=True)
-    _channels.create_channel("agy-topic", exist_ok=True)
+def discuss_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the discussion's Fleet Comms authority writes in this test's plane."""
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
 
 
 def test_delegate_dispatch_accepts_agy_agent(tmp_path, monkeypatch, capsys):
@@ -95,7 +64,7 @@ def test_delegate_dispatch_accepts_agy_agent(tmp_path, monkeypatch, capsys):
 
 def test_ab_discuss_accepts_agy_in_multi_participant_list(discuss_bridge, monkeypatch):
     """ACP discussion accepts Agy as one member of a bounded participant set."""
-    from lu_machinery.ai_agent_bridge import _channels_cli
+    from lu_machinery.ai_agent_bridge import _discuss
 
     observed: dict[str, object] = {}
 
@@ -120,14 +89,14 @@ def test_ab_discuss_accepts_agy_in_multi_participant_list(discuss_bridge, monkey
         models=None,
     )
 
-    assert _channels_cli._handle_discuss(args) == 0
+    assert _discuss.handle_discuss(args) == 0
     assert observed["participants"] == ("agy", "pool")
     assert observed["models"] is None
 
 
 def test_ab_discuss_passes_registered_agy_model_pin(discuss_bridge, monkeypatch):
     """The registered Agy ACP model pin reaches the durable controller."""
-    from lu_machinery.ai_agent_bridge import _channels_cli
+    from lu_machinery.ai_agent_bridge import _discuss
 
     observed: dict[str, object] = {}
 
@@ -152,5 +121,5 @@ def test_ab_discuss_passes_registered_agy_model_pin(discuss_bridge, monkeypatch)
         models="agy:gemini-3.8-flash-high",
     )
 
-    assert _channels_cli._handle_discuss(args) == 0
+    assert _discuss.handle_discuss(args) == 0
     assert observed["models"] == {"agy": "gemini-3.8-flash-high"}

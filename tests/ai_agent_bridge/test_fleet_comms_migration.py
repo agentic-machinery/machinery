@@ -2,46 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
-from lu_machinery.ai_agent_bridge import _db
 from lu_machinery.fleet_comms import migrations
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
-
-
-def test_bridge_upgrades_legacy_copy_without_mutating_legacy_rows(tmp_path, monkeypatch) -> None:
-    db_path = tmp_path / "messages.db"
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """CREATE TABLE messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, from_llm TEXT NOT NULL,
-            to_llm TEXT NOT NULL, message_type TEXT, content TEXT NOT NULL, data TEXT,
-            timestamp TEXT NOT NULL, acknowledged INTEGER DEFAULT 0
-        )"""
-    )
-    conn.execute(
-        "INSERT INTO messages(task_id, from_llm, to_llm, content, timestamp) VALUES ('legacy', 'codex', 'agy', 'body', 'now')"
-    )
-    conn.commit()
-    conn.close()
-    monkeypatch.setenv("AB_DB_PATH", str(db_path))
-
-    migrated = _db.get_db()
-    try:
-        assert migrated.execute("SELECT content FROM messages WHERE task_id = 'legacy'").fetchone()[0] == "body"
-        assert (
-            migrated.execute("SELECT MAX(version) FROM comms_schema_migrations").fetchone()[0]
-            == MIGRATIONS[-1].version
-        )
-        tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        assert {
-            "comms_messages",
-            "requests",
-            "artifacts",
-            "formal_review_jobs",
-            "acp_conversations",
-            "acp_conversation_events",
-        }.issubset(tables)
-    finally:
-        migrated.close()
 
 
 def test_apply_migrations_closes_prelock_read_transaction_and_returns_version(

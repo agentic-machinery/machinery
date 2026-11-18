@@ -851,19 +851,6 @@ def test_keeper_and_closeout_native_refusal_types(monkeypatch, tmp_path, github_
 
 @pytest.mark.usefixtures('configured_roots', 'fake_catalog')
 @pytest.mark.usefixtures('github_command_boundary')
-def test_bridge_comment_refusal_is_rendered_and_returns_false(monkeypatch, capsys):
-    from lu_machinery.ai_agent_bridge import _github
-
-    def refuse(*args, **kwargs):
-        raise gate.PublishBlocked("synthetic refusal")
-
-    monkeypatch.setattr(_github, "request_run", refuse)
-    assert not _github._gh_comment(1, "clean")
-    assert "publish_blocked: synthetic refusal" in capsys.readouterr().out
-
-
-@pytest.mark.usefixtures('configured_roots', 'fake_catalog')
-@pytest.mark.usefixtures('github_command_boundary')
 @pytest.mark.parametrize(
     "command,valid_shell",
     [

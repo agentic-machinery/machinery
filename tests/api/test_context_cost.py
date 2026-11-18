@@ -16,7 +16,7 @@ from lu_machinery.api.monitor_context import fixture_context
 
 
 def test_lifespan_closes_context_resources_for_repeated_apps(monkeypatch, tmp_path: Path) -> None:
-    for name in ("preload_all", "install_signal_logging", "ensure_broker_db_ready", "seed_manifest_inventory"):
+    for name in ("preload_all", "install_signal_logging", "seed_manifest_inventory"):
         monkeypatch.setattr(api_main, name, Mock())
     monkeypatch.setattr(api_main.isa, "schedule_refresh", Mock())
     # CF finding (PR #7571): a bare Mock left _WORKER_LOOP unexercised across

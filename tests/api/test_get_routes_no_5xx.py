@@ -62,7 +62,6 @@ _CONFIG_ROOTS = (
     "CURRICULUM_ROOT",
     "DASHBOARDS_DIR",
     "BATCH_STATE_DIR",
-    "MESSAGE_DB",
 )
 
 

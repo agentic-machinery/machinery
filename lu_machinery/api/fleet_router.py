@@ -33,7 +33,6 @@ from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
 
-from . import comms_router as legacy_comms
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
@@ -64,10 +63,6 @@ MAX_ACTIVITY_SCAN = 500
 MAX_OPERATIONS_ITEMS = 50
 AUTHORITY_HEALTH_WINDOW_HOURS = 24
 
-_ZOMBIE_TYPES = frozenset(
-    {"stale_message", "pingpong", "error_loop", "orphan_pid", "corrupt_pid"}
-)
-_ZOMBIE_SEVERITIES = frozenset({"warning", "critical"})
 _BATCH_HEALTH = frozenset({"complete", "healthy", "stalled", "dead", "unknown"})
 _TRACK_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
 _PROBE_ERROR = re.compile(r"^ps: [A-Za-z][A-Za-z0-9_]{0,63}(?: \d{1,6})?$")
@@ -588,100 +583,6 @@ def _non_negative_float(value: Any) -> float:
     return max(0.0, round(number, 1))
 
 
-def _legacy_broker_snapshot(ctx: MonitorContext | None = None) -> dict[str, Any]:
-    """Read the legacy broker with an explicit query-only connection.
-
-    The legacy health route opens a normal connection so that it can report
-    writability. This consolidated observer deliberately does not reuse that
-    behavior: a GET must never create, migrate, or journal the broker database.
-    """
-    resolved_ctx = resolve_context(ctx)
-    db_path = resolved_ctx.roots.message_db_path
-    result: dict[str, Any] = {
-        "availability": "db_missing",
-        "db_exists": False,
-        "readable": False,
-        "size_kb": 0.0,
-        "unacknowledged_depth": 0,
-    }
-    if db_path is None or not db_path.is_file():
-        return result
-
-    result["db_exists"] = True
-    try:
-        result["size_kb"] = round(db_path.stat().st_size / 1024, 1)
-        connection = open_readonly(db_path.resolve(), timeout=0.25)
-        try:
-            connection.execute("PRAGMA query_only = ON")
-            result["readable"] = True
-            if not _table_exists(connection, "messages"):
-                result["availability"] = "table_missing"
-                return result
-            row = connection.execute(
-                "SELECT COUNT(*) FROM messages WHERE acknowledged = 0"
-            ).fetchone()
-            result["unacknowledged_depth"] = _non_negative_int(row[0] if row else 0)
-            result["availability"] = "available"
-        finally:
-            connection.close()
-    except (OSError, ValueError, sqlite3.Error):
-        logger.warning("Fleet operations could not read the legacy broker database")
-        result["availability"] = "db_unavailable"
-        result["readable"] = False
-    return result
-
-
-def _safe_zombie_projection(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        return {
-            "availability": "unavailable",
-            "total": 0,
-            "returned": 0,
-            "limit": MAX_OPERATIONS_ITEMS,
-            "truncated": False,
-            "by_type": {},
-            "by_severity": {},
-            "items": [],
-        }
-
-    source = raw.get("zombies")
-    source_items = source if isinstance(source, list) else []
-    items: list[dict[str, Any]] = []
-    by_type: Counter[str] = Counter()
-    by_severity: Counter[str] = Counter()
-    for entry in source_items:
-        if not isinstance(entry, dict):
-            continue
-        zombie_type = entry.get("type")
-        if zombie_type not in _ZOMBIE_TYPES:
-            zombie_type = "unknown"
-        severity = entry.get("severity")
-        if severity not in _ZOMBIE_SEVERITIES:
-            severity = "unknown"
-        by_type[zombie_type] += 1
-        by_severity[severity] += 1
-        if len(items) >= MAX_OPERATIONS_ITEMS:
-            continue
-        item: dict[str, Any] = {"type": zombie_type, "severity": severity}
-        for field in ("message_count_1h", "error_count"):
-            if field in entry:
-                item[field] = _non_negative_int(entry[field])
-        if "age_hours" in entry:
-            item["age_hours"] = _non_negative_float(entry["age_hours"])
-        items.append(item)
-
-    return {
-        "availability": "available",
-        "total": sum(by_type.values()),
-        "returned": len(items),
-        "limit": MAX_OPERATIONS_ITEMS,
-        "truncated": sum(by_type.values()) > len(items),
-        "by_type": dict(sorted(by_type.items())),
-        "by_severity": dict(sorted(by_severity.items())),
-        "items": items,
-    }
-
-
 def _safe_probe_errors(raw: Any) -> list[str]:
     """Keep process-probe failures that name the failure class, not a path or secret."""
     if not isinstance(raw, list):
@@ -770,56 +671,21 @@ async def _product_batch_snapshot(ctx: MonitorContext) -> dict[str, Any] | None:
 
 @router.get("/operations")
 async def fleet_operations(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
-    """Sanitized legacy broker, zombie, and batch operations projection."""
-    broker_result, process_result, zombie_result, batch_result = await asyncio.gather(
-        asyncio.to_thread(_legacy_broker_snapshot, ctx),
-        asyncio.to_thread(legacy_comms.active_processes, ctx=ctx),
-        asyncio.to_thread(legacy_comms.detect_zombies, stale_hours=2.0, pingpong_threshold=5, ctx=ctx),
-        _product_batch_snapshot(ctx),
-        return_exceptions=True,
-    )
+    """Sanitized curriculum batch operations projection.
 
-    broker = (
-        broker_result
-        if isinstance(broker_result, dict)
-        else {
-            "availability": "db_unavailable",
-            "db_exists": False,
-            "readable": False,
-            "size_kb": 0.0,
-            "unacknowledged_depth": 0,
-        }
-    )
-    if isinstance(process_result, dict):
-        broker["live_process_count"] = _non_negative_int(process_result.get("alive"))
-        broker["process_availability"] = "available"
-    else:
-        broker["live_process_count"] = None
-        broker["process_availability"] = "unavailable"
-        if broker["availability"] == "available":
-            broker["availability"] = "partial"
-
-    zombies = _safe_zombie_projection(
-        zombie_result if not isinstance(zombie_result, BaseException) else None
-    )
-    batches = _safe_batch_projection(
-        batch_result if not isinstance(batch_result, BaseException) else None
-    )
-    sections = (broker["availability"], zombies["availability"], batches["availability"])
-    if all(section == "available" for section in sections):
-        availability = "available"
-    elif all(section in {"unavailable", "db_unavailable"} for section in sections):
-        availability = "unavailable"
-    else:
-        availability = "partial"
-
+    The legacy broker and zombie sections are removed with the legacy store (#515).
+    """
+    try:
+        batch_result = await _product_batch_snapshot(ctx)
+    except Exception:  # a failed product collector reads as unavailable, never a 500
+        logger.warning("Fleet operations could not collect the product batch snapshot")
+        batch_result = None
+    batches = _safe_batch_projection(batch_result)
     return {
         "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "read_only": True,
         "writes_enabled": False,
-        "availability": availability,
-        "broker": broker,
-        "zombies": zombies,
+        "availability": batches["availability"],
         "batches": batches,
     }
 

@@ -15,12 +15,6 @@ from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS, apply_migrations
 
 
-def _message_ctx(root: Path, message_db: Path) -> MonitorContext:
-    """Fixture context whose broker DB is pinned to ``message_db``."""
-    ctx = fixture_context(root)
-    return ctx.with_roots(message_db_path=message_db)
-
-
 def _client(ctx: MonitorContext | None = None) -> TestClient:
     from lu_machinery.api.comms_router import router
 
@@ -136,42 +130,6 @@ def test_api_plane_status_invalid_mode(monkeypatch, tmp_path: Path) -> None:
     assert data["mode_error"] == "invalid_mode"
 
 
-def test_comms_v1_collectors_with_seeded_broker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")  # #7486: pin legacy path
-    broker = tmp_path / "messages.db"
-    conn = sqlite3.connect(broker)
-    conn.executescript(
-        """
-        CREATE TABLE channel_messages (
-          message_id TEXT PRIMARY KEY,
-          channel TEXT,
-          from_agent TEXT,
-          kind TEXT,
-          body TEXT,
-          created_at TEXT
-        );
-        CREATE TABLE deliveries (
-          delivery_id TEXT PRIMARY KEY,
-          message_id TEXT,
-          to_agent TEXT,
-          to_model TEXT,
-          status TEXT,
-          dispatched_at TEXT,
-          delivered_at TEXT,
-          attempt_count INTEGER DEFAULT 0
-        );
-        """
-    )
-    conn.close()
-    client = _client(_message_ctx(tmp_path, broker))
-    metrics = client.get("/api/comms/v1/metrics").json()
-    for payload in (metrics,):
-        assert payload["response_schema_version"] == "comms.v2"
-        assert payload["store"]["kind"] == "legacy-broker"
-        assert payload["store"]["reachable"] is True
-        assert "db_path" not in payload
-
-
 def _stub_api_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep lifespan tests on the authority guard, not warmup side effects."""
     from lu_machinery.api import main as api_main
@@ -181,7 +139,6 @@ def _stub_api_startup(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(api_main, "preload_all", lambda *_args: None)
     monkeypatch.setattr(api_main, "install_signal_logging", lambda: None)
-    monkeypatch.setattr(api_main, "ensure_broker_db_ready", lambda **_kwargs: None)
     monkeypatch.setattr(api_main, "seed_manifest_inventory", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(api_main.isa, "schedule_refresh", lambda force=False: None)
     monkeypatch.setattr(api_main, "warm_projection_cache", lambda **_kwargs: None)

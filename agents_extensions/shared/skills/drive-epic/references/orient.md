@@ -1,4 +1,4 @@
-# Orient, inbox watcher, topology (drive-epic §0, §0b, §1)
+# Orient, inbox count, topology (drive-epic §0, §0b, §1)
 
 Read at cold start and whenever you lose track of fleet state. The §0a inbox drain
 itself is stated once in the core `SKILL.md` loop.
@@ -48,28 +48,19 @@ and next-action time alongside the projection — also a queue INPUT, never a re
 (absent) cache → `503` `building` + `retry_after_s` (does not trigger a build); unknown
 `stream` → `400` with `valid_streams`.
 
-## §0b. Optional Monitor inbox-watcher wakeup — cold start only
+## §0b. Fleet Comms inbox count — cold start
 
-At cold-start, **if your harness has a Monitor-equivalent**, invoke it once with that
-harness's `persistent`/timeout option, pointed at this one shell command:
+The legacy inbox watcher's notification mode is removed with the legacy stores (#515).
+The prompt hook `check-agent-inbox.sh` reports queued Fleet Comms deliveries, and this
+body-free count is the one-shot equivalent:
 
 ```bash
-lu_machinery/ai_agent_bridge/inbox_watch.sh "$SESSION_HANDOFF_AGENT"
+.venv/bin/python -I -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"
 ```
 
-This is a **wakeup signal only**: each stdout line says that an unconsumed legacy
-message exists, with its id, sender, request id, and a bounded preview. It never reads
-the full body into your context and never marks a message consumed. You still must run
-the required §0a / §4a / §5a / §8a inbox drains in the core loop to read, apply, and
-explicitly live-consume everything the signal points at; those drains remain the
-universal fallback for every seat, watcher or not.
-
-Direct confirmation exists only for **Claude Code, Gemini/AGY, and Grok CLI**. For any
-other harness, ask the running agent directly whether it has an equivalent before using
-one; do not infer it from documentation or `--help`. Stop a running watcher cleanly
-with `lu_machinery/ai_agent_bridge/inbox_watch.sh --stop "$SESSION_HANDOFF_AGENT"`; if a
-crashed process leaves a stale pidfile, the operating system releases its advisory lock
-and the next watcher replaces the recorded pid safely.
+It never reads a body and never claims a delivery. You still must run the required
+§0a / §4a / §5a / §8a inbox drains in the core loop to read, apply, and acknowledge
+everything it points at.
 
 ## §1. Read topology + metrics (don't hold state — query it)
 

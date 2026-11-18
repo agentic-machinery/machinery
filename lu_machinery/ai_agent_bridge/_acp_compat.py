@@ -644,11 +644,11 @@ def run_compat_ask(
     stdout_only: bool = False,
     hard_timeout: int | None = None,
 ) -> object:
-    """Execute one normal ACP ask with fail-open body-free usage telemetry."""
-    participant = admit_compat_target(command_target, model=model, data=data).recipient
+    """Execute one normal ACP ask; SIGTERM unwinds it like an interrupt."""
+    admit_compat_target(command_target, model=model, data=data)
     if not task_id or not task_id.strip():
         raise ValueError("ACP ask requires a non-empty task_id")
-    # Every ACP ask starts with the rules core: refuse before telemetry, the
+    # Every ACP ask starts with the rules core: refuse before the
     # job-host forward or any authority enqueue/claim (the runner re-checks).
     from lu_machinery.agent_runtime.runner import InterAgentTransportError
     from lu_machinery.lib import rules_core
@@ -660,13 +660,6 @@ def run_compat_ask(
             f"ask-{command_target} refused: {exc}; the rules core is required"
         ) from exc
 
-    from lu_machinery.telemetry.legacy_bridge import (
-        finish_bridge_invocation_safely,
-        start_bridge_invocation_safely,
-    )
-
-    telemetry_token = start_bridge_invocation_safely(participant, source)
-
     def terminated(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt("ACP ask terminated")
 
@@ -674,7 +667,7 @@ def run_compat_ask(
     if threading.current_thread() is threading.main_thread():
         previous_sigterm = signal.signal(signal.SIGTERM, terminated)
     try:
-        result = _run_compat_ask_impl(
+        return _run_compat_ask_impl(
             command_target,
             content,
             task_id=task_id,
@@ -687,17 +680,9 @@ def run_compat_ask(
             stdout_only=stdout_only,
             hard_timeout=hard_timeout,
         )
-    except BaseException:
-        finish_bridge_invocation_safely(telemetry_token, succeeded=False)
-        raise
     finally:
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)
-    finish_bridge_invocation_safely(
-        telemetry_token,
-        succeeded=bool(getattr(result, "ok", False)),
-    )
-    return result
 
 
 def _run_compat_ask_impl(
@@ -714,7 +699,7 @@ def _run_compat_ask_impl(
     stdout_only: bool = False,
     hard_timeout: int | None = None,
 ) -> object:
-    """Execute the authority/ACP path after telemetry admission.
+    """Execute the authority/ACP path after admission.
 
     ``review=True`` runs as a normal ask: the review of record is one direct
     cross-family round with the verdict posted on the PR by the requester

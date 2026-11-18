@@ -180,21 +180,6 @@
    "sha256": "c856a293b3e3201121b982622833fd3d451fd287185a081e13c72d1594833e0a"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-   "rule": "python.lang.best-practice.arbitrary-sleep",
-   "sha256": "f1449a68cf9f408fa7caccd50f208f557dc9c44358f5b4d9214513676d630372"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_channels_cli.py",
-   "rule": "python.lang.best-practice.arbitrary-sleep",
-   "sha256": "9a2d2f00ee41a3598c90684b66cac15b28809237d04d9f3d503fe47737d3b801"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_channels_watch.py",
-   "rule": "python.lang.best-practice.arbitrary-sleep",
-   "sha256": "36076541d12c1a0cd7edff4267293f47d8b0c5ded61c0575f6a6bb032779977e"
-  },
-  {
    "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
    "rule": "python.lang.best-practice.arbitrary-sleep",
    "sha256": "5e69384fd75fd4bea9ae4658dbaeb5c17f30efbf43850e7d2eb9adeae6936eb0"
@@ -365,11 +350,6 @@
    "sha256": "4fae900dc5e1a8cd39296c401e220ba1e078abf368ca87204e04009b213532ef"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/_gemini.py",
-   "rule": "python.lang.best-practice.unspecified-open-encoding",
-   "sha256": "fc2043aaa3ffdf8e272c9cd846f0491ea7a01d1446093408b0a085b5011e8147"
-  },
-  {
    "path": "lu_machinery/dispatcher/store.py",
    "rule": "python.lang.best-practice.unspecified-open-encoding",
    "sha256": "2a642c5c987dc0ca60cd5bebac103ebd6b3a9950c94606c0b4c377f3b062b0ce"
@@ -393,16 +373,6 @@
    "path": "lu_machinery/agent_runtime/runner.py",
    "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
    "sha256": "a0177c552d96aa434de4c2903ab1b08918b2fa80d9ff01c75dacca3c293cc202"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_inbox.py",
-   "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
-   "sha256": "97b4eda90e04c0191c6afe10ab5e922b411ed8d24787a58c5224f7bad6c8a470"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_inbox.py",
-   "rule": "python.lang.correctness.common-mistakes.string-concat-in-list",
-   "sha256": "a49496f3f3dabbbcc3b52166c8d63f7493ef72436f7a7e58e114fa378f40de1c"
   },
   {
    "path": "lu_machinery/api/git_hygiene_router.py",
@@ -698,16 +668,6 @@
    "path": "lu_machinery/agent_runtime/env_sanitize.py",
    "rule": "python.lang.maintainability.is-function-without-parentheses",
    "sha256": "664afd50e9478cce4a0caba5c70b894df1c41d8fd59a96a09c6fd3a549802fc1"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_citation_check.py",
-   "rule": "python.lang.maintainability.is-function-without-parentheses",
-   "sha256": "975247a0c8f9195cfb5b146a1755f8410bb8586c274074a810b68f0b89bf2e22"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_citation_check.py",
-   "rule": "python.lang.maintainability.is-function-without-parentheses",
-   "sha256": "975247a0c8f9195cfb5b146a1755f8410bb8586c274074a810b68f0b89bf2e22"
   },
   {
    "path": "lu_machinery/api/epics_router.py",
@@ -1155,16 +1115,6 @@
    "sha256": "77b05c3db01f0d2aaa89065faf8fe2791404b2b71ae1795b3cd2a7a16e3a89a4"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "2166e559687a21ffe1e5c1e03ba1c84c095e1a99cfc81379e7af0fcf26c153c2"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_channels_cli.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "1a85b5222b6d93daad3ac93ba44a7fabc26895e213ccda913c45e99d255655ac"
-  },
-  {
    "path": "lu_machinery/ai_agent_bridge/_dispatch_wrappers.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "fe772e32bd40d55338004711e1aac8f4cda4a655e27a664a140a6f022fe70999"
@@ -1180,11 +1130,6 @@
    "sha256": "b23598fe4262534922120d6c72b4cfdf06a3ff767f7134f4c1086f994e0b9f43"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/_gemini.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "8ac731b698c8931a3b9046e761ebb74e22f551097699c70946b6d43dfdeedf29"
-  },
-  {
    "path": "lu_machinery/ai_agent_bridge/_job_host_forward.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "04820377c1efd4d2c8c85f50cf2240566434c298bd1fcca8bbfa8ec0029f6f85"
@@ -1198,11 +1143,6 @@
    "path": "lu_machinery/ai_agent_bridge/_opencode.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "4c4b6fa367d40420cdc27c1078752a7ff37ac41c1706ebecc44033a366d3d19e"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_orphan_recovery.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "6e0769e6b2abace600943814aa5f7ef31ea7f53a05b507fc466c47aefad81a7b"
   },
   {
    "path": "lu_machinery/ai_agent_bridge/_review_worktree.py",
@@ -1935,11 +1875,6 @@
    "sha256": "5a6e537c2ba28ef19cad9f47cbb139af0bc071b53c3969479e06ff8868284e33"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/_channels_cli.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-tainted-env-args",
-   "sha256": "b8c077315da075ac835317536923b770bf695f39cdcbba2db3282affc7e14df7"
-  },
-  {
    "path": "lu_machinery/api/project_state_collect.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-tainted-env-args",
    "sha256": "255c5f36fccb680fd19dbe00aca19f26e6cef42aac097624ee4013796a8a9bed"
@@ -1968,11 +1903,6 @@
    "path": "lu_machinery/agent_runtime/model_pause.py",
    "rule": "python.lang.security.audit.dynamic-urllib-use-detected",
    "sha256": "504549e5aa11c8063fee76ac073ed116ae758e55d6ea3dc46536129df03efdd7"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/_channels.py",
-   "rule": "python.lang.security.audit.dynamic-urllib-use-detected",
-   "sha256": "be0fbb2c4415773ca192b8fe14a04aa1699b5da17267f74fbd6b9fb446879354"
   },
   {
    "path": "lu_machinery/ai_agent_bridge/monitor_client.py",
@@ -2083,11 +2013,6 @@
    "path": "lu_machinery/session_streams/db.py",
    "rule": "python.lang.security.audit.formatted-sql-query",
    "sha256": "c1608a91fbd93762a4fff6ab25b560ca43a635e89d00b05a7bad86d24ecf654c"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/broker_indexes.py",
-   "rule": "python.lang.security.audit.formatted-sql-query",
-   "sha256": "f2821069ff1c3d2a84c545aa0d66081ea05d9b673bcde73d46fdcd3fb3e8b5ce"
   },
   {
    "path": "lu_machinery/api/cluster_router.py",

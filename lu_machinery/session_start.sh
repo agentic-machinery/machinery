@@ -8,7 +8,7 @@
 #   3. Active builds
 #   4. Failing modules
 #   5. Active-manifest learner state
-#   6. Gemini inbox check
+#   6. Fleet Comms inbox count
 #
 # Issue: #595
 
@@ -121,39 +121,25 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 4. Gemini inbox
+# 4. Fleet Comms inbox (body-free count from the Monitor API)
 # ---------------------------------------------------------------------------
-# Check via the message broker MCP — fall back gracefully if not available
-INBOX_COUNT=""
-if command -v curl > /dev/null 2>&1; then
-    # The bridge package loads from this tree by the shared module bootstrap.
-    repo_root="$(cd "$MACHINERY_DIR/.." && pwd)"
-    # shellcheck disable=SC1091
-    source "$repo_root/lu_machinery/lib/project_interpreter.sh"
-    if inbox_python="$(project_interpreter_resolve "$repo_root")"; then
-        INBOX_RESULT=$(project_python_run "$inbox_python" -c "
-import json
-try:
-    from lu_machinery.ai_agent_bridge import check_inbox
-    msgs = check_inbox('claude')
-    print(json.dumps(msgs))
-except Exception as e:
-    print(json.dumps({'error': str(e)}))
-" 2>/dev/null || echo '{"error": "bridge unavailable"}')
-    else
-        INBOX_RESULT='{"error": "bridge unavailable"}'
-    fi
-
-    if echo "$INBOX_RESULT" | jq -e '.error' > /dev/null 2>&1; then
-        echo -e "${BOLD}GEMINI INBOX${NC}  ${DIM}(check manually: mcp__message-broker__check_inbox)${NC}"
-    else
-        inbox_count=$(echo "$INBOX_RESULT" | jq 'if type == "array" then length else .unread // 0 end' 2>/dev/null || echo "?")
-        if [ "$inbox_count" != "0" ] && [ "$inbox_count" != "?" ]; then
-            echo -e "${BOLD}GEMINI INBOX${NC}  ${YELLOW}$inbox_count unread${NC}"
-        else
-            echo -e "${BOLD}GEMINI INBOX${NC}  ${DIM}empty${NC}"
-        fi
-    fi
+# Only a registered seat has an inbox: without SESSION_HANDOFF_AGENT it is unknown.
+INBOX_AGENT="${SESSION_HANDOFF_AGENT:-}"
+if [ -z "$INBOX_AGENT" ]; then
+    echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (no seat identity: set SESSION_HANDOFF_AGENT to your slot)${NC}"
+    INBOX_COUNT=""
+else
+    INBOX_COUNT=$(curl -s --max-time 5 -G "$API/api/comms/inbox" --data-urlencode "agent=$INBOX_AGENT" \
+        | jq -r 'if .probe == "ok" and (.count | type == "number") then .count else "?" end' 2>/dev/null || echo "?")
+fi
+if [ -z "$INBOX_AGENT" ]; then
+    :
+elif [ "$INBOX_COUNT" = "?" ] || [ -z "$INBOX_COUNT" ]; then
+    echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (check: the project interpreter -I -m ${MACHINERY_PKG}.fleet_comms deliveries pending --recipient $INBOX_AGENT)${NC}"
+elif [ "$INBOX_COUNT" != "0" ]; then
+    echo -e "${BOLD}INBOX${NC}  ${YELLOW}$INBOX_COUNT queued for $INBOX_AGENT${NC}"
+else
+    echo -e "${BOLD}INBOX${NC}  ${DIM}empty${NC}"
 fi
 
 echo ""

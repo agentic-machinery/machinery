@@ -207,7 +207,7 @@ def test_orient_lifespan_warms_shared_sections_and_cancels_timer(monkeypatch, tm
     original_refresh = api_main.refresh_orient_periodically
     monkeypatch.setattr(api_main, "_collect_orient_sections", observe)
     monkeypatch.setattr(api_main, "refresh_orient_periodically", wait_for_cancellation)
-    for name in ("preload_all", "install_signal_logging", "ensure_broker_db_ready", "seed_manifest_inventory",
+    for name in ("preload_all", "install_signal_logging", "seed_manifest_inventory",
                  "warm_projection_cache", "schedule_state_scan_warmup", "start_periodic_refresh", "stop_periodic_refresh"):
         monkeypatch.setattr(api_main, name, Mock())
     monkeypatch.setattr(api_main.isa, "schedule_refresh", Mock())

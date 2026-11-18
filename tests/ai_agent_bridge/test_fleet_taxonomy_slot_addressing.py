@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from lu_machinery.ai_agent_bridge import _channels, _inbox
+
+from lu_machinery import agent_identity
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration.slot_routing import resolve_slot_holder
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -25,7 +25,7 @@ _AREA_ASSIGNMENTS_YAML = machinery_path("config/area_assignments.yaml")
 
 def test_roster_slots_accepted_by_validation() -> None:
     """Verify every slot configured in area_assignments.yaml is accepted by validation."""
-    all_valids = _channels.get_valid_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
+    all_valids = agent_identity.get_valid_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
     assert "grok-infra" in all_valids
     assert "claude-atlas" in all_valids
     assert "codex-devops" in all_valids
@@ -37,27 +37,18 @@ def test_roster_slots_accepted_by_validation() -> None:
     assert "cursor-atlas" in all_valids
     assert "codex-hramatka" in all_valids
 
-    # Verify _validate_agent, _validate_post_agent, _validate_recipient_agent do not raise
-    _channels._validate_agent("grok-infra", assignments_path=_AREA_ASSIGNMENTS_YAML)
-    _channels._validate_post_agent("claude-atlas", assignments_path=_AREA_ASSIGNMENTS_YAML)
-    _channels._validate_recipient_agent("codex-devops", assignments_path=_AREA_ASSIGNMENTS_YAML)
-    _channels._validate_recipient_agent("cursor-infra", assignments_path=_AREA_ASSIGNMENTS_YAML)
-    _inbox._validate_agent("grok-infra")
-    _inbox._validate_agent("cursor-infra")
-
 
 @pytest.mark.parametrize("provider", ["claude", "codex", "gemini", "grok", "cursor"])
 def test_monitor_aliases_preserve_inbox_destinations_beside_muse(provider: str) -> None:
     slot = f"{provider}-monitor"
     # grok-monitor is a registered slot (#10835); the other monitor names keep the bare-provider inbox.
     expected = slot if provider == "grok" else provider
-    assert _channels.resolve_recipient_alias(slot, assignments_path=_AREA_ASSIGNMENTS_YAML) == expected
+    assert agent_identity.resolve_recipient_alias(slot, assignments_path=_AREA_ASSIGNMENTS_YAML) == expected
     for muse_slot in ("muse-monitor", "muse-devops"):
-        assert muse_slot in _channels.get_valid_recipient_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
-        assert _channels.resolve_recipient_alias(muse_slot, assignments_path=_AREA_ASSIGNMENTS_YAML) == muse_slot
-    assert _channels.resolve_recipient_alias("unknown-monitor", assignments_path=_AREA_ASSIGNMENTS_YAML) == "unknown-monitor"
-    with pytest.raises(ValueError, match="Unknown delivery target"):
-        _channels._validate_recipient_agent("unknown-monitor", assignments_path=_AREA_ASSIGNMENTS_YAML)
+        assert muse_slot in agent_identity.get_valid_recipient_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
+        assert agent_identity.resolve_recipient_alias(muse_slot, assignments_path=_AREA_ASSIGNMENTS_YAML) == muse_slot
+    assert agent_identity.resolve_recipient_alias("unknown-monitor", assignments_path=_AREA_ASSIGNMENTS_YAML) == "unknown-monitor"
+    assert "unknown-monitor" not in agent_identity.get_valid_recipient_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
 
 
 @pytest.mark.parametrize(
@@ -69,25 +60,7 @@ def test_monitor_aliases_preserve_inbox_destinations_beside_muse(provider: str) 
 )
 def test_removed_content_slots_are_not_bridge_recipients(provider: str, lane: str) -> None:
     slot = f"{provider}-{lane}"
-    assert slot not in _channels.get_valid_recipient_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
-    # A Kimi slot is refused first: Kimi is not a bridge recipient at all.
-    refusal = "Kimi is retired" if provider == "kimi" else "Unknown delivery target"
-    with pytest.raises(ValueError, match=refusal):
-        _channels._validate_recipient_agent(slot, assignments_path=_AREA_ASSIGNMENTS_YAML)
-
-
-def test_unknown_slot_rejected_naming_valids() -> None:
-    """Verify unknown slot 'claude-nosucharea' is rejected with an error message listing valid agents."""
-    with pytest.raises(ValueError) as exc_info:
-        _channels._validate_agent("claude-nosucharea", assignments_path=_AREA_ASSIGNMENTS_YAML)
-
-    err_msg = str(exc_info.value)
-    assert "Unknown agent 'claude-nosucharea'" in err_msg
-    assert "claude-infra" in err_msg
-    assert "grok-infra" in err_msg
-
-    with pytest.raises(ValueError):
-        _inbox._validate_agent("claude-nosucharea")
+    assert slot not in agent_identity.get_valid_recipient_agents(assignments_path=_AREA_ASSIGNMENTS_YAML)
 
 
 def test_registry_absent_or_unreadable_fallback_to_static_tuple(tmp_path: Path) -> None:
@@ -96,13 +69,13 @@ def test_registry_absent_or_unreadable_fallback_to_static_tuple(tmp_path: Path) 
     MUTATION-CHECK: If fallback is removed/broken, get_valid_agents fails or crashes.
     """
     missing_file = tmp_path / "non_existent_area_assignments.yaml"
-    valids_missing = _channels.get_valid_agents(assignments_path=missing_file)
-    assert valids_missing == _channels.STATIC_VALID_AGENTS
+    valids_missing = agent_identity.get_valid_agents(assignments_path=missing_file)
+    assert valids_missing == agent_identity.STATIC_VALID_AGENTS
 
     corrupt_file = tmp_path / "corrupt_area_assignments.yaml"
     corrupt_file.write_text("invalid: yaml: ::: [[", encoding="utf-8")
-    valids_corrupt = _channels.get_valid_agents(assignments_path=corrupt_file)
-    assert valids_corrupt == _channels.STATIC_VALID_AGENTS
+    valids_corrupt = agent_identity.get_valid_agents(assignments_path=corrupt_file)
+    assert valids_corrupt == agent_identity.STATIC_VALID_AGENTS
 
 
 # ---------------------------------------------------------------------------
@@ -270,154 +243,3 @@ def test_resolve_slot_holder_alias_slot(session_db_fixture: Path) -> None:
     assert res.area_id == "seminars"
     assert res.stream_id == "epic:2836"  # allow-hardcoded-epic: slot addressing alias resolution
     assert res.holder_agent == "grok-infra"
-
-
-# ---------------------------------------------------------------------------
-# 4. Bounce Visibility Warning in Post
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 4b. Bounce/resolver warnings in post() return dict (#5889)
-# ---------------------------------------------------------------------------
-
-
-def test_post_bounce_warning_in_return_dict_hermetic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No-live-holder bounce warning appears in post() return dict (#5889 item 1).
-
-    Hermetic (step-3 r2 pattern): ``resolve_slot_holder`` is stubbed to a
-    deterministic no-holder result, so this does not depend on real
-    session-streams state.
-
-    MUTATION-CHECK (revert→fail): if the ``warnings`` key is removed from
-    post()'s return dict, the ``in result`` and content assertions fail —
-    the warning would only reach stderr and be unreachable to callers.
-    """
-    from lu_machinery.orchestration import slot_routing
-    from lu_machinery.orchestration.slot_routing import SlotHolderResult
-
-    def _no_holder(slot: str, **kwargs: object) -> SlotHolderResult:
-        return SlotHolderResult(
-            has_holder=False,
-            slot=slot,
-            area_id="infra",
-            queue_location=f"channels DB delivery queue for '{slot}'",
-            reason="no-live-holder",
-        )
-
-    monkeypatch.setattr(slot_routing, "resolve_slot_holder", _no_holder)
-
-    with contextlib.suppress(Exception):
-        _channels.init_db()
-    with contextlib.suppress(ValueError):
-        _channels.create_channel("test-bounce-ret", description="test channel")
-
-    result = _channels.post(
-        "test-bounce-ret",
-        "user",
-        "Hello bounce",
-        to_agents=["grok-infra"],
-        auto_snapshot=False,
-    )
-
-    # Item 1: warnings present in the return dict as list[str] (not just stderr).
-    assert "warnings" in result
-    assert isinstance(result["warnings"], list)
-    assert len(result["warnings"]) == 1
-    assert "recipient grok slot in area 'infra' has no live holder (no-live-holder)" in result["warnings"][0]
-    assert "queued in its channels DB delivery queue" in result["warnings"][0]
-    # Delivery still queued at the slot identity.
-    assert len(result["delivery_ids"]) == 1
-
-
-def test_post_resolver_failure_surfaces_warning_not_silent(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Resolver/import failure surfaces a warning instead of silent-dropping (#5889 item 2).
-
-    Hermetic: ``resolve_slot_holder`` is stubbed to raise, exercising the
-    exception path directly without depending on real infrastructure.
-
-    MUTATION-CHECK (revert→fail): if the bare ``except Exception: return
-    agent`` swallow is restored, ``result['warnings']`` stays empty (the
-    failure is silent-dropped) and every warning assertion below fails.
-    """
-    from lu_machinery.orchestration import slot_routing
-
-    def _boom(slot: str, **kwargs: object) -> None:
-        raise RuntimeError("simulated resolver/import failure")
-
-    monkeypatch.setattr(slot_routing, "resolve_slot_holder", _boom)
-
-    with contextlib.suppress(Exception):
-        _channels.init_db()
-    with contextlib.suppress(ValueError):
-        _channels.create_channel("test-resolver-fail", description="test channel")
-
-    result = _channels.post(
-        "test-resolver-fail",
-        "user",
-        "Hello resolver-fail",
-        to_agents=["grok-infra"],
-        auto_snapshot=False,
-    )
-
-    # Item 2: resolver failure surfaced as a warning in the return dict...
-    assert "warnings" in result
-    assert any("slot resolver failed for the grok slot" in w for w in result["warnings"])
-    assert any("RuntimeError" in w for w in result["warnings"])
-    assert any("simulated resolver/import failure" in w for w in result["warnings"])
-    # ...and on stderr (visible handling, not silent).
-    captured = capsys.readouterr()
-    assert "slot resolver failed for the grok slot" in captured.err
-    # Delivery still queued at the slot identity (fail-open on delivery).
-    assert len(result["delivery_ids"]) == 1
-
-
-def test_post_no_warnings_key_is_empty_list_when_all_held(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """post() return dict always carries a warnings key (empty when nothing bounces).
-
-    MUTATION-CHECK (revert→fail): if the ``warnings`` key is dropped from the
-    return dict, ``result['warnings']`` raises KeyError / ``in`` is False.
-    """
-    from lu_machinery.orchestration import slot_routing
-    from lu_machinery.orchestration.slot_routing import SlotHolderResult
-
-    def _held(slot: str, **kwargs: object) -> SlotHolderResult:
-        return SlotHolderResult(
-            has_holder=True,
-            slot=slot,
-            area_id="infra",
-            stream_id="epic:4707",
-            session_id="sess-1",
-            holder_agent="grok-infra",
-            holder_harness="grok",
-            generation=1,
-            expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            queue_location=f"channels DB delivery queue for '{slot}'",
-        )
-
-    monkeypatch.setattr(slot_routing, "resolve_slot_holder", _held)
-
-    with contextlib.suppress(Exception):
-        _channels.init_db()
-    with contextlib.suppress(ValueError):
-        _channels.create_channel("test-held", description="test channel")
-
-    # Recipient resolves to a live holder; from_agent 'user' never resolves.
-    result = _channels.post(
-        "test-held",
-        "user",
-        "Hello held",
-        to_agents=["grok-infra"],
-        auto_snapshot=False,
-    )
-
-    assert "warnings" in result
-    assert result["warnings"] == []
-    assert len(result["delivery_ids"]) == 1

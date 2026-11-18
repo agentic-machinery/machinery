@@ -28,10 +28,6 @@ def comms_plane_store(*, reachable: bool, schema_versions: dict[str, Any] | None
     )
 
 
-def legacy_broker_store(*, reachable: bool) -> dict[str, Any]:
-    return store_descriptor(kind="legacy-broker", reachable=reachable)
-
-
 def session_streams_store(*, reachable: bool) -> dict[str, Any]:
     return store_descriptor(kind="session-streams", reachable=reachable)
 

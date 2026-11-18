@@ -5,7 +5,7 @@
 # starts. Without that context the hook denies with the bootstrap diagnostic;
 # "unknown" is kept for a child that ran and could not read its stores.
 fleet_module=lu_machinery.fleet_comms
-fallback='{"injectSteps":[{"ephemeralMessage":"PENDING ORDERS: unknown; legacy: ai_agent_bridge inbox for the registered handoff slot; authority: project interpreter -m '"$fleet_module"' deliveries --help"}]}'
+fallback='{"injectSteps":[{"ephemeralMessage":"PENDING ORDERS: unknown; authority: project interpreter -I -m '"$fleet_module"' deliveries --help"}]}'
 bootstrap_failed() {
     cat >/dev/null 2>&1
     printf '%s %s\n' 'HOOK-BOOTSTRAP-FAILED: product root, shared state, interpreter or machinery unavailable.' "${1:-${PROJECT_HOOK_BOOTSTRAP_STEP:-machinery}}" >&2

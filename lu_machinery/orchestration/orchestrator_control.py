@@ -747,7 +747,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         max_result_chars=args.max_result_chars,
         max_log_chars=args.max_log_chars,
     )
-    from lu_machinery.ai_agent_bridge._channels_cli import authority_inbox_notice
+    from lu_machinery.inbox_pending import authority_inbox_notice
 
     # JSON stays machine-parseable: its pointer goes to stderr.
     authority_inbox_notice(

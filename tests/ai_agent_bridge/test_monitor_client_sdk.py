@@ -31,7 +31,6 @@ client: TestClient
 # The API config caches these roots on first use (``lu_machinery.api.config.__getattr__``).
 _CONFIG_ROOT_CACHES = (
     "PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR",
-    "MESSAGE_DB",
 )
 
 

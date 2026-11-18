@@ -70,27 +70,15 @@ def snapshot(stores):
 
 @pytest.fixture
 def stores(tmp_path, monkeypatch):
-    legacy = tmp_path / "messages.db"
+    """The Fleet Comms authority store, the only pending-order store (#515)."""
     authority = tmp_path / "comms.sqlite3"
-    with sqlite3.connect(legacy) as conn:
-        conn.execute(
-            "CREATE TABLE messages(id INTEGER PRIMARY KEY, to_llm TEXT, acknowledged INTEGER, consumed_by_live_driver INTEGER, content TEXT)"
-        )
     with sqlite3.connect(authority) as conn:
         apply_migrations(conn)
-    monkeypatch.setenv("AB_DB_PATH", str(legacy))
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path))
     monkeypatch.setenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW", "1")
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "gemini-infra")
     monkeypatch.setenv("LU_DRIVER_STATE_PYTHON", sys.executable)
-    return legacy, authority
-
-
-def add_legacy(path, *, recipient="gemini-infra", acknowledged=0, consumed=0, identifier=1):
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            "INSERT INTO messages VALUES (?, ?, ?, ?, ?)", (identifier, recipient, acknowledged, consumed, BODY_MARKER)
-        )
+    return (authority,)
 
 
 def add_authority(
