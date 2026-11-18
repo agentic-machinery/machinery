@@ -316,4 +316,6 @@ def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
     assert observed["worktree_untracked_only_on_exit"] is (case == "untracked")
     changed, untracked = git._tree_changes(work)
     assert changed == {"stat-hidden": [" M delivered.txt"], "filtered": ["hidden tracked changes"]}.get(case, [])
+    if case == "stat-hidden":  # salvage stages the edit the reader reports, never HEAD's tree again
+        assert git._snapshot_tree(work, "probe") != _git(work, "rev-parse", "HEAD^{tree}")
     assert sorted(untracked) == sorted(LINE_BREAK_NAMES if case == "untracked" else [])

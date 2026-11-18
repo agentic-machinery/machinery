@@ -796,6 +796,23 @@ def test_untracked_names_with_line_breaks_are_preserved_byte_exact_before_remova
 
 
 @pytest.mark.usefixtures('configured_roots')
+def test_dirty_detail_naming_a_non_utf8_path_still_encodes_as_utf8(sandbox):
+    """Defect (#807 round 1, Carbon F2): a byte-exact read names a non-UTF-8 path with surrogates, which the
+    retained tree's detail carried into UTF-8 receipts (scheduled_worktree_cleanup.write_receipt), failing them."""
+    task = sandbox.dispatch("blocked", "--mode", "workspace-write")
+    await_file(sandbox.tasks / f"{task[0]}.started")
+    tree = Path(json.loads((sandbox.tasks / f"{task[0]}.json").read_text())["worktree_path"])
+    name = os.fsdecode(b"bad\xffname")
+    (tree / name).write_text("staged, never committed\n")
+    run_git(tree, "add", "--", name)
+    (sandbox.tasks / f"{task[0]}.release").touch()
+    record = sandbox.settle(task, expected=1)
+    assert (record["worktree_disposition"], record["worktree_disposition_reason"]) == ("retained", "dirty")
+    assert record["worktree_disposition_detail"] == "A  bad\\udcffname"
+    json.dumps(record, ensure_ascii=False).encode("utf-8")
+
+
+@pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 def test_tracked_edit_hidden_by_an_index_flag_keeps_the_worktree(sandbox, flag):
     """Review F1: status omits edits under these flags, so untracked scratch beside one forced a removal."""

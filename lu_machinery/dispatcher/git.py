@@ -1342,13 +1342,15 @@ def _snapshot_tree(tree: Path, task_id: str) -> str:
     """The tree object of the checkout's tracked and untracked (not ignored) files.
 
     They are staged in a scratch copy of the checkout's index, so its own index, HEAD and branch stay as they were.
+    The copy keeps the index's timestamps, so racily clean entries stay racy, and staging forces core.trustctime
+    and core.checkStat to their defaults, so it stages every edit _tree_changes reports.
     """
     index = _git(tree, "rev-parse", "--path-format=absolute", "--git-path", "index", isolate=True)
     scratch = allocate(task_id + "-salvage")
     try:
         scratch.payload_dir.mkdir(exist_ok=True)
-        env = {"GIT_INDEX_FILE": str(shutil.copyfile(index, scratch.payload_dir / "index"))}
-        _git(tree, "add", "--all", isolate=True, env=env)
+        env = {"GIT_INDEX_FILE": str(shutil.copy2(index, scratch.payload_dir / "index"))}
+        _git(tree, "-c", "core.trustctime=true", "-c", "core.checkStat=default", "add", "--all", isolate=True, env=env)
         return _git(tree, "write-tree", isolate=True, env=env)
     finally:
         try:
@@ -1584,7 +1586,8 @@ def settle_worktree(record: dict, borrowed=lambda: False, salvage: bool = False)
             "worktree_disposition_reason": reason,
         }
         if detail:
-            outcome["worktree_disposition_detail"] = detail
+            # A path's non-UTF-8 bytes (os.fsdecode surrogates) are escaped, so the record and receipts encode.
+            outcome["worktree_disposition_detail"] = detail.encode("utf-8", "backslashreplace").decode("utf-8")
         if registry_note:
             outcome["worktree_registry"] = registry_note[0]
         return outcome
