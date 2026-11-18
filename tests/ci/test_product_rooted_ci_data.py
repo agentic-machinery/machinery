@@ -359,6 +359,8 @@ def test_lock_only_diff_needs_no_distribution_metadata(monkeypatch: pytest.Monke
     monkeypatch.setattr(components, "tracked_paths", list)
     monkeypatch.setattr(importlib.metadata, "files", absent)
     assert affected.infrastructure_changed(["requirements-machinery.lock"])
+    assert affected.infrastructure_changed(["requirements-dev.txt"])
+    assert affected.infrastructure_changed(["uv.lock"])
     assert affected.importing_tests({"requirements-machinery.lock"}, set(), "HEAD", {}) == ([], [])
 
 

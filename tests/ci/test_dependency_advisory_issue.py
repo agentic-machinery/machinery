@@ -70,6 +70,7 @@ def test_collect_python_findings() -> None:
         {
             "ecosystem": "python",
             "package": "urllib3",
+            "locked_version": "1.26.0",
             "advisory_id": "PYSEC-2023-0001",
             "severity": "unknown",
             "fixed_version": "1.26.18, 2.0.7",
@@ -77,6 +78,7 @@ def test_collect_python_findings() -> None:
         {
             "ecosystem": "python",
             "package": "urllib3",
+            "locked_version": "1.26.0",
             "advisory_id": "GHSA-XXXX-YYYY-ZZZZ",
             "severity": "unknown",
             "fixed_version": "none",
@@ -126,6 +128,13 @@ def test_build_issue_body_escapes_pipes_and_newlines() -> None:
     )
     assert "pkg\\|evil name" in body
     assert "\nname" not in body
+
+    report = _pip_report()
+    dependency = report["dependencies"][1]
+    report["dependencies"].append({**dependency, "version": "1.25.0"})
+    issue = helper.build_issue_body(helper.collect_python_findings(report))
+    assert "| urllib3==1.25.0 | PYSEC-2023-0001 |" in issue
+    assert "| urllib3==1.26.0 | PYSEC-2023-0001 |" in issue
 
 
 def test_collect_npm_findings_reports_effective_package_severity() -> None:
@@ -196,10 +205,36 @@ _CLEAN_PIP = _completed(0, json.dumps({"dependencies": []}))
 _CLEAN_NPM = _completed(0, json.dumps({"vulnerabilities": {}}))
 
 
-def test_run_collect_clean_audit_returns_no_findings(tmp_path: Path) -> None:
+def test_run_collect_clean_audit_returns_no_findings(tmp_path: Path, monkeypatch) -> None:
     repo = _fake_repo(tmp_path / "repo")
     with patch.object(helper.subprocess, "run", side_effect=_stub_audits(_CLEAN_PIP, _CLEAN_NPM)):
         assert helper.run_collect(repo) == []
+    lock = repo / "uv.lock"
+    lock.write_text('version = 1\n[[package]]\nname = "requests"\nversion = "2.31.0"\n'
+                    'source = { registry = "https://pypi.org/simple" }\n', encoding="utf-8")
+    monkeypatch.setattr("lu_machinery.ci.audit_dependencies.shutil.which", lambda _: "uv")
+    export = f"requests==2.31.0 --hash=sha256:{'1' * 64}\n"
+    uv_report = _completed(0, json.dumps({
+        "dependencies": [{"name": "requests", "version": "2.31.0", "vulns": []}],
+    }))
+
+    def run(cmd, **kwargs):
+        if cmd[0] == "uv":
+            return _completed(0, export)
+        if "pip_audit" in cmd:
+            assert "--require-hashes" in cmd
+            assert Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8") == export
+            return uv_report
+        return _stub_audits(_CLEAN_PIP, _CLEAN_NPM)(cmd, **kwargs)
+
+    with patch.object(helper.subprocess, "run", side_effect=run):
+        assert helper.run_collect(repo) == []
+        uv_report = _CLEAN_PIP
+        with pytest.raises(RuntimeError, match="reported 0 of 1 expected uv pins"):
+            helper.run_collect(repo)
+        lock.write_text("invalid toml", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="invalid uv.lock audit input"):
+            helper.run_collect(repo)
 
 
 def test_run_collect_pip_audit_exit_2_raises(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -373,6 +374,53 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
         ["git", "-C", str(product), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
     assert adopt.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+    assert cut.git(product, "show", "HEAD:requirements-machinery.lock") == "lu-machinery==0.1.22"
+
+    cut.version = "0.1.23"
+    base_url = "https://github.com/learn-ukrainian/machinery/releases/download"
+    old_url = f"{base_url}/v0.1.22/lu_machinery-0.1.22-py3-none-any.whl"
+    new_url = f"{base_url}/v0.1.23/lu_machinery-0.1.23-py3-none-any.whl"
+    manifest = product / "pyproject.toml"
+    old_manifest = ('[project]\nname = "product"\nversion = "1.0.0"\n'
+                    'dependencies = ["lu-machinery[api]==0.1.22"]\n'
+                    '[dependency-groups]\nmachinery = ["lu-machinery"]\n'
+                    f'[tool.uv.sources]\nlu-machinery = {{ url = "{old_url}" }}\n')
+    manifest.write_text(old_manifest, encoding="utf-8")
+    (product / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    cut.git(product, "add", "pyproject.toml", "uv.lock")
+    cut.git(product, *cut.committer(), "commit", "--quiet", "-m", "fixture: use uv")
+    published = work / "published"
+    published.mkdir()
+    payload = b"published release wheel"
+    (published / "lu_machinery-0.1.23-py3-none-any.whl").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+
+    def run_uv_adoption(argv, **kwargs):
+        if argv[0] == str(uv):
+            assert argv[1:] == ["lock", "--upgrade-package", "lu-machinery", "--no-python-downloads"]
+            assert kwargs["cwd"] == product
+            assert manifest.read_text(encoding="utf-8") == old_manifest.replace("0.1.22", "0.1.23")
+            (product / "uv.lock").write_text(
+                'version = 1\n[[package]]\nname = "lu-machinery"\nversion = "0.1.23"\n'
+                f'source = {{ url = "{new_url}" }}\nwheels = [{{ url = "{new_url}", hash = "sha256:{digest}" }}]\n',
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return run(argv, **kwargs)
+
+    cut.run = run_uv_adoption
+    cut.open_adopt_pr(lock, product)
+    assert cut.git(product, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines() == [
+        "pyproject.toml", "uv.lock",
+    ]
+    assert f"sha256:{digest}" in cut.git(product, "show", "HEAD:uv.lock")
+    assert cut.git(product, "log", "-1", "--format=%B").endswith("X-Agent: claude/claude-cto")
+    (product / "uv.lock").write_text('package = "invalid"\n', encoding="utf-8")
+    with pytest.raises(CutError, match="uv.lock package must be an array of tables"):
+        release_cut.wheel_only_requirements("", product / "uv.lock")
+    manifest.write_text("tool = []\n", encoding="utf-8")
+    with pytest.raises(CutError, match="pyproject.toml tool must be a table"):
+        cut.update_adopt_inputs(lock, product)
 
 
 def _released_history(tmp_path, commits, releases):
