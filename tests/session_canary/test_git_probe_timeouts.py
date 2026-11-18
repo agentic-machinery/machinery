@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from lu_machinery.session_canary import grok_lane
+
+from lu_machinery.session_canary import recall_core
 
 
 def _raise_timeout(calls: list[dict[str, Any]]) -> Any:
@@ -30,7 +31,7 @@ def _raise_timeout(calls: list[dict[str, Any]]) -> Any:
 # --- scripts/pre_commit/check_plan_immutability.py ---------------------------
 
 
-# --- scripts/session_canary/grok_lane.py -------------------------------------
+# --- lu_machinery/session_canary/recall_core.py ----------------------------
 
 
 def _score_args(tmp_path: Path, out_dir: Path, answers: Path) -> argparse.Namespace:
@@ -41,8 +42,8 @@ def _score_args(tmp_path: Path, out_dir: Path, answers: Path) -> argparse.Namesp
         answers=str(answers),
         context_tokens=1234,
         model="test-model",
-        pass_ratio=grok_lane.DEFAULT_PASS_RATIO,
-        threshold=grok_lane.DEFAULT_SIM_THRESHOLD,
+        pass_ratio=recall_core.DEFAULT_PASS_RATIO,
+        threshold=recall_core.DEFAULT_SIM_THRESHOLD,
         handoff=None,
         next_drive="",
         pins="",
@@ -55,21 +56,21 @@ def _score_args(tmp_path: Path, out_dir: Path, answers: Path) -> argparse.Namesp
     )
 
 
-def test_grok_lane_cmd_score_timeout_maps_to_fail_handoff_and_124(
+def test_recall_core_cmd_score_timeout_maps_to_fail_handoff_and_124(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(grok_lane.subprocess, "run", _raise_timeout(calls))
+    monkeypatch.setattr(recall_core.subprocess, "run", _raise_timeout(calls))
     out_dir = tmp_path / "canary"
     out_dir.mkdir()
     (out_dir / "probe.json").write_text(json.dumps({"anchors": []}), encoding="utf-8")
     answers = tmp_path / "answers.json"
     answers.write_text("{}", encoding="utf-8")
 
-    rc = grok_lane.cmd_score(_score_args(tmp_path, out_dir, answers))
+    rc = recall_core.cmd_score(_score_args(tmp_path, out_dir, answers))
 
     assert rc == 124
-    assert calls[0]["timeout"] == grok_lane._CANARY_TIMEOUT_SECONDS == 30
+    assert calls[0]["timeout"] == recall_core._CANARY_TIMEOUT_SECONDS == 30
     verdict = json.loads((out_dir / "last_verdict.json").read_text(encoding="utf-8"))
     assert verdict["verdict"] == "FAIL-HANDOFF"
     assert verdict["rc"] == 124

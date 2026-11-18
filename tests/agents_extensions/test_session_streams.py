@@ -22,10 +22,6 @@ from lu_machinery.session_streams.db import (
     SessionStreamDatabase,
     load_migrations,
 )
-from lu_machinery.session_streams.dual_write import (
-    ATLAS_HANDOFF_PATH,
-    mirror_atlas_handoff,
-)
 from lu_machinery.session_streams.hooks import (
     clean_exit_hook,
     heartbeat_hook,
@@ -1214,19 +1210,12 @@ def test_ssh_rejection_preserved_with_linear_token_boundary(body: str) -> None:
         validate_entry_body(body)
 
 
-def test_mirror_handoff_accepts_issue_filenames(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    handoff = repo_root / "handoff.md"
+def test_state_entry_accepts_issue_filenames(tmp_path: Path) -> None:
     body = "Updated `sources.db`, `vesum.db`, `core.md`, `a1.yaml`, `lexicon-manifest.json`, `mcp-sources-requests.jsonl`.\n"
-    handoff.write_text(body, encoding="utf-8")
     store = _store(tmp_path / "runtime")
     lease = _open(store)
-    result = mirror_atlas_handoff(
-        store, lease, repo_root=repo_root, stream_id=lease.stream_id, source_path=Path("handoff.md"), now=NOW
-    )
+    result = store.append_entry(lease, entry_type=EntryType.STATE, body=body, idempotency_key="filenames", now=NOW)
     assert result.entry.body == body
-    assert handoff.read_text(encoding="utf-8") == body
     assert store.dump_stream(lease.stream_id)["entries"][0]["body"] == body
 
 
@@ -1407,69 +1396,6 @@ def test_fleet_harnesses_share_heartbeat_and_exit_contract(
     assert heartbeat.action == "heartbeat"
     assert heartbeat.expires_at == "2026-07-18T12:00:31Z"
     assert closed.state == "closed"
-
-
-def test_atlas_dual_write_mirrors_file_without_modifying_or_deleting_it(tmp_path: Path) -> None:
-    repo_root = tmp_path / "repo"
-    handoff = repo_root / ATLAS_HANDOFF_PATH
-    handoff.parent.mkdir(parents=True)
-    handoff.write_text("# Atlas handoff\n\nCurrent state.\n", encoding="utf-8")
-    store = _store(tmp_path / "runtime")
-    lease = _open(store, stream="epic:4700")
-
-    first = mirror_atlas_handoff(
-        store,
-        lease,
-        repo_root=repo_root,
-        stream_id="epic:4700",
-        now=NOW + timedelta(seconds=1),
-    )
-    repeated = mirror_atlas_handoff(
-        store,
-        lease,
-        repo_root=repo_root,
-        stream_id="epic:4700",
-        now=NOW + timedelta(seconds=2),
-    )
-
-    assert handoff.read_text(encoding="utf-8") == "# Atlas handoff\n\nCurrent state.\n"
-    assert first.entry.entry_id == repeated.entry.entry_id
-    assert first.mirror_id == repeated.mirror_id
-    assert handoff.exists()
-    history = store.dump_stream("epic:4700")
-    assert len(history["entries"]) == 1
-    assert len(history["legacy_mirrors"]) == 1
-    assert history["entries"][0]["refs"][0]["kind"] == "legacy_source"
-
-    handoff.write_text("# Atlas handoff\n\nUpdated state.\n", encoding="utf-8")
-    changed = mirror_atlas_handoff(
-        store,
-        lease,
-        repo_root=repo_root,
-        stream_id="epic:4700",
-        now=NOW + timedelta(seconds=3),
-    )
-    assert changed.entry.entry_id != first.entry.entry_id
-    assert len(store.dump_stream("epic:4700")["entries"]) == 2
-
-    with pytest.raises(ValueError, match="must match"):
-        mirror_atlas_handoff(
-            store,
-            lease,
-            repo_root=repo_root,
-            stream_id="epic:4220",
-            now=NOW + timedelta(seconds=4),
-        )
-
-    store.close_session(lease, now=NOW + timedelta(seconds=5))
-    with pytest.raises(LeaseConflictError, match="current active"):
-        mirror_atlas_handoff(
-            store,
-            lease,
-            repo_root=repo_root,
-            stream_id="epic:4700",
-            now=NOW + timedelta(seconds=6),
-        )
 
 
 def test_parse_timestamp_refuses_out_of_range_utc_conversion():

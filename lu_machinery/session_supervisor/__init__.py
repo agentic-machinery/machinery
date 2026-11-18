@@ -27,10 +27,8 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     __package__ = "lu_machinery.session_supervisor"
 
 from lu_machinery.session_streams.db import SessionStreamDatabase
-from lu_machinery.session_streams.dual_write import resolve_handoff_path
 from lu_machinery.session_streams.handoff import diagnose_handoff, remote_lease_reason
 from lu_machinery.session_streams.hooks import clean_exit_hook, lease_from_environment
-from lu_machinery.session_streams.inventory import epic_handoff_map
 from lu_machinery.session_streams.model import (
     EntryType,
     Lease,
@@ -41,7 +39,6 @@ from lu_machinery.session_streams.model import (
     parse_timestamp,
     sha256_text,
 )
-from lu_machinery.session_streams.receipts import list_migration_state
 from lu_machinery.session_streams.store import (
     LifecycleError,
     SessionStreamError,
@@ -157,10 +154,6 @@ class BootstrapCapsule:
     stream_id: str
     lease: dict[str, Any] | None
     digest: StreamDigest
-    handoff_paths: tuple[str, ...]
-    active_handoff_path: str | None
-    dual_write_mode: str
-    dual_write_drift: bool
     digest_source: str = "supervisor-local-fallback"
 
     def as_dict(self) -> dict[str, Any]:
@@ -180,12 +173,6 @@ class BootstrapCapsule:
                 "digest_sha256": self.digest.digest_sha256,
                 "pinned": [entry_as_dict(entry) for entry in self.digest.pinned],
                 "recent": [entry_as_dict(entry) for entry in self.digest.recent],
-            },
-            "dual_write": {
-                "mode": self.dual_write_mode,
-                "handoff_paths": list(self.handoff_paths),
-                "active_handoff_path": self.active_handoff_path,
-                "drift": self.dual_write_drift,
             },
             "diagnostics": {
                 "digest_source": self.digest_source,
@@ -496,9 +483,6 @@ class SessionSupervisor:
                     raise RemoteLeaseLostError("LEASE LOST: live bootstrap lease expired")
                 lease = replace(lease, expires_at=current["expires_at"])
             digest = self.remote.digest_from_response(response)
-            handoff_paths = ()
-            active = None
-            mode, drift = "remote-api", False
             digest_source = "monitor-api"
         else:
             store = self._require_store()
@@ -507,9 +491,6 @@ class SessionSupervisor:
                     current = store._require_current_lease(connection, lease, require_valid_at=datetime.now(UTC))
                     lease = store._lease_from_row(current)
             digest = store.load_digest(stream_id, limit=digest_limit)
-            handoff_paths = tuple(epic_handoff_map(self.repo_root).get(stream_id, ()))
-            active = resolve_handoff_path(stream_id, self.repo_root)
-            mode, drift = self._dual_write_status(stream_id)
             digest_source = "supervisor-local-fallback"
         lease_summary = self._lease_summary(lease) if resolved_role is LaunchRole.DRIVER and lease else None
         return BootstrapCapsule(
@@ -517,31 +498,8 @@ class SessionSupervisor:
             stream_id=stream_id,
             lease=lease_summary,
             digest=digest,
-            handoff_paths=handoff_paths,
-            active_handoff_path=self._relative_path(active),
-            dual_write_mode=mode,
-            dual_write_drift=drift,
             digest_source=digest_source,
         )
-
-    def _dual_write_status(self, stream_id: str) -> tuple[str, bool]:
-        store = self._require_store()
-        rows = list_migration_state(store)
-        mode = next((str(row["mode"]) for row in rows if row["stream_id"] == stream_id), "unregistered")
-        with store._read_snapshot() as connection:
-            row = connection.execute(
-                "SELECT status FROM legacy_projection_receipts WHERE stream_id = ? ORDER BY projection_id DESC LIMIT 1",
-                (stream_id,),
-            ).fetchone()
-        return mode, bool(row and str(row["status"]) in {"drift", "failed"})
-
-    def _relative_path(self, path: Path | None) -> str | None:
-        if path is None:
-            return None
-        try:
-            return path.resolve().relative_to(self.repo_root).as_posix()
-        except ValueError:
-            return str(path)
 
     @staticmethod
     def _lease_summary(lease: Lease) -> dict[str, Any]:

@@ -1925,24 +1925,9 @@
    "sha256": "e1adebee74ed01880ffdb4e14ab178b10c70baa8228e6dd0b7ce779c1c0303cc"
   },
   {
-   "path": "lu_machinery/session_canary/grok_lane.py",
+   "path": "lu_machinery/session_canary/recall_core.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "3de579b305b1eedde7673005b20532f02f0053fea57d680c18359d82fd950ea1"
-  },
-  {
-   "path": "lu_machinery/session_canary/grok_lane.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "3de579b305b1eedde7673005b20532f02f0053fea57d680c18359d82fd950ea1"
-  },
-  {
-   "path": "lu_machinery/session_canary/grok_lane.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "48a823e2ad249c7145576fb402451e95db7d0d5199e7dd18faecbbada83f131b"
-  },
-  {
-   "path": "lu_machinery/session_canary/grok_lane.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "eab87090894835eefb1b9e24b7243019ee1a72cd9ec439134b8686d2d1fd0b8f"
   },
   {
    "path": "lu_machinery/session_canary/handoff_select.py",

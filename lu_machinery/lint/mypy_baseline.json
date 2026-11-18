@@ -8663,16 +8663,6 @@
       "message": "Incompatible types in \"yield\" (actual type \"Match[str] | None\", expected type \"Match[str]\")"
     },
     {
-      "path": "lu_machinery/session_canary/grok_lane.py",
-      "code": "arg-type",
-      "message": "Argument \"stderr\" to \"CompletedProcess\" has incompatible type \"bytes | str\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/session_canary/grok_lane.py",
-      "code": "arg-type",
-      "message": "Argument \"stderr\" to \"CompletedProcess\" has incompatible type \"bytes | str\"; expected \"None | str\""
-    },
-    {
       "path": "lu_machinery/session_canary/handoff_select.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"None | Path\", variable has type \"Path\")"
@@ -8691,11 +8681,6 @@
       "path": "lu_machinery/session_supervisor/__init__.py",
       "code": "arg-type",
       "message": "Argument 1 to \"diagnose_handoff\" has incompatible type \"None | SessionStreamStore\"; expected \"SessionStreamStore\""
-    },
-    {
-      "path": "lu_machinery/session_supervisor/__init__.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"tuple[str, ...]\", variable has type \"tuple[()]\")"
     },
     {
       "path": "lu_machinery/session_supervisor/__init__.py",

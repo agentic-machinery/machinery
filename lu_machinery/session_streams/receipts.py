@@ -20,7 +20,7 @@ from .inventory import (
     scan_stream_epic_inventory,
     streams_yaml_sha256,
 )
-from .model import isoformat_z, sha256_text, utc_now
+from .model import isoformat_z, utc_now
 from .store import SessionStreamStore
 
 
@@ -252,83 +252,6 @@ def register_manifest_inventory(
         skipped=scan.skipped,
         no_op=False,
     )
-
-
-def record_projection_receipt(
-    store: SessionStreamStore,
-    *,
-    stream_id: str,
-    target_path: str,
-    target_sha256: str,
-    projection_body: str,
-    status: str,
-    high_water_entry_id: int | None = None,
-    error: str = "",
-    agent: str = "system",
-    now: datetime | None = None,
-) -> int:
-    """Append one legacy projection receipt (ok / failed / drift).
-
-    Idempotent for the unique key
-    ``(stream_id, target_path, projection_hash, status)``. Drift/failed control
-    events are only inserted when a new receipt row is written.
-    """
-    if status not in {"ok", "failed", "drift"}:
-        raise ValueError(f"invalid projection status: {status}")
-    if target_sha256 and len(target_sha256) != 64:
-        raise ValueError("target_sha256 must be empty or a SHA-256 hex digest")
-    projection_hash = sha256_text(projection_body)
-    timestamp = isoformat_z(now or utc_now())
-    with store._transaction(now=now) as connection:
-        store._ensure_stream(connection, stream_id=stream_id, created_at=timestamp)
-        cursor = connection.execute(
-            "INSERT OR IGNORE INTO legacy_projection_receipts("
-            "stream_id, target_path, target_sha256, high_water_entry_id, "
-            "projection_hash, status, recorded_at, error"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                stream_id,
-                target_path,
-                target_sha256,
-                high_water_entry_id,
-                projection_hash,
-                status,
-                timestamp,
-                error,
-            ),
-        )
-        inserted = bool(cursor.rowcount)
-        row = connection.execute(
-            "SELECT projection_id FROM legacy_projection_receipts "
-            "WHERE stream_id = ? AND target_path = ? AND projection_hash = ? AND status = ? "
-            "ORDER BY projection_id DESC LIMIT 1",
-            (stream_id, target_path, projection_hash, status),
-        ).fetchone()
-        assert row is not None
-        if inserted and status in {"failed", "drift"}:
-            connection.execute(
-                "INSERT INTO stream_control_events("
-                "stream_id, event_type, from_mode, to_mode, proof_json, "
-                "recorded_at, agent, reason"
-                ") VALUES (?, 'drift_detected', NULL, NULL, ?, ?, ?, ?)",
-                (
-                    stream_id,
-                    json.dumps(
-                        {
-                            "target_path": target_path,
-                            "status": status,
-                            "projection_hash": projection_hash,
-                            "error": error,
-                        },
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ),
-                    timestamp,
-                    agent,
-                    f"projection {status} for {target_path}",
-                ),
-            )
-        return int(row["projection_id"])
 
 
 def list_migration_state(store: SessionStreamStore) -> list[dict[str, Any]]:

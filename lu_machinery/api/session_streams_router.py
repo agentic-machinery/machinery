@@ -1,7 +1,8 @@
-"""Sol PR-K: read-only Monitor surfaces for session streams + dual-write drift.
+"""Sol PR-K: read-only Monitor surfaces for session streams.
 
-Exposes stream digest/status, dual-write inventory, and projection drift without
-any cutover mutation. Operator cutovers remain explicit CLI/events.
+Exposes stream health, status and digest without any cutover mutation. The
+markdown-handoff mirror (dual-write status and projection drift) was retired in
+#512: a lane's handoff content is its DB note.
 """
 
 from __future__ import annotations
@@ -10,13 +11,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from lu_machinery.session_streams.dual_write import list_handoff_candidates
 from lu_machinery.session_streams.handoff import diagnose_handoff
 from lu_machinery.session_streams.model import entry_as_dict
-from lu_machinery.session_streams.projection import (
-    detect_projection_drift,
-    list_projection_receipts,
-)
 from lu_machinery.session_streams.store import NotFoundError, SessionStreamStore
 
 from .monitor_context import MonitorContext, get_ctx
@@ -114,97 +110,15 @@ def session_stream_digest(
     }
 
 
-@router.get("/v1/dual-write-status")
-def dual_write_status(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
-    """Inventory-derived handoff dual-write paths and file existence (no cutover)."""
-    root = ctx.roots.live_repo_root
-    candidates = list_handoff_candidates(root)
-    rows = [
-        {
-            "stream_id": c.stream_id,
-            "stream_name": c.stream_name,
-            "title": c.title,
-            "exists": c.exists,
-        }
-        for c in candidates
-    ]
-    missing = sum(1 for r in rows if not r["exists"])
-    return {
-        "repo": build_repository_identity(root),
-        "store": _store_health(ctx),
-        "total": len(rows),
-        "missing_files": missing,
-        "candidates": rows,
-        "cutover": "operator-gated",
-    }
-
-
-@router.get("/v1/drift")
-def projection_drift(
-    stream_id: str | None = Query(default=None, description="Optional epic:N filter"),
-    dry_run: bool = Query(
-        default=True,
-        description="When true, classify only without writing new receipts when possible",
-    ),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Projection drift surface for dual-write (PR-K).
-
-    Default dry_run=true returns the latest receipt snapshot + dual-write
-    missing-file count without forcing a full project rewrite. Set dry_run=false
-    to run detect_projection_drift (records receipts; still no stream cutover).
-    """
-    root = ctx.roots.live_repo_root
-    try:
-        store = _store(ctx)
-    except (NotFoundError, FileNotFoundError) as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    if dry_run:
-        receipts = list_projection_receipts(store, stream_id=stream_id)
-        dual = dual_write_status(ctx=ctx)
-        return {
-            "mode": "receipts_snapshot",
-            "stream_id": stream_id,
-            "receipt_count": len(receipts),
-            "receipts": receipts[-50:],  # bounded
-            "dual_write_missing_files": dual["missing_files"],
-            "cutover": "operator-gated",
-        }
-
-    stream_ids = (stream_id,) if stream_id else None
-    try:
-        batch = detect_projection_drift(store, root, stream_ids=stream_ids)
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=500, detail="drift_failed") from exc
-    # ProjectionBatchResult may be a dataclass — best-effort serialization
-    if hasattr(batch, "as_dict"):
-        payload = batch.as_dict()
-    elif hasattr(batch, "__dict__"):
-        payload = dict(batch.__dict__)
-    else:
-        payload = {"result": str(batch)}
-    return {
-        "mode": "detect_projection_drift",
-        "stream_id": stream_id,
-        "batch": payload,
-        "cutover": "operator-gated",
-    }
-
-
 @router.get("/v1/plane-continuity")
 def plane_continuity_bundle(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
-    """One-shot continuity board: health + dual-write + optional plane-status pointer.
+    """One-shot continuity board: health plus the plane-status pointer.
 
     Does not mutate streams or flip message-plane defaults.
     """
     health = session_streams_health(ctx=ctx)
-    dual = dual_write_status(ctx=ctx)
     return {
         "session_streams": health,
-        "dual_write": {
-            "total": dual["total"],
-            "missing_files": dual["missing_files"],
-        },
         "message_plane": {
             "status_path": "/api/comms/v1/plane-status",
             "default_cutover": "off — operator-gated",
