@@ -13,9 +13,7 @@ handoff earlier the same day (#5773).
 
 from __future__ import annotations
 
-
 import pytest
-
 
 from lu_machinery.ai_agent_bridge import _ask_lifecycle as lifecycle
 from tests.helpers.product_tree import configured_roots  # noqa: F401
