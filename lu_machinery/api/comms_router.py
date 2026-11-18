@@ -277,8 +277,9 @@ def _retired_read(replacement: str) -> JSONResponse:
 
 _CHANNEL_READ_REPLACEMENT = (
     "channel-wide history is retired; a seat reads its own deliveries with "
-    "fleet_comms deliveries pending --recipient <slot>, then fleet_comms deliveries receive "
-    "--recipient <slot> --worker-id <slot>; ACP discussions: "
+    "<project python> -I -m lu_machinery.fleet_comms deliveries pending --recipient <slot>, then "
+    "<project python> -I -m lu_machinery.fleet_comms deliveries receive --recipient <slot> "
+    "--worker-id <slot>; ACP discussions: "
     "GET /api/fleet/acp/conversations (metadata) and "
     "GET /api/runtime/acp/conversations/<conversation-id>/transcript (loopback only)"
 )

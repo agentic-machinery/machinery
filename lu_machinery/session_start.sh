@@ -135,7 +135,7 @@ fi
 if [ -z "$INBOX_AGENT" ]; then
     :
 elif [ "$INBOX_COUNT" = "?" ] || [ -z "$INBOX_COUNT" ]; then
-    echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (${MACHINERY_PKG}.fleet_comms deliveries pending --recipient $INBOX_AGENT)${NC}"
+    echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (check: the project interpreter -I -m ${MACHINERY_PKG}.fleet_comms deliveries pending --recipient $INBOX_AGENT)${NC}"
 elif [ "$INBOX_COUNT" != "0" ]; then
     echo -e "${BOLD}INBOX${NC}  ${YELLOW}$INBOX_COUNT queued for $INBOX_AGENT${NC}"
 else

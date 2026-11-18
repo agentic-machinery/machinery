@@ -90,7 +90,8 @@ handoff creates a competing authority.
   do not read `not_configured` as an outage, and do not try to reach, guess,
   or configure a private endpoint from this seat.
 - **Live delivery:** the live driver reads and applies its own inbox with
-  `fleet_comms deliveries receive`, then runs `fleet_comms deliveries ack`.
+  `.venv/bin/python -I -m lu_machinery.fleet_comms deliveries receive`, then runs
+  `.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack`.
   Detached worker processing and a wake signal are not live-consumption proof.
   Continue the required inbox drain in `drive-epic`; do not launch another
   supervisor to wake the current one.

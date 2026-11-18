@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -539,7 +540,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 Outputs: supervisory modes consume Fleet Comms events, prepare durable handoffs or invoke
 offline driver launchers. Without a mode the command refuses: the legacy inbox notification
-mode is removed (#515); read deliveries with {MACHINERY_PACKAGE}.fleet_comms deliveries pending.
+mode is removed (#515); read deliveries with
+{shlex.quote(sys.executable)} -I -m {MACHINERY_PACKAGE}.fleet_comms deliveries pending --recipient <slot>.
 Exit codes: 0 success; 2 refusal/error; 75 launcher-owned restart prepared;
 76 transient Monitor failure (launcher may restart the live watcher).
 Related: docs/runbooks/session-supervisor.md; {MACHINERY_PACKAGE}.session_supervisor.
@@ -610,7 +612,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise ValueError(
             "the legacy inbox notification mode is removed (#515); use "
-            f"{MACHINERY_PACKAGE}.fleet_comms deliveries pending --recipient <slot>, "
+            f"{shlex.quote(sys.executable)} -I -m {MACHINERY_PACKAGE}.fleet_comms deliveries pending "
+            "--recipient <slot>, "
             "--wake-driver, --live-supervisory, --launch-plan or --stop"
         )
     except RemoteUnavailableError:
