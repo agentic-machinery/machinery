@@ -1259,7 +1259,8 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     request = merged = None
     if record.get("mode") == "workspace-write" and "closeout" not in record:
         merged = git.merged_delivery(record)
-    _reap_worktree(record, patience=patience, salvage=salvage)
+    _reap_worktree(record, patience=patience, salvage=salvage,
+                   verified_merged_head=record.get("head_sha") if merged else None)
     if record.get("worktree_disposition") == "removed":
         if merged:
             record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
@@ -1316,7 +1317,8 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
     scratch.settle(record, provider_gone, hold=services_running)
 
 
-def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> None:
+def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
+                   verified_merged_head: str | None = None) -> None:
     """Record the task worktree's disposition and remove the task's caches.
 
     The worktree goes only once the provider's whole process tree is proven gone; liveness that
@@ -1348,7 +1350,8 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> 
             return (salvage and _provider_alive(record) is not False) or _borrowed(record)
 
         try:
-            record.update(git.settle_worktree(record, borrowed=borrowed, salvage=salvage))
+            record.update(git.settle_worktree(record, borrowed=borrowed, salvage=salvage,
+                                              verified_merged_head=verified_merged_head))
         except ImportError as exc:
             # Settlement's code could not be loaded: keep the tree and let the scheduled cleanup, a fresh process, finish.
             record.update(worktree_disposition="retained", worktree_disposition_reason=git.CODE_UNAVAILABLE,
@@ -1755,6 +1758,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 return
         provider = providers.load(spec.agent)
         if spec.mode == "workspace-write":
+            try:
+                git.pin_settlement_registry()
+            except (OSError, ValueError) as exc:
+                status, error = "failed", f"settlement_registry_unavailable: {type(exc).__name__}"
+                return
             try:
                 # The provider's TMPDIR (environment.child_env), made before any launch check runs a provider CLI
                 # with it, and persisted so settlement removes only this directory.

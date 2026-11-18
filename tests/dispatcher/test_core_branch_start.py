@@ -435,6 +435,24 @@ def test_branch_write_refuses_local_outside_commit_after_remote_branch_deleted(s
     assert not (sandbox.repo / ".worktrees/dispatch/codex/missing-remote").exists()
 
 
+def test_takeover_uses_recorded_start_after_history_rewrite(sandbox, delivery_settle):
+    """The old published start may be detached from both tips after a takeover rewrites its branch."""
+    record, settle = delivery_settle
+    tree = Path(record["cwd"])
+    (tree / "predecessor.txt").write_text("first predecessor commit\n")
+    run_git(tree, "add", "predecessor.txt")
+    run_git(tree, "commit", "-m", "predecessor")
+    predecessor = run_git(tree, "rev-parse", "HEAD")
+    run_git(tree, "commit", "--allow-empty", "-m", "superseded predecessor tip")
+    record["worktree_start_sha"] = run_git(tree, "rev-parse", "HEAD")
+    run_git(tree, "push", "origin", f"HEAD:{record['worktree_branch']}")
+    run_git(tree, "reset", "--hard", predecessor)
+    run_git(tree, "push", "--force-with-lease", "origin", f"HEAD:{record['worktree_branch']}")
+
+    delivered = settle("pushed")
+    assert (delivered["status"], delivered["error"]) == ("done", None)
+
+
 def test_workspace_write_sha_base_is_refused_at_dispatch(sandbox):
     """A commit SHA is not an origin base, so settlement would record no_deliverable."""
     sha = run_git(sandbox.repo, "rev-parse", "HEAD")
@@ -998,6 +1016,29 @@ def test_write_task_merged_into_main_counts_as_published_after_its_branch_is_del
     assert git.settle_worktree(record) == dict(worktree_disposition="removed", worktree_disposition_reason="clean")
     assert not tree.exists()
     assert branch not in local_branches(sandbox.repo)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("head_moved", [False, True])
+def test_reap_uses_verified_merged_snapshot_only_for_same_head(sandbox, monkeypatch, head_moved):
+    """Merge proof remains sufficient after ref deletion, but cannot cover a new local commit."""
+    record = sandbox.settle(sandbox.dispatch("unpushed", "--mode", "workspace-write"), expected=1)
+    tree = Path(record["worktree_path"])
+    if head_moved:
+        run_git(tree, "commit", "--allow-empty", "-m", "later unpublished work")
+    in_process_repo(sandbox, monkeypatch)
+    monkeypatch.setattr(git, "merged_delivery", lambda _: {"repo": "org/repo", "number": 7, "merge_sha": "a" * 40})
+    monkeypatch.setattr(worker, "_run_merge_closeout", lambda request: {"pr": request["pr"], "returncode": 0})
+
+    worker._reap_settled(record)
+
+    assert tree.exists() is head_moved
+    if head_moved:
+        assert record["worktree_disposition_reason"] == "unpublished"
+        assert "closeout" not in record
+    else:
+        assert record["worktree_disposition"] == "removed"
+        assert record["closeout"] == {"pr": 7, "returncode": 0}
 
 
 @pytest.mark.usefixtures('configured_roots')

@@ -8,6 +8,7 @@ store. Only gh and Git handle credential bytes, over their private pipe.
 import os
 import re
 import shlex
+from functools import cache
 from pathlib import Path
 
 import yaml
@@ -15,6 +16,19 @@ import yaml
 from lu_machinery.opsec.prepublish import PublishBlocked, real_gh
 
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
+
+
+@cache
+def repository_registry(path: Path) -> dict:
+    """Keep the installed release's repository registry for this process."""
+    try:
+        registry = yaml.safe_load(path.read_text())
+    except yaml.YAMLError:
+        raise ValueError("invalid fleet repository registry") from None
+    repos = registry.get("repos") if isinstance(registry, dict) else None
+    if not isinstance(repos, dict):
+        raise ValueError("invalid fleet repository registry")
+    return repos
 
 
 def canonical_origins(repository: dict) -> tuple[str, ...]:
@@ -40,7 +54,7 @@ def verification_credentials(remote: str) -> list[str]:
     """
     if not remote.startswith("https://github.com/"):
         return []
-    repositories = yaml.safe_load(CONFIG.read_text())["repos"].values()
+    repositories = repository_registry(CONFIG).values()
     if not any(remote in canonical_origins(repository) for repository in repositories):
         return []
     try:
