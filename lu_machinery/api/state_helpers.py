@@ -30,6 +30,7 @@ import inspect
 import logging
 import threading
 import time
+import weakref
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -61,8 +62,21 @@ DEMAND_WINDOW_S = 120.0
 DORMANT_READ_WAIT_S = 2.0
 # A stale-while-revalidate route read that finds its value dormant waits this
 # long for the refresh it starts; under the 1 s panel budget, then the stored
-# value with its true age.
+# value with its true age. A first read, with nothing stored yet, waits the same
+# bound for the first computation, then answers the typed warming 503.
 SWR_DORMANT_READ_WAIT_S = 0.5
+# Retry-After of every warming 503: the first collection usually lands by then.
+WARMING_RETRY_AFTER_S = 2
+
+
+def warming_unavailable(detail: str) -> HTTPException:
+    """The typed 503 a cold read gets when its first collection is still running."""
+    return HTTPException(
+        status_code=503, detail=detail,
+        headers={
+            "X-Snapshot-Age-S": "unknown", "Retry-After": str(WARMING_RETRY_AFTER_S), "Cache-Control": "no-store",
+        },
+    )
 
 
 class Demand:
@@ -82,6 +96,26 @@ class Demand:
         return _ttl_clock() - self._last_read < DEMAND_WINDOW_S
 
 
+# Snapshot writers whose lifespan is running; startup work waits for their first collections.
+_running_snapshots: weakref.WeakSet[PeriodicSnapshot[Any]] = weakref.WeakSet()
+
+
+async def first_collections_settled(timeout: float) -> None:
+    """Wait, at most ``timeout`` seconds, until every snapshot writer on this loop has settled its first collection.
+
+    Startup runs this before the heavy warmups, so the panels' first
+    collections get the task-scan lock and the GIL first. A collection that
+    takes longer than the bound stops holding the warmups back; it is not
+    cancelled.
+    """
+    loop = asyncio.get_running_loop()
+    events = [snapshot._ready for snapshot in list(_running_snapshots)
+              if snapshot._loop is loop and snapshot._ready is not None]
+    if events:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in events)), timeout=timeout)
+
+
 class PeriodicSnapshot[T]:
     """One lifespan-owned writer; readers never collect.
 
@@ -90,7 +124,9 @@ class PeriodicSnapshot[T]:
     wakes it and, off the event loop, waits up to ``dormant_wait_s`` (default
     :data:`DORMANT_READ_WAIT_S`) for the fresh collection; otherwise it gets
     the last observation with its true age. Reads while the writer is active
-    never wait.
+    never wait, except before the first collection settles: a read off the
+    event loop then joins that collection for the same bounded wait, and gets
+    the typed warming 503 only if it is still running.
     """
 
     def __init__(self, compute: Callable[[], T], interval: float, *, dormant_wait_s: float | None = None):
@@ -101,6 +137,7 @@ class PeriodicSnapshot[T]:
         self._demand = Demand()
         self._demand.touch()  # the startup collection
         self._wake: asyncio.Event | None = None
+        self._ready: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._attempts = 0
         # Attempt count when a read woke the dormant writer; None once it settles.
@@ -117,10 +154,7 @@ class PeriodicSnapshot[T]:
         self._join_wake_refresh()
         entry = self._entry
         if entry is None:
-            raise HTTPException(
-                status_code=503, detail="snapshot not ready",
-                headers={"X-Snapshot-Age-S": "unknown", "Retry-After": "2", "Cache-Control": "no-store"},
-            )
+            raise warming_unavailable("snapshot not ready")
         return entry[1], max(0.0, _ttl_clock() - entry[0])
 
     def _join_wake_refresh(self) -> None:
@@ -138,6 +172,8 @@ class PeriodicSnapshot[T]:
             if woke:
                 self._pending = self._attempts
             pending = self._pending
+            if pending is None and self._entry is None and self._attempts == 0:
+                pending = 0  # the first collection has not settled: join it
         if woke:
             try:
                 loop.call_soon_threadsafe(wake.set)
@@ -171,7 +207,8 @@ class PeriodicSnapshot[T]:
     async def lifespan(self):
         ready = asyncio.Event()
         wake = asyncio.Event()
-        self._loop, self._wake = asyncio.get_running_loop(), wake
+        self._loop, self._wake, self._ready = asyncio.get_running_loop(), wake, ready
+        _running_snapshots.add(self)
 
         async def repeat() -> None:
             while True:
@@ -202,9 +239,11 @@ class PeriodicSnapshot[T]:
                 await asyncio.wait_for(ready.wait(), timeout=0.1)
             yield
         finally:
+            _running_snapshots.discard(self)
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            self._ready = None
             with self._settled:  # no reader waits on a writer that has stopped
                 self._loop = self._wake = self._pending = None
                 self._settled.notify_all()
@@ -494,8 +533,10 @@ async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-pa
     joins) one refresh and waits for it, off the event loop, up to
     :data:`SWR_DORMANT_READ_WAIT_S`; a slower refresh leaves it the stored value
     with its true age. Only the first read of a key waits for the whole
-    computation, which concurrent first reads share. The age is the time since
-    the value was stored.
+    computation, which concurrent first reads share, for at most
+    :data:`SWR_DORMANT_READ_WAIT_S`; a slower first computation keeps running
+    and stores its value, and the read gets the typed warming 503 meanwhile.
+    The age is the time since the value was stored.
 
     A refresh that fails, or whose value ``storable`` rejects (the value reports
     its own failure), leaves the previous value in place, still ageing. When
@@ -518,7 +559,13 @@ async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-pa
                 return dormant[0], dormant[1], True  # type: ignore[return-value]
             stored = None
         if stored is None:
-            first = await cache_get_or_compute_async(key, ttl, guarded)
+            try:
+                # The computation is shared and shielded: a read that stops waiting leaves it running.
+                first = await asyncio.wait_for(
+                    cache_get_or_compute_async(key, ttl, guarded), timeout=SWR_DORMANT_READ_WAIT_S,
+                )
+            except TimeoutError:
+                raise warming_unavailable("snapshot warming") from None
             stored = cache_get_stored(key)
             return first, 0.0 if stored is None else stored[1], True
     except _Unstorable as failed:

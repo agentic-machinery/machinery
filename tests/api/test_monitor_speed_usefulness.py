@@ -635,3 +635,63 @@ def test_swr_route_caches_only_default_or_varied_parameters(monkeypatch, tmp_pat
         assert direct.json() == {"status": "done", "agent": "codex", "n": expected}
         assert "X-Snapshot-Age-S" not in direct.headers
     assert len(calls) == 4
+
+
+def test_cold_start_reads_answer_a_typed_warming_503_not_a_504(monkeypatch, tmp_path):
+    """Defect class: right after a restart, a read waited on a cold first collection into the
+    10 s request timeout (a 504). While the first collections run, routing-budget and the
+    snapshot routes answer at once with the typed warming 503 and Retry-After, and 200 once
+    those collections land."""
+    import threading
+
+    from fastapi import FastAPI
+
+    from lu_machinery.api import delegate_router, fleet_workers_router, state_helpers, state_router
+    from lu_machinery.api.monitor_context import fixture_context
+
+    release = threading.Event()
+
+    def held(value):
+        def collect(*_args, **_kwargs):
+            assert release.wait(30), "the test did not release the cold collection"
+            return value
+
+        return collect
+
+    async def no_claude_fields(**_kwargs):
+        return {}
+
+    tasks = {"total": 0, "tasks": []}
+    monkeypatch.setattr(delegate_router, "active_delegate_tasks", held(tasks))
+    monkeypatch.setattr(delegate_router, "recent_finished_tasks", held(tasks))
+    monkeypatch.setattr(fleet_workers_router, "_collect_snapshots", held({None: {"hosts": []}, "": {"hosts": []}}))
+    monkeypatch.setattr(state_router, "compute_routing_budget", held({"agents": {}}))
+    monkeypatch.setattr(state_router, "revalidated_routing_budget_fields", no_claude_fields)
+
+    ctx = fixture_context(tmp_path)
+    probe_app = FastAPI()
+    probe_app.state.ctx = ctx
+    probe_app.include_router(delegate_router.router, prefix="/api/delegate")
+    probe_app.include_router(fleet_workers_router.router, prefix="/api/fleet")
+    probe_app.include_router(state_router.router, prefix="/api/state")
+    routes = ("/api/state/routing-budget", "/api/delegate/active", "/api/delegate/recent", "/api/fleet/workers/v1")
+    snapshots = (
+        delegate_router.active_snapshot(ctx), delegate_router.recent_snapshot(ctx), fleet_workers_router.workers_snapshot(ctx),
+    )
+    with TestClient(probe_app) as client:
+        try:
+            for route in routes:
+                cold = client.get(route)
+                assert cold.status_code == 503, route
+                assert cold.headers["Retry-After"] == "2", route
+                assert cold.headers["X-Snapshot-Age-S"] == "unknown", route
+        finally:
+            release.set()
+        # Join the first collections instead of polling the routes.
+        key = state_router._ctx_cache_key(ctx, "routing-budget", "dispatch", 0)
+        state_helpers.cache_get_or_compute(key, 3600.0, lambda: pytest.fail("a second routing-budget compute"))
+        for snapshot in snapshots:
+            with snapshot._settled:
+                assert snapshot._settled.wait_for(lambda snapshot=snapshot: snapshot._attempts > 0, timeout=10)
+        for route in routes:
+            assert client.get(route).status_code == 200, route

@@ -103,7 +103,15 @@ from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
 from .session_streams_router import router as session_streams_router
-from .state_helpers import Demand, PeriodicSnapshot, cache_get, cache_invalidate, cache_set, ctx_cache_scope
+from .state_helpers import (
+    Demand,
+    PeriodicSnapshot,
+    cache_get,
+    cache_invalidate,
+    cache_set,
+    ctx_cache_scope,
+    first_collections_settled,
+)
 from .state_router import router as state_router
 from .state_router import schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -117,41 +125,41 @@ from .worktrees_router import router as worktrees_router
 # child inherits this; an explicit operator value wins.
 os.environ.setdefault("GIT_OPTIONAL_LOCKS", "0")
 
-core_router = APIRouter()
-
-
 @asynccontextmanager
-async def _lifespan(_app: FastAPI):
-    """Lifespan hook — wrap uvicorn signal handlers so we record WHO killed us.
+async def _routers_started(app: FastAPI):
+    """The innermost lifespan: the core router is included last, so every router lifespan has started.
 
-    Without this, "Shutting down" lines in logs/api.log have no provenance.
-    See scripts/api/_signal_log.py for the wrapper rationale.
-
-    Startup uses the authority-service interlock. An authority that component
-    cannot write refuses startup, so plane-status cannot report a store the
-    seats do not write. Sqlite and shadow stay allowed.
+    Router lifespans run after the app lifespan's startup (FastAPI nests them
+    inside it). The app lifespan's background work waits for this signal.
     """
-    ctx = _app.state.ctx
-    product: ProductContribution = _app.state.product
-    projection_refresh_task = None
-    panel_refresh_task = None
-    orient_refresh_task = None
+    started = getattr(app.state, "routers_started", None)
+    if started is not None:
+        started.set()
+    yield
+
+
+core_router = APIRouter(lifespan=_routers_started)
+# Startup holds the warmups at most this long for the snapshot writers' first collections.
+STARTUP_SNAPSHOT_FIRST_WAIT_S = 10.0
+
+
+async def _run_background_work(ctx: MonitorContext, product: ProductContribution, routers_started: asyncio.Event) -> None:
+    """Warm and refresh the slow collectors once every router lifespan has started.
+
+    The snapshot writers (the delegate lists, the fleet worker map) start in
+    router lifespans, and the warmups wait (bounded) for their first
+    collections. Those get the shared task-scan lock and the GIL before the
+    heavy warmups (routing budget, work projection, orient, issue audit) take
+    them: before, a restart answered those panels with 503s while their first
+    collection queued behind seconds of warmup scans. Runs until cancelled at
+    shutdown.
+    """
+    await routers_started.wait()
+    await first_collections_settled(STARTUP_SNAPSHOT_FIRST_WAIT_S)
+    tasks: list[asyncio.Task] = []
     try:
-        # Reuse assert_component_supported; do not add a second allow-list.
-        # ControlPlaneUnsupportedComponentError names the store and authority
-        # and carries no connection string.
-        assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
-        preload_all(product.preload, product.preload_optional)
-        install_signal_logging()
-        ensure_broker_db_ready(ctx=ctx)
         warm_panel_metrics(ctx)
         warm_pull_requests(ctx)
-        seed_manifest_inventory(
-            ctx.roots.project_root,
-            store=ctx.stores.epics_store,
-            handoff_root=ctx.roots.live_repo_root,
-            ctx=ctx,
-        )
         try:
             isa.schedule_refresh(force=False)
         except Exception as exc:
@@ -164,26 +172,57 @@ async def _lifespan(_app: FastAPI):
             schedule_state_scan_warmup(ctx, product.warmup)
         except Exception as exc:
             logger.warning("State scan warmup schedule on startup failed: %s", exc)
-        projection_refresh_task = asyncio.create_task(
-            refresh_projection_cache_periodically(ctx), name="work-projection-refresh"
-        )
-        panel_refresh_task = asyncio.create_task(refresh_panel_metrics_periodically(ctx), name="comms-metrics-refresh")
-        orient_refresh_task = asyncio.create_task(refresh_orient_periodically(ctx, product), name="orient-refresh")
+        tasks.append(asyncio.create_task(refresh_projection_cache_periodically(ctx), name="work-projection-refresh"))
+        tasks.append(asyncio.create_task(refresh_panel_metrics_periodically(ctx), name="comms-metrics-refresh"))
+        tasks.append(asyncio.create_task(refresh_orient_periodically(ctx, product), name="orient-refresh"))
         start_periodic_refresh()
+        await asyncio.Event().wait()
+    finally:
+        for task in reversed(tasks):
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Lifespan hook — wrap uvicorn signal handlers so we record WHO killed us.
+
+    Without this, "Shutting down" lines in logs/api.log have no provenance.
+    See scripts/api/_signal_log.py for the wrapper rationale.
+
+    Startup uses the authority-service interlock. An authority that component
+    cannot write refuses startup, so plane-status cannot report a store the
+    seats do not write. Sqlite and shadow stay allowed. Warmups and periodic
+    refreshes start after the router lifespans (``_run_background_work``).
+    """
+    ctx = _app.state.ctx
+    product: ProductContribution = _app.state.product
+    routers_started = _app.state.routers_started = asyncio.Event()
+    background_work = None
+    try:
+        # Reuse assert_component_supported; do not add a second allow-list.
+        # ControlPlaneUnsupportedComponentError names the store and authority
+        # and carries no connection string.
+        assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
+        preload_all(product.preload, product.preload_optional)
+        install_signal_logging()
+        ensure_broker_db_ready(ctx=ctx)
+        seed_manifest_inventory(
+            ctx.roots.project_root,
+            store=ctx.stores.epics_store,
+            handoff_root=ctx.roots.live_repo_root,
+            ctx=ctx,
+        )
+        background_work = asyncio.create_task(
+            _run_background_work(ctx, product, routers_started), name="startup-background-work"
+        )
         yield
     finally:
-        if orient_refresh_task is not None:
-            orient_refresh_task.cancel()
+        if background_work is not None:
+            background_work.cancel()
             with suppress(asyncio.CancelledError):
-                await orient_refresh_task
-        if panel_refresh_task is not None:
-            panel_refresh_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await panel_refresh_task
-        if projection_refresh_task is not None:
-            projection_refresh_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await projection_refresh_task
+                await background_work
         try:
             stop_periodic_refresh()
         finally:
