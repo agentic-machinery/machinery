@@ -208,7 +208,7 @@ def install_wheel(py: Path, wheel: Path, home: Path) -> None:
             "--no-input",
             "--index-url",
             PYPI_INDEX,
-            str(wheel),
+            f"lu-machinery[api,postgres,pytest] @ {wheel.as_uri()}",
         ],
         env=base_env(home),
         cwd=py.parent,
