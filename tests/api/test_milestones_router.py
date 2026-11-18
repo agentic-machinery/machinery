@@ -88,7 +88,11 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
         assert "private-description" not in response.text
         assert "private-link" not in response.text
         assert len(calls) == 3  # One milestones list each; only the public repo needs issue details.
-        assert client.get("/api/milestones").json()["repositories"] == data["repositories"]
+        warm = client.get("/api/milestones").json()["repositories"]
+        for original, refreshed in zip(data["repositories"], warm, strict=True):
+            assert original["age_seconds"] >= 0
+            assert refreshed.pop("age_seconds") >= 0
+            assert refreshed == {key: value for key, value in original.items() if key != "age_seconds"}
         assert len(calls) == 3  # Warm page polls never reach GitHub.
 
     # The same representative artifact proves validators are reused on the next collection.
