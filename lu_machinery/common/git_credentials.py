@@ -22,12 +22,19 @@ CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
 def repository_registry(path: Path) -> dict:
     """Keep the installed release's repository registry for this process."""
     try:
-        registry = yaml.safe_load(path.read_text())
+        registry = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError:
         raise ValueError("invalid fleet repository registry") from None
     repos = registry.get("repos") if isinstance(registry, dict) else None
-    if not isinstance(repos, dict):
+    if not isinstance(repos, dict) or not repos:
         raise ValueError("invalid fleet repository registry")
+    for key, entry in repos.items():
+        if (not isinstance(key, str) or not key.strip() or not isinstance(entry, dict)
+                or not isinstance(entry.get("github"), str) or not entry["github"].strip()
+                or entry.get("transport", "ssh") not in ("file", "https", "ssh")
+                or ("local_name" in entry and (not isinstance(entry["local_name"], str) or not entry["local_name"].strip()))
+                or not isinstance(entry.get("default", False), bool)):
+            raise ValueError("invalid fleet repository registry")
     return repos
 
 

@@ -192,6 +192,18 @@ def test_ownership_shallow_fetches_do_not_change_linked_worktree_primary(tmp_pat
     assert git._verification_git(primary, "show-ref") == refs
 
 
+@pytest.mark.parametrize("entry", [None, {"github": []}, {"github": "fixture/private", "transport": []},
+                                   {"github": "fixture/private", "local_name": 4}])
+def test_settlement_registry_rejects_malformed_entries(tmp_path, entry):
+    """Malformed entries must fail at startup rather than aborting the terminal record write."""
+    from lu_machinery.common import git_credentials
+
+    registry = tmp_path / "fleet_repos.yaml"
+    registry.write_text(yaml.safe_dump({"repos": {"public": entry}}))
+    with pytest.raises(ValueError, match="invalid fleet repository registry"):
+        git_credentials.repository_registry(registry)
+
+
 def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_remote(
     sandbox, delivery_settle, monkeypatch, tmp_path,
 ):
@@ -204,7 +216,7 @@ def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_
     import shlex
 
     from lu_machinery.common import git_credentials
-    from lu_machinery.orchestration import merge_closeout
+    from lu_machinery.orchestration import fleet_repos, merge_closeout
 
     record, settle = delivery_settle
     record = settle("pushed")
@@ -215,9 +227,12 @@ def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_
     run_git(tree, "config", "remote.origin.url", remote)
     record["worktree_remote_url"] = remote
     registry = tmp_path / "registry.yaml"
-    registry.write_text(yaml.safe_dump({"repos": {"fixture": {"github": "fixture/private", "transport": "https"}}}))
+    registry.write_text(yaml.safe_dump({"repos": {"fixture": {
+        "github": "fixture/private", "transport": "https", "local_name": "fixture", "default": True,
+    }}}))
     monkeypatch.setattr(git_credentials, "CONFIG", registry)
     monkeypatch.setattr(git, "machinery_path", lambda _relative: registry)
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", registry)
     git.pin_settlement_registry()
     registry.unlink()  # Simulate removing the installed package after launch.
     log = tmp_path / "helper-contexts"

@@ -341,14 +341,17 @@ def _git(path: Path, *args: str, isolate: bool = False, strip: bool = True, env:
 
 
 def pin_settlement_registry() -> None:
-    """Load the config used for HTTPS verification and closeout before provider execution."""
+    """Load the registry for Git, guarded worktree removal, and closeout before provider execution."""
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
     git_credentials.repository_registry(git_credentials.CONFIG)
     git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
+    load_fleet_repos()
 
 
 def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
     repos = git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
-    key = key or next(name for name, item in repos.items() if item.get("default"))
+    key = key or next((name for name, item in repos.items() if item.get("default")), None)
     if key not in repos:
         raise ValueError("unknown repository key")
     item = {**repos[key], "key": key}
@@ -356,7 +359,11 @@ def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
     if slug is not None:
         # A configured slug names the default repository (#12681); unset, the catalog's value stands.
         item["github"] = slug
-    return (main_checkout_root(product_root()) if item.get("default") else state_root().parent / item["local_name"]).resolve(), item
+    if item.get("default"):
+        return main_checkout_root(product_root()).resolve(), item
+    if "local_name" not in item:
+        raise ValueError("repository registry entry requires a local name")
+    return (state_root().parent / item["local_name"]).resolve(), item
 
 
 def publish_start(repo: Path, repository: dict, branch: str, task_id: str, *, label: str = "publish branch") -> tuple[str, str]:
@@ -1142,7 +1149,9 @@ def merged_delivery(record: dict) -> dict | None:
         primary = None
         strong_delivery = False
         snapshot = record.get("head_sha")
-        snapshot_published = record.get("commits_ahead") == 0
+        start = record.get("worktree_start_sha", record["worktree_base_sha"])
+        # A reset to an ancestor can have zero commits ahead while leaving unpublished work.
+        snapshot_published = snapshot is not None and snapshot == start
         branches = {record["worktree_branch"], record.get("publish_branch")} - {None}
         accepted = set(_accepted_prs(record["task_id"], repo))
 
@@ -1186,7 +1195,6 @@ def merged_delivery(record: dict) -> dict | None:
                     continue  # inherited task commits do not establish custody of a successor's PR
             # Use the actual pre-merge base. The live base may now include the task's commits.
             with ownership_git(record, head=pr_head) as run:
-                start = record.get("worktree_start_sha", record["worktree_base_sha"])
                 parent = _fetch_merged_parent(run, pr["mergeCommit"]["oid"], record)
                 # The exit snapshot may be a reset to the squash merge. Count the PR head's own range.
                 commits_expected = exact_delivery or bool(run("rev-list", "--max-count=1", f"{start}..{pr_head}"))
