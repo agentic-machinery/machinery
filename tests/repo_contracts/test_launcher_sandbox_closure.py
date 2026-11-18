@@ -17,11 +17,22 @@ import pytest
 
 from lu_machinery.common.repo_root import machinery_root
 from lu_machinery.fleet_comms import contracts
+from tests import launcher_sandbox
 from tests.launcher_sandbox import copy_slot_registry, launcher_environment, slot_registry_sources
 
 
 def test_slot_registry_closure_includes_fleet_comms_contracts_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     prefix = tmp_path / "bytecode"
+    # This regression owns its shim consumer; the slot gate need not import it.
+    monkeypatch.setattr(
+        launcher_sandbox,
+        "_PROBE",
+        launcher_sandbox._PROBE.replace(
+            "codes = [",
+            "importlib.import_module('lu_machinery.fleet_comms.contracts')\ncodes = [",
+            1,
+        ),
+    )
     monkeypatch.setattr(
         "tests.launcher_sandbox.launcher_environment",
         lambda: launcher_environment(PYTHONPYCACHEPREFIX=str(prefix)),
