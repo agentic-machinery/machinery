@@ -905,7 +905,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         import subprocess
 
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
@@ -928,7 +928,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
         from lu_machinery.ai_agent_bridge._model import check_model
         _MODEL_CACHE.pop("gemini-3.8-flash-high", None)
@@ -959,7 +959,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
         from lu_machinery.ai_agent_bridge._model import check_model
         _MODEL_CACHE.pop("gemini-3.8-flash-high", None)

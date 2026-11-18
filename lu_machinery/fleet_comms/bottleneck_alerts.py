@@ -97,7 +97,7 @@ def _active_lease_holder(stream_epic: str, *, session_db: Path, now: datetime) -
         streams = {name for name, epics in load_registry().items() if int(stream_epic) in epics}
         lanes = {lane for stream, lane in load_launcher_bindings().values() if stream in streams}
         candidates = {f"{holder}-{lane}" for lane in (lanes or streams)} & registered
-    except (OSError, ValueError, TypeError) as exc:
+    except Exception as exc:
         logger.error("bottleneck alerts: holder recipient lookup failed for epic %s: %s", stream_epic, exc)
         return None
     return next(iter(candidates)) if len(candidates) == 1 else None

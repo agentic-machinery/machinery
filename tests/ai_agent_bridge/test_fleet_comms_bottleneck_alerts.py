@@ -7,9 +7,10 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
+import yaml
 
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.authority import AuthorityService
@@ -178,7 +179,7 @@ def test_clear_resets_alert_state_for_a_later_breach(tmp_path: Path) -> None:
     assert len(_alerts()) == 2
 
 
-def test_no_or_stale_lease_escalates_to_claude_infra_only(tmp_path: Path) -> None:
+def test_no_or_stale_lease_escalates_to_claude_infra_only(tmp_path: Path, monkeypatch) -> None:
     result = scan_bottlenecks_at_inbox_checkpoint(
         repo_root=tmp_path,
         now=NOW,
@@ -194,6 +195,26 @@ def test_no_or_stale_lease_escalates_to_claude_infra_only(tmp_path: Path) -> Non
     finally:
         conn.close()
     assert recipients == ["claude-infra"]
+    from lu_machinery.fleet_comms import bottleneck_alerts
+
+    session_db = tmp_path / "active.sqlite3"
+    _open_lease(session_db)
+    for level, error in enumerate((yaml.YAMLError("invalid registry"), AttributeError("empty registry")), 1):
+        monkeypatch.setattr(bottleneck_alerts, "load_registry", Mock(side_effect=error))
+        result = scan_bottlenecks_at_inbox_checkpoint(
+            repo_root=tmp_path,
+            now=NOW + timedelta(seconds=level),
+            session_db=session_db,
+            rate_limit_seconds=0,
+            metrics_collector=lambda level=level, **kwargs: _metrics(age_s=7_200 * 2**level, **kwargs),
+        )
+        assert result.alerts_posted == 1
+    conn = _fleet_db()
+    try:
+        recipients = [row["recipient"] for row in conn.execute("SELECT recipient FROM authority_deliveries")]
+    finally:
+        conn.close()
+    assert recipients == ["claude-infra"] * 3
 
 
 def test_failed_delivery_is_loud_and_recorded_without_blocking_rescan(tmp_path: Path) -> None:
