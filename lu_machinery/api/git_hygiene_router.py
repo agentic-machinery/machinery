@@ -95,14 +95,20 @@ class CleanupReport(BaseModel):
 def _git_dir_options(cwd: Path) -> list[str]:
     git_path = cwd / ".git"
     if git_path.is_file():
-        line = git_path.read_text(encoding="utf-8", errors="surrogateescape").strip()
-        if line.startswith("gitdir:"):
-            raw_git_dir = Path(line.removeprefix("gitdir:").strip())
+        # As git reads a gitfile: bytes, ``gitdir: `` then the path, only the trailing CR and LF removed
+        # (a path may end in any other character, even a Unicode space).
+        line = git_path.read_bytes().decode("utf-8", "surrogateescape").rstrip("\r\n")
+        if line.startswith("gitdir: "):
+            raw_git_dir = Path(line.removeprefix("gitdir: "))
             git_dir = raw_git_dir if raw_git_dir.is_absolute() else cwd / raw_git_dir
             return [f"--git-dir={git_dir}", f"--work-tree={cwd}"]
     if git_path.is_dir():
         return [f"--git-dir={git_path}", f"--work-tree={cwd}"]
     return []
+
+
+def _decode(data: bytes) -> str:
+    return data.decode("utf-8", "surrogateescape")
 
 
 def _run_git(
@@ -112,22 +118,22 @@ def _run_git(
     input_text: str | None = None,
     timeout_s: float = _GIT_TIMEOUT_S,
 ) -> tuple[int, str, str]:
-    """Run git; the output is read losslessly (``surrogateescape``), so a name or path that is not UTF-8 keeps its exact bytes."""
+    """Run git; the output is read as bytes and decoded losslessly (``surrogateescape``).
+
+    A name or path that is not UTF-8 keeps its exact bytes, and a carriage return is not turned into a newline.
+    """
     try:
         env = sanitized_git_env()
         proc = subprocess.run(
             ["git", "--no-optional-locks", *_git_dir_options(cwd), *args],
             cwd=cwd,
             env=env,
-            input=input_text,
+            input=None if input_text is None else input_text.encode("utf-8", "surrogateescape"),
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="surrogateescape",
             timeout=timeout_s,
             check=False,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        return proc.returncode, _decode(proc.stdout), _decode(proc.stderr)
     except subprocess.TimeoutExpired as exc:
         return 124, "", f"TimeoutExpired after {exc.timeout}s"
     except (FileNotFoundError, PermissionError, OSError, AssertionError) as exc:
@@ -379,7 +385,8 @@ def _merged_to_main_answer(branch: str, cwd: Path, *, main: str = "main", tip: s
     code, stdout, _stderr = _run_git(["branch", "--merged", main, "--format=%(refname:short)"], cwd=cwd)
     if code != 0:
         return False, False
-    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}, False
+    # Split on newlines only and keep each name exactly: a ref may end in, or hold, any Unicode space.
+    return branch in {line for line in stdout.split("\n") if line}, False
 
 
 def _is_worktree_clean(path: Path) -> bool:
