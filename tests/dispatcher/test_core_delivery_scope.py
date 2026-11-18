@@ -158,7 +158,10 @@ LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nnam
     ("outside", "unbound", False),  # an unreadable scope owns every untracked file
     ("nested", None, False),  # a nested checkout's files are not listed, so it may hold task work
     ("bare", None, False),  # a nested bare repository's commits may hold work the delivery does not
+    ("bare-symlink-head", None, False),  # Git still opens a bare repository whose HEAD is a symbolic link
+    ("marker-output", None, True),  # HEAD and objects/ files that Git would not open as a repository
     ("stat-hidden", None, False),  # a tracked edit the worker's stat settings would hide from status
+    ("attributes-file", None, True),  # a configured attributes file keeps a clean checkout clean
 ])
 def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, unrelated):
     """Defect class: settlement failed a pushed delivery for scratch the task does not own (#524).
@@ -173,6 +176,10 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
         run_git(work, "config", key, value)
     (work / ".gitignore").write_text("*.log\n")
     (work / "delivered.txt").write_text("delivery\n")
+    if case == "attributes-file":  # checked out as CRLF only through the configured attributes file
+        (tmp_path / "attributes").write_text("*.txt text eol=crlf\n")
+        run_git(work, "config", "core.attributesFile", str(tmp_path / "attributes"))
+        (work / "delivered.txt").write_bytes(b"delivery\r\n")
     os.utime(work / "delivered.txt", (1_000_000_000, 1_000_000_000))  # older than the index: not racily clean
     run_git(work, "add", ".")
     run_git(work, "commit", "-q", "-m", "delivery")
@@ -183,8 +190,17 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
     if case == "nested":
         run_git(work, "init", "-q", "scratch/nested")
         (work / "scratch/nested/inner.txt").write_text("nested\n")
-    elif case == "bare":
+    elif case in {"bare", "bare-symlink-head"}:
         run_git(work, "init", "-q", "--bare", "scratch/nested.git")
+        if case == "bare-symlink-head":  # the legacy form; its branch may exist only as a packed ref
+            (work / "scratch/nested.git/HEAD").unlink()
+            (work / "scratch/nested.git/HEAD").symlink_to("refs/heads/main")
+    elif case == "attributes-file":
+        os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
+    elif case == "marker-output":
+        (work / "scratch/output/objects").mkdir(parents=True)
+        (work / "scratch/output/HEAD").write_text("generated report\n")
+        (work / "scratch/output/objects/artifact.json").write_text("{}\n")
     elif case == "stat-hidden":
         # Same size and timestamps on a new inode: only the stat checks the worker switches off can see it.
         before, rewrite = (work / "delivered.txt").stat(), work / "rewrite.tmp"
@@ -202,10 +218,12 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
                                         "grant_id": "g1", "owned_paths": ["scratch"]}]
     observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
     assert observed["worktree_dirty_on_exit"] is (case != "ignored")
-    assert observed["worktree_untracked_only_on_exit"] is (case not in {"ignored", "stat-hidden"})
+    assert observed["worktree_untracked_only_on_exit"] is (case != "ignored")
     assert observed["worktree_unrelated_only_on_exit"] is unrelated
-    changed, untracked = git._tree_changes(work)  # removal's inventory: the same exact names
-    assert bool(changed) is (case == "stat-hidden")
+    # Removal's inventory: the same exact names. Its integrity read sees the stat-hidden edit, and reads
+    # without the configured attributes file, which can only make removal keep the tree.
+    changed, untracked = git._tree_changes(work)
+    assert bool(changed) is (case in {"stat-hidden", "attributes-file"})
     if case in {"outside", "line-breaks"}:
         assert sorted(untracked) == sorted(leftovers)
 
