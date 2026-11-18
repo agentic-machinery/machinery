@@ -7,8 +7,8 @@ directory, whatever the task's terminal status, once the caller has proven the p
 and records ``task_scratch_disposition``, ``task_scratch_disposition_reason`` and ``task_scratch_bytes``.
 :func:`pending` tells the scheduled sweep which finished tasks to retry.
 
-Removal takes the whole tree or nothing. A tree that holds a socket, a FIFO or a ``tmux-*``/``ssh-*`` entry,
-or any part of which a live process holds, is kept whole and retried.
+A tree that holds a socket, a FIFO or a ``tmux-*``/``ssh-*`` entry, or any part of which a live process holds,
+is kept whole and retried. A removal that fails partway records ``failed``, and the next pass judges what remains.
 """
 
 from __future__ import annotations
@@ -99,18 +99,20 @@ def pending(record: dict) -> bool:
             and settleable(record))
 
 
-def settle(record: dict, provider_gone: Callable[[], bool], kept: str | None = None, *, final: bool = False) -> None:
+def settle(record: dict, provider_gone: Callable[[], bool], kept: str | None = None, *, final: bool = False,
+           hold: Callable[[], str | None] | None = None) -> None:
     """Remove the recorded scratch once ``provider_gone()`` proves the provider's process tree gone.
 
     The scratch is the worker's temp area, never deliverable state, so a kept worktree does not keep it.
     ``provider_gone`` is asked only when there is a recorded scratch to remove, and anything but ``True`` keeps
     it. ``kept``, a reason the caller has for keeping it, keeps it too: as ``retained`` (retried), or as ``kept``
-    (final) with ``final``. ``task_scratch_bytes`` is what the pass that recorded the disposition found: the
-    allocated bytes of the directories and files whose every name lies in the scratch, measured before removal
-    (None when the pass did not measure). A refusal or failure is recorded and never raised.
+    (final) with ``final``. ``hold``, asked only after that proof, returns a reason that keeps it as ``retained``.
+    ``task_scratch_bytes`` is what the pass that recorded the disposition found: the allocated bytes of the
+    directories and files whose every name lies in the scratch, measured before removal (None when the pass did
+    not measure). A refusal or failure is recorded and never raised.
     """
     try:
-        disposition, reason, found = _remove(record, provider_gone, kept, final)
+        disposition, reason, found = _remove(record, provider_gone, kept, final, hold)
     except Exception as exc:  # recorded, never raised: settlement must still publish the record
         disposition, reason, found = "failed", f"{type(exc).__name__}: {exc}"[:300], None
     record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
@@ -121,7 +123,8 @@ def settle(record: dict, provider_gone: Callable[[], bool], kept: str | None = N
 _Outcome = tuple[str, str, int | None]
 
 
-def _remove(record: dict, provider_gone: Callable[[], bool], kept: str | None, final: bool) -> _Outcome:
+def _remove(record: dict, provider_gone: Callable[[], bool], kept: str | None, final: bool,
+            hold: Callable[[], str | None] | None) -> _Outcome:
     task_id, created = record.get("task_id"), record.get("task_scratch")
     if not isinstance(task_id, str):
         return "refused", "task id missing", None
@@ -144,6 +147,8 @@ def _remove(record: dict, provider_gone: Callable[[], bool], kept: str | None, f
         gone = False
     if not gone:
         return "retained", "the provider is not proven gone", None
+    if hold is not None and (held := hold()):
+        return "retained", held, None
     base_fd = os.open(path.parent, _DIR_FLAGS)
     try:
         return _remove_held(base_fd, path.name, (created["dev"], created["ino"]))

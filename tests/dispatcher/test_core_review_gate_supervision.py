@@ -503,6 +503,24 @@ def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktre
         assert (base / "scratch-task").is_dir()
     # A scope launch's later sweep pass probes again, whatever the stale reason, and the gone provider releases it.
     stale["task_service_stops"] = [{"unit": "u", "postcondition": "true"}]
+    # F19: a service registered after the earlier stop is read from the scratch once the provider is proven gone,
+    # never before, and is stopped and checked before removal; one still active keeps the scratch.
+    from lu_machinery.orchestration import dispatch_isolation as iso
+
+    late = iso.task_service_name("scratch-task")
+    (base / "scratch-task" / "task-services.txt").write_text(f"{late}\n")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(iso, "_systemctl", lambda argv: calls.append(list(argv)) or subprocess.CompletedProcess(
+        argv, 0, stdout="active\n", stderr=""))
+    for alive, expected in ((True, "the provider is not proven gone"), (False, "task services not proven stopped")):
+        monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
+        registered = {**stale, "task_service_stops": list(stale["task_service_stops"])}
+        worker._settle_task_scratch(registered)
+        assert (registered["task_scratch_disposition"], registered["task_scratch_disposition_reason"]) == (
+            "retained", expected)
+        assert (base / "scratch-task").is_dir() and bool(calls) is (not alive)
+    assert ["systemctl", "--user", "stop", f"{late}.service"] in calls
+    (base / "scratch-task" / "task-services.txt").unlink()
     worker._settle_task_scratch(stale)
     assert stale["task_scratch_disposition"] == "removed" and not (base / "scratch-task").exists()
     assert not scratch.pending(stale)
@@ -605,7 +623,9 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
     """Defect class (F12): a damaged record stopped the scheduled sweep or passed for proof. An array disposition or
     status raised TypeError in a membership test, ending the pass before later records; such fields now read as
     final or live. A recorded cgroup under the wrong parent made a missing cgroup file read as an exited provider,
-    and so did a missing or empty one, through a unit not bound to the task and run nonce.
+    and so did a missing or empty one, through a unit not bound to the task and run nonce, or a stale unit while a
+    scope of the same task and run nonce under a fresh token still ran. An out-of-range process-group id raised
+    OverflowError and ended the sweep.
 
     Defect class (F10): bytes lost from the receipt. A removal that failed partway reported no bytes for the tree it
     had found. The receipt is what the pass that recorded it found before removal, so a partial pass keeps it.
@@ -642,12 +662,39 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
     # The unit is bound to the task and run nonce before either lookup, so an unbound one is never looked up.
     with monkeypatch.context() as bound:
         bound.setattr(worker, "_scope_cgroups", lambda _unit: pytest.fail("an unbound unit was looked up"))
+        bound.setattr(worker, "_run_scope_cgroups", lambda *_args: pytest.fail("an unbound unit's run was looked up"))
         for unbound in (iso.scope_unit_name("other-task", nonce), iso.scope_unit_name("scratch-task", "f" * 32),
                         f"lu-worker-scratch-task-{nonce}", ["damaged"], None):
             for cgroup in ({}, {"launch_cgroup": None}, {"launch_cgroup": []}, {"launch_cgroup": canonical}):
                 assert worker._provider_alive({**launch, "launch_unit": unbound, **cgroup}) is None
-    if Path("/sys/fs/cgroup/cgroup.controllers").exists():  # a gone canonical scope still proves exit
+    cgroup_v2 = Path("/sys/fs/cgroup/cgroup.controllers").exists()
+    if cgroup_v2:  # a gone canonical scope still proves exit
         assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is False
+    # A re-dispatch that reuses the run nonce gets a fresh token: the recorded scope's absence proves nothing while
+    # another scope of this task and run nonce, whatever its token, holds a process (F12, round 1).
+    slice_dir = canonical.rpartition("/")[0]
+    sibling, foreign = iso.scope_unit_name("scratch-task", nonce), iso.scope_unit_name("other-task", nonce)
+    with monkeypatch.context() as listed:
+        listed.setattr(worker.os, "listdir", lambda path: [f"{sibling}.scope", f"{foreign}.scope", sibling, "x.scope"]
+                       if path == "/sys/fs/cgroup" + slice_dir else pytest.fail(f"listed {path}"))
+        assert worker._run_scope_cgroups(unit, "scratch-task", nonce) == [f"{slice_dir}/{sibling}.scope"]
+    with monkeypatch.context() as unlisted:
+        unlisted.setattr(worker, "_run_scope_cgroups", lambda *_args: None)  # the slice cannot be listed
+        assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is None
+    if cgroup_v2:
+        own = next(line.split("::", 1)[1] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                   if line.startswith("0::"))
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            with monkeypatch.context() as live:
+                live.setattr(worker, "_run_scope_cgroups", lambda *_args: [own])  # a sibling scope with a live process
+                assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is True
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+    # F18: a damaged process-group id is unknown liveness, never an OverflowError that ends the sweep.
+    for pgid in (2**63, -1, 0, "12", True, 1.5):
+        assert worker._provider_alive({"task_id": "t", "launch_mode": "popen-fallback", "provider_pgid": pgid}) is None
     monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
     # A damaged record is skipped, and the sweep still reaches the records after it.
     reached = []

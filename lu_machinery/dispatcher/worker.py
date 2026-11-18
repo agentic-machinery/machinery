@@ -692,6 +692,24 @@ def _scope_cgroups(unit: str) -> list[str] | None:
     return None if failed else found
 
 
+def _run_scope_cgroups(unit: str, task_id: str, run_nonce: str) -> list[str] | None:
+    """Every scope in ``unit``'s dispatch slice named for this task and run nonce, whatever its launch token.
+
+    None when the slice cannot be listed; a slice that does not exist holds no scope.
+    """
+    from lu_machinery.orchestration import dispatch_isolation
+
+    parent = dispatch_isolation.scope_cgroup(unit, uid=os.getuid()).rpartition("/")[0]
+    try:
+        names = os.listdir("/sys/fs/cgroup" + parent)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    return [f"{parent}/{name}" for name in names if name.endswith(".scope") and dispatch_isolation.scope_unit_matches(
+        name.removesuffix(".scope"), task_id=task_id, run_nonce=run_nonce)]
+
+
 def _provider_alive(record: dict) -> bool | None:
     """Whether the provider's process tree still runs, from the identity recorded for it; None when unknown."""
     if record.get("launch_mode") == "scope":
@@ -718,6 +736,12 @@ def _provider_alive(record: dict) -> bool | None:
             cgroups = _scope_cgroups(unit)
             if cgroups is None:
                 return None
+        # A re-dispatch that reuses the run nonce launches under a fresh token, so the recorded scope's absence proves
+        # nothing while another scope named for this task and run nonce still holds a process.
+        siblings = _run_scope_cgroups(unit, task_id, nonce)
+        if siblings is None:
+            return None
+        cgroups = [*cgroups, *(sibling for sibling in siblings if sibling not in cgroups)]
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").exists()
         alive = False
         for cgroup in cgroups:
@@ -741,10 +765,13 @@ def _provider_alive(record: dict) -> bool | None:
             "spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed",
         }
         return False if never_ran and record.get("pid") is None and record.get("process_start") is None else None
-    if record["provider_pgid"] is None:
+    pgid = record["provider_pgid"]
+    if pgid is None:
         return False
+    if type(pgid) is not int or not 0 < pgid < 2**31:
+        return None  # a damaged group id is unknown, never an error that ends the sweep for later records
     try:
-        os.killpg(record["provider_pgid"], 0)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
         # A descendant that left the group is named by the stop that could not end it (#12520).
         return any(_identity(int(pid)) == identity for pid, identity in record.get("fallback_survivors", {}).items())
@@ -1264,25 +1291,29 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
 
     The proof is taken fresh from the run's own identity on every pass, whatever the worktree or task status
     says. ``liveness_kept`` is this pass's own verdict that the provider may still run, which keeps it too.
-    A service this task started that is not proven stopped keeps it too: the scratch holds the list of them.
-    Only a scope launch's probe sees every descendant from any process, so only a scope launch's scratch is
-    released here. A fallback launch's scratch is kept for good (``kept``) and left to tmp_sweep's settled-task
-    rule.
+    A service this task started that is not proven stopped once the provider is gone keeps it too: the scratch
+    holds the list of them. Only a scope launch's probe sees every descendant from any process, so only a scope
+    launch's scratch is released here. A fallback launch's scratch is kept for good (``kept``) and left to
+    tmp_sweep's settled-task rule.
     """
-    stops = record.get("task_service_stops")
-    unstopped = stops is not None and (not isinstance(stops, list) or any(
-        not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops))
 
     def provider_gone() -> bool:
         return not liveness_kept and _provider_alive(record) is False
+
+    def services_running() -> str | None:
+        # Asked only once the provider is proven gone, when no task process is left to register another service.
+        # The scratch's task-services.txt names them (dispatch_isolation), so every one is stopped and checked first.
+        _stop_task_services(record)
+        stops = record.get("task_service_stops")
+        unstopped = stops is not None and (not isinstance(stops, list) or any(
+            not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops))
+        return "task services not proven stopped" if unstopped else None
 
     if record.get("launch_mode") != "scope":
         kept = "a fallback launch's process tree is never proven gone; kept for tmp_sweep's settled-task rule"
         scratch.settle(record, provider_gone, kept, final=True)
         return
-
-    # Its task-services.txt names the transient services still to stop (dispatch_isolation): it stays with them.
-    scratch.settle(record, provider_gone, "task services not proven stopped" if unstopped else None)
+    scratch.settle(record, provider_gone, hold=services_running)
 
 
 def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> None:
@@ -1392,7 +1423,6 @@ def _settle_left(record: dict, salvage: bool) -> None:
             # A task settled without a worktree, or by an earlier pass, still sheds its caches and scratch.
             changed = _holds_task_caches(current) and _clear_task_caches(current)
             if scratch.pending(current):
-                _stop_task_services(current)  # its list lives in the scratch, so it is read before removal
                 _settle_task_scratch(current)
                 changed = True
             if changed:

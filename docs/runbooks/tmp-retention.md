@@ -212,23 +212,28 @@ provider's whole process tree is gone. For a scope launch that is an empty
 scope cgroup, which covers every descendant. The recorded unit must be the one
 named for the task and its run nonce before either cgroup lookup, and a
 recorded cgroup counts only as that unit's canonical path; anything else is
-unknown and keeps the scratch. A fallback (non-scope) launch's tree is never
+unknown and keeps the scratch. Another scope named for the same task and run
+nonce (a re-dispatch that reuses the nonce gets a fresh unit token) that still
+holds a process keeps it too. A fallback (non-scope) launch's tree is never
 proven gone, so settlement never releases its scratch: it is kept for good
 (`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit
 inventories `/tmp` only, so that rule reaches `/var/tmp` only in a run with
-`--temp-root /var/tmp`. A recorded disposition is never taken as proof. The
-scratch also holds `task-services.txt`, so the sweep stops the task's services
-before it settles the scratch, and a service not proven stopped keeps the
+`--temp-root /var/tmp`. A recorded disposition is never taken as proof. Once
+the provider is proven gone, when no task process is left to register another
+service, settlement stops and checks every service the record and the
+scratch's `task-services.txt` name, and a service not proven stopped keeps the
 scratch.
 
-Removal takes the whole tree or nothing. The tree is kept whole (`in_use`)
-when it holds a socket, a FIFO or an entry named `tmux-*` or `ssh-*` (the
-scratch's own name does not count), or when another process that `/proc` lets
-the agent user read holds any part of it as its working directory, root,
-executable, open descriptor or mapping. Holders are matched by device and
-inode through the process's view and each of its threads', never by name. A
-file also linked from outside the scratch, such as a package cache's link,
-counts only when the reference is not proven to come through an outside name.
+The checks before removal keep the tree whole (`in_use`) when it holds a
+socket, a FIFO or an entry named `tmux-*` or `ssh-*` (the scratch's own name
+does not count), or when another process that `/proc` lets the agent user read
+holds any part of it as its working directory, root, executable, open
+descriptor or mapping. Holders are matched by device and inode through the
+process's view and each of its threads', never by name. A file also linked
+from outside the scratch, such as a package cache's link, counts only when the
+reference is not proven to come through an outside name. Once removal has
+started, an I/O error can leave part of the tree: that pass records `failed`,
+and the next pass checks and removes what remains.
 
 The task record shows the result next to the worktree disposition:
 `task_scratch_disposition`, `task_scratch_disposition_reason` and
