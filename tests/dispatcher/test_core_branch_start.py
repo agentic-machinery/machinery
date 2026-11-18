@@ -777,6 +777,25 @@ def test_untracked_scratch_is_preserved_and_the_worktree_removed_at_settle(sandb
 
 
 @pytest.mark.usefixtures('configured_roots')
+def test_untracked_names_with_line_breaks_are_preserved_byte_exact_before_removal(sandbox):
+    """Defect (#524 F2): removal read untracked names as text, which folds CR and CRLF into LF. Where each folded
+    name is another file's, it preserved that file twice and removed the tree with the CR and CRLF files in it."""
+    names = ["leftover/cr\rname", "leftover/cr\nname", "leftover/crlf\r\nname", "leftover/crlf\nname"]
+    task = sandbox.dispatch("blocked", "--mode", "workspace-write")
+    await_file(sandbox.tasks / f"{task[0]}.started")
+    tree = Path(json.loads((sandbox.tasks / f"{task[0]}.json").read_text())["worktree_path"])
+    (tree / "leftover").mkdir()
+    for name in names:
+        (tree / name).write_text(f"leftover {name!r}\n")
+    (sandbox.tasks / f"{task[0]}.release").touch()
+    record = sandbox.settle(task, expected=1)
+    assert (record["worktree_disposition"], record["worktree_disposition_reason"]) == ("removed", "clean")
+    assert sorted(entry["path"] for entry in record["branch_holder_archive"]["paths"]) == sorted(names)
+    for name in names:
+        assert preserved_copy(sandbox, record, name) == f"leftover {name!r}\n"
+
+
+@pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
 def test_tracked_edit_hidden_by_an_index_flag_keeps_the_worktree(sandbox, flag):
     """Review F1: status omits edits under these flags, so untracked scratch beside one forced a removal."""

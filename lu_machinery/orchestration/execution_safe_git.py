@@ -712,10 +712,16 @@ def run_git(
     env: dict[str, str] | None = None,
     timeout: float | None = 30,
     integrity: bool = False,
+    stat_integrity: bool = False,
     profile: str = "local",
     **kwargs: Any,
 ) -> subprocess.CompletedProcess:
-    """Run an admitted command with compulsory controls for its explicit profile."""
+    """Run an admitted command with compulsory controls for its explicit profile.
+
+    ``stat_integrity`` forces core.trustctime and core.checkStat to their defaults, so the tree's config cannot
+    stop status comparing the stat data that reveals an edit. ``integrity`` does that and also ignores a
+    configured core.attributesFile.
+    """
     if runner is not None and type(runner) is not SafeGitRunner:
         raise TypeError("runner must be a SafeGitRunner executable constraint")
     executable = GIT if runner is None else runner.executable
@@ -770,9 +776,9 @@ def run_git(
     safe_env = safe_git_env(env)
     prefix = [executable, "--no-pager", "--no-lazy-fetch"]
     if integrity:
-        prefix.extend(
-            ["-c", f"core.attributesFile={os.devnull}", "-c", "core.trustctime=true", "-c", "core.checkStat=default"]
-        )
+        prefix.extend(["-c", f"core.attributesFile={os.devnull}"])
+    if integrity or stat_integrity:
+        prefix.extend(["-c", "core.trustctime=true", "-c", "core.checkStat=default"])
     for setting in _SETTINGS:
         prefix.extend(["-c", setting])
     for setting in _REMOTE_SETTINGS if profile == "remote" else _COMMIT_SETTINGS if profile == "commit" else ():

@@ -885,7 +885,7 @@ def _hidden_tracked_changes(tree: Path) -> bool:
             if os.path.isdir(path) and os.listdir(path):
                 return True
             continue
-        nested = partial(execution_safe_git, cwd=path, capture_output=True, check=True, timeout=30)
+        nested = partial(execution_safe_git, cwd=path, stat_integrity=True, capture_output=True, check=True, timeout=30)
         if nested(["status", "--porcelain", "--ignore-submodules=none"]).stdout or _hidden_tracked_changes(path):
             return True
     return False
@@ -921,16 +921,12 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             head_sha=local(["rev-parse", "HEAD"]).stdout.strip(),
             commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
         )
-        # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
-        # edit or new submodule commit is reported whatever the tree configures.
-        status = [line for line in local(["status", "--porcelain", "--ignore-submodules=none"]).stdout.splitlines()
-                  if line]
-        hidden = _hidden_tracked_changes(spec.worktree)
+        # The tree is read as settlement's removal reads it, so the two never disagree on what is uncommitted.
+        changed, untracked = _tree_changes(spec.worktree)
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
-        delivery.update(worktree_dirty_on_exit=bool(status) or hidden,
-                        worktree_untracked_only_on_exit=bool(status) and not hidden
-                        and all(line.startswith("?? ") for line in status))
+        delivery.update(worktree_dirty_on_exit=bool(changed or untracked),
+                        worktree_untracked_only_on_exit=bool(untracked) and not changed)
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -1213,15 +1209,30 @@ def merged_delivery(record: dict) -> dict | None:
 def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     """Return the tree's uncommitted tracked changes and its untracked files; ignored files are neither.
 
-    Use the exit snapshot's hidden-change check so index flags and submodule ignore settings cannot
-    hide tracked work from removal either.
+    The exit snapshot and removal both read the tree here. The read forces core.trustctime and core.checkStat
+    to their defaults (stat_integrity), so a worker's stat settings cannot hide an edit, and keeps the tree's
+    attributes, so a configured attributes file leaves a clean checkout clean. --untracked-files=all overrides
+    status.showUntrackedFiles and --ignore-submodules=none the tree's submodule ignore settings; the
+    hidden-change check covers the index flags status trusts. Names are read as bytes: a text read folds CR
+    and CRLF into LF, so removal would preserve names that do not exist. In porcelain v1 -z, a rename or copy
+    is followed by its source path as a separate field, which belongs to that entry.
     """
-    entries = [entry for entry in _git(tree, "status", "--porcelain", "--ignore-submodules=none", "-z", "--untracked-files=all",
-                                       isolate=True, strip=False).split("\0") if entry]
-    changed = [entry for entry in entries if not entry.startswith("?? ")]
+    fields = iter(execution_safe_git(
+        ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        cwd=tree, stat_integrity=True, capture_output=True, check=True, timeout=30).stdout.split(b"\0"))
+    changed, untracked = [], []
+    for field in fields:
+        if not field:
+            continue
+        if field.startswith(b"?? "):
+            untracked.append(os.fsdecode(field[3:]))
+            continue
+        changed.append(os.fsdecode(field))
+        if b"R" in field[:2] or b"C" in field[:2]:
+            next(fields, None)
     if _hidden_tracked_changes(tree):
         changed.append("hidden tracked changes")
-    return changed, [entry[3:] for entry in entries if entry.startswith("?? ")]
+    return changed, untracked
 
 
 def _canonical_publication(record: dict, ref: str, head: str) -> tuple[str | None, bool]:

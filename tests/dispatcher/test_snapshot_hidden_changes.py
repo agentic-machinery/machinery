@@ -5,6 +5,7 @@ skip-worktree index flags and the submodule ignore settings, so a worker that ex
 tracked work was reported clean (``worktree_dirty_on_exit=False``) and passed the delivery rescue.
 """
 
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -262,3 +263,48 @@ def test_removal_reports_a_recursion_error_as_unknown_not_error(tmp_path, monkey
               "worktree_branch": "claude/deep", "worktree_base_sha": "0" * 40}
     disposition = git.settle_worktree(record)
     assert (disposition["worktree_disposition"], disposition["worktree_disposition_reason"]) == ("retained", "unknown")
+
+
+# Distinct names a text read of Git's output folds into one another (CR and CRLF become LF).
+LINE_BREAK_NAMES = ["scratch/cr\rname", "scratch/cr\nname", "scratch/crlf\r\nname", "scratch/crlf\nname"]
+
+
+@pytest.mark.parametrize("case", ["untracked", "ignored", "stat-hidden", "attributes-file"])
+def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
+    """Defect class: the exit snapshot and removal read the tree differently, a worker's stat settings hid a
+    tracked edit from both, and removal's text read folded CR and CRLF in untracked names, so it preserved names
+    that do not exist (#524 F1, F2, F4). Both now read through one byte-exact, stat-forced reader that keeps the
+    tree's attributes, so a configured attributes file leaves a clean checkout clean."""
+    work = _repo(tmp_path / "tree")
+    (work / ".gitignore").write_text("*.log\n")
+    (work / "delivered.txt").write_text("delivery\n")
+    if case == "attributes-file":  # checked out as CRLF only through the configured attributes file
+        (tmp_path / "attributes").write_text("*.txt text eol=crlf\n")
+        _git(work, "config", "core.attributesFile", str(tmp_path / "attributes"))
+        (work / "delivered.txt").write_bytes(b"delivery\r\n")
+    os.utime(work / "delivered.txt", (1_000_000_000, 1_000_000_000))  # older than the index: not racily clean
+    _git(work, "add", ".")
+    _git(work, "commit", "-q", "-m", "delivery")
+    leftovers = {"untracked": LINE_BREAK_NAMES, "ignored": ["scratch/out.log"]}.get(case, [])
+    for name in leftovers:
+        (work / name).parent.mkdir(exist_ok=True)
+        (work / name).write_text(f"left over {name!r}\n")
+    if case == "attributes-file":
+        os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
+    elif case == "stat-hidden":
+        # Same size and timestamps on a new inode: only the stat checks the worker switches off can see it.
+        before, rewrite = (work / "delivered.txt").stat(), work / "rewrite.tmp"
+        rewrite.write_text("DELIVERY\n")
+        os.utime(rewrite, ns=(before.st_atime_ns, before.st_mtime_ns))
+        rewrite.replace(work / "delivered.txt")
+        _git(work, "config", "core.trustctime", "false")
+        _git(work, "config", "core.checkStat", "minimal")
+        # Hidden from a plain status; --no-optional-locks keeps that probe from refreshing the index.
+        assert "delivered.txt" not in _git(work, "--no-optional-locks", "status", "--porcelain")
+    record = {"worktree_base_sha": _git(work, "rev-parse", "HEAD")}
+    observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
+    assert observed["worktree_dirty_on_exit"] is (case in {"untracked", "stat-hidden"})
+    assert observed["worktree_untracked_only_on_exit"] is (case == "untracked")
+    changed, untracked = git._tree_changes(work)
+    assert changed == ([" M delivered.txt"] if case == "stat-hidden" else [])
+    assert sorted(untracked) == sorted(LINE_BREAK_NAMES if case == "untracked" else [])
