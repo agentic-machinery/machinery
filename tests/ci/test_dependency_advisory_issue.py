@@ -205,6 +205,9 @@ def test_run_collect_clean_audit_returns_no_findings(tmp_path: Path, monkeypatch
                     'source = { registry = "https://pypi.org/simple" }\n', encoding="utf-8")
     monkeypatch.setattr("lu_machinery.ci.audit_dependencies.shutil.which", lambda _: "uv")
     export = f"requests==2.31.0 --hash=sha256:{'1' * 64}\n"
+    uv_report = _completed(0, json.dumps({
+        "dependencies": [{"name": "requests", "version": "2.31.0", "vulns": []}],
+    }))
 
     def run(cmd, **kwargs):
         if cmd[0] == "uv":
@@ -212,10 +215,14 @@ def test_run_collect_clean_audit_returns_no_findings(tmp_path: Path, monkeypatch
         if "pip_audit" in cmd:
             assert "--require-hashes" in cmd
             assert Path(cmd[cmd.index("-r") + 1]).read_text(encoding="utf-8") == export
+            return uv_report
         return _stub_audits(_CLEAN_PIP, _CLEAN_NPM)(cmd, **kwargs)
 
     with patch.object(helper.subprocess, "run", side_effect=run):
         assert helper.run_collect(repo) == []
+        uv_report = _CLEAN_PIP
+        with pytest.raises(RuntimeError, match="reported 0 of 1 expected uv pins"):
+            helper.run_collect(repo)
         lock.write_text("invalid toml", encoding="utf-8")
         with pytest.raises(RuntimeError, match="invalid uv.lock audit input"):
             helper.run_collect(repo)

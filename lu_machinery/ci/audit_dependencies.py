@@ -28,6 +28,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 from lu_machinery.common import json_depth
@@ -402,18 +403,19 @@ def _verify_uv_machinery_wheel(package: dict) -> None:
     _hash_checked_wheel(_LuMachineryPin(version, frozenset({match[1].lower()})), "uv.lock")
 
 
-def _uv_audit_export(repo_root: Path, lock: Path) -> str:
-    """Export the locked registry closure, checking direct sources before excluding them."""
+def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str]]]:
+    """Export every locked registry version, checking direct sources before excluding them."""
     uv = shutil.which("uv")
     if uv is None:
         raise LuMachineryAuditWheelError("uv is not on PATH; cannot export uv.lock for audit")
     excluded: dict[str, str] = {}
-    registry: set[str] = set()
+    registry: set[tuple[str, str]] = set()
     cpu_versions: set[tuple[str, str]] = set()
+    name: str
     try:
         packages = tomllib.loads(_read_text(lock))["package"]
         for package in packages:
-            name = _pep503_name(package["name"])
+            name = canonicalize_name(package["name"], validate=True)
             source = package["source"]
             if len(source) != 1:
                 raise LuMachineryAuditWheelError(f"uv.lock has ambiguous source for {name}")
@@ -422,10 +424,17 @@ def _uv_audit_export(repo_root: Path, lock: Path) -> str:
                 _verify_uv_machinery_wheel(package)
                 excluded[name] = "hash-verified release wheel; published outside PyPI"
             elif kind == "registry":
-                registry.add(name)
+                version = str(Version(package["version"]))
+                registry.add((name, version))
                 if name in {"torch", "torchvision"} and origin.rstrip("/") == "https://download.pytorch.org/whl/cpu":
-                    cpu_versions.add((name, package["version"]))
-            elif kind in {"directory", "editable", "virtual"} and (repo_root / origin).resolve().is_relative_to(repo_root):
+                    cpu_versions.add((name, version))
+            elif kind in {"directory", "editable", "virtual"}:
+                try:
+                    local = (repo_root / origin).resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise LuMachineryAuditWheelError(f"uv.lock has an unreadable local source for {name}") from exc
+                if not local.is_relative_to(repo_root):
+                    raise LuMachineryAuditWheelError(f"uv.lock local source for {name} escapes the checkout")
                 excluded[name] = "local project; registry dependencies are audited"
             elif kind == "git" and re.fullmatch(r"https://[^/@?#]+/[^@#]+#[0-9a-f]{40}", origin):
                 excluded[name] = "Git commit; registry dependencies are audited"
@@ -433,55 +442,111 @@ def _uv_audit_export(repo_root: Path, lock: Path) -> str:
                 raise LuMachineryAuditWheelError(f"uv.lock has unsupported {kind} source for {name}")
     except (KeyError, TypeError, AttributeError, ValueError, OSError) as exc:
         raise LuMachineryAuditWheelError(f"invalid uv.lock audit input ({type(exc).__name__})") from exc
-    if registry & excluded.keys():
+    if any(name in excluded for name, _ in registry):
         raise LuMachineryAuditWheelError("uv.lock mixes registry and direct sources for the same package")
-    cmd = [uv, "export", "--locked", "--offline", "--no-python-downloads", "--format", "requirements.txt",
+    cmd = [uv, "export", "--locked", "--offline", "--no-build", "--no-python-downloads", "--format", "requirements.txt",
            "--all-groups", "--all-extras", "--no-emit-project", "--no-header", "--no-annotate"]
     for name in sorted(excluded):
         cmd.extend(["--no-emit-package", name])
-    # Fixed uv export argv. No packages are installed or built by the audit.
+    # Fixed uv export argv and validated distribution names, without a shell.
     try:
-        result = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            cmd, cwd=repo_root, capture_output=True, text=True, timeout=120
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LuMachineryAuditWheelError(f"uv export failed ({type(exc).__name__})") from exc
     if result.returncode:
         raise LuMachineryAuditWheelError(f"uv export --locked refused the audit input (exit {result.returncode})")
-    requirements = []
+    requirements: dict[str, dict[str, set[str]]] = {}
+    exported = set()
     for _, line in _logical_lines(result.stdout):
         spec, hashes = _split_options(line)
-        names = _line_names(repo_root, line)
-        if not hashes or not names <= registry:
-            raise LuMachineryAuditWheelError(f"uv export emitted an unhashed or non-registry requirement: {spec}")
+        _line_names(repo_root, line)
         req = Requirement(spec)
-        version = next(iter(req.specifier)).version
-        if (_pep503_name(req.name), version) in cpu_versions:
+        name = canonicalize_name(req.name)
+        version = str(Version(next(iter(req.specifier)).version))
+        if not hashes or (name, version) not in registry:
+            raise LuMachineryAuditWheelError(f"uv export emitted an unhashed or non-registry requirement: {name}=={version}")
+        exported.add((name, version))
+        if (name, version) in cpu_versions:
             # PyPI advisories apply to the public version; the CPU build has no PyPI version endpoint.
-            spec = spec.replace(f"=={version}", f"=={Version(version).public}", 1)
-        requirements.append(" ".join([spec, *hashes]))
-    if registry and not requirements:
-        raise LuMachineryAuditWheelError("uv export emitted no registry pins")
+            version = Version(version).public
+        # Markers select installations. An advisory audit covers every version in the universal lock.
+        requirements.setdefault(name, {}).setdefault(version, set()).update(hashes)
+    if not exported or exported != registry:
+        raise LuMachineryAuditWheelError(f"uv export covered {len(exported)} of {len(registry)} locked registry versions")
     for name, reason in sorted(excluded.items()):
         print(f"[audit_dependencies] {name}: {reason}", file=sys.stderr)
-    return "\n".join(requirements) + "\n"
+    return requirements
 
 
 @contextmanager
-def python_audit_input(repo_root: Path) -> Iterator[tuple[list[str], dict[str, str] | None]]:
-    """Shared pip-audit arguments for the blocking gate and scheduled advisory report."""
+def legacy_python_audit_input(repo_root: Path) -> Iterator[tuple[str, dict[str, str] | None]]:
+    """Shared legacy input and checked-wheel environment for both audit callers."""
     repo_root = repo_root.resolve()
-    lock = repo_root / "uv.lock"
-    if os.path.lexists(lock):
-        exported = _uv_audit_export(repo_root, lock)
-        with tempfile.TemporaryDirectory(prefix="uv-dependency-audit-") as tmp:
-            requirements = Path(tmp) / "requirements.txt"
-            requirements.write_text(exported, encoding="utf-8")
-            yield ["-r", str(requirements), "--require-hashes", "--disable-pip", "--strict"], None
-        return
     requirements = repo_root / "requirements-lock.txt"
     if not requirements.is_file():
         raise LuMachineryAuditWheelError(f"{requirements} not found; missing required inputs fail closed")
     with pip_audit_requirement_env(repo_root, requirements) as extra:
-        yield ["-r", str(requirements)], _pip_audit_process_env(extra)
+        yield str(requirements), _pip_audit_process_env(extra)
+
+
+def _checked_audit_report(result: subprocess.CompletedProcess[str], expected: set[tuple[str, str]]) -> list[dict]:
+    try:
+        dependencies = json_depth.loads(result.stdout, max_depth=512)["dependencies"]
+        if not isinstance(dependencies, list):
+            raise TypeError("dependencies must be a list")
+        audited = set()
+        for row in dependencies:
+            if "skip_reason" in row or not isinstance(row["vulns"], list):
+                raise ValueError("unverified dependency result")
+            if any(not isinstance(vuln.get("id"), str) or not vuln["id"] for vuln in row["vulns"]):
+                raise ValueError("vulnerability without an advisory ID")
+            audited.add((canonicalize_name(row["name"], validate=True), str(Version(row["version"]))))
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        raise LuMachineryAuditWheelError(f"pip-audit returned an invalid uv audit report (exit {result.returncode})") from exc
+    if audited != expected or len(dependencies) != len(expected):
+        raise LuMachineryAuditWheelError(
+            f"pip-audit reported {len(audited & expected)} of {len(expected)} expected uv pins with exact versions"
+        )
+    if result.returncode != int(any(row["vulns"] for row in dependencies)):
+        raise LuMachineryAuditWheelError(f"pip-audit exited {result.returncode} with an inconsistent uv audit report")
+    return dependencies
+
+
+def audit_uv_python(repo_root: Path, ignored_ids: list[str]) -> dict[str, list[dict]] | None:
+    """Audit all locked registry versions. Return None only for a legacy checkout."""
+    repo_root = repo_root.resolve()
+    lock = repo_root / "uv.lock"
+    if not os.path.lexists(lock):
+        return None
+    # pip-audit accepts one version per name in a run. Split forks across the fewest invocations.
+    batches: list[dict[tuple[str, str], set[str]]] = []
+    for name, versions in sorted(_uv_audit_export(repo_root, lock).items()):
+        for index, (version, hashes) in enumerate(sorted(versions.items())):
+            if index == len(batches):
+                batches.append({})
+            batches[index][name, version] = hashes
+    dependencies = []
+    with tempfile.TemporaryDirectory(prefix="uv-dependency-audit-") as tmp:
+        requirements = Path(tmp) / "requirements.txt"
+        cmd = [sys.executable, "-m", "pip_audit", "-r", str(requirements), "--require-hashes",
+               "--disable-pip", "--strict", "--format", "json", "--progress-spinner=off"]
+        for vuln_id in ignored_ids:
+            cmd.extend(["--ignore-vuln", vuln_id])
+        for batch in batches:
+            requirements.write_text("".join(
+                f"{name}=={version} {' '.join(sorted(hashes))}\n" for (name, version), hashes in batch.items()
+            ), encoding="utf-8")
+            # Fixed pip-audit argv with a validated, resolver-free requirements input.
+            try:
+                result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                    cmd, cwd=repo_root, capture_output=True, text=True, timeout=300
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise LuMachineryAuditWheelError(f"pip-audit failed ({type(exc).__name__})") from exc
+            dependencies.extend(_checked_audit_report(result, set(batch)))
+    return {"dependencies": dependencies}
 
 
 def audit_python(repo_root: Path, ignore_file: Path) -> int:
@@ -492,8 +557,18 @@ def audit_python(repo_root: Path, ignore_file: Path) -> int:
         options.extend(["--ignore-vuln", vuln_id])
 
     try:
-        with python_audit_input(repo_root) as (audit_args, process_env):
-            cmd = [sys.executable, "-m", "pip_audit", *audit_args, *options]
+        uv_report = audit_uv_python(repo_root, ignored_ids)
+        if uv_report is not None:
+            dependencies = uv_report["dependencies"]
+            findings = 0
+            for dependency in dependencies:
+                for vuln in dependency["vulns"]:
+                    print(f"{dependency['name']} {dependency['version']}: {vuln['id']}")
+                    findings += 1
+            print(f"[audit_dependencies] Audited {len(dependencies)} uv registry pins; {findings} findings.")
+            return int(findings != 0)
+        with legacy_python_audit_input(repo_root) as (requirements, process_env):
+            cmd = [sys.executable, "-m", "pip_audit", "-r", requirements, *options]
             print(f"[audit_dependencies] Running pip-audit with {len(ignored_ids)} suppressed vulnerability ID(s)...")
             if process_env is None:
                 res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=300)

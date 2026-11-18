@@ -369,7 +369,8 @@ def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str
             if canonicalize_name(req.name) == "lu-machinery" and str(req.specifier) == f"=={old[1]}":
                 group[index] = replacements[spec] = re.sub(rf"==\s*{re.escape(old[1])}\b", f"=={version}", spec, count=1)
     for spec, new_spec in replacements.items():
-        updated = re.sub(rf"(['\"]){re.escape(spec)}\1", lambda m: m[1] + new_spec + m[1], updated)
+        for quote in ("'", '"'):
+            updated = updated.replace(f"{quote}{spec}{quote}", f"{quote}{new_spec}{quote}")
     source["url"] = new_url
     if tomllib.loads(updated) != manifest:
         raise CutError("could not update only the lu-machinery URL and exact constraints in pyproject.toml")
@@ -594,7 +595,7 @@ class Cut:
         house = self.work / "wheelhouse"
         house.mkdir()
         # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
-        # group. The legacy consumer lock permits only wheels, including when used without the
+        # group or test extra. The legacy consumer lock permits only wheels, including when used without the
         # release wheelhouse. --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
         # required-version refuses any other uv release.
         uv = shutil.which("uv")
@@ -602,7 +603,8 @@ class Cut:
             raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
         lock = self.work / "runtime-requirements.txt"
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
-                             "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
+                             "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test"],
+                            cwd=self.work / "src").stdout
         lock.write_text(wheel_only_requirements(exported, self.work / "src/uv.lock"), encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
