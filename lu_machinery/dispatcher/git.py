@@ -1253,40 +1253,55 @@ def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
 
 
 def _nested_repository(tree: Path) -> bool:
-    """Whether any directory under the tree, ignored or not, is a Git repository of its own.
+    """Whether any directory under the tree, ignored or not, holds a Git repository other than the tree's own.
 
     Status cannot tell: it lists a nested checkout file by file when the tree tracks a path inside it, lists
     none of it when the tree tracks or ignores all of it, and lists a bare repository as plain files. Only a
-    directory holding a .git entry (a checkout's directory, gitfile or link) or a HEAD entry (a bare
-    repository; setup.c is_git_directory) can be one, so Git decides each such directory: run from there, it
-    finds a Git directory other than the tree's only in a repository of its own, such as a nested checkout,
-    a bare repository or a submodule. A directory Git cannot answer for, or one the walk cannot read, counts
-    as one.
+    HEAD entry (a bare repository; setup.c is_git_directory) or a .git entry (a checkout's directory, gitfile
+    or link) can mark one. Git decides each marker on its own with ``rev-parse --resolve-git-dir``, which
+    resolves it to a repository or rejects it (exit 128); discovery is not used, since it stops at the first
+    marker it meets and so passes over a bare repository that holds a .git entry. A marker that resolves to
+    a repository other than the tree's counts, such as a nested checkout, a bare repository or a submodule; a
+    rejected one, such as an empty or invalid gitfile or marker-shaped output, does not. A marker file Git
+    could not read (a gitfile, or a Git directory's HEAD or commondir), a directory the walk cannot list and
+    any other Git failure count as one.
     """
-    def git_directory(directory: str) -> str:
-        found = execution_safe_git(["rev-parse", "--absolute-git-dir"], cwd=Path(directory), capture_output=True,
-                                   check=True, timeout=30).stdout
+    def resolve(marker: Path) -> str | None:
+        found = execution_safe_git(["rev-parse", "--resolve-git-dir", os.fspath(marker)], cwd=tree,
+                                   capture_output=True, check=False, timeout=30)
+        if found.returncode == 128:
+            return None
         # Git ends the path with one LF; any other byte, blanks included, is part of the path.
-        if not found.endswith(b"\n"):
-            raise ValueError("rev-parse printed no path")
-        return os.path.realpath(os.fsdecode(found[:-1]))
+        if found.returncode or not found.stdout.endswith(b"\n"):
+            raise ValueError("rev-parse --resolve-git-dir failed")
+        return os.path.realpath(os.fsdecode(found.stdout[:-1]))
 
-    def unreadable(error: OSError) -> None:
+    def unreadable(marker: Path) -> bool:
+        # Git reads a symbolic HEAD with readlink, which needs no read permission.
+        files = [marker / "HEAD", marker / "commondir"] if marker.is_dir() else [marker]
+        return any(os.path.exists(path) and not (path.name == "HEAD" and path.is_symlink())
+                   and not os.access(path, os.R_OK) for path in files)
+
+    def unlistable(error: OSError) -> None:
         raise error
 
-    own = git_directory(os.fspath(tree))
-    for directory, directories, files in os.walk(tree, onerror=unreadable):
-        if directory == os.fspath(tree):
-            if ".git" in directories:
-                directories.remove(".git")  # the tree's own repository
-            continue
-        if {".git", "HEAD"}.isdisjoint(directories) and {".git", "HEAD"}.isdisjoint(files):
-            continue
-        try:
-            if git_directory(directory) != own:
+    own = resolve(tree / ".git")
+    if own is None:
+        raise ValueError("the tree's own Git directory does not resolve")
+    try:
+        for directory, directories, files in os.walk(tree, onerror=unlistable):
+            if directory == os.fspath(tree):
+                if ".git" in directories:
+                    directories.remove(".git")  # the tree's own repository
+                continue
+            entries = {*directories, *files}
+            markers = [Path(directory)] if "HEAD" in entries else []
+            if ".git" in entries:
+                markers.append(Path(directory, ".git"))
+            if any(unreadable(marker) or resolve(marker) not in (None, own) for marker in markers):
                 return True
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return True
     return False
 
 

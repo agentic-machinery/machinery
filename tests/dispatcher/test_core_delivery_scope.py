@@ -157,10 +157,10 @@ LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nnam
     ("outside", ["scratch"], False),  # a grant bound to this run widens the scope
     ("outside", "unbound", False),  # an unreadable scope owns every untracked file
     ("nested", None, False),  # a nested checkout's files are not listed, so it may hold task work
-    ("bare", None, False),  # a nested bare repository's commits may hold work the delivery does not
+    ("bare", None, False),  # a bare repository's commits may hold work, even beside a .git link to the tree's own
     ("bare-symlink-head", None, False),  # Git still opens a bare repository whose HEAD is a symbolic link
     ("bare-trailing-blank", None, False),  # a repository name ending in a blank is still that repository
-    ("marker-output", None, True),  # HEAD and objects/ files that Git would not open as a repository
+    ("marker-output", None, True),  # HEAD, objects/ and .git files that Git would not open as a repository
     ("nested-listed", None, False),  # a checkout under a path the tree tracks: status lists its files one by one
     ("nested-gitfile", None, False),  # the same checkout, its .git a file naming a separate Git directory
     ("nested-all-tracked", None, False),  # a checkout whose files the tree tracks: status lists none of them
@@ -204,6 +204,8 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
         if case == "bare-symlink-head":  # the legacy form; its branch may exist only as a packed ref
             (work / "scratch/nested.git/HEAD").unlink()
             (work / "scratch/nested.git/HEAD").symlink_to("refs/heads/main")
+        elif case == "bare":  # Git's discovery from inside would stop at this link and find the tree's repository
+            (work / "scratch/nested.git/.git").symlink_to(work / ".git")
     elif case == "attributes-file":
         os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
     elif case.startswith("nested-"):
@@ -218,6 +220,9 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
         (work / "scratch/output/objects").mkdir(parents=True)
         (work / "scratch/output/HEAD").write_text("generated report\n")
         (work / "scratch/output/objects/artifact.json").write_text("{}\n")
+        for name, text in (("empty", ""), ("invalid", "generated\n"), ("missing", f"gitdir: {tmp_path}/none\n")):
+            (work / "scratch/output" / name).mkdir()
+            (work / "scratch/output" / name / ".git").write_text(text)
     elif case == "stat-hidden":
         # Same size and timestamps on a new inode: only the stat checks the worker switches off can see it.
         before, rewrite = (work / "delivered.txt").stat(), work / "rewrite.tmp"
