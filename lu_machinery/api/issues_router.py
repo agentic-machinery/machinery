@@ -14,13 +14,15 @@ and extracts ``superseded-by: #N`` / ``merged-in: PR #N`` hints from
 issue bodies when present.
 
 Read-only. Single 5-second ``gh`` call. Degrades gracefully to
-``{"categories": {}, "error": "..."}`` when ``gh`` is unavailable.
+``{"categories": {}, "error": "..."}`` when ``gh`` is unavailable; the
+error text is fixed, and exception detail goes to the server log only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import subprocess
 from typing import Any
@@ -35,6 +37,13 @@ from .state_helpers import swr_route
 
 # One ``gh issue list`` call per refresh; a read never waits on GitHub after the first.
 ISSUES_MAP_TTL_S = 120.0
+
+# The request's ``limit`` selects one of these constant arguments; the request
+# value itself never reaches the ``gh`` command line.
+_MAX_LIMIT = 200
+_LIMIT_ARGUMENTS: dict[int, str] = {n: str(n) for n in range(1, _MAX_LIMIT + 1)}
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["issues"])
 
@@ -84,10 +93,11 @@ def _run_gh(
             check=False,
         )
         return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        return 124, "", f"TimeoutExpired after {exc.timeout}s"
-    except (FileNotFoundError, PermissionError, OSError) as exc:
-        return 127, "", f"{type(exc).__name__}: {exc}"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"gh timed out after {timeout_s}s"
+    except OSError:
+        logger.warning("gh could not be started", exc_info=True)
+        return 127, "", "gh unavailable"
 
 
 def _categorize(labels: list[str | None]) -> str:
@@ -129,7 +139,7 @@ def _fetch_issues(limit: int, ctx: MonitorContext | None = None) -> dict[str, An
         [
             "gh", "issue", "list",
             "--state", "open",
-            "--limit", str(limit),
+            "--limit", _LIMIT_ARGUMENTS[limit],
             "--json", "number,title,labels,body,createdAt,updatedAt,assignees,url",
         ],
         ctx=ctx,
@@ -143,8 +153,9 @@ def _fetch_issues(limit: int, ctx: MonitorContext | None = None) -> dict[str, An
 
     try:
         payload = json.loads(stdout or "[]")
-    except json.JSONDecodeError as exc:
-        return {"categories": {}, "count": 0, "error": f"invalid gh json: {exc}"}
+    except json.JSONDecodeError:
+        logger.warning("gh issue list returned invalid JSON", exc_info=True)
+        return {"categories": {}, "count": 0, "error": "invalid gh json"}
 
     categories: dict[str, list[dict[str, Any]]] = {cat: [] for cat in _CATEGORY_ORDER}
     for item in payload:
@@ -183,7 +194,7 @@ def _fetch_issues(limit: int, ctx: MonitorContext | None = None) -> dict[str, An
 @router.get("/map")
 @swr_route("issues-map", ISSUES_MAP_TTL_S, vary=("limit",))
 def issues_map(
-    limit: int = Query(50, ge=1, le=200, description="Upper bound on issues to scan."),
+    limit: int = Query(50, ge=1, le=_MAX_LIMIT, description="Upper bound on issues to scan."),
     ctx: MonitorContext = Depends(get_ctx),
 ):
     """Open issues grouped by category with superseded-by / merged-in hints.
