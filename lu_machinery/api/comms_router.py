@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.control_plane.storage import ControlPlaneError
 from lu_machinery.fleet_comms.agent_success_metrics import collect_agent_success
 from lu_machinery.fleet_comms.efficiency_metrics import (
@@ -41,7 +42,7 @@ from lu_machinery.fleet_comms.opsec_store import (
     COMMS_RESPONSE_SCHEMA_VERSION,
     comms_plane_store,
 )
-from lu_machinery.fleet_comms.paths import default_plane_root
+from lu_machinery.fleet_comms.paths import PlaneRootAnchorError, default_plane_root
 
 from . import panel_values
 from .monitor_context import MonitorContext, get_ctx
@@ -329,7 +330,13 @@ def comms_inbox(
         pending_delivery_snapshot,
     )
 
-    snapshot = pending_delivery_snapshot(agent, root=default_plane_root(repo_root=ctx.roots.state_root), limit=limit)
+    try:
+        plane_root = default_plane_root(repo_root=ctx.roots.state_root)
+    except (PlaneRootAnchorError, MachineryConfigError, OSError, ValueError):
+        # Same fail-open rule as the metrics route: an unanchored plane is unknown, never a 500.
+        snapshot: dict = {"probe": "unknown"}
+    else:
+        snapshot = pending_delivery_snapshot(agent, root=plane_root, limit=limit)
     return {
         "agent": agent,
         "count": snapshot.get("count"),
