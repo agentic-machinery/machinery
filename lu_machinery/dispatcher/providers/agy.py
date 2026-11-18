@@ -370,7 +370,6 @@ def _unsuccessful(result: dict) -> str:
 
 def parse(
     stdout: str, stderr: str, returncode: int, final_text: str | None, *, output_schema: dict | None = None,
-    settle_read_only: bool = False,
 ) -> ParsedResult:
     if returncode and not stdout.strip() and _schema_refused(stderr):
         return ParsedResult(None, None, _SCHEMA_REFUSAL)
@@ -489,7 +488,7 @@ def parse(
             incomplete=incomplete,
         )
     if (
-        settle_read_only and returncode == 0 and stream_clean and terminal_failed and not incomplete
+        returncode == 0 and stream_clean and terminal_failed and not incomplete
         and result.get("status") == "ERROR" and terminal_error is not None
         and not terminal_error.startswith(_MODEL_SELECTION_REFUSAL)
     ):
