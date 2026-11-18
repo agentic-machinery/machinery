@@ -558,6 +558,12 @@ def test_prepare_or_dependency_failure_still_writes_incomplete_manifest(measurem
         copied = tmp_path / "copied-tool"
         copied.mkdir()
         shutil.copyfile(machinery_path("ci/coverage_ref.py"), copied / "coverage_ref.py")
+        # The measurement copy runs without a package or companion decoder.
+        run_help = subprocess.run(
+            [sys.executable, "-I", "-S", str(copied / "coverage_ref.py"), "run", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert run_help.returncode == 0, run_help.stdout + run_help.stderr
         shutil.copyfile(machinery_path("common/json_depth.py"), copied / "json_depth.py")
         result = subprocess.run(
             [
@@ -761,10 +767,14 @@ def test_real_xdist_and_subprocess_measurement_records_status_and_child_lines(tm
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
         }
     )
+    # Match the workflow's package-free measurement copy, without a decoder.
+    copied_tool = tmp_path / "measurement-tool" / "coverage_ref.py"
+    copied_tool.parent.mkdir()
+    shutil.copyfile(machinery_path("ci/coverage_ref.py"), copied_tool)
     result = subprocess.run(
         [
             sys.executable,
-            str(machinery_path('ci/coverage_ref.py')),
+            str(copied_tool),
             "run",
             "--output",
             "raw",

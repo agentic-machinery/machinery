@@ -28,15 +28,6 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 
-# The workflow stages the decoder beside a copied tool. Package callers use the
-# identical helper in their own release; neither path imports an installed copy.
-_HERE = Path(__file__).resolve()
-_JSON_HELPER = (
-    _HERE.parents[1] / "common" / "json_depth.py"
-    if _HERE.parent.name == "ci" else _HERE.with_name("json_depth.py")
-)
-_json_loads = runpy.run_path(str(_JSON_HELPER))["loads"]
-
 
 def _packaged_script(name: str) -> str:
     """Checkout-relative path of a sibling while this file is still in the package.
@@ -212,6 +203,11 @@ def combine(root: Path, output: Path, sha: str, shard_count: int, matrix_result:
     if matrix_result != "success":
         errors.append(f"pytest matrix: {matrix_result}")
     try:
+        # Only combine reads JSON. The measurement job keeps its package-free
+        # copy; the combine job stages the decoder beside the copied tool.
+        here = Path(__file__).resolve()
+        helper = here.parents[1] / "common" / "json_depth.py" if here.parent.name == "ci" else here.with_name("json_depth.py")
+        loads = runpy.run_path(str(helper))["loads"]
         import coverage
 
         manifest["versions"] = versions()
@@ -219,7 +215,7 @@ def combine(root: Path, output: Path, sha: str, shard_count: int, matrix_result:
         for shard in range(1, shard_count + 1):
             directory = root / f"coverage-shard-{shard}"
             try:
-                receipt = _json_loads((directory / "receipt.json").read_text(encoding="utf-8"), max_depth=512)
+                receipt = loads((directory / "receipt.json").read_text(encoding="utf-8"), max_depth=512)
                 manifest["shards"].append(receipt)
                 if manifest["core"] is None:
                     manifest["core"] = receipt.get("core")
@@ -329,7 +325,7 @@ def combine(root: Path, output: Path, sha: str, shard_count: int, matrix_result:
             if reportable:
                 try:
                     cov.json_report(morfs=reportable, outfile=str(report_path), ignore_errors=True)
-                    report = _json_loads(report_path.read_text(encoding="utf-8"), max_depth=512)
+                    report = loads(report_path.read_text(encoding="utf-8"), max_depth=512)
                 except coverage.exceptions.NoDataError:
                     pass  # Every unreportable file is a completeness error below.
             # Keep a diagnostic report even if all paths or sources are unusable;
