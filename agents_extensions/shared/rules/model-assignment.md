@@ -473,7 +473,7 @@ or count as a formal review.
   operator 2026-11-07, REMOVE-UNNEEDED-1107). No executable routing, reviewer
   ladder or substitution may select the retired ones. GLM is neither local nor free.
 * **Current subscriptions:** Codex Sol 6.2 and Luna,
-  AGY Gemini 4 Hydrogen, 3.8 Flash High, 4 Carbon and 4 Argon, OpenCode DeepSeek V4.1 Flash on OpenCode credit,
+  AGY Gemini 4 Hydrogen, 3.8 Flash High, 4 Neon and 4 Argon, OpenCode DeepSeek V4.1 Flash on OpenCode credit,
   native Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5, and Cursor Grok 4.7 (`grok-4.7-high`, C-5307).
   Muse Wonder Full is retired (MUSE-RETIRE-1112, 2026-11-12) and is not a current subscription.
 * **OpenRouter:** no general fleet routing. Existing DeepSeek compatibility
