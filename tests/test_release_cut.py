@@ -455,6 +455,74 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
         cut.update_adopt_inputs(lock, product)
 
 
+def test_annotated_tag_uses_the_checkout_identity_when_the_host_has_none(tmp_path, monkeypatch):
+    """Defect class: the annotated tag ignores the checkout identity and fails after the wheel build."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE", "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE", "EMAIL"):
+        monkeypatch.delenv(key, raising=False)
+    checkout = tmp_path / "checkout"
+    _init_repo(checkout)
+    work = tmp_path / "work"
+    work.mkdir()
+    bare = tmp_path / "machinery.git"
+    clone = work / "machinery"
+    _bare_checkout(checkout, bare, clone)
+    cut = Cut(work=work, dry_run=False, machinery_remote=str(bare), product_remote=str(tmp_path / "product.git"),
+              machinery_repo=REPO, product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python",
+              primary=checkout, alert=False, x_agent="claude/claude-cto")
+    name, email = (cut.git(checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
+    assert (name, email) == ("Release Cut", "release-cut@example.invalid")
+    assert cut.git(clone, "config", "--get", "user.name", check=False) == ""
+    assert cut.git(clone, "config", "--get", "user.email", check=False) == ""
+    cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
+    cut.head = cut.git(clone, "rev-parse", "HEAD")
+    cut.version = "0.1.22"
+    dist = work / "dist"
+    dist.mkdir()
+    wheel = dist / "lu_machinery-0.1.22-py3-none-any.whl"
+    source = dist / "lu_machinery-0.1.22.tar.gz"
+    wheel.write_bytes(b"wheel")
+    source.write_bytes(b"sdist")
+    sums = dist / "SHA256SUMS"
+    sums.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in (wheel, source)),
+                    encoding="utf-8")
+    files = {"wheel": wheel, "sdist": source, "sums": sums}
+    original_run = cut.run
+
+    def run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        # The host pre-push scan refuses a fixture that is not the public repository. The tag is what this test reads.
+        if "push" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ["gh", "release"]:
+            published = Path(command[command.index("-D") + 1])
+            published.mkdir()
+            for path in files.values():
+                (published / path.name).write_bytes(path.read_bytes())
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(argv, **kwargs)
+
+    cut.run = run
+    cut.publisher = lambda *_args: ""
+    cut.publish(files, "notes\n")
+    expected = f"{name}|<{email}>"
+    assert cut.git(clone, "cat-file", "-t", "refs/tags/v0.1.22") == "tag"
+    assert cut.git(clone, "rev-parse", "refs/tags/v0.1.22^{commit}") == cut.head
+    assert cut.git(clone, "for-each-ref", "--format=%(taggername)|%(taggeremail)", "refs/tags/v0.1.22") == expected
+    refused_work = tmp_path / "refuse"
+    refused_work.mkdir()
+    refused = Cut(work=refused_work, dry_run=True, machinery_remote=str(tmp_path / "missing.git"),
+                  product_remote=str(tmp_path / "missing-product.git"), machinery_repo=REPO,
+                  product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python",
+                  primary=checkout, alert=False, x_agent="claude/claude-cto")
+    with pytest.raises(CutError, match=r"^no git user\.name and user\.email in the registered machinery checkout$"):
+        refused.preflight()
+    assert refused.step == "preflight"
+    assert list(refused_work.iterdir()) == []
+
+
 def _released_history(tmp_path, commits, releases):
     """A machinery remote whose first-parent history is ``commits`` ((title, version, tag)), and a dry-run Cut on it.
 
@@ -481,7 +549,8 @@ def _released_history(tmp_path, commits, releases):
     work.mkdir()
     cut = Cut(work=work, dry_run=True, machinery_remote=str(remote), product_remote=str(tmp_path / "product.git"),
               machinery_repo="learn-ukrainian/machinery", product_repo="learn-ukrainian/learn-ukrainian",
-              host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="claude/claude-cto")
+              host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="claude/claude-cto",
+              git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"))
     original_run = cut.run
     tree = cut.git(seed, "rev-parse", "HEAD^{tree}")
     target = {"id": 7, "run_attempt": 1, "head_sha": head, "head_branch": "main", "event": "push",

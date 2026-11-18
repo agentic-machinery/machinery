@@ -38,3 +38,8 @@ DISPATCH_MAX_TEST_SLOT_QUEUE = 4
 DISPATCH_DISK_REAP_USED_PERCENT = 85.0
 DISPATCH_DISK_REFUSE_USED_PERCENT = 90.0
 DISPATCH_DISK_ALERT_USED_PERCENT = 75.0
+
+# CTO seat safe mode (lu_machinery/cto_safe_mode.py). The CTO supervisor writes this file after two
+# consecutive fast deaths of the CTO seat and clears it only with its own clear command. While it
+# exists, new write dispatches and pr-merge from the CTO seat are refused; dispatched workers are not.
+CTO_SAFE_MODE_FILE = "~/.config/learn-ukrainian/cto-seat/safe-mode.json"
