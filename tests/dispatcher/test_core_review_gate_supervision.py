@@ -504,22 +504,28 @@ def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktre
     # A scope launch's later sweep pass probes again, whatever the stale reason, and the gone provider releases it.
     stale["task_service_stops"] = [{"unit": "u", "postcondition": "true"}]
     # F19: a service registered after the earlier stop is read from the scratch once the provider is proven gone,
-    # never before, and is stopped and checked before removal; one still active keeps the scratch.
+    # never before, and is stopped and checked before removal. One still active, or still deactivating after a
+    # failed stop (is-active exit 3), keeps the scratch.
     from lu_machinery.orchestration import dispatch_isolation as iso
 
     late = iso.task_service_name("scratch-task")
     (base / "scratch-task" / "task-services.txt").write_text(f"{late}\n")
-    calls: list[list[str]] = []
-    monkeypatch.setattr(iso, "_systemctl", lambda argv: calls.append(list(argv)) or subprocess.CompletedProcess(
-        argv, 0, stdout="active\n", stderr=""))
-    for alive, expected in ((True, "the provider is not proven gone"), (False, "task services not proven stopped")):
-        monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
-        registered = {**stale, "task_service_stops": list(stale["task_service_stops"])}
-        worker._settle_task_scratch(registered)
-        assert (registered["task_scratch_disposition"], registered["task_scratch_disposition_reason"]) == (
-            "retained", expected)
-        assert (base / "scratch-task").is_dir() and bool(calls) is (not alive)
-    assert ["systemctl", "--user", "stop", f"{late}.service"] in calls
+    alerts: list[tuple[str, ...]] = []
+    monkeypatch.setattr(iso, "_publish_task_service_alert", lambda *args: alerts.append(args))
+    for code, state in ((0, "active"), (3, "deactivating")):
+        calls: list[list[str]] = []
+        monkeypatch.setattr(iso, "_systemctl", lambda argv, code=code, state=state, calls=calls: calls.append(
+            list(argv)) or subprocess.CompletedProcess(argv, 1 if "stop" in argv else code, stdout=f"{state}\n",
+                                                       stderr=""))
+        for alive, expected in ((True, "the provider is not proven gone"), (False, "task services not proven stopped")):
+            monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
+            registered = {**stale, "task_service_stops": list(stale["task_service_stops"])}
+            worker._settle_task_scratch(registered)
+            assert (registered["task_scratch_disposition"], registered["task_scratch_disposition_reason"]) == (
+                "retained", expected), state
+            assert (base / "scratch-task").is_dir() and bool(calls) is (not alive)
+        assert ["systemctl", "--user", "stop", f"{late}.service"] in calls
+    assert len(alerts) == 2  # one alert for each record whose service was left running
     (base / "scratch-task" / "task-services.txt").unlink()
     worker._settle_task_scratch(stale)
     assert stale["task_scratch_disposition"] == "removed" and not (base / "scratch-task").exists()
