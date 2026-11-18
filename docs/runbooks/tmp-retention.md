@@ -194,19 +194,30 @@ overrides a task that is still unsettled.
 ### Dispatched task scratch
 
 Every dispatched worker gets `LU_TASK_SCRATCH=/var/tmp/<task-id>` in its
-environment; the worker creates the directory when it needs it, and `TMPDIR`
-is unchanged. When the task settles and the dispatcher removes its worktree
-(`worktree_disposition: removed`), it deletes that directory too, directly and
-without quarantine. A retained worktree keeps its scratch. The task record
-shows the result next to the worktree disposition: `task_scratch_disposition`
-(`removed`, `absent`, `retained`, `refused` or `failed`),
-`task_scratch_disposition_reason` and `task_scratch_bytes` (file bytes found
-before deletion). Only the exact child named by a valid task id is
-considered. A symlink, a non-directory, an entry another user owns, one on
-another filesystem or one with a mount below it is refused; deletion never
-follows a symlink and makes read-only directories writable before emptying
-them. A refusal or failure is recorded and never fails settlement; whatever
-stays is left to the rules above.
+environment. For a workspace-write worker it is also `TMPDIR`: the supervisor
+creates it, private and exclusively, before any launch check runs, and records
+its identity as `task_scratch` (path, device, inode). An entry already at that
+name is never adopted, so the launch fails as `task_scratch_unavailable`.
+Read-only routes keep their boundary's private `TMPDIR`, and seats and hooks
+outside a task keep their own. Once the provider's whole process tree is proven
+gone, whatever the terminal status and even when the worktree is kept,
+settlement prunes exactly the recorded directory, directly and without
+quarantine. Only a provider that may still run (`provider_processes_alive`,
+`provider_liveness_unknown`) keeps it. The prune never removes a socket, a
+FIFO, a `tmux-*` or `ssh-*` directory, or a path a live process holds as its
+working directory, an open descriptor or a mapping, as far as `/proc` shows.
+The directories that hold these entries stay as well.
+
+The task record shows the result next to the worktree disposition:
+`task_scratch_disposition`, `task_scratch_disposition_reason` and
+`task_scratch_bytes` (allocated bytes freed). The dispositions are `removed`,
+`partial` (only sockets, FIFOs or agent socket directories stay, for good),
+`in_use` and `failed` (the hourly settlement sweep retries both), `absent`,
+`retained` and `refused`. A directory the run did not record is refused,
+and so is a changed identity, a symlink, a non-directory, an entry another
+user owns, one on another filesystem or one with a mount below it. Removal
+never follows a symlink and makes read-only directories writable before
+emptying them. A refusal or failure is recorded and never fails settlement.
 
 ### Listening sockets
 
@@ -540,15 +551,11 @@ belong in the system temp area. To keep a path, do one of the following:
 
 ## Write workers' temp files
 
-A dispatched workspace-write worker's `TMPDIR` is its task scratch, the
-directory `LU_TASK_SCRATCH` names. Python (pytest's basetemp included), uv,
-Git and Node write their temp files there. The supervisor creates it before
-launch. Settlement removes it once the provider is proven gone, whatever the
-terminal status and even when the worktree is kept, and records
-`task_scratch_disposition` and the bytes freed in the task record. Read-only
-routes keep their boundary's private `TMPDIR`. Seats and hooks that run
-outside a dispatched task keep their own. A path a worker hard-codes, such as
-`/tmp/<name>`, is outside this scratch and is not removed.
+Python (pytest's basetemp included), uv, Git and Node take their temp
+directory from `TMPDIR`, so a workspace-write worker's temp files land in its
+task scratch, which settlement removes ("Dispatched task scratch" above). A
+path a worker hard-codes, such as `/tmp/<name>`, is outside this scratch and is
+not removed.
 
 ## Settled task state
 
@@ -557,22 +564,29 @@ settled tasks. A task qualifies when its record (hot, else archived) has a
 released terminal status and finished more than `--settled-days` ago (default
 2). Everything in that task's `tasks/<task>.*` directories then goes, except
 hand-off `.md` files. The record, its `.result` and every other file beside
-it stay. `--dry-run` lists what would go and deletes nothing.
+it stay. `--dry-run` lists what would go and deletes nothing. A dry run and a
+removal share one walk, so they list the same entries and bytes.
 
 Never removed:
 
-- a live task's state, and a directory written since the cutoff;
+- a live task's state, a terminal task whose provider may still run, and a
+  directory written since the cutoff;
 - a task whose record holds its worktree (`worktree_retention_hold`), or any
   path the retention list names under `batch_state/tasks/`;
-- a directory with no owner record, a damaged owner record or no completion
-  time;
+- a directory with no owner record, or whose most specific owner record is
+  damaged, symlinked or names another task, or has no completion time;
+- a directory with a mount below it;
 - `tasks/archive/`;
 - sockets, FIFOs, `tmux-*` and `ssh-*` directories, and any path a live process
   holds as its working directory, an open descriptor or a mapping, as far as
   `/proc` shows. Dispatcher settlement applies the same rule to task scratch.
 
-The record is read again under its task-state lock before removal, so a
-re-dispatch of the same id keeps its state.
+Before removal the command takes the task-state lock of every id that could
+claim the directory (each dotted prefix of its name) and proves the owner, the
+directory's identity and its freshness again. A run that starts in between
+keeps its state. It exits 1 only when a scan or removal did not complete
+(`unknown`, `failed`). Every other count is a decision and exits 0, so the
+unit's later steps still run.
 
 ## The batch_state staleness report
 

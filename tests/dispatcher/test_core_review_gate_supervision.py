@@ -389,6 +389,7 @@ def test_settlement_removes_the_task_scratch_including_a_read_only_directory(mon
     """Defect class: scratch leak. A settled task whose worktree went left /var/tmp/<task-id> behind, and a
     0500 directory a test left inside it refused deletion."""
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    record["task_scratch"] = worker._create_task_scratch("scratch-task")
     locked = base / "scratch-task" / "fixture" / "locked"
     locked.mkdir(parents=True)
     (locked / "data").write_bytes(b"x" * 65536)
@@ -418,7 +419,7 @@ def test_task_scratch_outlives_only_a_provider_that_may_still_run(monkeypatch, t
     with a worktree retained for unpublished work kept its temp files for good; deleting it under a provider that
     may still run would pull its TMPDIR from under it."""
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "retained")
-    (base / "scratch-task").mkdir()
+    record["task_scratch"] = worker._create_task_scratch("scratch-task")
     (base / "scratch-task" / "pytest-of-user").write_bytes(b"x" * 65536)
     worker._reap_settled(record)
     assert not (base / "scratch-task").exists()
@@ -439,9 +440,13 @@ def test_settlement_never_removes_sockets_fifos_agent_directories_or_paths_in_us
     """Defect (2026-11-18): an age-only temp cleanup deleted a tmux server's socket directory and stranded the
     live server. A server finds its socket or FIFO by path, so those, tmux-*/ssh-* directories and anything a
     live process holds open stay; the rest of the scratch still goes."""
-    base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    (tmp_path / "linked").symlink_to(tmp_path, target_is_directory=True)
+    base = tmp_path / "linked" / "var-tmp"  # /proc names the real path; the base is reached through a link
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    record = {"task_id": "scratch-task", "task_scratch": worker._create_task_scratch("scratch-task")}
     scratch = base / "scratch-task"
-    (scratch / "tmux-1000").mkdir(parents=True)
+    (scratch / "tmux-1000").mkdir()
     (scratch / "ssh-agentdir").mkdir()
     (scratch / "pytest-of-user" / "basetemp").mkdir(parents=True)
     (scratch / "pytest-of-user" / "basetemp" / "junk").write_bytes(b"j" * 65536)
@@ -455,33 +460,51 @@ def test_settlement_never_removes_sockets_fifos_agent_directories_or_paths_in_us
         monkeypatch.chdir(tmp_path)
         worker._reap_settled(record)
         assert (record["task_scratch_disposition"], record["task_scratch_disposition_reason"]) == (
-            "partial", "provider gone; kept 4 socket, FIFO or in-use entries")
+            "in_use", "provider gone; 1 path(s) a live process holds stay")
         assert record["task_scratch_bytes"] >= 65536
         assert not (scratch / "pytest-of-user" / "basetemp").exists()
         assert stat.S_ISFIFO((scratch / "pytest-of-user" / "pipe").lstat().st_mode)
         assert (scratch / "held.log").is_file() and (scratch / "ssh-agentdir").is_dir()
         monkeypatch.chdir(scratch / "tmux-1000")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.connect("default")  # the live server is still reachable
+                client.connect("default")  # the live server is still reachable
+        monkeypatch.chdir(tmp_path)
+        held.close()  # the holder lets go: the sweep's retry takes the file, and only rendezvous entries stay
+        assert worker._holds_task_scratch({**record, "status": "done"})
+        worker._settle_task_scratch(record)
+        assert (record["task_scratch_disposition"], record["task_scratch_disposition_reason"]) == (
+            "partial", "provider gone; kept 3 socket, FIFO or agent directory")
+        assert not (scratch / "held.log").exists() and not worker._holds_task_scratch({**record, "status": "done"})
     finally:
         listener.close()
         held.close()
 
 
 def test_write_task_scratch_is_created_private_and_refused_when_not_our_directory(monkeypatch, tmp_path):
-    """Defect class: unusable TMPDIR. A write worker's TMPDIR must exist at launch (Node and uv fail on a missing
-    one, Python silently falls back to /tmp), and a planted symlink must never become it."""
+    """Defect class: unusable or foreign TMPDIR. A write worker's TMPDIR must exist at launch (Node and uv fail on
+    a missing one, Python silently falls back to /tmp). An existing entry at its name (a symlink, another
+    service's directory) is never adopted, and settlement never removes a directory this run did not create."""
     base = tmp_path / "var-tmp"
     base.mkdir()
     monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
-    worker._create_task_scratch("scratch-task")
-    assert (base / "scratch-task").stat().st_mode & 0o777 == 0o700
-    worker._create_task_scratch("scratch-task")  # a relaunch of the same task reuses it
+    created = worker._create_task_scratch("scratch-task")
+    info = (base / "scratch-task").stat()
+    assert info.st_mode & 0o777 == 0o700 and (created["dev"], created["ino"]) == (info.st_dev, info.st_ino)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (base / "linked-task").symlink_to(elsewhere, target_is_directory=True)
-    with pytest.raises(ValueError, match="not a directory owned"):
-        worker._create_task_scratch("linked-task")
+    (base / "lu").mkdir()  # a task id can name any entry of the base, such as another service's directory
+    for taken in ("scratch-task", "linked-task", "lu"):
+        with pytest.raises(FileExistsError):
+            worker._create_task_scratch(taken)  # never adopted
+    # Settlement removes only the directory this run recorded: a same-named directory it did not create stays.
+    (base / "lu" / "shared").write_text("other service")
+    record = {"task_id": "lu", "worktree_disposition": "removed", "worktree_disposition_reason": "clean"}
+    worker._settle_task_scratch(record)
+    assert record["task_scratch_disposition"] == "refused" and (base / "lu" / "shared").exists()
+    record["task_scratch"] = {**created, "path": str(base / "lu")}
+    worker._settle_task_scratch(record)
+    assert record["task_scratch_disposition"] == "refused" and (base / "lu" / "shared").exists()
 
 
 def test_settlement_removes_only_recreatable_caches_from_the_task_output_directories(sandbox):

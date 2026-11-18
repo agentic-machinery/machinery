@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 import pytest
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
-from lu_machinery.dispatcher.environment import child_env, task_scratch_path
+from lu_machinery.dispatcher.environment import child_env, probe_env, task_scratch_path
 from lu_machinery.dispatcher.providers import load
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.dispatcher import write_boundary
@@ -111,6 +111,8 @@ def test_checkout_stays_read_only_and_only_the_scratch_is_writable(worktree, mon
     # A write task's TMPDIR is its own task scratch, which settlement removes (CLEANUP-WORKFILES-1118).
     write = spec_for(worktree, "workspace-write")
     assert child_env(write)["TMPDIR"] == child_env(write)["LU_TASK_SCRATCH"] == str(task_scratch_path(TASK_ID))
+    # A provider check before the scratch exists (the OpenRouter endpoint probe) keeps the caller's TMPDIR.
+    assert probe_env(write).get("TMPDIR") == os.environ.get("TMPDIR")
     assert "permissions=" not in " ".join(load("codex").build(write, child_env(write)).argv)
 
 

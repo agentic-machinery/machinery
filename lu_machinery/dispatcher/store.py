@@ -30,6 +30,9 @@ from lu_machinery.orchestration.task_record_store import (
 _JSON_MAX_DEPTH = 128
 
 ACTIVE = {"spawning", "running"}
+# Worktree reasons settlement records before the provider's whole process tree is proven gone. A terminal task with
+# one may still run: its scratch and task-store state stay (worker._settle_task_scratch, batch_state_retention).
+PROVIDER_MAY_RUN = frozenset({"provider_processes_alive", "provider_liveness_unknown"})
 
 
 class TaskRecordError(ValueError):

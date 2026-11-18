@@ -19,12 +19,14 @@ belongs to the tmp_sweep quarantine and purge path, through explicit expiry.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import stat
 import subprocess
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -32,6 +34,7 @@ from typing import Any
 from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.task_scratch import ContainmentError, mount_points
+from lu_machinery.dispatcher.store import PROVIDER_MAY_RUN
 from lu_machinery.orchestration.task_record_store import (
     ARCHIVE_DIR_NAME,
     archived_task_record_path,
@@ -253,25 +256,35 @@ def report(
 
 
 def _task_owner(tasks_root: Path, name: str) -> tuple[str, dict[str, Any]] | None:
-    """The task whose record names ``name`` as its ``<task>.<suffix>`` directory: the longest such id.
+    """The task whose record claims ``name`` as its ``<task>.<suffix>`` directory: the most specific claim.
 
-    The hot record wins over an archived one (a re-dispatch). Raises for a damaged record.
+    The longest dotted prefix with a record file decides, the hot record before an archived one (a
+    re-dispatch). A foreign sidecar named like a record is skipped. Raises, so the directory is kept, when
+    that claim cannot be verified: a symlinked or non-regular record, a damaged one, or one naming another
+    task. A legacy record without an embedded id is identified by its file name, as its parser does.
     """
     parts = name.split(".")
     for end in range(len(parts) - 1, 0, -1):
         task_id = ".".join(parts[:end])
         for path in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
-            if path.is_file() and not path.is_symlink():
-                record = read_task_record(path)
-                if record is not None and record.get("task_id") == task_id:
-                    return task_id, record
+            if not os.path.lexists(path):
+                continue
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("the record is not a regular file")
+            record = read_task_record(path)
+            if record is None:
+                continue  # a foreign file named like a record
+            if record.get("task_id", task_id) != task_id:
+                raise ValueError("the record names another task")
+            return task_id, record
     return None
 
 
 def _released(record: dict[str, Any]) -> bool:
-    """A released terminal status; anything else, a malformed value included, is live."""
+    """A released terminal status whose provider is proven gone; anything else, malformed included, is live."""
     status = record.get("status")
-    return isinstance(status, str) and status in RELEASED_TASK_STATUSES
+    return (isinstance(status, str) and status in RELEASED_TASK_STATUSES
+            and record.get("worktree_disposition_reason") not in PROVIDER_MAY_RUN)
 
 
 def _settled_at(record: dict[str, Any]) -> float | None:
@@ -295,63 +308,102 @@ def _held_task(holds: list[dict[str, Any]], record: dict[str, Any], owner: str, 
     )
 
 
-def paths_in_use() -> frozenset[str]:
-    """Every path a live process has as its cwd, an open descriptor or a mapping, as far as ``/proc`` shows.
+def paths_in_use() -> frozenset[str] | None:
+    """Every path a live process has as its cwd, an open descriptor or a mapping, as ``/proc`` shows; None if unreadable.
 
-    Best effort: a process the kernel will not let us inspect is skipped (tmp_sweep.process_snapshot reports
-    it as incomplete). Unlinking a file such a process holds open does not disturb it. What a process finds by
-    path is a socket or a FIFO, and :func:`prune_tree` keeps those by type, whatever this probe saw.
+    A process the kernel will not let us inspect (another user's, or a non-dumpable one of ours) is
+    skipped: unlinking a file it holds open does not disturb that descriptor. What a process finds by path
+    is a socket or a FIFO, and :func:`prune_tree` keeps those by type, whatever this probe saw.
     """
     from lu_machinery.hygiene.tmp_sweep import process_snapshot  # tmp_sweep imports this module
 
-    references, _complete = process_snapshot()
+    references, complete = process_snapshot()
+    if not references and not complete:
+        return None  # /proc could not be listed; this process alone would have appeared
     return frozenset(str(path) for _pid, path in references)
+
+
+@dataclass
+class PruneResult:
+    """What :func:`prune_tree` removed, or would remove, and what it kept."""
+
+    freed: int = 0  # allocated bytes whose last link goes
+    removed: int = 0  # entries unlinked or directories removed
+    rendezvous: int = 0  # sockets, FIFOs and tmux-*/ssh-* directories: kept for good
+    in_use: int = 0  # paths a live process holds: kept until it lets go
+    newest: float = 0.0  # newest modification time seen below the root, the root included
+    links: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 def prune_tree(
     parent_fd: int, name: str, expected: os.stat_result, *, path: Path, device: int, mount_id: int,
-    in_use: frozenset[str], keep_handoffs: bool,
-) -> tuple[int, int]:
-    """Unlink what is below ``name`` and remove what is left empty, keeping anything something may still use.
+    in_use: frozenset[str], keep_handoffs: bool, apply: bool, repair: bool | None = None,
+    result: PruneResult | None = None,
+) -> PruneResult:
+    """Remove (``apply``) or count what is below ``name``, keeping anything something may still use.
 
-    Never removed: a socket or FIFO, a ``tmux-*`` or ``ssh-*`` directory, any path in ``in_use`` (a directory
-    there keeps its whole tree) and, with ``keep_handoffs``, hand-off ``.md`` files. ``path`` is the real path
-    of ``name``. Returns (allocated bytes freed, entries kept). Never follows a symlink or leaves the device
-    and mount: each descent re-proves identity on its descriptor and each ``rmdir`` re-identifies the
-    emptied directory (the task-scratch remover's checks). A directory without owner rwx gets it first.
+    Never removed: a socket or FIFO, a ``tmux-*`` or ``ssh-*`` directory, any path in ``in_use`` (a
+    directory there keeps its whole tree) and, with ``keep_handoffs``, hand-off ``.md`` files; a directory
+    holding one of them stays too. ``path`` is the real path of ``name``. The count and the removal share
+    this one walk, so a dry run lists exactly what a removal takes. Never follows a symlink or leaves the
+    device and mount: each descent re-proves identity on its descriptor, an entry is re-identified just
+    before its unlink, and each ``rmdir`` re-identifies the emptied directory (task_scratch's checks).
+    ``repair`` (default: ``apply``) gives a directory of ours without owner rwx that permission first, so a
+    planning walk before a removal can read a locked tree; without it such a directory raises.
     """
+    result = PruneResult() if result is None else result
+    repair = apply if repair is None else repair
+    result.newest = max(result.newest, expected.st_mtime)
     if str(path) in in_use:
-        return 0, 1
+        result.in_use += 1
+        return result
     try:
         fd = task_scratch._open_dir_at(parent_fd, name)
     except PermissionError:
+        if not repair:
+            raise ContainmentError(f"directory {name!r} is not readable") from None
         task_scratch.grant_owner_rwx(parent_fd, name, expected, device=device, mount_id=mount_id)
         fd = task_scratch._open_dir_at(parent_fd, name)
     try:
         held = task_scratch._verify_held_dir(fd, expected_dev=expected.st_dev, expected_ino=expected.st_ino,
                                              device=device, mount_id=mount_id, what=f"directory {name!r}")
-        if stat.S_IMODE(held.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
+        if repair and stat.S_IMODE(held.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
             os.fchmod(fd, stat.S_IMODE(held.st_mode) | stat.S_IRWXU)
         with os.scandir(fd) as entries:
             children = [(entry.name, entry.stat(follow_symlinks=False)) for entry in entries]
-        freed = kept = 0
+        kept = result.rendezvous + result.in_use
         for child, info in children:
-            if (stat.S_ISSOCK(info.st_mode) or stat.S_ISFIFO(info.st_mode) or str(path / child) in in_use
-                    or (stat.S_ISDIR(info.st_mode) and child.startswith(_RENDEZVOUS_DIRS))
-                    or (keep_handoffs and stat.S_ISREG(info.st_mode) and child.endswith(KEPT_SUFFIX))):
-                kept += 1
+            result.newest = max(result.newest, info.st_mtime)
+            if (stat.S_ISSOCK(info.st_mode) or stat.S_ISFIFO(info.st_mode)
+                    or (stat.S_ISDIR(info.st_mode) and child.startswith(_RENDEZVOUS_DIRS))):
+                result.rendezvous += 1
+            elif str(path / child) in in_use:
+                result.in_use += 1
+            elif keep_handoffs and stat.S_ISREG(info.st_mode) and child.endswith(KEPT_SUFFIX):
+                result.rendezvous += 1
             elif stat.S_ISDIR(info.st_mode):
                 if info.st_dev != device:
                     raise ContainmentError(f"refusing to cross a mount boundary at {child!r}")
-                child_freed, child_kept = prune_tree(fd, child, info, path=path / child, device=device,
-                                                     mount_id=mount_id, in_use=in_use, keep_handoffs=keep_handoffs)
-                freed, kept = freed + child_freed, kept + child_kept
+                prune_tree(fd, child, info, path=path / child, device=device, mount_id=mount_id, in_use=in_use,
+                           keep_handoffs=keep_handoffs, apply=apply, repair=repair, result=result)
             else:
-                os.unlink(child, dir_fd=fd)
-                freed += info.st_blocks * 512 if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else 0
-        if not kept:
-            task_scratch._rmdir_held(parent_fd, name, held_fd=fd, held_st=held)
-        return freed, kept
+                if apply:
+                    now = os.stat(child, dir_fd=fd, follow_symlinks=False)
+                    if (now.st_dev, now.st_ino, stat.S_IFMT(now.st_mode)) != (
+                            info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)):
+                        raise ContainmentError(f"entry {child!r} changed during the prune")
+                    os.unlink(child, dir_fd=fd)
+                result.removed += 1
+                if stat.S_ISREG(info.st_mode):
+                    key = (info.st_dev, info.st_ino)
+                    result.links[key] = result.links.get(key, 0) + 1
+                    if result.links[key] == info.st_nlink:  # the last name of this file goes
+                        result.freed += info.st_blocks * 512
+        if result.rendezvous + result.in_use == kept:  # nothing below this directory stays
+            if apply:
+                task_scratch._rmdir_held(parent_fd, name, held_fd=fd, held_st=held)
+            result.removed += 1
+        return result
     finally:
         os.close(fd)
 
@@ -367,12 +419,13 @@ def prune_settled_tasks(
     """Remove settled tasks' ``<task>.*`` directories, keeping hand-off ``.md`` files; ``dry_run`` only lists them.
 
     Sockets, FIFOs, agent socket directories and paths a live process uses stay too (:func:`prune_tree`).
-
-    A directory is pruned only when its owner record (hot, else archived) has a released terminal status
-    and a completion time older than ``settled_days``, no hold names it, and nothing below it was written
-    since that cutoff. The record is read again under its task-state lock before removal, which keeps that
-    lock: a re-dispatch of the same id cannot start in between. A directory with no owner record, a damaged
-    record or an unknown completion time is left alone and counted, never guessed.
+    A directory qualifies only when its owner record (:func:`_task_owner`) has a released terminal status
+    with its provider proven gone, a completion time older than ``settled_days``, no hold, and nothing below
+    it written since that cutoff. Before removal every task-state lock that could claim the directory is
+    taken (each dotted prefix of its name, in order), and the owner, its record, the directory's identity
+    and its freshness are proven again under them. A directory with no owner record, an unverifiable one or
+    an unknown completion time is kept and counted, never guessed. Row and exit semantics: ``unknown`` and
+    ``failed`` mean a scan or removal did not complete; every other count is a decision.
     """
     if not math.isfinite(settled_days) or settled_days <= 0:
         raise ValueError("settled days must be finite and positive")
@@ -380,16 +433,35 @@ def prune_settled_tasks(
         raise ValueError("task store must be a real directory")
     now = time.time() if now is None else now
     cutoff = now - settled_days * 86400
-    counts = dict.fromkeys(("removed", "would_remove", "live", "held", "settling", "fresh", "undated",
-                            "unowned", "owner_unreadable", "unknown", "failed"), 0)
+    counts = dict.fromkeys(("removed", "would_remove", "live", "held", "settling", "fresh", "undated", "unowned",
+                            "owner_unverified", "mount", "unsafe", "changed", "kept", "unknown", "failed"), 0)
     rows: list[dict[str, Any]] = []
     result = {"schema": "batch-state-task-prune.v1", "dry_run": dry_run, "settled_days": settled_days,
               "counts": counts, "rows": rows}
     if not tasks_root.exists():
         return {**result, "bytes": 0}  # a machine that never dispatched has nothing to prune
     tasks_root = tasks_root.resolve(strict=True)
-    mounts = mount_points()
-    in_use = None if dry_run else paths_in_use()
+
+    def classify(name: str) -> tuple[str, str | None, dict[str, Any] | None]:
+        """(decision, owner, record): ``candidate`` or the count that keeps the directory."""
+        try:
+            owned = _task_owner(tasks_root, name)
+        except (OSError, ValueError, RecursionError):
+            return "owner_unverified", None, None
+        if owned is None:
+            return "unowned", None, None
+        owner, record = owned
+        settled = _settled_at(record)
+        if not _released(record):
+            return "live", owner, record
+        if _held_task(holds, record, owner, name):
+            return "held", owner, record
+        if settled is None:
+            return "undated", owner, record
+        if settled >= cutoff:
+            return "settling", owner, record
+        return "candidate", owner, record
+
     root_fd = os.open(tasks_root, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
     try:
         device, mount_id = os.fstat(root_fd).st_dev, task_scratch.fd_mount_id(root_fd)
@@ -397,67 +469,66 @@ def prune_settled_tasks(
             names = sorted(entry.name for entry in entries
                            if not entry.name.startswith(".") and entry.name != ARCHIVE_DIR_NAME
                            and entry.is_dir(follow_symlinks=False))
+        in_use_once = paths_in_use() if dry_run and names else None
         for name in names:
             row: dict[str, Any] = {"path": f"batch_state/tasks/{name}/"}
+            decision, owner, record = classify(name)
+            if decision != "candidate":
+                counts[decision] += 1
+                if decision == "owner_unverified":
+                    rows.append({**row, "status": decision})
+                continue
+            prefixes = [".".join(name.split(".")[:end]) for end in range(1, name.count(".") + 1)]
             try:
-                owned = _task_owner(tasks_root, name)
-            except (OSError, ValueError, RecursionError) as error:
-                counts["owner_unreadable"] += 1
-                rows.append({**row, "status": "owner_unreadable", "reason": type(error).__name__})
-                continue
-            if owned is None:
-                counts["unowned"] += 1
-                continue
-            owner, record = owned
-            settled = _settled_at(record)
-            if not _released(record):
-                status = "live"
-            elif _held_task(holds, record, owner, name):
-                status = "held"
-            elif settled is None:
-                status = "undated"
-            elif settled >= cutoff:
-                status = "settling"
-            else:
-                status = None
-            if status is not None:
-                counts[status] += 1
-                continue
-            allocated, newest, reason = tree_activity(tasks_root / name, cutoff)
-            if mounts is None or mount_id is None:
-                reason = "mount_probe_unknown"
-            elif task_scratch._mounts_below(tasks_root / name, mounts):
-                reason = "mount_point"
-            if reason:
-                counts["unknown"] += 1
-                rows.append({**row, "status": "unknown", "reason": reason})
-                continue
-            if newest >= cutoff:
-                counts["fresh"] += 1
-                continue
-            if dry_run:
-                counts["would_remove"] += 1
-                rows.append({**row, "status": "would_remove", "task_id": owner, "bytes": allocated})
-                continue
-            try:
-                with task_state_lock(task_record_path(tasks_root, owner)):
-                    again = _task_owner(tasks_root, name)
-                    if (again is None or again[0] != owner or not _released(again[1])
-                            or _settled_at(again[1]) != settled or _held_task(holds, again[1], owner, name)):
-                        raise ContainmentError("the owner record changed before removal")
+                with contextlib.ExitStack() as locks:
+                    if not dry_run:
+                        for prefix in prefixes:  # every id that could claim the directory, shortest first
+                            locks.enter_context(task_state_lock(task_record_path(tasks_root, prefix)))
+                        again = classify(name)
+                        if again[0] != "candidate" or again[1] != owner or _settled_at(again[2] or {}) != _settled_at(
+                                record or {}):
+                            counts["changed"] += 1
+                            continue
                     info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
                     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-                        raise ContainmentError("not a directory this user owns")
-                    if mount_id is None or in_use is None:  # classified unknown above; never delete without it
-                        raise ContainmentError("mount information unavailable")
-                    freed, kept = prune_tree(root_fd, name, info, path=tasks_root / name, device=device,
-                                             mount_id=mount_id, in_use=in_use, keep_handoffs=True)
+                        counts["changed"] += 1
+                        continue
+                    mounts = mount_points()
+                    in_use = in_use_once if dry_run else paths_in_use()
+                    if mounts is None or mount_id is None or in_use is None:
+                        counts["unknown"] += 1
+                        rows.append({**row, "status": "unknown", "reason": "process_probe_unknown"
+                                     if in_use is None else "mount_probe_unknown"})
+                        continue
+                    if task_scratch._mounts_below(tasks_root / name, mounts):
+                        counts["mount"] += 1
+                        continue
+                    try:  # one planning walk decides freshness and what goes; it never removes
+                        plan = prune_tree(root_fd, name, info, path=tasks_root / name, device=device,
+                                          mount_id=mount_id, in_use=in_use, keep_handoffs=True, apply=False,
+                                          repair=not dry_run)
+                    except task_scratch.ContainmentError as error:  # a mount, a crossing or a changed entry
+                        counts["unsafe"] += 1
+                        rows.append({**row, "status": "unsafe", "reason": str(error)[:300]})
+                        continue
+                    if plan.newest >= cutoff:
+                        counts["fresh"] += 1
+                        continue
+                    pruned = plan if dry_run else prune_tree(
+                        root_fd, name, info, path=tasks_root / name, device=device, mount_id=mount_id,
+                        in_use=in_use, keep_handoffs=True, apply=True)
             except (OSError, ValueError, RecursionError, task_scratch.TaskScratchError) as error:
                 counts["failed"] += 1
-                rows.append({**row, "status": "failed", "task_id": owner, "reason": f"{type(error).__name__}: {error}"[:300]})
+                rows.append({**row, "status": "failed", "task_id": owner,
+                             "reason": f"{type(error).__name__}: {error}"[:300]})
                 continue
-            counts["removed"] += 1
-            rows.append({**row, "status": "removed", "task_id": owner, "bytes": freed, "kept": kept})
+            if not pruned.removed:
+                counts["kept"] += 1
+                continue
+            status = "would_remove" if dry_run else "removed"
+            counts[status] += 1
+            rows.append({**row, "status": status, "task_id": owner, "bytes": pruned.freed,
+                         "kept": pruned.rendezvous + pruned.in_use})
     finally:
         os.close(root_fd)
     return {**result, "bytes": sum(row["bytes"] for row in rows if row["status"] in {"removed", "would_remove"})}
@@ -516,9 +587,10 @@ def main(argv: list[str] | None = None) -> int:
     batch_root = args.batch_root or default_batch_root()
     try:
         holds = load_holds(args.retention_list)
+        # The report validates the root and its own arguments first, so an invalid run removes nothing.
+        result = report(batch_root, holds=holds, stale_days=args.stale_days)
         pruned = prune_settled_tasks(batch_root / "tasks", holds=holds, settled_days=args.settled_days,
                                      dry_run=args.dry_run)
-        result = report(batch_root, holds=holds, stale_days=args.stale_days)
     except (ValueError, OSError) as error:
         parser.error(str(error))
     if args.json:

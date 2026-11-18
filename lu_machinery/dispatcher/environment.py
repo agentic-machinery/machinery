@@ -78,6 +78,15 @@ def claude_config_dir(account: str, home: str | None = None) -> str | None:
     return str(Path(home or os.environ.get("HOME") or str(Path.home())) / f".claude{suffix}")
 
 
+def probe_env(spec: TaskSpec) -> dict[str, str]:
+    """``child_env`` for a provider check that runs before the task's scratch exists: the caller's own TMPDIR."""
+    env = child_env(spec)
+    env.pop("TMPDIR", None)
+    if os.environ.get("TMPDIR"):
+        env["TMPDIR"] = os.environ["TMPDIR"]
+    return env
+
+
 def child_env(spec: TaskSpec) -> dict[str, str]:
     source = os.environ
     if spec.agent == "codex":

@@ -1241,18 +1241,26 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     _settle_task_scratch(record)
 
 
-# Worktree reasons recorded before the provider's whole process tree is proven gone: it may still use its TMPDIR.
-_PROVIDER_MAY_RUN = frozenset({"provider_processes_alive", "provider_liveness_unknown"})
+def _create_task_scratch(task_id: str) -> dict:
+    """Create a write task's scratch, its TMPDIR, before launch; return the identity settlement must find.
 
-
-def _create_task_scratch(task_id: str) -> None:
-    """Create a write task's scratch, its TMPDIR, before launch; refuse anything but a directory this user owns."""
+    The directory is created exclusively and private: an entry already at that name is never adopted,
+    since a task id can name anything in the base. Settlement removes only the directory recorded here.
+    """
     path = task_scratch_path(task_id)
-    with contextlib.suppress(FileExistsError):
-        os.mkdir(path, 0o700)
-    info = os.lstat(path)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        raise ValueError(f"{path} is not a directory owned by uid {os.geteuid()}")
+    os.mkdir(path, 0o700)  # FileExistsError fails the launch closed
+    fd = os.open(path, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise ValueError(f"{path} is not a private directory of uid {os.geteuid()}")
+    return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino}
+
+
+# Scratch outcomes the scheduled sweep retries: a live holder let go, or a transient error.
+_SCRATCH_RETRY = frozenset({"in_use", "failed"})
 
 
 def _settle_task_scratch(record: dict) -> None:
@@ -1260,70 +1268,86 @@ def _settle_task_scratch(record: dict) -> None:
 
     The scratch is the worker's TMPDIR, never deliverable state, so a worktree kept for unpublished or dirty
     work does not keep it. Only a provider that may still run does; the scheduled sweep retries that tree and
-    its scratch with it. Records ``task_scratch_disposition`` (removed, partial, absent, retained, refused or
-    failed) with its reason and the bytes freed. A refusal or failure is recorded and never fails settlement.
+    its scratch with it. Records ``task_scratch_disposition`` with its reason and the allocated bytes freed:
+    removed; partial (only sockets, FIFOs or agent socket directories stay, for good); in_use or failed (the
+    sweep retries); absent; retained; refused. A refusal or failure never fails settlement.
     """
     reason = record.get("worktree_disposition_reason")
-    if record.get("worktree_disposition") is None or reason in _PROVIDER_MAY_RUN:
+    if record.get("worktree_disposition") is None or reason in store.PROVIDER_MAY_RUN:
         record.update(task_scratch_disposition="retained", task_scratch_bytes=None,
                       task_scratch_disposition_reason=f"{reason or 'unsettled'}: the provider may still use it")
         return
     try:
-        disposition, reason, size = _remove_task_scratch(record.get("task_id"))
+        disposition, reason, size = _remove_task_scratch(record)
     except Exception as exc:  # recorded, never raised: settlement must still publish the record
         disposition, reason, size = "failed", f"{type(exc).__name__}: {exc}"[:300], None
     record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
                   task_scratch_bytes=size)
 
 
-def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
-    """Prune exactly ``<base>/<task-id>``; return (disposition, reason, bytes freed).
+def _remove_task_scratch(record: dict) -> tuple[str, str, int | None]:
+    """Prune exactly the scratch this run created; return (disposition, reason, bytes freed).
 
-    Refuses an invalid task id, a symlink, a non-directory, an entry another user owns, one on another
-    filesystem or with a mount below it. Pruning never follows a symlink, never leaves the entry's device
-    or mount, and gives a read-only directory owner rwx before emptying it. It keeps sockets, FIFOs,
-    ``tmux-*``/``ssh-*`` directories and anything a live process uses (batch_state_retention.prune_tree):
-    then the disposition is ``partial`` and those entries, with the directories holding them, stay.
+    Only the directory recorded at launch (``task_scratch``: path, device and inode) is touched, so a
+    directory the run did not create is never removed. Refuses a changed identity, a symlink, a
+    non-directory, an entry another user owns, one on another filesystem or with a mount below it.
+    Pruning never follows a symlink and never leaves the entry's device or mount. It keeps sockets, FIFOs,
+    ``tmux-*``/``ssh-*`` directories and anything a live process uses (batch_state_retention.prune_tree).
     """
     from lu_machinery.hygiene.batch_state_retention import paths_in_use, prune_tree
 
+    created, task_id = record.get("task_scratch"), record.get("task_id")
     if not isinstance(task_id, str):
         return "refused", "task id missing", None
     try:
         path = task_scratch_path(task_id)
     except ValueError:
         return "refused", "task id fails validation", None
-    base_fd = os.open(path.parent, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
+    if not isinstance(created, dict):
+        return ("absent", "no scratch created by this run", None) if not os.path.lexists(path) else (
+            "refused", "the scratch directory was not created by this run", None)
+    if (created.get("path") != str(path) or type(created.get("dev")) is not int
+            or type(created.get("ino")) is not int):
+        return "refused", "the recorded scratch identity is malformed", None
+    try:
+        base_fd = os.open(path.parent, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
+    except OSError as exc:
+        return "refused", f"the scratch base cannot be held: {exc.strerror or exc}", None
     try:
         try:
             info = os.stat(path.name, dir_fd=base_fd, follow_symlinks=False)
         except FileNotFoundError:
             return "absent", "no scratch directory", None
-        if stat.S_ISLNK(info.st_mode):
-            return "refused", "scratch path is a symlink", None
-        if not stat.S_ISDIR(info.st_mode):
-            return "refused", "scratch path is not a directory", None
-        if info.st_uid != os.geteuid():
-            return "refused", "scratch directory is owned by another user", None
+        if (info.st_dev, info.st_ino) != (created["dev"], created["ino"]):
+            return "refused", "the scratch directory is not the one this run created", None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            return "refused", "the scratch path is not a directory this user owns", None
         base = os.fstat(base_fd)
         mount_id = task_scratch.fd_mount_id(base_fd)
         if info.st_dev != base.st_dev:
             return "refused", "scratch directory is on another filesystem", None
         mounts = task_scratch.mount_points()
         if mount_id is None or mounts is None:
-            return "refused", "mount information unavailable", None
-        if task_scratch._mounts_below(path, mounts):
+            return "failed", "mount information unavailable", None
+        # /proc names real paths: compare against the held base's, whatever symlinks lead to it.
+        real = Path(os.readlink(f"/proc/self/fd/{base_fd}")) / path.name
+        if task_scratch._mounts_below(real, mounts):
             return "refused", "a mount point lies below the scratch directory", None
+        in_use = paths_in_use()
+        if in_use is None:
+            return "failed", "process probe unavailable", None
         try:
-            size, kept = prune_tree(base_fd, path.name, info, path=path, device=base.st_dev, mount_id=mount_id,
-                                    in_use=paths_in_use(), keep_handoffs=False)
+            pruned = prune_tree(base_fd, path.name, info, path=real, device=base.st_dev, mount_id=mount_id,
+                                in_use=in_use, keep_handoffs=False, apply=True)
         except task_scratch.ContainmentError as exc:
             return "refused", str(exc)[:300], None
         except OSError as exc:
             return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], None
-        if kept:
-            return "partial", f"provider gone; kept {kept} socket, FIFO or in-use entries", size
-        return "removed", "provider gone", size
+        if pruned.in_use:
+            return "in_use", f"provider gone; {pruned.in_use} path(s) a live process holds stay", pruned.freed
+        if pruned.rendezvous:
+            return "partial", f"provider gone; kept {pruned.rendezvous} socket, FIFO or agent directory", pruned.freed
+        return "removed", "provider gone", pruned.freed
     finally:
         os.close(base_fd)
 
@@ -1386,6 +1410,11 @@ def _holds_task_caches(record: dict) -> bool:
     return bool(record.get("task_cache_residue") != [])
 
 
+def _holds_task_scratch(record: dict) -> bool:
+    """Whether a finished task's scratch outcome is one the sweep retries (a holder let go, a transient error)."""
+    return record.get("status") not in store.ACTIVE and record.get("task_scratch_disposition") in _SCRATCH_RETRY
+
+
 def _unsettled(record: dict) -> bool:
     return record.get("status") not in store.ACTIVE and (
         "worktree_disposition" not in record or record.get("worktree_disposition_reason") in RETRY_REASONS)
@@ -1405,7 +1434,7 @@ def settle_left_worktrees(salvage: bool = False) -> None:
             records.append(record)
     for record in records:
         reap = _unsettled(record) and Path(record.get("worktree_path") or "").is_dir()
-        if not reap and not _holds_task_caches(record):
+        if not reap and not _holds_task_caches(record) and not _holds_task_scratch(record):
             continue
         try:
             path = store.record_path(record["task_id"])
@@ -1415,8 +1444,12 @@ def settle_left_worktrees(salvage: bool = False) -> None:
         with contextlib.suppress(OSError, ValueError, KeyError), store.task_state_lock(path):
             current = json_depth.loads(path.read_text(), max_depth=512)
             if not reap or not _unsettled(current):
-                # A task settled without a worktree, or by an earlier pass, still sheds its caches.
-                if _clear_task_caches(current):
+                # A task settled without a worktree, or by an earlier pass, still sheds its caches and scratch.
+                changed = _holds_task_caches(current) and _clear_task_caches(current)
+                if _holds_task_scratch(current):
+                    _settle_task_scratch(current)
+                    changed = True
+                if changed:
                     store.replace(current, path)
             else:
                 _reap_settled(current, salvage=salvage)
@@ -1745,6 +1778,15 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status, error = "failed", "output schema binding invalid"
                 return
         provider = providers.load(spec.agent)
+        if spec.mode == "workspace-write":
+            try:
+                # The provider's TMPDIR (environment.child_env), before any launch check runs a provider CLI with it.
+                # Persisted, so settlement removes only this directory.
+                record["task_scratch"] = _create_task_scratch(spec.task_id)
+                store.replace(record, path, require_existing=True)
+            except (OSError, ValueError) as exc:
+                status, error = "failed", f"task_scratch_unavailable: {exc}"
+                return
         invocation = runtime_context.build(spec, _provider_env(spec))
         record["runtime_input_sha256"] = hashlib.sha256(invocation.stdin or b"").hexdigest()
         pending_conversation = None
@@ -1768,12 +1810,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         except ValueError as exc:
             status, error = "failed", str(exc)
             return
-        if spec.mode == "workspace-write":
-            try:
-                _create_task_scratch(spec.task_id)  # the provider's TMPDIR (environment.child_env)
-            except (OSError, ValueError) as exc:
-                status, error = "failed", f"task_scratch_unavailable: {exc}"
-                return
         if spec.agent == "codex" and spec.mode == "read-only":
             try:
                 # Persisted before the lease exists, so crash recovery under another scratch root still finds it.
