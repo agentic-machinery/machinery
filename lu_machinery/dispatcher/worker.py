@@ -1666,7 +1666,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     })
     child, status, returncode, error, usage, text = None, "crashed", None, None, None, None
     slots = None
-    resolved_model = sources_calls = source = None
+    resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
     cancel_requested = interruptible = False
 
@@ -1880,9 +1880,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             final = invocation.final_file
             final_text = final.read_text(errors="replace") if final and final.exists() else None
             stdout = stdout_path.read_text(errors="replace")
-            parse_options = (
+            parse_options: dict[str, object] = (
                 {"output_schema": schema} if spec.agent in {"agy", "claude"} and schema is not None else {}
             )
+            if spec.agent == "agy" and spec.mode == "read-only":
+                parse_options["settle_read_only"] = True
             parsed = provider.parse(stdout, stderr_path.read_text(errors="replace"), exit_code, final_text, **parse_options)
             text, usage, sources_calls = parsed.text, parsed.usage, parsed.sources_mcp_call_count
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
@@ -1921,7 +1923,22 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             # Before the schema check, which would record the same terminal failure as invalid output.
             status, error = "rate_limited", parsed.error
             return
-        status = "done" if exit_code == 0 and not parsed.error and text and text.strip() else "failed"
+        if spec.agent == "agy" and spec.mode == "read-only" and text:
+            from lu_machinery.dispatcher.providers.agy import AgyParsedResult
+
+            if isinstance(parsed, AgyParsedResult) and parsed.terminal_warning:
+                from lu_machinery.agent_runtime.adapters._output_schema import json_value
+                from lu_machinery.review.review_contract import ContractError, validate_reviewer_payload
+
+                payload = json_value(text)
+                if isinstance(payload, dict):
+                    try:
+                        validate_reviewer_payload(payload)
+                    except ContractError:
+                        pass
+                    else:
+                        transport_warning = parsed.terminal_warning
+        status = "done" if exit_code == 0 and (not parsed.error or transport_warning) and text and text.strip() else "failed"
         if exit_code < 0:
             status = "crashed"
         if spec.mode == "read-only" and exit_code == 0 and not (text and text.strip()) and parsed.error in {
@@ -2075,6 +2092,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     if cancel_requested and record["status"] != "cancelled":
                         record.pop("no_deliverable_reason", None)
                         record.update(status="cancelled", error="cancelled by client")
+                    if transport_warning and record["status"] == "done":
+                        record["transport_warning"] = transport_warning
                     if (children := record.get("orphaned_child_tasks")) and record["status"] != "done":
                         record["error"] = f"orphaned_child_tasks: {', '.join(children)}; {record['error']}"
                     try:

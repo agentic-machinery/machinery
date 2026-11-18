@@ -3,7 +3,7 @@
 import json
 import math
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from lu_machinery.common import json_depth
@@ -43,6 +43,12 @@ _SCHEMA_REFUSAL = (
     "agy_output_schema_unsupported: AGY rejected the --json-schema argument; its text is in the task's retained stream"
 )
 _MODEL_UNAVAILABLE = "agy_model_unavailable: AGY does not offer the requested model to this account"
+
+
+@dataclass(frozen=True)
+class AgyParsedResult(ParsedResult):
+    # Settlement may accept this error only after validating the read-only result.
+    terminal_warning: str | None = None
 
 
 def _stderr_capacity(stderr: str) -> str | None:
@@ -364,6 +370,7 @@ def _unsuccessful(result: dict) -> str:
 
 def parse(
     stdout: str, stderr: str, returncode: int, final_text: str | None, *, output_schema: dict | None = None,
+    settle_read_only: bool = False,
 ) -> ParsedResult:
     if returncode and not stdout.strip() and _schema_refused(stderr):
         return ParsedResult(None, None, _SCHEMA_REFUSAL)
@@ -480,6 +487,15 @@ def parse(
             one_model(models),
             sources_mcp_call_count=len(sources_calls),
             incomplete=incomplete,
+        )
+    if (
+        settle_read_only and returncode == 0 and stream_clean and terminal_failed and not incomplete
+        and result.get("status") == "ERROR" and terminal_error is not None
+        and not terminal_error.startswith(_MODEL_SELECTION_REFUSAL)
+    ):
+        return AgyParsedResult(
+            text, usage, error, one_model(models),
+            sources_mcp_call_count=len(sources_calls), terminal_warning=error,
         )
     return ParsedResult(
         text, usage, error or (None if text else "agy: missing final text"), one_model(models),

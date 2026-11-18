@@ -6,14 +6,13 @@ import os
 import sys
 from pathlib import Path
 from unittest.mock import Mock
+
 import pytest
+
 from lu_machinery.dispatcher import worker
+from lu_machinery.dispatcher.types import Invocation, TaskSpec
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 
 def test_zombie_supervisor_fix_preserves_pid_reuse_cancellation_guard(monkeypatch):
@@ -224,6 +223,75 @@ def test_agy_stream_from_another_model_family_settles_as_a_failure(sandbox, term
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.mark.parametrize("failure", [None, "unclassified", "missing", "truncated", "schema", "dirty_stream", "wrong_model"])
+def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monkeypatch, failure):
+    """Defect: AGY exit 0 with terminal ERROR discarded a complete Carbon review."""
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "logs").mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-b", "main")
+    run_git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "--allow-empty", "-m", "Fixture base")
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(worker, "_reap_settled", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.headroom, "check_plan", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.agy_sandbox, "verify", lambda *_args: ({}, None, None))
+    monkeypatch.setattr(worker.agy_sandbox, "unavailable", lambda: None)
+    monkeypatch.setattr(worker.agy_sandbox, "scratch", lambda _task_id: tmp_path / "provider-scratch")
+    valid = json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "confidence": 0.9, "explanation": "No defects."},
+        "findings": [],
+    })
+    response = {"missing": None, "truncated": valid[:-1], "schema": '{"findings": []}'}.get(failure, valid)
+    terminal = {"status": "ERROR", "error": "fixture" if failure == "unclassified" else "API error: fixture"}
+    if response is not None:
+        terminal["response"] = response
+    model = "gemini-4-carbon-medium"
+    attested = "claude-sonnet-5-5-high" if failure == "wrong_model" else model
+    events = [
+        {"event": "init", "init": {"model": attested}},
+        {"event": "result", "result": terminal},
+    ]
+    stream = "\n".join(json.dumps(event) for event in events) + "\n"
+    if failure == "dirty_stream":
+        stream += "{"
+    monkeypatch.setattr(worker.runtime_context, "build", lambda _spec, env: Invocation(
+        [sys.executable, "-c", f"print({stream!r}, end='')"], None, env, None,
+    ))
+    spec = TaskSpec(
+        "agy-terminal-error", "agy", model, None, "read-only", repo,
+        tmp_path / "source.prompt", tasks / "agy-terminal-error.result",
+    )
+    prompt = b"Review the fixture."
+    spec.prompt_file.write_bytes(prompt)
+    head = run_git(repo, "rev-parse", "HEAD")
+    record = worker.store.new_record(spec, {"key": "public", "github": "example/fixture"}, "main", head,
+                                     {"research_owned_path": []})
+    record["prompt_file"] = str(tasks / "agy-terminal-error.prompt")
+    path = worker.store.create(record, prompt)
+    worker.supervise(path)
+
+    settled = json.loads(path.read_text())
+    error_class = "unclassified" if failure == "unclassified" else "transport"
+    terminal_error = f"agy: terminal result unsuccessful (ERROR): {error_class} error; its text is in the task's retained stream"
+    assert settled["returncode"] == 0, settled["error"]
+    if failure in (None, "unclassified"):
+        assert settled["status"] == "done"
+        assert settled["error"] is None
+        assert settled["provider_terminal_failure"] is False
+        assert settled["transport_warning"] == terminal_error
+        assert spec.final_file.read_text() == valid
+    else:
+        assert settled["status"] == "failed"
+        assert "transport_warning" not in settled
+        if failure != "wrong_model":
+            assert settled["error"] == terminal_error
 
 
 @pytest.mark.parametrize(
