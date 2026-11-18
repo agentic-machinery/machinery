@@ -77,9 +77,9 @@ never fine.
    alerts the CTO inbox when a PR has had no live owning task for 15 minutes, and repeats the
    alert hourly. Re-seat each alerted PR this cycle with one successor (the integration owner
    for queue work in CTO-only mode). Start the successor's brief with
-   `lu_machinery.orchestration.pr_ownership accept --pr <N>`. A PR waiting on a named decision,
+   `lu_machinery.orchestration.pr_ownership accept --pr <N> --repo <owner/name>`. A PR waiting on a named decision,
    with no live task, is recorded from this seat with no dispatch task:
-   `accept --pr <N> --reason "<why>" --decision-owner "<who>"`. The alert clears on that
+   `accept --pr <N> --repo <owner/name> --reason "<why>" --decision-owner "<who>"`. The alert clears on that
    acceptance or custody, or when the PR closes; `--release` ends recorded custody, and
    `pr_ownership status` lists the alerts still outstanding. The successor inherits the PR's
    review budget and the head's rerun allowance (infrastructure failures only, never a failing

@@ -76,8 +76,11 @@ alert stays outstanding until a named successor accepts. The successor runs this
 its own dispatch task:
 
 ```bash
-"$PY" -m lu_machinery.orchestration.pr_ownership accept --pr "$PR"
+"$PY" -m lu_machinery.orchestration.pr_ownership accept --pr "$PR" --repo "$REPO"
 ```
+
+`$REPO` is the PR's `owner/name`. `accept` and `queue-exit` refuse without `--repo`: they never infer a
+repository from the checkout.
 
 Acceptance is refused while another task may still own the PR (one owner at a time). The
 successor then carries the review ledger and budget from the PR and the head's rerun allowance
@@ -106,13 +109,13 @@ timeout ends it. The custodian, from its own live dispatch task, accepts custody
 stale approval, merge confirmation and closeout, including disposing of the linked issues:
 
 ```bash
-"$PY" -m lu_machinery.orchestration.pr_ownership accept --pr "$PR" --custody --from "$OWNER_TASK"
+"$PY" -m lu_machinery.orchestration.pr_ownership accept --pr "$PR" --repo "$REPO" --custody --from "$OWNER_TASK"
 ```
 
 The waiting owner then checks:
 
 ```bash
-"$PY" -m lu_machinery.orchestration.pr_ownership queue-exit --pr "$PR"
+"$PY" -m lu_machinery.orchestration.pr_ownership queue-exit --pr "$PR" --repo "$REPO"
 ```
 
 Exit 0 means the owner may end its run cleanly. It reports `QUEUED_UNDER_CUSTODY` with the

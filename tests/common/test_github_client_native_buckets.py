@@ -137,6 +137,63 @@ def test_native_rate_limit_stderr_still_stores_secondary_and_exits_75(tmp_path):
     assert blocked(again) and len(seen) == 1 and not native
 
 
+def test_jq_on_an_empty_200_body_prints_nothing_instead_of_raising_typeerror(tmp_path):
+    """Review finding F3 on PR 789: ``--jq`` over a raw (bytes) body, an empty 200 GET included, went to
+    json.dumps and raised TypeError out of ``run``; real gh prints nothing for an empty body."""
+
+    def transport(method, endpoint, headers, body, timeout):
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"")
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    args = ["gh", "api", "repos/o/r/x", "--jq", ".x", "-H", "Accept: application/octet-stream"]
+    result = gh.run(args, client=store, capture_output=True)
+    assert (result.returncode, result.stdout) == (0, b"")
+
+
+def test_jq_on_a_non_json_200_body_is_a_typed_refusal_not_a_traceback(tmp_path):
+    """Class: a raw body jq cannot read escaped ``run`` as an exception even with ``check=False``."""
+
+    def transport(method, endpoint, headers, body, timeout):
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"not json")
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    result = gh.run(["gh", "api", "repos/o/r/x", "--jq", ".x"], client=store, capture_output=True, check=False)
+    assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [lambda command, kw: subprocess.TimeoutExpired(command, kw["timeout"]), lambda command, kw: FileNotFoundError("jq")],
+    ids=["timeout", "not-installed"],
+)
+def test_jq_that_times_out_or_cannot_start_is_a_typed_refusal(tmp_path, monkeypatch, failure):
+    """Class: a jq that outlived its timeout or was not installed raised out of ``run`` instead of a typed result."""
+
+    def transport(method, endpoint, headers, body, timeout):
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"{}")
+
+    def broken(command, **kwargs):
+        raise failure(command, kwargs)
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    monkeypatch.setattr(gh.subprocess, "run", broken)
+    args = ["gh", "api", "repos/o/r/x", "--jq", ".x"]
+    result = gh.run(args, client=store, capture_output=True, check=False)
+    assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        gh.run(args, client=store, capture_output=True, check=True)
+    assert raised.value.github_result.error == "github_invalid_command"
+
+
+def test_jq_reads_a_raw_json_body_as_input(tmp_path):
+    def transport(method, endpoint, headers, body, timeout):
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b'{"x": "v"}')
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    args = ["gh", "api", "repos/o/r/x", "--jq", ".x", "-H", "Accept: application/octet-stream"]
+    assert gh.run(args, client=store, capture_output=True).stdout == b"v\n"
+
+
 def test_translated_search_code_uses_code_search_bucket(tmp_path):
     store, runner, translated, native = seeded(tmp_path, ["search"])
     assert spent(
