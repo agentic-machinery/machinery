@@ -50,7 +50,13 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
             body.append({**body[0], "number": 9, "pull_request": {}})
         return github_client.Response(200, {"etag": '"fixture"'}, json.dumps(body).encode())
 
-    cache = GitHubRestCache(github_client.GitHubClient(cache_dir=tmp_path / "github", env={}, transport=transport))
+    cache = GitHubRestCache(
+        github_client.GitHubClient(
+            cache_dir=tmp_path / "github",
+            env={"GH_CONFIG_DIR": str(tmp_path)},
+            transport=transport,
+        )
+    )
     monkeypatch.setattr(milestones, "shared_cache", lambda: cache)
     monkeypatch.setattr(milestones, "load_fleet_repos", lambda: repos)
     monkeypatch.setattr(milestones, "schedule_cache_refresh",

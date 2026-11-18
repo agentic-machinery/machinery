@@ -1222,7 +1222,7 @@ def test_rest_cache_adapter_keeps_reason_and_reset(tmp_path):
     from lu_machinery import github_rest_cache as rest
 
     wire = Wire()
-    client = store(tmp_path, wire, [("core", 0, OPEN)])
+    client = store(tmp_path, wire, [("core", 0, OPEN)], env={"GH_CONFIG_DIR": str(tmp_path)})
     cache = rest.GitHubRestCache(client)
     with pytest.raises(rest.GitHubRestError) as raised:
         cache.get_json("repos/o/r/pulls?state=open", timeout=5)
