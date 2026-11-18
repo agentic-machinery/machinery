@@ -2,7 +2,7 @@
 
 Two subcommands support the scheduled ``security-audit.yml`` job:
 
-``collect`` runs pip-audit (requirements-lock.txt) and npm audit (root and
+``collect`` runs pip-audit (uv.lock or requirements-lock.txt) and npm audit (root and
 ``site/``), keeps only *unsuppressed* findings after the audited ignore files,
 and writes them as JSON. Tool failures exit non-zero so a broken audit never
 closes the tracking issue.
@@ -14,7 +14,7 @@ issue body. The workflow applies the action with ``gh``.
 Reuses the suppression logic from ``scripts/ci/audit_dependencies.py`` so
 "unsuppressed" means exactly what the blocking audit enforces: every pip-audit
 finding, and High/Critical npm findings. The pip-audit invocation shares
-``pip_audit_requirement_env`` with that blocking audit, so a first-party
+its locked inputs with that blocking audit, so a first-party
 ``lu-machinery`` requirement resolves from ``LU_MACHINERY_WHEELHOUSE`` instead
 of PyPI.
 """
@@ -31,10 +31,11 @@ from pathlib import Path
 
 from lu_machinery.ci._location import checkout_relative, module_name
 from lu_machinery.ci.audit_dependencies import (
+    audit_uv_python,
     filter_npm_audit_vulnerabilities,
+    legacy_python_audit_input,
     load_npm_audit_ignores,
     load_pip_audit_ignores,
-    pip_audit_requirement_env,
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
@@ -87,6 +88,7 @@ def collect_python_findings(report: dict) -> list[Finding]:
         if not isinstance(dep, dict):
             continue
         package = str(dep.get("name", "")).strip()
+        version = str(dep.get("version", "")).strip()
         for vuln in dep.get("vulns", []) or []:
             if not isinstance(vuln, dict):
                 continue
@@ -95,6 +97,7 @@ def collect_python_findings(report: dict) -> list[Finding]:
                 {
                     "ecosystem": "python",
                     "package": package,
+                    "locked_version": version,
                     "advisory_id": str(vuln.get("id", "")).strip() or "unknown",
                     "severity": str(vuln.get("severity", "")).strip() or "unknown",
                     "fixed_version": ", ".join(fix_versions) if fix_versions else "none",
@@ -180,32 +183,25 @@ def run_collect(
     """
     findings: list[Finding] = []
 
-    req_file = repo_root / "requirements-lock.txt"
-    if not req_file.exists():
-        raise RuntimeError(f"{req_file} not found; missing required inputs fail closed")
     pip_ignore = pip_ignore_file or repo_root / "scripts/config/pip-audit-ignore.yaml"
-    pip_cmd = [
-        sys.executable,
-        "-m",
-        "pip_audit",
-        "-r",
-        str(req_file),
-        "--format",
-        "json",
-        "--progress-spinner=off",
-    ]
-    for vuln_id in load_pip_audit_ignores(pip_ignore):
-        pip_cmd.extend(["--ignore-vuln", vuln_id])
-    with pip_audit_requirement_env(repo_root, req_file) as extra:
-        pip_report, pip_code = _run_json_command(
-            pip_cmd,
-            cwd=repo_root,
-            timeout=PIP_AUDIT_TIMEOUT_SECONDS,
-            label="pip-audit",
-            env=({**os.environ, **extra} if extra else None),
-        )
-    if pip_code not in (0, 1):
-        raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
+    ignored = load_pip_audit_ignores(pip_ignore)
+    pip_report = audit_uv_python(repo_root, ignored)
+    if pip_report is None:
+        pip_options = ["--format", "json", "--progress-spinner=off"]
+        for vuln_id in ignored:
+            pip_options.extend(["--ignore-vuln", vuln_id])
+        with legacy_python_audit_input(repo_root) as (requirements, env):
+            pip_report, pip_code = _run_json_command(
+                [sys.executable, "-m", "pip_audit", "-r", requirements, *pip_options],
+                cwd=repo_root,
+                timeout=PIP_AUDIT_TIMEOUT_SECONDS,
+                label="pip-audit",
+                env=env,
+            )
+        if pip_code not in (0, 1):
+            raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
+        if not isinstance(pip_report.get("dependencies"), list) or (pip_code and not collect_python_findings(pip_report)):
+            raise RuntimeError(f"pip-audit returned an invalid report (exit={pip_code})")
     findings.extend(collect_python_findings(pip_report))
 
     npm_ignore = npm_ignore_file or repo_root / "scripts/config/npm-audit-ignore.yaml"
@@ -241,7 +237,7 @@ def build_issue_body(findings: list[Finding]) -> str:
     """Render the tracking-issue body for a non-empty findings list."""
     rows = sorted(
         findings,
-        key=lambda f: (f["ecosystem"], f["package"], f["advisory_id"]),
+        key=lambda f: (f["ecosystem"], f["package"], f.get("locked_version", ""), f["advisory_id"]),
     )
     lines = [
         "The scheduled dependency audit on the default branch found **unsuppressed** "
@@ -251,10 +247,13 @@ def build_issue_body(findings: list[Finding]) -> str:
         "| --- | --- | --- | --- | --- |",
     ]
     for finding in rows:
+        package = finding["package"]
+        if version := finding.get("locked_version"):
+            package = f"{package}=={version}"
         lines.append(
             "| {eco} | {pkg} | {adv} | {sev} | {fix} |".format(
                 eco=_cell(finding["ecosystem"]),
-                pkg=_cell(finding["package"]),
+                pkg=_cell(package),
                 adv=_cell(finding["advisory_id"]),
                 sev=_cell(finding["severity"]),
                 fix=_cell(finding["fixed_version"]),
@@ -331,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "repository root holding requirements-lock.txt plus root and site/ npm manifests "
+            "repository root holding uv.lock (or requirements-lock.txt) plus root and site/ npm manifests "
             "(default: the selected product checkout)"
         ),
     )

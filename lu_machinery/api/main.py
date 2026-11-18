@@ -25,12 +25,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
-from prometheus_client import CollectorRegistry, Counter, Histogram, make_asgi_app
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
+from prometheus_client.core import Metric
+from prometheus_client.exposition import CONTENT_TYPE_PLAIN_0_0_4
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -100,7 +103,7 @@ from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
 from .session_streams_router import router as session_streams_router
-from .state_helpers import Demand, cache_get, cache_invalidate, cache_set, ctx_cache_scope
+from .state_helpers import Demand, PeriodicSnapshot, cache_get, cache_invalidate, cache_set, ctx_cache_scope
 from .state_router import router as state_router
 from .state_router import schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
@@ -1967,32 +1970,26 @@ def _status_class(status_code: int) -> str:
     return "5xx"
 
 
-def _scope_without_accept(scope: Scope) -> Scope:
-    """Return a scope whose ``Accept`` header is absent.
+_METRICS_REFRESH_S = 5.0
 
-    ``prometheus_client`` negotiates OpenMetrics or Prometheus text 1.0.0 from
-    that header. With it removed, ``make_asgi_app`` stays on Prometheus text
-    0.0.4 (``text/plain; version=0.0.4; charset=utf-8``).
-    """
-    headers = scope.get("headers")
-    if not headers:
-        return scope
-    pinned = [header for header in headers if header[0].lower() != b"accept"]
-    if len(pinned) == len(headers):
-        return scope
-    return {**scope, "headers": pinned}
+
+@dataclass(frozen=True, eq=False)
+class _CollectedMetrics:
+    families: tuple[Metric, ...]
+    indexed: bool
+
+    def collect(self) -> tuple[Metric, ...]:
+        return self.families
+
+    def describe(self) -> tuple[Metric, ...]:
+        return self.families if self.indexed else ()
 
 
 class PrometheusMetricsMiddleware:
     """Record request totals, latency, and 5xx responses, and serve GET /metrics.
 
-    Exposition is pinned to Prometheus text 0.0.4
-    (``text/plain; version=0.0.4; charset=utf-8``). ``Accept`` is removed
-    before ``prometheus_client.make_asgi_app`` builds the body, so every
-    response uses that content type. Metric names and counting are unchanged.
-    The route label is the full matched template (router prefix included),
-    never the request path. The process still binds the existing loopback
-    listener; this adds no socket.
+    The lifespan refreshes the Prometheus text 0.0.4 exposition off-loop.
+    The route label is the full matched template (router prefix included).
 
     ``METRICS_PATH`` is the path the route inventory records with FastAPI's
     framework routes. Those paths are served and are outside the OpenAPI
@@ -2001,38 +1998,61 @@ class PrometheusMetricsMiddleware:
 
     METRICS_PATH = "/metrics"
 
-    def __init__(self, app: ASGIApp, context: MonitorContext | None = None) -> None:
-        registry = CollectorRegistry()
-        if context is not None:
-            registry.register(CommsCollector(context))
-            # Per-model value gauges from the model-stats snapshot (#581); Grafana's contract is its runbook.
-            registry.register(ModelStatsCollector(context))
-        self.app = app
+    def __init__(self, context: MonitorContext) -> None:
         self._requests = Counter(
             "monitor_http_requests_total",
             "HTTP requests handled by the Monitor API.",
             labelnames=("method", "route", "status"),
-            registry=registry,
+            registry=None,
         )
         self._errors = Counter(
             "monitor_http_responses_5xx_total",
             "HTTP responses whose status class is 5xx.",
             labelnames=("method", "route", "status"),
-            registry=registry,
+            registry=None,
         )
         self._latency = Histogram(
             "monitor_http_request_duration_seconds",
             "HTTP request latency in seconds.",
             labelnames=("method", "route", "status"),
-            registry=registry,
+            registry=None,
         )
-        # Each subscription pool's run-out-before-reset status, read at scrape time for alerting.
-        registry.register(subscriptions.PoolPaceCollector())
-        self._metrics_app = make_asgi_app(registry=registry, disable_compression=True)
+        # Preserve exposition order and which collectors the registry indexes for name[].
+        self._collectors = (
+            (CommsCollector(context), False),
+            (ModelStatsCollector(context), False),
+            (self._requests, True),
+            (self._errors, True),
+            (self._latency, True),
+            (subscriptions.PoolPaceCollector(), False),
+        )
+        self.snapshot = PeriodicSnapshot(self._collect_snapshot, _METRICS_REFRESH_S, dormant_wait_s=0)
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+    def _collect_snapshot(self) -> tuple[bytes, CollectorRegistry]:
+        registry = CollectorRegistry()
+        for collector, indexed in self._collectors:
+            registry.register(_CollectedMetrics(tuple(collector.collect()), indexed))
+        return generate_latest(registry), registry
+
+    def _scrape(self, scope: Scope) -> Response:
+        try:
+            (body, registry), age = self.snapshot.read()
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        query = scope.get("query_string", b"")
+        if query and (names := parse_qs(query.decode("utf-8")).get("name[]")):
+            body = generate_latest(registry.restricted_registry(names))
+        return Response(body, headers={
+            "Content-Type": CONTENT_TYPE_PLAIN_0_0_4,
+            "X-Snapshot-Age-S": f"{age:.3f}",
+        })
+
+    def wrap(self, app: ASGIApp) -> ASGIApp:
+        return functools.partial(self._instrument, app)
+
+    async def _instrument(self, app: ASGIApp, scope: Scope, receive: Receive, send: Send) -> None:
         if scope.get("type") != "http":
-            await self.app(scope, receive, send)
+            await app(scope, receive, send)
             return
 
         started = time.perf_counter()
@@ -2046,9 +2066,9 @@ class PrometheusMetricsMiddleware:
 
         try:
             if scope.get("method") == "GET" and scope.get("path") == self.METRICS_PATH:
-                await self._metrics_app(_scope_without_accept(scope), receive, send_wrapper)
+                await self._scrape(scope)(scope, receive, send_wrapper)
             else:
-                await self.app(scope, receive, send_wrapper)
+                await app(scope, receive, send_wrapper)
         finally:
             self._record(scope, status_code, time.perf_counter() - started)
 
@@ -2077,6 +2097,13 @@ def create_app(
     ahead of the machinery routers and the core catch-all stays last.
     """
     factory_lifespan = _lifespan if lifespan is None else lifespan
+    metrics = PrometheusMetricsMiddleware(context)
+
+    @asynccontextmanager
+    async def lifespan_with_metrics(app: FastAPI):
+        async with factory_lifespan(app) as state, app.state.metrics_snapshot.lifespan():
+            yield state
+
     product = load_product(context) if product is None else product
     factory_app = FastAPI(
         title="Ops API",
@@ -2092,10 +2119,11 @@ def create_app(
             "Powers ops dashboards (root /), cold-start, state, comms, delegate, "
             "build events, and operational tooling."
         ),
-        lifespan=factory_lifespan,
+        lifespan=lifespan_with_metrics,
     )
     factory_app.state.ctx = context
     factory_app.state.product = product
+    factory_app.state.metrics_snapshot = metrics.snapshot
     install_providers(product)
     factory_app.add_middleware(
         CORSMiddleware,
@@ -2106,7 +2134,7 @@ def create_app(
     )
     factory_app.middleware("http")(resilience_middleware)
     factory_app.middleware("http")(opsec_path_sanitizer_middleware)
-    factory_app.add_middleware(PrometheusMetricsMiddleware, context=context)
+    factory_app.add_middleware(metrics.wrap)
     factory_app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     factory_app.add_exception_handler(RequestValidationError, request_validation_exception_handler)
     factory_app.add_exception_handler(Exception, global_exception_handler)

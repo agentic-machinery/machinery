@@ -762,8 +762,11 @@ def current_identities(component: str, manifest: dict, root: Path | None = None)
     sources = {path: value for path, value in blobs.items() if component in assign_path(path, manifest)[0]}
     configs = {path: value for path, value in blobs.items()
                if path.startswith(("schemas/", "agents_extensions/", ".github/")) or path in {"pyproject.toml", "Makefile"}}
+    python_locks = {"uv.lock"} if "uv.lock" in blobs and blobs["uv.lock"][0] != "deleted" else {
+        "requirements-lock.txt", "requirements-machinery.lock"
+    }
     locks = {path: value for path, value in blobs.items()
-             if PurePosixPath(path).name in {"package-lock.json", "requirements-lock.txt", ".python-version", ".nvmrc"}}
+             if path in python_locks or PurePosixPath(path).name in {"package-lock.json", ".python-version", ".nvmrc"}}
     return {"source": digest(sources), "config": digest(configs), "lockfiles": digest(locks),
             "tools": digest({"node": manifest["components"][component], "manifest": manifest,
                              "runner": hashlib.sha256(machinery_path("ci/components.py").read_bytes()).hexdigest()})}

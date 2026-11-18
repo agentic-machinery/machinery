@@ -14,8 +14,8 @@ imports, found by a static walk of its ``import`` statements resolved the way th
 resolves them (``scripts/``, then the repository root, then the server's directory). Files are read from disk
 whatever git thinks of them (ignored, untracked or dirty), and a symlink contributes its target's bytes. Imports
 made dynamically (``importlib``) are not seen; the server makes none. An import outside the repository (standard
-library or third-party) is not traced. ``requirements-lock.txt``: the sha256 of the checkout's lock file, which
-pins every third-party package the project environment is built from; a checkout without it refuses.
+library or third-party) is not traced. The second component is the digest of ``uv.lock`` or the legacy
+``requirements-lock.txt``. A checkout without a dependency lock refuses.
 
 Digests are recomputed at render, at admission (``check_render_contract`` checks both the recorded render
 checkout and the actual server checkout), and at launch
@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -207,13 +208,14 @@ class ServerCode:
     """What the sources server of a checkout executes: its repository files and the lock of its environment."""
 
     files: dict[str, str]  # sha256 by path, relative inside the checkout
-    lock_sha256: str  # of ``LOCK_FILE``
+    lock_sha256: str
+    lock_name: str = LOCK_FILE
 
     def components(self) -> dict[str, str]:
         """One digest per part, so a refusal can name the part that changed."""
         return {
             "repository": _mapping_digest(_REPOSITORY_DIGEST_VERSION, self.files),
-            LOCK_FILE: f"sha256:{self.lock_sha256}",
+            self.lock_name: f"sha256:{self.lock_sha256}",
         }
 
     @property
@@ -225,7 +227,7 @@ def server_code(checkout: Path) -> ServerCode:
     """What the sources server of ``checkout`` executes.
 
     The entry and each repository module it imports, recursively (a symlink is followed and its target's bytes
-    hashed), and the checkout's ``LOCK_FILE``. Modules found outside the roots are not traced.
+    hashed), and the checkout's dependency lock. Modules found outside the roots are not traced.
 
     Parsed import lists are cached for the process by the sha256 of the file's bytes. Package layout
     (``__init__.py``, a module file, or a namespace directory) is read on every walk, so a new ``__init__.py``
@@ -235,7 +237,9 @@ def server_code(checkout: Path) -> ServerCode:
     entry = root / SERVER_ENTRY
     if not entry.is_file():
         raise ReviewContractError(f"review attempt refused: no sources server at {entry} (#9163)")
-    lock = root / LOCK_FILE
+    lock = root / "uv.lock"
+    if not os.path.lexists(lock):
+        lock = root / LOCK_FILE
     try:
         lock_sha256 = hashlib.sha256(lock.read_bytes()).hexdigest()
     except OSError as exc:
@@ -260,7 +264,7 @@ def server_code(checkout: Path) -> ServerCode:
             module = finder.find(name)
             for file in module.files if module is not None else ():
                 pending.append((file, name if file.name == "__init__.py" else name.rpartition(".")[0]))
-    return ServerCode(files=dict(sorted(hashes.items())), lock_sha256=lock_sha256)
+    return ServerCode(files=dict(sorted(hashes.items())), lock_sha256=lock_sha256, lock_name=lock.name)
 
 
 def server_code_files(checkout: Path) -> dict[str, str]:
