@@ -148,13 +148,6 @@ def registry_for(repository: str) -> dict[str, list[int]] | None:
     return None
 
 
-def registry_absence(repository: str) -> dict:
-    known = any(r.github.casefold() == repository.casefold() for r in fleet_repos.load_fleet_repos().values())
-    if known:
-        return section("membership_not_applicable")
-    return membership_error("membership_registry_absent")
-
-
 def live_audit(
     repository: str, registry: dict, *, root: Path | None = None, progress: MembershipProgress | None = None
 ) -> dict:
@@ -233,7 +226,7 @@ def read_parent(repository: str, number: int) -> dict | None:
     return {"number": parent["number"], "repository": slug}
 
 
-def _claim(issue: dict, roots: list[int], index: dict, parents: dict) -> int | None:
+def _claim(issue: dict, repository: str, roots: list[int], index: dict, parents: dict) -> int | None:
     """Resolve the documented title/body claim independently of the observed root."""
     candidates = re.findall(r"\[(\d+)\]", issue.get("title") or "")
     candidates += re.findall(r"(?im)^Parent:\s*#(\d+)\b", issue.get("body") or "")
@@ -246,10 +239,10 @@ def _claim(issue: dict, roots: list[int], index: dict, parents: dict) -> int | N
             entry = index.get(str(number), {})
             if entry.get("unique_stream") is True and len(entry.get("epics", [])) == 1:
                 return entry["epics"][0]
-            if number in visited or not parents.get(number):
+            parent = parents.get(number)
+            if number in visited or not parent or parent["repository"].casefold() != repository.casefold():
                 break
             visited.add(number)
-            parent = parents[number]
             number = parent.get("number")
     return None
 
@@ -307,14 +300,17 @@ def evaluate_membership(
     report: dict | None = None,
     *,
     cached: bool = False,
+    epic_repository: str | None = None,
 ) -> dict:
     """Pure evaluation of qualified observations using the canonical validator.
 
     ``cached`` marks ``report`` as read from the shared cache file rather than
     produced by an in-memory live audit; see ``_audit_refusal``.
     """
+    epic_repository = repository if epic_repository is None else epic_repository
+    local_registry = repository.casefold() == epic_repository.casefold()
     roots = [n for ns in registry.values() for n in ns]
-    if number in roots:
+    if local_registry and number in roots:
         return section("root_exempt")
     if report is not None:
         refusal = _audit_refusal(report, repository, registry, cached=cached)
@@ -324,14 +320,14 @@ def evaluate_membership(
     entry = index.get(str(number), {})
     if entry and entry.get("unique_stream") is not True:
         return membership_error("membership_conflicting_ancestry")
-    claim = _claim(issue, roots, index, parents)
+    claim = _claim(issue, repository, roots, index, parents) if local_registry else None
     if claim is not None and entry and entry.get("epics") != [claim]:
         return membership_error("membership_conflicting_ancestry")
     observed_root = next(
         (
             p["number"]
             for p in parents.values()
-            if p and p.get("repository", "").casefold() == repository.casefold() and p.get("number") in roots
+            if p and p.get("repository", "").casefold() == epic_repository.casefold() and p.get("number") in roots
         ),
         None,
     )
@@ -344,6 +340,7 @@ def evaluate_membership(
         issue_number=number,
         stream_epic=claim or roots[0],
         registered_epics=roots,
+        epic_repository=epic_repository,
         read_parent=lambda _r, n: parents[n],
         membership_report=report,
     )
@@ -388,24 +385,27 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
     progress = MembershipProgress()
     cache_rejection = None
     try:
-        registry = registry_for(repository)
-        if registry is None:
-            return registry_absence(repository)
+        try:
+            epic_repository = lifecycle.stream_registry_repository(repository)
+        except lifecycle.LifecycleError as exc:
+            return membership_error("membership_registry_absent", str(exc))
+        registry = registry_for(epic_repository)
         if not registry:
             return membership_error("membership_registry_absent")
+        local_registry = repository.casefold() == epic_repository.casefold()
         roots = {n for ns in registry.values() for n in ns}
-        if number in roots:
+        if local_registry and number in roots:
             return section("root_exempt")
         parents: dict = {}
         current = number
-        for _ in range(8):
+        for _ in range(audit._MAX_SUBISSUE_DEPTH):
             progress.stage = f"parent_{current}"
             parent = read_parent(repository, current)
             parents[current] = parent
             if (
                 parent is None
                 or parent.get("repository", "").casefold() != repository.casefold()
-                or parent.get("number") in roots
+                or (local_registry and parent.get("number") in roots)
                 or parent.get("number") in parents
             ):
                 break
@@ -413,7 +413,7 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
                 raise ValueError("malformed parent")
             current = parent["number"]
         report = None
-        if audit_orphans and parents.get(number) is None:
+        if audit_orphans and local_registry and parents.get(number) is None:
             progress.stage = "cached_audit_validation"
             cached = cached_membership(issue, repository, number, registry, parents)
             if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
@@ -421,7 +421,7 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
             cache_rejection = cached["errors"][0]["code"]
             progress.stage = "live_audit"
             report = live_audit(repository, registry, progress=progress)
-        result = evaluate_membership(issue, repository, number, registry, parents, report)
+        result = evaluate_membership(issue, repository, number, registry, parents, report, epic_repository=epic_repository)
         if report is not None and (
             result["status"] == "PASS" or result["errors"][0]["code"] == "membership_unregistered_parentless"
         ):
