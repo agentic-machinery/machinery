@@ -51,8 +51,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from lu_machinery.common import json_depth
-
 STATUS_CONTEXT = "fleet/cross-family-review"
 GITHUB_HTTPS = "https://github.com/"
 GIT_TIMEOUT_SECONDS = 300
@@ -228,7 +226,7 @@ def graphql_post() -> Post:
     The client authenticates from ``GITHUB_TOKEN`` in the environment, so the credential
     never appears on argv, and ``fresh=True`` never answers from its cache.
     """
-    from lu_machinery.common import github_client
+    from lu_machinery.common import github_client, json_depth
 
     def post(query: str, variables: dict) -> object:
         argv = ["gh", "api", "graphql", "-f", f"query={query}"]
@@ -471,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     if __package__ in (None, ""):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from lu_machinery.ci._location import module_name
+    from lu_machinery.common import json_depth
 
     module = module_name(__spec__, __file__)
     parser = argparse.ArgumentParser(

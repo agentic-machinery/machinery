@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import shlex
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -360,6 +362,26 @@ def test_weekly_reader_prints_plain_decimal_and_clamps_overshoot(pct, expected, 
     _mock_request(monkeypatch, io.BytesIO(json.dumps(payload).encode()))
     claude_weekly_used.main()
     assert capsys.readouterr().out == expected + "\n"
+    # A release script must not depend on the package installed in its interpreter.
+    code = """import io, json, runpy, sys
+from datetime import UTC, datetime
+namespace = runpy.run_path(sys.argv[1])
+state = namespace["main"].__globals__
+payload = json.loads(sys.argv[2])
+payload["generated_at"] = datetime.now(UTC).isoformat()
+class Opener:
+    def open(self, *args, **kwargs):
+        return io.BytesIO(json.dumps(payload).encode())
+state["launch_account"] = lambda: state["DEFAULT_ACCOUNT"]
+state["urllib"].request.build_opener = lambda *args: Opener()
+namespace["main"]()
+"""
+    isolated = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", code, str(machinery_path("lib/claude_weekly_used.py")), json.dumps(payload)],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert isolated.returncode == 0, isolated.stderr
+    assert isolated.stdout == expected + "\n"
 
 
 @pytest.mark.parametrize("pct", (None, True, -1, -0.5, "0", float("nan"), float("inf")))

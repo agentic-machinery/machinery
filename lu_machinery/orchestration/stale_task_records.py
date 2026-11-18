@@ -64,14 +64,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import json_depth
-
 for _path in (Path(__file__).resolve().parents[2], Path(__file__).resolve().parents[1]):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
-
 from lu_machinery import secret_redactor
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import MachineryConfigError, state_root

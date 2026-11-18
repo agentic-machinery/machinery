@@ -16,9 +16,8 @@ put ``not slow`` in global addopts (nightly would inherit it).
 from __future__ import annotations
 
 import os
+import runpy
 import sys
-
-from lu_machinery.common import json_depth
 
 # Direct file execution runs pytest in this process, so this copy must put
 # nothing on the runner's import path. Its own directory (sys.path[0], absent
@@ -41,6 +40,9 @@ import xml.etree.ElementTree as element_tree
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
+
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 
 if __package__ in (None, ""):
     # Its two standard-library-only siblings load from this copy, by file.
@@ -100,7 +102,7 @@ def _digest(nodeids: Iterable[str]) -> str:
 
 
 def _read_json(path: Path) -> Any:
-    return json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
+    return _json_loads(path.read_text(encoding="utf-8"), max_depth=512)
 
 
 def _write_json(path: Path, value: Any) -> None:

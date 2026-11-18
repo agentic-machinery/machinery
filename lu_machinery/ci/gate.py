@@ -10,8 +10,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from lu_machinery.common import json_depth
-
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMMON = frozenset({"secret-scan", "hydrate-release-assets", "checks", "dependency-audit", "pr-affected", "frontend"})
 FULL = frozenset({"refresh-pytest-durations", "pytest", "pytest-report"})
@@ -85,6 +83,7 @@ def main() -> int:
     if __package__ in (None, ""):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from lu_machinery.ci._location import module_name
+    from lu_machinery.common import json_depth
 
     parser = argparse.ArgumentParser(
         description="Validate CI event identity and require every result in its tier.\n"

@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import runpy
 import shutil
 import stat
 import subprocess
@@ -35,8 +36,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from lu_machinery.common import json_depth
-
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 LOGGER = logging.getLogger(__name__)
 LAYOUT = 1
 SITE = "site"
@@ -91,10 +92,10 @@ def _tree_digest(root: Path) -> str:
 def _local_inputs(site: Path) -> dict[str, str]:
     """Digests of every non-registry input the install reads: file:/link: targets and patches."""
     specs: set[str] = set()
-    package = json_depth.loads((site / "package.json").read_text(encoding="utf-8"), max_depth=512)
+    package = _json_loads((site / "package.json").read_text(encoding="utf-8"), max_depth=512)
     for field in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
         specs.update(v for v in package.get(field, {}).values() if v.startswith(("file:", "link:")))
-    lock = json_depth.loads((site / "package-lock.json").read_text(encoding="utf-8"), max_depth=512)
+    lock = _json_loads((site / "package-lock.json").read_text(encoding="utf-8"), max_depth=512)
     for entry in lock.get("packages", {}).values():
         if entry.get("link") and entry.get("resolved"):
             specs.add(f"link:{entry['resolved']}")
@@ -151,7 +152,7 @@ def _runtime(site: Path) -> dict:
     probe = ("const r=process.report.getReport().header;console.log(JSON.stringify({node:process.version,"
              "abi:process.versions.modules,platform:process.platform,arch:process.arch,"
              "libc:r.glibcVersionRuntime?'glibc-'+r.glibcVersionRuntime:'other'}))")
-    runtime = json_depth.loads(_run(["node", "-e", probe], site).stdout, max_depth=512)
+    runtime = _json_loads(_run(["node", "-e", probe], site).stdout, max_depth=512)
     runtime["npm"] = _run(["npm", "--version"], site).stdout.strip()
     return runtime
 
@@ -167,7 +168,7 @@ def install_key(site: Path) -> tuple[str, dict]:
         "layout": LAYOUT,
         "runtime": _runtime(site),
         # Digests only: user npm configuration can hold registry credentials, and facts are stored.
-        "npm_config": _digest(json_depth.loads(_run(["npm", "config", "ls", "-l", "--json"], site).stdout, max_depth=512)),
+        "npm_config": _digest(_json_loads(_run(["npm", "config", "ls", "-l", "--json"], site).stdout, max_depth=512)),
         "env": {name: _digest(value) for name, value in env.items()},
         "toolchain": _toolchain(env),
         "inputs": {name: _sha256(site / name) for name in INSTALL_INPUTS if (site / name).is_file()},
@@ -292,7 +293,7 @@ def _altered(store: Path, manifest: Path) -> list[Path] | None:
     if not manifest.is_file():
         return []
     altered = []
-    for name in sorted({e[2] for e in json_depth.loads(manifest.read_text(encoding="utf-8"), max_depth=512)["entries"]
+    for name in sorted({e[2] for e in _json_loads(manifest.read_text(encoding="utf-8"), max_depth=512)["entries"]
                         if e[0] in ("f", "c")}):
         if not _intact(_blob(store, name), name):
             altered.append(_blob(store, name))
@@ -303,7 +304,7 @@ def materialize(repo: Path, site: Path, key: str) -> dict:
     """Give the worktree its own real node_modules of hard links; never replaces an existing install."""
     store = store_root(repo)
     destination = site / "node_modules"
-    manifest = json_depth.loads((store / "trees" / f"{key}.json").read_text(encoding="utf-8"), max_depth=512)
+    manifest = _json_loads((store / "trees" / f"{key}.json").read_text(encoding="utf-8"), max_depth=512)
     if destination.exists() or destination.is_symlink():
         return {"state": "present"}
     # A killed dispatcher must not leave unknown output inside its worktree.
@@ -384,7 +385,7 @@ def prune(repo: Path, keep: int = KEEP_TREES, *, blocking: bool = True) -> dict:
             stale.unlink()
         wanted = set()
         for tree in trees[:keep]:
-            wanted.update(entry[2] for entry in json_depth.loads(tree.read_text(encoding="utf-8"), max_depth=512)["entries"]
+            wanted.update(entry[2] for entry in _json_loads(tree.read_text(encoding="utf-8"), max_depth=512)["entries"]
                           if entry[0] in ("f", "c"))
         removed = 0
         for blob in (store / "blobs").glob("*/*"):

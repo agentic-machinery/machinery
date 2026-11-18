@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -550,15 +551,20 @@ def test_source_reporting_failure_keeps_incomplete_manifest(measurement):
 
 
 @pytest.mark.parametrize("missing", ["coverage", "metadata", "config"])
-def test_prepare_or_dependency_failure_still_writes_incomplete_manifest(measurement, monkeypatch, missing):
-    """Combine must leave a manifest even before coverage imports/configuration succeed."""
+def test_prepare_or_dependency_failure_still_writes_incomplete_manifest(measurement, monkeypatch, missing, tmp_path):
+    """A copied tool must leave its incomplete manifest without an installed package or coverage."""
     raw, output = measurement
     if missing == "coverage":
+        copied = tmp_path / "copied-tool"
+        copied.mkdir()
+        shutil.copyfile(machinery_path("ci/coverage_ref.py"), copied / "coverage_ref.py")
+        shutil.copyfile(machinery_path("common/json_depth.py"), copied / "json_depth.py")
         result = subprocess.run(
             [
                 sys.executable,
+                "-I",
                 "-S",
-                str(machinery_path('ci/coverage_ref.py')),
+                str(copied / "coverage_ref.py"),
                 "combine",
                 "--input",
                 str(raw),

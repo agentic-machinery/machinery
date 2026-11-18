@@ -10,17 +10,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from lu_machinery.common import json_depth
-
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
 # are also its directories in checkout-relative paths.
+
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 _PACKAGE = f"{Path(os.path.abspath(__file__)).parents[1].name}.{Path(os.path.abspath(__file__)).parent.name}"
 _PACKAGE_DIR = _PACKAGE.replace(".", "/")
 
@@ -85,7 +87,7 @@ def _database_pages(opencode: str) -> tuple[int, int, int]:
     for name in ("freelist_count", "page_count", "page_size"):
         raw = _run([opencode, "db", f"PRAGMA {name}", "--format", "json", "--pure"])
         try:
-            rows = json_depth.loads(raw, max_depth=512)
+            rows = _json_loads(raw, max_depth=512)
         except json.JSONDecodeError as exc:
             raise RetentionError(f"invalid {name} response: {exc}") from exc
         if (
@@ -107,7 +109,7 @@ def _old_session_ids(raw: str, cutoff_ms: int) -> tuple[list[str], list[tuple[st
     if not raw:
         raise RetentionError("opencode db returned no JSON")
     try:
-        rows = json_depth.loads(raw, max_depth=512)
+        rows = _json_loads(raw, max_depth=512)
     except json.JSONDecodeError as exc:
         raise RetentionError(f"invalid JSON from opencode db: {exc}") from exc
     if not isinstance(rows, list):
@@ -230,7 +232,7 @@ def retain(*, days: int, dry_run: bool, opencode: str = "opencode", now_ms: int 
         idle_or_fail()
         checkpoint = _run([opencode, "db", "PRAGMA wal_checkpoint(TRUNCATE)", "--format", "json", "--pure"])
         try:
-            rows = json_depth.loads(checkpoint, max_depth=512)
+            rows = _json_loads(checkpoint, max_depth=512)
         except json.JSONDecodeError as exc:
             raise RetentionError(f"invalid WAL checkpoint response: {exc}") from exc
         if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("busy") != 0:

@@ -25,8 +25,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import json_depth
-
 # The package directory, from the unresolved file location. A literal scripts/
 # join is the machinery package name (design-v1 amendment 1). It and its parent go
 # on sys.path only for file-path invocation; neither is a state or product root.
@@ -34,7 +32,7 @@ _PACKAGE_DIR = Path(os.path.abspath(__file__)).parents[1]
 for _path in (_PACKAGE_DIR.parent, _PACKAGE_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME

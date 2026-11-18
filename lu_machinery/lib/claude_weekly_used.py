@@ -23,14 +23,15 @@ from __future__ import annotations
 import math
 import os
 import re
+import runpy
 import stat
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from lu_machinery.common import json_depth
-
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 DEFAULT_ACCOUNT = "a"
 _BINDINGS_MAX_BYTES = 65536
 
@@ -88,7 +89,7 @@ def _bound_labels() -> dict[str, str]:
     if len(raw) > _BINDINGS_MAX_BYTES:
         return {}
     try:
-        data = json_depth.loads(raw, max_depth=512)
+        data = _json_loads(raw, max_depth=512)
     except ValueError:
         return {}
     accounts = data.get("accounts") if isinstance(data, dict) and data.get("schema_version") == 1 else None
@@ -151,7 +152,7 @@ def main() -> None:
         # Shell-controlled proxy settings and redirects cannot replace the target.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         with opener.open(base + "/api/state/routing-budget", timeout=4) as r:
-            data = json_depth.load(r, max_depth=512)
+            data = _json_loads(r.read(), max_depth=512)
         # Aggregate diagnostics include other providers' age. Check this
         # response's age separately from Claude's own telemetry freshness.
         generated_at = datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
