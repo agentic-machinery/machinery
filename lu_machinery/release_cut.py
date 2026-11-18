@@ -629,7 +629,7 @@ class Cut:
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
                              "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test"],
                             cwd=self.work / "src").stdout
-        lock.write_text(wheel_only_requirements(exported, self.work / "src/uv.lock"), encoding="utf-8")
+        lock.write_text(exported, encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
                   "--disable-pip-version-check",
@@ -639,7 +639,7 @@ class Cut:
         consumer = self.work / "consumer.lock"
         consumer.write_text(
             f"lu-machinery=={built_version} \\\n    --hash=sha256:{sha256(files['wheel'])}\n"
-            + lock.read_text(encoding="utf-8"),
+            + wheel_only_requirements(exported, self.work / "src/uv.lock"),
             encoding="utf-8",
         )
         return consumer
