@@ -1,64 +1,58 @@
-"""AI Agent Bridge - Multi-agent communication bridge via MCP Message Broker.
+"""Compatibility exports for the bridge, loaded only when requested.
 
-This package provides bidirectional communication between AI agents (Gemini, Claude)
-using a shared SQLite database.
-
-Configuration:
-- ``AB_REPO_ROOT``: defaults to the product checkout (``product_root``).
-- ``AB_DB_PATH``: defaults to ``{state root}/.mcp/servers/message-broker/messages.db``.
-- ``AB_PID_DIR``: defaults to ``{state root}/.mcp/servers/message-broker/pids``.
-- ``AB_CONTEXT_DIR``: defaults to ``{REPO_ROOT}/docs/agent-channels``.
-- ``AB_WAKE_DIR``: defaults to ``{REPO_ROOT}/.agent/wake``.
-- ``AB_MONITOR_URL``: defaults to empty string (Monitor API disabled).
-- ``AB_GEMINI_MODEL``: defaults to the AGY seat pin from the ACP participant registry.
-- ``AB_PIPELINE_ENV_KEY``: defaults to ``LEARN_UKRAINIAN_PIPELINE``.
-
-All public functions are re-exported here for backward compatibility.
+Importing a transport or Monitor client must not initialize the retired broker
+CLI, message lifecycle, or channel store.
 """
 
-# Re-export everything that was previously importable from ai_agent_bridge
-from ._broker import (
-    _git_status_snapshot,
-    _is_task_locked,
-    _remove_pid_file,
-    _validate_file_writes,
-    _write_pid_file,
-    bridge_status,
-    broker_cleanup,
-)
-from ._cli import interactive_mode, main, process_all_claude, process_all_codex, process_all_gemini
-from ._config import (
-    _MODEL_CACHE,
-    _MODEL_CACHE_TTL,
-    AGY_CLI,
-    CLAUDE_CMD,
-    CODEX_CLI,
-    GEMINI_CLI,
-    GH_CHAR_LIMIT,
-    default_gemini_model,
-)
-from ._db import get_db, get_session, init_db, set_session
-from ._gemini import ask_gemini, process_and_respond
-from ._github import (
-    _format_review_chunk,
-    _gh_comment,
-    _post_review_to_github,
-    _split_content,
-)
-from ._messaging import (
-    _extract_issue_number,
-    acknowledge,
-    acknowledge_all,
-    check_inbox,
-    detect_sender,
-    get_conversation,
-    read_message,
-    send_message,
-    send_to_codex,
-    send_to_gemini,
-)
-from ._model import _detect_model_error, check_model
-from ._prompts import build_claude_prompt, build_codex_prompt, build_gemini_prompt
+from importlib import import_module
+
+_EXPORTS = {
+    'AGY_CLI': ('._config', 'AGY_CLI'),
+    'CLAUDE_CMD': ('._config', 'CLAUDE_CMD'),
+    'CODEX_CLI': ('._config', 'CODEX_CLI'),
+    'GEMINI_CLI': ('._config', 'GEMINI_CLI'),
+    'GH_CHAR_LIMIT': ('._config', 'GH_CHAR_LIMIT'),
+    '_MODEL_CACHE': ('._config', '_MODEL_CACHE'),
+    '_MODEL_CACHE_TTL': ('._config', '_MODEL_CACHE_TTL'),
+    '_detect_model_error': ('._model', '_detect_model_error'),
+    '_extract_issue_number': ('._messaging', '_extract_issue_number'),
+    '_format_review_chunk': ('._github', '_format_review_chunk'),
+    '_gh_comment': ('._github', '_gh_comment'),
+    '_git_status_snapshot': ('._broker', '_git_status_snapshot'),
+    '_is_task_locked': ('._broker', '_is_task_locked'),
+    '_post_review_to_github': ('._github', '_post_review_to_github'),
+    '_remove_pid_file': ('._broker', '_remove_pid_file'),
+    '_split_content': ('._github', '_split_content'),
+    '_validate_file_writes': ('._broker', '_validate_file_writes'),
+    '_write_pid_file': ('._broker', '_write_pid_file'),
+    'acknowledge': ('._messaging', 'acknowledge'),
+    'acknowledge_all': ('._messaging', 'acknowledge_all'),
+    'ask_gemini': ('._gemini', 'ask_gemini'),
+    'bridge_status': ('._broker', 'bridge_status'),
+    'broker_cleanup': ('._broker', 'broker_cleanup'),
+    'build_claude_prompt': ('._prompts', 'build_claude_prompt'),
+    'build_codex_prompt': ('._prompts', 'build_codex_prompt'),
+    'build_gemini_prompt': ('._prompts', 'build_gemini_prompt'),
+    'check_inbox': ('._messaging', 'check_inbox'),
+    'check_model': ('._model', 'check_model'),
+    'default_gemini_model': ('._config', 'default_gemini_model'),
+    'detect_sender': ('._messaging', 'detect_sender'),
+    'get_conversation': ('._messaging', 'get_conversation'),
+    'get_db': ('._db', 'get_db'),
+    'get_session': ('._db', 'get_session'),
+    'init_db': ('._db', 'init_db'),
+    'interactive_mode': ('._cli', 'interactive_mode'),
+    'main': ('._cli', 'main'),
+    'process_all_claude': ('._cli', 'process_all_claude'),
+    'process_all_codex': ('._cli', 'process_all_codex'),
+    'process_all_gemini': ('._cli', 'process_all_gemini'),
+    'process_and_respond': ('._gemini', 'process_and_respond'),
+    'read_message': ('._messaging', 'read_message'),
+    'send_message': ('._messaging', 'send_message'),
+    'send_to_codex': ('._messaging', 'send_to_codex'),
+    'send_to_gemini': ('._messaging', 'send_to_gemini'),
+    'set_session': ('._db', 'set_session'),
+}
 
 __all__ = [
     "AGY_CLI",
@@ -113,15 +107,14 @@ __all__ = [
     "set_session",
 ]
 
-
 def __getattr__(name: str):
     if name == "GEMINI_DEFAULT_MODEL":
-        from ._config import default_gemini_model
-
-        return default_gemini_model()
+        return import_module("._config", __name__).default_gemini_model()
     if name in ("DB_PATH", "PID_DIR", "REPO_ROOT", "_PARENT_ENV"):
-        # Resolved at each access, never at import (C-4843).
-        from . import _config
-
-        return getattr(_config, name)
+        return getattr(import_module("._config", __name__), name)
+    if name in _EXPORTS:
+        module, attribute = _EXPORTS[name]
+        value = getattr(import_module(module, __name__), attribute)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

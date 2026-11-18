@@ -19,8 +19,8 @@ MONITOR_PROVIDERS = ("claude", "codex", "gemini", "agy", "grok", "cursor")
 ROOT = Path(__file__).resolve().parents[2]
 CLI_BOOTSTRAP = (
     "import os, runpy; from pathlib import Path; "
-    "from lu_machinery.ai_agent_bridge import _channels; "
-    "_channels.ASSIGNMENTS_PATH = Path(os.environ['TEST_INBOX_ROSTER']); "
+    "from lu_machinery import agent_identity; "
+    "agent_identity.ASSIGNMENTS_PATH = Path(os.environ['TEST_INBOX_ROSTER']); "
     "runpy.run_module('lu_machinery.inbox_pending', run_name='__main__')"
 )
 
@@ -28,11 +28,11 @@ CLI_BOOTSTRAP = (
 @pytest.fixture
 def roster(tmp_path, monkeypatch):
     """Replace only the roster file and executable boundary, never alias logic."""
-    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery import agent_identity
 
     path = tmp_path / "assignments.yaml"
     path.write_text("assignments:\n  infra:\n    slots: [gemini-infra, codex-core]\n  monitor:\n    slots: []\n")
-    monkeypatch.setattr(_channels, "ASSIGNMENTS_PATH", path)
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", path)
     monkeypatch.setenv("TEST_INBOX_ROSTER", str(path))
     interpreter = tmp_path / "roster-interpreter"
     interpreter.write_text(

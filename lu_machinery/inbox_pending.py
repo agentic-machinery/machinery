@@ -7,24 +7,16 @@ import json
 import os
 import re
 import sys
-from contextlib import closing
-from datetime import UTC, datetime
 from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lu_machinery.agent_runtime.agent_identity import seat_read_aliases
-from lu_machinery.ai_agent_bridge._channels import resolve_recipient_alias
-from lu_machinery.common.bridge_paths import configured_bridge_db_path
 from lu_machinery.common.repo_root import (
     HOOK_BOOTSTRAP_DIAGNOSTIC,
     HOOK_BOOTSTRAP_REASON,
     configure_native_hook_roots,
-    state_root,
 )
-from lu_machinery.fleet_comms.paths import default_plane_root
-from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.handoff_slot_registry import is_registered_slot, registry_readable
 
 # The machinery package's import name, which is also the directory its files have in checkout
@@ -32,87 +24,29 @@ from lu_machinery.orchestration.handoff_slot_registry import is_registered_slot,
 _MACHINERY = Path(os.path.abspath(__file__)).parents[0].name
 _AUTHORITY_HELP = f".venv/bin/python -m {_MACHINERY}.fleet_comms deliveries --help"
 UNKNOWN_LINE = (
-    "PENDING ORDERS: unknown; legacy: ai_agent_bridge inbox for the registered handoff slot; "
-    f"authority: {_AUTHORITY_HELP}"
+    f"PENDING ORDERS: unknown; authority: {_AUTHORITY_HELP}"
 )
-LEGACY_PENDING = "COALESCE(acknowledged, 0) = 0 AND COALESCE(consumed_by_live_driver, 0) = 0"
-AUTHORITY_WHERE = """recipient = ? AND state IN ('queued', 'running')
-    AND (deadline_at IS NULL OR deadline_at > ?)
-    AND NOT EXISTS (SELECT 1 FROM authority_idempotency i
-                    WHERE i.namespace = 'supervisory-consumption:' || d.delivery_id)"""
 
 
 def probe(recipient: str, *, limit: int = 5) -> dict:
-    """Return only counts and identifiers; any uncertainty invalidates the result."""
-    unknown = {
-        "count": 0,
-        "ids": [],
-        "truncated": False,
-        "stores": {"legacy": None, "authority": None},
-        "probe": "unknown",
-    }
-    if type(limit) is not int or limit < 1 or limit > 500:
-        return unknown
-    try:
-        from lu_machinery.agent_runtime.retired_seat_admission import BRIDGE_MODE
-        from lu_machinery.agent_runtime.target_admission import resolve_and_admit
+    """Read only Fleet delivery metadata; the retired broker is historical."""
+    from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
 
-        if not re.fullmatch(r"[a-z]+-[a-z0-9]+(?:-[a-z0-9]+)*", recipient):
-            return unknown
-        if not registry_readable() or not is_registered_slot(recipient):
-            return unknown
-        # Match check_inbox's canonical legacy read set, never a family-wide
-        # fallback for a dedicated slot. Unknown alias policy fails closed.
-        legacy_recipients = seat_read_aliases(resolve_recipient_alias(recipient))
-        if not legacy_recipients:
-            return unknown
-        # Authority publish/claim admit exact names without a roster resolver.
-        # Legacy aliases are not authority aliases. Refuse unavailable or
-        # changed admission rather than guessing another authority address.
-        targets = resolve_and_admit((recipient,), mode=BRIDGE_MODE)
-        if len(targets) != 1 or targets[0].recipient != recipient:
-            return unknown
-        placeholders = ",".join("?" for _ in legacy_recipients)
-        legacy_where = f"to_llm IN ({placeholders}) AND {LEGACY_PENDING}"
-        state = state_root()
-        legacy = configured_bridge_db_path(state)
-        authority = default_plane_root(repo_root=state) / "comms.sqlite3"
-        stores = {}
-        ids = []
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        for name, path, table, column, where, params in (
-            ("legacy", legacy, "messages", "id", legacy_where, legacy_recipients),
-            ("authority", authority, "authority_deliveries d", "message_id", AUTHORITY_WHERE, (recipient, now)),
-        ):
-            # Never create a missing store, migrate schema, claim, or read bodies.
-            if not path.is_absolute() or not path.is_file():
-                return unknown
-            with closing(open_readonly(path, timeout=0.2)) as conn:
-                conn.execute("BEGIN")
-                if name == "authority":
-                    # Preserve schema uncertainty without treating receiver
-                    # observation as generation-bound supervisory consumption.
-                    conn.execute("SELECT delivery_id, state FROM authority_wake_receipts LIMIT 0")
-                stores[name] = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", params).fetchone()[0]
-                rows = conn.execute(
-                    f"SELECT {column} FROM {table} WHERE {where} ORDER BY {column} LIMIT ?",
-                    (*tuple(params), limit),
-                )
-                for (identifier,) in rows:
-                    if name == "legacy":
-                        if not isinstance(identifier, int) or identifier < 1:
-                            return unknown
-                    elif not isinstance(identifier, str) or not re.fullmatch(
-                        r"(?:[a-z][a-z0-9-]*_|legacy-message-)[0-9a-f]{32}", identifier
-                    ):
-                        return unknown
-                    ids.append(identifier)
-        count = sum(stores.values())
-        shown = ids[:limit]
-        return {"count": count, "ids": shown, "truncated": count > len(shown), "stores": stores, "probe": "ok"}
-    except Exception:
-        # Exception text can contain paths or data. It never leaves this boundary.
-        return unknown
+    valid = (
+        re.fullmatch(r"[a-z]+-[a-z0-9]+(?:-[a-z0-9]+)*", recipient)
+        and registry_readable() and is_registered_slot(recipient)
+    )
+    result = pending_delivery_snapshot(recipient, limit=limit) if valid else {"probe": "unknown"}
+    if result["probe"] != "ok":
+        return {
+            "count": 0, "ids": [], "truncated": False,
+            "stores": {"authority": None}, "probe": "unknown",
+        }
+    return {
+        "count": result["count"], "ids": result["ids"],
+        "truncated": result["truncated"], "stores": {"authority": result["count"]},
+        "probe": "ok",
+    }
 
 
 def _reject_constant(_value: str) -> None:
@@ -132,8 +66,6 @@ def hook(stdin_text: str, recipient: str) -> dict:
             return {}
         else:
             suffix = ""
-            if result["stores"]["legacy"]:
-                suffix += f"; legacy: ai_agent_bridge inbox --for {resolve_recipient_alias(recipient)}"
             if result["stores"]["authority"]:
                 suffix += f"; authority: {_AUTHORITY_HELP}"
             prefix = f"PENDING ORDERS: {result['count']} (ids "

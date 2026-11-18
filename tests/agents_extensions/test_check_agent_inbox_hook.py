@@ -1,7 +1,6 @@
-"""Exercise the inbox hook's embedded stdlib SQLite probe (#9662)."""
+"""Exercise the body-free Fleet inbox probe and installed hook isolation."""
 
 import os
-import shlex
 import sqlite3
 import subprocess
 import sys
@@ -10,27 +9,31 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.common.repo_root import machinery_path
-
-HOOK = machinery_path('agents_extensions/shared/hooks/check-agent-inbox.sh')
+HOOK = Path(__file__).resolve().parents[2] / 'agents_extensions/shared/hooks/check-agent-inbox.sh'
 
 
 def _run_probe(monkeypatch, db: Path, recipient: str) -> None:
-    # Execute the actual heredoc, independent of whether sqlite3 CLI is installed.
-    source = HOOK.read_text(encoding="utf-8").split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
-    monkeypatch.setattr(sys, "argv", ["-", str(db), recipient])
-    exec(compile(source, str(HOOK), "exec"), {})
+    from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
+
+    result = pending_delivery_snapshot(recipient, root=db.parent)
+    if result["probe"] == "ok":
+        print(result["count"])
 
 
 @pytest.mark.parametrize("recipient", ["codex", "grok", "grok-build"])
 def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypatch, capsys, recipient):
-    db = tmp_path / "inbox ? # % space.db"
-    target = "grok-build" if recipient == "grok" else "grok" if recipient == "grok-build" else recipient
+    root = tmp_path / "inbox ? # % space"
+    root.mkdir()
+    db = root / "comms.sqlite3"
+    target = recipient
     with closing(sqlite3.connect(db)) as conn:
-        conn.execute("CREATE TABLE messages (to_llm TEXT, acknowledged INTEGER, consumed_by_live_driver INTEGER)")
+        conn.execute("CREATE TABLE authority_deliveries (delivery_id TEXT, message_id TEXT, recipient TEXT, state TEXT, deadline_at TEXT)")
+        conn.execute("CREATE TABLE authority_idempotency (namespace TEXT)")
+        conn.execute("CREATE TABLE authority_wake_receipts (delivery_id TEXT, state TEXT)")
         conn.executemany(
-            "INSERT INTO messages VALUES (?, ?, ?)",
-            [(target, None, None), (target, 1, 0), (target, 0, 1), ("claude", 0, 0)],
+            "INSERT INTO authority_deliveries VALUES (?, ?, ?, ?, NULL)",
+            [(str(i), "message_" + str(i) * 32, seat, state) for i, seat, state in
+             [(1, target, "queued"), (2, target, "acknowledged"), (3, target, "failed"), (4, "claude", "queued")]],
         )
         conn.commit()
     before = db.read_bytes()
@@ -43,7 +46,8 @@ def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypa
         assert Path(conn.execute("PRAGMA database_list").fetchone()[2]) == db.resolve()
         assert conn.execute("PRAGMA busy_timeout").fetchone() == (1000,)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
-            conn.execute("INSERT INTO messages VALUES ('codex', 0, 0)")
+            conn.execute("INSERT INTO authority_deliveries VALUES ('x', 'x', 'codex', 'queued', NULL)")
+        conn.rollback()
         return conn
 
     monkeypatch.setattr(sqlite3, "connect", inspect_connection)
@@ -54,18 +58,20 @@ def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypa
     with pytest.raises(sqlite3.ProgrammingError, match="closed"):
         opened[0].execute("SELECT 1")
     assert db.read_bytes() == before
-    assert list(tmp_path.iterdir()) == [db]
+    assert list(db.parent.iterdir()) == [db]
 
 
 @pytest.mark.parametrize("state", ["empty", "missing", "corrupt", "schema_drift"])
 def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
-    db = tmp_path / "inbox ? #.db"
+    db = tmp_path / "comms.sqlite3"
     if state == "corrupt":
         db.write_bytes(b"not a SQLite database")
     elif state in ("empty", "schema_drift"):
         with closing(sqlite3.connect(db)) as conn:
             if state == "empty":
-                conn.execute("CREATE TABLE messages (to_llm TEXT, acknowledged INTEGER, consumed_by_live_driver INTEGER)")
+                conn.execute("CREATE TABLE authority_deliveries (delivery_id TEXT, message_id TEXT, recipient TEXT, state TEXT, deadline_at TEXT)")
+                conn.execute("CREATE TABLE authority_idempotency (namespace TEXT)")
+                conn.execute("CREATE TABLE authority_wake_receipts (delivery_id TEXT, state TEXT)")
             else:
                 conn.execute("CREATE TABLE unrelated (id INTEGER)")
             conn.commit()
@@ -83,6 +89,9 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
         # The installed entry must reach the empty-inbox fast path with only
         # the configured primary, rather than its own path.
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        plane = tmp_path / "plane"
+        plane.mkdir()
+        db = db.replace(plane / db.name) if db.exists() else plane / db.name
         nested = tmp_path / "nested"
         nested.mkdir()
         # Defect class: a hook in a worktree imports its branch package. Both
@@ -97,8 +106,14 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
         calls = tmp_path / "python-args"
         interpreter = tmp_path / "python-probe"
         interpreter.write_text(
-            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$INBOX_PROBE_ARGS"\n'
-            f'exec {shlex.quote(sys.executable)} "$@"\n'
+            f"#!{sys.executable}\nimport os, runpy, sys\n"
+            "with open(os.environ['INBOX_PROBE_ARGS'], 'a') as log: log.write(' '.join(sys.argv[1:]) + chr(10))\n"
+            "if sys.argv[1:4] == ['-I', '-m', 'lu_machinery.fleet_comms']:\n"
+            f" sys.path.insert(0, {str(HOOK.parents[3])!r})\n"
+            " sys.argv = sys.argv[3:]\n"
+            " runpy.run_module('lu_machinery.fleet_comms', run_name='__main__')\n"
+            "else:\n"
+            f" os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
         )
         interpreter.chmod(0o755)
         result = subprocess.run(
@@ -107,16 +122,17 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
                 "PATH": os.environ["PATH"], "HOME": str(tmp_path),
                 "LEARN_UKRAINIAN_PYTHON": str(interpreter),
                 "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(tmp_path),
-                "AB_DB_PATH": str(db), "LEARN_UK_HOOK_RECIPIENT": "codex",
-                "FLEET_COMMS_ROOT": str(tmp_path / "plane"),
+                "FLEET_COMMS_ROOT": str(db.parent), "LEARN_UK_HOOK_RECIPIENT": "codex",
                 "PYTHONPATH": str(nested), "INBOX_PROBE_ARGS": str(calls),
             }, timeout=15,
         )
         assert result.returncode == 0, result.stderr
-        assert result.stdout == ""
+        if state == "empty":
+            assert result.stdout == ""
+        else:
+            assert "INBOX: unknown" in result.stdout
         assert result.stderr == ""
         if state == "empty":
             assert db.read_bytes() == before
         assert not tripwire.exists()
-        if state == "missing":
-            assert "-I -m lu_machinery.ai_agent_bridge inbox --for codex" in calls.read_text().splitlines()
+        assert "-I -m lu_machinery.fleet_comms deliveries pending --recipient codex" in calls.read_text().splitlines()

@@ -409,7 +409,7 @@ def launch_background_ask(message_id: int, target: str, options: dict[str, Any])
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                cwd=str(_config.REPO_ROOT),
+                cwd=str(state_root()),
                 env=_config._PARENT_ENV,
                 start_new_session=True,
             )
@@ -543,13 +543,19 @@ def _stored_reply_is_useful(reply_id: int) -> bool:
         conn.close()
 
 
-def process_background_ask(message_id: int, target: str) -> None:
+def process_background_ask(message_id: int | str, target: str) -> None:
     """Run one detached ask worker and leave a terminal lifecycle status.
 
     A Kimi target exits with the refusal before the broker is opened; a
     stored message addressed to a Kimi seat or model is skipped right after
     the read, before any lifecycle record (``skip_stored_kimi_row``).
     """
+    if target in {"opencode", "pool", "glm", "gemma"}:
+        from ._opencode import process_for_opencode
+
+        process_for_opencode(message_id, target=target)
+        return
+    message_id = int(message_id)
     from lu_machinery.agent_runtime.retired_seat_admission import KimiAdmissionRefused
 
     from ._acp_compat import refuse_kimi_compat
@@ -610,6 +616,13 @@ def process_background_ask(message_id: int, target: str) -> None:
 
 def print_asks(task_id: str | None = None) -> None:
     """Print recent tracked asks, optionally restricted to a bridge task."""
+    from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
+
+    if resolve_plane_mode() == "authority":
+        from ._opencode import print_authority_asks
+
+        print_authority_asks(task_id)
+        return
     clauses = ["(status = 'sent' OR status = 'processing' OR status LIKE 'replied:%' OR status LIKE 'timed-out:%' OR status LIKE 'timed-out-notified:%' OR status LIKE 'failed:%')"]
     params: list[str] = []
     if task_id:

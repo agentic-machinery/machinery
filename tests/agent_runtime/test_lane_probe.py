@@ -165,7 +165,7 @@ def test_handoff_resolution_covers_registry_and_area_lanes(monkeypatch, tmp_path
     areas["monitor"]["slots"].append("new-provider-monitor")
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(yaml.safe_dump({"assignments": areas}), encoding="utf-8")
-    monkeypatch.setattr(handoff_slot_registry._channels, "ASSIGNMENTS_PATH", roster)
+    monkeypatch.setattr(handoff_slot_registry.agent_identity, "ASSIGNMENTS_PATH", roster)
     assert lane_probe.resolve_handoff_agent("new-provider-monitor") == "new-provider"
     assert lane_probe.resolve_handoff_agent("new-provider-new-lane") == "new-provider-new-lane"
     assert lane_probe.resolve_handoff_agent("unknown-lane") == "unknown-lane"

@@ -25,14 +25,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
-from lu_machinery.agent_identity import seat_read_aliases
+from lu_machinery.agent_identity import resolve_recipient_alias, seat_read_aliases
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, open_readonly
 from lu_machinery.secret_redactor import redact_text
 
 from . import _config
-from ._channels import resolve_recipient_alias
 from ._config import MACHINERY_PACKAGE
 
 # Deepest JSON this module reads (json_depth): its own wake-state file.

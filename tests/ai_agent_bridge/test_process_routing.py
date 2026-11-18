@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 from lu_machinery.agent_runtime.runner import InterAgentTransportError, resolve_inter_agent_route
 from lu_machinery.ai_agent_bridge import _process
 from lu_machinery.ai_agent_bridge._acp_compat import (
@@ -454,31 +453,40 @@ def test_agy_error_handler_never_acks(bridge_db):
     assert _replies(message_id)[0][2] == "error"
 
 
-def test_opencode_incomplete_turn_never_acks(bridge_db):
-    from lu_machinery.ai_agent_bridge import _opencode
+def test_opencode_incomplete_turn_never_acks(bridge_db, tmp_path, monkeypatch):
+    """A timeout preserves attachment integrity without consuming legacy mail."""
+    import json
 
-    message_id = _send("glm")
-    msg = {
-        "id": message_id,
-        "task_id": "task-6915",
-        "from": "qa-engineer",
-        "to": "glm",
-        "type": "advisory",
-        "content": "x",
-        "data": None,
-    }
-    _opencode._handle_opencode_incomplete_turn(
-        msg,
-        message_id,
-        "glm",
-        "",
-        SimpleNamespace(outcome="timeout", cancellation_category=None, reason="hard timeout"),
-        actual_model="glm-5.3",
-        effort="high",
-    )
-    acked, status = _row(message_id)
-    assert acked == 0
-    assert status.startswith("failed:")
+    from lu_machinery.ai_agent_bridge import _opencode
+    from lu_machinery.fleet_comms.authority import AuthorityService
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
+    attachment = tmp_path / "attachment.txt"
+    attachment.write_text("frozen attachment")
+    monkeypatch.chdir(tmp_path)
+    status = _opencode.OpencodeTurnStatus(outcome="timeout", cancellation_category=None, reason="hard timeout")
+    def incomplete(*args, **kwargs):
+        assert kwargs["data"] == str(attachment.resolve())
+        raise _opencode.OpencodeTurnError(status, "partial narration")
+    monkeypatch.setattr(_opencode, "_invoke_opencode", incomplete)
+    with pytest.raises(SystemExit, match="opencode turn aborted"):
+        _opencode.ask_opencode("Question", "task-6915", model="deepseek/deepseek-v4.1-flash", data="attachment.txt")
+    with AuthorityService() as service:
+        row = service.store.connection.execute("SELECT job_id, state FROM authority_jobs").fetchone()
+        assert row["state"] == "failed"
+        job = service.get_job(row["job_id"])
+        metadata = json.loads(service.store.read_bytes(job.payload_artifact_id))["metadata"]
+        assert metadata["data"] == str(attachment.resolve())
+        assert metadata["attachment_sha256"] == "04fee3a35512bde4d325e49fc704a6291b7ecf98b88e8db75c3157f83455858a"
+        receipt = json.loads(service.read_job_result(row["job_id"]))
+        assert receipt["turn_outcome"] == "timeout"
+        assert receipt["partial_response"] == "partial narration"
+        assert "response" not in receipt
+    conn = get_db()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_process_all_gemini_counts_failures_without_consuming(bridge_db, monkeypatch, capsys):

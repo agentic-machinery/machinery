@@ -7,12 +7,11 @@ from unittest.mock import Mock
 
 import pytest
 
-
 from lu_machinery.ai_agent_bridge import _ask_lifecycle as lifecycle
 from lu_machinery.ai_agent_bridge._agy import ask_agy
 from lu_machinery.ai_agent_bridge._db import get_db, init_db
 from lu_machinery.ai_agent_bridge._messaging import send_message
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
@@ -160,6 +159,7 @@ def test_background_signal_handler_writes_terminal_record(bridge_db, monkeypatch
 
 def test_asks_marks_dead_launched_worker_without_terminal_as_died_silent(bridge_db, monkeypatch, capsys, tmp_path, configured_roots):
     """A vanished worker cannot remain indefinitely indistinguishable from pending."""
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     message_id = _send_ask()
     monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
     state_dir = configured_roots.primary / "batch_state" / "asks" / "task-4837"

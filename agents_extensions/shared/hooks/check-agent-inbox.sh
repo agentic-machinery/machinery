@@ -4,10 +4,7 @@
 # LEARN_UK_HOOK_RECIPIENT; the Gemini CLI seat is retired, the name is not.
 # Uses the live inbox CLI so fleet-comms remains the authority for messages.
 #
-# Fast path (#8529): a read-only, 1 s-bounded unread COUNT against the same
-# broker DB the CLI reads skips the Python bridge startup entirely when the
-# inbox is empty. Any probe uncertainty falls through to the live CLI so
-# messages are never hidden.
+# Read only the Fleet inbox. Unknown storage remains visible to the agent.
 #
 # PIPELINE GUARD: Skips during build_module / ai_agent_bridge runs
 # to prevent ping-pong between automated pipeline phases.
@@ -24,113 +21,27 @@ source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
   || { echo "check-agent-inbox.sh: context-rollover-lib.sh is missing beside this hook" >&2; exit 1; }
 context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
 
-RECIPIENT="${LEARN_UK_HOOK_RECIPIENT:-claude}"
-
-case "$RECIPIENT" in
-  claude|codex|gemini|agy|grok|orchestrator) ;;
-  *) exit 0 ;;
-esac
+RECIPIENT="${LEARN_UK_HOOK_RECIPIENT:-${SESSION_HANDOFF_AGENT:-claude}}"
 
 RECIPIENT_LABEL=$(printf '%s' "$RECIPIENT" | tr '[:lower:]' '[:upper:]')
-
-# One interpreter (R66) and code root (machinery #100 R51, R62, R69): the release the
-# one project interpreter imports, never this file's location. Fails closed: refuse,
-# with the reason on stderr, rather than run code from anywhere else. Exit 1 does
-# not block the provider's prompt submission; a later CLI failure stays silent.
 INBOX_PYTHON="$CONTEXT_PROJECT_PYTHON"
-# Fast path: probe the same broker DB the bridge CLI reads
-# (scripts/ai_agent_bridge/_config.py DB_PATH → _messaging.py check_inbox)
-# with a read-only, 1 s-bounded unread count. Zero unread → exit silently
-# without paying the Python bridge startup. DB missing/locked/error, schema
-# drift, or an inconclusive result → fall through to the live CLI below.
-# The DB is the configured shared-state anchor's (common/bridge_paths.py), as the
-# CLI's is; the product checkout's own Git metadata never names it (#100).
-DB_FILE="${AB_DB_PATH:-$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT/.mcp/servers/message-broker/messages.db}"
 
-if [ -n "$DB_FILE" ] && [ -f "$DB_FILE" ]; then
-  # Mirror check_inbox recipient resolution for the seats this hook serves:
-  # resolve_recipient_alias is identity for registered seats, and
-  # seat_read_aliases dual-reads only grok ↔ grok-build. RECIPIENT is already
-  # whitelisted above, so interpolating it into SQL cannot inject.
-  case "$RECIPIENT" in
-    grok|grok-build) TO_LLM_SQL="'grok','grok-build'" ;;
-    *) TO_LLM_SQL="'$RECIPIENT'" ;;
-  esac
-  # "unread" matches _message_consumption_state: neither acknowledged nor
-  # consumed by a live driver (NULL is falsy in Python, 0 via COALESCE here).
-  UNREAD_COUNT=""
-  if command -v sqlite3 >/dev/null 2>&1; then
-    UNREAD_COUNT=$(sqlite3 -readonly -cmd ".timeout 1000" "$DB_FILE" \
-      "SELECT COUNT(*) FROM messages WHERE to_llm IN ($TO_LLM_SQL) AND COALESCE(acknowledged, 0) = 0 AND COALESCE(consumed_by_live_driver, 0) = 0;" \
-      2>/dev/null || true)
-  else
-    # stdlib-only fallback for hosts without the sqlite3 CLI; prints nothing
-    # on any error so the live CLI below stays the authority.
-    UNREAD_COUNT=$("$INBOX_PYTHON" -I - "$DB_FILE" "$RECIPIENT" <<'PYEOF'
-import sqlite3
-import sys
-from pathlib import Path
-
-db, recipient = sys.argv[1], sys.argv[2]
-recipients = ("grok", "grok-build") if recipient in ("grok", "grok-build") else (recipient,)
-try:
-    conn = sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=1.0)
-    try:
-        placeholders = ",".join("?" * len(recipients))
-        row = conn.execute(
-            f"SELECT COUNT(*) FROM messages WHERE to_llm IN ({placeholders}) "
-            "AND COALESCE(acknowledged, 0) = 0 AND COALESCE(consumed_by_live_driver, 0) = 0",
-            recipients,
-        ).fetchone()
-        print(row[0])
-    finally:
-        conn.close()
-except Exception:
-    pass
-PYEOF
-    )
-  fi
-  case "$UNREAD_COUNT" in
-    ''|*[!0-9]*) ;;  # probe inconclusive → the live CLI decides below
-    0) exit 0 ;;
-  esac
-fi
-
-# Ask the live CLI for the recipient's inbox. Keep its existing output as the
-# source of both the count and the bounded preview; the fast path above only
-# ever short-circuits a proven-empty inbox, never replaces this listing.
-INBOX_OUTPUT=$("$INBOX_PYTHON" -I -m lu_machinery.ai_agent_bridge inbox --for "$RECIPIENT" 2>/dev/null) || exit 0
-
-# The legacy human listing emits `N unread`; the live channel listing emits a
-# `pending: N` line. Accept both existing CLI shapes without creating a new
-# output protocol for the hook.
-COUNT=$(printf '%s\n' "$INBOX_OUTPUT" | sed -nE \
-  -e 's/.*:[[:space:]]*([0-9]+)[[:space:]]+unread.*/\1/p' \
-  -e 's/^[[:space:]]*pending:[[:space:]]*([0-9]+).*/\1/p' | head -n 1)
-
-# Keep the pending IDs separate from previews: session-local dedupe state may
-# never contain message content. The CLI's human listing places the state in
-# the second bracket; `pending` covers the live channel listing if it exposes
-# delivery IDs in the same row shape.
-PENDING_IDS=$(printf '%s\n' "$INBOX_OUTPUT" | sed -nE \
-  's/^[[:space:]]*\[([^]]+)\][[:space:]]*\[(unread|pending)\].*/\1/p')
-
-case "$COUNT" in
-  ''|*[!0-9]*)
-    COUNT=$(printf '%s\n' "$PENDING_IDS" | sed '/^$/d' | wc -l | tr -d ' ')
-    ;;
-esac
-
-if [ -z "$COUNT" ] || [ "$COUNT" -eq 0 ]; then
+# This command reads only Fleet delivery counts and IDs. It never creates a
+# database, claims mail or reads a message body. A missing store is unknown.
+INBOX_OUTPUT=$(cd "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT" && "$INBOX_PYTHON" -I -m lu_machinery.fleet_comms deliveries pending --recipient "$RECIPIENT")
+INBOX_STATUS=$?
+if [ "$INBOX_STATUS" -ne 0 ] || ! printf '%s' "$INBOX_OUTPUT" | jq -e '.probe == "ok" and (.count | type == "number")' >/dev/null 2>&1; then
+  CONTEXT="${RECIPIENT_LABEL} INBOX: unknown. Fleet delivery state could not be read.
+cd $(printf '%q' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
+  jq -n --arg msg "$CONTEXT" \
+    '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$msg}}'
   exit 0
 fi
-
-# A structured count without IDs still deserves a notification. Use only the
-# count as the body-free fallback dedupe key; human listings use their exact
-# pending ID list.
-if [ -z "$PENDING_IDS" ]; then
-  PENDING_IDS="count:${COUNT}"
+COUNT=$(printf '%s' "$INBOX_OUTPUT" | jq -r '.count')
+if [ "$COUNT" -eq 0 ]; then
+  exit 0
 fi
+PENDING_IDS=$(printf '%s' "$INBOX_OUTPUT" | jq -r '.ids[]')
 
 # A UserPromptSubmit hook can fire repeatedly before another worker claims or
 # acknowledges its message. Suppress only an identical recipient/session ID
@@ -161,42 +72,11 @@ if [ -n "$SESSION_ID" ]; then
   fi
 fi
 
-# Surface at most five rows from the CLI's own human listing. The following
-# line is the CLI-provided preview, not a second read of message content.
-PREVIEWS=$(printf '%s\n' "$INBOX_OUTPUT" | awk '
-  /^[[:space:]]*\[[^]]+\][[:space:]]*\[(unread|pending)\]/ {
-    if (shown >= 5) exit
-    print
-    if (getline > 0) print
-    shown++
-  }
-')
-
-# The live channel listing reports one bounded preview after this marker
-# instead of exposing message IDs. Preserve that existing preview shape.
-if [ -z "$PREVIEWS" ]; then
-  PREVIEWS=$(printf '%s\n' "$INBOX_OUTPUT" | awk '
-    /^[[:space:]]*oldest preview:[[:space:]]*$/ { capture = 1; next }
-    capture && NF {
-      print
-      shown++
-      if (shown >= 5) exit
-    }
-  ')
-fi
-
 CONTEXT="${RECIPIENT_LABEL} INBOX: ${COUNT} unread message(s) waiting.
----"
-
-if [ -n "$PREVIEWS" ]; then
-  CONTEXT="${CONTEXT}
-${PREVIEWS}"
-fi
-
-INBOX_MODULE=lu_machinery.ai_agent_bridge
-CONTEXT="${CONTEXT}
+Message IDs:
+${PENDING_IDS}
 ---
-$(printf '%q' "$INBOX_PYTHON") -I -m ${INBOX_MODULE} inbox --for ${RECIPIENT}"
+cd $(printf '%q' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT") && $(printf '%q' "$INBOX_PYTHON") -I -m lu_machinery.fleet_comms deliveries receive --recipient $(printf '%q' "$RECIPIENT") --worker-id $(printf '%q' "$RECIPIENT")"
 
 jq -n --arg msg "$CONTEXT" \
   '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":$msg}}'

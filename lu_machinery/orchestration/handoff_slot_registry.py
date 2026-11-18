@@ -6,9 +6,8 @@ lane self-test and lets rollover detection fall back to another lane's packet
 pool, so the launcher must refuse it before it starts a session.
 
 There is deliberately no roster parser here: the registry is
-``scripts/config/area_assignments.yaml`` and the only readers are the bridge
-helpers in ``scripts.ai_agent_bridge._channels`` -- the same ones that build
-the ``--for`` choices.  A slot is registered when the bridge accepts it as a
+``lu_machinery/config/area_assignments.yaml`` and its parser lives in
+``lu_machinery.agent_identity``. A slot is registered when the fleet accepts it as a
 recipient, either as a roster slot or as the ``<provider>-<empty-roster-area>``
 alias of a bare provider (``claude-monitor`` -> ``claude``, #7597).
 
@@ -31,7 +30,7 @@ from pathlib import Path
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from lu_machinery.ai_agent_bridge import _channels
+from lu_machinery import agent_identity
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -43,23 +42,23 @@ _MODULE = f"{_PACKAGE}.{Path(__file__).stem}"
 
 def registry_readable(assignments_path: Path | None = None) -> bool:
     """True when the roster loaded at least one slot beyond the static identities."""
-    return bool(_channels._load_registry_slots(assignments_path))
+    return bool(agent_identity._load_registry_slots(assignments_path))
 
 
 def is_registered_slot(slot: str, *, assignments_path: Path | None = None) -> bool:
     if not slot:
         return False
-    alias = _channels.resolve_recipient_alias(slot, assignments_path=assignments_path)
-    return alias in _channels.get_valid_agents(assignments_path=assignments_path)
+    alias = agent_identity.resolve_recipient_alias(slot, assignments_path=assignments_path)
+    return alias in agent_identity.get_valid_agents(assignments_path=assignments_path)
 
 
 def registered_slots(provider: str, *, assignments_path: Path | None = None) -> list[str]:
     """Roster slots for one provider, plus its empty-roster area aliases."""
     prefix = f"{provider}-"
-    slots = [slot for slot in _channels._load_registry_slots(assignments_path) if slot.startswith(prefix)]
+    slots = [slot for slot in agent_identity._load_registry_slots(assignments_path) if slot.startswith(prefix)]
     slots += [
         f"{prefix}{area}"
-        for area in _channels._load_empty_slot_areas(assignments_path, provider=provider)
+        for area in agent_identity._load_empty_slot_areas(assignments_path, provider=provider)
         if f"{prefix}{area}" not in slots and is_registered_slot(f"{prefix}{area}", assignments_path=assignments_path)
     ]
     return slots

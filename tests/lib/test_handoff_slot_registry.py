@@ -19,8 +19,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from lu_machinery import agent_identity
 from lu_machinery.agent_runtime.lane_probe import resolve_handoff_agent
-from lu_machinery.ai_agent_bridge import _channels
 from lu_machinery.common.repo_root import PRODUCT_ROOT_ENV, machinery_path
 from lu_machinery.orchestration import handoff_slot_registry as registry
 from lu_machinery.orchestration.slot_routing import resolve_slot_holder
@@ -82,7 +82,7 @@ def mixed_roster(request, tmp_path, monkeypatch):
     assignments["assignments"]["empty-fixture"] = {"slots": []}
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(yaml.safe_dump(assignments), encoding="utf-8")
-    monkeypatch.setattr(_channels, "ASSIGNMENTS_PATH", roster)
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     return roster
 
 
@@ -102,20 +102,20 @@ def test_mixed_roster_list_slot_and_inbox_alias_agree(mixed_roster, provider, ca
     assert registry.main(["--slot", slot, "--assignments", str(mixed_roster)]) == 0
     assert registry.main(["--registered", slot, "unknown-monitor", "--assignments", str(mixed_roster)]) == 0
     assert capsys.readouterr().out == f"{slot}\n"
-    expected = slot if slot in _channels._load_registry_slots(mixed_roster) else provider
-    assert _channels.resolve_recipient_alias(slot, assignments_path=mixed_roster) == expected
+    expected = slot if slot in agent_identity._load_registry_slots(mixed_roster) else provider
+    assert agent_identity.resolve_recipient_alias(slot, assignments_path=mixed_roster) == expected
 
 
 @pytest.mark.parametrize("provider", ["muse", "unknown"])
 def test_mixed_roster_never_invents_launcher_only_or_unknown_aliases(mixed_roster, provider, capsys):
-    expected = [slot for slot in _channels._load_registry_slots(mixed_roster) if slot.startswith(f"{provider}-")]
+    expected = [slot for slot in agent_identity._load_registry_slots(mixed_roster) if slot.startswith(f"{provider}-")]
     assert registry.registered_slots(provider, assignments_path=mixed_roster) == expected
     assert registry.main(["--list", provider, "--assignments", str(mixed_roster)]) == 0
     assert capsys.readouterr().out == "\n".join(expected) + "\n"
     for area in ("monitor", "devops", "empty-fixture"):
         slot = f"{provider}-{area}"
         assert registry.main(["--slot", slot, "--assignments", str(mixed_roster)]) == (0 if slot in expected else 3)
-        assert _channels.resolve_recipient_alias(slot, assignments_path=mixed_roster) == slot
+        assert agent_identity.resolve_recipient_alias(slot, assignments_path=mixed_roster) == slot
 
 
 @pytest.mark.parametrize("provider", ["codex", "gemini"])
@@ -294,7 +294,7 @@ def test_every_registered_slot_is_reachable_from_a_selector_for_its_provider() -
 
     Every registered slot for a launcher provider must be reachable through a selector.
     """
-    roster = _channels._load_registry_slots()
+    roster = agent_identity._load_registry_slots()
     assert roster, "area_assignments.yaml roster must load"
     _, gate = _gate_matrix()
     accepted = {provider: {lane for lane, code in gate[provider].items() if code == 0} for provider in PROVIDERS}
@@ -333,9 +333,9 @@ def test_grok_monitor_is_a_dedicated_slot_and_muse_monitor_stays_locked() -> Non
     """grok-monitor receives its own inbox; Muse keeps its monitor identity; other monitor names stay legacy."""
     roster = yaml.safe_load((MACHINERY / "config/area_assignments.yaml").read_text(encoding="utf-8"))
     assert roster["assignments"]["monitor"]["slots"] == ["muse-monitor", "grok-monitor"]
-    assert _channels.resolve_recipient_alias("grok-monitor") == "grok-monitor"
-    assert _channels.resolve_recipient_alias("muse-monitor") == "muse-monitor"
-    assert _channels.resolve_recipient_alias("claude-monitor") == "claude"
+    assert agent_identity.resolve_recipient_alias("grok-monitor") == "grok-monitor"
+    assert agent_identity.resolve_recipient_alias("muse-monitor") == "muse-monitor"
+    assert agent_identity.resolve_recipient_alias("claude-monitor") == "claude"
     gate = _gate("grok", "monitor")
     assert gate.returncode == 0, gate.stderr
 
@@ -379,8 +379,8 @@ def test_kube_dojo_wrapper_dry_run_binds_its_claude_lane(launch_root: Path) -> N
 def test_practice_slots_reach_existing_consumers(provider: str, tmp_path: Path) -> None:
     slot = f"{provider}-practice"
     assert registry.is_registered_slot(slot)
-    assert _channels.resolve_recipient_alias(slot) == slot
-    assert slot in _channels.get_valid_agents()
+    assert agent_identity.resolve_recipient_alias(slot) == slot
+    assert slot in agent_identity.get_valid_agents()
     assert resolve_handoff_agent(slot) == provider
     holder = resolve_slot_holder(slot, session_db_path=tmp_path / "absent.sqlite3")
     assert (holder.area_id, holder.reason) == ("practice", "no-live-holder")

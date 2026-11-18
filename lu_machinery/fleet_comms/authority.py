@@ -232,10 +232,10 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     cached per file identity (path, mtime, size), so every claim does not
     reparse both files.
     """
-    from lu_machinery.ai_agent_bridge import _channels
+    from lu_machinery import agent_identity
     from lu_machinery.ops import driver_lanes
 
-    paths = (Path(_channels.ASSIGNMENTS_PATH), Path(driver_lanes.DATA_FILE))
+    paths = (Path(agent_identity.ASSIGNMENTS_PATH), Path(driver_lanes.DATA_FILE))
     key: list[object] = []
     for path in paths:
         try:
@@ -246,7 +246,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     cached = _ROSTER_CACHE.get(tuple(key))
     if cached is not None:
         return cached
-    slots = _channels._load_registry_slots(paths[0])
+    slots = agent_identity._load_registry_slots(paths[0])
     external = _load_external_recipients(paths[0])
     lanes: tuple[str, ...] = ()
     with contextlib.suppress(Exception):
@@ -521,6 +521,50 @@ class HistoricalImportResult:
         }
 
 
+def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit: int = 5) -> dict[str, Any]:
+    """Read counts and identifiers only, without creating, migrating or claiming.
+
+    Unknown storage or schema is an explicit refusal to report an empty inbox.
+    Supervisory consumption is distinct from merely observing a wake receipt.
+    """
+    from lu_machinery.fleet_comms.paths import default_plane_root
+
+    unknown = {"count": None, "ids": [], "probe": "unknown", "content_included": False}
+    try:
+        if type(limit) is not int or not 1 <= limit <= 500:
+            return {**unknown, "reason": "invalid_pending_limit"}
+        recipient = _nonempty(recipient, field="recipient")
+        _admit_recipients((recipient,), mode=BRIDGE_MODE, claiming=True)
+        assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
+        path = (root or default_plane_root()) / "comms.sqlite3"
+        with contextlib.closing(open_readonly(path, timeout=1.0)) as conn:
+            conn.execute("BEGIN")
+            conn.execute("SELECT delivery_id, state FROM authority_wake_receipts LIMIT 0")
+            where = """recipient = ? AND state IN ('queued', 'running')
+                AND (deadline_at IS NULL OR deadline_at > ?)
+                AND NOT EXISTS (SELECT 1 FROM authority_idempotency i
+                    WHERE i.namespace = 'supervisory-consumption:' || d.delivery_id)"""
+            params = (recipient, _iso())
+            count = conn.execute(
+                f"SELECT COUNT(*) FROM authority_deliveries d WHERE {where}", params,
+            ).fetchone()[0]
+            ids = [row[0] for row in conn.execute(
+                f"SELECT message_id FROM authority_deliveries d WHERE {where} ORDER BY message_id LIMIT ?",
+                (*params, limit),
+            )]
+            if any(not isinstance(mid, str) or not re.fullmatch(
+                r"(?:[a-z][a-z0-9-]*_|legacy-message-)[0-9a-f]{32}", mid,
+            ) for mid in ids):
+                return {**unknown, "reason": "invalid_pending_message_id"}
+        return {
+            "count": count, "ids": ids, "truncated": count > len(ids),
+            "probe": "ok", "content_included": False,
+        }
+    except Exception:
+        # Paths, SQL and message content never leave this read boundary.
+        return {**unknown, "reason": "pending_delivery_store_unavailable"}
+
+
 class AuthorityService:
     """Transactional authority API backed by the shared Fleet Comms store."""
 
@@ -793,6 +837,28 @@ class AuthorityService:
                 (revision.context_revision_id, revision.channel_id),
             )
             return revision
+
+    def read_channel_context(self, channel: str, *, revision_id: str | None = None) -> str:
+        """Read an integrity-checked pinned revision, or the channel's current context.
+
+        A channel without pinned context has an empty body. A named revision
+        must exist and belong to that channel; it never falls back to a file.
+        """
+        record = self.get_channel(channel)
+        revision = revision_id or record.current_context_revision_id
+        if revision is None:
+            return ""
+        row = self._conn.execute(
+            """SELECT artifact_id FROM authority_context_revisions
+               WHERE context_revision_id = ? AND channel_id = ?""",
+            (revision, record.channel_id),
+        ).fetchone()
+        if row is None:
+            raise AuthorityServiceError("channel_context_revision_not_found")
+        try:
+            return self.store.read_bytes(str(row["artifact_id"])).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AuthorityServiceError("channel_context_not_utf8") from exc
 
     def publish_message(
         self,

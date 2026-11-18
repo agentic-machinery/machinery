@@ -1,9 +1,8 @@
 """Rate-limited, metadata-only stream bottleneck alerts (#5646).
 
 The inbox worker calls :func:`scan_bottlenecks_at_inbox_checkpoint`; this
-module deliberately owns no daemon or gate.  Alert delivery uses the existing
-channel inbox, while the broker stores only alert lifecycle metadata needed for
-dedupe and re-arming.
+module deliberately owns no daemon or gate. Alert delivery and its metadata
+use the Fleet authority store for dedupe and re-arming.
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.ai_agent_bridge import _channels
-from lu_machinery.ai_agent_bridge._db import get_db
+from lu_machinery import agent_identity
+from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.fleet_comms.efficiency_metrics import collect_stream_bottleneck_metrics
 from lu_machinery.fleet_comms.message_plane import default_plane_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
@@ -85,7 +84,7 @@ def _active_lease_holder(stream_epic: str, *, session_db: Path, now: datetime) -
         logger.error("bottleneck alerts: invalid lease expiry for epic %s", stream_epic)
         return None
     holder = str(row["holder_agent"] or "")
-    if expires_at <= now or holder not in _channels.get_valid_recipient_agents():
+    if expires_at <= now or holder not in agent_identity.get_valid_recipient_agents():
         return None
     return holder
 
@@ -162,11 +161,11 @@ def _record_delivery_failures(conn: SQLiteConnection) -> int:
     """Make failed alert deliveries loud once; the channel remains the record."""
     rows = conn.execute(
         """
-        SELECT s.stream_epic, s.span, MIN(COALESCE(d.error, 'delivery failed')) AS error
+        SELECT s.stream_epic, s.span, MIN(d.state) AS error
         FROM bottleneck_alert_state AS s
-        JOIN deliveries AS d ON d.message_id = s.message_id
+        JOIN authority_deliveries AS d ON d.message_id = s.message_id
         WHERE s.active = 1 AND s.delivery_failure_reported = 0
-          AND d.status IN ('failed', 'expired')
+          AND d.state IN ('failed', 'expired', 'dead_lettered')
         GROUP BY s.stream_epic, s.span
         """
     ).fetchall()
@@ -334,14 +333,15 @@ def is_public_cause(value: object) -> bool:
     return value in _PUBLIC_CAUSES or all(_is_public_item(item) for item in value.split("; "))
 
 
-def _scan_finalization_attention(*, task_root: Path, now: datetime) -> tuple[int, tuple[dict[str, str], ...]]:
-    """Post once per aged task/run through the checkpoint's durable broker."""
+def _scan_finalization_attention(*, task_root: Path, plane_root: Path, now: datetime) -> tuple[int, tuple[dict[str, str], ...]]:
+    """Post once per aged task/run through the Fleet authority store."""
     from lu_machinery.driver_blockers import finalization_age
 
     if not task_root.is_dir():
         return 0, ({"source": "needs_finalize", "error": "task_store_unavailable"},)
     posted, errors = 0, []
-    conn = get_db()
+    authority = AuthorityService(root=plane_root)
+    conn = authority.store.connection
     try:
         for path in sorted(task_root.glob("*.json")):
             try:
@@ -369,30 +369,29 @@ def _scan_finalization_attention(*, task_root: Path, now: datetime) -> tuple[int
                 if not is_public_cause(reason):
                     reason = "finalize_delivery_pending"
                 owner = task.get("initiator")
-                if owner not in _channels.get_valid_recipient_agents():
+                if owner not in agent_identity.get_valid_recipient_agents():
                     owner = "unknown"
-                _channels.create_channel("cto", description="CTO attention")
+                authority.create_channel("cto")
                 correlation = f"needs-finalize:{task_id}:{nonce}"
                 delivered = conn.execute(
-                    "SELECT message_id FROM channel_messages WHERE channel='cto' AND correlation_id=? LIMIT 1",
+                    "SELECT m.message_id FROM comms_messages m JOIN authority_message_metadata meta USING(message_id) "
+                    "JOIN authority_channels c USING(channel_id) WHERE c.name='cto' AND meta.correlation_id=? LIMIT 1",
                     (correlation,),
                 ).fetchone()
                 if delivered is not None:
                     post = {"message_id": delivered["message_id"]}
                 else:
-                    post = _channels.post(
-                        "cto",
-                        "user",
-                        f"ACTION REQUIRED: needs_finalize task={task_id}; age_minutes={age['age_minutes']}; "
+                    message = authority.publish_message(
+                        channel="cto", sender="user", recipients=("claude-cto",),
+                        body=f"ACTION REQUIRED: needs_finalize task={task_id}; age_minutes={age['age_minutes']}; "
                         f"age_state={age['age_state']}; threshold_minutes={age['threshold_minutes']}; "
                         f"configuration={age['configuration']}; reason={reason}; owner={owner}; "
                         "action=inspect retained task/head, repair the named gate and retry normal publication.",
-                        correlation_id=f"needs-finalize:{task_id}:{nonce}",
-                        kind="system",
-                        priority=_channels.PRIORITY_ACTION_REQUIRED,
-                        auto_snapshot=False,
-                        verify_citations=False,
+                        correlation_id=correlation, kind="system",
+                        provenance={"Source": "finalization-alert", "Agent": "user", "Via": "fleet-comms", "priority": "action_required"},
+                        idempotency_key=correlation,
                     )
+                    post = {"message_id": message.message_id}
                 conn.execute(
                     """INSERT INTO bottleneck_alert_state(
                         stream_epic, span, active, rearm_level, last_alert_age_s, last_alert_at, message_id
@@ -413,7 +412,7 @@ def _scan_finalization_attention(*, task_root: Path, now: datetime) -> tuple[int
                 errors.append({"source": "needs_finalize", "error": type(exc).__name__})
                 logger.exception("finalization alert could not be evaluated or posted")
     finally:
-        conn.close()
+        authority.close()
     return posted, tuple(errors)
 
 
@@ -450,15 +449,16 @@ def scan_bottlenecks_at_inbox_checkpoint(
             logger.error("bottleneck alerts: cannot resolve session-stream DB: %s", exc)
             lease_path = repo_root / ".agent" / "session-streams" / "missing.sqlite3"
 
-    conn = get_db()
+    authority = AuthorityService(root=plane_path.parent)
+    conn = authority.store.connection
     try:
         if not _reserve_scan(conn, now=clock, rate_limit_seconds=rate_limit_seconds):
             return AlertScanResult(False, 0, 0, _record_delivery_failures(conn), ())
         delivery_failures = _record_delivery_failures(conn)
     finally:
-        conn.close()
+        authority.close()
 
-    finalization_posted, finalization_errors = _scan_finalization_attention(task_root=task_path, now=clock)
+    finalization_posted, finalization_errors = _scan_finalization_attention(task_root=task_path, plane_root=plane_path.parent, now=clock)
     try:
         metrics = metrics_collector(tasks_dir=task_path, plane_db=plane_path, now=clock)
     except Exception as exc:  # A diagnostics failure must never break inbox delivery.
@@ -486,7 +486,8 @@ def scan_bottlenecks_at_inbox_checkpoint(
                 if isinstance(age_s, (int, float)) and isinstance(threshold_s, int) and age_s >= threshold_s:
                     breaches[(str(stream_epic), str(span))] = (float(age_s), threshold_s)
 
-    conn = get_db()
+    authority = AuthorityService(root=plane_path.parent)
+    conn = authority.store.connection
     alerts_posted = finalization_posted
     cleared = 0
     try:
@@ -516,23 +517,28 @@ def scan_bottlenecks_at_inbox_checkpoint(
             holder = _active_lease_holder(stream_epic, session_db=lease_path, now=clock)
             recipients = list(dict.fromkeys([*([holder] if holder else []), ESCALATION_RECIPIENT]))
             try:
-                _channels.create_channel(ALERT_CHANNEL, description="Fleet lifecycle alerts")
-                post = _channels.post(
-                    ALERT_CHANNEL,
-                    "user",
-                    _alert_body(
-                        stream_epic=stream_epic,
-                        span=span,
-                        age_s=age_s,
-                        threshold_s=threshold_s,
-                    ),
-                    to_agents=recipients,
-                    correlation_id=f"bottleneck:{stream_epic}:{span}:{new_level}",
-                    kind="system",
-                    priority=_channels.PRIORITY_ACTION_REQUIRED,
-                    auto_snapshot=False,
-                    verify_citations=False,
-                )
+                authority.create_channel(ALERT_CHANNEL)
+                # Include the re-arm epoch so clearing and breaching again creates
+                # a new immutable alert while a crash before metadata commit replays.
+                correlation = f"bottleneck:{stream_epic}:{span}:{new_level}:{row['last_alert_at'] if row else 'initial'}"
+                published = conn.execute(
+                    "SELECT message_id FROM authority_message_metadata WHERE correlation_id=? LIMIT 1",
+                    (correlation,),
+                ).fetchone()
+                if published is not None:
+                    post = {"message_id": published["message_id"]}
+                else:
+                    message = authority.publish_message(
+                        channel=ALERT_CHANNEL, sender="user", recipients=recipients,
+                        body=_alert_body(
+                            stream_epic=stream_epic, span=span, age_s=age_s, threshold_s=threshold_s,
+                        ),
+                        correlation_id=correlation, kind="system",
+                        provenance={"Source": "bottleneck-alert", "Agent": "user", "Via": "fleet-comms", "priority": "action_required"},
+                        idempotency_key=correlation,
+                    )
+                    post = {"message_id": message.message_id}
+
             except Exception as exc:
                 logger.exception("bottleneck alert post failed for epic %s %s: %s", stream_epic, span, exc)
                 conn.execute(
@@ -565,7 +571,7 @@ def scan_bottlenecks_at_inbox_checkpoint(
             conn.commit()
             alerts_posted += 1
     finally:
-        conn.close()
+        authority.close()
 
     errors = (*finalization_errors, *(error for error in metrics.get("source_errors", []) if isinstance(error, dict)))
     return AlertScanResult(True, alerts_posted, cleared, delivery_failures, errors)

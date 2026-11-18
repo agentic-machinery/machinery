@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import os
 import builtins
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from lu_machinery.ai_agent_bridge import _channels, _db
+
+from lu_machinery.fleet_comms.artifacts import ArtifactStore
+from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.fleet_comms.bottleneck_alerts import scan_bottlenecks_at_inbox_checkpoint
 from lu_machinery.session_streams import LeaseHolder, SessionStreamDatabase, SessionStreamStore
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -28,10 +30,12 @@ def isolate_broker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # checkout. These fixtures are plain non-git tmp dirs; since #6863 the
     # default hard-fails there, so they use the explicit operator override.
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
-    with (
-        patch.dict(os.environ, {"AB_DB_PATH": str(broker_db)}),
-    ):
-        _db.init_db()
+    from lu_machinery.fleet_comms import authority
+    real = authority._registered_recipients
+    monkeypatch.setattr(authority, "_registered_recipients", lambda: real() | {"claude", "claude-infra"})
+    with patch.dict(os.environ, {"AB_DB_PATH": str(broker_db)}):
+        with AuthorityService():
+            pass
         yield broker_db
 
 
@@ -69,8 +73,30 @@ def _open_lease(path: Path, *, holder: str = "claude") -> None:
     )
 
 
+def _fleet_db():
+    return ArtifactStore().connection
+
+
+def _messages(channel: str, tail: int = 20) -> list[dict[str, object]]:
+    with AuthorityService() as service:
+        rows = service.store.connection.execute(
+            "SELECT m.message_id FROM comms_messages m JOIN authority_message_metadata meta USING(message_id) "
+            "JOIN authority_channels c USING(channel_id) WHERE c.name=? ORDER BY m.created_at, m.rowid LIMIT ?",
+            (channel, tail),
+        ).fetchall()
+        result = []
+        for row in rows:
+            message = service.get_message(row["message_id"])
+            result.append({
+                "message_id": message.message_id, "kind": message.kind,
+                "priority": message.provenance["priority"],
+                "body": service.read_message_body(message.message_id),
+            })
+        return result
+
+
 def _alerts() -> list[dict[str, object]]:
-    return _channels.read("fleet-comms", tail=20)
+    return _messages("fleet-comms")
 
 
 def test_duplicate_scan_posts_one_action_required_system_alert(tmp_path: Path) -> None:
@@ -101,12 +127,12 @@ def test_duplicate_scan_posts_one_action_required_system_alert(tmp_path: Path) -
     assert len(messages) == 1
     assert messages[0]["kind"] == "system"
     assert messages[0]["priority"] == "action_required"
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
         recipients = {
-            row["to_agent"]
+            row["recipient"]
             for row in conn.execute(
-                "SELECT to_agent FROM deliveries WHERE message_id = ?", (messages[0]["message_id"],)
+                "SELECT recipient FROM authority_deliveries WHERE message_id = ?", (messages[0]["message_id"],)
             )
         }
     finally:
@@ -165,9 +191,9 @@ def test_no_or_stale_lease_escalates_to_claude_infra_only(tmp_path: Path) -> Non
     )
 
     assert result.alerts_posted == 1
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
-        recipients = [row["to_agent"] for row in conn.execute("SELECT to_agent FROM deliveries")]
+        recipients = [row["recipient"] for row in conn.execute("SELECT recipient FROM authority_deliveries")]
     finally:
         conn.close()
     assert recipients == ["claude-infra"]
@@ -178,9 +204,9 @@ def test_failed_delivery_is_loud_and_recorded_without_blocking_rescan(tmp_path: 
         return _metrics(age_s=7_200, **kwargs)
 
     scan_bottlenecks_at_inbox_checkpoint(repo_root=tmp_path, now=NOW, rate_limit_seconds=0, metrics_collector=collector)
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
-        conn.execute("UPDATE deliveries SET status = 'failed', error = 'test transport failure'")
+        conn.execute("UPDATE authority_deliveries SET state = 'failed'")
         conn.commit()
     finally:
         conn.close()
@@ -193,14 +219,14 @@ def test_failed_delivery_is_loud_and_recorded_without_blocking_rescan(tmp_path: 
     )
 
     assert result.delivery_failures == 1
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
         state = conn.execute(
             "SELECT last_delivery_error, delivery_failure_reported FROM bottleneck_alert_state"
         ).fetchone()
     finally:
         conn.close()
-    assert state["last_delivery_error"] == "test transport failure"
+    assert state["last_delivery_error"] == "failed"
     assert state["delivery_failure_reported"] == 1
 
 
@@ -215,7 +241,7 @@ def test_alert_state_and_messages_never_contain_collector_prompt_or_body(tmp_pat
         metrics_collector=lambda **kwargs: payload,
     )
 
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
         state = [dict(row) for row in conn.execute("SELECT * FROM bottleneck_alert_state")]
     finally:
@@ -280,7 +306,7 @@ def test_aged_finalization_posts_once_to_cto_at_checkpoint(
             rate_limit_seconds=0,
             metrics_collector=lambda **_: _metrics(age_s=None),
         )
-    messages = _channels.read("cto", tail=20)
+    messages = _messages("cto", tail=20)
     assert len(messages) == expected
     if expected:
         assert "task=isolated-finalize" in messages[0]["body"]
@@ -315,14 +341,14 @@ def test_finalization_dedupe_recovers_a_post_before_state_checkpoint(tmp_path, m
         )
 
     assert scan().alerts_posted == 1
-    conn = _db.get_db()
+    conn = _fleet_db()
     try:
         conn.execute("DELETE FROM bottleneck_alert_state WHERE span='needs_finalize'")
         conn.commit()
     finally:
         conn.close()
     assert scan().alerts_posted == 0
-    assert len(_channels.read("cto", tail=20)) == 1
+    assert len(_messages("cto", tail=20)) == 1
 
 
 @pytest.mark.parametrize("threshold", ["nan", "inf", "bad", "0", "-1"])
@@ -348,6 +374,6 @@ def test_finalization_alert_reports_unknown_threshold(tmp_path, monkeypatch, thr
         rate_limit_seconds=0,
         metrics_collector=lambda **_: _metrics(age_s=None),
     )
-    message = _channels.read("cto", tail=1)[0]
+    message = _messages("cto", tail=1)[0]
     assert "configuration=unknown" in message["body"]
     assert "age_state=unknown" in message["body"]
