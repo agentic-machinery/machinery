@@ -396,7 +396,6 @@ def test_keyed_mutation_failover_cannot_fire_while_loopback_fence_holds(
         "/api/epics/v1/epic:7178/heartbeat",  # allow-hardcoded-epic: loopback fence on allowlisted prefix
         "/api/epics/v1/epic:7178/handoff",  # allow-hardcoded-epic: loopback fence on allowlisted prefix
         "/api/epics/v1/epic:7178/release",  # allow-hardcoded-epic: loopback fence on allowlisted prefix
-        "/api/epics/v1/epic:7178/bundles",  # allow-hardcoded-epic: loopback fence on allowlisted prefix
     ):
         refused = remote.post(path, json={})
         assert refused.status_code == 403, path

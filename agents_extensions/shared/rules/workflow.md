@@ -145,7 +145,7 @@ change, just-filed issue), pass `?fresh=true` to `/api/orient`.
 then bind/resume and confirm the exact replacement with `thread_handoff.py`.
 Confirmation checks the replacement binding and lease without a semantic
 snapshot, self-answered quiz, or canary proof. Preserve the lineage/rollover IDs,
-generation fence, bundle upload and native identity/title requirements.
+generation fence and native identity/title requirements.
 Predecessor archival still requires authoritative idle and unpinned app evidence.
 The commands are in `thread-rollover/references/resume.md`.
 
