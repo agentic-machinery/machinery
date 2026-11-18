@@ -20,7 +20,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -186,10 +186,12 @@ async def _run_background_work(ctx: MonitorContext, product: ProductContribution
         _start_warmup("CodexBar periodic refresh", start_periodic_refresh)
         await asyncio.Event().wait()
     finally:
-        for task in reversed(tasks):
+        # Cancel every refresher before awaiting any, so one that already failed cannot leave the others running.
+        for task in tasks:
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        for task, outcome in zip(tasks, await asyncio.gather(*tasks, return_exceptions=True), strict=True):
+            if isinstance(outcome, Exception):
+                logger.warning("%s failed: %s", task.get_name(), outcome)
 
 
 @asynccontextmanager

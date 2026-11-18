@@ -60,7 +60,9 @@ from .project_state_store import REPORT_TTL_SECONDS, get_freshest_lane_usage
 from .rules_router import rules_hash
 from .runtime_router import summarize_runtime_usage
 from .session_router import session_hash
+from .resilience import request_timeout_s
 from .state_helpers import (
+    SWR_DORMANT_READ_WAIT_S,
     cache_first_value,
     cache_get_or_compute,
     cache_get_stored,
@@ -125,6 +127,9 @@ ROUTING_BUDGET_TTL_S = 15.0
 # Past this age a stored snapshot must not authorize a lane. Same bound the
 # payload already publishes as diagnostics.stale_threshold_s.
 ROUTING_BUDGET_MAX_AGE_S = 900.0
+# A first read on a running server answers this long before the request timeout,
+# so its typed warming 503 is never cut off by the 504.
+ROUTING_BUDGET_TIMEOUT_MARGIN_S = 1.0
 
 
 def _ctx_cache_key(ctx: MonitorContext, *parts: object) -> str:
@@ -2527,14 +2532,15 @@ async def routing_budget(
             claude_fields=claude_fields,
         ))
         return _routing_budget_response(payload)
-    # Nothing stored for this key yet: wait a bounded time for its first snapshot
-    # (the startup warmup is already computing the default key). The computation
-    # is shared and keeps running past the wait; the caller then gets the typed
-    # warming 503 with Retry-After, never the 504 of the 10 s request timeout.
-    settled, first = await cache_first_value(cache_key, ROUTING_BUDGET_TTL_S, _compute)
+    # Nothing stored for this key yet. The computation is shared and keeps running
+    # past the wait; past it the caller gets the typed warming 503 with
+    # Retry-After, never the 504 of the request timeout.
+    settled, first = await cache_first_value(
+        cache_key, ROUTING_BUDGET_TTL_S, _compute, wait_s=_routing_budget_cold_wait_s(ctx),
+    )
     if not settled or first is None:
         raise warming_unavailable("routing budget warming")
-    observed, value = first
+    observed, value = cast(tuple[_RoutingBudgetGeneration, dict[str, Any]], first)
     claude_fields = await revalidated_routing_budget_fields()
     payload = _public_routing_budget(_aged_routing_budget(
         value,
@@ -2542,6 +2548,21 @@ async def routing_budget(
         claude_fields=claude_fields,
     ))
     return _routing_budget_response(payload)
+
+
+def _routing_budget_cold_wait_s(ctx: MonitorContext) -> float:
+    """How long a read of a key with nothing stored waits for its first snapshot.
+
+    While the process is warming (the default key, which the startup warmup
+    computes first, has no snapshot yet), a short wait, then the typed warming
+    503. On a running server a key read for the first time (``?fresh_codexbar=true``
+    for credit-lane admission, ``?transport=acp``) waits for its computation as
+    before, which one-shot readers rely on, up to just under the request timeout
+    instead of into it.
+    """
+    if cache_get_stored(_ctx_cache_key(ctx, "routing-budget", "dispatch", 0)) is None:
+        return SWR_DORMANT_READ_WAIT_S
+    return max(SWR_DORMANT_READ_WAIT_S, request_timeout_s() - ROUTING_BUDGET_TIMEOUT_MARGIN_S)
 
 
 def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
