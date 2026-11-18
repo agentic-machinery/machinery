@@ -2172,7 +2172,7 @@ SUBSCRIPTION_REFRESH_KEYS: tuple[str, ...] = tuple(
 def _refresh_claude_accounts_live() -> None:
     """The sole machinery reader for all Claude subscription accounts."""
     # The per-account module reads this module's CodexBar helpers, so a top-level import is a cycle.
-    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415  # lazy-ok: import cycle
+    from lu_machinery.api.claude_account_usage import refresh_claude_account_usage  # noqa: PLC0415, I001  # lazy-ok: import cycle
 
     refresh_claude_account_usage()
 
