@@ -1411,6 +1411,10 @@ def _dispatch_command(args):
         else:
             read_message(int(args.message_id))
     elif args.command == "send":
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            raise SystemExit(_retired_legacy_write("send"))
         data = None
         if args.data:
             data = Path(args.data).read_text()

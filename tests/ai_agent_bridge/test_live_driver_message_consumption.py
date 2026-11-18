@@ -19,7 +19,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 def isolate_db(tmp_path: Path):
     """Keep legacy-message rows isolated for each consumption-state test."""
     db_file = tmp_path / "messages.db"
-    with patch.dict(os.environ, {"AB_DB_PATH": str(db_file)}):
+    with patch.dict(os.environ, {"AB_DB_PATH": str(db_file), "FLEET_COMMS_MESSAGE_PLANE": "shadow"}):
         _db.init_db().close()
         yield db_file
 

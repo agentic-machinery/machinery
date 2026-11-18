@@ -1638,6 +1638,39 @@ def _handle_sync(args) -> int:
     return worst_exit_code
 
 
+def _discussion_context_revisions(authority, channel: str, *, _seen: set[str] | None = None) -> dict[str, str]:
+    """Pin Fleet include revisions; unimported authoring files are a visible refusal."""
+    from lu_machinery.fleet_comms.authority import AuthorityServiceError
+
+    seen = _seen if _seen is not None else set()
+    if channel in seen:
+        return {}
+    seen.add(channel)
+    record = authority.get_channel(channel)
+    includes = record.metadata.get("include", [])
+    if isinstance(includes, str):
+        includes = _parse_csv(includes)
+    if not isinstance(includes, list) or any(not isinstance(name, str) for name in includes):
+        raise AuthorityServiceError("channel_context_includes_invalid")
+    revisions: dict[str, str] = {}
+    for name in includes:
+        revisions.update(_discussion_context_revisions(authority, name, _seen=seen))
+    if record.current_context_revision_id:
+        revisions[f"include:{channel}"] = record.current_context_revision_id
+    elif _channels.channel_context_path(channel).exists():
+        raise AuthorityServiceError("channel_context_import_required")
+    return revisions
+
+
+def _read_discussion_context(authority, channel: str, revisions: dict[str, str]) -> str:
+    includes = [(name.split(":", 2)[2], revision) for name, revision in sorted(revisions.items())
+                if name.startswith("include:")]
+    parts = [authority.read_channel_context(name, revision_id=revision) for name, revision in includes]
+    if "channel" in revisions and not any(name == channel for name, _ in includes):
+        parts.append(authority.read_channel_context(channel, revision_id=revisions["channel"]))
+    return "\n".join(part.strip() for part in parts if part.strip())
+
+
 def _handle_discuss(args) -> int:
     """Run bounded ACP discussion with a Fleet root and its pinned context.
 
@@ -1788,12 +1821,20 @@ def _handle_discuss(args) -> int:
     authority = AuthorityService()
     try:
         authority.create_channel(args.channel)
+        snapshot = _discussion_context_revisions(authority, args.channel)
+        context_revisions = {
+            f"include:{index:06d}:{name.removeprefix('include:')}": revision
+            for index, (name, revision) in enumerate(snapshot.items())
+        }
+        if f"include:{args.channel}" in snapshot:
+            context_revisions["channel"] = snapshot[f"include:{args.channel}"]
         root = authority.publish_message(
             sender=discussion_source,
             body=body,
             channel=args.channel,
             recipients=(),
             kind="discussion-root",
+            context_revisions=context_revisions,
             provenance={
                 "Source": discussion_source,
                 "Agent": "ab-discuss",
@@ -1803,9 +1844,7 @@ def _handle_discuss(args) -> int:
         )
         root_id = root.message_id
         correlation_id = root.thread_id
-        channel_context = authority.read_channel_context(
-            args.channel, revision_id=root.context_revisions.get("channel")
-        ).strip() if root.context_revisions.get("channel") else ""
+        channel_context = _read_discussion_context(authority, args.channel, root.context_revisions)
         deadline_at = (datetime.now(UTC) + timedelta(seconds=1800)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )

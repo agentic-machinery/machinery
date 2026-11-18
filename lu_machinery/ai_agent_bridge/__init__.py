@@ -54,17 +54,29 @@ _EXPORTS = {
     'set_session': ('._db', 'set_session'),
 }
 
-_MODULES = {
-    '._broker': lambda: import_module('._broker', __name__),
-    '._cli': lambda: import_module('._cli', __name__),
-    '._config': lambda: import_module('._config', __name__),
-    '._db': lambda: import_module('._db', __name__),
-    '._gemini': lambda: import_module('._gemini', __name__),
-    '._github': lambda: import_module('._github', __name__),
-    '._messaging': lambda: import_module('._messaging', __name__),
-    '._model': lambda: import_module('._model', __name__),
-    '._prompts': lambda: import_module('._prompts', __name__),
-}
+def _load_module(name: str):
+    match name:
+        case '._broker':
+            return import_module('._broker', __name__)
+        case '._cli':
+            return import_module('._cli', __name__)
+        case '._config':
+            return import_module('._config', __name__)
+        case '._db':
+            return import_module('._db', __name__)
+        case '._gemini':
+            return import_module('._gemini', __name__)
+        case '._github':
+            return import_module('._github', __name__)
+        case '._messaging':
+            return import_module('._messaging', __name__)
+        case '._model':
+            return import_module('._model', __name__)
+        case '._prompts':
+            return import_module('._prompts', __name__)
+        case _:
+            raise ImportError(f"unsupported bridge export module: {name}")
+
 
 __all__ = [
     "AGY_CLI",
@@ -126,7 +138,7 @@ def __getattr__(name: str):
         return getattr(import_module("._config", __name__), name)
     if name in _EXPORTS:
         module, attribute = _EXPORTS[name]
-        value = getattr(_MODULES[module](), attribute)
+        value = getattr(_load_module(module), attribute)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

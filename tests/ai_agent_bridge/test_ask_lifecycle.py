@@ -20,6 +20,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 def bridge_db(tmp_path, monkeypatch):
     db_path = tmp_path / "messages.db"
     monkeypatch.setenv("AB_DB_PATH", str(db_path))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     monkeypatch.setenv("AB_PID_DIR", str(tmp_path / "pids"))
     conn = init_db()
     conn.close()

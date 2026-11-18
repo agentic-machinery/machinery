@@ -536,6 +536,25 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         recipient = _nonempty(recipient, field="recipient")
         _admit_recipients((recipient,), mode=BRIDGE_MODE, claiming=True)
         assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
+        from lu_machinery.agent_identity import seat_read_aliases
+        from lu_machinery.common.bridge_paths import configured_bridge_db_path
+        from lu_machinery.common.repo_root import state_root
+
+        legacy_path = configured_bridge_db_path(state_root())
+        if legacy_path.exists():
+            aliases = seat_read_aliases(recipient) or (recipient,)
+            placeholders = ",".join("?" for _ in aliases)
+            with contextlib.closing(open_readonly(legacy_path, timeout=1.0)) as legacy:
+                columns = {row[1] for row in legacy.execute("PRAGMA table_info(messages)")}
+                unconsumed = " AND COALESCE(consumed_by_live_driver, 0) = 0" if "consumed_by_live_driver" in columns else ""
+                unread = legacy.execute(
+                    f"SELECT 1 FROM messages WHERE to_llm IN ({placeholders}) "
+                    f"AND COALESCE(acknowledged, 0) = 0{unconsumed} LIMIT 1", aliases,
+                ).fetchone()
+            if unread is not None:
+                # An id-only receipt cannot prove an unchanged import. Until
+                # #515 retires the source, never silently declare this empty.
+                return {**unknown, "reason": "legacy_unread_import_unverified"}
         path = (root or default_plane_root()) / "comms.sqlite3"
         with contextlib.closing(open_readonly(path, timeout=1.0)) as conn:
             conn.execute("BEGIN")

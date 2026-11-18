@@ -22,7 +22,7 @@ def isolate_db(tmp_path: Path):
     """Create an isolated broker database with the current messages schema."""
     db_path = tmp_path / "messages.db"
     with (
-        patch.dict(os.environ, {"AB_DB_PATH": str(db_path)}),
+        patch.dict(os.environ, {"AB_DB_PATH": str(db_path), "FLEET_COMMS_MESSAGE_PLANE": "shadow"}),
     ):
         _db.init_db().close()
         yield db_path

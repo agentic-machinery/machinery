@@ -15,6 +15,7 @@ HOOK = Path(__file__).resolve().parents[2] / 'agents_extensions/shared/hooks/che
 def _run_probe(monkeypatch, db: Path, recipient: str) -> None:
     from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
 
+    monkeypatch.setenv("AB_DB_PATH", str(db.parent / "absent-legacy.db"))
     result = pending_delivery_snapshot(recipient, root=db.parent)
     if result["probe"] == "ok":
         print(result["count"])

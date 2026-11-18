@@ -44,8 +44,8 @@ def test_legacy_delivery_states(stores, acknowledged, consumed, expected):
         "count": 0,
         "ids": [],
         "truncated": False,
-        "stores": {"authority": 0},
-        "probe": "ok",
+        "stores": {"authority": None if expected else 0},
+        "probe": "unknown" if expected else "ok",
     }
 
 
@@ -179,17 +179,8 @@ def test_recipient_shapes(stores, recipient):
     add_legacy(stores[0], identifier=2)
     add_authority(stores[1], recipient="claude")
     result = inbox_pending.probe(recipient)
-    if recipient == "gemini-infra":
-        assert result == {
-            "count": 0,
-            "ids": [],
-            "truncated": False,
-            "stores": {"authority": 0},
-            "probe": "ok",
-        }
-    else:
-        assert result["probe"] == "unknown"
-        assert result["ids"] == []
+    assert result["probe"] == "unknown"
+    assert result["ids"] == []
 
 
 def test_registry_unavailable_is_unknown(stores, roster):
@@ -216,7 +207,8 @@ def test_readonly_hashes_and_no_body_or_artifacts(stores, tmp_path):
     files = set(tmp_path.iterdir())
     for _ in range(2):
         result = inbox_pending.probe("gemini-infra")
-        assert result["count"] == 1
+        assert result["probe"] == "unknown"
+        assert result["stores"] == {"authority": None}
         assert BODY_MARKER not in json.dumps(result)
     assert {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in stores} == before
     assert set(tmp_path.iterdir()) == files
@@ -233,7 +225,7 @@ def test_missing_store_returns_unknown_without_creation(stores, store_index):
 def test_locked_store_is_unknown(stores, store_index):
     with sqlite3.connect(stores[store_index]) as conn:
         conn.execute("BEGIN EXCLUSIVE")
-        assert inbox_pending.probe("gemini-infra")["probe"] == ("unknown" if store_index == 1 else "ok")
+        assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
 
 
 @pytest.mark.parametrize("store_index", [0, 1])
@@ -248,14 +240,14 @@ def test_unreadable_store_is_unknown(stores, monkeypatch, store_index):
 
     monkeypatch.setattr(authority, "open_readonly", denied)
     result = inbox_pending.probe("gemini-infra")
-    assert result["probe"] == ("unknown" if store_index == 1 else "ok")
+    assert result["probe"] == "unknown"
     assert BODY_MARKER not in json.dumps(result)
 
 
 @pytest.mark.parametrize("store_index", [0, 1])
 def test_schema_drift_and_corrupt_store_unknown(stores, store_index):
     stores[store_index].write_bytes(b"not sqlite " + BODY_MARKER.encode())
-    assert inbox_pending.probe("gemini-infra")["probe"] == ("unknown" if store_index == 1 else "ok")
+    assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
 
 
 @pytest.mark.parametrize("schema_fault", ["table", "delivery_id", "state"])
@@ -308,8 +300,8 @@ def test_cli_returns_only_metadata(stores):
         "count": 0,
         "ids": [],
         "truncated": False,
-        "stores": {"authority": 0},
-        "probe": "ok",
+        "stores": {"authority": None},
+        "probe": "unknown",
     }
     assert BODY_MARKER not in result.stdout
 
@@ -384,7 +376,7 @@ def test_unknown_cli_notice_guides_both_drains(stores, roster, tmp_path, monkeyp
     assert proc.stderr == ""
     assert BODY_MARKER not in proc.stdout
     result = json.loads(proc.stdout)
-    if store_index == 0:
+    if store_index == 0 and failure == "missing-store":
         expected = {"injectSteps": [{"ephemeralMessage": f"PENDING ORDERS: 1 (ids {MESSAGE_ID}); authority: .venv/bin/python -m lu_machinery.fleet_comms deliveries --help"}]} if pending else {}
     else:
         expected = {"injectSteps": [{"ephemeralMessage": EXPECTED_UNKNOWN_NOTICE}]}
@@ -440,7 +432,7 @@ def test_direct_invalid_payload_is_unknown(stores, payload):
     }
 
 
-def test_negative_legacy_identifier_does_not_affect_fleet(stores):
+def test_negative_legacy_identifier_stays_body_free_and_unknown(stores):
     add_legacy(stores[0], identifier=-1)
-    assert inbox_pending.probe("gemini-infra")["probe"] == "ok"
+    assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
     assert inbox_pending.probe("gemini-infra")["ids"] == []

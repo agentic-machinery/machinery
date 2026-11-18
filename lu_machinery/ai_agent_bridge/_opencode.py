@@ -27,7 +27,7 @@ from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServic
 from lu_machinery.fleet_comms.paths import default_plane_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.dispatch_isolation import DispatchIsolationError, spawn_detached_worker
-from lu_machinery.review.model_catalog import activity_role_refusal
+from lu_machinery.review.model_catalog import activity_role_refusal, load_model_catalog, resolve_catalog_model_id
 from lu_machinery.secret_redactor import redact_text, redact_value
 
 from ._ask_contract import (
@@ -472,8 +472,12 @@ def _enqueue_opencode_ask(
     activity = "review" if is_formal_review_ask(msg_type=msg_type, task_id=task_id) else (
         "consult" if msg_type.strip().lower() in {"advisory", "consult", "discussion"} else None
     )
-    if activity and (refusal := activity_role_refusal(model, activity)):
-        raise ValueError(f"ask-{target}: {refusal}")
+    if activity:
+        catalog = load_model_catalog()
+        if resolve_catalog_model_id(model, catalog) is None:
+            raise ValueError(f"ask-{target}: model is not catalogued for {activity}")
+        if refusal := activity_role_refusal(model, activity, catalog):
+            raise ValueError(f"ask-{target}: {refusal}")
     content = redact_text(content) or ""
     attachment = Path(data).resolve() if data else None
     metadata = {
