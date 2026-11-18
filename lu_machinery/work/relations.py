@@ -7,24 +7,33 @@ from typing import Any
 
 from lu_machinery.work import SOURCE_PUBLIC, WORK_ID_PREFIX
 
+# ``\s*:?\s*`` is quadratic: the optional colon does not anchor the split, so a
+# keyword plus a long space run (and no ``#``) makes the two ``\s*`` try every
+# partition. ``\s*(?::\s*)?`` is the same language — whitespace, then an optional
+# colon and the whitespace after it — and that failure is linear.
 _SUPERSEDED_BY_RE = re.compile(
-    r"(?:superseded[- ]?by|replaced[- ]?by|obsoleted[- ]?by)\s*:?\s*#(\d+)",
+    r"(?:superseded[- ]?by|replaced[- ]?by|obsoleted[- ]?by)"
+    r"\s*(?::\s*)?#(\d+)",
     re.IGNORECASE,
 )
 _SUPERSEDES_RE = re.compile(
-    r"(?:supersedes|replaces|obsoletes)\s*:?\s*#(\d+)",
+    r"(?:supersedes|replaces|obsoletes)"
+    r"\s*(?::\s*)?#(\d+)",
     re.IGNORECASE,
 )
 _DUPLICATE_RE = re.compile(
-    r"(?:duplicate of|duplicates)\s*:?\s*#(\d+)",
+    r"(?:duplicate of|duplicates)"
+    r"\s*(?::\s*)?#(\d+)",
     re.IGNORECASE,
 )
 _BLOCKS_RE = re.compile(
-    r"(?:blocks)\s*:?\s*#(\d+)",
+    r"(?:blocks)"
+    r"\s*(?::\s*)?#(\d+)",
     re.IGNORECASE,
 )
 _BLOCKED_BY_RE = re.compile(
-    r"(?:blocked by|depends on|waiting on)\s*:?\s*#(\d+)",
+    r"(?:blocked by|depends on|waiting on)"
+    r"\s*(?::\s*)?#(\d+)",
     re.IGNORECASE,
 )
 

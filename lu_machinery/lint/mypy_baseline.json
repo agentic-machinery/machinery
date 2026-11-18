@@ -1774,41 +1774,6 @@
     },
     {
       "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"observed\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "has-type",
-      "message": "Cannot determine type of \"value\""
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
       "code": "index",
       "message": "Invalid index type \"str\" for \"str\"; expected type \"SupportsIndex | slice[None | SupportsIndex, None | SupportsIndex, None | SupportsIndex]\""
     },
@@ -1911,11 +1876,6 @@
       "path": "lu_machinery/api/state_router.py",
       "code": "index",
       "message": "Value of type \"None | dict[str, Any] | dict[str, None | bool | str] | str\" is not indexable"
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
-      "code": "misc",
-      "message": "\"object\" object is not iterable"
     },
     {
       "path": "lu_machinery/api/state_router.py",
