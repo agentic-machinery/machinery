@@ -416,7 +416,12 @@ def test_dry_run_does_not_delete_anything(tmp_path: Path, monkeypatch: pytest.Mo
     assert worktree.exists()
     assert git(repo, "rev-parse", "--verify", "codex/dry-run")
     assert git(repo, "ls-remote", "--heads", "origin", "codex/dry-run") != ""
-    assert result.ok is True
+    # A kept matched worktree is a residual a dry run must report, as apply refuses on it.
+    assert result.ok is False
+    assert any("worktree still registered" in error for error in result.errors)
+    applied = mc.run_merge_closeout(repo, 303, apply=True)
+    assert applied.ok is False
+    assert applied.errors[0] == result.errors[0]
 
 
 def test_apply_deletes_stale_remote_branch_when_no_worktree_remains(
@@ -840,7 +845,7 @@ def test_main_exits_nonzero_and_prints_json_when_pr_not_merged(
     assert "not MERGED" in payload["error"]
 
 
-def test_main_dry_run_default_reports_ok_without_deleting(
+def test_main_dry_run_default_reports_worktree_residual_without_deleting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     repo = init_repo(tmp_path)
@@ -857,11 +862,12 @@ def test_main_dry_run_default_reports_ok_without_deleting(
     )
     exit_code = mc.main(["606", "--repo-root", str(repo)])
 
-    assert exit_code == 0
+    assert exit_code == 1  # the kept matched worktree is a residual in dry-run too
     assert worktree.exists()
     out = capsys.readouterr().out
     assert "mode: dry-run" in out
-    assert "OK" in out
+    assert "worktree still registered" in out
+    assert "RESIDUAL / ERROR" in out
 
 
 def test_detached_earlier_pr_commit_matches_and_main_checkout_does_not(tmp_path: Path) -> None:

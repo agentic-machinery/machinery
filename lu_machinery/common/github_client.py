@@ -2606,10 +2606,13 @@ def _format_value(value, options, *, api=False):
     expression = _opt(options, "--jq", "-q")
     if expression:
         # jq stays local: gh must not fetch again to format a cached response.
-        p = subprocess.run(
-            ["jq", "-r", expression], input=json.dumps(value), text=True, capture_output=True, check=True, timeout=5
-        )
-        return p.stdout.encode()
+        # A raw body (bytes) is jq's own input, as for gh: an empty body prints nothing.
+        source = value if isinstance(value, bytes) else json.dumps(value).encode()
+        done = subprocess.run(["jq", "-r", expression], input=source, capture_output=True, check=False, timeout=5)
+        if done.returncode:
+            # A body or expression jq rejects is a typed refusal through ``run``, never a traceback.
+            raise ValueError(f"jq exited {done.returncode} on the response")
+        return done.stdout
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):

@@ -1134,7 +1134,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subs.add_parser(name, help=text)
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
         sub.add_argument("--repo", default=None,
-                         help="owner/name (default: the default fleet repository)")
+                         help="owner/name (default: this checkout's origin; refused when unresolvable)")
         if name == "accept":
             sub.add_argument("--custody", action="store_true",
                              help="Accept queue custody: ejection, stale approval, merge confirmation, closeout")
@@ -1147,6 +1147,18 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--release", action="store_true",
                              help="Release recorded custody so an ownerless PR can alert again")
     return parser
+
+
+def _repo_or_checkout(repo: str | None) -> str:
+    """The ``--repo`` value, else the checkout's origin; never another repository by default."""
+    if repo:
+        return repo
+    from lu_machinery.fleet.pr_identity import resolve_repo_slug
+
+    slug = resolve_repo_slug(Path.cwd())
+    if slug is None:
+        raise OwnershipError("repository unresolved: run inside a checkout with a GitHub origin, or pass --repo owner/name")
+    return slug
 
 
 def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
@@ -1164,7 +1176,7 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     repos = load_fleet_repos()
-    repo = args.repo or next(item.github for item in repos.values() if item.default)
+    repo = _repo_or_checkout(args.repo)
     pr = _gh_pr(repo, args.pr)
     now = datetime.now(UTC)
     records = [] if args.release else store.list_tasks(strict=True)
@@ -1213,7 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
         from lu_machinery.dispatcher import store
         from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-        repo = args.repo or next(r.github for r in load_fleet_repos().values() if r.default)
+        repo = _repo_or_checkout(args.repo)
         records = store.list_tasks(strict=True)
         pr = _gh_pr(repo, args.pr)
         now = datetime.now(UTC)

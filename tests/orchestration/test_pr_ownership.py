@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.fleet import pr_identity
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.orchestration import pr_ownership as own
@@ -473,6 +474,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
     repo = fleet_repos.FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True)
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {"public": repo})
+    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: REPO)
     return path
 
 
@@ -491,6 +493,24 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
     assert own.main(["queue-exit", "--pr", "42"]) == 0
     assert json.loads(capsys.readouterr().out) == {"may_exit": True, "reasons": []}
     assert own.main(["status"]) == 0
+
+
+def test_cli_without_repo_targets_the_checkout_not_the_default_fleet_repository(world, monkeypatch, capsys):
+    """Wrong-repository class: an omitted --repo once meant the default fleet repository, whatever the checkout."""
+    seen = []
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: seen.append(repo) or {"state": "OPEN", "headRefOid": HEAD})
+    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: "learn-ukrainian/machinery")
+    monkeypatch.setenv(own.TASK_ENV, "integration")
+    own.main(["accept", "--pr", "42"])
+    own.main(["accept", "--pr", "42", "--repo", "other/explicit"])
+    assert seen == ["learn-ukrainian/machinery", "other/explicit"]
+    # A checkout whose repository cannot be determined is refused before any GitHub read.
+    seen.clear()
+    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: None)
+    capsys.readouterr()
+    assert own.main(["accept", "--pr", "42"]) == 2
+    assert own.main(["queue-exit", "--pr", "42"]) == 2
+    assert "repository unresolved" in capsys.readouterr().err and seen == []
 
 
 def test_documented_module_invocation_shows_help():
