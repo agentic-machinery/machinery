@@ -695,27 +695,29 @@ def _scope_cgroups(unit: str) -> list[str] | None:
 def _provider_alive(record: dict) -> bool | None:
     """Whether the provider's process tree still runs, from the identity recorded for it; None when unknown."""
     if record.get("launch_mode") == "scope":
-        # The scope holds every descendant, including ones that left the provider's process group.
-        unit = record.get("launch_unit")
-        unit = unit if isinstance(unit, str) and re.fullmatch(r"lu-worker-[A-Za-z0-9._-]+", unit) else None
-        if cgroup := record.get("launch_cgroup"):
-            # Only this launch's own scope proves anything: a damaged path's missing cgroup file proves nothing.
-            from lu_machinery.orchestration import dispatch_isolation
+        # The scope holds every descendant, including ones that left the provider's process group. Only this
+        # launch's own scope proves anything, so the unit must be the one named for this task and run nonce
+        # before either lookup; any other unit is unknown.
+        from lu_machinery.orchestration import dispatch_isolation
 
-            task_id, nonce = record.get("task_id"), record.get("run_nonce")
-            if not (unit and isinstance(task_id, str) and isinstance(nonce, str)
-                    and dispatch_isolation.scope_unit_matches(unit, task_id=task_id, run_nonce=nonce)
-                    and cgroup == dispatch_isolation.scope_cgroup(unit, uid=os.getuid())):
+        unit, task_id, nonce = record.get("launch_unit"), record.get("task_id"), record.get("run_nonce")
+        if not (isinstance(unit, str) and re.fullmatch(r"lu-worker-[A-Za-z0-9._-]+", unit)
+                and isinstance(task_id, str) and isinstance(nonce, str)
+                and dispatch_isolation.scope_unit_matches(unit, task_id=task_id, run_nonce=nonce)):
+            return None
+        cgroup = record.get("launch_cgroup")
+        if cgroup is not None:
+            # A recorded cgroup counts only as that unit's canonical path. Anything else, [] or "" included, is
+            # unknown: a damaged path's missing cgroup file proves nothing.
+            if cgroup != dispatch_isolation.scope_cgroup(unit, uid=os.getuid()):
                 return None
             cgroups = [cgroup]
-        elif unit:
+        else:
             # A supervisor that ended before it read the provider's cgroup still named the scope's unit,
             # which is found wherever it was placed.
             cgroups = _scope_cgroups(unit)
             if cgroups is None:
                 return None
-        else:
-            return None
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").exists()
         alive = False
         for cgroup in cgroups:
@@ -1220,7 +1222,7 @@ def _run_merge_closeout(request: dict) -> dict:
     return {"pr": pr, "returncode": result.returncode, "stdout": result.stdout[-4000:], "stderr": result.stderr[-2000:]}
 
 
-def _reap_settled(record: dict, patience: float = 0, salvage: bool = False, own_run: bool = False) -> None:
+def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> None:
     """Settle services and the worktree, close out merged delivery, then remove scratch.
 
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
@@ -1254,18 +1256,18 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False, own_
                                                  f"{closeout.get('returncode')}")
     if scratch.settleable(record):
         liveness_kept = _text(record.get("worktree_disposition_reason")) in LIVENESS_REASONS
-        _settle_task_scratch(record, liveness_kept=liveness_kept, own_run=own_run)
+        _settle_task_scratch(record, liveness_kept=liveness_kept)
 
 
-def _settle_task_scratch(record: dict, *, liveness_kept: bool = False, own_run: bool = False) -> None:
+def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
     """Remove the task's scratch, its write worker's TMPDIR, once the provider is proven gone (scratch.settle).
 
     The proof is taken fresh from the run's own identity on every pass, whatever the worktree or task status
     says. ``liveness_kept`` is this pass's own verdict that the provider may still run, which keeps it too.
     A service this task started that is not proven stopped keeps it too: the scratch holds the list of them.
-    Only a scope launch's probe sees every descendant from any process. A fallback launch's whole tree is
-    proven gone only by its own supervisor (``own_run``), the subreaper that stopped the group and adopted
-    what left it; any later pass keeps that scratch for good.
+    Only a scope launch's probe sees every descendant from any process, so only a scope launch's scratch is
+    released here. A fallback launch's scratch is kept for good (``kept``) and left to tmp_sweep's settled-task
+    rule.
     """
     stops = record.get("task_service_stops")
     unstopped = stops is not None and (not isinstance(stops, list) or any(
@@ -1274,8 +1276,8 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False, own_run: 
     def provider_gone() -> bool:
         return not liveness_kept and _provider_alive(record) is False
 
-    if record.get("launch_mode") != "scope" and not own_run:
-        kept = "a fallback launch's exit is proven only by its own supervisor"
+    if record.get("launch_mode") != "scope":
+        kept = "a fallback launch's process tree is never proven gone; kept for tmp_sweep's settled-task rule"
         scratch.settle(record, provider_gone, kept, final=True)
         return
 
@@ -2052,7 +2054,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
-                    _reap_settled(record, patience=SETTLE_PATIENCE, own_run=True)
+                    _reap_settled(record, patience=SETTLE_PATIENCE)
                 try:
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:

@@ -209,13 +209,17 @@ Settlement removes exactly the recorded directory, directly and without
 quarantine, whatever the task's terminal status and even when the worktree is
 kept. It needs fresh proof, from the run's own launch identity, that the
 provider's whole process tree is gone. For a scope launch that is an empty
-scope cgroup, which covers every descendant; a recorded cgroup counts only
-when it is the canonical path of the launch's own unit. A fallback launch's
-tree is proven gone only by its own supervisor, which stopped the process
-group and adopted what left it; any later pass keeps that scratch for good
-(`kept`). A recorded disposition is never taken as proof. The scratch also
-holds `task-services.txt`, so the sweep stops the task's services before it
-settles the scratch, and a service not proven stopped keeps the scratch.
+scope cgroup, which covers every descendant. The recorded unit must be the one
+named for the task and its run nonce before either cgroup lookup, and a
+recorded cgroup counts only as that unit's canonical path; anything else is
+unknown and keeps the scratch. A fallback (non-scope) launch's tree is never
+proven gone, so settlement never releases its scratch: it is kept for good
+(`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit
+inventories `/tmp` only, so that rule reaches `/var/tmp` only in a run with
+`--temp-root /var/tmp`. A recorded disposition is never taken as proof. The
+scratch also holds `task-services.txt`, so the sweep stops the task's services
+before it settles the scratch, and a service not proven stopped keeps the
+scratch.
 
 Removal takes the whole tree or nothing. The tree is kept whole (`in_use`)
 when it holds a socket, a FIFO or an entry named `tmux-*` or `ssh-*` (the

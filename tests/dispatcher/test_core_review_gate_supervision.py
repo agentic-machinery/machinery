@@ -486,13 +486,13 @@ def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktre
              "worktree_disposition_reason": "provider_processes_alive", "task_scratch": scratch.create("scratch-task")}
     worker._settle_task_scratch(stale, liveness_kept=True)
     assert stale["task_scratch_disposition"] == "retained" and (base / "scratch-task").is_dir()
-    # A fallback launch's whole tree is proven gone only by its own supervisor, the subreaper that stopped its
-    # group: any later pass (the hourly sweep, crash recovery) keeps that scratch for good, whatever the probe says.
+    # A fallback launch's tree is never proven gone, so no pass (its supervisor's, the hourly sweep's, crash
+    # recovery's) releases its scratch, whatever the probe says: it is kept for tmp_sweep's settled-task rule.
     for fallback_reason in ("provider_liveness_unknown", "borrowed_worktree", None):
         fallback = {**stale, "launch_mode": "popen-fallback", "worktree_disposition_reason": fallback_reason}
         worker._settle_task_scratch(fallback)
         assert (fallback["task_scratch_disposition"], fallback["task_scratch_disposition_reason"]) == (
-            "kept", "a fallback launch's exit is proven only by its own supervisor")
+            "kept", "a fallback launch's process tree is never proven gone; kept for tmp_sweep's settled-task rule")
         assert (base / "scratch-task").is_dir() and not scratch.pending(fallback)
     # The scratch holds task-services.txt, the list of services still to stop: one not proven stopped keeps it.
     for stops in ([{"unit": "u", "postcondition": "false"}], [{"unit": "", "postcondition": "unknown"}], "damaged"):
@@ -604,7 +604,8 @@ def test_settlement_keeps_a_scratch_holding_a_socket_fifo_agent_entry_or_held_pa
 def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(monkeypatch, tmp_path):
     """Defect class (F12): a damaged record stopped the scheduled sweep or passed for proof. An array disposition or
     status raised TypeError in a membership test, ending the pass before later records; such fields now read as
-    final or live. A recorded cgroup under the wrong parent made a missing cgroup file read as an exited provider.
+    final or live. A recorded cgroup under the wrong parent made a missing cgroup file read as an exited provider,
+    and so did a missing or empty one, through a unit not bound to the task and run nonce.
 
     Defect class (F10): bytes lost from the receipt. A removal that failed partway reported no bytes for the tree it
     had found. The receipt is what the pass that recorded it found before removal, so a partial pass keeps it.
@@ -636,10 +637,15 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
     unit = iso.scope_unit_name("scratch-task", nonce)
     launch = {"task_id": "scratch-task", "run_nonce": nonce, "launch_mode": "scope", "launch_unit": unit}
     canonical = iso.scope_cgroup(unit, uid=os.getuid())
-    for cgroup in (f"/nonexistent-parent/{unit}.scope", f"{canonical}/..", ["damaged"]):
+    for cgroup in (f"/nonexistent-parent/{unit}.scope", f"{canonical}/..", ["damaged"], [], ""):
         assert worker._provider_alive({**launch, "launch_cgroup": cgroup}) is None
-    assert worker._provider_alive({**launch, "launch_unit": iso.scope_unit_name("other-task", nonce),
-                                   "launch_cgroup": canonical}) is None
+    # The unit is bound to the task and run nonce before either lookup, so an unbound one is never looked up.
+    with monkeypatch.context() as bound:
+        bound.setattr(worker, "_scope_cgroups", lambda _unit: pytest.fail("an unbound unit was looked up"))
+        for unbound in (iso.scope_unit_name("other-task", nonce), iso.scope_unit_name("scratch-task", "f" * 32),
+                        f"lu-worker-scratch-task-{nonce}", ["damaged"], None):
+            for cgroup in ({}, {"launch_cgroup": None}, {"launch_cgroup": []}, {"launch_cgroup": canonical}):
+                assert worker._provider_alive({**launch, "launch_unit": unbound, **cgroup}) is None
     if Path("/sys/fs/cgroup/cgroup.controllers").exists():  # a gone canonical scope still proves exit
         assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is False
     monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)

@@ -724,8 +724,9 @@ def test_pushed_write_task_removes_its_worktree_at_settle(sandbox, model, flags,
 def test_dirty_or_unpublished_write_task_keeps_worktree_with_reason(sandbox, model, flags, reason):
     """Defect: settlement must never discard uncommitted or unpublished work, and must say why it kept it.
 
-    Defect (CLEANUP-WORKFILES-1118): a write worker's temp files went to the host temp area, which no settlement
-    removes. Its TMPDIR is now the task scratch, and the scratch goes once the provider is gone, kept tree or not.
+    Defect (CLEANUP-WORKFILES-1118): a write worker's temp files went to the host temp area. Its TMPDIR is now the
+    task scratch. These stub workers run as fallback launches, whose tree is never proven gone, so settlement keeps
+    the scratch for tmp_sweep's settled-task rule instead of removing it.
     """
     run_git(sandbox.repo, "push", "origin", "main:release")
     task = sandbox.dispatch(model, "--mode", "workspace-write", *flags)
@@ -737,9 +738,9 @@ def test_dirty_or_unpublished_write_task_keeps_worktree_with_reason(sandbox, mod
     assert record["worktree_branch"] in local_branches(sandbox.repo)
     assert run_git(tree, "rev-parse", "HEAD") == record["head_sha"]
     leftover = Path((sandbox.tasks / f"{task[0]}.tmpfile").read_text())
-    assert leftover.parent == sandbox.scratch_base / task[0] and not leftover.parent.exists()
-    assert (record["task_scratch_disposition"], record["task_scratch_disposition_reason"]) == ("removed", "provider gone")
-    assert record["task_scratch_bytes"] >= 4096
+    assert leftover.parent == sandbox.scratch_base / task[0] and leftover.read_bytes() == b"t" * 4096
+    assert (record["launch_mode"], record["task_scratch_disposition"]) == ("popen-fallback", "kept")
+    assert record["task_scratch_disposition_reason"].startswith("a fallback launch's process tree is never proven")
 
 
 @pytest.mark.usefixtures('configured_roots')
