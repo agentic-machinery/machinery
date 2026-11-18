@@ -9,8 +9,9 @@ from approved roots.
 from __future__ import annotations
 
 import logging
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +32,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["docs"])
 
 _FRONTMATTER_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_HTML_META_RE = re.compile(
+    r'<meta\s+name="report-([^"]+)"\s+content="([^"]*)"\s*/?>',
+    re.IGNORECASE,
+)
+_HEAD_BYTES = 8192
 
 # Path prefixes (relative to project_root) to exclude from discovery.
 DISCOVERY_EXCLUDES = ("docs/archive", "docs/resources/podcasts/raw")
@@ -93,8 +99,8 @@ _MIME_TYPES = {
 }
 
 
-def _iso_from_mtime(path: Path) -> str:
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat().replace("+00:00", "Z")
+def _iso_from_timestamp(mtime: float) -> str:
+    return datetime.fromtimestamp(mtime, tz=UTC).isoformat().replace("+00:00", "Z")
 
 
 def _split_csv_numbers(value: str | None) -> list[int]:
@@ -110,25 +116,69 @@ def _split_csv_strings(value: str | None) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+def _read_head(path: str | Path) -> str | None:
+    """Return the first 8KB of text, or None if the file cannot be read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read(_HEAD_BYTES)
+    except Exception:
+        return None
+
+
+def _parse_html_meta(head: str) -> dict[str, str]:
+    """Extract report-* meta tags from an HTML head already in memory."""
+    return {match.group(1): match.group(2) for match in _HTML_META_RE.finditer(head)}
+
+
+def _h1_title(text: str) -> str | None:
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            return stripped[2:].strip()
+    return None
+
+
+def _parse_md_frontmatter(head: str, path: str | Path) -> dict[str, str]:
+    """Parse a markdown head already in memory.
+
+    Same rules as the file reader: a leading ``---`` block, then the first H1
+    when the block has no title. Malformed YAML is skipped.
+    """
+    meta: dict[str, str] = {}
+    if not head.startswith("---"):
+        title = _h1_title(head)
+        if title is not None:
+            meta["title"] = title
+        return meta
+
+    end_idx = head.find("\n---", 3)
+    if end_idx == -1:
+        return meta
+
+    try:
+        data = yaml.load(head[4:end_idx], Loader=_FRONTMATTER_LOADER)
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if value is not None:
+                    meta[str(key)] = str(value)
+    except Exception:
+        logger.debug("Malformed YAML frontmatter in %s, skipping metadata", path)
+
+    if "title" not in meta:
+        title = _h1_title(head[end_idx + 4:])
+        if title is not None:
+            meta["title"] = title
+    return meta
+
+
 def _extract_html_meta(path: Path) -> dict[str, str]:
     """Extract <meta name="report-*" content="..."> tags from HTML."""
-    meta = {}
     if path.suffix.lower() != ".html" or not path.is_file():
-        return meta
-    try:
-        # Read the head of the file (first 8KB is usually enough for meta tags)
-        with open(path, encoding="utf-8", errors="replace") as f:
-            head = f.read(8192)
-        # Match <meta name="report-class" content="handoff" />
-        # and variants with different spacing/quotes
-        matches = re.finditer(
-            r'<meta\s+name="report-([^"]+)"\s+content="([^"]*)"\s*/?>', head, re.IGNORECASE
-        )
-        for m in matches:
-            meta[m.group(1)] = m.group(2)
-    except Exception:
-        pass
-    return meta
+        return {}
+    head = _read_head(path)
+    if head is None:
+        return {}
+    return _parse_html_meta(head)
 
 
 def _extract_md_frontmatter(path: Path) -> dict[str, str]:
@@ -138,49 +188,87 @@ def _extract_md_frontmatter(path: Path) -> dict[str, str]:
     Falls back to first H1 as title if no frontmatter ``title`` key.
     Limits reads to 8KB head. Returns empty dict on any error.
     """
-    meta: dict[str, str] = {}
     if path.suffix.lower() != ".md" or not path.is_file():
-        return meta
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            head = f.read(8192)
-    except Exception:
-        return meta
+        return {}
+    head = _read_head(path)
+    if head is None:
+        return {}
+    return _parse_md_frontmatter(head, path)
 
-    if not head.startswith("---"):
-        # No frontmatter — try H1 as title fallback
-        for line in head.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("# ") and not stripped.startswith("## "):
-                meta["title"] = stripped[2:].strip()
-                break
-        return meta
 
-    # Find closing ---
-    end_idx = head.find("\n---", 3)
-    if end_idx == -1:
-        return meta
+def _project_prefix(project_root: Path) -> str:
+    text = os.fspath(project_root)
+    return text if text.endswith(os.sep) else text + os.sep
 
-    yaml_str = head[4:end_idx]  # Skip opening "---\n"
-    try:
-        data = yaml.load(yaml_str, Loader=_FRONTMATTER_LOADER)
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if value is not None:
-                    meta[str(key)] = str(value)
-    except Exception:
-        logger.debug("Malformed YAML frontmatter in %s, skipping metadata", path)
 
-    # Title: first H1 if no title in frontmatter
-    if "title" not in meta:
-        body_start = head[end_idx + 4:]  # after closing ---\n
-        for line in body_start.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("# ") and not stripped.startswith("## "):
-                meta["title"] = stripped[2:].strip()
-                break
+def _is_excluded(rel_posix: str) -> bool:
+    return any(rel_posix == excl or rel_posix.startswith(f"{excl}/") for excl in DISCOVERY_EXCLUDES)
 
-    return meta
+
+def _relative_under(path: str, root: str) -> str | None:
+    """Return the posix path of ``path`` under ``root``, or None if it is not a lexical child.
+
+    This is the string form of ``_relative_to_root`` for a walk that never
+    follows directory links. It does not resolve symlinks.
+    """
+    if path == root:
+        return "."
+    prefix = root if root.endswith(os.sep) else root + os.sep
+    if not path.startswith(prefix):
+        return None
+    return path[len(prefix):].replace(os.sep, "/")
+
+
+def _iter_discovery_files(project_prefix: str) -> Iterator[tuple[str, str, str, bool]]:
+    """Yield ``(path, name, project-relative posix, is_symlink)`` under docs/ and audit/.
+
+    Directory symlinks are not followed, matching ``Path.rglob``. Hidden names
+    and ``DISCOVERY_EXCLUDES`` are pruned. Unreadable directories are skipped.
+    """
+    for name in ("docs", "audit"):
+        discovery = project_prefix + name
+        if not os.path.isdir(discovery):
+            continue
+        stack = [discovery]
+        while stack:
+            current = stack.pop()
+            children: list[tuple[str, str, str, bool]] = []
+            subdirs: list[str] = []
+            try:
+                with os.scandir(current) as scanned:
+                    for entry in scanned:
+                        if entry.name.startswith("."):
+                            continue
+                        try:
+                            is_dir = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if is_dir:
+                            if not entry.path.startswith(project_prefix):
+                                continue
+                            rel_dir = entry.path[len(project_prefix):].replace(os.sep, "/")
+                            if _is_excluded(rel_dir):
+                                continue
+                            subdirs.append(entry.path)
+                            continue
+                        try:
+                            is_file = entry.is_file(follow_symlinks=True)
+                        except OSError:
+                            continue
+                        if not is_file or not entry.path.startswith(project_prefix):
+                            continue
+                        rel = entry.path[len(project_prefix):].replace(os.sep, "/")
+                        if _is_excluded(rel):
+                            continue
+                        try:
+                            symlink = entry.is_symlink()
+                        except OSError:
+                            symlink = True
+                        children.append((entry.path, entry.name, rel, symlink))
+            except OSError:
+                continue
+            yield from children
+            stack.extend(subdirs)
 
 
 def _get_root_info(path: str, effective_roots: Mapping[str, Path]) -> tuple[str, Path, str] | None:
@@ -251,28 +339,6 @@ def _directory_listing(path: str, root_key: str, root_path: Path, remainder: str
     }
 
 
-def _artifact_url_for(root_key: str, file_path: Path, root_path: Path) -> str:
-    relative = _relative_to_root(file_path, root_path)
-    return f"/artifacts/{root_key}/{relative}"
-
-
-def _artifact_path_for(file_path: Path, project_root: Path) -> str:
-    return _relative_to_root(file_path, project_root)
-
-
-def _find_artifact_root(file_path: Path, effective_roots: Mapping[str, Path], project_root: Path) -> str | None:
-    """Find the effective_roots key that contains this file path.
-
-    Returns the longest matching root_key, or None if no root covers it.
-    """
-    rel = _relative_to_root(file_path, project_root)
-    # Sort by key length descending — longest (most specific) match wins
-    for root_key in sorted(effective_roots.keys(), key=len, reverse=True):
-        if rel == root_key or rel.startswith(f"{root_key}/"):
-            return root_key
-    return None
-
-
 def collect_artifacts(
     *,
     class_filter: str | None = None,
@@ -284,10 +350,9 @@ def collect_artifacts(
 ) -> dict:
     """Return all HTML and MD artifacts under discovery roots.
 
-    Walks discovery roots (docs/ + audit/) broadly. Skips
-    DISCOVERY_EXCLUDES and dotfiles. Matches each file to an
-    effective_roots entry for serving. Parses HTML <meta> tags
-    and MD YAML frontmatter for metadata.
+    Walks docs/ and audit/ once, without following directory symlinks. Skips
+    DISCOVERY_EXCLUDES and dotfiles. Matches each file to an effective_roots
+    entry for serving. Parses HTML <meta> tags and MD YAML frontmatter.
 
     Args:
         class_filter: Filter by artifact class.
@@ -299,81 +364,95 @@ def collect_artifacts(
     """
     resolved_ctx = resolve_context(ctx)
     project_root = resolved_ctx.roots.project_root
-    discovery_roots = (project_root / "docs", project_root / "audit")
-    effective_roots = resolved_ctx.roots.effective_roots
+    project_prefix = _project_prefix(project_root)
+    # Longest key wins. Sorted once per collect, not once per file.
+    root_rows = tuple(
+        sorted(
+            ((key, os.fspath(path), path) for key, path in resolved_ctx.roots.effective_roots.items()),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+    )
 
     artifacts: list[dict] = []
     type_set = set(types)
 
-    for discovery_root in discovery_roots:
-        if not discovery_root.exists():
+    for path, name, rel, symlink in _iter_discovery_files(project_prefix):
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix == ".html":
+            if "html" not in type_set:
+                continue
+            kind = "html"
+        elif suffix == ".md":
+            if "md" not in type_set:
+                continue
+            kind = "md"
+        else:
             continue
-        for file_path in sorted(discovery_root.rglob("*")):
-            if not file_path.is_file():
-                continue
 
-            # Skip dotfiles
-            rel_to_project = Path(_relative_to_root(file_path, project_root))
-            if any(part.startswith(".") for part in rel_to_project.parts):
-                continue
+        root_key: str | None = None
+        root_text = ""
+        root_path: Path | None = None
+        for key, text, candidate in root_rows:
+            if rel == key or rel.startswith(f"{key}/"):
+                root_key = key
+                root_text = text
+                root_path = candidate
+                break
+        if root_key is None or root_path is None:
+            continue
 
-            # Skip excluded paths
-            rel_str = rel_to_project.as_posix()
-            if any(rel_str == excl or rel_str.startswith(f"{excl}/") for excl in DISCOVERY_EXCLUDES):
-                continue
+        # Path.resolve() realpaths every parent. On this tree that was most of
+        # a cold collect, and a non-symlink walked without following directory
+        # links cannot leave its lexical root. Symlinks, and any path that is
+        # not a lexical child, still go through _assert_under_root (HTTP 403).
+        url_rel = _relative_under(path, root_text)
+        if symlink or url_rel is None:
+            _assert_under_root(Path(path), root_path)
+        if url_rel is None:
+            url_rel = _relative_to_root(Path(path), root_path)
 
-            # Filter by type
-            suffix = file_path.suffix.lower()
-            if suffix == ".html":
-                if "html" not in type_set:
-                    continue
-            elif suffix == ".md":
-                if "md" not in type_set:
-                    continue
-            else:
-                continue  # Only HTML and MD for now
+        st = os.stat(path)
+        head = _read_head(path)
+        if head is None:
+            meta: dict[str, str] = {}
+        elif kind == "html":
+            meta = _parse_html_meta(head)
+        else:
+            meta = _parse_md_frontmatter(head, path)
 
-            # Find the serving root for this file
-            root_key = _find_artifact_root(file_path, effective_roots, project_root)
-            if root_key is None:
-                continue  # Not under any approved root
+        report_class = meta.get("class") or "document"
+        report_status = meta.get("status") or "unknown"
+        modified_at = _iso_from_timestamp(st.st_mtime)
+        report_date = meta.get("date") or modified_at[:10]
+        report_author = meta.get("author") or ""
 
-            _assert_under_root(file_path, effective_roots[root_key])
+        if class_filter and report_class != class_filter:
+            continue
+        if status and report_status != status:
+            continue
+        if author and report_author != author:
+            continue
+        if date_from and report_date < date_from:
+            continue
 
-            # Extract metadata
-            meta = _extract_html_meta(file_path) if suffix == ".html" else _extract_md_frontmatter(file_path)
-
-            report_class = meta.get("class") or "document"
-            report_status = meta.get("status") or "unknown"
-            report_date = meta.get("date") or _iso_from_mtime(file_path)[:10]
-            report_author = meta.get("author") or ""
-
-            if class_filter and report_class != class_filter:
-                continue
-            if status and report_status != status:
-                continue
-            if author and report_author != author:
-                continue
-            if date_from and report_date < date_from:
-                continue
-
-            artifacts.append(
-                {
-                    "path": _artifact_path_for(file_path, project_root),
-                    "url": _artifact_url_for(root_key, file_path, effective_roots[root_key]),
-                    "class": report_class,
-                    "date": report_date,
-                    "status": report_status,
-                    "title": meta.get("title") or file_path.stem,
-                    "kpi_summary": meta.get("kpi_summary") or meta.get("kpi-summary") or "",
-                    "related_issues": _split_csv_numbers(meta.get("related_issues") or meta.get("related-issues")),
-                    "related_prs": _split_csv_numbers(meta.get("related_prs") or meta.get("related-prs")),
-                    "agents": _split_csv_strings(meta.get("agents")),
-                    "author": report_author,
-                    "size_bytes": file_path.stat().st_size,
-                    "modified_at": _iso_from_mtime(file_path),
-                }
-            )
+        artifacts.append(
+            {
+                "path": rel,
+                "url": f"/artifacts/{root_key}/{url_rel}",
+                "class": report_class,
+                "date": report_date,
+                "status": report_status,
+                "title": meta.get("title") or os.path.splitext(name)[0],
+                "kpi_summary": meta.get("kpi_summary") or meta.get("kpi-summary") or "",
+                "related_issues": _split_csv_numbers(meta.get("related_issues") or meta.get("related-issues")),
+                "related_prs": _split_csv_numbers(meta.get("related_prs") or meta.get("related-prs")),
+                "agents": _split_csv_strings(meta.get("agents")),
+                "author": report_author,
+                "size_bytes": st.st_size,
+                "modified_at": modified_at,
+            }
+        )
 
     artifacts.sort(key=lambda item: (item["date"], item["modified_at"], item["path"]), reverse=True)
     return {
