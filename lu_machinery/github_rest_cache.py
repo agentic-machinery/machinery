@@ -1,9 +1,6 @@
 """Shared GitHub REST cache for Monitor and Work pollers.
 
-List and per-PR reads go through ``gh api`` with ``If-None-Match``. A 304
-returns the cached body and does not replace it. Failures are not stored.
-Both ``scripts.api.main`` and ``scripts.work.sources_public`` use
-:func:`shared_cache` so one process keeps a single ETag map.
+The common GitHub client owns conditional reads, credentials and cache storage.
 
 Projected dicts keep only the fields those consumers read. The shapes match
 the ``gh --json`` objects the collectors already understood: ``createdAt``,
@@ -14,36 +11,19 @@ the ``gh --json`` objects the collectors already understood: ``createdAt``,
 
 from __future__ import annotations
 
-import contextvars
-import json
-import re
 import subprocess
-import threading
 import time
-from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from lu_machinery.common import github_client, json_depth
-
-# (path, request headers, timeout seconds) -> (status, response headers, body)
-RestTransport = Callable[[str, dict[str, str], float], tuple[int, dict[str, str], bytes]]
+from lu_machinery.common import github_client
 
 # Safety ceiling. Hitting it while ``Link: rel="next"`` remains is truncated,
 # never a silent complete list.
 _MAX_PAGES = 20
 _DETAIL_WORKERS = 8
-_CACHE_MAX_ENTRIES = 512
-_DETAIL_TTL_S = 900.0
-_DETAIL_URL = re.compile(
-    r"(?:^|https://api\.github\.com/)repos/[^/]+/[^/]+/"
-    r"(?:pulls/\d+(?:/reviews)?|issues/\d+(?:/comments)?|"
-    r"commits/[^/?]+(?:/(?:check-runs|status))?|actions/runs)"
-    r"(?:\?|$)"
-)
-_REQUEST_SEQ: contextvars.ContextVar[int] = contextvars.ContextVar("github_rest_request_seq", default=0)
 
 
 class GitHubRestError(RuntimeError):
@@ -96,305 +76,41 @@ class RestPage(list):
         self.age_seconds = age_seconds
 
 
-@dataclass
-class _CacheEntry:
-    etag: str
-    body: Any
-    link_next: str | None
-    seq: int
-    stored_at: float
-    detail: bool
-
-
-class _IdentityAttempt:
-    """One login lookup. Every waiter of this attempt re-raises its error."""
-
-    def __init__(self) -> None:
-        self.ready = threading.Event()
-        self.error: BaseException | None = None
-        self.waiters = 0
-
-
-def current_request_seq() -> int:
-    """Monotonic sequence of the ``get_json`` in flight on this thread."""
-    return _REQUEST_SEQ.get()
-
-
-def _is_detail_url(path: str) -> bool:
-    """Per-PR and per-commit URLs expire. List URLs stay until the LRU evicts them."""
-    return _DETAIL_URL.search(path) is not None
-
-
-def _may_replace(existing: _CacheEntry | None, *, seq: int) -> bool:
-    """A later-issued request wins. Response header times are not an order."""
-    if existing is None:
-        return True
-    return seq >= existing.seq
-
-
-def _link_next(header: str | None) -> str | None:
-    if not header:
-        return None
-    for part in header.split(","):
-        if 'rel="next"' not in part and "rel=next" not in part:
-            continue
-        start = part.find("<")
-        end = part.find(">", start + 1)
-        if start >= 0 and end > start:
-            return part[start + 1 : end]
-    return None
-
-
-def _gh_api_transport(path: str, headers: dict[str, str], timeout: float) -> tuple[int, dict[str, str], bytes]:
-    """Project a shared conditional GitHub read into the legacy cache transport."""
-    try:
-        result = github_client.GitHubClient().request("GET", path, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise GitHubRestTimeout(timeout) from exc
-    except github_client.GitHubRateLimited as exc:
-        raise GitHubRestRateLimited(exc.reset_at, exc.reason) from exc
-    except (OSError, RuntimeError) as exc:
-        raise GitHubRestError(str(exc)) from exc
-    if result.error == "github_rate_limited":
-        raise GitHubRestRateLimited(result.reset_at, result.reason)
-    if result.error and result.status != 404:
-        raise GitHubRestError(result.error, status=result.status)
-    response_headers = dict(result.headers)
-    if result.stale:
-        response_headers.update({"x-github-stale": "true", "x-github-age": str(result.age_seconds)})
-    # The shared disk cache already resolved 304; this compatibility layer
-    # consumes a complete body while retaining its own projection contract.
-    body = result.value if isinstance(result.value, bytes) else json.dumps(result.value).encode()
-    return 200 if result.status == 304 else result.status, response_headers, body
-
-
 class GitHubRestCache:
-    """Process-local ETag cache. Errors leave the previous entry in place.
+    """Adapt common-client reads to the Monitor and Work projection contract."""
 
-    Keys are ``(login, url)``. The login comes from one ``GET /user`` and is
-    never the token. Detail URLs expire; the map is an LRU with a hard cap.
-    A response from an earlier request cannot replace a newer cached body.
-    """
-
-    def __init__(self, transport: RestTransport | None = None, *, identity: str | None = None) -> None:
-        self._transport = transport or _gh_api_transport
-        self._entries: OrderedDict[tuple[str, str], _CacheEntry] = OrderedDict()
-        self._lock = threading.Lock()
-        self._identity_lock = threading.Lock()
-        self._identity = identity
-        self._identity_attempt: _IdentityAttempt | None = None
-        self._seq = 0
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-
-    def _start_identity_attempt(self, timeout: float) -> _IdentityAttempt:
-        """Start one login lookup. Caller holds ``_identity_lock``."""
-        attempt = _IdentityAttempt()
-        self._identity_attempt = attempt
-
-        def _run() -> None:
-            try:
-                self._auth_identity(timeout)
-            except Exception as exc:
-                attempt.error = exc
-            finally:
-                attempt.ready.set()
-
-        threading.Thread(target=_run, name="gh-rest-identity", daemon=True).start()
-        return attempt
-
-    def _kick_identity(self, timeout: float) -> None:
-        """Start the one login lookup without blocking the data read."""
-        if self._identity:
-            return
-        with self._identity_lock:
-            if self._identity or self._identity_attempt is not None:
-                return
-            self._start_identity_attempt(timeout)
-
-    def _wait_identity(self, timeout: float) -> str:
-        if self._identity:
-            return self._identity
-        with self._identity_lock:
-            if self._identity:
-                return self._identity
-            attempt = self._identity_attempt
-            if attempt is None:
-                attempt = self._start_identity_attempt(timeout)
-            attempt.waiters += 1
-        try:
-            if not attempt.ready.wait(timeout):
-                raise GitHubRestTimeout(timeout)
-            if self._identity:
-                return self._identity
-            error = attempt.error
-            if isinstance(error, Exception):
-                raise error
-            raise GitHubRestError("GitHub login lookup failed")
-        finally:
-            with self._identity_lock:
-                attempt.waiters -= 1
-                if (
-                    attempt.waiters == 0
-                    and attempt.ready.is_set()
-                    and attempt.error is not None
-                    and self._identity_attempt is attempt
-                ):
-                    self._identity_attempt = None
-
-    def _auth_identity(self, timeout: float) -> str:
-        if self._identity:
-            return self._identity
-        with self._identity_lock:
-            if self._identity:
-                return self._identity
-            status, _headers, body = self._transport("user", {}, timeout)
-            if status != 200:
-                raise GitHubRestError("GitHub login lookup failed", status=status)
-            try:
-                payload = json_depth.loads(body.decode("utf-8"), max_depth=512)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise GitHubRestError("GitHub login lookup returned invalid JSON") from exc
-            login = payload.get("login") if isinstance(payload, dict) else None
-            if (
-                not isinstance(login, str)
-                or not login
-                or login.strip() != login
-                or "/" in login
-                or any(c.isspace() for c in login)
-            ):
-                raise GitHubRestError("GitHub login lookup returned no login")
-            self._identity = login
-            return login
-
-    def _expired(self, entry: _CacheEntry, now: float) -> bool:
-        return entry.detail and (now - entry.stored_at) >= _DETAIL_TTL_S
-
-    def _live_locked(self, key: tuple[str, str], now: float) -> _CacheEntry | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        if self._expired(entry, now):
-            del self._entries[key]
-            return None
-        self._entries.move_to_end(key)
-        return entry
-
-    def _store_locked(self, key: tuple[str, str], entry: _CacheEntry, now: float) -> None:
-        stale = [cached_key for cached_key, cached in self._entries.items() if self._expired(cached, now)]
-        for cached_key in stale:
-            del self._entries[cached_key]
-        self._entries[key] = entry
-        self._entries.move_to_end(key)
-        while len(self._entries) > _CACHE_MAX_ENTRIES:
-            self._entries.popitem(last=False)
-
-    def cached_body(self, path: str) -> Any:
-        with self._lock:
-            if not self._identity:
-                return None
-            entry = self._live_locked((self._identity, path), time.monotonic())
-            return None if entry is None else entry.body
+    def __init__(self, client: github_client.GitHubClient | None = None) -> None:
+        self._client = client
 
     def get_json(self, path: str, *, timeout: float) -> RestResult:
-        """Conditional GET.
-
-        200 stores the body when this request is not older than the cached
-        one. 304 returns the cached body and does not replace it. 404 is
-        returned and not cached. Any other failure raises and is not cached.
-        """
         if timeout <= 0:
             raise GitHubRestTimeout(timeout)
-        known = self._identity
-        if known is None:
-            # Overlap the one login lookup with this read. A cold cache has no
-            # validator to send, so the data request does not wait for /user.
-            self._kick_identity(timeout)
-        with self._lock:
-            self._seq += 1
-            seq = self._seq
-            etag = None
-            if known:
-                current = self._live_locked((known, path), time.monotonic())
-                etag = None if current is None else current.etag
-        headers: dict[str, str] = {}
-        if etag:
-            headers["If-None-Match"] = etag
-
-        token = _REQUEST_SEQ.set(seq)
         try:
-            status, resp_headers, body = self._transport(path, headers, timeout)
-        finally:
-            _REQUEST_SEQ.reset(token)
-        identity = known or self._wait_identity(timeout)
-        key = (identity, path)
-        resp_headers = {key_name.lower(): value for key_name, value in resp_headers.items()}
-        new_etag = resp_headers.get("etag")
-        link_next = _link_next(resp_headers.get("link"))
+            client = self._client if self._client is not None else github_client.GitHubClient()
+            result: github_client.Result = client.request("GET", path, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubRestTimeout(timeout) from exc
+        except github_client.GitHubRateLimited as exc:
+            raise GitHubRestRateLimited(exc.reset_at, exc.reason) from exc
+        except (OSError, RuntimeError) as exc:
+            raise GitHubRestError(str(exc)) from exc
 
-        if status == 304:
-            with self._lock:
-                cached = self._live_locked(key, time.monotonic())
-                if cached is None:
-                    raise GitHubRestError("304 without a cached body", status=304)
-                # A rotated validator must be replayed next time; the body stays.
-                # An older in-flight 304 must not roll the validator backward.
-                if new_etag and new_etag != cached.etag and _may_replace(cached, seq=seq):
-                    cached = _CacheEntry(
-                        etag=new_etag,
-                        body=cached.body,
-                        link_next=cached.link_next,
-                        seq=seq,
-                        stored_at=cached.stored_at,
-                        detail=cached.detail,
-                    )
-                    self._store_locked(key, cached, time.monotonic())
-                return RestResult(
-                    status=304,
-                    body=cached.body,
-                    etag=cached.etag,
-                    link_next=cached.link_next,
-                    not_modified=True,
-                )
-
-        if status == 404:
+        if result.status == 404:
             return RestResult(status=404, body=None, etag=None, link_next=None, not_modified=False)
-
-        if status != 200:
-            raise GitHubRestError(f"GitHub REST {status} for {path}", status=status)
-
-        try:
-            parsed = json_depth.loads(body.decode("utf-8"), max_depth=512)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise GitHubRestError("invalid GitHub JSON") from exc
-
-        if new_etag:
-            with self._lock:
-                existing = self._entries.get(key)
-                if _may_replace(existing, seq=seq):
-                    now = time.monotonic()
-                    self._store_locked(
-                        key,
-                        _CacheEntry(
-                            etag=new_etag,
-                            body=parsed,
-                            link_next=link_next,
-                            seq=seq,
-                            stored_at=now,
-                            detail=_is_detail_url(path),
-                        ),
-                        now,
-                    )
+        if result.error == "github_rate_limited":
+            raise GitHubRestRateLimited(result.reset_at, result.reason)
+        if result.error or result.status not in (200, 304):
+            raise GitHubRestError(result.error or f"GitHub REST {result.status} for {path}", status=result.status)
+        if isinstance(result.value, bytes):
+            raise GitHubRestError("invalid GitHub JSON")
         return RestResult(
-            status=200,
-            body=parsed,
-            etag=new_etag,
-            link_next=link_next,
-            not_modified=False,
-            stale=resp_headers.get("x-github-stale") == "true",
-            age_seconds=float(resp_headers.get("x-github-age", "0")),
+            status=result.status,
+            body=result.value,
+            etag=result.headers.get("etag"),
+            link_next=github_client.next_link(result.headers),
+            not_modified=result.status == 304,
+            stale=result.stale,
+            age_seconds=result.age_seconds,
         )
 
 
@@ -402,7 +118,7 @@ _SHARED = GitHubRestCache()
 
 
 def shared_cache() -> GitHubRestCache:
-    """The one cache Monitor orient and the Work projection share."""
+    """The common-client adapter shared by Monitor and Work."""
     return _SHARED
 
 

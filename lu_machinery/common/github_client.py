@@ -1865,8 +1865,10 @@ def _repo(options, client):
     return value.split("/", 1)[1]
 
 
-def _next_link(headers):
-    return next((m.group(1) for m in re.finditer(r'<([^>]+)>;\s*rel="next"', headers.get("link", ""))), None)
+def next_link(headers: dict[str, str]) -> str | None:
+    """Return the next page URL advertised in GitHub's Link header."""
+    match = re.search(r'<([^>]+)>;\s*rel=(?:"next"|next)(?=\s*[,;]|\s*$)', headers.get("link", ""))
+    return match.group(1) if match else None
 
 
 def _pages(client, endpoint, *, timeout, fresh, paginate, limit=None, items=lambda value: value):
@@ -1881,7 +1883,7 @@ def _pages(client, endpoint, *, timeout, fresh, paginate, limit=None, items=lamb
             count += len(items(result.value))
             if count >= limit:
                 return pages
-        endpoint = _next_link(result.headers) if paginate else None
+        endpoint = next_link(result.headers) if paginate else None
         if not endpoint:
             return pages
     return Result(error="github_pagination_limit")

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from lu_machinery.api import milestones_router as milestones
 from lu_machinery.api import state_helpers
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.common import github_client
 from lu_machinery.github_rest_cache import GitHubRestCache
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 
@@ -28,10 +29,11 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
         "due_on": "2030-01-01T00:00:00Z", "open_issues": 2, "closed_issues": 6,
     }
 
-    def transport(path, headers, timeout):
-        calls.append((path, headers))
+    def transport(method, path, headers, body, timeout):
+        assert method == "GET"
+        calls.append((path, headers.get("If-None-Match")))
         if headers.get("If-None-Match") == '"fixture"':
-            return 304, {}, b""
+            return github_client.Response(304, {}, b"")
         if "/milestones?" in path:
             row = {**milestone}
             if "fixture/private/" in path:
@@ -46,9 +48,9 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
             ]
             # GitHub's issues collection also returns pull requests.
             body.append({**body[0], "number": 9, "pull_request": {}})
-        return 200, {"etag": '"fixture"'}, json.dumps(body).encode()
+        return github_client.Response(200, {"etag": '"fixture"'}, json.dumps(body).encode())
 
-    cache = GitHubRestCache(transport, identity="fixture")
+    cache = GitHubRestCache(github_client.GitHubClient(cache_dir=tmp_path / "github", env={}, transport=transport))
     monkeypatch.setattr(milestones, "shared_cache", lambda: cache)
     monkeypatch.setattr(milestones, "load_fleet_repos", lambda: repos)
     monkeypatch.setattr(milestones, "schedule_cache_refresh",
@@ -86,7 +88,7 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
     # The same representative artifact proves validators are reused on the next collection.
     assert milestones.collect_milestones()["status"] == "ok"
     assert len(calls) == 6
-    assert all(headers == {"If-None-Match": '"fixture"'} for _, headers in calls[3:])
+    assert all(etag == '"fixture"' for _, etag in calls[3:])
 
     page = Path(milestones.__file__).with_name("dashboards").joinpath("index.html").read_text()
     script = page.split("<script>", 1)[1].split("</script>", 1)[0].rsplit("refreshAll();", 1)[0]
