@@ -266,7 +266,9 @@ def test_removal_reports_a_recursion_error_as_unknown_not_error(tmp_path, monkey
 
 
 # Distinct names a text read of Git's output folds into one another (CR and CRLF become LF).
-LINE_BREAK_NAMES = ["scratch/cr\rname", "scratch/cr\nname", "scratch/crlf\r\nname", "scratch/crlf\nname"]
+LINE_BREAK_NAMES = ["scratch/cr\rname", "scratch/cr\nname", "scratch/crlf\r\nname", "scratch/crlf\nname",
+                    # A text read of the snapshot's list fails on the first and splits the second (#812 round 1).
+                    os.fsdecode(b"scratch/bad\xffname"), "scratch/line\u2028separator"]
 
 
 @pytest.mark.parametrize("case", ["untracked", "ignored", "stat-hidden", "attributes-file", "attributes-file-global",
@@ -282,6 +284,7 @@ def test_snapshot_and_removal_reads_reveal_at_least_what_main_did(tmp_path, monk
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))  # this test's own global config, no system one
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     work = _repo(tmp_path / "tree")
+    _git(work, "config", "core.quotePath", "false")  # status prints high bytes in names as they are
     (work / ".gitignore").write_text("*.log\n")
     (work / "delivered.txt").write_text("delivery\n")
     if case.startswith("attributes-file"):  # checked out as CRLF only through a configured attributes file

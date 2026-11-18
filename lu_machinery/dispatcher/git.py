@@ -924,15 +924,16 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
         # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
         # edit or new submodule commit is reported whatever the tree configures. stat_integrity forces
         # core.trustctime and core.checkStat to their defaults, so a worker's stat settings cannot hide an edit,
-        # and --untracked-files=all overrides status.showUntrackedFiles.
-        status = [line for line in local(["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
-                                         stat_integrity=True).stdout.splitlines() if line]
+        # and --untracked-files=all overrides status.showUntrackedFiles. The listed names are read as bytes
+        # (_porcelain), so no file name can fail a decode or split one entry in two.
+        changed, untracked = _porcelain(local(
+            ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+            stat_integrity=True, text=False).stdout)
         hidden = _hidden_tracked_changes(spec.worktree)
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
-        delivery.update(worktree_dirty_on_exit=bool(status) or hidden,
-                        worktree_untracked_only_on_exit=bool(status) and not hidden
-                        and all(line.startswith("?? ") for line in status))
+        delivery.update(worktree_dirty_on_exit=bool(changed or untracked) or hidden,
+                        worktree_untracked_only_on_exit=bool(untracked) and not changed and not hidden)
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -1218,19 +1219,30 @@ def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     Removal's own read: plain Git with every config scope and the tree's filters, as before, plus controls that
     can only reveal more. core.trustctime and core.checkStat are forced to their defaults and core.fsmonitor and
     core.untrackedCache are off, so a worker's settings cannot hide an edit or a new file from it. Names are read
-    as bytes: a text read folds CR and CRLF into LF, so removal would preserve names that do not exist. In
-    porcelain v1 -z, a rename or copy is followed by its source path as a separate field, which belongs to that
-    entry. The exit snapshot's hidden-change check covers the index flags and submodule ignore settings status
+    as bytes (_porcelain): a text read folds CR and CRLF into LF, so removal would preserve names that do not
+    exist. The exit snapshot's hidden-change check covers the index flags and submodule ignore settings status
     trusts.
     """
     # The argv is literal apart from the tree path and runs no shell; the environment is main's removal read's
     # (_git with isolate=True). It is called directly only to read the output as bytes.
-    fields = iter(subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+    changed, untracked = _porcelain(subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         ["git", "-C", str(tree), *_REVEALING, "status", "--porcelain", "-z", "--untracked-files=all",
          "--ignore-submodules=none"],
         capture_output=True, check=True, timeout=30,
         env={**sanitized_git_env(strip_config_injection=True), "GIT_TERMINAL_PROMPT": "0"},
-    ).stdout.split(b"\0"))
+    ).stdout)
+    if _hidden_tracked_changes(tree):
+        changed.append("hidden tracked changes")
+    return changed, untracked
+
+
+def _porcelain(output: bytes) -> tuple[list[str], list[str]]:
+    """Tracked entries and untracked names from ``git status --porcelain -z`` output, decoded with os.fsdecode.
+
+    In porcelain v1 -z, a rename or copy is followed by its source path as a separate field, which belongs to
+    that entry.
+    """
+    fields = iter(output.split(b"\0"))
     changed, untracked = [], []
     for field in fields:
         if not field:
@@ -1241,8 +1253,6 @@ def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
         changed.append(os.fsdecode(field))
         if b"R" in field[:2] or b"C" in field[:2]:
             next(fields, None)
-    if _hidden_tracked_changes(tree):
-        changed.append("hidden tracked changes")
     return changed, untracked
 
 
