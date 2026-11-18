@@ -1043,6 +1043,30 @@ put the PR number in the brief. `--pr` or a review profile would request review-
 admission. Keep the literal model ID in the advisory record and check it against the model
 reported by AGY in the settled dispatch. Compare review outcomes by selector.
 
+### SubQ Savant test routing
+
+Use the pinned `subq-savant-1.4` model through native OpenCode for public-code and
+public-docs trials. This includes supplemental review, hard-problem advice,
+proposed patches and the independent round of non-Ukrainian councils. Savant's
+findings are advisory and carry no formal review, Ukrainian authoring or review,
+or designated approval authority.
+
+Pass `--agent opencode --provider subq --model subq-savant-1.4 --mode read-only`,
+with `--data-class public-code` or `--data-class public-docs`. Use `--research-role
+advisory` for counsel and supplemental review and `--research-role test` for
+trials. Put the question and its published evidence in the prompt. The model
+receives the prompt in an empty sandbox directory with its tools disabled. The
+dispatch rejects private repositories and other data classes. Secrets and
+unreleased curriculum are outside the route's scope.
+
+Use a stable `--task-id`. Dispatch assigns `low`, `high` or `max` by SHA-256 of
+that ID modulo three and records the effective effort for model stats. Compare
+results by effort on held-out real jobs. The Chat Completions route always sends
+`store: false` and defaults to 64,000 generated tokens, including reasoning.
+Set `--max-tokens` when a trial needs a different cap. The public-data boundary
+stays in force until the operator authorizes a change after obtaining a zero
+data retention agreement.
+
 ## Codex routing — GPT-6 driver, workers, reviewer, and advisor
 
 Codex has two Pro 20x subscriptions with separate credentials and capacity.
