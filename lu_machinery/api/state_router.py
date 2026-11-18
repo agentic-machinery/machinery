@@ -2239,8 +2239,10 @@ def _withdraw_routing_authorization(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-async def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> object:
-    """Refresh displayed failure text off-loop while retaining snapshot age."""
+def _with_live_lane_errors(
+    payload: dict[str, Any], tasks_dir: Path, cache_key: str, observed: _RoutingBudgetGeneration,
+) -> dict[str, Any]:
+    """Serve this snapshot's failure scan and refresh it off-loop without renewing its age."""
     if not isinstance(payload, dict) or not isinstance(payload.get("agents"), dict):
         return payload
     # Only snapshots displaying a failure need a second read. Healthy warm
@@ -2255,13 +2257,23 @@ async def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: st
 
     def _scan() -> LaneHealthScan:
         try:
-            return scan_lane_health(tasks_dir)
+            health = scan_lane_health(tasks_dir)
         except Exception as exc:
-            return LaneHealthScan(observed=False, error=f"lane health scan failed: {type(exc).__name__}")
+            health = LaneHealthScan(observed=False, error=f"lane health scan failed: {type(exc).__name__}")
+        if not isinstance(health, LaneHealthScan):
+            health = LaneHealthScan(observed=False, error="lane health scan returned an invalid result")
+        observed.lane_errors = health
+        return health
 
-    # Error text can change in place without a directory-token change. Read
-    # it off-loop, coalescing concurrent reads without caching old excerpts.
-    health = await cache_get_or_compute_async(f"{cache_key}:lane-errors", 0.0, _scan)
+    # Error text can change in place without a directory-token change. Start
+    # one off-loop scan without making a warm read wait for a worker.
+    health_key = f"{cache_key}:lane-errors"
+    # A completed or late scan belongs only to the snapshot that started it.
+    # The shared scheduler key coalesces work, never supplies an older result.
+    health = observed.lane_errors
+    schedule_cache_refresh(health_key, 0.0, _scan)
+    if health is None:
+        return payload
     agents = {}
     for lane, info in payload["agents"].items():
         if isinstance(info, dict) and isinstance(info.get("health"), dict):
@@ -2303,6 +2315,7 @@ class _RoutingBudgetGeneration:
     directory_token: str
     started_at: float
     invalidated: threading.Event = field(default_factory=threading.Event)
+    lane_errors: LaneHealthScan | None = None
 
 
 def _routing_budget_compute(
@@ -2479,7 +2492,7 @@ async def routing_budget(
     """
     if fresh_codexbar:
         trigger_background_refresh()
-    cache_key = await asyncio.to_thread(_ctx_cache_key, ctx, "routing-budget", transport, int(fresh_codexbar))
+    cache_key = _ctx_cache_key(ctx, "routing-budget", transport, int(fresh_codexbar))
     # Directory checks are cheap enough for warm reads. All-file validation
     # runs beside the request to detect in-place rewrites without pool waits.
     tasks_dir = ctx.roots.batch_state_dir / "tasks"
@@ -2490,8 +2503,8 @@ async def routing_budget(
     # Past the stale threshold it no longer authorizes a lane.
     stored = cache_get_stored(cache_key)
     if stored is not None:
-        (observed, value), age_s = stored
-        if observed.directory_token != await asyncio.to_thread(delegate_api._dir_token, tasks_dir):
+        (observed, value), age_s = cast(tuple[tuple[_RoutingBudgetGeneration, dict[str, Any]], float], stored)
+        if observed.directory_token != delegate_api._dir_token(tasks_dir):
             observed.invalidated.set()
 
         def _needs_refresh() -> bool:
@@ -2503,8 +2516,10 @@ async def routing_budget(
             return False
 
         schedule_cache_refresh(cache_key, ROUTING_BUDGET_TTL_S, _compute, should_refresh=_needs_refresh)
-        value = await _with_live_lane_errors(value, tasks_dir, cache_key)
-        claude_fields = await revalidated_routing_budget_fields()
+        value = _with_live_lane_errors(value, tasks_dir, cache_key, observed)
+        # Stat-only serving withholds changed bindings and schedules their
+        # validation in the background. A warm read never waits for it.
+        claude_fields = claude_account_routing_fields()
         payload = _public_routing_budget(_aged_routing_budget(
             value,
             state_helpers._ttl_clock() - observed.started_at,
