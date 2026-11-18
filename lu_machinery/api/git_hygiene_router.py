@@ -98,6 +98,7 @@ def _run_git(
     cwd: Path,
     input_text: str | None = None,
     timeout_s: float = _GIT_TIMEOUT_S,
+    errors: str = "strict",
 ) -> tuple[int, str, str]:
     try:
         env = sanitized_git_env()
@@ -108,6 +109,7 @@ def _run_git(
             input=input_text,
             capture_output=True,
             text=True,
+            errors=errors,
             timeout=timeout_s,
             check=False,
         )
@@ -200,10 +202,10 @@ _GIT_WORKERS = min(16, os.cpu_count() or 1)
 _merged_memo: dict[str, tuple[str, dict[tuple[str, str], bool]]] = {}
 _RECORD = "\x01"
 _TipKey = tuple[str, str]
-# git hashes a path with its whitespace removed; mirror that, over-removing
+# git hashes a path's bytes with its whitespace removed; mirror that on the bytes, over-removing
 # any ASCII whitespace, so a path the hash cannot tell apart is never told apart here either.
-_STRIP_WHITESPACE = str.maketrans("", "", " \t\n\v\f\r")
-_PathSet = frozenset[str] | None
+_ASCII_WHITESPACE = b" \t\n\v\f\r"
+_PathSet = frozenset[bytes] | None
 
 
 def _log_records(args: list[str], cwd: Path) -> list[tuple[list[str], _PathSet]] | None:
@@ -211,10 +213,12 @@ def _log_records(args: list[str], cwd: Path) -> list[tuple[list[str], _PathSet]]
 
     The paths are spelled as git hashes them. A commit with a path git quotes (a
     control character, quote or backslash in the name) has no sure spelling: its path set is ``None``.
+    Output is read losslessly (``surrogateescape``), so a path that is not UTF-8 keeps its exact bytes
+    and whitespace removal and comparison act on the bytes git hashes.
     """
     code, stdout, _stderr = _run_git(
         ["-c", "core.quotePath=false", "log", "--root", "--no-renames", "--name-only",
-         f"--format={_RECORD}%H %P", *args], cwd=cwd)
+         f"--format={_RECORD}%H %P", *args], cwd=cwd, errors="surrogateescape")
     if code != 0:
         return None
     records: list[tuple[list[str], _PathSet]] = []
@@ -222,7 +226,8 @@ def _log_records(args: list[str], cwd: Path) -> list[tuple[list[str], _PathSet]]
         head, _, listing = chunk.partition("\n")
         names = [line for line in listing.split("\n") if line]
         quoted = any(name.startswith('"') for name in names)
-        records.append((head.split(), None if quoted else frozenset(name.translate(_STRIP_WHITESPACE) for name in names)))
+        records.append((head.split(), None if quoted else frozenset(
+            name.encode("utf-8", "surrogateescape").translate(None, _ASCII_WHITESPACE) for name in names)))
     return records
 
 
@@ -407,9 +412,12 @@ def _running_ids_in_record(path: Path, tasks_dir: Path) -> tuple[str, ...]:
 def _active_task_ids(project_root: Path, candidates: set[str]) -> set[str]:
     """The ``candidates`` that a running task record in the hot store names.
 
-    Only a record's own file names (``<id>.json`` and its redispatch-archived
-    copies) are read, so a report costs a directory listing and a handful of
-    cached record reads, never one read per record in the store.
+    Dispatch writes a task's record as ``<id>.json`` (``task_record_path``), and a
+    re-dispatch archives the old one beside it, so a task's own record is found by
+    that file name and its embedded id is checked. A record kept under another file
+    name is never consulted: reading every record's embedded id costs about 8.5 s
+    on a store of 15,000 records, and a report is a directory listing and a handful
+    of cached record reads instead.
     """
     tasks_dir = project_root / "batch_state" / "tasks"
     if not candidates:

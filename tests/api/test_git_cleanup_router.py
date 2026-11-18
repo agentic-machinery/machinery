@@ -254,6 +254,15 @@ def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, mon
     branch_with("newpaths", "only-here.txt", "n\n")
     branch_with("spaced", "x y.txt", "same body\n")
     branch_with("quoted", "a\tb.txt", "same body\n")
+    # A path that is not UTF-8 must not break the report, and git hashes its bytes with whitespace removed.
+    for name, filename, body in (
+        ("latin1", b"caf\xe9.txt", b"latin\n"), ("splitutf8", b"caf\xc3 \xa9.txt", b"same body\n"),
+    ):
+        _git(repo, "checkout", "-b", name, "main")
+        with open(os.fsencode(repo) + b"/" + filename, "wb") as handle:
+            handle.write(body)
+        _commit_all(repo, f"add {name}")
+        _git(repo, "checkout", "main")
     # ``main`` moves on, so the cherry-picked commit gets an id of its own.
     _write(repo / "shared.txt", "main\n")
     _commit_all(repo, "main moves")
@@ -263,11 +272,14 @@ def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, mon
     _commit_all(repo, "spaceless")
     _write(repo / "ab.txt", "same body\n")
     _commit_all(repo, "tabless")
+    with open(os.fsencode(repo) + b"/caf\xc3\xa9.txt", "wb") as handle:
+        handle.write(b"same body\n")
+    _commit_all(repo, "splitless")
 
     main = _git(repo, "rev-parse", "main").strip()
     expected = {
         "main": True, "in-main": True, "pick": True, "samepath": False,
-        "newpaths": False, "spaced": True, "quoted": True,
+        "newpaths": False, "spaced": True, "quoted": True, "latin1": False, "splitutf8": True,
     }
 
     def answers() -> dict[str, bool]:
@@ -287,7 +299,7 @@ def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, mon
     decided = git_hygiene_router._decide_without_cherry(keys, main, repo)
     names = {name: verdict for (name, _tip), verdict in decided.items()}
     # Only the branches the cheap facts settle; one whose paths ``main`` also changed, or whose path git quotes, is left to cherry.
-    assert names == {"main": True, "in-main": True, "newpaths": False}
+    assert names == {"main": True, "in-main": True, "newpaths": False, "latin1": False}
 
     # No common ancestor with main: the decision stands aside and cherry answers for every branch.
     _git(repo, "checkout", "--orphan", "unrelated")
