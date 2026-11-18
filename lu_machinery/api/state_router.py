@@ -2266,7 +2266,7 @@ def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> 
     schedule_cache_refresh(health_key, 0.0, _scan)
     if stored is None:
         return payload
-    health, _age_s = stored
+    health = cast(LaneHealthScan, stored[0])
     agents = {}
     for lane, info in payload["agents"].items():
         if isinstance(info, dict) and isinstance(info.get("health"), dict):
