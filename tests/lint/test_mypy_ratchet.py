@@ -129,6 +129,7 @@ def test_complete_analysis_prunes_stale_entries_atomically(tmp_path: Path) -> No
     root, baseline, real = _scripts_tree(tmp_path, _BAD)
     stale = MypyError("scripts/gone.py", "misc", "fixed long ago")
     write_baseline(baseline, [real, stale])
+    baseline.chmod(0o640)  # not the temp file's owner-only mode, so a rewrite must carry it over
     mode = baseline.stat().st_mode
 
     assert prune_baseline(root, baseline) == (1, [])

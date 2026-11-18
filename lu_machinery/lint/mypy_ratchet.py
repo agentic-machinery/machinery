@@ -39,6 +39,7 @@ import importlib.metadata
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -636,13 +637,16 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
         ],
     }
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    # A new file keeps mkstemp's owner-only mode; a rewrite keeps the mode it had.
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temp, path.stat().st_mode & 0o777 if path.exists() else 0o644)
         os.replace(temp, path)
     except BaseException:
         Path(temp).unlink(missing_ok=True)
