@@ -6,8 +6,8 @@ import argparse
 from pathlib import Path
 
 import pytest
-from lu_machinery.session_canary import codex_lane
 
+from lu_machinery.session_canary import codex_lane
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -193,7 +193,7 @@ def test_hydrate_uses_exact_registered_provider_identity(monkeypatch, capsys, tm
     # A local roster exercises provider slots without changing live eligibility.
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(f"assignments:\n  core:\n    slots: [{provider}-core]\n", encoding="utf-8")
-    monkeypatch.setattr(handoff_slot_registry._channels, "ASSIGNMENTS_PATH", roster)
+    monkeypatch.setattr(handoff_slot_registry.agent_identity, "ASSIGNMENTS_PATH", roster)
     identity = {
         "registered": f"{provider}-core",
         "removed": f"{provider}-infra",
@@ -227,7 +227,7 @@ def test_hydrate_refuses_slot_when_registry_unavailable(monkeypatch, capsys, tmp
     from lu_machinery.session_canary import gemini_lane
 
     lane = {"codex": codex_lane, "gemini": gemini_lane}[provider]
-    monkeypatch.setattr(handoff_slot_registry._channels, "ASSIGNMENTS_PATH", tmp_path / "missing.yaml")
+    monkeypatch.setattr(handoff_slot_registry.agent_identity, "ASSIGNMENTS_PATH", tmp_path / "missing.yaml")
     monkeypatch.setenv("SESSION_STREAM_AGENT", f"{provider}-core")
     monkeypatch.setattr(
         lane.shared_hydration,

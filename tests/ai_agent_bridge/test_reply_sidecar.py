@@ -7,9 +7,10 @@ import sqlite3
 from unittest.mock import patch
 
 import pytest
+
 from lu_machinery.ai_agent_bridge import _reply_sidecar
 from lu_machinery.ai_agent_bridge._ask_lifecycle import assert_ask_content_present
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
@@ -67,6 +68,7 @@ def test_ask_query_never_sidecared(tmp_path, monkeypatch):
 
 
 def test_send_message_large_response_records_sidecar_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     from lu_machinery.ai_agent_bridge import _messaging
 
     monkeypatch.setenv("AB_REPLY_INLINE_MAX_BYTES", "100")

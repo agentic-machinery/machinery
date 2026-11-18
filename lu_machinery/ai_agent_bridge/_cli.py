@@ -163,6 +163,11 @@ def interactive_mode():
 
 def _dispatch_interactive(action: str, parts: list[str]):
     """Dispatch a single interactive mode command."""
+    if action in {"send", "process"}:
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            return _retired_legacy_write(action)
     if action == "inbox":
         agent = parts[1] if len(parts) > 1 else "gemini"
         check_inbox(agent)
@@ -189,6 +194,9 @@ def process_all_gemini(model: str | None = None):
     participant (#6915); a message is consumed only when the routed seat
     replies successfully, so failures stay in the inbox for retry.
     """
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -237,6 +245,9 @@ def process_all_gemini(model: str | None = None):
 
 def process_all_claude(new_session: bool = False):
     """Process ALL unread messages for Claude in batch (headless)."""
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -285,6 +296,9 @@ def process_all_claude(new_session: bool = False):
 
 def process_all_codex(new_session: bool = False):
     """Process ALL unread messages for Codex in batch (ordinary rows via ACP)."""
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -600,7 +614,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # read
     read_parser = subparsers.add_parser("read", help="Read a specific message")
-    read_parser.add_argument("message_id", type=int, help="Message ID to read")
+    read_parser.add_argument("message_id", help="Fleet job ID or historical integer message ID to read")
 
     # send
     send_parser = subparsers.add_parser("send", help="Send message to another agent")
@@ -730,7 +744,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # process-ask is the detached-worker re-entry point for ``ask-* --background``.
     proc_ask_parser = subparsers.add_parser("process-ask", help=argparse.SUPPRESS)
-    proc_ask_parser.add_argument("message_id", type=int)
+    proc_ask_parser.add_argument("message_id", help="Fleet job ID, or a historical integer ask ID")
     proc_ask_parser.add_argument("target")
 
     asks_parser = subparsers.add_parser("asks", help="List tracked one-shot ask lifecycle states")
@@ -1381,6 +1395,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _dispatch_command(args):
     """Dispatch parsed CLI arguments to the appropriate handler."""
+    legacy_process = args.command == "process" or (
+        args.command is not None and args.command.startswith("process-") and args.command != "process-ask"
+    ) or (args.command == "process-ask" and args.target not in {"opencode", "pool", "glm", "gemma"}) or (
+        args.command == "asks" and getattr(args, "watchdog", False)
+    )
+    if legacy_process:
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            raise SystemExit(_retired_legacy_write(args.command))
     if args.command == "serve":
         if not args.openai:
             raise SystemExit("serve currently requires --openai")
@@ -1404,8 +1428,17 @@ def _dispatch_command(args):
             sys.exit(rc)
         check_inbox(args.for_llm or "gemini")
     elif args.command == "read":
-        read_message(args.message_id)
+        if str(args.message_id).startswith("authority-job_"):
+            from ._opencode import read_opencode_result
+
+            print(json.dumps(read_opencode_result(args.message_id), sort_keys=True))
+        else:
+            read_message(int(args.message_id))
     elif args.command == "send":
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            raise SystemExit(_retired_legacy_write("send"))
         data = None
         if args.data:
             data = Path(args.data).read_text()
@@ -2139,7 +2172,9 @@ def main():
         _maybe_print_backlog_warnings(_resolve_backlog_warn_agent(args))
     # The notices are read query-only and marked shown only once the command
     # succeeds, so a command its own handler refuses leaves the rows as they were.
-    notices = print_timeout_notice() if args.command is not None else []
+    from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
+
+    notices = print_timeout_notice() if args.command is not None and resolve_plane_mode() != "authority" else []
     try:
         handled = _dispatch_command(args)
     except SystemExit as exc:

@@ -5,12 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 from lu_machinery.secret_redactor import REDACTION, redact_text, redact_value
 
 
 @pytest.fixture
-def msg_db(tmp_path):
+def msg_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     db_path = tmp_path / "msg.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("""CREATE TABLE messages (

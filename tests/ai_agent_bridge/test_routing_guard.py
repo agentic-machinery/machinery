@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 import pytest
+
 from lu_machinery.ai_agent_bridge.routing_guard import (
     RoutingGuardError,
     assert_agent_routing_allowed,
@@ -20,9 +21,6 @@ def _no_override(monkeypatch: pytest.MonkeyPatch):
 @pytest.mark.parametrize(
     "model",
     [
-        "openrouter/google/gemma-4-31b-it",  # google/ but NOT gemini — no subscription lane
-        "google-ais/gemma-4-31b-it",  # $0 default lane (Gemma has no paid SKU)
-        "GOOGLE-AIS/GEMMA-4-31B-IT",
         "deepseek/deepseek-v4-pro",
         "gemini-3.1-pro-high",  # agy NATIVE lane (no openrouter/ prefix) is the subscription path
         "zai/glm-5.3-flash",
@@ -114,6 +112,9 @@ def test_openrouter_glm_retirement_cannot_be_overridden(monkeypatch) -> None:
 @pytest.mark.parametrize(
     "model",
     [
+        "openrouter/google/gemma-4-31b-it",  # google/ but NOT gemini — no subscription lane
+        "google-ais/gemma-4-31b-it",  # $0 default lane (Gemma has no paid SKU)
+        "GOOGLE-AIS/GEMMA-4-31B-IT",
         "deepseek/deepseek-flash",
         "claude-opus-4.8",  # native Anthropic lane
         "gpt-5.5",  # native codex lane

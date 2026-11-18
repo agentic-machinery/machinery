@@ -557,6 +557,11 @@ def process_for_agy(
     ``--conversation=<session_id>`` to resume a prior turn; today the
     bridge is single-shot.
     """
+    from ._messaging import require_legacy_message_writes
+
+    if review:
+        raise ValueError(AGY_SEALED_REVIEW_UNSUPPORTED)
+    require_legacy_message_writes()
     msg = _fetch_agy_message(message_id)
     if not msg:
         return
@@ -570,10 +575,6 @@ def process_for_agy(
         effort=effort,
         reason="the Antigravity CLI has no per-invocation effort control",
     )
-
-    if review:
-        # Defense in depth: process-ask may re-enter with review=true.
-        raise ValueError(AGY_SEALED_REVIEW_UNSUPPORTED)
 
     if not stdout_only:
         print(f"📨 Message #{msg['id']}")

@@ -364,11 +364,7 @@ def test_unknown_activity_and_unknown_model():
 
 
 def test_unknown_google_ais_gemma_stays_refused_under_the_routing_override(monkeypatch):
-    """An unknown Gemma spelling of the retired row stays refused when the spend override is set.
-
-    Identity stays None. The retired prefix is what refuses it, before the override.
-    google-ais also refuses an uncatalogued Gemma and a catalog Gemma whose row is not active.
-    """
+    """Only catalogued AIS models pass; holding the kept row still refuses it."""
     from lu_machinery.ai_agent_bridge.routing_guard import RoutingGuardError, assert_model_routing_allowed
 
     unknown_gemma = (
@@ -378,27 +374,20 @@ def test_unknown_google_ais_gemma_stays_refused_under_the_routing_override(monke
     )
     for spelling in unknown_gemma:
         assert canonical_model_id(spelling) is None
-        expected = (
-            f"model {spelling!r} names no catalog model; its prefix "
-            "google-ais/gemma-4-31b-it is retired in the model catalog"
-        )
-        with pytest.raises(RoutingGuardError, match=re.escape(expected)):
+        assert retired_model_refusal(spelling) is None
+    for spelling in (unknown_gemma[0], "google-ais/gemmaX"):
+        with pytest.raises(RoutingGuardError, match=re.escape(unknown_model_refusal(spelling))):
             assert_model_routing_allowed(spelling, context="probe")
-    monkeypatch.setenv("LU_ROUTING_GUARD_OVERRIDE", "1")
-    for spelling in unknown_gemma:
-        with pytest.raises(RoutingGuardError, match="is retired in the model catalog"):
-            assert_model_routing_allowed(spelling, context="probe")
-    for still_retired in (
-        "google-ais/gemma-4-31b-it",
-        "gemma-4-31b-it",
-        "gemma",
+    for retained in (
+        "google-ais/gemma-4-31b-it", "gemma-4-31b-it", "gemma",
         "openrouter/google/gemma-4-31b-it",
     ):
-        with pytest.raises(RoutingGuardError, match="retired in the model catalog"):
-            assert_model_routing_allowed(still_retired, context="probe")
-    monkeypatch.delenv("LU_ROUTING_GUARD_OVERRIDE", raising=False)
-    with pytest.raises(RoutingGuardError, match=re.escape(unknown_model_refusal("google-ais/gemmaX"))):
-        assert_model_routing_allowed("google-ais/gemmaX", context="probe")
+        assert retired_model_refusal(retained) is None
+        assert_model_routing_allowed(retained, context="probe")
+    from lu_machinery.review.model_catalog import activity_role_refusal
+
+    assert activity_role_refusal("google-ais/gemma-4-31b-it", "review") is not None
+    assert activity_role_refusal("google-ais/gemma-4-31b-it", "consult") is not None
     catalog = deepcopy(load_model_catalog())
     catalog["models"]["google-ais/gemma-4-31b-it"]["lifecycle"] = "hold"
     monkeypatch.setattr("lu_machinery.review.model_catalog.load_model_catalog", lambda: catalog)
@@ -979,9 +968,9 @@ def test_retired_model_refusal_admits_non_retired_ids(model):
         ("claude-opus-5-6", "claude-opus-5", "retired"),
         ("claude-sonnet-5-6", "claude-sonnet-5", "retired"),
         ("claude-fable-5-3", "claude-fable-5", "retired"),
-        ("gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "retired"),
-        ("google-ais/gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "retired"),
-        ("openrouter/google/gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "retired"),
+        ("gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "active"),
+        ("google-ais/gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "active"),
+        ("openrouter/google/gemma-4-26b-a4b-it", "google-ais/gemma-4-31b-it", "active"),
         ("composer-2.5-fast", "composer-2.5", "retired"),
         ("gpt-6-astra-extra", "gpt-6-astra", "retired"),
     ],
@@ -990,7 +979,9 @@ def test_retired_model_refusal_refuses_an_unknown_spelling_of_a_retired_or_red_t
     """An unknown extension keeps no identity, and the retired or red-team owner still refuses it."""
     assert canonical_model_id(model) is None
     refusal = retired_model_refusal(model)
-    if kind == "retired":
+    if kind == "active":
+        assert refusal is None
+    elif kind == "retired":
         assert refusal == f"model {model!r} names no catalog model; its prefix {prefix} is retired in the model catalog"
     else:
         assert refusal == (

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import os
 import io
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
 
-
 from lu_machinery.ai_agent_bridge import _channels, _db, _inbox_watch, _messaging
+from tests.ai_agent_bridge.conftest import bridge_wake_dir  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
@@ -22,7 +22,7 @@ def isolate_db(tmp_path: Path):
     """Create an isolated broker database with the current messages schema."""
     db_path = tmp_path / "messages.db"
     with (
-        patch.dict(os.environ, {"AB_DB_PATH": str(db_path)}),
+        patch.dict(os.environ, {"AB_DB_PATH": str(db_path), "FLEET_COMMS_MESSAGE_PLANE": "shadow"}),
     ):
         _db.init_db().close()
         yield db_path
@@ -200,7 +200,8 @@ def legacy_monitor_roster(tmp_path: Path, monkeypatch):
     assignments["assignments"]["monitor"]["slots"] = ["muse-monitor"]
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(yaml.safe_dump(assignments), encoding="utf-8")
-    monkeypatch.setattr(_channels, "ASSIGNMENTS_PATH", roster)
+    from lu_machinery import agent_identity
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     return roster
 
 
@@ -276,9 +277,9 @@ def test_idle_tick_does_not_clear_a_monitor_outage(capsys):
             _inbox_watch.MONITOR_NOT_CONTACTED,
         ]),
         patch.object(_inbox_watch.time, "sleep", side_effect=stop_after_idle),
+        pytest.raises(RuntimeError, match="stop after idle tick"),
     ):
-        with pytest.raises(RuntimeError, match="stop after idle tick"):
-            _inbox_watch.run_live_supervisory_watcher(interval_seconds=0.25)
+        _inbox_watch.run_live_supervisory_watcher(interval_seconds=0.25)
     captured = capsys.readouterr()
     assert captured.err.count("Monitor API unreachable") == 1
     assert "Monitor API recovered" not in captured.err

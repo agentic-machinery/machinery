@@ -593,6 +593,26 @@ _V10_STATEMENTS = (
     )""",
 )
 
+# #513: alert metadata follows its messages into the Fleet authority store.
+_V11_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS bottleneck_alert_state (
+    stream_epic TEXT NOT NULL,
+    span TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 0,
+    rearm_level INTEGER NOT NULL DEFAULT 1,
+    last_alert_age_s REAL,
+    last_alert_at TEXT,
+    message_id TEXT,
+    last_delivery_error TEXT,
+    delivery_failure_reported INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (stream_epic, span)
+)""",
+    """CREATE TABLE IF NOT EXISTS bottleneck_alert_scan_control (
+    control_key TEXT PRIMARY KEY,
+    last_scanned_at TEXT NOT NULL
+)""",
+)
+
 MIGRATIONS = (
     Migration(version=1, name="fleet-comms-v1-contracts", statements=_V1_STATEMENTS),
     Migration(
@@ -636,6 +656,7 @@ MIGRATIONS = (
         name="fleet-comms-v10-v4-runner-attempts",
         statements=_V10_STATEMENTS,
     ),
+    Migration(version=11, name="fleet-comms-v11-alert-consumers", statements=_V11_STATEMENTS),
 )
 
 # During the pre-merge #6159 soak, one development build applied the v5

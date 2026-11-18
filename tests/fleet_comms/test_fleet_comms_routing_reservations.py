@@ -97,14 +97,13 @@ def test_v10_migration_is_idempotent_and_has_authority_tables(tmp_path: Path) ->
 
     The pinned version is deliberately a literal, not ``MIGRATIONS[-1]``
     compared to itself: adding a migration must be a conscious edit here,
-    with the new tables asserted below. Head is 10 since PR #7662 repair 8
-    added runner-owned attempts, the per-attempt capability column/index, and
-    authorship receipts (v10) on top of the V4 execution dispatch binding (v9).
+    with the new tables asserted below. Head is 11 since #513 moved alert
+    lifecycle metadata into the Fleet authority store.
     """
     connection = sqlite3.connect(tmp_path / "comms.sqlite3")
     try:
-        assert apply_migrations(connection) == MIGRATIONS[-1].version == 10
-        assert apply_migrations(connection) == 10, "re-applying the ledger must be an idempotent no-op"
+        assert apply_migrations(connection) == MIGRATIONS[-1].version == 11
+        assert apply_migrations(connection) == 11, "re-applying the ledger must be an idempotent no-op"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"routing_reservations", "routing_reservation_decisions", "routing_circuit_state"} <= tables
         assert {
@@ -114,6 +113,7 @@ def test_v10_migration_is_idempotent_and_has_authority_tables(tmp_path: Path) ->
             "v4_execution_attempts",
             "v4_authorship_receipts",
         } <= tables
+        assert {"bottleneck_alert_state", "bottleneck_alert_scan_control"} <= tables
         # The V4 authority tables must carry the columns their writers rely
         # on, including the repair-7 request correlation used to derive an
         # observation's verification tool ids and to audit provenance.

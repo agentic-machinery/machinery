@@ -381,6 +381,9 @@ def launch_background_ask(message_id: int, target: str, options: dict[str, Any])
     print the success banner — callers that key on return value / stdout must
     not treat a dead worker as a successful dispatch.
     """
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     task_key = str(message_id)
     log_dir = state_root() / ".mcp" / "servers" / "message-broker" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -410,7 +413,7 @@ def launch_background_ask(message_id: int, target: str, options: dict[str, Any])
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,
-                cwd=str(_config.REPO_ROOT),
+                cwd=str(state_root()),
                 env=_config._PARENT_ENV,
                 start_new_session=True,
             )
@@ -544,13 +547,21 @@ def _stored_reply_is_useful(reply_id: int) -> bool:
         conn.close()
 
 
-def process_background_ask(message_id: int, target: str) -> None:
+def process_background_ask(message_id: int | str, target: str) -> None:
     """Run one detached ask worker and leave a terminal lifecycle status.
 
     A Kimi target exits with the refusal before the broker is opened; a
     stored message addressed to a Kimi seat or model is skipped right after
     the read, before any lifecycle record (``skip_stored_kimi_row``).
     """
+    if target in {"opencode", "pool", "glm", "gemma"}:
+        from ._opencode import process_for_opencode
+
+        process_for_opencode(str(message_id), target=target)
+        return
+    from ._messaging import require_legacy_message_writes
+
+    message_id = int(message_id)
     from lu_machinery.agent_runtime.retired_seat_admission import KimiAdmissionRefused
 
     from ._acp_compat import refuse_kimi_compat
@@ -560,6 +571,7 @@ def process_background_ask(message_id: int, target: str) -> None:
         refuse_kimi_compat(target)
     except KimiAdmissionRefused as exc:
         raise SystemExit(f"❌ {exc}") from exc
+    require_legacy_message_writes()
     msg = read_message(message_id, quiet=True)
     if msg and skip_stored_kimi_row(msg, message_id, target):
         return
@@ -611,6 +623,13 @@ def process_background_ask(message_id: int, target: str) -> None:
 
 def print_asks(task_id: str | None = None) -> None:
     """Print recent tracked asks, optionally restricted to a bridge task."""
+    from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
+
+    if resolve_plane_mode() == "authority":
+        from ._opencode import print_authority_asks
+
+        print_authority_asks(task_id)
+        return
     clauses = ["(status = 'sent' OR status = 'processing' OR status LIKE 'replied:%' OR status LIKE 'timed-out:%' OR status LIKE 'timed-out-notified:%' OR status LIKE 'failed:%')"]
     params: list[str] = []
     if task_id:
@@ -785,6 +804,9 @@ def run_ask_watchdog(target_message_id: int | None = None) -> list[int]:
     without a reply and without a clean terminal record get re-fired with
     'auto-retried': True in metadata. Never silent.
     """
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     retried_ids: list[int] = []
     conn = get_db()
     try:
@@ -955,10 +977,11 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
     the read, before any record, and returns None (``skip_stored_kimi_row``).
     """
     from ._acp_compat import refuse_kimi_compat
-    from ._messaging import read_message
+    from ._messaging import read_message, require_legacy_message_writes
     from ._process import process_message_for_recipient
 
     refuse_kimi_compat(target)
+    require_legacy_message_writes()
     no_timeout = bool(options.get("no_timeout", False))
     review = bool(options.get("review", False))
     new_session = bool(options.get("new_session", False))
@@ -983,7 +1006,7 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
     elif target in {"opencode", "pool", "glm", "gemma"}:
         from ._opencode import process_for_opencode
 
-        process_for_opencode(message_id, target=target, no_timeout=no_timeout, variant=options.get("variant"))
+        process_for_opencode(str(message_id), target=target, no_timeout=no_timeout, variant=options.get("variant"))
     else:
         raise ValueError(f"unsupported background ask target {target!r}")
 
