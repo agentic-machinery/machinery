@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.orchestration.safe_git_context import CANONICAL_ORIGIN, GIT, SafeGitContext, SnapshotRefusal
+from lu_machinery.orchestration.safe_git_context import GIT, SafeGitContext, SnapshotRefusal
 
 
 def git(repo: Path, *args: str) -> str:
@@ -309,9 +309,9 @@ def test_noncanonical_destination_refused(source, tmp_path, url):
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     repo, _remote, _head = source
-    with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
-        SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=url)
     private = load_fleet_repos()["infra-private"]
+    with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
+        SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, repository=private, origin=url)
     with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
         SafeGitContext(
             objects=repo / ".git/objects",
@@ -320,31 +320,33 @@ def test_noncanonical_destination_refused(source, tmp_path, url):
             origin="https://github.com/forged/destination.git",
         )
     with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
-        SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, repository=private)
+        SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path)
 
 
-def test_default_destination_is_driver_pinned(source, tmp_path):
+def test_destination_is_derived_from_the_explicit_registered_repository(source, tmp_path):
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     repo, _remote, _head = source
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path) as safe:
-        assert safe.checked("config", "remote.origin.url") == CANONICAL_ORIGIN
+    repos = load_fleet_repos()
+    machinery = repos["machinery"]
+    machinery_origin = f"https://github.com/{machinery.github}.git"
+    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, repository=machinery) as safe:
+        assert safe.checked("config", "remote.origin.url") == machinery_origin
         assert safe.checked("config", "protocol.allow") == "never"
         assert safe.checked("config", "protocol.https.allow") == "always"
         assert safe.run("config", "protocol.file.allow").returncode == 1
-    private = load_fleet_repos()["infra-private"]
+    private = repos["infra-private"]
     origin = f"https://github.com/{private.github}.git"
     with SafeGitContext(
         objects=repo / ".git/objects",
         temp_root=tmp_path,
         repository=private,
-        origin=origin,
         token="synthetic-driver-identity",
     ) as safe:
         assert safe.checked("config", "remote.origin.url") == origin
         assert safe.repository == private.github
         assert safe.checked("config", f"http.{origin}.extraHeader").startswith("Authorization: Basic ")
-        assert safe.run("config", f"http.{CANONICAL_ORIGIN}.extraHeader").returncode == 1
+        assert safe.run("config", f"http.{machinery_origin}.extraHeader").returncode == 1
 
 
 def test_source_repository_exclusions_are_preserved_as_data(source, tmp_path):

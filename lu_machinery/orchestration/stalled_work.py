@@ -1,7 +1,6 @@
 """Report committed dispatch work awaiting delivery or review fixes (#11212).
 
-Only scan refs, cadence state and explicitly requested Fleet messages are written.
-Task records and dispatch branches are never changed.
+Only cadence state and explicitly requested Fleet messages are written.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ import json
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,8 +23,10 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet.ignored_task_output import succession_streams
+from lu_machinery.fleet.pr_identity import RecordRepositoryRefusal, record_repository
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import stale_task_records as stale
+from lu_machinery.orchestration.fleet_repos import FleetRepo, MissingFleetCheckout, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, TAXONOMY_PATH, _load_yaml
@@ -101,8 +103,8 @@ def load_records(tasks: Path, now: datetime) -> tuple[list[stale.Candidate], lis
     return records, errors
 
 
-def git_value(checkout: Path, args: list[str]) -> str:
-    result = stale._git(args, cwd=checkout, timeout=30)
+def git_value(checkout: Path, args: list[str], *, stdin: str | None = None) -> str:
+    result = stale._git(args, cwd=checkout, timeout=30, stdin=stdin)
     if result is None or result.returncode:
         raise RuntimeError("git evidence unavailable: " + args[0])
     return result.stdout.strip()
@@ -121,14 +123,31 @@ def finished(candidate: stale.Candidate) -> datetime:
     return stale._parse_ts(candidate.record.get("finished_at")) or datetime.fromtimestamp(candidate.mtime_ns / 1e9, UTC)
 
 
-def scan(tasks: Path, checkouts: dict[str, Path], *, now: datetime, adapter_factory=GitHubAdapter) -> dict[str, Any]:
+def scan(
+    tasks: Path,
+    checkouts: Mapping[str, Path | None],
+    *,
+    repos: Mapping[str, FleetRepo],
+    now: datetime,
+    adapter_factory=GitHubAdapter,
+) -> dict[str, Any]:
     """Use batched fresh remote refs, complete open PRs, and trusted exact-head verdicts."""
     candidates, errors = load_records(tasks, now)
     lanes = owner_lanes()
     rows: list[dict[str, Any]] = []
-    terminal_count = sum(
-        c.record.get("status") in TERMINAL and c.record.get("repository") in checkouts for c in candidates
-    )
+    groups: dict[str, list[stale.Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        record = candidate.record
+        try:
+            slug = record_repository(record, repos)
+        except RecordRepositoryRefusal as exc:
+            if record.get("worktree_branch") or record.get("review_branch") or record.get("pr"):
+                errors.append(f"{candidate.task_id}: {exc.code}")
+            continue
+        # The reused classifier expects its input's repository field to be the slug.
+        record["repository"] = slug
+        groups[slug].append(candidate)
+    terminal_count = 0
     open_count = 0
 
     def add(candidate, kind, commit, since, pr=None):
@@ -146,9 +165,13 @@ def scan(tasks: Path, checkouts: dict[str, Path], *, now: datetime, adapter_fact
         )
 
     for slug, checkout in checkouts.items():
-        group = [c for c in candidates if c.record.get("repository") == slug]
+        group = groups[slug]
         terminal = [c for c in group if c.record.get("status") in TERMINAL]
         live = [c for c in group if c.record.get("status") not in TERMINAL]
+        terminal_count += len(terminal)
+        if checkout is None:
+            errors.append(f"{slug}: missing_fleet_checkout")
+            continue
         facts = stale.collect_repo_facts(slug, checkout, stale.fleet_fetch_target(slug))
         if facts.error or facts.fetch_error:
             errors.append(f"{slug}: git repository evidence unavailable")
@@ -164,12 +187,19 @@ def scan(tasks: Path, checkouts: dict[str, Path], *, now: datetime, adapter_fact
         by_branch = {pr["headRefName"]: pr for pr in prs}
         pending_prs = []
         # Cache reachability across reused worktrees and repeated task records.
-        reachability: dict[tuple[str, str], str] = {}
+        reachability: dict[tuple[str, tuple[str, ...]], str] = {}
+        remote_heads = facts.remote_heads or {}
+        published_tips = tuple(sorted(set(remote_heads.values())))
 
-        def ahead(tip, exclusion, reachability=reachability, checkout=checkout):
-            key = (tip, exclusion)
+        def ahead(tip, exclusions, reachability=reachability, checkout=checkout):
+            if tip in exclusions:
+                return ""
+            key = (tip, exclusions)
             if key not in reachability:
-                reachability[key] = git_value(checkout, ["rev-list", "--max-count=1", tip, "--not", exclusion, "--"])
+                reachability[key] = git_value(
+                    checkout, ["rev-list", "--max-count=1", tip, "--stdin"],
+                    stdin="".join(f"^{sha}\n" for sha in exclusions),
+                )
             return reachability[key]
 
         for c in terminal:
@@ -195,21 +225,24 @@ def scan(tasks: Path, checkouts: dict[str, Path], *, now: datetime, adapter_fact
                         if sha in (facts.local_branches or {}).values()
                     )
                     for tip in dict.fromkeys(tips):
-                        unpushed = ahead(tip, f"--glob={facts.target.ref_prefix}/*")
+                        unpushed = ahead(tip, published_tips)
                         if unpushed:
                             add(c, "unpushed", unpushed, since)
                             break
                 if unpushed:
                     continue
-                remote = (facts.remote_heads or {}).get(branch)
+                remote = remote_heads.get(branch)
                 # Already landed branches are cleanup debt, not stalled work.
                 if (
                     remote
                     and branch not in by_branch
                     and c.age_days * 86400 > GRACE_SECONDS
-                    and ahead(remote, f"{facts.target.ref_prefix}/main")
                 ):
-                    pending_prs.append((c, remote, since))
+                    main = remote_heads.get("main")
+                    if main is None:
+                        raise RuntimeError("remote_main_unavailable")
+                    if ahead(remote, (main,)):
+                        pending_prs.append((c, remote, since))
             except RuntimeError as exc:
                 errors.append(f"{c.task_id}: {exc}")
 
@@ -298,8 +331,16 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
 
 
 def run(args, *, now: datetime) -> dict[str, Any]:
-    repository = next(repo.github for repo in stale.fleet_repos.load_fleet_repos().values() if repo.default)
-    report = scan(args.tasks_dir, {repository: state_root()}, now=now)
+    repos = load_fleet_repos()
+    primary = state_root()
+    checkouts: dict[str, Path | None] = {}
+    for key, repo in repos.items():
+        try:
+            _, checkout = resolve_fleet_repo(key, primary_root=primary, repos=repos)
+        except MissingFleetCheckout:
+            checkout = None
+        checkouts[repo.github] = checkout
+    report = scan(args.tasks_dir, checkouts, repos=repos, now=now)
     if args.route and not report["errors"]:
         with AuthorityService(root=None) as service:
             report["messages"] = route(report, cycle=int(now.timestamp()) // args.cadence_seconds, service=service)
@@ -341,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
   .venv/bin/python -m {_MODULE} stalled --route
   .venv/bin/python -m {_MODULE} stalled --tick
 Outputs: JSON on stdout; --route enqueues Fleet requests; --tick writes cadence state.
-Fresh Git scan refs are fetched; no task records or dispatch branches are written.
+Git reads remote heads without fetching scan refs or changing task records or dispatch branches.
 Exit codes: 0 complete or cadence skip; 1 incomplete evidence; 2 invalid usage/config.
 Related: #11212; docs/runbooks/stalled-work.md; stale_task_records.py
 """,

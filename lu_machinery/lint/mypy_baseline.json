@@ -4673,16 +4673,6 @@
       "message": "Returning Any from function declared to return \"CompletedProcess[str]\""
     },
     {
-      "path": "lu_machinery/fleet/pr_owner_check.py",
-      "code": "index",
-      "message": "Invalid index type \"Any | None\" for \"Mapping[str, FleetRepo]\"; expected type \"str\""
-    },
-    {
-      "path": "lu_machinery/fleet/pr_owner_check.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bool\""
-    },
-    {
       "path": "lu_machinery/fleet/quota_history.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
@@ -6844,11 +6834,6 @@
     },
     {
       "path": "lu_machinery/orchestration/pr_ownership.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | bool\""
-    },
-    {
-      "path": "lu_machinery/orchestration/pr_ownership.py",
       "code": "var-annotated",
       "message": "Need type annotation for \"handoff\""
     },
@@ -6921,16 +6906,6 @@
       "path": "lu_machinery/orchestration/stalled_work.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"bool\""
-    },
-    {
-      "path": "lu_machinery/orchestration/stalled_work.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"FetchTarget | None\" has no attribute \"ref_prefix\""
-    },
-    {
-      "path": "lu_machinery/orchestration/stalled_work.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"FetchTarget | None\" has no attribute \"ref_prefix\""
     },
     {
       "path": "lu_machinery/orchestration/task_closeout.py",

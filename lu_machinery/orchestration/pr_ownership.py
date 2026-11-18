@@ -47,6 +47,7 @@ if __package__ in (None, ""):
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.task_store_paths import tasks_dir
+from lu_machinery.fleet.pr_identity import supervisor_liveness as liveness
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -67,7 +68,6 @@ CTO_CHANNEL = "cto"
 SENDER = "merge-queue-keeper"
 TASK_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 HISTORY_LIMIT = 200
-_ACTIVE = {"spawning", "running"}
 # Compiled at the call. A module-level ``re.compile`` plus a later method call is one
 # Semgrep match spanning every byte in between, so an edit in that span is a new finding.
 
@@ -468,35 +468,6 @@ class Finding:
     pr_state: str | None = None
 
 
-def liveness(record: Mapping[str, Any] | None) -> bool | None:
-    """True for a live supervisor, False for a finished task or a provably gone or replaced
-    supervisor, None when the record or the host gives no identity to observe.
-
-    The identity is the one ``scripts.dispatcher.worker`` records (boot id and process
-    start time), read here so that an unreadable source stays unknown instead of gone.
-    """
-    if record is None or record.get("status") not in _ACTIVE:
-        return False
-    pid, started = record.get("pid"), record.get("process_start")
-    if not pid or not started:
-        return None
-    try:
-        stat = Path(f"/proc/{int(pid)}/stat").read_text()
-    except FileNotFoundError:
-        return None if not Path("/proc/self/stat").exists() else False
-    except (OSError, ValueError, TypeError):
-        return None
-    try:
-        fields = stat.rsplit(")", 1)[1].split()
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        start_ticks = fields[19]
-    except (OSError, IndexError):
-        return None
-    if fields[0] == "Z":
-        return False
-    return f"{boot}:{start_ticks}" == started
-
-
 def _head_commit(pr: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """The commit at ``headRefOid``. With no oid, the last commit. Never a different oid."""
     commits = pr.get("commits")
@@ -590,9 +561,11 @@ def findings(
     candidate owner is live or unobservable; with an unobservable one it is unknown.
     """
     from lu_machinery.fleet import pr_owner_check as check
+    from lu_machinery.fleet.pr_identity import RecordRepositoryRefusal, record_repository
 
     by_id = {record.get("task_id"): record for record in records if record.get("task_id")}
     successors = {}
+    unbound_trailers: dict[tuple[str, int], str] = {}
     unobservable: set[tuple[str, int]] = set()
     seated = list(records)
     for slug, prs in open_prs.items():
@@ -601,7 +574,11 @@ def findings(
             record = by_id.get(handoffs.get(key))
             if record is not None:
                 successors[key] = record
-                seated.append({**record, "repository": slug, "worktree_branch": pr.get("headRefName")})
+                # Custody is already bound to this PR, including its repository.
+                seated.append({
+                    **record, "repository": slug, "repository_id": None, "repo": None,
+                    "worktree_branch": pr.get("headRefName"),
+                })
             if pr.get("isCrossRepository"):
                 continue
             branch = pr.get("headRefName")
@@ -609,24 +586,33 @@ def findings(
                 continue
             for task_id in _head_task_ids(pr):
                 named = by_id.get(task_id)
-                if named is None or check._record_repository(named, repos) != slug.casefold():
+                if named is None:
                     continue
                 state = live(named)
                 if state is False:
+                    continue
+                try:
+                    named_repo = record_repository(named, repos)
+                except RecordRepositoryRefusal as exc:
+                    unbound_trailers[key] = exc.code
+                    continue
+                if named_repo.casefold() != slug.casefold():
                     continue
                 seated.append({**named, "worktree_branch": branch})
                 if state is None:
                     unobservable.add(key)
     strict = check.evaluate(open_prs, seated, repos, lambda record: live(record) is True)
-    lenient = {(f.repo, f.number) for f in check.evaluate(open_prs, seated, repos, lambda r: live(r) is not False)}
+    lenient = {(f.repo, f.number): f for f in check.evaluate(open_prs, seated, repos, lambda r: live(r) is not False)}
     result = []
     for row in strict:
         key = (row.repo.casefold(), row.number)
         successor = live(successors[key]) if key in successors else False
         if successor is True:
             continue  # the owner check never seats a task on a fork PR's branch
-        unknown = (row.repo, row.number) not in lenient or successor is None or key in unobservable
-        reason = "an owner is active but its supervisor cannot be observed (unknown)" if unknown else row.reason
+        possible = lenient.get((row.repo, row.number))
+        binding_reason = possible.reason if possible is not None and possible.unknown else unbound_trailers.get(key)
+        unknown = binding_reason is not None or possible is None or successor is None or key in unobservable
+        reason = binding_reason or ("an owner is active but its supervisor cannot be observed (unknown)" if unknown else row.reason)
         result.append(Finding(row.repo, row.number, row.branch, reason, row.last_task, unknown))
     return result
 
@@ -654,14 +640,14 @@ def _annotate_findings(
 
 
 def _observe(handoffs: Mapping[tuple[str, int], str]) -> tuple[set[str], dict[str, Finding]]:
-    """Every open PR key and its finding, across the owner check's default fleet repositories."""
+    """Every open PR key and its finding across the registered fleet repositories."""
     from lu_machinery.dispatcher import store
     from lu_machinery.fleet import pr_owner_check as check
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     repos = load_fleet_repos()
     records = store.list_tasks(strict=True)
-    open_prs = {repos[k].github: check.fetch_open_prs(repos[k].github) for k in check.DEFAULT_REPO_KEYS}
+    open_prs = check.fetch_fleet_open_prs(repos)
     open_prs = _with_head_commits(open_prs, records, repos)
     rows = _annotate_findings(findings(open_prs, records, repos, handoffs), open_prs)
     keys = {pr_key(slug, int(pr["number"])) for slug, prs in open_prs.items() for pr in prs}
@@ -833,18 +819,21 @@ def accept(
         if previous and not decision_custody(previous) else {}
     )
 
-    def owns(record: Mapping[str, Any]) -> bool:
+    def ownership(record: Mapping[str, Any]) -> bool | None:
         target = {repo: [{**pr, "number": number}]}
-        return not findings(target, [dict(record)], repos, seated, live=lambda _record: True)
+        rows = findings(target, [dict(record)], repos, seated, live=lambda _record: True)
+        if not rows:
+            return True
+        return None if rows[0].unknown else False
 
     if custody and not (
-        (record := by_id.get(predecessor)) is not None and owns(record) and live(record) is True
+        (record := by_id.get(predecessor)) is not None and ownership(record) is True and live(record) is True
     ):
         raise OwnershipError("queue custody needs the PR's live owner that is waiting in the queue (--from)")
     blocking = sorted(
         record["task_id"] for record in records
         if record.get("task_id") not in {successor, predecessor}
-        and live(record) is not False and owns(record)
+        and live(record) is not False and ownership(record) is not False
     )
     if blocking:
         raise OwnershipError(f"one owner at a time: {', '.join(blocking)} may still own this PR")
