@@ -2551,10 +2551,16 @@ async def routing_budget(
     return _routing_budget_response(payload)
 
 
+# One startup-phase flag per context, keyed like that context's routing-budget cache.
+_routing_budget_warming_flags: dict[str, threading.Event] = {}
+_routing_budget_warming_lock = threading.Lock()
+
+
 def _routing_budget_warming(ctx: MonitorContext) -> threading.Event:
     """Set from the start of this context's startup warmup until its first routing-budget attempt finishes."""
-    warming: threading.Event = ctx.runtime.get_or_create_derived("routing-budget-warming", threading.Event)
-    return warming
+    key = _ctx_cache_key(ctx, "routing-budget-warming")
+    with _routing_budget_warming_lock:
+        return _routing_budget_warming_flags.setdefault(key, threading.Event())
 
 
 def routing_budget_startup_begins(ctx: MonitorContext) -> None:
