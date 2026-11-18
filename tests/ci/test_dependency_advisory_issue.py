@@ -70,6 +70,7 @@ def test_collect_python_findings() -> None:
         {
             "ecosystem": "python",
             "package": "urllib3",
+            "locked_version": "1.26.0",
             "advisory_id": "PYSEC-2023-0001",
             "severity": "unknown",
             "fixed_version": "1.26.18, 2.0.7",
@@ -77,6 +78,7 @@ def test_collect_python_findings() -> None:
         {
             "ecosystem": "python",
             "package": "urllib3",
+            "locked_version": "1.26.0",
             "advisory_id": "GHSA-XXXX-YYYY-ZZZZ",
             "severity": "unknown",
             "fixed_version": "none",
@@ -126,6 +128,13 @@ def test_build_issue_body_escapes_pipes_and_newlines() -> None:
     )
     assert "pkg\\|evil name" in body
     assert "\nname" not in body
+
+    report = _pip_report()
+    dependency = report["dependencies"][1]
+    report["dependencies"].append({**dependency, "version": "1.25.0"})
+    issue = helper.build_issue_body(helper.collect_python_findings(report))
+    assert "| urllib3==1.25.0 | PYSEC-2023-0001 |" in issue
+    assert "| urllib3==1.26.0 | PYSEC-2023-0001 |" in issue
 
 
 def test_collect_npm_findings_reports_effective_package_severity() -> None:

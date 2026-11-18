@@ -380,8 +380,8 @@ def _run_steps(
         ["snapfuse", str(work / "candidate.squashfs"), str(mount), "-o", "ro"],
         # The candidate's runtime closure from its own uv.lock, as release_cut exports it.
         ["uv", "export", "--locked", "--quiet", "--format", "requirements.txt", "--no-emit-project",
-         "--no-default-groups", "--all-extras", "--no-extra", "test", "--project", str(mount),
-         "--output-file", str(work / "runtime-requirements.txt")],
+         "--no-default-groups", "--all-extras", "--no-extra", "test",
+         "--project", str(mount), "--output-file", str(work / "runtime-requirements.txt")],
         [str(interpreter), "-I", "-m", "venv", str(work / "consumer")],
         [python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
          "--require-hashes", "--only-binary=:all:", *(["--find-links", wheelhouse] if wheelhouse else []),

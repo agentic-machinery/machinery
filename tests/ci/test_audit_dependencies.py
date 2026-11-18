@@ -204,6 +204,7 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
     runtime.rmdir()
     runtime.symlink_to(runtime.name)
     assert audit_python(tmp_path, ignore_file) == 1
+    assert audit_python(runtime, ignore_file) == 1
     mock_run.assert_not_called()
 
 

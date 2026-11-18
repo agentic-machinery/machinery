@@ -415,6 +415,9 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     ]
     assert f"sha256:{digest}" in cut.git(product, "show", "HEAD:uv.lock")
     assert cut.git(product, "log", "-1", "--format=%B").endswith("X-Agent: claude/claude-cto")
+    (product / "uv.lock").write_text('package = "invalid"\n', encoding="utf-8")
+    with pytest.raises(CutError, match="uv.lock package must be an array of tables"):
+        release_cut.wheel_only_requirements("", product / "uv.lock")
 
 
 def _released_history(tmp_path, commits, releases):
@@ -605,18 +608,26 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
     )
     publisher.chmod(0o755)
     primary = _host(monkeypatch, tmp_path, publisher)
+    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
 
     def execute(cut):
-        cut.step = "Node provisioning"
-        raise CutError("Unsafe Node dependency artifact")
+        cut.tag_pushed = True
+        cut.step = "adopt PR"
+        release_cut.adopt_manifest("tool = []\n", "https://example.invalid/releases/download", "0.1.23")
+
+    def cleanup(_cut, failed_step):
+        assert failed_step == "adopt PR"
+        return "fixture pre-release withdrawn"
 
     monkeypatch.setattr(release_cut, "execute", execute)
-    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
+    monkeypatch.setattr(Cut, "clean_up", cleanup)
+    assert main(["cut", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
     assert "alert to claude-cto failed" not in capsys.readouterr().err
     toplevel, argv, body = record.read_text(encoding="utf-8").split("\n", 2)
     assert Path(toplevel).resolve() == primary.resolve()
     assert "channel publish cto - --sender release-cut --source release --recipient claude-cto" in argv
-    assert body.startswith("release-cut FAILED (dry run) at Node provisioning: Unsafe Node dependency artifact")
+    assert body.startswith("release-cut FAILED (cut) at adopt PR: pyproject.toml tool must be a table")
+    assert "fixture pre-release withdrawn" in body
 
 
 def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeypatch, tmp_path):

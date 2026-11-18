@@ -330,9 +330,25 @@ def heredoc(text: str, opener: str) -> str:
     raise CutError(f"heredoc {opener!r} not found")
 
 
+def _uv_packages(lock: Path) -> list[dict]:
+    try:
+        packages = tomllib.loads(lock.read_text(encoding="utf-8")).get("package")
+    except (OSError, ValueError) as exc:
+        raise CutError(f"cannot read the uv lock ({type(exc).__name__})") from exc
+    if not isinstance(packages, list) or not all(isinstance(package, dict) for package in packages):
+        raise CutError("uv.lock package must be an array of tables")
+    for package in packages:
+        wheels = package.get("wheels", [])
+        if not isinstance(package.get("name"), str) or not isinstance(wheels, list) or any(
+            not isinstance(wheel, dict) or not isinstance(wheel.get("hash"), str) for wheel in wheels
+        ):
+            raise CutError("uv.lock has an invalid package name or wheel record")
+    return packages
+
+
 def wheel_only_requirements(exported: str, lock: Path) -> str:
     """Keep wheel hashes in the legacy consumer lock that is used by pip."""
-    packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+    packages = _uv_packages(lock)
     wheel_hashes = {wheel["hash"] for package in packages for wheel in package.get("wheels", [])}
     pins = []
     for stanza in exported.replace("\\\n", " ").splitlines():
@@ -346,18 +362,28 @@ def wheel_only_requirements(exported: str, lock: Path) -> str:
     return "\n".join(pins) + "\n"
 
 
+def _manifest_table(container: dict, key: str) -> dict:
+    table = container.get(key, {})
+    if not isinstance(table, dict):
+        raise CutError(f"pyproject.toml {key} must be a table")
+    return table
+
+
 def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str]:
     """Update one release wheel source and any matching exact version constraints."""
     manifest = tomllib.loads(text)
-    source = manifest.get("tool", {}).get("uv", {}).get("sources", {}).get("lu-machinery")
+    uv = _manifest_table(_manifest_table(manifest, "tool"), "uv")
+    source = _manifest_table(uv, "sources").get("lu-machinery")
     if not isinstance(source, dict) or not isinstance(old_url := source.get("url"), str):
         raise CutError("pyproject.toml must declare one lu-machinery wheel URL")
     old = re.fullmatch(re.escape(release_base) + r"/v(\d+\.\d+\.\d+)/lu_machinery-\1-py3-none-any\.whl", old_url)
     if old is None or text.count(old_url) != 1:
         raise CutError("pyproject.toml must declare one lu-machinery wheel URL from this release repository")
-    project = manifest.get("project", {})
-    groups = [project.get("dependencies", []), *project.get("optional-dependencies", {}).values(),
-              *manifest.get("dependency-groups", {}).values()]
+    project = _manifest_table(manifest, "project")
+    groups = [project.get("dependencies", []), *_manifest_table(project, "optional-dependencies").values(),
+              *_manifest_table(manifest, "dependency-groups").values()]
+    if not all(isinstance(group, list) for group in groups):
+        raise CutError("pyproject.toml dependency groups must be arrays")
     new_url = f"{release_base}/v{version}/lu_machinery-{version}-py3-none-any.whl"
     updated = text.replace(old_url, new_url)
     replacements: dict[str, str] = {}
@@ -594,10 +620,8 @@ class Cut:
         self.step = "wheelhouse"
         house = self.work / "wheelhouse"
         house.mkdir()
-        # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
-        # group or test extra. The legacy consumer lock permits only wheels, including when used without the
-        # release wheelhouse. --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
-        # required-version refuses any other uv release.
+        # Export core and the runtime extras with hashes, as in CI. The
+        # consumer lock keeps the bare release pin used by product CI.
         uv = shutil.which("uv")
         if uv is None:
             raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
@@ -675,8 +699,7 @@ class Cut:
         updated, url = adopt_manifest(manifest.read_text(encoding="utf-8"), release_base, self.version)
         manifest.write_text(updated, encoding="utf-8")
         self.run([uv, "lock", "--upgrade-package", "lu-machinery", "--no-python-downloads"], cwd=product)
-        packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
-        selected = [package for package in packages if package["name"] == "lu-machinery"]
+        selected = [package for package in _uv_packages(lock) if package["name"] == "lu-machinery"]
         wheel = self.work / "published" / url.rsplit("/", 1)[-1]
         expected_hash = f"sha256:{sha256(wheel)}"
         if (len(selected) != 1 or selected[0].get("version") != self.version
