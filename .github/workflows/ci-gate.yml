@@ -1393,18 +1393,17 @@ jobs:
           # imports in the same venv. Postgres adapters also import in core
           # because the SQLite path can use them without a Postgres driver.
           extra_modules = {
-              "api": (
-                  "lu_machinery.api",
-                  "lu_machinery.ai_agent_bridge.openai_proxy",
-                  "lu_machinery.orchestration.observer_heartbeat",
-              ),
+              "api": ("lu_machinery.api",),
               "mcp": ("lu_machinery.orchestration.trails.trail_mcp",),
               "postgres": (),
               "pytest": (
+                  "lu_machinery.ci.coverage_diff",
+                  "lu_machinery.ci.coverage_ref",
+                  "lu_machinery.ci.coverage_ref_environment",
                   "lu_machinery.ci.data_tier",
                   "lu_machinery.ci.pytest_dispatch_cap",
+                  "lu_machinery.ci.pytest_shards",
                   "lu_machinery.common.pytest_scratch",
-                  "lu_machinery.hygiene.pytest_retention",
               ),
               "test": (),
           }
@@ -1482,6 +1481,73 @@ jobs:
           print(f"{profile}: imported {len(imports) - len(failed)} of {len(imports)} targets ({len(names)} shipped modules).")
           if failed:
               sys.exit(1)
+
+          if profile == "core":
+              import sqlite3
+              from contextlib import closing
+              from importlib.util import find_spec
+              from unittest.mock import patch
+
+              from lu_machinery.agent_runtime.attempt_boundary import DEFAULT_CLAUDE_ACCOUNT
+              from lu_machinery.ci.data_tier import prune_stale_worktrees
+              from lu_machinery.control_plane.storage import Authority
+              from lu_machinery.fleet.claude_account_lane import ClaudeAccount, lane_view
+              from lu_machinery.fleet.usage import read_budget
+              from lu_machinery.hygiene.pytest_retention import sweep_pytest_runs
+              from lu_machinery.ops.verify_run import joined_contracts
+              from lu_machinery.orchestration.curriculum_coordinator import default_health_probe
+              from lu_machinery.work.sources_public import fetch_fleet_reviews, public_repository_id
+
+              # Use a fixed budget and no provider refresh in an isolated wheel install.
+              budget = {"agents": {"codex": {"status": "cool"}}, "api_accounts": {}}
+              with (
+                  patch("lu_machinery.api.state_router.compute_routing_budget", return_value=budget) as compute,
+                  patch("lu_machinery.api.subscription_usage.refresh_provider_usage_data"),
+                  patch("lu_machinery.api.subscription_usage.refresh_api_account_data"),
+              ):
+                  assert read_budget(fresh=True) == {**budget, "source": "in-process-fresh"}
+                  compute.assert_called_once_with(transport="dispatch")
+
+              row = {"status": "ok", "session5h": {"left_pct": 80}, "weekly": {"left_pct": 95}}
+              lane, reason = lane_view(row, {})
+              assert reason is None and lane["status"] == "cool" and lane["remaining_pct"] == 95
+
+              _, routes, _ = joined_contracts()
+              assert any(route.matches("/api/state/routing-budget", "http") for route in routes)
+
+              account = ClaudeAccount(DEFAULT_CLAUDE_ACCOUNT, "builtin")
+              with (
+                  patch("lu_machinery.api.state_router.compute_routing_budget", return_value=budget) as compute,
+                  patch("lu_machinery.fleet.claude_account_lane.resolve_route_account", return_value=account),
+              ):
+                  assert default_health_probe()["agents"]["codex"]["status"] == "cool"
+                  compute.assert_called_once_with(fresh_codexbar=True)
+              print("core: exercised 4 of 4 runtime entry points")
+
+              assert find_spec("pytest") is None and find_spec("psycopg") is None
+              assert callable(sweep_pytest_runs)
+              prune_stale_worktrees(Path.cwd())  # The isolated workspace has no nightly worktrees.
+
+              database = Path.cwd() / "core-fleet.sqlite3"
+              repository = public_repository_id()
+              with closing(sqlite3.connect(database)) as connection, connection:
+                  connection.execute(
+                      "CREATE TABLE formal_review_jobs (review_id TEXT, repository TEXT, pr_number INTEGER, "
+                      "head_sha TEXT, gate_kind TEXT, state TEXT, sealed_verdict_artifact_id TEXT, created_at TEXT)"
+                  )
+                  connection.execute(
+                      "INSERT INTO formal_review_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      ("core-review", repository, 1, "0" * 40, "code", "completed", None, "2026-01-01T00:00:00Z"),
+                  )
+              with (
+                  patch("lu_machinery.api.fleet_router.resolve_context", return_value=object()),
+                  patch("lu_machinery.api.fleet_router._plane_db_path", return_value=database),
+                  patch("lu_machinery.api.fleet_router.storage.resolve_authority", return_value=Authority.SQLITE),
+              ):
+                  section = fetch_fleet_reviews(repository_id=repository)
+              assert section.status == "ok" and section.count == 1
+              assert section.payload["reviews"][0]["review_id"] == "core-review"
+              print("core: loaded both cleanup paths and read one public fleet review from SQLite")
           PY
           mapfile -t project_data < "$work/project.txt"
           cd "$work/scratch"

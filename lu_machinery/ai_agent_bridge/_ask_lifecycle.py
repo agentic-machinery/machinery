@@ -969,7 +969,7 @@ def skip_stored_kimi_row(msg: dict[str, Any], message_id: int, target: str | Non
 
 
 def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bool | None:
-    """Drain ordinary asks via ACP; toolful review remains for agy and opencode-family seats.
+    """Drain ordinary asks via ACP and keep toolful review for OpenCode-family seats.
 
     Ordinary drains return success; review processors retain their None return.
     A Kimi target raises ``KimiAdmissionRefused`` before the broker is opened;
@@ -984,7 +984,6 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
     require_legacy_message_writes()
     no_timeout = bool(options.get("no_timeout", False))
     review = bool(options.get("review", False))
-    new_session = bool(options.get("new_session", False))
     msg = read_message(message_id, quiet=True)
     if msg and skip_stored_kimi_row(msg, message_id, target):
         return None
@@ -999,11 +998,7 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
         if options.get("fire_and_forget"):
             raise ValueError("ordinary process --async is retired; enqueue through fleet-comms")
         return bool(process_message_for_recipient(message_id, no_timeout=no_timeout))
-    if target == "agy":
-        from ._agy import process_for_agy
-
-        process_for_agy(message_id, new_session, no_timeout, review=review)
-    elif target in {"opencode", "pool", "glm", "gemma"}:
+    if target in {"opencode", "pool", "glm", "gemma"}:
         from ._opencode import process_for_opencode
 
         process_for_opencode(str(message_id), target=target, no_timeout=no_timeout, variant=options.get("variant"))

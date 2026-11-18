@@ -105,7 +105,9 @@ uv export --locked --quiet --format requirements.txt --no-emit-project --no-defa
 The `Dependency audit` job audits this export. The `Installed wheel` job uses
 pip `--require-hashes` to install the wheel offline in separate core and
 per-extra environments. It checks those imports on the pinned Python and the
-`requires-python` floor.
+`requires-python` floor. Core still includes FastAPI, Prometheus and their
+dependency floors because routing and verification commands call into the API
+package. The wheel job calls those entry points in the core environment.
 
 ## Cut a release
 

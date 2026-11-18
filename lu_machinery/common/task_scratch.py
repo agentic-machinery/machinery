@@ -75,6 +75,8 @@ from lu_machinery.common.scratch import (
 _JSON_MAX_DEPTH = 128
 
 NAMESPACE_DIRNAME = "task-scratch"
+PYTEST_NAMESPACE_DIRNAME = "pytest-runs"
+PYTEST_RUNS_DIRNAME = "runs"
 LEASE_FILENAME = "lease.json"
 LOCK_FILENAME = "lease.lock"
 PAYLOAD_DIRNAME = "scratch"

@@ -95,9 +95,9 @@ from lu_machinery.common.task_scratch import (
     current_boot_id,
 )
 from lu_machinery.common.task_scratch import NAMESPACE_DIRNAME as LEASE_KIND
+from lu_machinery.common.task_scratch import PYTEST_NAMESPACE_DIRNAME as NAMESPACE
+from lu_machinery.common.task_scratch import PYTEST_RUNS_DIRNAME as RUNS_DIRNAME
 
-NAMESPACE = "pytest-runs"
-RUNS_DIRNAME = "runs"
 PRIVATE_MODE = 0o700
 FALLBACK_PREFIX = "lu-pytest-"
 # Set to 1 to keep the run's scratch after the session for inspection.

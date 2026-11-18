@@ -34,6 +34,8 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from fastapi import HTTPException, Response
+
 from .panel_values import snapshot_headers
 
 if TYPE_CHECKING:
@@ -115,8 +117,6 @@ class PeriodicSnapshot[T]:
         self._join_wake_refresh()
         entry = self._entry
         if entry is None:
-            from fastapi import HTTPException  # noqa: PLC0415  # lazy-ok: only HTTP routes need it
-
             raise HTTPException(
                 status_code=503, detail="snapshot not ready",
                 headers={"X-Snapshot-Age-S": "unknown", "Retry-After": "2", "Cache-Control": "no-store"},
@@ -554,8 +554,6 @@ def swr_route(
     """
 
     def decorate(handler: Callable[..., T]) -> Callable[..., Awaitable[T]]:
-        from fastapi import Response  # noqa: PLC0415  # lazy-ok: only HTTP routes decorate with it
-
         if inspect.iscoroutinefunction(handler):
             raise TypeError(f"swr_route needs a synchronous handler: {handler.__name__}")
         signature = inspect.signature(handler)
