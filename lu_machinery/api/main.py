@@ -20,7 +20,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import wait as wait_for_futures
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,7 +37,6 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import lu_machinery.github_rest_cache as github_rest
 from lu_machinery.agent_runtime.usage import has_headroom
 from lu_machinery.common import json_depth
-from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
 from lu_machinery.common.repo_root import ProductRootError, machinery_path
@@ -489,11 +487,10 @@ def _run_command(
         return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr=str(exc))
 
 
-# The git section is independent reads of one checkout, each a subprocess that
-# spends its time waiting, not computing. Run together they cost the slowest one
-# (a ``git status`` scan) instead of the sum; serially they were ~0.9 s of every
-# cold or expired request, and longer while detached collectors held the GIL.
-_GIT_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="orient-git")
+# The git section's five cheap reads are independent subprocesses that spend
+# their time waiting, not computing. Run together they cost the slowest one
+# instead of the sum, which matters most while detached collectors hold the GIL.
+_GIT_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=5, thread_name_prefix="orient-git")
 
 
 def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
@@ -509,19 +506,6 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
             ("log", "--oneline", "-5"),
         )
     ]
-    # Does the checkout the authority read scans have a work tree? Asked the way
-    # that read asks (same root, Git redirect variables removed). Only an exact
-    # ``false`` proves it; ``true``, any other answer or a failed probe does not.
-    work_tree_probe = _GIT_PROBE_EXECUTOR.submit(
-        subprocess.run,
-        [*git, "rev-parse", "--is-bare-repository"],
-        cwd=resolved_ctx.roots.live_repo_root,
-        env=sanitized_git_env(),
-        capture_output=True,
-        text=True,
-        timeout=2.0,
-        check=False,
-    )
     branch_proc, head_proc, full_head_proc, ahead_proc, log_proc = (probe.result() for probe in probes)
 
     if branch_proc.returncode != 0:
@@ -530,29 +514,6 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         raise RuntimeError(head_proc.stderr.strip() or "git rev-parse failed")
     if log_proc.returncode != 0:
         raise RuntimeError(log_proc.stderr.strip() or "git log failed")
-
-    try:
-        work_tree_proc = work_tree_probe.result()
-        has_work_tree = work_tree_proc.returncode == 0 and work_tree_proc.stdout.strip() == "false"
-    except Exception:
-        has_work_tree = False
-    # Only now, as before: a failed request starts neither slow read, so it never
-    # heals (writes) Git configuration. The status read heals a bare-drifted
-    # primary; the authority read runs ``git status`` and needs a work tree. When
-    # the authority's checkout has one, healing cannot change that read and the
-    # two slow reads run together. Otherwise (bare, or not proven) the status read
-    # finishes first and the authority read follows, as when the reads were serial.
-    # An error in the status read keeps its fallback below.
-    status_probe = _GIT_PROBE_EXECUTOR.submit(
-        worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
-    )
-    if not has_work_tree:
-        wait_for_futures([status_probe])
-    authority_probe = _GIT_PROBE_EXECUTOR.submit(
-        build_repository_authority,
-        project_root=resolved_ctx.roots.project_root,
-        live_repo_root=resolved_ctx.roots.live_repo_root,
-    )
 
     recent_commits = []
     # One ``--oneline`` record per physical line; a subject may contain NEL/LS/PS.
@@ -569,8 +530,12 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
             ahead_value = int(ahead_proc.stdout.strip() or "0")
         except ValueError:
             ahead_value = 0
+    # The two slow reads stay serial, status first. The status read heals a
+    # bare-drifted primary (a Git configuration write, which can also switch on
+    # a linked worktree's own config), and the authority read must see the
+    # checkout as that heal leaves it.
     try:
-        primary_status = status_probe.result()
+        primary_status = worktree_containment.primary_checkout_dirty_status(resolved_ctx.roots.live_repo_root)
     except Exception:
         branch = branch_proc.stdout.strip()
         primary_status = {
@@ -583,7 +548,10 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         }
 
     branch = branch_proc.stdout.strip()
-    authority = authority_probe.result()
+    authority = build_repository_authority(
+        project_root=resolved_ctx.roots.project_root,
+        live_repo_root=resolved_ctx.roots.live_repo_root,
+    )
     return {
         "branch": branch,
         "head": head_proc.stdout.strip(),
@@ -966,8 +934,9 @@ async def _cached_detached_orient_section(
     up to ``DETACHED_ORIENT_INLINE_WAIT_S`` only if *this* call started
     that worker (so cheap test doubles still populate the same response),
     except a refresh that has only just come due (``_due_for_stale_serve``),
-    which serves last-good at once. ``fresh`` waits for the live worker, whoever
-    started it.
+    which serves last-good at once. A ``fresh`` request never takes that
+    shortcut, and it too waits only for a worker it started: a worker started
+    before its invalidation may hold older data, which must not read as current.
     Overlapping requests and live hangs return last-good or fallback with
     honest ``meta.error``.
     """
@@ -991,7 +960,7 @@ async def _cached_detached_orient_section(
 
     started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
     thread = _detached_orient_threads.get(cache_key)
-    if thread is not None and thread.is_alive() and (fresh or (started and not _due_for_stale_serve(cache_key, ttl))):
+    if started and thread is not None and thread.is_alive() and (fresh or not _due_for_stale_serve(cache_key, ttl)):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
 
     # One snapshot under the lock the worker publishes under: the value, its
