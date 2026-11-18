@@ -9,6 +9,24 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.35"></a>
+## [0.1.35] - 2026-11-18
+
+### Added
+
+- Refuse CTO write dispatch and pr-merge while the CTO seat is in safe mode ([#821](https://github.com/learn-ukrainian/machinery/pull/821))
+- Remove the legacy inbox, broker and channel stores (#515) (Supersedes #825) ([#830](https://github.com/learn-ukrainian/machinery/pull/830))
+
+### Changed
+
+- Preserve valid AGY reviews after terminal errors ([#826](https://github.com/learn-ukrainian/machinery/pull/826))
+
+### Fixed
+
+- Sync the pinned product consumer environment from uv.lock ([#823](https://github.com/learn-ukrainian/machinery/pull/823))
+- Install the deployed consumer extras ([#828](https://github.com/learn-ukrainian/machinery/pull/828))
+- Enforce CTO safe mode on pull request merges ([#831](https://github.com/learn-ukrainian/machinery/pull/831))
+
 <a id="v0.1.34"></a>
 ## [0.1.34] - 2026-11-18
 
@@ -937,7 +955,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...HEAD
+[0.1.35]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...v0.1.34
 [0.1.33]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...v0.1.33
 [0.1.32]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...v0.1.32
