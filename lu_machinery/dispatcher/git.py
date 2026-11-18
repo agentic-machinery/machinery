@@ -885,7 +885,7 @@ def _hidden_tracked_changes(tree: Path) -> bool:
             if os.path.isdir(path) and os.listdir(path):
                 return True
             continue
-        nested = partial(execution_safe_git, cwd=path, capture_output=True, check=True, timeout=30)
+        nested = partial(execution_safe_git, cwd=path, stat_integrity=True, capture_output=True, check=True, timeout=30)
         if nested(["status", "--porcelain", "--ignore-submodules=none"]).stdout or _hidden_tracked_changes(path):
             return True
     return False
@@ -917,10 +917,8 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     work. Every tracked change is task work, inside the scope or not (an edit outside it may be work the
     worker could not commit), and so is any untracked file of an unscoped task or one whose scope is
     unreadable, and any nested repository: a checkout, whose files Git does not list, or a bare repository,
-    whose commits may hold work the published branch does not. The tree is read with _tree_changes, without
-    its integrity settings, so a configured attributes file keeps a clean checkout clean; a tree whose config
-    weakens stat checks (core.trustctime false, core.checkStat minimal) never qualifies, since status may miss
-    an edit there.
+    whose commits may hold work the published branch does not. The tree is read with _tree_changes, the reader
+    settlement's removal uses.
     """
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
@@ -934,10 +932,7 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             head_sha=local(["rev-parse", "HEAD"]).stdout.strip(),
             commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
         )
-        changed, untracked = _tree_changes(spec.worktree, integrity=False)
-        # These settings stop status checking stat data a same-size edit with restored timestamps leaves alone.
-        weak_stat = (local(["config", "--type=bool", "core.trustctime"], check=False).stdout.strip() == "false"
-                     or local(["config", "core.checkStat"], check=False).stdout.strip().lower() == "minimal")
+        changed, untracked = _tree_changes(spec.worktree)
         try:
             owned = ownership.effective_scope(record)
         except (TypeError, ValueError):
@@ -952,7 +947,7 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
         delivery.update(worktree_dirty_on_exit=bool(changed or untracked),
                         worktree_untracked_only_on_exit=bool(untracked) and not changed,
-                        worktree_unrelated_only_on_exit=bool(untracked) and not changed and not weak_stat
+                        worktree_unrelated_only_on_exit=bool(untracked) and not changed
                         and all(map(unrelated, untracked)))
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
@@ -1233,21 +1228,20 @@ def merged_delivery(record: dict) -> dict | None:
     return None
 
 
-def _tree_changes(tree: Path, integrity: bool = True) -> tuple[list[str], list[str]]:
+def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     """Return the tree's uncommitted tracked changes and its untracked files; ignored files are neither.
 
-    The exit snapshot and removal both read the tree here. Removal reads with integrity, which forces
-    core.trustctime and core.checkStat to their defaults, so a worker's stat settings cannot hide an edit
-    from it; integrity also ignores a configured attributes file, which can only make removal keep a tree.
-    The snapshot reads without integrity (snapshot_delivery). The hidden-change check covers the index flags
-    and submodule ignore settings status trusts; --ignore-submodules=none overrides the tree's submodule
-    ignore settings. Names are read as bytes: a
+    The exit snapshot and removal both read the tree here. The read forces core.trustctime and core.checkStat
+    to their defaults (stat_integrity), so a worker's stat settings cannot hide an edit, and keeps the tree's
+    attributes, so a configured attributes file leaves a clean checkout clean. The hidden-change check covers
+    the index flags and submodule ignore settings status trusts; --ignore-submodules=none overrides the tree's
+    submodule ignore settings. Names are read as bytes: a
     text read folds CR and CRLF into LF, so distinct files would collapse into one. In porcelain v1 -z, a
     rename or copy is followed by its source path as a separate field, which belongs to that entry.
     """
     fields = iter(execution_safe_git(
         ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
-        cwd=tree, integrity=integrity, capture_output=True, check=True, timeout=30).stdout.split(b"\0"))
+        cwd=tree, stat_integrity=True, capture_output=True, check=True, timeout=30).stdout.split(b"\0"))
     changed, untracked = [], []
     for field in fields:
         if not field:

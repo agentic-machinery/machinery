@@ -219,12 +219,12 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
                                         "grant_id": "g1", "owned_paths": ["scratch"]}]
     observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
     assert observed["worktree_dirty_on_exit"] is (case != "ignored")
-    assert observed["worktree_untracked_only_on_exit"] is (case != "ignored")
+    # The stat-hidden edit is a tracked change to the snapshot itself, with or without scratch beside it.
+    assert observed["worktree_untracked_only_on_exit"] is (case not in {"ignored", "stat-hidden"})
     assert observed["worktree_unrelated_only_on_exit"] is unrelated
-    # Removal's inventory: the same exact names. Its integrity read sees the stat-hidden edit, and reads
-    # without the configured attributes file, which can only make removal keep the tree.
+    # Removal's inventory is the same read: the same exact names and the same tracked changes.
     changed, untracked = git._tree_changes(work)
-    assert bool(changed) is (case in {"stat-hidden", "attributes-file"})
+    assert bool(changed) is (case == "stat-hidden")
     if case in {"outside", "line-breaks"}:
         assert sorted(untracked) == sorted(leftovers)
 
