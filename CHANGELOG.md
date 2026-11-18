@@ -9,6 +9,67 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.31"></a>
+## [0.1.31] - 2026-11-18
+
+### Added
+
+- Frozen reviewer-grading set and runner (VERIFY-ADOPT item 4) ([#703](https://github.com/learn-ukrainian/machinery/pull/703))
+- Read a diff-triggered reliability checklist and code owners from the merge-base ([#708](https://github.com/learn-ukrainian/machinery/pull/708))
+- Clean-machine release drill kit with mocks for every consumer row ([#714](https://github.com/learn-ukrainian/machinery/pull/714))
+- Trivial tier lands on CI alone; Low is one quick red-team pass ([#728](https://github.com/learn-ukrainian/machinery/pull/728))
+- Sol 6.2 replaces Sol 6.1; Astra 6.2 is read-only pin-only; per-model efforts ([#751](https://github.com/learn-ukrainian/machinery/pull/751))
+
+### Changed
+
+- Add deterministic Hypothesis properties ([#701](https://github.com/learn-ukrainian/machinery/pull/701))
+- Reuse merge-queue proof on main with release evidence receipts ([#710](https://github.com/learn-ukrainian/machinery/pull/710))
+- Cancel superseded main runs without losing history checks ([#716](https://github.com/learn-ukrainian/machinery/pull/716))
+- Add design charter v3 and serve it in task:repo-change ([#721](https://github.com/learn-ukrainian/machinery/pull/721))
+- Stop reading the caller's product checkout ([#729](https://github.com/learn-ukrainian/machinery/pull/729))
+- Store 33 mypy baseline messages in the lu_machinery spelling ([#731](https://github.com/learn-ukrainian/machinery/pull/731))
+- Fail any parameter-free GET that returns 5xx on a fresh checkout ([#739](https://github.com/learn-ukrainian/machinery/pull/739))
+- Gate the depth scan with a C-speed structure check ([#742](https://github.com/learn-ukrainian/machinery/pull/742))
+- Serve slow Monitor reads stale-while-revalidate and fix their scans ([#743](https://github.com/learn-ukrainian/machinery/pull/743))
+- Move shared handoff helpers out of lane and rollover code (#510) ([#749](https://github.com/learn-ukrainian/machinery/pull/749))
+- Supersedes #741 (fresh lineage; content = #741 final head) ([#747](https://github.com/learn-ukrainian/machinery/pull/747))
+- Fail CI on new sleeps, polls, reruns, and loose xfails ([#748](https://github.com/learn-ukrainian/machinery/pull/748))
+- Stop serving unused Monitor routes (Supersedes #752) ([#756](https://github.com/learn-ukrainian/machinery/pull/756))
+- Centralize typed REST read schemas ([#759](https://github.com/learn-ukrainian/machinery/pull/759))
+- Share bounded task reads on current routes (Supersedes #753) ([#762](https://github.com/learn-ukrainian/machinery/pull/762))
+
+### Fixed
+
+- Keep shallow clones out of shared Git history ([#706](https://github.com/learn-ukrainian/machinery/pull/706))
+- Wake the forwarder fixture after its signal so a TERM is never lost ([#705](https://github.com/learn-ukrainian/machinery/pull/705))
+- Drop passed tests' tmp directories during the session ([#698](https://github.com/learn-ukrainian/machinery/pull/698))
+- Refuse control, format and separator characters in path components ([#709](https://github.com/learn-ukrainian/machinery/pull/709))
+- Never rerun a failing test; the keeper enqueues only never-queued PRs ([#711](https://github.com/learn-ukrainian/machinery/pull/711))
+- Refuse deep JSON and symlink loops explicitly on CPython 3.14 ([#699](https://github.com/learn-ukrainian/machinery/pull/699))
+- Allow slow asks and retain interrupted output ([#712](https://github.com/learn-ukrainian/machinery/pull/712))
+- Admit an installed release in the checkout's untracked venv, refuse nested work trees ([#718](https://github.com/learn-ukrainian/machinery/pull/718))
+- Resolve --python through PATH to the real installation ([#719](https://github.com/learn-ukrainian/machinery/pull/719))
+- Preserve prior queue history and disarm unverified heads ([#717](https://github.com/learn-ukrainian/machinery/pull/717))
+- List two firing alert rules by name instead of UnrecognizedAlert ([#724](https://github.com/learn-ukrainian/machinery/pull/724))
+- Bound every JSON decode in the Claude-seat adapters with json_depth ([#726](https://github.com/learn-ukrainian/machinery/pull/726))
+- Serve a never-fetched checkout, 404 a missing artifacts page, quote hook paths ([#730](https://github.com/learn-ukrainian/machinery/pull/730))
+- Subscriptions as stacked cards at 640 px and below ([#723](https://github.com/learn-ukrainian/machinery/pull/723))
+- Judge panel age and stale from the payload, headers only as fallback ([#727](https://github.com/learn-ukrainian/machinery/pull/727))
+- Ship the loopback target inside the installed package ([#725](https://github.com/learn-ukrainian/machinery/pull/725))
+- Stop the venv canary expecting zeroconf ([#734](https://github.com/learn-ukrainian/machinery/pull/734))
+- Refresh Monitor caches only while someone reads them ([#736](https://github.com/learn-ukrainian/machinery/pull/736))
+- Derive launch models from the catalog ([#746](https://github.com/learn-ukrainian/machinery/pull/746))
+- Label Monitor HTTP metrics with the full route template ([#750](https://github.com/learn-ukrainian/machinery/pull/750))
+- Make the lane's DB note the handoff content authority (#511) ([#754](https://github.com/learn-ukrainian/machinery/pull/754))
+- Validate canaries with the candidate gate ([#766](https://github.com/learn-ukrainian/machinery/pull/766))
+
+### Removed
+
+- Remove the extraction rename map, its mypy respelling and old scripts/* canary paths ([#733](https://github.com/learn-ukrainian/machinery/pull/733))
+- Remove superseded deployment helpers ([#738](https://github.com/learn-ukrainian/machinery/pull/738))
+- Remove unused research and IPA forwarding shims ([#737](https://github.com/learn-ukrainian/machinery/pull/737))
+- Retire the handoff mirror and the Grok canary CLI (#512) ([#760](https://github.com/learn-ukrainian/machinery/pull/760))
+
 <a id="v0.1.30"></a>
 ## [0.1.30] - 2026-11-18 [YANKED]
 
@@ -803,7 +864,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.30...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...HEAD
+[0.1.31]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.31
 [0.1.30]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.30
 [0.1.29]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.29
 [0.1.28]: https://github.com/learn-ukrainian/machinery/compare/v0.1.27...v0.1.28
