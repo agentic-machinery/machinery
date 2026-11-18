@@ -1111,10 +1111,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"  python -m {_MODULE} status\n"
             f"  python -m {_MODULE} accept --pr 42\n"
             f"  python -m {_MODULE} accept --pr 42 --custody --from TASK\n"
-            f"  python -m {_MODULE} accept --pr 42 --reason REASON --decision-owner OWNER\n"
-            f"  python -m {_MODULE} accept --pr 42 --release\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --reason REASON --decision-owner OWNER\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --release\n"
             f"  python -m {_MODULE} queue-exit --pr 42\n\n"
-            "accept --reason and --decision-owner records coordinator custody with no dispatch task.\n"
+            "accept --reason and --decision-owner records coordinator custody with no dispatch task; it and\n"
+            "--release need --repo, since the coordinator's checkout is not the alert's repository.\n"
             "--release drops that custody. The PR is not alerted again while it stays open.\n"
             "Other accept and queue-exit act as the dispatch task named by LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
             "Outputs: JSON on stdout (check: one line per PR without a live owner);\n"
@@ -1153,19 +1154,28 @@ def build_parser() -> argparse.ArgumentParser:
 def _checkout_slug(cwd: Path) -> str | None:
     """The ``owner/name`` of the checkout's own origin, else None.
 
-    Only repository-scoped configuration names a checkout: a user- or system-level ``remote.origin.url``
-    applies to every directory, including one that is no checkout at all.
+    One read, with Git's repository redirects (``GIT_*``) cleared: only a value the checkout's repository
+    or worktree configuration (includes followed) defines names it. A user-level, system-level or
+    command-line ``remote.origin.url`` applies to any directory, so it names no checkout.
     """
-    from lu_machinery.fleet.pr_identity import resolve_repo_slug
+    from lu_machinery.fleet.pr_identity import _GITHUB_REMOTE_PATTERNS
 
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
-        local = subprocess.run(
-            ["git", "config", "--local", "--get", "remote.origin.url"],
-            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+        done = subprocess.run(
+            ["git", "config", "--show-scope", "--includes", "--get", "remote.origin.url"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return resolve_repo_slug(cwd) if local.returncode == 0 and local.stdout.strip() else None
+    scope, _, url = done.stdout.strip().partition("\t")
+    if done.returncode != 0 or scope not in {"local", "worktree"}:
+        return None
+    for pattern in _GITHUB_REMOTE_PATTERNS:
+        match = pattern.match(url.strip())
+        if match:
+            return f"{match.group(1)}/{match.group(2)}"
+    return None
 
 
 def _repo_or_checkout(repo: str | None) -> str:

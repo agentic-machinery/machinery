@@ -529,22 +529,47 @@ def test_coordinator_custody_never_takes_the_repository_from_the_checkout(world,
 
 
 def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch):
-    """Class: a user-level remote.origin.url named a repository for any directory, checkout or not."""
+    """Class: an origin from user config, command-line config or a redirected GIT_DIR named a repository
+    for a directory that is not the checkout's; an origin from a local config include was refused."""
     import subprocess
 
-    global_config = tmp_path / "global.gitconfig"
-    global_config.write_text('[remote "origin"]\n\turl = https://github.com/someone/global-only.git\n')
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    def git(cwd, *args):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, timeout=30)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text('[remote "origin"]\n\turl = https://github.com/someone/global-only.git\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    checkout, outside = tmp_path / "checkout", tmp_path / "outside"
-    checkout.mkdir()
-    outside.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True, capture_output=True)
+    checkout, outside, other = tmp_path / "checkout", tmp_path / "outside", tmp_path / "other"
+    for directory in (checkout, outside, other):
+        directory.mkdir()
+    git(checkout, "init", "-q")
+    git(other, "init", "-q")
+    git(other, "remote", "add", "origin", "https://github.com/someone/redirected.git")
     assert own._checkout_slug(outside) is None
     assert own._checkout_slug(checkout) is None
+    # Ambient redirects and command-line configuration never name the checkout.
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/someone/command-line.git")
+    assert own._checkout_slug(checkout) is None
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_CONFIG_COUNT")
     url = "https://github.com/learn-ukrainian/machinery.git"
-    subprocess.run(["git", "remote", "add", "origin", url], cwd=checkout, check=True, capture_output=True)
+    git(checkout, "remote", "add", "origin", url)
     assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    # An origin defined by a file the local configuration includes is still the checkout's own.
+    included = tmp_path / "included"
+    included.mkdir()
+    git(included, "init", "-q")
+    (included / "origin.inc").write_text(f'[remote "origin"]\n\turl = {url}\n')
+    git(included, "config", "include.path", str(included / "origin.inc"))
+    assert own._checkout_slug(included) == "learn-ukrainian/machinery"
+    git(checkout, "remote", "set-url", "origin", "https://example.com/not/github.git")
+    assert own._checkout_slug(checkout) is None
 
 
 def test_documented_module_invocation_shows_help():
