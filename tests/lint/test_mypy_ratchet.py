@@ -183,7 +183,24 @@ def _break_syntax(root: Path, _baseline: Path) -> None:
     (root / "scripts" / "mod.py").write_text("def answer(:\n", encoding="utf-8")
 
 
-@pytest.mark.parametrize("damage", [_remove_config, _other_mypy, _remove_tree, _break_syntax])
+def _no_mypy_table(root: Path, _baseline: Path) -> None:
+    (root / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+
+
+def _invalid_config(root: Path, _baseline: Path) -> None:
+    # mypy reports this on stderr and still exits 0 with an empty report.
+    (root / "pyproject.toml").write_text('[tool.mypy]\npython_version = "oops"\n', encoding="utf-8")
+
+
+def _tree_is_a_file(root: Path, _baseline: Path) -> None:
+    _remove_tree(root, _baseline)
+    (root / "scripts").write_text(_GOOD, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [_remove_config, _other_mypy, _remove_tree, _break_syntax, _no_mypy_table, _invalid_config, _tree_is_a_file],
+)
 def test_incomplete_analysis_never_prunes(tmp_path: Path, damage: Callable[[Path, Path], None]) -> None:
     """Defect class: a missing config or tree, another mypy, or a failed run reads as 'no errors' and wipes debt."""
     root, baseline, _real = _scripts_tree(tmp_path, _GOOD)
@@ -215,3 +232,24 @@ def test_cli_prune_takes_no_paths_and_check_mode_never_writes(tmp_path: Path, ca
     assert ratchet.main([*base, "--write-baseline"]) == 0
     assert load_entries(baseline) == []
     assert importlib.metadata.version("mypy") == json.loads(baseline.read_text(encoding="utf-8"))["mypy"]
+
+
+def test_concurrent_prune_is_refused_and_malformed_baselines_fail_cleanly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Defect class: a stale prune restores entries a newer prune removed, or a malformed baseline prints a traceback."""
+    root, baseline, _real = _scripts_tree(tmp_path, _GOOD)
+    before = baseline.read_bytes()
+    with ratchet._exclusive(baseline.parent), pytest.raises(ValueError, match="another prune"):
+        prune_baseline(root, baseline)
+    assert baseline.read_bytes() == before
+
+    deep = '{"schema": "mypy-ratchet-baseline.v1", "mypy": "x", "entries": [], "extra": ' + "[" * 600 + "]" * 600 + "}"
+    baseline.write_text(deep, encoding="utf-8")
+    assert ratchet.main(["--root", str(root), "--baseline", str(baseline), "--write-baseline"]) == 1
+    assert "could not run" in capsys.readouterr().err
+    assert baseline.read_text(encoding="utf-8") == deep
+
+    # A message that looks like the normalizer's own slot marker is data, not a slot.
+    spoof = ratchet._normalize_message('Missing keys ("b", "a") \ue0000\ue001')
+    assert spoof == 'Missing keys ("a", "b") \ue0000\ue001'

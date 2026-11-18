@@ -33,6 +33,8 @@ Related: #12642, scripts/hygiene/lint_source_db_writable_connects.py.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import importlib.metadata
 import json
 import os
@@ -42,7 +44,7 @@ import sys
 import tempfile
 import tomllib
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -312,7 +314,6 @@ _UNORDERED_KEYS = re.compile(
     r"(?P<prefix>Missing keys|Extra keys|Non-required keys|expected one of|TypedDict keys)"
     r" \((?P<body>[^)]*)\)"
 )
-_KEY_SLOT = re.compile("\ue000(\\d+)\ue001")
 # mypy names the line of an earlier definition inside some messages
 # ("already defined on line 12"). Lines are not part of the identity.
 _LINE_REFERENCE = re.compile(r" on line \d+\b")
@@ -331,14 +332,19 @@ def _normalize_message(message: str) -> str:
     """Drop order that mypy does not keep stable and line references, and nothing else."""
 
     message = _LINE_REFERENCE.sub("", message)
+    # Slot markers are private-use characters the message does not contain, so
+    # message text can never be read back as a slot.
+    free = (chr(code) for code in range(0xE000, 0xF900) if chr(code) not in message)
+    mark = next(free)
+    slot_pattern = re.compile(f"{mark}(\\d+){mark}")
     slots: list[str] = []
 
     def protect(match: re.Match[str]) -> str:
         slots.append(f"{match.group('prefix')} ({_sort_name_list(match.group('body'))})")
-        return f"\ue000{len(slots) - 1}\ue001"
+        return f"{mark}{len(slots) - 1}{mark}"
 
     ordered = _sort_unions(_UNORDERED_KEYS.sub(protect, message))
-    return _KEY_SLOT.sub(lambda slot: slots[int(slot.group(1))], ordered)
+    return slot_pattern.sub(lambda slot: slots[int(slot.group(1))], ordered)
 
 
 def _relative(root: Path, raw: str) -> str | None:
@@ -556,6 +562,9 @@ def collect_errors(
     if result.returncode not in (0, 1):
         detail = (result.stderr or result.stdout).strip()
         return [], [f"mypy failed ({result.returncode}): {detail}"]
+    if result.stderr.strip():
+        # mypy reports an invalid config or a runner problem on stderr and may still exit 0 or 1.
+        return [], [f"mypy reported on stderr: {result.stderr.strip()}"]
     errors, unparsed = parse_mypy_stdout(result.stdout, root)
     if unparsed:
         return [], [f"mypy report was not parseable: {unparsed[0]}"]
@@ -728,34 +737,59 @@ def evaluate(
     return violations
 
 
+@contextlib.contextmanager
+def _exclusive(directory: Path) -> Iterator[None]:
+    """One prune per baseline directory, from the first read to the replace.
+
+    The lock sits on the directory, which a replace never swaps, so it leaves no file behind.
+    """
+
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError(f"another prune holds {directory.name}; the census would be stale") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
     """Drop the entries mypy no longer reports. Returns (removed, refusals).
 
     The one writer. It only shrinks, and only on a complete analysis: the whole
-    product tree, the repository mypy config, the mypy version the baseline
-    records, and a clean mypy run. Anything else writes nothing.
+    product tree, the repository's own ``[tool.mypy]`` table, the mypy version the
+    baseline records, and a clean mypy run. Anything else writes nothing.
     """
 
-    if not (root / "pyproject.toml").is_file():
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
         return 0, ["no pyproject.toml: the repository mypy config would not apply"]
-    payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
-    entries = _payload_entries(payload, str(baseline))
-    recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
-    if recorded != installed:
-        return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
-    current, fatal = collect_errors(root, [product_tree_path(root=root).name], incremental=False)
-    if fatal:
-        return 0, fatal
-    grown = _counts(current) - _counts(entries)
-    if grown:
-        return 0, [f"{path}: new {code}: {message}" for (path, code, message) in sorted(grown)]
-    refused = shrink_violations(root, baseline, current)
-    if refused:
-        return 0, refused
-    removed = len(entries) - len(current)
-    if removed:
-        write_baseline(baseline, current)
-    return removed, []
+    if not isinstance(tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("mypy"), dict):
+        return 0, ["pyproject.toml has no [tool.mypy] table: the repository mypy config would not apply"]
+    tree = product_tree_path(root=root)
+    if not tree.is_dir():
+        return 0, [f"{tree.name} is not a directory: there is no tree to analyse"]
+    with _exclusive(baseline.parent):
+        payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
+        entries = _payload_entries(payload, str(baseline))
+        recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
+        if recorded != installed:
+            return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
+        current, fatal = collect_errors(root, [tree.name], incremental=False)
+        if fatal:
+            return 0, fatal
+        grown = _counts(current) - _counts(entries)
+        if grown:
+            return 0, [f"{path}: new {code}: {message}" for (path, code, message) in sorted(grown)]
+        refused = shrink_violations(root, baseline, current)
+        if refused:
+            return 0, refused
+        removed = len(entries) - len(current)
+        if removed:
+            write_baseline(baseline, current)
+        return removed, []
 
 
 def _python_targets(paths: Sequence[str], root: Path) -> list[str]:
@@ -822,7 +856,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         violations = evaluate(
             root, baseline, targets, incremental=not args.no_incremental
         )
-    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, RecursionError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(f"mypy ratchet could not run: {exc}", file=sys.stderr)
         return 1
     if violations:
