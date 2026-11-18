@@ -202,6 +202,12 @@ def _tool_is_not_a_table(root: Path, _baseline: Path) -> None:
     (root / "pyproject.toml").write_text("tool = false\n", encoding="utf-8")
 
 
+def _baseline_is_a_symlink(root: Path, baseline: Path) -> None:
+    real = root / "real-baseline.json"
+    baseline.rename(real)
+    baseline.symlink_to(real)
+
+
 @pytest.mark.parametrize(
     "damage",
     [
@@ -213,6 +219,7 @@ def _tool_is_not_a_table(root: Path, _baseline: Path) -> None:
         _invalid_config,
         _tree_is_a_file,
         _tool_is_not_a_table,
+        _baseline_is_a_symlink,
     ],
 )
 def test_incomplete_analysis_never_prunes(tmp_path: Path, damage: Callable[[Path, Path], None]) -> None:
@@ -272,7 +279,7 @@ def test_concurrent_prune_is_refused_and_malformed_baselines_fail_cleanly(
 
 
 def test_prune_runs_mypy_on_the_validated_config_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Defect class: the config vanishes after validation and mypy falls back to another file, dropping a live error."""
+    """Defect class: the config vanishes, or a concurrent check rewrites the shared snapshot, and mypy drops a live error."""
     root, baseline, _real = _scripts_tree(tmp_path, "from typing import Any\n\n\ndef f(x: Any) -> int:\n    return x\n")
     (root / "pyproject.toml").write_text('[tool.mypy]\npython_version = "3.12"\nwarn_return_any = true\n', encoding="utf-8")
     live, fatal = collect_errors(root, ["scripts"], incremental=False)
@@ -281,8 +288,12 @@ def test_prune_runs_mypy_on_the_validated_config_snapshot(tmp_path: Path, monkey
     before = baseline.read_bytes()
     real_config = ratchet.ratchet_config
 
-    def vanishing(root: Path, **kwargs: bool) -> Path | None:
+    def vanishing(root: Path, **kwargs: object) -> Path | None:
         config = real_config(root, **kwargs)
+        # A concurrent check rewrites the shared snapshot, and the repository config changes under us.
+        shared = root / ".mypy_cache" / "mypy-ratchet" / "pyproject.toml"
+        shared.parent.mkdir(parents=True, exist_ok=True)
+        shared.write_text("", encoding="utf-8")
         (root / "pyproject.toml").unlink()
         (root / "mypy.ini").write_text("[mypy]\nwarn_return_any = False\n", encoding="utf-8")
         return config

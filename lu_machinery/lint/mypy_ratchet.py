@@ -415,14 +415,15 @@ def _toml(value: object) -> str:
     raise ValueError(f"unsupported mypy config value: {value!r}")
 
 
-def ratchet_config(root: Path, *, require_table: bool = False) -> Path | None:
+def ratchet_config(root: Path, *, require_table: bool = False, dest: Path | None = None) -> Path | None:
     """Point mypy at the repo config plus overrides for wheels CI does not install.
 
     ``files`` is omitted so the paths passed on the command line are the whole
     check. An unknown ``[tool.mypy]`` key fails closed instead of being dropped.
     ``require_table`` refuses a pyproject with no ``[tool.mypy]`` table instead of
     running mypy with its defaults. The returned file is a snapshot: mypy reads it,
-    never the repository's own config.
+    never the repository's own config. ``dest`` is a private file for a caller that
+    must not share the default one, which every run rewrites.
     """
 
     pyproject = root / "pyproject.toml"
@@ -457,7 +458,7 @@ def ratchet_config(root: Path, *, require_table: bool = False) -> Path | None:
         "ignore_missing_imports = true",
         "",
     ])
-    dest = root / ".mypy_cache" / "mypy-ratchet" / "pyproject.toml"
+    dest = dest or root / ".mypy_cache" / "mypy-ratchet" / "pyproject.toml"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text("\n".join(lines), encoding="utf-8")
     return dest
@@ -646,7 +647,6 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
         ],
     }
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    path = path.resolve()  # replace the file a symlink points at, never the link
     # A new file keeps mkstemp's owner-only mode; a rewrite keeps the mode it had.
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -777,16 +777,19 @@ def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
     baseline records, and a clean mypy run. Anything else writes nothing.
     """
 
-    try:
-        config = ratchet_config(root, require_table=True)
-    except ValueError as exc:
-        return 0, [str(exc)]
-    if config is None:
-        return 0, ["no pyproject.toml: the repository mypy config would not apply"]
     tree = product_tree_path(root=root)
     if not tree.is_dir():
         return 0, [f"{tree.name} is not a directory: there is no tree to analyse"]
-    with _exclusive(baseline.parent):
+    if baseline.is_symlink():
+        return 0, [f"{baseline.name} is a symlink: the lock and the replace would name different files"]
+    # The config snapshot is private to this run: the default one is rewritten by every check.
+    with tempfile.TemporaryDirectory(prefix="mypy-prune-") as work, _exclusive(baseline.parent):
+        try:
+            config = ratchet_config(root, require_table=True, dest=Path(work) / "pyproject.toml")
+        except ValueError as exc:
+            return 0, [str(exc)]
+        if config is None:
+            return 0, ["no pyproject.toml: the repository mypy config would not apply"]
         payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
         entries = _payload_entries(payload, str(baseline))
         recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
