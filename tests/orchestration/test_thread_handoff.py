@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import io
 import json
 import os
 import sqlite3
 import subprocess
 import sys
-import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -289,7 +287,6 @@ def resume_bound(state: dict, thread_id: str = "new-thread") -> dict:
         now=datetime(2026, 5, 30, 8, 1, tzinfo=UTC),
     )
     return resumed
-
 
 
 def test_prepare_state_records_meaningful_title_and_native_identity():
@@ -2229,8 +2226,6 @@ def test_unsupported_native_title_adapter_binds_exact_task_without_claiming_rena
     assert resumed["title_transition"]["fallback_receipt"]["attempted"] is False
 
 
-
-
 def test_register_created_context_failure_reports_cleanly(tmp_path: Path, capsys):
     rc = th.main(
         [
@@ -2982,8 +2977,6 @@ def test_resume_is_deterministic_and_refuses_a_different_thread():
         )
 
 
-
-
 def test_v1_state_requires_explicit_migration(tmp_path: Path, capsys, monkeypatch):
     state_path = tmp_path / ".agent/legacy.json"
     state_path.parent.mkdir(parents=True)
@@ -3072,6 +3065,7 @@ def test_default_runtime_root_is_shared_by_real_linked_worktree(tmp_path: Path, 
 
 
 def test_canonical_discovery_failure_refuses_fallback_and_explicit_root_is_isolated(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
     monkeypatch.setattr(
         th,
         "run_command",
@@ -3106,16 +3100,6 @@ def test_parallel_lineages_do_not_collide_in_an_explicit_fixture(tmp_path: Path,
     assert payloads[0]["lineage_id"] != payloads[1]["lineage_id"]
     assert payloads[0]["state_file"] != payloads[1]["state_file"]
     assert payloads[0]["runtime_path"] != payloads[1]["runtime_path"]
-
-
-
-
-
-
-
-
-
-
 
 
 def test_confirmation_refuses_unresumed_and_identity_mismatched_rollovers(tmp_path: Path):
@@ -3469,17 +3453,6 @@ def test_alias_lane_detect_compares_stream_without_regard_to_case(
     assert "Skipped foreign candidate" not in context
 
 
-class _EmptyBundleList:
-    """Bundle API whose list has no row for any seat (#11259)."""
-
-    def __init__(self) -> None:
-        self.paths: list[str] = []
-
-    def get(self, path: str, headers: dict | None = None) -> tuple[int, str, dict]:
-        self.paths.append(path)
-        return 200, json.dumps({"bundles": []}), {}
-
-
 def _prepare_stream_packet(tmp_path: Path, capsys, *, owner: str, thread_id: str, family: str = "atlas") -> dict:
     assert (
         th.main(
@@ -3517,7 +3490,6 @@ def _gate_args(tmp_path: Path, *, agent: str) -> SimpleNamespace:
         task_family="atlas",
         stream="epic:1001",
         detect=True,
-        import_bundle=True,
     )
 
 
@@ -3530,21 +3502,13 @@ def _run_rendered(tmp_path: Path, line: str, **substitutions: str) -> int:
     return th.main(["--repo-root", str(tmp_path), *words[script + 1 :]])
 
 
-def test_session_start_delivers_provider_fallback_packet_when_api_has_no_row(tmp_path: Path, capsys, monkeypatch):
-    """#11259 AC-01: seat codex-atlas, packet under codex, empty bundle list."""
+def test_session_start_delivers_provider_fallback_packet_from_file(tmp_path: Path, capsys, monkeypatch):
+    """A lane receives its provider fallback packet directly from the file handoff."""
     from lu_machinery.hooks import session_start_gate as gate
 
     monkeypatch.delenv("SESSION_STREAM_ID", raising=False)
     monkeypatch.setattr(th, "gather_snapshot", lambda root, url: sample_snapshot(root))
     packet = _prepare_stream_packet(tmp_path, capsys, owner="codex", thread_id="old-thread")
-    server = _EmptyBundleList()
-    monkeypatch.setattr(th, "_bundle_client", lambda *_a, **_kw: server)
-
-    imported = gate.phase_rollover_import(_gate_args(tmp_path, agent="codex-atlas"))
-    assert imported["status"] == "ok", imported
-    assert "warning" not in imported
-    assert server.paths, "the bundle API list was not consulted"
-
     detected = gate.phase_rollover_detect(_gate_args(tmp_path, agent="codex-atlas"))
     assert detected["status"] == "stop"
     assert detected["detect_status"] == "pending_start"
@@ -3574,11 +3538,6 @@ def test_session_start_lists_multiple_pending_without_formatting_failure(tmp_pat
         owner: _prepare_stream_packet(tmp_path, capsys, owner=owner, thread_id=f"old-{owner}")
         for owner in ("codex-atlas", "codex")
     }
-    monkeypatch.setattr(th, "_bundle_client", lambda *_a, **_kw: _EmptyBundleList())
-
-    imported = gate.phase_rollover_import(_gate_args(tmp_path, agent="codex-atlas"))
-    assert imported == {"status": "ok", "elapsed_seconds": imported["elapsed_seconds"]}
-
     detected = gate.phase_rollover_detect(_gate_args(tmp_path, agent="codex-atlas"))
     assert detected["status"] == "stop"
     assert detected["detect_status"] == "ambiguous"
@@ -3869,12 +3828,6 @@ def test_epic_harness_session_start_surfaces_claude_infra_pending_packet(tmp_pat
     assert prepared_payload["rollover_id"] in startup
 
 
-
-
-
-
-
-
 def test_detect_excludes_registry_terminal_rollover_packets(tmp_path: Path, capsys, monkeypatch):
     """#5851: detect excludes registry-terminal rollover packets (e.g. SUPERSEDED)."""
     monkeypatch.setattr(th, "gather_snapshot", lambda root, url: sample_snapshot(root))
@@ -3948,232 +3901,6 @@ def test_detect_corrupt_registry_record_fails_open(tmp_path: Path, capsys, monke
     assert "registry_errors" in detected
     assert len(detected["registry_errors"]) == 1
     assert "corrupt or unreadable" in detected["registry_errors"][0]
-
-
-# ── GH #7489: bundle API client contract ────────────────────────────────
-#
-# One typed base-URL contract pinned to a single loopback origin, semantic
-# 4xx classification (never retried as transient "unavailable"), and all
-# traffic through the shared MonitorClient — no second urllib client.
-
-
-class _FakeBundleResponse:
-    def __init__(self, status: int = 200, body: str = "{}", headers: dict | None = None) -> None:
-        self.status = status
-        self._body = body.encode("utf-8")
-        self.headers = headers or {}
-
-    def read(self) -> bytes:
-        return self._body
-
-    def __enter__(self) -> _FakeBundleResponse:
-        return self
-
-    def __exit__(self, *args) -> bool:
-        return False
-
-
-def _bundle_args(port: int = 8765) -> SimpleNamespace:
-    return SimpleNamespace(monitor_base_url=f"http://127.0.0.1:{port}")
-
-
-def _set_lease_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SESSION_STREAM_SESSION_ID", "sess-1")
-    monkeypatch.setenv("SESSION_STREAM_LEASE_ID", "lease-1")
-    monkeypatch.setenv("SESSION_STREAM_GENERATION", "1")
-    monkeypatch.setenv("SESSION_STREAM_FENCING_TOKEN", "1")
-    monkeypatch.setenv("SESSION_STREAM_PROCESS_ID", "1234")
-
-
-def test_bundle_monitor_url_accepts_loopback_only() -> None:
-    """The stricter loopback constraint stays: non-loopback bases are rejected."""
-    assert th._bundle_monitor_url("http://localhost:8765") == "http://127.0.0.1:8765"
-    assert th._bundle_monitor_url("http://127.0.0.1:9999/api/state/summary") == "http://127.0.0.1:9999"
-    with pytest.raises(ValueError, match="loopback"):
-        th._bundle_monitor_url("http://example.invalid:8765")
-    with pytest.raises(ValueError, match="loopback"):
-        th._bundle_monitor_url("https://127.0.0.1:8765")
-
-
-@pytest.mark.parametrize("status", [400, 403, 409, 422])
-def test_bundle_api_4xx_is_semantic_refusal_not_unavailable(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
-    """GH #7489: 4xx answers are semantic refusals, never transient 'unavailable'."""
-    calls: list[str] = []
-
-    def fake_urlopen(req, timeout: float = 3.0):
-        calls.append(req.full_url)
-        raise urllib.error.HTTPError(  # type: ignore[arg-type]
-            req.full_url, status, "refused", {}, io.BytesIO(json.dumps({"detail": "nope"}).encode())
-        )
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    with pytest.raises(th.RolloverBundleRefused, match=f"HTTP|{status}"):
-        th._bundle_api_request(
-            "http://127.0.0.1:8765",
-            method="GET",
-            path="/api/epics/v1/shared:rollover/bundles?limit=20",
-        )
-    # A semantic answer is returned once — never retried as transient.
-    assert len(calls) == 1
-
-
-def test_bundle_api_get_404_latest_is_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_urlopen(req, timeout: float = 3.0):
-        raise urllib.error.HTTPError(req.full_url, 404, "not found", {}, io.BytesIO(b'{"detail":"none"}'))  # type: ignore[arg-type]
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    with pytest.raises(th.RolloverBundleNotFound):
-        th._bundle_api_request(
-            "http://127.0.0.1:8765",
-            method="GET",
-            path="/api/epics/v1/shared:rollover/bundles/latest",
-        )
-
-
-def test_bundle_api_5xx_and_transport_stay_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_500(req, timeout: float = 3.0):
-        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, io.BytesIO(b"{}"))  # type: ignore[arg-type]
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_500)
-    with pytest.raises(th.RolloverBundleAPIUnavailable):
-        th._bundle_api_request("http://127.0.0.1:8765", method="GET", path="/api/epics/v1/s/bundles/latest")
-
-    def fake_down(req, timeout: float = 3.0):
-        raise urllib.error.URLError("connection refused")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_down)
-    with pytest.raises(th.RolloverBundleAPIUnavailable):
-        th._bundle_api_request("http://127.0.0.1:8765", method="GET", path="/api/epics/v1/s/bundles/latest")
-
-
-def test_bundle_upload_pinned_single_loopback_cannot_failover(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Acceptance: the advertised [A, B] failover cannot occur for bundle traffic —
-    the pinned single loopback base means one transport failure, one attempt."""
-    _set_lease_env(monkeypatch)
-    calls: list[str] = []
-
-    def fake_urlopen(req, timeout: float = 3.0):
-        calls.append(req.full_url)
-        raise urllib.error.URLError("connection reset")
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    with pytest.raises(th.RolloverBundleAPIUnavailable):
-        th._bundle_api_upload(
-            _bundle_args(),
-            stream_id="shared:rollover",
-            manifest={"bundle_sha256": "abc123"},
-            blob=b"blob",
-        )
-    assert len(calls) == 1
-    assert calls[0].startswith("http://127.0.0.1:8765/api/epics/v1/shared:rollover/bundles")
-
-
-def test_bundle_upload_success_returns_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    _set_lease_env(monkeypatch)
-
-    def fake_urlopen(req, timeout: float = 3.0):
-        return _FakeBundleResponse(200, json.dumps({"upload_seq": 7}))
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-
-    result = th._bundle_api_upload(
-        _bundle_args(),
-        stream_id="shared:rollover",
-        manifest={"bundle_sha256": "abc123"},
-        blob=b"blob",
-    )
-    assert result["upload_seq"] == 7
-
-
-def test_confirm_replacement_stream_uploads_with_parser_monitor_base_url(
-    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """GH #8643: confirm-replacement must carry --monitor-base-url into the bundle upload.
-
-    The confirm step used to rebuild its namespace field-by-field and dropped
-    ``monitor_base_url``, so a ``--stream`` upload always skipped with
-    "'Namespace' object has no attribute 'monitor_base_url'".
-    """
-    _set_lease_env(monkeypatch)
-    monkeypatch.setattr(th, "gather_snapshot", lambda root, url: sample_snapshot(root))
-    assert (
-        th.main(
-            [
-                "--repo-root",
-                str(tmp_path),
-                "prepare",
-                "--agent",
-                "codex",
-                "--harness",
-                "headless",
-                "--active-thread-id",
-                "old",
-            ]
-        )
-        == 0
-    )
-    packet = json.loads(capsys.readouterr().out)
-    bootstrap = [
-        "--repo-root",
-        str(tmp_path),
-        "bootstrap-replacement",
-        "--agent",
-        "codex",
-        "--lineage-id",
-        packet["lineage_id"],
-        "--rollover-id",
-        packet["rollover_id"],
-        "--replacement-thread-id",
-        "new-thread",
-        "--evidence",
-        "test exact binding",
-    ]
-    assert th.main(bootstrap) == 0
-    capsys.readouterr()
-    seen_base_urls: list[str] = []
-
-    class _RecordingBundleClient:
-        def __init__(self, base_url: str, *, timeout_s: float = 3.0) -> None:
-            self.base_url = base_url
-            self.timeout_s = timeout_s
-
-        def post(self, path: str, *, json_body=None, idempotency_key=None, headers=None):
-            seen_base_urls.append(self.base_url)
-            return 200, json.dumps({"upload_seq": 9}), {}
-
-    monkeypatch.setattr(th, "_bundle_client", _RecordingBundleClient)
-
-    monitor_base_url = "http://127.0.0.1:8767"
-    assert (
-        th.main(
-            [
-                "--repo-root",
-                str(tmp_path),
-                "--monitor-base-url",
-                monitor_base_url,
-                "confirm-replacement",
-                "--agent",
-                "codex",
-                "--lineage-id",
-                packet["lineage_id"],
-                "--rollover-id",
-                packet["rollover_id"],
-                "--stream",
-                "epic:4700",
-            ]
-        )
-        == 0
-    )
-    out = capsys.readouterr().out
-    # confirm-replacement prints the mint/questions lines first, then its result JSON.
-    start = out.rfind("\n{")
-    payload = json.loads(out[start + 1 :] if start != -1 else out)
-    assert payload["bundle_upload"]["status"] == "uploaded"
-    assert payload["bundle_upload"]["upload_seq"] == 9
-    assert seen_base_urls == [monitor_base_url]
 
 
 @pytest.mark.parametrize("command", ["resume", "bootstrap-replacement"])

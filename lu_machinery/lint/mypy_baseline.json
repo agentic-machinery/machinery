@@ -7068,11 +7068,6 @@
       "message": "Returning Any from function declared to return \"int\""
     },
     {
-      "path": "lu_machinery/orchestration/rollover_registry_cli.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
       "path": "lu_machinery/orchestration/safe_git_context.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"None\", target has type \"tuple[int, int, int, int, int]\")"
@@ -7590,72 +7585,17 @@
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"_bundle_member_path\" has incompatible type \"Any | None\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_bundle_read_limited\" has incompatible type \"GzipFile\"; expected \"BinaryIO\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_bundle_read_limited\" has incompatible type \"IO[bytes]\"; expected \"BinaryIO\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_bundle_read_limited\" has incompatible type \"IO[bytes]\"; expected \"BinaryIO\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"_epoch_seconds\" has incompatible type \"Any | None\"; expected \"float\""
     },
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"is_terminal_state\" has incompatible type \"Any | None\"; expected \"RolloverState | str\""
     },
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "arg-type",
       "message": "Argument 1 to \"is_terminal_state\" has incompatible type \"Any | None\"; expected \"RolloverState | str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"len\" has incompatible type \"IO[bytes] | None\"; expected \"Sized\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"openssl_sha256\" has incompatible type \"IO[bytes] | None\"; expected \"Buffer\""
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"bytes\", variable has type \"IO[bytes] | None\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/thread_handoff.py",
-      "code": "attr-defined",
-      "message": "\"BaseException\" has no attribute \"code\""
     },
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",

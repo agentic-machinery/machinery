@@ -164,7 +164,6 @@ tests/agents_extensions/test_operator_contract_wiring.py
 tests/agents_extensions/test_post_compact_stream.py
 tests/agents_extensions/test_remote_epic_lifecycle.py
 tests/agents_extensions/test_remote_supervisor.py
-tests/agents_extensions/test_rollover_bundles.py
 tests/agents_extensions/test_rules_core_structural_coverage.py
 tests/agents_extensions/test_session_stream_handoff.py
 tests/agents_extensions/test_session_streams.py
@@ -291,7 +290,6 @@ tests/api/test_project_state_collect.py
 tests/api/test_project_state_local_cli.py
 tests/api/test_release_snapshot.py
 tests/api/test_rollover_api.py
-tests/api/test_rollover_bundle_router.py
 tests/api/test_route_contracts.py
 tests/api/test_route_locality.py
 tests/api/test_panel_data_hygiene.py
@@ -709,7 +707,6 @@ tests/dispatcher/test_write_boundary.py
 tests/orchestration/test_dispatch_admission_disk.py
 tests/orchestration/test_imported_rollover_detection.py
 tests/orchestration/test_reaper_regenerable_round3.py
-tests/orchestration/test_thread_handoff_reconcile.py
 tests/review/test_review_capacity_rule.py
 tests/test_agent_runtime_env_sanitize.py
 tests/test_ci_recovery.py

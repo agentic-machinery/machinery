@@ -14,7 +14,6 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from lu_machinery.orchestration import rollover_registry_cli as cli
 from lu_machinery.orchestration import thread_handoff as th
 from lu_machinery.orchestration.task_family import rollover_registry as registry
 from tests.orchestration.task_family.test_rollover_registry import _lease, _sync, _write_json
@@ -278,32 +277,6 @@ def test_legacy_retry_recovers_interrupted_publication(case, monkeypatch, crash_
         _apply(case, plan)
     assert _apply(case, plan)["final_state"] == "ABANDONED_WITH_PROOF"
     assert sum(event.get("operation_id") == plan["digest"] for event in _record(case)["history"]) == 1
-
-
-def test_legacy_cli_plan_apply_and_help(case, capsys):
-    proof_path = case.root / "operator-proof.json"
-    _write_json(proof_path, case.proof)
-    command = [
-        "--repo-root",
-        str(case.root),
-        "dispose-legacy-resumed-exact",
-        "--agent",
-        "codex-infra",
-        "--lineage-id",
-        case.record["key"]["lineage_id"],
-        "--rollover-id",
-        case.record["key"]["rollover_id"],
-    ]
-    assert cli.main([*command, "--plan", "--proof-file", str(proof_path)]) == 0
-    plan = json.loads(capsys.readouterr().out)
-    assert cli.main([*command, "--apply", "--plan-file", plan["plan_path"]]) == 0
-    assert json.loads(capsys.readouterr().out)["final_state"] == "ABANDONED_WITH_PROOF"
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["dispose-legacy-resumed-exact", "--help"])
-    assert exc.value.code == 0
-    help_text = capsys.readouterr().out
-    assert "operator_disposition" in help_text
-    assert "positive thread heartbeat" in help_text
 
 
 @pytest.mark.parametrize(

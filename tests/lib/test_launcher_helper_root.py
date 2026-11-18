@@ -52,7 +52,6 @@ _PLACEHOLDERS = (
     "lu_machinery/lib/context_profiles.py",
 )
 _SITES = (
-    "import_bundle",
     "renew_heartbeat",
     "lease_close",
     "driver_agent_type",
@@ -60,7 +59,6 @@ _SITES = (
     "claude_profile",
 )
 _EXPECTED_HONEST = {
-    "import_bundle": "lu_machinery.orchestration.thread_handoff",
     "renew_heartbeat": "lu_machinery.session_supervisor heartbeat",
     "lease_close": "lu_machinery.session_supervisor close",
     "driver_agent_type": "lu_machinery.orchestration.driver_agent_type",
@@ -182,8 +180,6 @@ printf 'hook_primary=%s\n' "${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}"
 source "$LC_ROOT/lu_machinery/lib/handoff_identity.sh"
 site() { printf 'SITE %s\n' "$1" >> "$SITE_LOG"; }
 
-site import_bundle
-( LC_EPIC=devops; launcher_import_rollover_bundle ) >/dev/null 2>&1
 site renew_heartbeat
 (
   LC_MODE=driver LC_DRIVER_LEASE_CLAIMED=1 LC_DRY_RUN=0
@@ -250,8 +246,6 @@ def _assert_every_site_ran_the_primary(
         assert str(layout.attacker) not in line, line
         assert str(layout.worktree / ".venv") not in line, line
     # The validated primary interpreter invokes the installed module (#161).
-    joined = "\n".join(layout.lines())
-    assert "-m lu_machinery.orchestration.thread_handoff" in joined
     raw = Path(str(layout.log) + ".raw").read_bytes().decode().split("\0")
     roots = [raw[index + 3:index + 5] for index, arg in enumerate(raw) if arg == "-I" and raw[index + 1] == "-c" and "module bootstrap:" in raw[index + 2]]
     assert roots and all(pair == [str(result.args[-1]), "lu_machinery"] for pair in roots), roots

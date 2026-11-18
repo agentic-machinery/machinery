@@ -34,8 +34,8 @@ clean, continuous checkout and are idempotent; a different replacement ID fails
 closed. A retry also repairs the registry projection after a partial write. The
 lineage, rollover ID, generation fence and native identity/title rules remain in
 force.
-Pass `--stream <stream-id>` to confirmation when a bundle upload is required;
-the configured `--monitor-base-url` carries through to the upload.
+Confirmation uses the local file handoff and performs no upload. Launcher-bound
+lanes continue from the driver-state DB note; lifecycle files remain readable.
 
 Successful confirmation unlocks the existing cleanup authorization. Before
 archiving the predecessor, follow [archive proof](archive.md): authoritative app

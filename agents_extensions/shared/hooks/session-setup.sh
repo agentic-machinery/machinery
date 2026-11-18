@@ -776,9 +776,6 @@ ROLLOVER_STREAM_ARGS=()
 if [ -n "$ROLLOVER_BUNDLE_STREAM" ]; then
   ROLLOVER_STREAM_ARGS=(--stream "$ROLLOVER_BUNDLE_STREAM")
   GATE_ARGS+=("${ROLLOVER_STREAM_ARGS[@]}")
-  case "$ROLLOVER_BUNDLE_STREAM" in
-    epic:*) GATE_ARGS+=(--import-bundle) ;;
-  esac
 fi
 
 GATE_RC=0

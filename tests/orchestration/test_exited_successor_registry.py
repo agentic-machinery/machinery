@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from lu_machinery.orchestration import rollover_registry_cli as cli
 from lu_machinery.orchestration import thread_handoff as th
 from lu_machinery.orchestration.task_family import rollover_registry as registry
 from tests.orchestration.task_family.test_rollover_registry import (
@@ -267,32 +266,6 @@ def test_arbitrary_evidence_paths_cannot_touch_lease(case, path_kind):
     with pytest.raises(ValueError):
         _plan(case)
     assert lease_path.read_bytes() == before
-
-
-def test_exact_cli_plan_and_apply_and_wrong_action(case, capsys):
-    proof_path = case.root / "exit-proof.json"
-    _write_json(proof_path, case.proof)
-    common = [
-        "--repo-root",
-        str(case.root),
-        "dispose-exited-successor-exact",
-        "--agent",
-        "codex-infra",
-        "--lineage-id",
-        case.record["key"]["lineage_id"],
-        "--rollover-id",
-        case.record["key"]["rollover_id"],
-    ]
-    assert cli.main([*common, "--plan", "--proof-file", str(proof_path)]) == 0
-    plan = json.loads(capsys.readouterr().out)
-    wrong = common.copy()
-    wrong[2] = "abandon-exact"
-    assert cli.main([*wrong, "--apply", "--plan-file", plan["plan_path"]]) == 2
-    assert "action does not match" in capsys.readouterr().out
-    assert cli.main([*common, "--apply", "--plan-file", plan["plan_path"]]) == 0
-    assert json.loads(capsys.readouterr().out)["final_state"] == "ABANDONED_WITH_PROOF"
-    assert cli.main([*common, "--apply", "--plan-file", plan["plan_path"]]) == 0
-    assert json.loads(capsys.readouterr().out)["final_state"] == "ABANDONED_WITH_PROOF"
 
 
 @pytest.mark.parametrize(

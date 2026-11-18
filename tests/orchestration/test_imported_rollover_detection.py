@@ -13,7 +13,7 @@ from lu_machinery.session_streams.inventory import stream_anchor_id
 from lu_machinery.orchestration import thread_handoff as th
 from tests.orchestration.test_codex_driver_rollover_recovery import _launcher_detection
 from tests.orchestration.test_thread_handoff import sample_snapshot
-from tests.agents_extensions.test_rollover_bundles import _export_args, _import_args
+import shutil
 
 AGENT = "codex-infra"
 HANDOFF = ".claude/harness-epic/CLAUDE-DRIVER-HANDOFF.md"
@@ -50,15 +50,26 @@ def test_imported_pending_packet_launcher_binding(tmp_path, monkeypatch, capsys,
     handoff = source / HANDOFF
     handoff.parent.mkdir(parents=True)
     handoff.write_text("The pending packet's own lane handoff.\n")
-    bundle = tmp_path / "pending.tgz"
-    assert th.cmd_export_bundle(_export_args(source, state, bundle, stream=stream)) == 0
-    capsys.readouterr()
-    assert th.cmd_import_bundle(_import_args(target, bundle, agent=AGENT, stream=stream)) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "installed"
+    # Historical installed packet and receipt. No retired producer is needed to
+    # prove that existing local handoffs remain readable after transport retirement.
+    shutil.copytree(source / ".agent", target / ".agent")
     installed = target / HANDOFF
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_bytes(handoff.read_bytes())
     assert installed.stat().st_mtime > th.parse_iso_datetime(state["replacement"]["prepared_at"]).timestamp()
+    info = installed.stat()
+    receipt = {
+        "schema": "rollover-bundle-receipt.v1", "agent": AGENT,
+        "lineage_id": state["lineage_id"], "rollover_id": state["replacement"]["rollover_id"],
+        "stream_id": stream, "prepared_at": state["replacement"]["prepared_at"],
+        "installed_handoffs": {HANDOFF: {
+            "device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+        }},
+    }
     receipt_path = target / f".agent/thread-rollovers/{AGENT}/_bundle-receipts/{state['lineage_id']}.json"
-    receipt = json.loads(receipt_path.read_text())
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text(json.dumps(receipt))
     if case == "missing_receipt":
         receipt_path.unlink()
     elif case == "legacy_receipt":
