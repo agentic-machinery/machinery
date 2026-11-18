@@ -17,14 +17,18 @@ pytest scratch is deleted directly, without quarantine.
 
 `learn-ukrainian-tmp-sweep.timer` runs every hour at 30 minutes past, UTC,
 with up to 10 minutes of random delay. Missed runs catch up. It starts
-`learn-ukrainian-tmp-sweep.service`, which runs two steps in order:
+`learn-ukrainian-tmp-sweep.service`, which runs three steps in order:
 
-1. `lu_machinery.hygiene.batch_state_retention`: the read-only staleness report.
+1. `lu_machinery.hygiene.batch_state_retention`: prunes settled tasks' state
+   in `batch_state/tasks/` (see "Settled task state" below), then prints the
+   staleness report.
 2. `lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary`: the
    sweep. It purges expired quarantine entries, quarantines newly proven
    ones and deletes inactive, unheld pytest run folders. It logs counts and
    byte totals only, never entry names; the ledger holds the quarantined
    names.
+3. `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary`: explicit
+   batch_state scratch expiry (see below).
 
 The unit does not set `RestrictAddressFamilies=`. In a user manager every
 seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
@@ -534,15 +538,51 @@ belong in the system temp area. To keep a path, do one of the following:
 - Give it an excluded name prefix only when it really is harness or session
   state.
 
+## Write workers' temp files
+
+A dispatched workspace-write worker's `TMPDIR` is its task scratch, the
+directory `LU_TASK_SCRATCH` names. Python (pytest's basetemp included), uv,
+Git and Node write their temp files there. The supervisor creates it before
+launch. Settlement removes it once the provider is proven gone, whatever the
+terminal status and even when the worktree is kept, and records
+`task_scratch_disposition` and the bytes freed in the task record. Read-only
+routes keep their boundary's private `TMPDIR`. Seats and hooks that run
+outside a dispatched task keep their own. A path a worker hard-codes, such as
+`/tmp/<name>`, is outside this scratch and is not removed.
+
+## Settled task state
+
+`lu_machinery.hygiene.batch_state_retention` removes the bulky state of
+settled tasks. A task qualifies when its record (hot, else archived) has a
+released terminal status and finished more than `--settled-days` ago (default
+2). Everything in that task's `tasks/<task>.*` directories then goes, except
+hand-off `.md` files. The record, its `.result` and every other file beside
+it stay. `--dry-run` lists what would go and deletes nothing.
+
+Never removed:
+
+- a live task's state, and a directory written since the cutoff;
+- a task whose record holds its worktree (`worktree_retention_hold`), or any
+  path the retention list names under `batch_state/tasks/`;
+- a directory with no owner record, a damaged owner record or no completion
+  time;
+- `tasks/archive/`;
+- sockets, FIFOs, `tmux-*` and `ssh-*` directories, and any path a live process
+  holds as its working directory, an open descriptor or a mapping, as far as
+  `/proc` shows. Dispatcher settlement applies the same rule to task scratch.
+
+The record is read again under its task-state lock before removal, so a
+re-dispatch of the same id keeps its state.
+
 ## The batch_state staleness report
 
-`lu_machinery.hygiene.batch_state_retention` lists every top-level `batch_state/`
-directory with no write for 7 days (`--stale-days`). For each one it shows the
-allocated size and the date of the newest write. It skips `tasks/`,
-`preserved/`, `reports/` and `branch-archive/`. It never deletes anything.
-Unclassified state is retained. Explicitly declared disposable scratch can
-expire through the existing sweep as described below. Quarantine directories
-are excluded from this staleness report; the sweep ledger owns them.
+The same command then lists every top-level `batch_state/` directory with no
+write for 7 days (`--stale-days`). For each one it shows the allocated size
+and the date of the newest write. It skips `tasks/`, `preserved/`, `reports/`
+and `branch-archive/`. This report deletes nothing: unclassified state is
+retained. Explicitly declared disposable scratch can expire through the
+existing sweep as described below. Quarantine directories are excluded from
+this staleness report; the sweep ledger owns them.
 
 ### Explicit batch_state scratch expiry (#11365)
 
