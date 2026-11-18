@@ -560,6 +560,9 @@ def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch
     monkeypatch.delenv("GIT_CONFIG_COUNT")
     url = "https://github.com/learn-ukrainian/machinery.git"
     git(checkout, "remote", "add", "origin", url)
+    # Git fetches from the first of several origin URLs, the user-level one: the checkout's own is not the answer.
+    assert own._checkout_slug(checkout) is None
+    (home / ".gitconfig").unlink()
     assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
     # An origin defined by a file the local configuration includes is still the checkout's own.
     included = tmp_path / "included"
@@ -569,6 +572,15 @@ def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch
     git(included, "config", "include.path", str(included / "origin.inc"))
     assert own._checkout_slug(included) == "learn-ukrainian/machinery"
     git(checkout, "remote", "set-url", "origin", "https://example.com/not/github.git")
+    assert own._checkout_slug(checkout) is None
+    # Distinct origin URLs, in an include or as a push URL, leave the repository ambiguous.
+    (included / "second.inc").write_text('[remote "origin"]\n\turl = https://github.com/sample/second.git\n')
+    git(included, "config", "--add", "include.path", str(included / "second.inc"))
+    assert own._checkout_slug(included) is None
+    git(checkout, "remote", "set-url", "origin", url)
+    git(checkout, "config", "remote.origin.pushurl", "git@github.com:learn-ukrainian/machinery.git")
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    git(checkout, "config", "remote.origin.pushurl", "https://github.com/sample/elsewhere.git")
     assert own._checkout_slug(checkout) is None
 
 

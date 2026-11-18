@@ -1154,28 +1154,28 @@ def build_parser() -> argparse.ArgumentParser:
 def _checkout_slug(cwd: Path) -> str | None:
     """The ``owner/name`` of the checkout's own origin, else None.
 
-    One read, with Git's repository redirects (``GIT_*``) cleared: only a value the checkout's repository
-    or worktree configuration (includes followed) defines names it. A user-level, system-level or
-    command-line ``remote.origin.url`` applies to any directory, so it names no checkout.
+    One read of every origin URL (fetch and push), with Git's repository redirects (``GIT_*``) cleared.
+    Each value must come from the checkout's repository or worktree configuration (includes followed), and
+    all must name the same GitHub repository: a user-level, system-level or command-line value applies to
+    any directory, and distinct values leave the checkout's repository ambiguous.
     """
     from lu_machinery.fleet.pr_identity import _GITHUB_REMOTE_PATTERNS
 
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         done = subprocess.run(
-            ["git", "config", "--show-scope", "--includes", "--get", "remote.origin.url"],
+            ["git", "config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$"],
             cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    scope, _, url = done.stdout.strip().partition("\t")
-    if done.returncode != 0 or scope not in {"local", "worktree"}:
-        return None
-    for pattern in _GITHUB_REMOTE_PATTERNS:
-        match = pattern.match(url.strip())
-        if match:
-            return f"{match.group(1)}/{match.group(2)}"
-    return None
+    slugs: set[str | None] = set()
+    for line in done.stdout.splitlines():
+        scope, _, entry = line.partition("\t")
+        url = entry.partition(" ")[2].strip()
+        match = next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None)
+        slugs.add(f"{match.group(1)}/{match.group(2)}" if match and scope in {"local", "worktree"} else None)
+    return slugs.pop() if done.returncode == 0 and len(slugs) == 1 else None
 
 
 def _repo_or_checkout(repo: str | None) -> str:
