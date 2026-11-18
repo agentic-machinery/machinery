@@ -527,6 +527,9 @@
     "requirements-lock.txt": [
       "shared-core"
     ],
+    "requirements-machinery.lock": [
+      "shared-core"
+    ],
     "requirements.txt": [
       "shared-core"
     ],
@@ -661,6 +664,9 @@
       "practice-frontend"
     ],
     "tsconfig.json": [
+      "shared-core"
+    ],
+    "uv.lock": [
       "shared-core"
     ],
     "zizmor.yml": [

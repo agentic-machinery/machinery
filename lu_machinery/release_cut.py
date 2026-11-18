@@ -32,6 +32,9 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 
@@ -327,6 +330,52 @@ def heredoc(text: str, opener: str) -> str:
     raise CutError(f"heredoc {opener!r} not found")
 
 
+def wheel_only_requirements(exported: str, lock: Path) -> str:
+    """Keep wheel hashes in the legacy consumer lock that is used by pip."""
+    packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+    wheel_hashes = {wheel["hash"] for package in packages for wheel in package.get("wheels", [])}
+    pins = []
+    for stanza in exported.replace("\\\n", " ").splitlines():
+        if not stanza.strip() or stanza.lstrip().startswith("#"):
+            continue
+        requirement, *hashes = stanza.split(" --hash=")
+        hashes = [part.strip() for part in hashes if part.strip() in wheel_hashes]
+        if not hashes:
+            raise CutError(f"release runtime requirement has no locked wheel hash: {requirement.strip()}")
+        pins.append(requirement.strip() + " \\\n    --hash=" + " \\\n    --hash=".join(hashes))
+    return "\n".join(pins) + "\n"
+
+
+def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str]:
+    """Update one release wheel source and any matching exact version constraints."""
+    manifest = tomllib.loads(text)
+    source = manifest.get("tool", {}).get("uv", {}).get("sources", {}).get("lu-machinery")
+    if not isinstance(source, dict) or not isinstance(old_url := source.get("url"), str):
+        raise CutError("pyproject.toml must declare one lu-machinery wheel URL")
+    old = re.fullmatch(re.escape(release_base) + r"/v(\d+\.\d+\.\d+)/lu_machinery-\1-py3-none-any\.whl", old_url)
+    if old is None or text.count(old_url) != 1:
+        raise CutError("pyproject.toml must declare one lu-machinery wheel URL from this release repository")
+    project = manifest.get("project", {})
+    groups = [project.get("dependencies", []), *project.get("optional-dependencies", {}).values(),
+              *manifest.get("dependency-groups", {}).values()]
+    new_url = f"{release_base}/v{version}/lu_machinery-{version}-py3-none-any.whl"
+    updated = text.replace(old_url, new_url)
+    replacements: dict[str, str] = {}
+    for group in groups:
+        for index, spec in enumerate(group):
+            if not isinstance(spec, str):  # PEP 735 group include
+                continue
+            req = Requirement(spec)
+            if canonicalize_name(req.name) == "lu-machinery" and str(req.specifier) == f"=={old[1]}":
+                group[index] = replacements[spec] = re.sub(rf"==\s*{re.escape(old[1])}\b", f"=={version}", spec, count=1)
+    for spec, new_spec in replacements.items():
+        updated = re.sub(rf"(['\"]){re.escape(spec)}\1", lambda m: m[1] + new_spec + m[1], updated)
+    source["url"] = new_url
+    if tomllib.loads(updated) != manifest:
+        raise CutError("could not update only the lu-machinery URL and exact constraints in pyproject.toml")
+    return updated, new_url
+
+
 # --- Steps ------------------------------------------------------------------------------------
 
 
@@ -545,8 +594,8 @@ class Cut:
         house = self.work / "wheelhouse"
         house.mkdir()
         # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
-        # group, with every hash (ci-gate.yml's dependency-audit and installed-wheel jobs export the
-        # same). --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
+        # group. The legacy consumer lock permits only wheels, including when used without the
+        # release wheelhouse. --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
         # required-version refuses any other uv release.
         uv = shutil.which("uv")
         if uv is None:
@@ -554,7 +603,7 @@ class Cut:
         lock = self.work / "runtime-requirements.txt"
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
                              "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
-        lock.write_text(exported, encoding="utf-8")
+        lock.write_text(wheel_only_requirements(exported, self.work / "src/uv.lock"), encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
                   "--disable-pip-version-check",
@@ -575,7 +624,8 @@ class Cut:
         venv = self.work / "accept"
         python = self.venv(venv)
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
-                  "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "-r", consumer_lock])
+                  "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "--only-binary=:all:",
+                  "-r", consumer_lock])
         self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"])
         shown = self.run([python, "-I", "-c", _SHOW_LU], env=self.scratch_env()).stdout.split()
         if shown[0] != built_version or not Path(shown[1]).resolve().is_relative_to(venv.resolve()):
@@ -609,21 +659,50 @@ class Cut:
                 raise CutError(f"published {path.name} differs from the built file")
         self.say(f"published pre-release {tag}; downloaded assets match SHA256SUMS")
 
+    def update_adopt_inputs(self, consumer_lock: Path, product: Path) -> tuple[str, ...]:
+        """Update the current product pin and return the exact paths the adopt PR will stage."""
+        lock = product / "uv.lock"
+        if not os.path.lexists(lock):
+            shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
+            return ("requirements-machinery.lock",)
+        uv = shutil.which("uv")
+        if uv is None:
+            raise CutError("uv is not on PATH; cannot refresh the product's uv.lock")
+        manifest = product / "pyproject.toml"
+        release_base = f"https://github.com/{self.machinery_repo}/releases/download"
+        updated, url = adopt_manifest(manifest.read_text(encoding="utf-8"), release_base, self.version)
+        manifest.write_text(updated, encoding="utf-8")
+        self.run([uv, "lock", "--upgrade-package", "lu-machinery", "--no-python-downloads"], cwd=product)
+        packages = tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+        selected = [package for package in packages if package["name"] == "lu-machinery"]
+        wheel = self.work / "published" / url.rsplit("/", 1)[-1]
+        expected_hash = f"sha256:{sha256(wheel)}"
+        if (len(selected) != 1 or selected[0].get("version") != self.version
+                or selected[0].get("source") != {"url": url}
+                or [(row.get("url"), row.get("hash")) for row in selected[0].get("wheels", [])]
+                != [(url, expected_hash)]):
+            raise CutError("product uv.lock does not pin the verified published lu-machinery wheel")
+        return ("pyproject.toml", "uv.lock")
+
     def open_adopt_pr(self, consumer_lock: Path, product: Path) -> None:
-        """Draft PR that changes only the product's machinery lock."""
+        """Draft PR adopting the verified release into the product's active lock format."""
         self.step = "adopt PR"
         branch = f"release/lu-machinery-{self.version}"
         self.git(product, "switch", "--quiet", "-c", branch)
-        shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
-        self.git(product, "add", "requirements-machinery.lock")
+        paths = self.update_adopt_inputs(consumer_lock, product)
+        self.git(product, "add", *paths)
         self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
+        pin_summary = (
+            "`pyproject.toml` points to the release wheel and `uv.lock` pins its verified SHA-256."
+            if paths == ("pyproject.toml", "uv.lock") else
+            "`requirements-machinery.lock` becomes the release's wheel-only consumer lock."
+        )
         body.write_text(
             f"Adopts [lu-machinery {self.version}](https://github.com/{self.machinery_repo}/releases/tag/"
-            f"v{self.version}): `requirements-machinery.lock` becomes the release's consumer lock (its "
-            "`lu-machinery` line and hash, then the dependency lock at the tagged commit).\n\n"
+            f"v{self.version}). {pin_summary}\n\n"
             "Opened as a draft by the release cut. It is marked ready when release acceptance passes; "
             "it still needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
