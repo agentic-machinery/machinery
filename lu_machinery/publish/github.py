@@ -1837,7 +1837,21 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
         return results[aid]
 
     baseline_ref = f"refs/heads/{base_ref}"
+    if not any(instance["ref"] == baseline_ref for instance in instances):
+        raise ValueError("no open triage-branch instance")
+    closed_prs = {}
     for instance in instances:
+        if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
+            endpoint = f"pulls/{match[1]}"
+            pull = closed_prs.get(endpoint) or get(endpoint)
+            if (type(pull.get("number")) is not int or pull["number"] != int(match[1])
+                    or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{match[1]}"
+                    or pull.get("state") not in {"open", "closed"}
+                    or type(pull.get("merged")) is not bool):
+                raise ValueError("unknown instance PR identity or state")
+            if pull["state"] == "closed" or pull["merged"] is True:
+                closed_prs[endpoint] = pull
+                continue
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
                 or not instance.get("message", {}).get("text")):
@@ -1853,7 +1867,8 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     # Close the evidence/read race before the one write, without retrying.
     if (get(f"code-scanning/alerts/{number}") != alert
             or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
-            or get(head_endpoint) != head_reference):
+            or get(head_endpoint) != head_reference
+            or any(get(endpoint) != pull for endpoint, pull in closed_prs.items())):
         raise ValueError("alert or triage evidence changed during preflight")
     return alert
 
