@@ -893,8 +893,12 @@ def process_group_exists(pgid):
 def test_scheduled_recovery_settles_terminal_task_left_by_crash(sandbox):
     """Defect: a supervisor killed before settlement left its worktree behind for good."""
     task = sandbox.dispatch("blocked")
-    provider = int(await_file(sandbox.tasks / f"{task[0]}.started"))
-    record = json.loads((sandbox.tasks / f"{task[0]}.json").read_text())
+    # Recovery needs the process group recorded by the supervisor before we kill it.
+    record = json.loads(await_file(
+        sandbox.tasks / f"{task[0]}.json",
+        ready=lambda content: json.loads(content).get("provider_pgid") is not None,
+    ))
+    provider = record["provider_pgid"]
     os.kill(record["pid"], signal.SIGKILL)
     deadline = time.monotonic() + 10
     while worker._identity(record["pid"]) == record["process_start"]:
