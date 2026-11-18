@@ -186,7 +186,9 @@ def test_git_cleanup_reuses_cherry_answers_until_a_tip_moves(tmp_path: Path, mon
     answers: dict[str, tuple[bool, bool]] = {"a": (True, True), "b": (False, True)}
 
     def run_git(args: list[str], *, cwd: Path, **_kwargs: object) -> tuple[int, str, str]:
-        assert args[:1] == ["rev-parse"], args
+        if args[:1] != ["rev-parse"]:
+            # Without a merge base the cheap prefilter decides nothing: every branch goes to cherry.
+            return 1, "", "stub: no git"
         return 0, f"{main_tip[0]}\n", ""
 
     def answer(branch: str, cwd: Path, *, main: str, tip: str | None) -> tuple[bool, bool]:
@@ -227,6 +229,75 @@ def test_git_cleanup_reuses_cherry_answers_until_a_tip_moves(tmp_path: Path, mon
     answers["a"] = (True, True)
     assert merged() == {"a": True, "b": True}
     assert asked == [("a", "m2", "a2"), ("a", "m2", "a2")]
+
+
+def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: the cherry-free branch decision answers differently from ``git cherry``
+    (a branch reported merged that is not, or the reverse), or decides a branch it cannot judge."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "config", "user.email", "codex@example.invalid")
+    _git(repo, "config", "user.name", "Codex Test")
+    _write(repo / "shared.txt", "base\n")
+    _commit_all(repo, "initial")
+
+    def branch_with(name: str, filename: str, body: str) -> None:
+        _git(repo, "checkout", "-b", name, "main")
+        _write(repo / filename, body)
+        _commit_all(repo, f"add {name}")
+        _git(repo, "checkout", "main")
+
+    _git(repo, "branch", "in-main", "main")
+    branch_with("pick", "picked.txt", "p\n")
+    branch_with("samepath", "shared.txt", "branch\n")
+    branch_with("newpaths", "only-here.txt", "n\n")
+    branch_with("spaced", "x y.txt", "same body\n")
+    branch_with("quoted", "a\tb.txt", "same body\n")
+    # ``main`` moves on, so the cherry-picked commit gets an id of its own.
+    _write(repo / "shared.txt", "main\n")
+    _commit_all(repo, "main moves")
+    _git(repo, "cherry-pick", "pick")
+    # Git hashes a path with its whitespace removed: these equal the two branches' patches.
+    _write(repo / "xy.txt", "same body\n")
+    _commit_all(repo, "spaceless")
+    _write(repo / "ab.txt", "same body\n")
+    _commit_all(repo, "tabless")
+
+    main = _git(repo, "rev-parse", "main").strip()
+    expected = {
+        "main": True, "in-main": True, "pick": True, "samepath": False,
+        "newpaths": False, "spaced": True, "quoted": True,
+    }
+
+    def answers() -> dict[str, bool]:
+        branches = git_hygiene_router._list_local_branches(repo)
+        monkeypatch.setattr(git_hygiene_router, "_merged_memo", {})
+        merged = git_hygiene_router._branches_merged_to_main(branches, repo, main)
+        cherry = {
+            branch["name"]: git_hygiene_router._merged_to_main_answer(
+                branch["name"], repo, main=main, tip=branch["_full_sha"])[0]
+            for branch in branches
+        }
+        assert merged == cherry
+        return merged
+
+    assert answers() == expected
+    keys = [(b["name"], b["_full_sha"]) for b in git_hygiene_router._list_local_branches(repo)]
+    decided = git_hygiene_router._decide_without_cherry(keys, main, repo)
+    names = {name: verdict for (name, _tip), verdict in decided.items()}
+    # Only the branches the cheap facts settle; one whose paths ``main`` also changed, or whose path git quotes, is left to cherry.
+    assert names == {"main": True, "in-main": True, "newpaths": False}
+
+    # No common ancestor with main: the decision stands aside and cherry answers for every branch.
+    _git(repo, "checkout", "--orphan", "unrelated")
+    _git(repo, "rm", "-rf", ".")
+    _write(repo / "lone.txt", "x\n")
+    _commit_all(repo, "unrelated root")
+    _git(repo, "checkout", "main")
+    assert answers() == {**expected, "unrelated": False}
+    keys = [(b["name"], b["_full_sha"]) for b in git_hygiene_router._list_local_branches(repo)]
+    assert git_hygiene_router._decide_without_cherry(keys, main, repo) == {}
 
 
 def _graphql_result(monkeypatch, returncode: int, stdout: str) -> None:
