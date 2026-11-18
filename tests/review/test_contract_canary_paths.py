@@ -20,14 +20,16 @@ CURRENT_SOL = current_sol()
 GIB = 2**30
 
 def test_contract_paths_match_product_layout() -> None:
-    """Every contract path is a machinery package file; the retired product scripts/ copies are not."""
+    """Use the root runtime lock and the machinery modules, excluding retired product copies."""
     package_paths = [path for path in CONTRACT_PATHS if path.startswith("lu_machinery/")]
-    assert package_paths == list(CONTRACT_PATHS)
+    assert set(CONTRACT_PATHS) - set(package_paths) == {"uv.lock"}
     for path in package_paths:
         assert touches_contract([path])
         assert not touches_contract([path.replace("lu_machinery/", "scripts/", 1)])
     assert not touches_contract(["schemas/code-review-findings.v1.schema.json"])
     assert not touches_contract(["lu_machinery/unrelated.py"])
+    assert touches_contract(["uv.lock"])
+    assert not touches_contract([".dagger/uv.lock"])
 
 
 CONTRACT_FILE = "lu_machinery/review/review_contract.py"
@@ -305,6 +307,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "git clone" not in output and "fetch --quiet --no-tags --depth 1 " in output
     assert output.index("mksquashfs") < output.index("/source (the image holds") < output.index("snapfuse")
     assert "dispatch admission's disk refuse level" in output
+    assert "--no-emit-project --no-default-groups --all-extras --no-extra test" in output
     # lu-machinery is on no package index: the host wheelhouse supplies it, the lock's hashes pick the bytes.
     assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
     assert "--codex-account b-sub" in output and "--claude-account b" in output
