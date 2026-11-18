@@ -316,13 +316,11 @@ def test_a_claude_slot_keeps_its_ambiguity_refusal(tmp_path, monkeypatch, capsys
     [
         (["prepare", "--agent", "codex"], "codex-core"),
         (["prepare", "--agent", "codex", "--state-file", ".agent/thread-rollovers/codex/lineage-x/lease.json"], "codex"),
-        (["import-bundle", "--agent", "codex", "--file", "legacy.tgz"], "codex"),
-        (["export-bundle", "--agent", "codex"], "codex"),
         (["claim-thread-lease", "--agent", "codex", "--current-thread-id", "t"], "codex"),
     ],
 )
 def test_explicit_packet_selectors_keep_their_namespace(tmp_path, monkeypatch, argv, agent):
-    """Review F2: an explicit state file or bundle keeps the namespace it names."""
+    """Review F2: an explicit state file or lease keeps the namespace it names."""
     monkeypatch.setenv("SESSION_HANDOFF_AGENT", "codex-core")
     args = th.build_parser().parse_args(["--repo-root", str(tmp_path), *argv])
     th.apply_lane_slot(args)

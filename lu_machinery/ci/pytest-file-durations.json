@@ -110,7 +110,6 @@
   "tests/agents_extensions/test_post_compact_stream.py": 7.638,
   "tests/agents_extensions/test_remote_epic_lifecycle.py": 2.345,
   "tests/agents_extensions/test_remote_supervisor.py": 5.924,
-  "tests/agents_extensions/test_rollover_bundles.py": 111.019,
   "tests/agents_extensions/test_rules_core_structural_coverage.py": 0.609,
   "tests/agents_extensions/test_session_stream_handoff.py": 0.661,
   "tests/agents_extensions/test_session_streams.py": 13.619,

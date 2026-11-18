@@ -67,7 +67,6 @@ LAUNCHER_TEST_FILES = (
     "tests/test_start_kimi_launcher.py",
     "tests/test_launcher_sandbox_closure.py",
     "tests/test_secret_redaction.py",
-    "tests/test_rollover_bundles.py",
     "tests/orchestration/test_codex_driver_rollover_recovery.py",
     "tests/orchestration/test_exited_successor_registry.py",
     "tests/orchestration/test_imported_rollover_detection.py",
@@ -139,10 +138,9 @@ POLLUTED_PARENT_TESTS = {
     "tests/test_secret_redaction.py::test_interactive_launcher_child_uses_dispatcher_credential_policy": "explicit synthetic credential environments across active and retired adapters",
     "tests/test_secret_redaction.py::test_round4_exec_restores_signal_defaults": "shared _round4_launcher_probe environment builder",
     "tests/test_secret_redaction.py::test_round5_launcher_preserves_process_paths": "final-agent cleanup preserves explicit PATH, HOME and PWD",
-    "tests/test_rollover_bundles.py::test_launcher_import_is_silent_for_the_typed_none_only": "direct launcher-core rollover import shell environment",
     "tests/orchestration/test_codex_driver_rollover_recovery.py::test_live_pending_packet_is_still_bound": "real rollover shell detection and explicit stream environment",
     "tests/orchestration/test_exited_successor_registry.py::test_real_detector_and_shell_cold_start_after_exact_disposition": "shared rollover shell detection consumer",
-    "tests/orchestration/test_imported_rollover_detection.py::test_imported_pending_packet_launcher_binding": "shared rollover shell detection after cross-host bundle import",
+    "tests/orchestration/test_imported_rollover_detection.py::test_imported_pending_packet_launcher_binding": "shared rollover shell detection of a historical installed packet",
     "tests/test_start_claude_profiles.py::test_native_claude_clears_foreign_route_and_capacity_overrides": "retained launcher failure from the historical exact-head manifest",
     "tests/test_start_codex_driver.py::test_sustained_driver_probes_then_claims_lease_then_binds_drive_epic": "retained launcher failure from the historical exact-head manifest",
     "tests/test_start_codex_driver.py::test_driver_launch_with_caller_prompt_passes_one_positional_prompt": "retained launcher failure from the historical exact-head manifest",
@@ -158,7 +156,7 @@ POLLUTED_PARENT_TESTS = {
 }
 
 
-_PORTED_LAUNCHER_PATHS = {'tests/test_handoff_slot_registry.py': 'tests/lib/test_handoff_slot_registry.py', 'tests/test_launcher_contract.py': 'tests/lib/test_launcher_contract.py', 'tests/test_launcher_helper_root.py': 'tests/lib/test_launcher_helper_root.py', 'tests/test_launcher_interactive_scope.py': 'tests/lib/test_launcher_interactive_scope.py', 'tests/test_start_cto_wrappers.py': 'tests/lib/test_start_cto_wrappers.py', 'tests/test_start_codex_profiles.py': 'tests/lib/test_start_codex_profiles.py', 'tests/test_launcher_driver_scope.py': 'tests/lib/test_launcher_driver_scope.py', 'tests/test_fleet_taxonomy_aliases.py': 'tests/lib/test_fleet_taxonomy_aliases.py', 'tests/test_session_supervisor_shell.py': 'tests/lib/test_session_supervisor_shell.py', 'tests/test_claude_cap_guard.py': 'tests/lib/test_claude_cap_guard.py', 'tests/test_start_claude_profiles.py': 'tests/lib/test_start_claude_profiles.py', 'tests/test_start_codex_claude_code.py': 'tests/lib/test_start_codex_claude_code.py', 'tests/test_rollover_bundles.py': 'tests/agents_extensions/test_rollover_bundles.py'}
+_PORTED_LAUNCHER_PATHS = {'tests/test_handoff_slot_registry.py': 'tests/lib/test_handoff_slot_registry.py', 'tests/test_launcher_contract.py': 'tests/lib/test_launcher_contract.py', 'tests/test_launcher_helper_root.py': 'tests/lib/test_launcher_helper_root.py', 'tests/test_launcher_interactive_scope.py': 'tests/lib/test_launcher_interactive_scope.py', 'tests/test_start_cto_wrappers.py': 'tests/lib/test_start_cto_wrappers.py', 'tests/test_start_codex_profiles.py': 'tests/lib/test_start_codex_profiles.py', 'tests/test_launcher_driver_scope.py': 'tests/lib/test_launcher_driver_scope.py', 'tests/test_fleet_taxonomy_aliases.py': 'tests/lib/test_fleet_taxonomy_aliases.py', 'tests/test_session_supervisor_shell.py': 'tests/lib/test_session_supervisor_shell.py', 'tests/test_claude_cap_guard.py': 'tests/lib/test_claude_cap_guard.py', 'tests/test_start_claude_profiles.py': 'tests/lib/test_start_claude_profiles.py', 'tests/test_start_codex_claude_code.py': 'tests/lib/test_start_codex_claude_code.py'}
 LAUNCHER_TEST_FILES += tuple(
     _PORTED_LAUNCHER_PATHS[path] for path in LAUNCHER_TEST_FILES if path in _PORTED_LAUNCHER_PATHS
 )

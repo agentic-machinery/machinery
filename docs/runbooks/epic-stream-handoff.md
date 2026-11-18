@@ -84,78 +84,23 @@ The successor launcher performs the claim above; it is not a live-driver command
 `--local` is the explicit operator-offline fallback and prints its warning;
 drivers must not use it for remote recovery.
 
-## Cross-host rollover bundle (#7260)
+## Durable rollover handoff
 
-The launcher-derived `epic:<N>` stream now carries the gitignored thread packet
-and the lane handoff as one bounded `rollover-bundle.v1` tarball. `prepare` and
-`confirm-replacement` write the local bundle and best-effort upload it after
-their durable mutation when the fenced `SESSION_STREAM_*` lease envelope is
-present. Upload failure is loud and fail-open: it never blocks close or start.
+For launcher-bound lanes, the newest driver-state `handoff_note` that is not
+done or dropped contains the durable handoff. Run `lu-driver-state render
+--lane <lane>`, then `lu-driver-state show <ID>` to read it.
 
-The automatic launcher import runs before provider pre-lease checks and packet
-scans. The consolidated SessionStart gate repeats the import as a <=3-second
-backstop before `detect`; an unavailable API is a warning, not a start blocker.
-The Python caller receives `--stream` from `launcher_selector_stream
-"$SESSION_EPIC"`; there is no `SESSION_STREAM_ID` guessing path.
+The local `.agent/thread-rollovers/` files retain lifecycle identity, the
+bootstrap prompt and readable handoff. Preparation, resume, confirmation and
+archival use those files without producing or transporting an archive.
+Historical bundle database rows and installed-packet receipts remain readable;
+startup never downloads them or uploads a new bundle.
 
-```bash
-# Explicit export to a local file (the source root is the current checkout).
-.venv/bin/python lu_machinery/orchestration/thread_handoff.py \
-  export-bundle --agent claude-infra --stream epic:6943 --file /tmp/rollover.tgz
-
-# Import from the API authority, or use the file after scp/rsync.
-SESSION_HANDOFF_AGENT=claude-infra .venv/bin/python lu_machinery/orchestration/thread_handoff.py \
-  import-bundle --from-api epic:6943
-.venv/bin/python lu_machinery/orchestration/thread_handoff.py \
-  import-bundle --agent claude-infra --stream epic:6943 --file /tmp/rollover.tgz
-```
-
-When the successor is a different agent, the lane handoff follows the newest
-**upload** across agents, while the successor's own packet is selected separately
-from the newest upload in its own agent namespace; the strict packet binds only
-same-harness successors, who receive it from that own namespace. A
-different-harness successor keeps any foreign lineage under its recorded agent
-namespace and must not treat that packet as its own.
-
-The API host stores at most the five newest bundles for each
-`(stream, agent, lineage)`. Re-uploading the same `bundle_sha256` is idempotent.
-The manifest fingerprints the tokenised member bytes and records
-`tokenized_members`; `bootstrap.md`, `handoff.md`, and other text members carry
-`{{REPO_ROOT}}`, while JSON members are copied byte-for-byte. The bundle tar
-hash is deterministic, `.native-intent.lock` is excluded, and present semantic
-snapshot templates, strict JSON artifacts, identity receipts, and canary
-receipts are included. Secret-pattern hits log only the rule id, write the local
-file, and skip upload.
-
-Import compares `(generation, status rank, prepared_at, rollover_id,
-upload_seq)`, where confirmed/started outranks resumed, which outranks
-pending_start. A newer remote copy archives the local lineage and marks stale
-pending/resumed replacements `superseded`; a newer local copy is refused with
-exit 2 unless `--force` is explicit. A confirmed local replacement is never
-archived for a remote pending copy. Differing existing lane handoffs are kept
-beside the target as `CLAUDE-DRIVER-HANDOFF.<utc>.superseded.md` before install.
-
-`--from-api` with no bundle for the caller's slot (none at all, or only other
-slots' bundles) installs nothing and exits 0 with
-`{"status":"none","action":"import-bundle"}`; SessionStart reports it as ok.
-Refusals (403, 409, a listed bundle that 404s, hash or agent mismatch) still
-exit 2 with `invalid_rollover_bundle`; an unreachable API still fails open with
-a `WARNING: rollover bundle import skipped (fail-open)` line.
-
-The bundle API is loopback-mutation protected just like claim and handoff. A
-remote host reaches it through the SSH tunnel to the API host. If tunnelling is
-not available, export to a file and copy only that file:
-
-```bash
-scp /path/to/rollover.tgz target-host:/tmp/rollover.tgz
-ssh target-host -- .venv/bin/python lu_machinery/orchestration/thread_handoff.py \
-  import-bundle --agent claude-infra --stream epic:6943 --file /tmp/rollover.tgz
-```
-
-After import, run `detect --agent claude-infra --format session-start` and
-follow the exact packet's `bootstrap-replacement` / `confirm-replacement` card.
-Archived copies under `.agent/thread-rollovers/<agent>/_archive/` are retained
-for operator review and are never swept automatically.
+Run `thread_handoff detect --agent <agent> --format session-start` and follow
+the selected packet's exact `bootstrap-replacement` and `confirm-replacement`
+commands. Confirmation still verifies the replacement binding, checkout and
+lease before allowing cleanup. Archive the predecessor only with authoritative
+idle and unpinned app evidence; an unknown state preserves it.
 
 ## Manual checklist (until CLI is habitual)
 

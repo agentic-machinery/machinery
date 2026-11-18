@@ -10,7 +10,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -288,50 +288,24 @@ def test_confirm_replacement_without_quiz_reruns_idempotently(tmp_path, capsys, 
     assert state_path.read_bytes() == before
 
 
-def test_confirm_replacement_stream_uploads_with_parser_monitor_base_url(tmp_path, capsys, monkeypatch):
-    """Port of GH #8643: confirmation forwards the configured upload endpoint."""
+def test_confirm_replacement_stream_stays_local(tmp_path, capsys, monkeypatch):
+    """Confirmation succeeds from the durable file handoff without any network upload."""
     packet, _bootstrap = headless_packet(tmp_path, capsys, monkeypatch)
-    monkeypatch.setenv("SESSION_STREAM_ID", "epic:4700")
-    monkeypatch.setenv("SESSION_STREAM_SESSION_ID", "sess-1")
-    monkeypatch.setenv("SESSION_STREAM_LEASE_ID", "lease-1")
-    monkeypatch.setenv("SESSION_STREAM_GENERATION", "1")
-    monkeypatch.setenv("SESSION_STREAM_FENCING_TOKEN", "1")
-    monkeypatch.setenv("SESSION_STREAM_PROCESS_ID", "1234")
-    seen_base_urls = []
 
-    class RecordingBundleClient:
-        def __init__(self, base_url, *, timeout_s=3.0):
-            self.base_url = base_url
+    def network_forbidden(*args, **kwargs):
+        pytest.fail("local replacement confirmation attempted network access")
 
-        def post(self, path, *, json_body=None, idempotency_key=None, headers=None):
-            seen_base_urls.append(self.base_url)
-            return 200, json.dumps({"upload_seq": 9}), {}
-
-    monkeypatch.setattr(th, "_bundle_client", RecordingBundleClient)
-    assert (
-        th.main(
-            [
-                "--repo-root",
-                str(tmp_path),
-                "--monitor-base-url",
-                "http://127.0.0.1:8767",
-                "confirm-replacement",
-                "--agent",
-                "codex",
-                "--lineage-id",
-                packet["lineage_id"],
-                "--rollover-id",
-                packet["rollover_id"],
-                "--stream",
-                "epic:4700",
-            ]
-        )
-        == 0
-    )
+    monkeypatch.setattr("socket.socket.connect", network_forbidden)
+    assert th.main([
+        "--repo-root", str(tmp_path), "--monitor-base-url", "http://127.0.0.1:1",
+        "confirm-replacement", "--agent", "codex", "--lineage-id", packet["lineage_id"],
+        "--rollover-id", packet["rollover_id"], "--stream", "epic:4700",
+    ]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["bundle_upload"]["status"] == "uploaded"
-    assert payload["bundle_upload"]["upload_seq"] == 9
-    assert seen_base_urls == ["http://127.0.0.1:8767"]
+    assert payload["replacement_status"] == "started"
+    assert payload["replacement_thread_id"] == "new-thread"
+    assert "bundle_upload" not in payload
+    assert (tmp_path / packet["handoff_file"]).is_file()
 
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -341,7 +315,6 @@ _REPO = Path(__file__).resolve().parents[2]
     "argv",
     [
         pytest.param([str(machinery_path("orchestration/thread_handoff.py"))], id="thread_handoff"),
-        pytest.param([str(machinery_path("orchestration/rollover_registry_cli.py"))], id="rollover_registry_cli"),
         pytest.param(["-I", "-c", th.CLAUDEX_SUPERVISOR_BOOTSTRAP, str(_REPO)], id="claudex_supervisor"),
     ],
 )

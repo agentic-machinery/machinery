@@ -45,10 +45,10 @@ This archive step does not replace or weaken the existing automation cleanup
 gate. Delete or pause an old heartbeat only after `confirm-started` reports
 `old_automation_ready_to_delete: true`.
 
-For stale or duplicate-looking packets, never delete the lease. Use the exact
-registry maintenance commands. `finish-cleanup-exact`, `supersede-exact`, and
-`abandon-exact` require immutable proof and separate `--plan` then `--apply`
-invocations. Apply validates the selected agent/lineage/rollover, plan digest,
-and action before mutation and writes a durable receipt. Age alone can warn but
-cannot authorize a disposition. The complete proof contract is
-`agents_extensions/shared/contracts/rollover-registry.md`.
+For stale or duplicate-looking packets, never delete the lease. Authorized
+registry maintenance uses the retained library's `create_maintenance_plan`
+and then `apply_maintenance_plan`, with `MaintenanceAction.FINISH_CLEANUP`,
+`SUPERSEDE` or `ABANDON` and immutable proof. Apply validates the selected
+agent/lineage/rollover, plan digest and action before mutation and writes a
+durable receipt. Age alone cannot authorize a disposition. The complete proof
+contract is `agents_extensions/shared/contracts/rollover-registry.md`.

@@ -326,7 +326,6 @@ launcher_normalize_model() { :; }
 launcher_validate_mode() { :; }
 launcher_load_rules_core() { [ -s "$FAKE_STARTS" ] || exit 98; }
 launcher_prepare_driver_identity() { :; }
-launcher_import_rollover_bundle() { printf 'IMPORT\\n'; }
 launcher_claim_driver_lease() { printf 'LEASE\\n'; }
 launcher_bind_drive_epic() { :; }
 """

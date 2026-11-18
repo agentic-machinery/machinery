@@ -146,8 +146,6 @@ def _runtime_checkout(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     # Only preparation and provider execution are fake. Slot validation, scope
     # re-entry, common supervisor and remote lease refusals execute real code.
     (root / "lu_machinery/lib/deploy_extensions.sh").write_text("deploy_agent_extensions() { :; }\n")
-    core = root / "lu_machinery/lib/launcher_core.sh"
-    core.write_text(core.read_text() + "\nlauncher_import_rollover_bundle() { :; }\n")
     for provider in ("claude", "codex"):
         (root / f"lu_machinery/launchers/{provider}.sh").write_text("""launcher_adapter_validate() { :; }
 launcher_adapter_preflight() { :; }

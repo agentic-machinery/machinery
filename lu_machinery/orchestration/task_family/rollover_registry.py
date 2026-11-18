@@ -1125,13 +1125,13 @@ def next_safe_action(record: Mapping[str, Any]) -> str:
     if state is RolloverState.AWAITING_NATIVE_CREATE:
         return "run native-action --action create for this exact lineage and rollover"
     if state is RolloverState.REPLACEMENT_CREATED:
-        return "resume-exact with the authoritative replacement task ID"
+        return "run bootstrap-replacement with the exact lineage, rollover and authoritative replacement thread ID"
     if state in {RolloverState.RESUMED, RolloverState.STRICT_RECALL_PASSED, RolloverState.CANARY_PASSED}:
         return "read the durable handoff, then confirm this exact resumed successor"
     if state is RolloverState.CONFIRMED:
         return "reconcile and archive only the exact confirmed predecessor"
     if state is RolloverState.PREDECESSOR_ARCHIVED:
-        return "finish-cleanup exact after explicit heartbeat retirement authorization"
+        return "request FINISH_CLEANUP library maintenance with exact heartbeat retirement proof and authorization"
     if state is RolloverState.HEARTBEAT_RETIRED:
         return "none; confirmed successor owns the active lineage"
     if state in TERMINAL_STATES:

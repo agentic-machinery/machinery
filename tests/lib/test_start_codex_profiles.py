@@ -121,14 +121,7 @@ JSON
       ;;
   esac
 fi
-if [[ ( "${{1:-}}" == */lu_machinery/orchestration/thread_handoff.py || "${{1:-}}:${{2:-}}" == -m:lu_machinery.orchestration.thread_handoff ) && "$*" == *" import-bundle "* ]]; then
-  if [[ -n "${{CODEX_LAUNCHER_TEST_ORDER:-}}" ]]; then
-    printf '%s\n' 'import-bundle' >> "$CODEX_LAUNCHER_TEST_ORDER"
-    [[ "$*" == *"--from-api"* ]] && printf '%s\n' 'from-api' >> "$CODEX_LAUNCHER_TEST_ORDER"
-    [[ "$*" != *"--agent"* ]] && printf '%s\n' 'agent-unpinned' >> "$CODEX_LAUNCHER_TEST_ORDER"
-  fi
-  exit 0
-fi
+
 if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "lu_machinery.orchestration.codex_transport_health" ]]; then
   printf '%s\\n' '{{"status":"healthy","fresh":true}}'
   exit 0
@@ -336,7 +329,7 @@ def test_launcher_binds_epic_and_strips_private_flag(tmp_path: Path) -> None:
     assert any("already claimed the hramatka lease" in arg for arg in forwarded)
 
 
-def test_launcher_imports_bundle_before_prelease_scan_and_lease_claim(tmp_path: Path) -> None:
+def test_launcher_scans_local_rollover_before_lease_claim(tmp_path: Path) -> None:
     order_capture = tmp_path / "launcher-order.txt"
     _launch(
         tmp_path,
@@ -345,9 +338,6 @@ def test_launcher_imports_bundle_before_prelease_scan_and_lease_claim(tmp_path: 
         order_capture=order_capture,
     )
     assert order_capture.read_text(encoding="utf-8").splitlines() == [
-        "import-bundle",
-        "from-api",
-        "agent-unpinned",
         "prelease-scan",
         "lease-claim",
     ]
