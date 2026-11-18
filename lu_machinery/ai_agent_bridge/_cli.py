@@ -52,8 +52,8 @@ RETIRED_VERBS = {
     "post": _PUBLISH,
     "p": f"{_PUBLISH} --recipient <slot>",
     "channel": f"{_FLEET} channel create|subscribe|context|publish",
-    "conversation": "GET /api/fleet/acp/conversations",
-    "thread": "GET /api/fleet/acp/conversations/<conversation-id>",
+    "conversation": "GET /api/fleet/acp/conversations (metadata only)",
+    "thread": "GET /api/runtime/acp/conversations/<conversation-id>/transcript (loopback only)",
     "process": _RECEIVE,
     "process-claude": _RECEIVE,
     "process-codex": _RECEIVE,
@@ -980,6 +980,10 @@ def _dispatch_command(args):
     replacement = getattr(args, "retired_replacement", None)
     if replacement is not None:
         refuse_retired_verb(args.command, replacement)
+    # The pre-parse guard in main() cannot see every token argparse accepts as
+    # the id (``-``, ``-1.5``): the parsed id is checked again here.
+    if args.command in _JOB_ID_VERBS and not str(args.message_id).startswith("authority-job_"):
+        refuse_retired_verb(f"{args.command} <message-id>", _JOB_ID_VERBS[args.command])
     if args.command == "read":
         from ._opencode import read_opencode_result
 

@@ -333,7 +333,12 @@ def comms_inbox(
 
     # Only a roster seat is queried, by the roster's own spelling: a request value
     # never reaches the store lookups (task records, plane paths). Others are unknown.
-    roster, _complete = _load_roster()
+    # An unreadable roster (a registry symlink loop raises RuntimeError on 3.12) is
+    # unknown too, never a 500.
+    try:
+        roster, _complete = _load_roster()
+    except (MachineryConfigError, OSError, RuntimeError, ValueError):
+        roster = frozenset()
     seat = next((name for name in sorted(roster) if name == agent), None)
     snapshot: dict = {"probe": "unknown"}
     if seat is not None:

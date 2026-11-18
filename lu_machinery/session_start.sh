@@ -123,10 +123,18 @@ echo ""
 # ---------------------------------------------------------------------------
 # 4. Fleet Comms inbox (body-free count from the Monitor API)
 # ---------------------------------------------------------------------------
-INBOX_AGENT="${SESSION_HANDOFF_AGENT:-claude}"
-INBOX_COUNT=$(curl -s --max-time 5 -G "$API/api/comms/inbox" --data-urlencode "agent=$INBOX_AGENT" \
-    | jq -r 'if .probe == "ok" and (.count | type == "number") then .count else "?" end' 2>/dev/null || echo "?")
-if [ "$INBOX_COUNT" = "?" ] || [ -z "$INBOX_COUNT" ]; then
+# Only a registered seat has an inbox: without SESSION_HANDOFF_AGENT it is unknown.
+INBOX_AGENT="${SESSION_HANDOFF_AGENT:-}"
+if [ -z "$INBOX_AGENT" ]; then
+    echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (no seat identity: set SESSION_HANDOFF_AGENT to your slot)${NC}"
+    INBOX_COUNT=""
+else
+    INBOX_COUNT=$(curl -s --max-time 5 -G "$API/api/comms/inbox" --data-urlencode "agent=$INBOX_AGENT" \
+        | jq -r 'if .probe == "ok" and (.count | type == "number") then .count else "?" end' 2>/dev/null || echo "?")
+fi
+if [ -z "$INBOX_AGENT" ]; then
+    :
+elif [ "$INBOX_COUNT" = "?" ] || [ -z "$INBOX_COUNT" ]; then
     echo -e "${BOLD}INBOX${NC}  ${DIM}unknown (${MACHINERY_PKG}.fleet_comms deliveries pending --recipient $INBOX_AGENT)${NC}"
 elif [ "$INBOX_COUNT" != "0" ]; then
     echo -e "${BOLD}INBOX${NC}  ${YELLOW}$INBOX_COUNT queued for $INBOX_AGENT${NC}"

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -615,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
     except RemoteUnavailableError:
         print("inbox watcher: Monitor API temporarily unavailable", file=sys.stderr)
         return SUPERVISORY_TRANSIENT_EXIT if args.live_supervisory else 2
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
         print(f"inbox watcher: {exc}", file=sys.stderr)
         return 2
     return 0

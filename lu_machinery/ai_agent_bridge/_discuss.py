@@ -94,13 +94,19 @@ def _authoring_context_exists(channel: str) -> bool:
 
     Such a file must be sealed into Fleet Comms (``fleet_comms channel
     context``) before a discussion uses the channel, never silently skipped.
-    ``AB_CONTEXT_DIR`` overrides the authoring root.
+    ``AB_CONTEXT_DIR`` overrides the authoring root. An invalid channel name,
+    or a context path that escapes that root, raises ``ValueError``: the
+    caller refuses the discussion rather than treating it as "no context".
     """
-    if _CHANNEL_NAME.fullmatch(channel) is None:
-        return False
+    if not isinstance(channel, str) or _CHANNEL_NAME.fullmatch(channel) is None:
+        raise ValueError(f"channel name must be lowercase-kebab-case; got {channel!r}")
     root = os.path.realpath(os.environ.get("AB_CONTEXT_DIR") or _config.REPO_ROOT / "docs" / "agent-channels")
     candidate = os.path.realpath(os.path.join(root, channel, "context.md"))
-    return candidate.startswith(root + os.sep) and os.path.isfile(candidate)
+    if not candidate.startswith(root + os.sep):
+        raise ValueError("channel context path escapes the channel context root")
+    return os.path.isfile(candidate)
+
+
 def _resolve_body(body_arg: str) -> str:
     """Accept '-' to mean 'read from stdin'."""
     if body_arg == "-":

@@ -29,6 +29,10 @@ RETIRED_CALLS = (
     ("process-ask", "12", "opencode"),
     ("read", "-12"),
     ("process-ask", "-12", "opencode"),
+    ("read", "-"),
+    ("read", "-1.5"),
+    ("process-ask", "-", "opencode"),
+    ("process-ask", "-1.5", "opencode"),
     ("send", "hello", "--to", "claude"),
     ("ack", "--consumed-by-live-driver", "12"),
     ("ack-all", "claude"),
@@ -75,7 +79,7 @@ def test_retired_bridge_verbs_refuse_with_fleet_replacement(argv, tmp_path, monk
     assert exited.value.code == 2
     assert out.out == ""
     assert f"ab {argv[0]}" in out.err and "is retired" in out.err
-    assert any(name in out.err for name in ("fleet_comms", "/api/fleet/", "ask-"))
+    assert any(name in out.err for name in ("fleet_comms", "/api/fleet/", "/api/runtime/", "ask-"))
     assert not broker.exists()
     assert not pids.exists()
 

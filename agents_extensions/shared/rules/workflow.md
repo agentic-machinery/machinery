@@ -44,7 +44,7 @@ curl -s "http://localhost:8765/api/orient?lean=true&session=$S"         # lean, 
 # Known functional role only: replace `quality` with the assigned role.
 curl -s 'http://localhost:8765/api/knowledge/cold-start?role=quality'  # role-scoped pointers
 # Generic or genuinely role-unknown session: skip the role-scoped request; remain pointer-free.
-curl -s 'http://localhost:8765/api/comms/inbox?agent=claude'  # unread messages
+curl -s "http://localhost:8765/api/comms/inbox?agent=$SESSION_HANDOFF_AGENT"  # queued deliveries for your seat
 # Fleet-comms durable authority: query live mode + parity (see fleet-comms-coordination.md)
 .venv/bin/python -m lu_machinery.fleet_comms plane-status
 ```
@@ -742,13 +742,14 @@ those.
 **Quick reference** (through the explicit project bridge; never run bare
 `ab`, which resolves to ApacheBench on the operator machine):
 ```bash
-  # Inspect (read-only Monitor API)
+  # Inspect (read-only Monitor API): conversation metadata, then the local-only transcript
 curl -s http://127.0.0.1:8765/api/fleet/acp/conversations
 curl -s http://127.0.0.1:8765/api/fleet/acp/conversations/CONVERSATION_ID
+curl -s http://127.0.0.1:8765/api/runtime/acp/conversations/CONVERSATION_ID/transcript
 
   # Post (one recipient per --recipient; threading with --in-reply-to / --correlation-id)
 .venv/bin/python -m lu_machinery.fleet_comms channel publish reviews - \
-  --sender "$SESSION_HANDOFF_AGENT" --recipient claude --idempotency-key KEY < message.md
+  --sender "$SESSION_HANDOFF_AGENT" --recipient claude-cto --idempotency-key KEY < message.md
 
   # Multi-agent bounded discussion
 .venv/bin/python -m lu_machinery.ai_agent_bridge discuss architecture \
@@ -760,7 +761,9 @@ curl -s http://127.0.0.1:8765/api/fleet/acp/conversations/CONVERSATION_ID
 short-circuits when all agents end their response with `[AGREE]`,
 and caps at 4 rounds. Default: 2 rounds, 1 agent. The discussion is a
 Fleet Comms job; read its transcript with
-`GET /api/fleet/acp/conversations/<conversation-id>`.
+`GET /api/runtime/acp/conversations/<conversation-id>/transcript` (loopback
+only). `GET /api/fleet/acp/conversations/<conversation-id>` is its body-free
+metadata.
 
 **Full docs**: `docs/best-practices/agent-bridge.md`.
 
