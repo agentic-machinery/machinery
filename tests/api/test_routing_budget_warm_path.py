@@ -200,10 +200,11 @@ def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypa
     """Defect class: right after a restart the cold routing-budget read awaited the startup
     warmup's computation with no bound, so the request middleware cut it off with a 504.
     While the first attempt runs, even with the default executor saturated, the read answers
-    the typed warming 503 with Retry-After inside the request timeout, then 200 once it lands."""
+    the typed warming 503 with Retry-After inside the 2 s client bound, then 200 once it lands.
+    Only the context that started the warmup is starting; a running server waits longer."""
     from lu_machinery.api import resilience
 
-    monkeypatch.setenv("API_REQUEST_TIMEOUT_S", "4")
+    monkeypatch.delenv("API_REQUEST_TIMEOUT_S", raising=False)  # the default 10 s limit
     release = threading.Event()
 
     def compute(**kwargs):
@@ -213,7 +214,11 @@ def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypa
 
     app = _app(monkeypatch, tmp_path, compute)
     app.middleware("http")(resilience.resilience_middleware)
-    warmup = state_router.schedule_state_scan_warmup(app.state.ctx)  # what the lifespan starts at process start
+    ctx = app.state.ctx
+    warmup = state_router.schedule_state_scan_warmup(ctx)  # what the lifespan starts at process start
+    running_wait = resilience.request_timeout_s() - state_router.ROUTING_BUDGET_RESPONSE_RESERVE_S
+    # Another context on the same root that would reuse this thread is not starting.
+    assert state_router._routing_budget_cold_wait_s(fixture_context(tmp_path)) == running_wait
 
     async def scenario():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -228,9 +233,10 @@ def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypa
             assert cold.json() == {"detail": "routing budget warming"}
             assert cold.headers["Retry-After"] == "2"
             assert cold.headers["X-Snapshot-Age-S"] == "unknown"
-            assert elapsed < resilience.request_timeout_s() - 1
+            assert elapsed < 2.0
             await asyncio.to_thread(warmup.join, 30)
             assert not warmup.is_alive()
+            assert state_router._routing_budget_cold_wait_s(ctx) == running_wait
             assert (await client.get("/api/state/routing-budget")).status_code == 200
 
     asyncio.run(scenario())

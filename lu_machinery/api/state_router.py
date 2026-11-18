@@ -125,9 +125,11 @@ ROUTING_BUDGET_TTL_S = 15.0
 # Past this age a stored snapshot must not authorize a lane. Same bound the
 # payload already publishes as diagnostics.stale_threshold_s.
 ROUTING_BUDGET_MAX_AGE_S = 900.0
-# A read with nothing stored answers within this bound while the startup warmup's
-# first routing-budget attempt runs, then the typed warming 503 (#829, #832).
-ROUTING_BUDGET_STARTUP_COLD_WAIT_S = 2.0
+# A read with nothing stored waits this long while the startup warmup's first
+# routing-budget attempt runs, then answers the typed warming 503 (#829, #832).
+# Short, so request setup and delivery under startup load still fit the 2 s
+# client timeout of the dispatch pool selector.
+ROUTING_BUDGET_STARTUP_COLD_WAIT_S = 0.5
 # On a running server a cold read waits for its computation until this long
 # before the request timeout, so its typed 503 is never cut off by the 504.
 ROUTING_BUDGET_RESPONSE_RESERVE_S = 3.0
@@ -2571,13 +2573,10 @@ def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
 
 _state_scan_warm_lock = threading.Lock()
 _state_scan_warm_thread: threading.Thread | None = None
-# Context cache scopes whose startup warmup has not finished its first
-# routing-budget attempt; guarded by ``_state_scan_warm_lock``.
-_routing_budget_startup_scopes: set[str] = set()
-
-
-def _routing_budget_startup_scope(ctx: MonitorContext) -> str:
-    return _ctx_cache_key(ctx, "routing-budget-startup")
+# The context whose startup warmup thread has not finished its first
+# routing-budget attempt (by identity: another context with the same root that
+# reused the thread is not starting); guarded by ``_state_scan_warm_lock``.
+_routing_budget_startup_owner: MonitorContext | None = None
 
 
 def _routing_budget_cold_wait_s(ctx: MonitorContext) -> float:
@@ -2592,16 +2591,15 @@ def _routing_budget_cold_wait_s(ctx: MonitorContext) -> float:
     never below zero: a request timeout too short for the reserve answers the
     typed 503 at once rather than the 504.
     """
-    scope = _routing_budget_startup_scope(ctx)
     with _state_scan_warm_lock:
-        starting = scope in _routing_budget_startup_scopes
+        starting = _routing_budget_startup_owner is ctx
     bound = max(0.0, request_timeout_s() - ROUTING_BUDGET_RESPONSE_RESERVE_S)
     return min(ROUTING_BUDGET_STARTUP_COLD_WAIT_S, bound) if starting else bound
 
 
 def _run_state_scan_warmup(ctx: MonitorContext, follow_ups: tuple[Callable[[MonitorContext], None], ...] = ()) -> None:
     """Warm the routing-budget cache after process start, then run the product scan warms in order."""
-    scope = _routing_budget_startup_scope(ctx)
+    global _routing_budget_startup_owner
     try:
         # First: a dispatch launch right after a restart reads this key (#12512).
         cache_get_or_compute(
@@ -2613,7 +2611,8 @@ def _run_state_scan_warmup(ctx: MonitorContext, follow_ups: tuple[Callable[[Moni
         logging.getLogger("state_router").warning("Routing-budget warmup failed: %s", exc)
     finally:
         with _state_scan_warm_lock:  # the startup phase ends with this first attempt, either way
-            _routing_budget_startup_scopes.discard(scope)
+            if _routing_budget_startup_owner is ctx:
+                _routing_budget_startup_owner = None
     for follow_up in follow_ups:
         follow_up(ctx)
 
@@ -2627,8 +2626,7 @@ def schedule_state_scan_warmup(
     from an earlier call (which may belong to a different ctx) — so callers can
     join it instead of polling for effects (#8570).
     """
-    global _state_scan_warm_thread
-    scope = _routing_budget_startup_scope(ctx)
+    global _state_scan_warm_thread, _routing_budget_startup_owner
     with _state_scan_warm_lock:
         if _state_scan_warm_thread is not None and _state_scan_warm_thread.is_alive():
             return _state_scan_warm_thread
@@ -2638,11 +2636,11 @@ def schedule_state_scan_warmup(
             name="state-scan-warmup",
             daemon=True,
         )
-        _routing_budget_startup_scopes.add(scope)
+        _routing_budget_startup_owner = ctx
         try:
             worker.start()
         except BaseException:
-            _routing_budget_startup_scopes.discard(scope)
+            _routing_budget_startup_owner = None
             raise
         _state_scan_warm_thread = worker
         return worker
