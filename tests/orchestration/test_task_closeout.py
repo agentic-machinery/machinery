@@ -2220,20 +2220,13 @@ def merged_mutation(bound_case, tmp_path, monkeypatch):
     """Exercise the real fresh collector with named GitHub response fixtures."""
     from lu_machinery.orchestration import merge_closeout as mc
 
-    ledger, observation, pull, run, jobs = bound_case
+    ledger, observation, *_ = bound_case
     path = tmp_path / "merged.json"
     task_lifecycle.write_lifecycle(path, ledger)
     adapter = FakeAdapter(observation)
     adapter.repo_root = tmp_path
     adapter.merged_run_evidence = lambda *a, **k: task_closeout.GhGitHubAdapter.merged_run_evidence(adapter, *a, **k)
-    def api(root, request):
-        assert root == tmp_path
-        assert request.fields["repo"] == "org/repo"
-        return {
-            "read-pull": pull, "read-runs": [{"total_count": 1, "workflow_runs": [run]}],
-            "read-run": run, "read-jobs": [{"total_count": len(jobs), "jobs": jobs}],
-        }[request.verb]
-    monkeypatch.setattr(mc, "_closeout_api", api)
+    monkeypatch.setattr(mc, "_closeout_api", run_evidence.closeout_reads(bound_case, tmp_path))
     return path, adapter, bound_case
 
 
