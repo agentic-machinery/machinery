@@ -56,8 +56,10 @@ def authority_inbox_notice(recipient: str | None, *, file: TextIO | None = None)
     Body-free: only the queued count is read. An unknown recipient or store
     reports ``unknown``, never zero.
     """
+    from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
+
     slot = (recipient or "").strip().lower()
-    result = probe(slot) if slot else {"probe": "unknown"}
+    result = pending_delivery_snapshot(slot) if slot else {"probe": "unknown"}
     count = result["count"] if result["probe"] == "ok" else "unknown"
     target = slot or "<slot>"
     print(

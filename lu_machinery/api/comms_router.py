@@ -325,7 +325,9 @@ def comms_inbox(
     only when the plane was read; otherwise ``count`` is null (unknown, never
     zero). Read the deliveries with ``fleet_comms deliveries receive``.
     """
-    from lu_machinery.fleet_comms.authority import pending_delivery_snapshot  # noqa: PLC0415 — authority stack on demand
+    from lu_machinery.fleet_comms.authority import (  # noqa: PLC0415 — authority stack on demand
+        pending_delivery_snapshot,
+    )
 
     snapshot = pending_delivery_snapshot(agent, root=default_plane_root(repo_root=ctx.roots.state_root), limit=limit)
     return {
