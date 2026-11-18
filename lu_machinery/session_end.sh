@@ -94,18 +94,6 @@ if curl -s --max-time 2 "$API/api/state/summary" > /dev/null 2>&1; then
         echo ""
     fi
 
-    # Failures
-    FAILING=$(curl -s "$API/api/state/failing")
-    fail_count=$(echo "$FAILING" | jq '.count')
-    if [ "$fail_count" -gt 0 ]; then
-        echo -e "${BOLD}FAILING${NC}  ${RED}$fail_count modules${NC}"
-        echo "$FAILING" | jq -r '.modules[:5][] |
-            "  \(.track)/\(.slug) — audit:\(.audit_status) phases:\(.failed_phases | join(","))"'
-        if [ "$fail_count" -gt 5 ]; then
-            echo -e "  ${DIM}... and $((fail_count - 5)) more${NC}"
-        fi
-        echo ""
-    fi
 else
     echo -e "${DIM}Monitoring API not running — skipping state check${NC}"
     echo ""

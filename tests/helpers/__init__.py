@@ -37,3 +37,18 @@ def product_checkout() -> Path:
     from lu_machinery.common import repo_root
 
     return repo_root.product_root()
+
+
+@functools.cache
+def current_sol() -> str:
+    """The model catalog's current Sol: the ``openai_frontier`` seat holder (``gpt-6.2-sol`` since 2026-11-17).
+
+    Tests whose intent is "the current Sol" (a live dispatch, reviewer, default or seat) read it here,
+    so the next Sol replacement is a catalog edit. Tests about historical records keep literal ids.
+    """
+    import yaml
+
+    from lu_machinery.review.model_catalog import CATALOG_PATH
+
+    # Plain read: leaves load_model_catalog's cache cold for tests that patch or clear it.
+    return yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))["seats"]["openai_frontier"]["model_id"]

@@ -28,6 +28,9 @@ from lu_machinery.dispatcher import worker
 from lu_machinery.dispatcher.providers import agy
 from lu_machinery.dispatcher.providers import codex
 from tests.agent_runtime.product_roots import agent_runtime_roots as agent_runtime_roots
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 TASK_ID = "review-demo-r1"
 
@@ -151,7 +154,7 @@ def dispatch(tmp_path, monkeypatch):
     schema.write_text('{"type":"object","required":["verdict"]}')
 
     def invoke(path="schema.json", agent="sol", expected=0, review=False, review_profile="code", task_id="schema"):
-        model = {"agy": "gemini-3.8-flash-high", "claude": "claude-opus-5-5"}.get(agent, "gpt-6.1-sol")
+        model = {"agy": "gemini-3.8-flash-high", "claude": "claude-opus-5-5"}.get(agent, CURRENT_SOL)
         args = ["dispatch", "--agent", agent, "--model", model, "--task-id", task_id, "--prompt", "Review"]
         if agent == "agy" and review_profile is not None:
             args += ["--review-profile", review_profile]

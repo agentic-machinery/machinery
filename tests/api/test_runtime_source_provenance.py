@@ -142,6 +142,3 @@ def test_runtime_api_reports_every_failure_code_the_runtime_emits(
 
     records = runtime_router.recent_runtime_records(limit=1, ctx=ctx)["records"]
     assert records[0]["failure_code"] == failure_code
-    response = client.get("/api/runtime/recent?limit=1")
-    assert response.status_code == 200
-    assert response.json()["records"][0]["failure_code"] == failure_code

@@ -1,7 +1,10 @@
 ## Resume and confirm
 
 In the fresh task, use the exact IDs and handoff path returned by `detect`.
-Read that handoff before continuing. Finish the exact native title reconciliation
+Read that handoff before continuing. A launcher-bound lane's handoff content is
+its DB note instead: its newest driver-state `handoff_note` that is not done or
+dropped (`lu-driver-state render --lane <lane>`, then `lu-driver-state show <ID>`).
+For a lane, the packet carries identity and lifecycle only. Finish the exact native title reconciliation
 or the recorded unsupported-adapter fallback described in [preparation](prepare.md).
 Use the replacement already bound to this rollover.
 

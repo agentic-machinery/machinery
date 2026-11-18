@@ -38,10 +38,10 @@ PROFILE_ROLES = {
     "luna_explorer_medium": ("gpt-6-luna", "medium", "read-only"),
     "luna_explorer_high": ("gpt-6-luna", "high", "read-only"),
     "luna_coder_high": ("gpt-6-luna", "high", "workspace-write"),
-    "sol_coder_high": ("gpt-6.1-sol", "high", "workspace-write"),
-    "sol_red_team_high": ("gpt-6.1-sol", "high", "read-only"),
-    "sol_ukrainian_content_high": ("gpt-6.1-sol", "high", "workspace-write"),
-    "sol_advisor_high": ("gpt-6.1-sol", "high", "read-only"),
+    "sol_coder_high": ("gpt-6.2-sol", "high", "workspace-write"),
+    "sol_red_team_high": ("gpt-6.2-sol", "high", "read-only"),
+    "sol_ukrainian_content_high": ("gpt-6.2-sol", "high", "workspace-write"),
+    "sol_advisor_high": ("gpt-6.2-sol", "high", "read-only"),
 }
 SUPERSEDED_PROFILES = ("astra_worker_low", "astra_red_team_high", "astra_advisor_high")
 ROOT_SETTINGS = {key: value for key, value in EXPECTED.items() if key != "agents"}

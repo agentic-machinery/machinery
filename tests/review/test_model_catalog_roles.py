@@ -42,6 +42,9 @@ from tests.review.test_model_catalog import (
     without_advisory_roles,
 )
 from lu_machinery.common.repo_root import machinery_path
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -64,7 +67,7 @@ def test_expansion_is_independent_and_does_not_mutate_catalog(catalog):
     before = deepcopy(catalog)
     expanded = expanded_legacy_view(catalog)
     assert_frozen_surfaces({"catalog": expanded}, surfaces=("catalog",))
-    expanded["models"]["gpt-6.1-sol"]["roles"].clear()
+    expanded["models"][CURRENT_SOL]["roles"].clear()
     assert catalog == before
     assert without_advisory_roles(expanded_legacy_view(with_advisory_roles(BASELINE["catalog"]))) == BASELINE["catalog"]
 
@@ -74,7 +77,7 @@ def test_roles_and_identity_aliases_remain_distinct():
     assert canonical_model_id("anthropic_authority") is None
     assert canonical_model_id("claude-opus-5-5[1m]") == "claude-opus-5-5"
     with pytest.raises(ModelCatalogError, match="unknown routing role"):
-        resolve_role("gpt-6.1-sol", purpose="inspect")
+        resolve_role(CURRENT_SOL, purpose="inspect")
     with pytest.raises(ModelCatalogError, match="stable routing role"):
         resolve_role([], purpose="inspect")
 
@@ -83,8 +86,8 @@ def test_authorities_have_one_native_holder_per_family():
     # D-129 (#10464): no Claude model reviews or holds authority through Cursor.
     result = resolve_role("designated_authorities", purpose="inspect")
     assert [(row.model_id, row.family, row.transport) for row in result.candidates] == [
-        ("gpt-6.1-sol", "openai", "native_codex"),
-        ("gpt-6.1-sol", "openai", "native_codex"),
+        (CURRENT_SOL, "openai", "native_codex"),
+        (CURRENT_SOL, "openai", "native_codex"),
         ("claude-opus-5-5", "anthropic", "native_claude"),
         ("claude-opus-5-5", "anthropic", "agy"),
     ]
@@ -124,7 +127,7 @@ def test_wire_ids_belong_to_identity_and_transport_and_opus_has_native_and_agy_p
 def test_launch_explicitly_pins_current_review_models():
     launched = resolve_role("legacy_reviewers", purpose="launch")
     assert {row.model_id for row in launched.candidates} == {
-        "gpt-6.1-sol",
+        CURRENT_SOL,
         "claude-opus-5-5",
         "claude-sonnet-5-5",
         "gemini-3.8-flash-high",
@@ -195,7 +198,7 @@ def test_family_capability_isolation_subject_and_explicit_pin_exclusions():
     result = resolve_role("anthropic_authority_reviewer", purpose="inspect", family="openai", context={
         "required_capabilities": ["unsupported"], "isolation_required": True,
         "excluded_seats": ["anthropic_authority"], "excluded_families": ["anthropic"],
-        "pinned_model": "gpt-6.1-sol",
+        "pinned_model": CURRENT_SOL,
     })
     assert [row.route_name for row in result.candidates] == ["native", "agy"]
     for opus in result.candidates:
@@ -205,7 +208,7 @@ def test_family_capability_isolation_subject_and_explicit_pin_exclusions():
     result = resolve_role("legacy_reviewers", purpose="inspect", family="openai", context={
         "required_capabilities": ["unsupported"], "isolation_required": True,
         "excluded_seats": ["anthropic_practical"], "excluded_families": ["anthropic"],
-        "pinned_model": "gpt-6.1-sol",
+        "pinned_model": CURRENT_SOL,
     })
     (sonnet_agy,) = (row for row in result.candidates
                      if row.seat == "anthropic_practical" and row.route_name == "agy")
@@ -265,7 +268,7 @@ def test_invalid_extension_versions_or_empty_sections(catalog, field, value):
         validate_catalog(catalog)
 
 
-@pytest.mark.parametrize("model", ["unregistered", "gpt-6-astra", "qwen/qwen3.6-plus", "gpt-6.1-sol-high"])
+@pytest.mark.parametrize("model", ["unregistered", "gpt-6-astra", "qwen/qwen3.6-plus", f"{CURRENT_SOL}-high"])
 def test_holder_requires_concrete_registered_routable_identity(catalog, model):
     catalog["seats"]["bounded_worker"]["model_id"] = model
     reason = r"unknown concrete|unroutable"
@@ -324,7 +327,7 @@ def test_review_role_does_not_relax_family_or_risk_exclusions(catalog, seat):
 
 
 def test_wire_mapping_cannot_come_from_predecessor(catalog):
-    catalog["models"]["gpt-6-luna"]["routing_wire_ids"]["native_codex"] = "gpt-6.1-sol"
+    catalog["models"]["gpt-6-luna"]["routing_wire_ids"]["native_codex"] = CURRENT_SOL
     with pytest.raises(ModelCatalogError, match="mismatched identity"):
         validate_catalog(catalog)
     catalog = deepcopy(load_model_catalog())
@@ -367,7 +370,7 @@ def test_qualification_is_identity_and_capability_bound(catalog):
     seat["qualification"] = {"model_id": seat["model_id"], "bindings": seat["bindings"], "reference": "fixture:qualified"}
     assert validate_catalog(catalog)
     assert resolve_role("bounded_recon", catalog=catalog, purpose="inspect").candidates[0].qualification_reference == "fixture:qualified"
-    seat["qualification"]["model_id"] = "gpt-6.1-sol"
+    seat["qualification"]["model_id"] = CURRENT_SOL
     with pytest.raises(ModelCatalogError, match="qualification mismatches"):
         validate_catalog(catalog)
 
@@ -376,7 +379,7 @@ def test_shell_api_returns_structured_evidence_and_typed_refusal(tmp_path):
     argv = [sys.executable, "-m", "lu_machinery.review.model_catalog"]
     result = subprocess.run([*argv, "--resolve-role", "bounded_advisor"], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["candidates"][0]["model_id"] == "gpt-6.1-sol"
+    assert json.loads(result.stdout)["candidates"][0]["model_id"] == CURRENT_SOL
     context = tmp_path / "context.json"
     health = tmp_path / "health.json"
     context.write_text(json.dumps({"required_capabilities": ["missing"]}))
@@ -418,7 +421,7 @@ def test_catalog_file_path_cli_in_clean_environment(tmp_path, args, expected_sta
     else:
         row = json.loads(result.stdout)["candidates"][0]
         assert (row["model_id"], row["family"], row["transport"]) == (
-            "gpt-6.1-sol", "openai", "native_codex",
+            CURRENT_SOL, "openai", "native_codex",
         )
         if "launch" in args:
             assert row["argv"][row["argv"].index("--model") + 1] == row["wire_id"]

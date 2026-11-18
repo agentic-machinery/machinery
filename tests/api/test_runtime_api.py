@@ -367,10 +367,7 @@ def test_usage_aggregates_by_agent(tmp_path, monkeypatch):
         ],
     )
 
-    response = client.get("/api/runtime/usage?days=7")
-
-    assert response.status_code == 200
-    data = response.json()
+    data = runtime_router.summarize_runtime_usage(days=7, ctx=app.state.ctx)
     assert data["records_total"] == 3
     assert data["by_agent"]["codex"]["total"] == 2
     assert data["by_agent"]["codex"]["ok"] == 1
@@ -813,10 +810,7 @@ def test_recent_limits_results(tmp_path, monkeypatch):
         ],
     )
 
-    response = client.get("/api/runtime/recent?limit=2")
-
-    assert response.status_code == 200
-    records = response.json()["records"]
+    records = runtime_router.recent_runtime_records(limit=2, ctx=app.state.ctx)["records"]
     assert len(records) == 2
     assert records[0]["outcome"] == "timeout"
     assert records[0]["source"] == "unknown"
@@ -850,10 +844,7 @@ def test_recent_preserves_typed_body_free_acp_failure(tmp_path, monkeypatch):
         ],
     )
 
-    response = client.get("/api/runtime/recent?limit=1")
-
-    assert response.status_code == 200
-    record = response.json()["records"][0]
+    record = runtime_router.recent_runtime_records(limit=1, ctx=app.state.ctx)["records"][0]
     assert record["failure_code"] == "acp_turn_limit"
     assert "stderr_excerpt" not in record
 
@@ -940,9 +931,7 @@ def test_recent_accounting_projections_preserve_legacy_aggregates(tmp_path, monk
     _write_usage_file(path, [{**original[0], **expected}, original[1]])
     assert runtime_router.summarize_runtime_usage(ctx=ctx) == before
     assert runtime_router._last_used_agent_models(ctx=ctx) == last_used
-    response = client.get("/api/runtime/recent")
-    assert response.status_code == 200
-    rows = {row["agent"]: row for row in response.json()["records"]}
+    rows = {row["agent"]: row for row in runtime_router.recent_runtime_records(ctx=ctx)["records"]}
     assert rows["agy"]["model"] == "accounting-model"
     assert {key: rows["agy"][key] for key in expected} == expected
     assert {key: rows["codex"][key] for key in expected} == {

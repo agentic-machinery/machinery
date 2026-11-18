@@ -548,7 +548,7 @@ the task's private stdout log, as evidence of its repository and Git context rea
 ```bash
 "$PROJECT_PYTHON" -m scripts.review.prompts.render <manifest> --review-id R --attempt-id A \
   --review-access full --repo-root <checkout> --output <prompt>   # <checkout>: detached, at the reviewed commit
-"$PROJECT_PYTHON" lu_machinery/dispatch.py dispatch --agent sol --model gpt-6.1-sol --effort high \
+"$PROJECT_PYTHON" lu_machinery/dispatch.py dispatch --agent sol --model gpt-6.2-sol --effort high \
   --mode read-only --full-checkout --pinned-head <commit> --review-access full \
   --review-id R --attempt-id A --review-attempt <manifest> --prompt-file <prompt> --task-id T
 "$PROJECT_PYTHON" lu_machinery/dispatch.py wait T

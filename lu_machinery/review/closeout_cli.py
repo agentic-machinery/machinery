@@ -1608,7 +1608,7 @@ Examples:
   .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
     target --mode pr --pr 8946 --repo-root .
   .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
-    resolve-reviewer --author-model codex:gpt-6.1-sol --risk high --domain infra \\
+    resolve-reviewer --author-model codex:gpt-6.2-sol --risk high --domain infra \\
     --owned-path {_EXAMPLE_OWNED_PATH}
   .venv/bin/python {_ENTRY} --state-file .agent/review.json \\
     resolve-reviewer --author-model claude --subject-seat grok
@@ -1775,7 +1775,7 @@ def _build_parser() -> argparse.ArgumentParser:
             f"  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\\n"
             "    resolve-reviewer --author-model claude --risk high\n"
             f"  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\\n"
-            "    resolve-reviewer --author-model codex:gpt-6.1-sol --domain infra --risk high \\\n"
+            "    resolve-reviewer --author-model codex:gpt-6.2-sol --domain infra --risk high \\\n"
             f"    --owned-path {_EXAMPLE_OWNED_PATH}\n"
             f"  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\\n"
             "    resolve-reviewer --author-model claude --subject-seat grok --subject-family xai\n"
@@ -1934,7 +1934,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fr = finding_sub.add_parser("raise")
     fr.add_argument("--id", required=True, help="Finding id. Example: F1")
     fr.add_argument("--summary", required=True, help="One-line finding summary. Example: governed seat can self-review")
-    fr.add_argument("--source", required=True, help="Who raised it. Example: reviewer:gpt-6.1-sol")
+    fr.add_argument("--source", required=True, help="Who raised it. Example: reviewer:gpt-6.2-sol")
     fa = finding_sub.add_parser("adjudicate")
     fa.add_argument("--id", required=True, help="Finding id to adjudicate. Example: F1")
     fa.add_argument(

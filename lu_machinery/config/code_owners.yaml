@@ -25,7 +25,7 @@ areas:
       - agents_extensions/shared/skills/review-loop/**
 
   - area: ci-release-deps
-    owner: gpt-6.1-sol
+    owner: gpt-6.2-sol
     paths:
       - .github/**
       - lu_machinery/ci/**
@@ -54,7 +54,7 @@ areas:
       - dashboards/**
 
   - area: storage-and-sources
-    owner: gpt-6.1-sol
+    owner: gpt-6.2-sol
     paths:
       - lu_machinery/storage/**
       - lu_machinery/lib/readonly_sqlite.py
@@ -62,7 +62,7 @@ areas:
       - scripts/verification/**
 
   - area: ukrainian-content-and-language
-    owner: language lanes (gemini-3.8-flash-high via AGY; gpt-6.1-sol)
+    owner: language lanes (gemini-3.8-flash-high via AGY; gpt-6.2-sol)
     note: VESUM and sources evidence required
     paths:
       - curriculum/**
@@ -72,7 +72,7 @@ areas:
 
   - area: rules-skills-policy
     owner: claude-cto
-    note: designated approval (Opus 5.5 plus Sol 6.1, or the operator)
+    note: designated approval (Opus 5.5 plus Sol 6.2, or the operator)
     paths:
       - agents_extensions/shared/rules/**
       - agents_extensions/shared/skills/**
@@ -80,7 +80,7 @@ areas:
       - lu_machinery/config/code_owners.yaml
 
   - area: open-model-data
-    owner: gpt-6.1-sol
+    owner: gpt-6.2-sol
     note: operator keep-list, never delete
     paths:
       - scripts/projects/open_model_data/**

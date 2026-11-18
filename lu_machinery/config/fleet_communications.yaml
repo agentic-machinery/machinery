@@ -21,7 +21,7 @@ formal_review_eligibility_source: scripts/config/model_catalog.yaml#review_sched
 # fail-closed; retired seats are never reviewers.
 #
 # Formal CF model+effort pins (model_catalog formal_cf_defaults; review-pr removed in #8520):
-#   codex → gpt-6.1-sol @ high · claude → claude-sonnet-5-5 @ high
+#   codex → gpt-6.2-sol @ high · claude → claude-sonnet-5-5 @ high
 #   claude formal pins also: claude-opus-5-5
 #   GLM, Pool/Laguna, Composer and Qwen are retired, not subscribed (2026-10-23).
 #   Gemma is live for hramatka only, through OpenCode, and is not a review,
@@ -30,15 +30,15 @@ formal_review_eligibility_source: scripts/config/model_catalog.yaml#review_sched
 #     attestation, native CLI or Cursor (operator decision 2026-10-05, #9769)
 #   agy → gemini-3.8-flash-high @ high (catalog seat for bounded work and Ukrainian content review;
 #         not a planning, design or driver seat, #9584; text-only ACP wrapper is not a formal-review route)
-# Codex advisory escalation: gpt-6.1-sol @ high; routine reviewer stays high.
-# Automatic authority Opus 5.5/Sol 6.1 selection stays on the critical ladder;
+# Codex advisory escalation: gpt-6.2-sol @ high; routine reviewer stays high.
+# Automatic authority Opus 5.5/Sol 6.2 selection stays on the critical ladder;
 # Fable and Astra hold no review role (#9583). An explicit operator pin at another risk keeps every
 # formal eligibility, isolation, family, capability, health, and circuit gate
 # enforced.
 #
 # Orchestrator seats for this stream (model_catalog.orchestrator_seats):
 #   claude(claude-opus-5-5 @ high)
-#   · codex(gpt-6.1-sol @ high) · grok(daily driver)
+#   · codex(gpt-6.2-sol @ high) · grok(daily driver)
 #   (codex was dropped as a driver on 2026-07-22, then re-added on 2026-07-23 because
 #    HydrationCapsuleV1 reduces rollover overhead; formal-CF eligibility is unchanged.)
 # Each of these may own cold-start / drive-board loops. agy(gemini-3.8-flash-high @ high)

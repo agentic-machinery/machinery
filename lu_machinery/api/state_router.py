@@ -6,7 +6,6 @@ product routes in ``scripts.project_api.state_router`` (Monitor split, C-4687).
 
 Endpoints:
   GET /api/state/routing-budget       Per-agent capacity burn + routing recommendation
-  GET /api/state/github-budget        Cached GitHub GraphQL rateLimit observation
   GET /api/state/manifest             Cold-start component index
 """
 
@@ -38,7 +37,6 @@ from lu_machinery.fleet.reset_reserve import (
     codex_reset_reserve_eligible,
     load_reset_reserve,
 )
-from lu_machinery.github_graphql_budget import probe_graphql_budget
 from lu_machinery.research.registry import research_manifest_component
 from lu_machinery.telemetry.cost_report import CostRecord, load_cost_records
 
@@ -66,7 +64,6 @@ from .state_helpers import (
     cache_get_or_compute,
     cache_get_or_compute_async,
     cache_get_stored,
-    cache_read_swr,
     ctx_scoped_ttl_key,
     schedule_cache_refresh,
 )
@@ -674,8 +671,7 @@ def _recommend_agent(
 
 
 def _runtime_usage_records_7d(*, usage_dir: Path | None = None) -> int | None:
-    """Count agent-runtime usage rows over the same 7-day window served by
-    ``GET /api/runtime/usage?days=7``. Returns None when the probe itself fails.
+    """Count agent-runtime usage rows over a 7-day window. Returns None when the probe itself fails.
 
     The USD cost ledger can be empty while runtime usage exists; diagnostics
     must say so instead of reporting ``runtime_data_available=false`` just
@@ -1531,13 +1527,13 @@ def _compute_dispatch_routing_budget(
         data_age_s = cb_max_age_s
 
     # Honest availability: the 5-minute reactive window can be quiet while
-    # the 7-day runtime usage log (what /api/runtime/usage serves) has rows.
+    # the 7-day runtime usage log has rows.
     runtime_data_available = runtime_sourced_any or bool(runtime_records_7d)
     if not records and runtime_records_7d:
         warnings.append(
             f"USD cost ledger empty (records_loaded=0) but runtime usage has "
             f"{runtime_records_7d} record(s) in 7d — ledger burn unavailable, "
-            f"see /api/runtime/usage?days=7"
+            f"the runtime usage log has rows but this ledger does not"
         )
 
     if is_stale:
@@ -1707,7 +1703,7 @@ def _compute_dispatch_routing_budget(
     if reserve_relaxes_codex:
         rec["primary_agent_for_code"] = "codex"
         rec["rationale"] = (
-            "Operator-confirmed Codex reset reserve permits the GPT-6.1 Sol code lane; "
+            "Operator-confirmed Codex reset reserve permits the GPT-6.2 Sol code lane; "
             "provider windows, runtime headroom, and lane health were freshly verified."
         )
 
@@ -2149,7 +2145,7 @@ def compute_routing_budget(
     if reserve_relaxes_codex and budget["agents"].get("codex", {}).get("eligible") is True:
         budget["recommendation"]["primary_agent_for_code"] = "codex"
         budget["recommendation"]["rationale"] = (
-            "Operator-confirmed Codex reset reserve permits the GPT-6.1 Sol code lane; "
+            "Operator-confirmed Codex reset reserve permits the GPT-6.2 Sol code lane; "
             "provider windows, runtime headroom, and ACP compatibility were freshly verified."
         )
     primary = budget["recommendation"]["primary_agent_for_code"]
@@ -2532,20 +2528,6 @@ def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
     ))
 
 
-GITHUB_BUDGET_TTL_S = 60.0
-
-
-@router.get("/github-budget")
-async def github_budget():
-    """Return a shared, one-minute GraphQL rateLimit observation; ``checked_at`` names its time.
-
-    An expired reading is served at once with its true age (``X-Snapshot-Age-S``)
-    while one refresh asks GitHub again.
-    """
-    # A failed probe is kept for the minute too, as before: an outage must not send every read to GitHub.
-    value, age, _stored = await cache_read_swr("github_graphql_budget", GITHUB_BUDGET_TTL_S, probe_graphql_budget)
-    return JSONResponse(content=value, headers=panel_values.snapshot_headers(age, GITHUB_BUDGET_TTL_S))
-
 
 _state_scan_warm_lock = threading.Lock()
 _state_scan_warm_thread: threading.Thread | None = None
@@ -2612,7 +2594,6 @@ async def manifest(request: Request, ctx: MonitorContext = Depends(get_ctx)):
           "session": {"hash": "...", "url": "/api/session/current?agent=orchestrator&format=markdown"},
           "orient":  {"url": "/api/orient"},
           "inbox":   {"url_template": "/api/comms/inbox?agent={name}"},
-          "activity": {"url": "/api/comms/agent-activity"}
         }
 
     ``rules`` and ``session`` expose a content hash so an agent can
@@ -2661,10 +2642,6 @@ async def manifest(request: Request, ctx: MonitorContext = Depends(get_ctx)):
             "inbox": {
                 "url_template": "/api/comms/inbox?agent={name}",
                 "note": "Read-only view of unread channel deliveries for one agent.",
-            },
-            "activity": {
-                "url": "/api/comms/agent-activity",
-                "note": "Compact channel delivery/event snapshot for orchestration.",
             },
             "capacity": {
                 "url": "/api/state/routing-budget",

@@ -25,6 +25,9 @@ from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from lu_machinery.lib import rules_core
 from tests.agent_runtime.attempt_boundary_support import CLAUDE_AMBIENT_AUTH, _private_json
 from tests.agent_runtime.test_claude_account_worker import _calls, _run, accounts  # noqa: F401  (fixture)
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("agent_runtime_roots")
 
@@ -405,7 +408,7 @@ def test_plan_headroom_stop_cannot_be_bypassed_by_pin_or_host_override(headroom_
 
 
 @pytest.mark.parametrize("block", ["pause", "headroom", "runtime"])
-@pytest.mark.parametrize("agent,model", [("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol")])
+@pytest.mark.parametrize("agent,model", [("claude", "claude-opus-5-5"), ("codex", CURRENT_SOL)])
 def test_paused_or_exhausted_lane_never_silently_substitutes(headroom_box, capsys, block, agent, model):
     """Granted D6 defect class: a refused/exhausted v2 route silently launches a different model."""
     box = headroom_box
@@ -450,9 +453,9 @@ def test_invoke_rate_limit_short_circuit(headroom_box, monkeypatch):
 
     headroom_box.policy({})
     monkeypatch.setattr(usage, "has_headroom", lambda *_a, **_k: (False, "cached rate limit"))
-    record = headroom_box.supervise(agent="codex", model="gpt-6.1-sol")
+    record = headroom_box.supervise(agent="codex", model=CURRENT_SOL)
     assert record["status"] == "rate_limited"
-    assert record["error"] == "codex/gpt-6.1-sol rate limited: cached rate limit"
+    assert record["error"] == f"codex/{CURRENT_SOL} rate limited: cached rate limit"
     assert record["returncode"] is None
     assert headroom_box.launches == []
 
@@ -465,7 +468,7 @@ def test_headroom_stop_refuses_matching_models_only(headroom_box, capsys, monkey
 
     assert headroom_box.dispatch(model="claude-sonnet-5-5") == 2
     assert "MODEL_HEADROOM: claude-sonnet-5-5" in capsys.readouterr().err
-    assert headroom_box.dispatch(agent="codex", model="gpt-6.1-sol") == 0
+    assert headroom_box.dispatch(agent="codex", model=CURRENT_SOL) == 0
     # A Claude model on another route is outside the native plan cap.
     for model in ("claude-opus-5-5-high", "claude-sonnet-5-5-high"):
         assert headroom_box.dispatch(agent="agy", model=model) == 0
@@ -517,7 +520,7 @@ def test_trial_shadow_requires_qualified_matching_task(headroom_box, monkeypatch
     box.policy({})
     monkeypatch.setattr(git, "resolve_repo", lambda *_a: (box.root, {"key": "public", "github": "example/repo"}))
     now = datetime.now(UTC)
-    entry = {"model": "gpt-6.1-sol", "roles": ["authoring"], "reason": "New role measurement with no prior runs",
+    entry = {"model": CURRENT_SOL, "roles": ["authoring"], "reason": "New role measurement with no prior runs",
              "start": (now - timedelta(days=1)).isoformat(), "review_date": (now + timedelta(days=1)).isoformat(),
              "decided_by": "cto", "evidence": {"window_start": (now - timedelta(days=2)).isoformat(),
                  "window_end": (now - timedelta(days=1)).isoformat(), "dispatch_records": []}}
@@ -526,7 +529,7 @@ def test_trial_shadow_requires_qualified_matching_task(headroom_box, monkeypatch
                  "agent": "claude", "mode": "read-only", "research_role": "authoring", "status": "done",
                  "repository_id": "example/repo", "worktree_base_sha": "a" * 40,
                  "prompt_sha256": store.digest(b"Explain the result")}
-    trial = {**qualified, "task_id": "trial", "model": "gpt-6.1-sol", "agent": "codex", "schema_version": 2,
+    trial = {**qualified, "task_id": "trial", "model": CURRENT_SOL, "agent": "codex", "schema_version": 2,
              "trial_role": "authoring", "trial_qualified_task": "qualified", "trial_label": "trial"}
     if defect == "trial_pair":
         qualified["trial_label"] = "trial"
@@ -546,15 +549,15 @@ def test_trial_shadow_requires_qualified_matching_task(headroom_box, monkeypatch
              "--research-role", "authoring"]
     if defect in {"label", "write"}:
         with pytest.raises(ValueError, match="MODEL_ROLE_TRIAL_REFUSED"):
-            headroom.check_plan("codex", "gpt-6.1-sol", trial)
+            headroom.check_plan("codex", CURRENT_SOL, trial)
     else:
-        result = box.dispatch(*flags, agent="codex", model="gpt-6.1-sol")
+        result = box.dispatch(*flags, agent="codex", model=CURRENT_SOL)
         assert result == (0 if defect is None else 2)
         if defect is not None:
             assert "MODEL_ROLE_TRIAL_REFUSED" in capsys.readouterr().err
         else:
-            headroom.check_plan("codex", "gpt-6.1-sol", trial)
-    assert box.launches == ([("codex", "gpt-6.1-sol", None)] if defect is None else [])
+            headroom.check_plan("codex", CURRENT_SOL, trial)
+    assert box.launches == ([("codex", CURRENT_SOL, None)] if defect is None else [])
 
 
 @pytest.fixture

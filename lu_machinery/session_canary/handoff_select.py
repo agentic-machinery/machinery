@@ -296,13 +296,18 @@ def load_codex_candidates(repo: Path, epic: str) -> list[LoadedCandidate]:
     )
 
 
-# A lane's handoff lives in the driver-state database as one full-content
-# ``handoff_note`` (scripts/driver_state.py). The Codex canary mints from the
-# newest note first; markdown handoffs are the fallback (#12567).
+# A lane's handoff content lives in the driver-state database as one
+# full-content ``handoff_note`` (the lane's DB note). It is the only handoff
+# content authority on cold start, compaction and replacement (#511); markdown
+# handoffs are canary inputs only. The fence matches ``lu-driver-state render``
+# and the driver keeper: the exact lane, notes that are not done or dropped,
+# newest first. The owner is not part of the fence, so a lane's successor on
+# another harness reads the same note.
 DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
 DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
 DRIVER_STATE_TIMEOUT_SECONDS = 60
 DRIVER_STATE_SNAPSHOT_NAME = "driver-state-handoff-note.md"
+_TERMINAL_NOTE_STATUSES = frozenset({"done", "dropped"})
 _NUMBERED_ITEM_RE = re.compile(r"^\s*\d+[.)]\s+(.+?)\s*$")
 
 
@@ -316,36 +321,6 @@ def _driver_state_cli() -> str | None:
     return shutil.which(name) if name else None
 
 
-def codex_lane_slot(epic: str) -> str | None:
-    """The Codex slot the launcher derives for ``epic`` (``handoff_identity_for_codex_epic``).
-
-    Inside a launched lane the launcher already exported that value as
-    ``SESSION_HANDOFF_AGENT``; otherwise the shell function is asked directly.
-    """
-    exported = os.environ.get("SESSION_HANDOFF_AGENT", "").strip()
-    if re.fullmatch(r"codex-[a-z0-9-]+", exported) and os.environ.get("SESSION_EPIC", "").strip() == epic:
-        return exported
-    try:
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'source "$1" && handoff_identity_for_codex_epic "$2"',
-                "codex-slot",
-                str(machinery_path("lib/handoff_identity.sh")),
-                epic,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    slot = result.stdout.strip()
-    return slot if result.returncode == 0 and re.fullmatch(r"codex-[a-z0-9-]+", slot) else None
-
-
 def _note_created(note: Mapping[str, object]) -> datetime | None:
     raw = note.get("created_utc")
     if not isinstance(raw, str):
@@ -357,31 +332,31 @@ def _note_created(note: Mapping[str, object]) -> datetime | None:
     return created if created.tzinfo else created.replace(tzinfo=UTC)
 
 
-def fetch_newest_handoff_note(lane: str, owner: str) -> dict[str, object] | None:
-    """Newest non-dropped ``handoff_note`` for ``lane`` written by ``owner``, or None.
+def fetch_newest_handoff_note(lane: str) -> dict[str, object] | None:
+    """The lane's DB note: its newest ``handoff_note`` that is not done or dropped, or None.
 
     Reads through the ``lu-driver-state`` CLI (override or disable with
     ``LU_DRIVER_STATE_CLI``; an empty value disables the lookup). Any failure
-    returns None, so the caller falls back to markdown handoffs.
+    returns None with a warning; callers decide whether that blocks.
     """
     cli = _driver_state_cli()
     if not cli:
         return None
-    command = [cli, "list", "--lane", lane, "--kind", "handoff_note", "--owner", owner, "--all", "--json"]
+    command = [cli, "list", "--lane", lane, "--kind", "handoff_note", "--json"]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=DRIVER_STATE_TIMEOUT_SECONDS, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        _warn(f"driver-state handoff_note unavailable ({type(exc).__name__}); using markdown handoffs")
+        _warn(f"driver-state handoff_note unavailable ({type(exc).__name__})")
         return None
     if result.returncode != 0:
-        _warn(f"driver-state handoff_note unavailable (exit {result.returncode}); using markdown handoffs")
+        _warn(f"driver-state handoff_note unavailable (exit {result.returncode})")
         return None
     try:
         items = json.loads(result.stdout)
     except json.JSONDecodeError:
-        _warn("driver-state handoff_note output is not JSON; using markdown handoffs")
+        _warn("driver-state handoff_note output is not JSON")
         return None
     notes = [
         item
@@ -389,8 +364,7 @@ def fetch_newest_handoff_note(lane: str, owner: str) -> dict[str, object] | None
         if isinstance(item, dict)
         and item.get("kind") == "handoff_note"
         and item.get("lane") == lane
-        and item.get("owner") == owner
-        and item.get("status") != "dropped"
+        and item.get("status") not in _TERMINAL_NOTE_STATUSES
         and isinstance(item.get("id"), str)
         and isinstance(item.get("statement"), str)
         and _note_created(item) is not None
@@ -414,7 +388,7 @@ def _next_actions(statement: str, limit: int = 3) -> list[str]:
     return items
 
 
-def render_handoff_note(note: Mapping[str, object], *, lane: str, owner: str) -> str:
+def render_handoff_note(note: Mapping[str, object], *, lane: str) -> str:
     """Render a note as a handoff the canary minter reads: next actions plus a working set."""
     note_id = str(note["id"])
     created = _note_created(note)
@@ -422,6 +396,7 @@ def render_handoff_note(note: Mapping[str, object], *, lane: str, owner: str) ->
         raise ValueError(f"handoff_note {note_id} has no valid created_utc")
     created_utc = created.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     statement = str(note.get("statement") or "")
+    owner = note.get("owner")
     lines = [
         f"# Driver-state handoff_note {note_id}",
         "",
@@ -444,22 +419,19 @@ def render_handoff_note(note: Mapping[str, object], *, lane: str, owner: str) ->
     return "\n".join(lines) + "\n"
 
 
-def load_driver_state_candidate(repo: Path, epic: str, *, slot: str | None = None) -> LoadedCandidate | None:
-    """The lane's newest driver-state ``handoff_note`` as a mint candidate, or None.
+def load_driver_state_candidate(repo: Path, epic: str) -> LoadedCandidate | None:
+    """The lane's DB note as a mint candidate, or None.
 
-    The driver-state lane is the launcher's epic; the note owner is the lane's
-    Codex slot. The rendered snapshot is written under the epic's canary
-    directory so mint, score and hydrate read the same recorded file.
+    The driver-state lane is the launcher's epic. The rendered snapshot is
+    written under the epic's canary directory so mint, score and hydrate read
+    the same recorded file.
     """
     if _driver_state_cli() is None:
         return None
-    owner = slot or codex_lane_slot(epic)
-    if not owner:
-        return None
-    note = fetch_newest_handoff_note(epic, owner)
+    note = fetch_newest_handoff_note(epic)
     if note is None:
         return None
-    text = render_handoff_note(note, lane=epic, owner=owner)
+    text = render_handoff_note(note, lane=epic)
     path = repo / ".claude" / f"{epic}-epic" / "canary" / DRIVER_STATE_SNAPSHOT_NAME
     try:
         if read_candidate_text(path) != text:
@@ -473,14 +445,14 @@ def load_driver_state_candidate(repo: Path, epic: str, *, slot: str | None = Non
     return LoadedCandidate(path=path, text=text)
 
 
-def load_codex_mint_candidates(repo: Path, epic: str, *, slot: str | None = None) -> list[LoadedCandidate]:
-    """What the Codex launcher mints from: the newest DB handoff_note, then markdown.
+def load_codex_mint_candidates(repo: Path, epic: str) -> list[LoadedCandidate]:
+    """What the Codex launcher mints from: the lane's DB note, then markdown.
 
     Selection takes the first candidate that yields the full anchor set, so the
     markdown handoffs are used only when the database note is absent or short.
     """
     markdown = load_codex_candidates(repo, epic)
-    note = load_driver_state_candidate(repo, epic, slot=slot)
+    note = load_driver_state_candidate(repo, epic)
     return [note, *markdown] if note is not None else markdown
 
 

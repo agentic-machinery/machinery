@@ -41,8 +41,9 @@ RESERVED_SCHEMA_FAILURE = "reserved_collaboration_schema"
 EXPECTED_TOOL_NAMESPACE = "agents"
 DEFAULT_TTL_SECONDS = 900
 DEFAULT_TIMEOUT_SECONDS = 120
-DEFAULT_MODEL = "gpt-6.1-sol"
-DEFAULT_EFFORT = "low"
+DEFAULT_MODEL = "gpt-6.2-sol"
+# The cheapest effort models.gpt-6.2-sol.efforts offers; the launcher refuses low for Sol 6.2.
+DEFAULT_EFFORT = "medium"
 
 # The product's Codex config, relative to the product checkout (C-4746).
 DEFAULT_CONFIG_REL = "agents_extensions/codex/config.toml"

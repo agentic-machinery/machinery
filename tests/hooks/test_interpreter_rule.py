@@ -854,8 +854,6 @@ for arg in "$@"; do url=$arg; done
 case $url in
   */api/state/summary) printf '%s\\n' '{"totals":{"total":1,"research_done":0,"content_done":0,"audit_passing":0,"final_review_done":0},"tracks":{}}' ;;
   */api/batch/active) printf '%s\\n' '[]' ;;
-  */api/state/failing) printf '%s\\n' '{"count":0,"modules":[]}' ;;
-  */api/state/preparation) printf '%s\\n' '{"totals":{"manifest_active_tracks":0,"manifest_active_modules":0,"module_state_counts":{"built":0,"partial":0,"unbuilt":0},"publication_state_counts":{"published":0,"generated":0,"absent":0}}}' ;;
   *) printf '%s\\n' '{}' ;;
 esac
 """)

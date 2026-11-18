@@ -7,11 +7,7 @@ D01, D03, D04, D10, D12 and D13 have dedicated tests beside their handlers.
 
 from __future__ import annotations
 
-import json
-import sqlite3
-
 from lu_machinery.api import claude_account_usage
-from lu_machinery.api.fleet_router import _message_item
 from lu_machinery.api.route_contracts import contract_for_route
 from lu_machinery.common.repo_root import machinery_path
 
@@ -48,49 +44,6 @@ def test_d02_routing_contract_declares_its_source() -> None:
     assert contract is not None
     assert contract.mutates is False
     assert contract.locality == "host_affine"
-
-
-def test_d05_message_metadata_never_fabricates_a_posted_blocker_or_decision() -> None:
-    """D05 stays unmet rather than turning arbitrary metadata into authority."""
-    connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    connection.execute(
-        """
-        CREATE TABLE messages (
-            message_id TEXT, conversation_id TEXT, in_reply_to TEXT, kind TEXT,
-            sender TEXT, recipient TEXT, request_state TEXT, created_at TEXT,
-            body_inline TEXT, body_artifact_id TEXT, metadata_json TEXT,
-            authority_provenance_json TEXT, conversation_source TEXT
-        )
-        """
-    )
-    connection.execute(
-        "INSERT INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (
-            "msg-1",
-            "conv-1",
-            None,
-            "blocker",
-            "worker",
-            "operator",
-            "pending",
-            "2026-10-20T10:00:00Z",
-            "private body text",
-            None,
-            json.dumps({"blocker": {"owner": "private-owner"}, "operator_decision": {"required": True}}),
-            None,
-            None,
-        ),
-    )
-    row = connection.execute("SELECT * FROM messages").fetchone()
-    message = _message_item(row)
-
-    assert message["body_available"] is True
-    assert message["body_preview"] == "private body text"
-    assert "blocker" not in message["metadata"]
-    assert "operator_decision" not in message["metadata"]
-    assert "posted_blocker" not in message
-    assert "operator_decision" not in message
 
 
 def test_d06_home_reads_exclude_agent_monitor_status() -> None:

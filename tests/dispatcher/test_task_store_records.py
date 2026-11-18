@@ -12,6 +12,9 @@ from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review import review_lineage
 from tests.dispatcher.conftest import run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -140,7 +143,7 @@ def test_receipt_marker_cannot_hide_legacy_review_claim(tmp_path, monkeypatch):
     ("review_attempt", {"review_id": "legacy"}),
     ("require_review_verdict", True),
     ("review_profile", "infra"),
-    ("review_author_model", "gpt-6.1-sol"),
+    ("review_author_model", CURRENT_SOL),
     ("review_risk", "high"),
     ("review_mode", "cross_family"),
     ("type", "review"),

@@ -505,3 +505,28 @@ def test_cold_request_waits_for_the_collect_instead_of_a_poll(tmp_path, monkeypa
         release.set()
         background.set()
         cache_invalidate(str(tmp_path.resolve()))
+
+
+def test_pinned_astra_rows_counted_separately(tmp_path, monkeypatch):
+    """Defect class: a pinned model's runs merged into, or dropped beside, the routed Sol rows.
+
+    Astra 6.2 runs only on request (operator 2026-11-17); each pinned run, read-only security
+    review or write, must stay its own model row next to Sol 6.2 and historical Sol 6.1 rows.
+    """
+    batch_state, tasks = _state(tmp_path)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    _record(tasks, "astra-write", model="gpt-6.2-astra", duration_s=900)
+    _record(tasks, "sol62-write", model="gpt-6.2-sol", duration_s=300)
+    _record(tasks, "sol61-write", duration_s=600)
+    _review(tasks, "astra-review", "correct", ["P2"], agent="codex", model="gpt-6.2-astra",
+            resolved_model="gpt-6.2-astra", duration_s=400)
+    added = rows.backfill(tasks, batch_state)["added"]
+    payload = _window(batch_state, stats.Landing(task_ids={"astra-write"}))
+
+    assert added == 4
+    astra_write = _row(payload, "gpt-6.2-astra", "write")
+    assert (astra_write["tasks"], astra_write["landed"]) == (1, 1)
+    assert astra_write["wall_seconds"]["total_seconds"] == 900.0
+    assert _row(payload, "gpt-6.2-astra", "review")["tasks"] == 1
+    assert (_row(payload, "gpt-6.2-sol", "write")["tasks"], _row(payload, "gpt-6.2-sol", "write")["landed"]) == (1, 0)
+    assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 1

@@ -21,6 +21,9 @@ from lu_machinery.lib import rules_core
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from lu_machinery.common.repo_root import machinery_root
+from tests.helpers import current_sol
+
+CURRENT_SOL = current_sol()
 
 
 
@@ -304,13 +307,13 @@ def test_worktree_plan_retains_containment_symlinks_repo_identity_and_git_failur
 
 
 def test_review_family_uses_model_family_not_harness_and_refuses_unknown():
-    checks.check_review_family("gpt-6.1-sol", "claude-opus-5-5")
+    checks.check_review_family(CURRENT_SOL, "claude-opus-5-5")
     checks.check_review_family("claude-opus-5-5", "grok-4.7-high")
     for author, reviewer in (
-        ("gpt-6.1-sol", "gpt-6-luna"),
+        (CURRENT_SOL, "gpt-6-luna"),
         ("claude-opus-5-5", "claude-sonnet-5-5"),
-        ("unknown", "gpt-6.1-sol"),
-        ("gpt-6.1-sol", "unknown"),
+        ("unknown", CURRENT_SOL),
+        (CURRENT_SOL, "unknown"),
     ):
         with pytest.raises(ValueError, match="known, different"):
             checks.check_review_family(author, reviewer)
@@ -533,7 +536,7 @@ def test_aliases_and_all_retained_metadata_flags_parse():
             "--agent",
             "sol",
             "--model",
-            "gpt-6.1-sol",
+            CURRENT_SOL,
             "--prompt",
             "x",
             "--owned-path",
@@ -556,7 +559,7 @@ def test_aliases_and_all_retained_metadata_flags_parse():
 
 def test_initial_response_timeout_default_is_600():
     """Ported from tests/test_delegate.py::test_initial_response_timeout_default_is_600."""
-    args = build_parser().parse_args(["dispatch", "--agent", "codex", "--model", "gpt-6.1-sol", "--prompt", "hi"])
+    args = build_parser().parse_args(["dispatch", "--agent", "codex", "--model", CURRENT_SOL, "--prompt", "hi"])
     assert args.initial_response_timeout == 600
     assert args.silence_timeout == 3600
 

@@ -6,15 +6,11 @@ batch progress) is a product route in ``scripts.project_api.batch_progress``
 under the same prefix (Monitor split, C-4687).
 
 Endpoints:
-  GET /api/comms/messages              All messages (filterable)
-  GET /api/comms/conversations         Grouped by task_id
-  GET /api/comms/conversation/{id}     Full thread
-  GET /api/comms/active-processes      Live bridge PIDs
-  GET /api/comms/zombies               Stuck patterns
-  GET /api/comms/stats                 Rate, latency, error %
-  GET /api/comms/health                Broker DB health
   GET /api/comms/v1/plane-status       Message-plane mode + schema + parity (read-only)
-  GET /api/comms/agent-activity        Compact channel activity by agent
+  GET /api/comms/live-activity         Module-level live feed
+  GET /api/comms/channels/{name}       Channel bridge reads and posts
+  GET /api/comms/inbox                 Unread deliveries for one agent
+  GET /api/comms/v1/metrics            Authority failure metrics
   POST /api/comms/cleanup              Force-ack zombies
   POST /api/comms/acknowledge/{id}     Ack single message
 """
@@ -31,7 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -39,15 +35,11 @@ from lu_machinery.ai_agent_bridge.broker_indexes import apply as apply_broker_in
 from lu_machinery.control_plane.storage import ControlPlaneError
 from lu_machinery.fleet_comms.agent_success_metrics import collect_agent_success
 from lu_machinery.fleet_comms.efficiency_metrics import (
-    collect_dead_letters,
-    collect_dead_letters_authority,
-    collect_delivery_backlog,
-    collect_delivery_backlog_authority,
     collect_efficiency_metrics,
     collect_efficiency_metrics_authority,
     resolve_metrics_source,
 )
-from lu_machinery.fleet_comms.message_plane import read_plane_status, resolve_plane_mode
+from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import apply_migrations
 from lu_machinery.fleet_comms.opsec_store import (
     COMMS_RESPONSE_SCHEMA_VERSION,
@@ -63,7 +55,6 @@ from .state_helpers import (
     cache_get,
     cache_get_or_compute_async,
     cache_get_stored,
-    cache_set,
     ctx_scoped_ttl_key,
     schedule_cache_refresh,
 )
@@ -129,437 +120,24 @@ def _get_db(ctx: MonitorContext) -> SQLiteConnection | None:
     return conn
 
 
-def _table_exists(conn: SQLiteConnection, table: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table,),
-    ).fetchone()
-    return row is not None
 
 
-def _column_exists(conn: SQLiteConnection, table: str, column: str) -> bool:
-    return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
-
-
-# ── Delivery-expiry background sweep (#4837 item 4) ────────────────────
-#
-# Precedent: codexbar_usage.trigger_background_refresh() (this package) —
-# a lazy, cache-miss-triggered background thread rather than a true cron.
-# Dead lanes (e.g. a retired CLI) never call `ab inbox run`, so nothing
-# else in the process ever runs the expire sweep for them; hooking it to
-# a frequently-polled dashboard endpoint means it fires on a real cadence
-# without needing a separate scheduler process.
-
-_EXPIRE_SWEEP_INTERVAL_S = 900.0  # 15 minutes
-_expire_sweep_lock = threading.Lock()
-# Serializes the callers that point the bridge's _config.DB_PATH at this router's broker DB
-# (the expiry sweep thread and comms_inbox), so an overlapping restore cannot drop or pin
-# another caller's override.
+# Serializes callers that point the bridge DB path at this router's broker DB
+# (comms inbox), so an overlapping restore cannot drop or pin another override.
 _bridge_db_override_lock = threading.Lock()
-_expire_sweep_thread: threading.Thread | None = None
 
 
-def _maybe_run_delivery_expiry_sweep(ctx: MonitorContext) -> None:
-    """Lazily trigger the channel-delivery TTL + dead-lane expire sweep.
-
-    Non-blocking: the sweep runs in a daemon thread so a slow SQLite
-    write never delays the caller's response. At most one sweep thread
-    runs at a time and at most once per ``_EXPIRE_SWEEP_INTERVAL_S``.
-    Skips entirely if this router's broker DB doesn't exist yet, the
-    channel-bridge tables aren't there yet, or the schema predates the TTL
-    columns (``channels.max_age_hours`` / ``channel_messages.priority``) —
-    the sweep must never be what triggers ``ai_agent_bridge``'s own schema
-    auto-migration (adding those columns) as a side effect of a dashboard
-    poll. That migration is safe when the bridge CLI runs it deliberately,
-    but silently altering + then expiring rows in some OTHER schema this
-    router's DB happens to resemble (e.g. an older/synthetic fixture) is
-    not — it must look exactly like a current, real broker DB first.
-    """
-    message_db = ctx.roots.message_db_path
-    if resolve_plane_mode(None) == "authority" or not message_db.exists():
-        return
-    if cache_get("bridge_expire_sweep", ttl=_EXPIRE_SWEEP_INTERVAL_S) is not None:
-        return
-
-    conn = _get_db(ctx)
-    if conn is None:
-        return
-    try:
-        if not all(_table_exists(conn, table) for table in ("channels", "deliveries", "channel_messages")):
-            return
-        if not _column_exists(conn, "channels", "max_age_hours"):
-            return
-        if not _column_exists(conn, "channel_messages", "priority"):
-            return
-    finally:
-        conn.close()
-
-    cache_set("bridge_expire_sweep", True)
-
-    global _expire_sweep_thread
-    with _expire_sweep_lock:
-        if _expire_sweep_thread is not None and _expire_sweep_thread.is_alive():
-            return
-        # Snapshot the message DB path from the request's context (respects
-        # the app's MonitorContext) and hand it to the sweep explicitly.
-        _expire_sweep_thread = threading.Thread(
-            target=_run_delivery_expiry_sweep, args=(message_db,), daemon=True
-        )
-        _expire_sweep_thread.start()
 
 
-def _run_delivery_expiry_sweep(message_db: "os.PathLike[str]") -> None:
-    try:
-        # Canonical identity only (#6812). A bare ai_agent_bridge import
-        # loads a second sys.modules identity, and on the sweep's background
-        # thread it did so at racy, xdist-order-dependent times.
-        from lu_machinery.ai_agent_bridge import _channels as _ch  # noqa: PLC0415 — optional broker bridge
-        from lu_machinery.ai_agent_bridge import _config as _ch_config  # noqa: PLC0415 — optional broker bridge
-    except Exception:
-        logger.exception(
-            "bridge delivery-expiry sweep: %s.ai_agent_bridge not importable",
-            Path(__file__).parents[1].name,
-        )
-        return
-
-    # `_db.get_db()` reads the bridge's `_config.DB_PATH`, resolved at each
-    # call from AB_DB_PATH and the state root — it does not track this
-    # router's MonitorContext. Point it at the exact same broker DB this
-    # router already resolved from the app's context so the sweep can never
-    # land on a different file. Restoring drops the override (an earlier one
-    # is put back), so the attribute resolves at the call again; the lock
-    # keeps overlapping callers from undoing each other's override.
-    with _bridge_db_override_lock:
-        previous_db_path = vars(_ch_config).get("DB_PATH")
-        _ch_config.DB_PATH = message_db
-        try:
-            released = _ch.release_expired_leases()
-            expired = _ch.expire_stale_deliveries()
-            dead_counts = _ch.bulk_expire_dead_lanes()
-            total_dead = sum(dead_counts.values())
-            if released or expired or total_dead:
-                logger.info(
-                    "bridge delivery-expiry sweep: released=%d expired=%d dead_lane_expired=%d (%s)",
-                    released,
-                    expired,
-                    total_dead,
-                    dead_counts,
-                )
-        except Exception:
-            logger.exception("bridge delivery-expiry sweep failed")
-        finally:
-            if previous_db_path is None:
-                vars(_ch_config).pop("DB_PATH", None)
-            else:
-                _ch_config.DB_PATH = previous_db_path
 
 
-def _parse_agent_csv(raw: str | None) -> list[str]:
-    if raw is None or not raw.strip():
-        return list(DEFAULT_ACTIVITY_AGENTS)
-    agents = []
-    for item in raw.split(","):
-        agent = item.strip()
-        if agent and agent not in agents:
-            agents.append(agent)
-    return agents or list(DEFAULT_ACTIVITY_AGENTS)
 
 
-def _empty_agent_activity(agents: list[str]) -> dict[str, dict]:
-    return {
-        agent: {
-            "pending": 0,
-            "processing": 0,
-            "failed": 0,
-            "recent_deliveries": [],
-            "recent_events": [],
-            "next_actions": [],
-        }
-        for agent in agents
-    }
 
 
-def _empty_agent_activity_response(
-    agents: list[str],
-    *,
-    error: str | None = None,
-) -> dict:
-    response = {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "agents": _empty_agent_activity(agents),
-        "totals": {"pending": 0, "processing": 0, "failed": 0},
-    }
-    if error:
-        response["error"] = error
-    return response
 
+# Fleet operations calls these two readers in-process. They are not HTTP routes.
 
-def _append_delivery_snapshot(activity: dict[str, dict], row, limit: int) -> None:
-    agent = row["to_agent"]
-    if agent not in activity or len(activity[agent]["recent_deliveries"]) >= limit:
-        return
-    body = row["body"] or ""
-    activity[agent]["recent_deliveries"].append(
-        {
-            "delivery_id": row["delivery_id"],
-            "message_id": row["message_id"],
-            "channel": row["channel"],
-            "thread_id": row["thread_id"],
-            "from_agent": row["from_agent"],
-            "to_model": row["to_model"],
-            "status": row["status"],
-            "attempt_count": row["attempt_count"],
-            "retry_after": row["retry_after"],
-            "lease_until": row["lease_until"],
-            "created_at": row["created_at"],
-            "dispatched_at": row["dispatched_at"],
-            "delivered_at": row["delivered_at"],
-            "error": row["error"],
-            "preview": body[:160] + ("..." if len(body) > 160 else ""),
-        }
-    )
-
-
-def _append_event_snapshot(activity: dict[str, dict], row, limit: int) -> None:
-    payload = {}
-    if row["payload_json"]:
-        try:
-            payload = json.loads(row["payload_json"])
-        except json.JSONDecodeError:
-            payload = {}
-    event_agents = {agent for agent in (row["to_agent"], payload.get("agent")) if agent in activity}
-    for agent in event_agents:
-        if len(activity[agent]["recent_events"]) >= limit:
-            continue
-        activity[agent]["recent_events"].append(
-            {
-                "event_id": row["event_id"],
-                "event": row["event"],
-                "thread_id": row["thread_id"],
-                "delivery_id": row["delivery_id"],
-                "channel": row["channel"],
-                "ts": row["ts"],
-                "payload": payload,
-            }
-        )
-
-
-def _bridge_launch() -> str:
-    """Argument prefix that runs the installed bridge module."""
-    return "-m lu_machinery.ai_agent_bridge"
-
-
-def _add_agent_activity_actions(activity: dict[str, dict]) -> None:
-    bridge = _bridge_launch()
-    for agent, snapshot in activity.items():
-        if snapshot["pending"]:
-            snapshot["next_actions"].append(
-                {
-                    "kind": "drain_inbox",
-                    "command": (f".venv/bin/python {bridge} inbox run {agent} --until-idle"),
-                }
-            )
-        processing_threads = {
-            row["thread_id"]
-            for row in snapshot["recent_deliveries"]
-            if row["status"] == "processing" and row["thread_id"]
-        }
-        for thread_id in sorted(processing_threads):
-            snapshot["next_actions"].append(
-                {
-                    "kind": "watch_thread",
-                    "thread_id": thread_id,
-                    "command": (
-                        f".venv/bin/python {bridge} "
-                        f"channel watch {thread_id} --follow --event-stream"
-                    ),
-                }
-            )
-
-
-# ==================== MESSAGES (legacy broker) ====================
-#
-# Everything in this section projects the legacy `messages` table also used by
-# the ask-claude / ask-agy / ask-codex CLI commands. The CLI talks to the bridge
-# and SQLite directly; it does not call these HTTP routes. The HTTP surface is
-# DEPRECATED for new conversations as of #1190 Phase B.5.
-# For new multi-agent conversations, code reviews, and design debates,
-# use the channel bridge endpoints under /api/comms/channels/* and the
-# `ab channel` / `ab post` / `ab discuss` CLI commands.
-#
-# Removal remains gated by #6106: route telemetry, separate direct ask-* usage
-# evidence, an approved observation window, and present-tense deletion approval.
-
-
-@router.get("/messages", deprecated=True)
-def list_messages(
-    agent: str | None = Query(None, description="Filter by from_llm or to_llm"),
-    task_id: str | None = Query(None),
-    msg_type: str | None = Query(None),
-    unacked_only: bool = Query(False),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-    since: str | None = Query(None, description="Only messages with timestamp > this ISO-8601 value"),
-    cursor: int | None = Query(None, ge=1, description="Keyset cursor: return messages older than this id"),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    """**Deprecated (#1190 B.5).** All broker messages with optional filters.
-
-    Use /api/comms/channels/{name}/messages for channel-based
-    conversations. No dashboard page reads this route (the former comms.html
-    page was removed in Monitor cull wave 1); direct ask-* CLI calls bypass it.
-    """
-    conn = _get_db(ctx)
-    if not conn:
-        return {"messages": [], "total": 0, "error": "Broker DB not found"}
-
-    conditions = []
-    params = []
-
-    if agent:
-        conditions.append("(from_llm = ? OR to_llm = ?)")
-        params.extend([agent, agent])
-    if task_id:
-        conditions.append("task_id = ?")
-        params.append(task_id)
-    if msg_type:
-        conditions.append("message_type = ?")
-        params.append(msg_type)
-    if unacked_only:
-        conditions.append("acknowledged = 0")
-    if since:
-        conditions.append("timestamp > ?")
-        params.append(since)
-    if cursor is not None:
-        conditions.append("id < ?")
-        params.append(cursor)
-
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-    total = conn.execute(f"SELECT COUNT(*) FROM messages {where}", params).fetchone()[0]
-    page_params = [*params, limit]
-    if cursor is None:
-        page_params.append(offset)
-        page_clause = "LIMIT ? OFFSET ?"
-    else:
-        page_clause = "LIMIT ?"
-    rows = conn.execute(
-        f"SELECT id, task_id, from_llm, to_llm, message_type, "
-        f"substr(content, 1, 300) as preview, length(content) as content_len, "
-        f"timestamp, acknowledged "
-        f"FROM messages {where} ORDER BY id DESC {page_clause}",
-        page_params,
-    ).fetchall()
-    conn.close()
-
-    return {
-        "total": total,
-        "limit": limit,
-        "next_cursor": rows[-1]["id"] if len(rows) == limit else None,
-        "messages": [dict(r) for r in rows],
-    }
-
-
-@router.get("/conversations", deprecated=True)
-def list_conversations(
-    limit: int = Query(50, ge=1, le=200),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    """**Deprecated (#1190 B.5).** Broker messages grouped by task_id.
-
-    Use /api/comms/channels/{name}/threads/{thread_id} for
-    channel-based threads.
-    """
-    conn = _get_db(ctx)
-    if not conn:
-        return {"conversations": []}
-
-    rows = conn.execute(
-        """
-        SELECT task_id,
-               COUNT(*) as msg_count,
-               COUNT(CASE WHEN acknowledged = 0 THEN 1 END) as unacked,
-               MIN(timestamp) as first_msg,
-               MAX(timestamp) as last_msg,
-               GROUP_CONCAT(DISTINCT from_llm) as agents,
-               COUNT(CASE WHEN message_type = 'error' THEN 1 END) as errors
-        FROM messages
-        WHERE task_id IS NOT NULL AND task_id != ''
-        GROUP BY task_id
-        ORDER BY MAX(id) DESC
-        LIMIT ?
-    """,
-        (limit,),
-    ).fetchall()
-    conn.close()
-
-    return {"conversations": [dict(r) for r in rows]}
-
-
-@router.get("/conversation/{task_id}", deprecated=True)
-def get_conversation(
-    task_id: str,
-    limit: int = Query(100, ge=1, le=500),
-    since: str | None = Query(None, description="Only messages with timestamp > this ISO-8601 value"),
-    cursor: int | None = Query(None, ge=1, description="Keyset cursor: return messages older than this id"),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    """**Deprecated (#1190 B.5).** Full broker thread for one task_id.
-
-    Use /api/comms/channels/{name}/threads/{thread_id} for
-    channel-based threads.
-    """
-    conn = _get_db(ctx)
-    if not conn:
-        return {"messages": []}
-
-    conditions = ["task_id = ?"]
-    params: list = [task_id]
-    if since:
-        conditions.append("timestamp > ?")
-        params.append(since)
-    if cursor is not None:
-        conditions.append("id < ?")
-        params.append(cursor)
-
-    where = " AND ".join(conditions)
-    total = conn.execute(
-        f"SELECT COUNT(*) FROM messages WHERE {where}",
-        params,
-    ).fetchone()[0]
-    rows = conn.execute(
-        f"""
-        SELECT id, task_id, from_llm, to_llm, message_type,
-               preview, content_len, data, timestamp, acknowledged
-        FROM (
-            SELECT id, task_id, from_llm, to_llm, message_type,
-                   substr(content, 1, 500) as preview, length(content) as content_len,
-                   data, timestamp, acknowledged
-            FROM messages
-            WHERE {where}
-            ORDER BY id DESC
-            LIMIT ?
-        )
-        ORDER BY id ASC
-        """,
-        [*params, limit],
-    ).fetchall()
-    conn.close()
-
-    return {
-        "task_id": task_id,
-        "count": len(rows),
-        "total": total,
-        "limit": limit,
-        "next_cursor": rows[0]["id"] if len(rows) == limit else None,
-        "messages": [dict(r) for r in rows],
-    }
-
-
-# ==================== ACTIVE PROCESSES ====================
-
-
-@router.get("/active-processes")
 def active_processes(ctx: MonitorContext = Depends(get_ctx)):
     """Live bridge PIDs with health status."""
     pid_dir = ctx.roots.pid_dir
@@ -609,7 +187,6 @@ def active_processes(ctx: MonitorContext = Depends(get_ctx)):
 # ==================== ZOMBIES ====================
 
 
-@router.get("/zombies")
 def detect_zombies(
     stale_hours: float = Query(2.0, description="Unacked messages older than this = stale"),
     pingpong_threshold: int = Query(5, description="Round-trips on same task in 1h = loop"),
@@ -725,121 +302,10 @@ def detect_zombies(
 # ==================== STATS ====================
 
 
-@router.get("/stats")
-def comms_stats(ctx: MonitorContext = Depends(get_ctx)):
-    """Message rate, latency, error %, per-agent breakdown."""
-    conn = _get_db(ctx)
-    if not conn:
-        return {"error": "Broker DB not found"}
-
-    total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    unacked = conn.execute("SELECT COUNT(*) FROM messages WHERE acknowledged = 0").fetchone()[0]
-    errors = conn.execute("SELECT COUNT(*) FROM messages WHERE message_type = 'error'").fetchone()[0]
-
-    # Per-agent counts
-    agent_stats = {}
-    for row in conn.execute("SELECT from_llm, COUNT(*) as sent FROM messages GROUP BY from_llm").fetchall():
-        agent_stats[row["from_llm"]] = {"sent": row["sent"]}
-    for row in conn.execute("SELECT to_llm, COUNT(*) as received FROM messages GROUP BY to_llm").fetchall():
-        agent_stats.setdefault(row["to_llm"], {})["received"] = row["received"]
-
-    # Messages in last hour
-    last_hour = conn.execute("SELECT COUNT(*) FROM messages WHERE timestamp > datetime('now', '-1 hour')").fetchone()[0]
-
-    # Messages in last 24h
-    last_24h = conn.execute("SELECT COUNT(*) FROM messages WHERE timestamp > datetime('now', '-24 hours')").fetchone()[
-        0
-    ]
-
-    # Task count
-    tasks = conn.execute("SELECT COUNT(DISTINCT task_id) FROM messages WHERE task_id IS NOT NULL").fetchone()[0]
-
-    conn.close()
-
-    return {
-        "total_messages": total,
-        "unacked": unacked,
-        "errors": errors,
-        "error_rate": round(errors / total * 100, 1) if total > 0 else 0,
-        "last_hour": last_hour,
-        "last_24h": last_24h,
-        "total_tasks": tasks,
-        "per_agent": agent_stats,
-    }
-
 
 # ==================== HEALTH ====================
 
 
-def _is_probeable_pid(pid: object) -> bool:
-    """True for an int PID in ``1.._MAX_PROBE_PID``. Bool is not an int here."""
-    if isinstance(pid, bool) or not isinstance(pid, int):
-        return False
-    return 1 <= pid <= _MAX_PROBE_PID
-
-
-@router.get("/health")
-def broker_health(ctx: MonitorContext = Depends(get_ctx)):
-    """Broker DB writable, queue depth."""
-    message_db = ctx.roots.message_db_path
-    pid_dir = ctx.roots.pid_dir
-    health = {
-        "db_exists": message_db.exists(),
-        "db_writable": False,
-        "db_size_kb": 0,
-        "queue_depth": 0,
-        "pid_dir_exists": pid_dir.exists(),
-        "alive_processes": 0,
-    }
-    errors: list[str] = []
-
-    if message_db.exists():
-        health["db_size_kb"] = round(message_db.stat().st_size / 1024, 1)
-        try:
-            conn = ctx.stores.message_db.connect() if ctx.stores.message_db is not None else None
-            if conn is not None:
-                conn.execute("SELECT 1")
-                health["db_writable"] = True
-                health["queue_depth"] = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE acknowledged = 0"
-                ).fetchone()[0]
-                conn.close()
-        except Exception as exc:
-            logger.warning("comms health: broker DB probe failed: %s", exc)
-            errors.append(f"db: {type(exc).__name__}")
-
-    if pid_dir.exists():
-        for pf in pid_dir.glob("*.json"):
-            try:
-                data = json.loads(pf.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-                logger.warning("comms health: failed to load pid file %s: %s", pf.name, exc)
-                errors.append(f"{pf.name}: {type(exc).__name__}")
-                continue
-            if not isinstance(data, dict):
-                logger.warning("comms health: pid file %s is not an object", pf.name)
-                errors.append(f"{pf.name}: invalid record")
-                continue
-            pid = data.get("pid")
-            if not _is_probeable_pid(pid):
-                logger.warning("comms health: pid file %s has invalid pid", pf.name)
-                errors.append(f"{pf.name}: invalid pid")
-                continue
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                # Dead or unsignalable process: not a file-load failure.
-                continue
-            except (OverflowError, ValueError, TypeError) as exc:
-                logger.warning("comms health: pid file %s probe failed: %s", pf.name, exc)
-                errors.append(f"{pf.name}: {type(exc).__name__}")
-                continue
-            health["alive_processes"] += 1
-
-    if errors:
-        health["errors"] = errors
-
-    return health
 
 
 @router.get("/v1/plane-status")
@@ -980,35 +446,15 @@ def _scan_recent_completions(ctx: MonitorContext, minutes: int = 60) -> list[dic
     return completions
 
 
-@router.get("/live-activity", deprecated=True)
+@router.get("/live-activity")
 async def live_activity(
-    response: Response,
     minutes: int = Query(15, ge=1, le=120),
     limit: int = Query(30, ge=1, le=500, description="Maximum recent broker dispatches"),
     since: str | None = Query(None, description="Only dispatches with timestamp > this ISO-8601 value"),
     cursor: int | None = Query(None, ge=1, description="Keyset cursor: return dispatches older than this id"),
     ctx: MonitorContext = Depends(get_ctx),
 ):
-    """What's being built RIGHT NOW — module-level live feed.
-
-    DEPRECATED (GH #1309): use ``/api/state/build-status`` for a
-    typed, tested view of what each track is doing. This
-    handler remains for backwards compatibility but will be removed.
-
-    Responses carry ``X-Deprecated: true`` and ``X-Deprecated-Use``
-    so clients can log a warning without parsing the JSON body.
-
-    Returns:
-      - in_progress: modules with recently updated orchestration state
-      - recent_completions: research files created in last hour
-      - recent_messages: last N broker dispatches
-    """
-    response.headers["X-Deprecated"] = "true"
-    response.headers["X-Deprecated-Use"] = "/api/state/build-status"
-    response.headers["Warning"] = (
-        '299 - "This endpoint is deprecated; migrate to /api/state/build-status (#1309)"'
-    )
-
+    """Module-level live feed: in-progress modules, recent completions, recent dispatches."""
     acts, completions = await asyncio.gather(
         asyncio.to_thread(_scan_live_activity, ctx, minutes),
         asyncio.to_thread(_scan_recent_completions, ctx, 60),
@@ -1096,22 +542,6 @@ async def acknowledge_message(message_id: int):
     )
 
 
-class SendMessageRequest(BaseModel):
-    from_llm: str
-    to_llm: str
-    content: str
-    task_id: str = ""
-    message_type: str = "message"
-
-
-@router.post("/send", deprecated=True)
-async def send_message(msg: SendMessageRequest):
-    """Retired raw broker mutation endpoint."""
-    _ = msg
-    return JSONResponse(
-        status_code=410,
-        content={"error": "legacy send retired; use fleet-comms authority"},
-    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1132,56 +562,6 @@ class ChannelPostRequest(BaseModel):
     from_agent: str = "user"
     auto_snapshot: bool = True
 
-
-@router.get("/channels")
-def list_channels_endpoint(ctx: MonitorContext = Depends(get_ctx)):
-    """List all channels with row counts and last activity.
-
-    Read-only. Safe to poll from the frontend every few seconds.
-    """
-    conn = _get_db(ctx)
-    if not conn:
-        return {"channels": [], "error": "Broker DB not found"}
-
-    try:
-        channel_rows = conn.execute(
-            "SELECT name, description, include, subscribers, created_at FROM channels ORDER BY created_at ASC"
-        ).fetchall()
-        msg_counts = {}
-        latest = {}
-        for r in conn.execute(
-            "SELECT channel, COUNT(*) AS n, MAX(created_at) AS latest FROM channel_messages GROUP BY channel"
-        ).fetchall():
-            msg_counts[r["channel"]] = r["n"]
-            latest[r["channel"]] = r["latest"]
-        pending_counts = {}
-        for r in conn.execute(
-            "SELECT cm.channel, COUNT(*) AS n "
-            "FROM deliveries d JOIN channel_messages cm "
-            "  ON cm.message_id = d.message_id "
-            "WHERE d.status = 'pending' "
-            "GROUP BY cm.channel"
-        ).fetchall():
-            pending_counts[r["channel"]] = r["n"]
-    finally:
-        conn.close()
-
-    channels = []
-    for r in channel_rows:
-        name = r["name"]
-        channels.append(
-            {
-                "name": name,
-                "description": r["description"] or "",
-                "include": [s for s in (r["include"] or "").split(",") if s],
-                "subscribers": [s for s in (r["subscribers"] or "").split(",") if s],
-                "created_at": r["created_at"],
-                "message_count": msg_counts.get(name, 0),
-                "last_activity": latest.get(name),
-                "pending_deliveries": pending_counts.get(name, 0),
-            }
-        )
-    return {"channels": channels, "count": len(channels)}
 
 
 @router.get("/channels/{name}")
@@ -1489,115 +869,6 @@ def messages_by_module(
 # ==================== INBOX (#1309) ====================
 
 
-@router.get("/agent-activity")
-def agent_activity(
-    agents: str | None = Query(
-        None,
-        description="Comma-separated agent names. Defaults to core CLI + desktop agents.",
-    ),
-    limit: int = Query(5, ge=1, le=25, description="Max recent rows per section."),
-    ctx: MonitorContext = Depends(get_ctx),
-):
-    """Compact read-only channel activity snapshot for orchestrators.
-
-    This complements `/api/comms/inbox`: inbox answers "what is waiting
-    for one agent?", while this endpoint answers "what should the
-    orchestrator watch or drain next?" in one cheap API call.
-
-    Also lazily triggers the delivery-expiry background sweep (#4837
-    item 4) — this is the endpoint dashboards poll to see per-agent
-    pending counts, so it doubles as the sweep's periodic trigger.
-    """
-    _maybe_run_delivery_expiry_sweep(ctx)
-    selected_agents = _parse_agent_csv(agents)
-    conn = _get_db(ctx)
-    if not conn:
-        return _empty_agent_activity_response(
-            selected_agents,
-            error="Broker DB not found",
-        )
-
-    activity = _empty_agent_activity(selected_agents)
-    totals = {"pending": 0, "processing": 0, "failed": 0}
-
-    try:
-        if not all(_table_exists(conn, table) for table in ("deliveries", "channel_messages")):
-            response = _empty_agent_activity_response(
-                selected_agents,
-                error="Channel bridge tables not found",
-            )
-            response["agents"] = activity
-            response["totals"] = totals
-            return response
-
-        placeholders = ",".join("?" for _ in selected_agents)
-        count_rows = conn.execute(
-            f"""
-            SELECT to_agent, status, COUNT(*) AS n
-            FROM deliveries
-            WHERE to_agent IN ({placeholders})
-              AND status IN ('pending', 'processing', 'failed')
-            GROUP BY to_agent, status
-            """,
-            selected_agents,
-        ).fetchall()
-        for row in count_rows:
-            agent = row["to_agent"]
-            status = row["status"]
-            count = int(row["n"])
-            if agent in activity:
-                activity[agent][status] = count
-            totals[status] += count
-
-        delivery_rows = conn.execute(
-            f"""
-            SELECT d.delivery_id, d.message_id, d.to_agent, d.to_model,
-                   d.status, d.dispatched_at, d.delivered_at, d.error,
-                   d.attempt_count, d.retry_after, d.lease_until,
-                   cm.channel, cm.thread_id, cm.from_agent, cm.body,
-                   cm.created_at
-            FROM deliveries d
-            JOIN channel_messages cm ON cm.message_id = d.message_id
-            WHERE d.to_agent IN ({placeholders})
-              AND d.status IN ('pending', 'processing', 'failed')
-            ORDER BY cm.created_at DESC, d.delivery_id DESC
-            LIMIT ?
-            """,
-            [*selected_agents, limit * max(len(selected_agents), 1)],
-        ).fetchall()
-        for row in delivery_rows:
-            _append_delivery_snapshot(activity, row, limit)
-
-        if _table_exists(conn, "channel_events"):
-            event_rows = conn.execute(
-                """
-                SELECT ce.event_id, ce.delivery_id, ce.thread_id, ce.event,
-                       ce.payload_json, ce.ts, d.to_agent, t.channel
-                FROM channel_events ce
-                LEFT JOIN deliveries d ON d.delivery_id = ce.delivery_id
-                LEFT JOIN (
-                    SELECT thread_id, MIN(channel) AS channel
-                    FROM channel_messages
-                    GROUP BY thread_id
-                ) t ON t.thread_id = ce.thread_id
-                ORDER BY ce.event_id DESC
-                LIMIT ?
-                """,
-                (limit * max(len(selected_agents), 1) * 4,),
-            ).fetchall()
-            for row in event_rows:
-                _append_event_snapshot(activity, row, limit)
-    finally:
-        conn.close()
-
-    _add_agent_activity_actions(activity)
-
-    return {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "agents": activity,
-        "totals": totals,
-    }
-
 
 @router.get("/inbox")
 def comms_inbox(
@@ -1755,71 +1026,6 @@ def _authority_metrics_payload(
     return payload
 
 
-@router.get("/v1/backlog")
-def comms_v1_backlog(
-    limit: int = Query(100, ge=1, le=500),
-    exclude_retired: bool = Query(True),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict:
-    """Pending delivery backlog (no message content). Sol PR-M / #7486 switch-aware."""
-    if resolve_metrics_source() == "authority":
-        return _authority_metrics_payload(
-            collect_delivery_backlog_authority,
-            ctx,
-            empty_fields={"total": 0, "by_agent": {}, "by_status": {}, "rows": []},
-            limit=limit,
-            exclude_retired=exclude_retired,
-        )
-    message_db = ctx.roots.message_db_path
-    store = legacy_broker_store(reachable=message_db.is_file())
-    if not message_db.exists():
-        return {
-            "response_schema_version": COMMS_RESPONSE_SCHEMA_VERSION,
-            "total": 0,
-            "by_agent": {},
-            "by_status": {},
-            "rows": [],
-            "db_missing": True,
-            "store": store,
-        }
-    payload = collect_delivery_backlog(
-        message_db, limit=limit, exclude_retired=exclude_retired
-    )
-    payload["response_schema_version"] = COMMS_RESPONSE_SCHEMA_VERSION
-    payload["store"] = store
-    payload["content_included"] = False
-    return payload
-
-
-@router.get("/v1/dead-letters")
-def comms_v1_dead_letters(
-    limit: int = Query(100, ge=1, le=500),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict:
-    """Dead-letter inventory (metadata only). Sol PR-M / #7486 switch-aware."""
-    if resolve_metrics_source() == "authority":
-        return _authority_metrics_payload(
-            collect_dead_letters_authority,
-            ctx,
-            empty_fields={"total": 0, "by_reason": {}, "rows": []},
-            limit=limit,
-        )
-    message_db = ctx.roots.message_db_path
-    store = legacy_broker_store(reachable=message_db.is_file())
-    if not message_db.exists():
-        return {
-            "response_schema_version": COMMS_RESPONSE_SCHEMA_VERSION,
-            "total": 0,
-            "by_reason": {},
-            "rows": [],
-            "db_missing": True,
-            "store": store,
-        }
-    payload = collect_dead_letters(message_db, limit=limit)
-    payload["response_schema_version"] = COMMS_RESPONSE_SCHEMA_VERSION
-    payload["store"] = store
-    payload["content_included"] = False
-    return payload
 
 
 _METRIC_STATES = frozenset({

@@ -33,16 +33,6 @@
     ]
   },
   {
-    "path": "lu_machinery/api/agent_monitor_router.py",
-    "reference_count": 2,
-    "kind": "writer",
-    "target_db": "agent monitor DB",
-    "reason": "persists monitor configuration",
-    "calls": [
-      "sqlite3.connect(db_path, timeout=10.0)"
-    ]
-  },
-  {
     "path": "lu_machinery/api/resilience.py",
     "reference_count": 3,
     "kind": "writer",

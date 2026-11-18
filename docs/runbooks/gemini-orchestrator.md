@@ -2,7 +2,7 @@
 
 > **Gemini may drive epics (2026-10-08 approval)** through `start-gemini-driver.sh`
 > (see `docs/runbooks/epic-orchestrator-roster.md`). Design input and designated approval
-> stay with `gpt-6.1-sol` and `claude-opus-5-5`. Standalone sessions take bounded, fully
+> stay with `gpt-6.2-sol` and `claude-opus-5-5`. Standalone sessions take bounded, fully
 > specified work and Ukrainian content review.
 
 ## Launcher
@@ -55,7 +55,7 @@ standalone session. Gemini driver slots are listed in
 
 ## Fleet Management & Rate Limits
 
-The driver of record (Opus 5.5 or Sol 6.1) monitors usage across the fleet using the native fleet probes:
+The driver of record (Opus 5.5 or Sol 6.2) monitors usage across the fleet using the native fleet probes:
 
 ```bash
 .venv/bin/python -m lu_machinery.fleet.usage show --fresh
@@ -65,4 +65,4 @@ Use `lu_machinery.fleet.usage show` to verify credits, quota windows, and availa
 
 ## Advisor Approval Gate
 
-All architecture, file layout, and process decisions require designated approval: the operator, or the designated advisors (**Opus 5.5** `claude-opus-5-5` and **Sol 6.1** `gpt-6.1-sol`) agreeing; when one of them authored the proposal, the other's approval completes it; a proposal by any other agent, Gemini included, needs both; if they disagree, the operator decides. When Gemini is the driver of record, it owns task breakdown and fleet routing for its stream; architecture, layout and process changes still need designated approval.
+All architecture, file layout, and process decisions require designated approval: the operator, or the designated advisors (**Opus 5.5** `claude-opus-5-5` and **Sol 6.2** `gpt-6.2-sol`) agreeing; when one of them authored the proposal, the other's approval completes it; a proposal by any other agent, Gemini included, needs both; if they disagree, the operator decides. When Gemini is the driver of record, it owns task breakdown and fleet routing for its stream; architecture, layout and process changes still need designated approval.

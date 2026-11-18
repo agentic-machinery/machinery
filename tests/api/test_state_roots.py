@@ -88,10 +88,13 @@ def test_ledger_reads_and_timing_database_writes_use_state(roots):
         directory = root / "batch_state/agent-ledger/tasks"
         directory.mkdir(parents=True)
         (directory / f"{task_id}.json").write_text(json.dumps({"task_id": task_id, "status": "running"}))
+    from fastapi import HTTPException
+
     ctx = monitor_context.production_context()
-    result = asyncio.run(coordination_router.coordination_summary(ctx))
-    assert [task["task_id"] for task in result["tasks"]] == ["state-task"]
     assert asyncio.run(coordination_router.coordination_task("state-task", ctx))["task_id"] == "state-task"
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(coordination_router.coordination_task("product-decoy", ctx))
+    assert caught.value.status_code == 404
     assert telemetry_router._tool_timings_path(ctx) == state / "data/telemetry/tool_timings.db"
     telemetry_router._init_db(ctx)
     assert (state / "data/telemetry/tool_timings.db").is_file()
@@ -100,7 +103,6 @@ def test_ledger_reads_and_timing_database_writes_use_state(roots):
 
 def test_occupancy_and_rollover_paths_follow_state_at_use_time(roots, monkeypatch):
     product, state = roots
-    ctx = monitor_context.production_context()
     assert occupancy_local.session_streams_db_path() == state / ".agent/session-streams/v1/session-streams.sqlite3"
     assert occupancy_local.markers_root() == state / ".agent/occupancy/markers"
     seen = []
@@ -112,9 +114,7 @@ def test_occupancy_and_rollover_paths_follow_state_at_use_time(roots, monkeypatc
     monkeypatch.setattr(rollover_router.registry, "audit_fleet", audit)
     monkeypatch.setattr(rollover_router.thread_handoff, "rollover_identity_snapshot", lambda root: {"schema_version": 1, "candidate_count": 0, "errors": []})
     rollover_router.collect_rollover_orient_data()
-    rollover_router.rollover_audit.__wrapped__(agent=None, source_thread_id=None, replacement_thread_id=None,
-                                   lineage_id=None, rollover_id=None, stale_hours=24, ctx=ctx)
-    assert seen == [state, state]
+    assert seen == [state]
     monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(product))
     assert occupancy_local.markers_root() == product / ".agent/occupancy/markers"
     rollover_router.collect_rollover_orient_data()
@@ -260,7 +260,7 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     comms_router = _load_api("lu_machinery.api.comms_router", monkeypatch)
     fleet_router = _load_api("lu_machinery.api.fleet_router", monkeypatch)
     runtime_router = _load_api("lu_machinery.api.runtime_router", monkeypatch)
-    from lu_machinery.fleet_comms import cold_start_board, message_plane, routing_reservations
+    from lu_machinery.fleet_comms import message_plane, routing_reservations
 
     product, state = roots
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
@@ -299,13 +299,11 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     monkeypatch.setattr(fleet_router, "read_plane_status", spy)
     monkeypatch.setattr(runtime_router, "read_plane_status", spy)
     monkeypatch.setattr(comms_router, "read_plane_status", spy)
-    monkeypatch.setattr(cold_start_board, "read_plane_status", spy)
     fleet_router._safe_plane_status(ctx)
-    fleet_router.fleet_facade_status(ctx)
     routing = runtime_router._routing_plane_status(ctx)
     comms_router.message_plane_status(ctx)
     assert routing["mode"] == "off"
-    assert seen == [state.resolve()] * 4
+    assert seen == [state.resolve()] * 3
 
     roots_seen = []
 
@@ -318,8 +316,4 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     assert roots_seen == [plane]
     assert listed["availability"] == "empty"
 
-    seen.clear()
-    board = fleet_router.fleet_facade_board.__wrapped__(None, None, None, ctx)
-    assert seen == [state.resolve(), plane]
-    assert board["probes"]["plane_status"]["status"] == "ok"
     assert not (product / "batch_state").exists()

@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run provider CLIs in detached dispatch worktrees.\nUse for new tasks; legacy tasks retain their supervisor.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Examples:\n  .venv/bin/python {_CLI} dispatch --agent sol --model gpt-6.1-sol --prompt 'Explain X'\n"
+        epilog=f"Examples:\n  .venv/bin/python {_CLI} dispatch --agent sol --model gpt-6.2-sol --prompt 'Explain X'\n"
         f"  .venv/bin/python {_DISPATCH} wait TASK --run-nonce NONCE --timeout 60\n"
         f"  .venv/bin/python {_DISPATCH} grant-paths TASK --run-nonce NONCE --owned-path tests/fix.py "
         "--reason 'Approved fixture change' --approval-ref message-id\n"
@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     for flag, default, help_text in (
         ("agent", None, "Provider or alias, e.g. sol; Grok is cursor with --model grok-4.7-high (required)"),
-        ("model", None, "Exact provider model, e.g. gpt-6.1-sol (required)"),
+        ("model", None, "Exact provider model, e.g. gpt-6.2-sol (required)"),
         ("task-id", None, "Unique safe task ID (default: random UUID)"),
         ("prompt-file", None, "UTF-8 prompt path; '-' reads stdin (one source required)"),
         ("prompt", None, "Literal prompt; '-' reads stdin (one source required)"),

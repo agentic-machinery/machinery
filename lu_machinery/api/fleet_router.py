@@ -8,7 +8,6 @@ initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import math
@@ -19,37 +18,26 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
-from lu_machinery.common.repo_root import state_root
 from lu_machinery.control_plane import storage
-from lu_machinery.control_plane.health import authority_collector_payload, read_failure_code
-from lu_machinery.fleet_comms import cold_start_board, message_plane
-from lu_machinery.fleet_comms.agent_success_metrics import collect_agent_success
-from lu_machinery.fleet_comms.cli import fleet_help_payload, fleet_status_payload
-from lu_machinery.fleet_comms.cold_start_board import ProbeResult, build_cold_start_board
-from lu_machinery.fleet_comms.efficiency_metrics import (
-    collect_dead_letters_authority,
-    collect_delivery_backlog_authority,
-    collect_efficiency_metrics_authority,
-)
+from lu_machinery.control_plane.health import read_failure_code
+from lu_machinery.fleet_comms import message_plane
 from lu_machinery.fleet_comms.endpoints import load_endpoint_registry
-from lu_machinery.fleet_comms.legacy_broker_report import build_legacy_broker_report
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
-from lu_machinery.fleet_comms.opsec_store import COMMS_RESPONSE_SCHEMA_VERSION
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
 
 from . import comms_router as legacy_comms
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
-from .state_helpers import cache_get_or_compute, cache_get_or_refresh, ctx_scoped_ttl_key, swr_route
+from .state_helpers import swr_route
 
 router = APIRouter(tags=["fleet"])
 # Fleet read models served stale-while-revalidate (``state_helpers.swr_route``):
@@ -60,8 +48,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
-MAX_BODY_PREVIEW_CHARS = 280
-MAX_BODY_DETAIL_CHARS = 2_048
 MAX_DETAIL_ROWS = 100
 MAX_ACP_SCAN = 500
 MAX_ACTIVITY_SCAN = 500
@@ -228,19 +214,6 @@ def _safe_text(value: Any, *, limit: int = 160, fallback: str = "unknown") -> st
     return text[:limit]
 
 
-def _redact_preview(value: str) -> str:
-    value = _SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", value
-    )
-    value = _BEARER_TOKEN.sub("Bearer [REDACTED]", value)
-    return _TOKEN_LITERAL.sub("[REDACTED]", value)
-
-
-def _body_preview(value: Any, *, limit: int) -> tuple[str | None, bool]:
-    """Return only a redacted inline excerpt; blobs are never read here."""
-    if not isinstance(value, str):
-        return None, False
-    return _redact_preview(value[:limit]), len(value) > limit
 
 
 def _safe_metadata(value: Any) -> dict[str, Any]:
@@ -425,92 +398,10 @@ def _safe_plane_status(ctx: MonitorContext | None = None) -> dict[str, Any]:
     }
 
 
-def _facade_authority_payload(
-    collector: Callable[[Path], dict[str, Any]],
-    ctx: MonitorContext | None = None,
-) -> dict[str, Any]:
-    """Read the configured authority through the PG-capable collector."""
-    return authority_collector_payload(collector, _plane_db_path(ctx))
 
 
-def _facade_backlog_payload(limit: int, ctx: MonitorContext | None = None) -> dict[str, Any]:
-    return authority_collector_payload(
-        collect_delivery_backlog_authority,
-        _plane_db_path(ctx),
-        empty_fields={"total": 0, "by_agent": {}, "by_status": {}, "rows": []},
-        limit=limit,
-        exclude_retired=True,
-    )
 
 
-def _facade_dead_letters_payload(limit: int, ctx: MonitorContext | None = None) -> dict[str, Any]:
-    return authority_collector_payload(
-        collect_dead_letters_authority,
-        _plane_db_path(ctx),
-        empty_fields={"total": 0, "by_reason": {}, "rows": []},
-        limit=limit,
-    )
-
-
-@router.get("/facade")
-@router.get("/facade/help")
-def fleet_facade_help(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
-    """Index the read-only CLI facade routes available to seats and the Monitor UI."""
-    del ctx
-    payload = fleet_help_payload()
-    payload.update(
-        {
-            "read_only": True,
-            "endpoints": {
-                "help": "/api/fleet/facade/help",
-                "status": "/api/fleet/facade/status",
-                "board": "/api/fleet/facade/board",
-                "metrics": "/api/fleet/facade/metrics",
-                "backlog": "/api/fleet/facade/backlog",
-                "dead": "/api/fleet/facade/dead",
-                "broker_report": "/api/fleet/facade/broker-report?days=7",
-            },
-        }
-    )
-    return payload
-
-
-@router.get("/facade/status")
-def fleet_facade_status(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
-    """Expose the CLI fleet-status payload without a second health authority."""
-    active_ctx = ctx if ctx is not None else resolve_context(None)
-    status = read_plane_status(repo_root=active_ctx.roots.state_root, recent_limit=50)
-    epics_store = getattr(getattr(active_ctx, "stores", None), "epics_store", None)
-    payload = fleet_status_payload(
-        status,
-        repo_root=active_ctx.roots.state_root,
-        epics_store=epics_store,
-    )
-    payload["read_only"] = True
-    return payload
-
-
-@router.get("/facade/board")
-@swr_route("fleet-facade-board", FACADE_TTL_S)
-def fleet_facade_board(
-    stream_id: str | None = Query(default=None),
-    agent: str | None = Query(default=None),
-    needle: str | None = Query(default=None),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Expose the JSON cold-start board already used by the fleet CLI.
-
-    Two probes are served from the in-process cache (see ``_board_bottleneck_metrics``
-    and ``_board_pr_list``); every other probe, the inbox included, is read per request.
-    """
-    return build_cold_start_board(
-        stream_id=stream_id,
-        agent=agent,
-        needle=needle,
-        repo_root=ctx.roots.state_root,
-        bottleneck_metrics=lambda tasks_dir, plane_db: _board_bottleneck_metrics(ctx, tasks_dir, plane_db),
-        pr_list_probe=lambda: _board_pr_list(ctx),
-    )
 
 
 # The bottleneck slice is lifecycle statistics over every task record: a few seconds
@@ -523,70 +414,10 @@ BOARD_BOTTLENECK_WAIT_S = 2.0
 BOARD_PR_LIST_TTL_S = 30.0
 
 
-def _board_bottleneck_metrics(ctx: MonitorContext, tasks_dir: Path, plane_db: Path) -> dict[str, Any] | None:
-    key = ctx_scoped_ttl_key(ctx, "facade-board-bottleneck", tasks_dir, plane_db)
-    hit = cache_get_or_refresh(
-        key,
-        BOARD_BOTTLENECK_TTL_S,
-        lambda: cold_start_board.collect_board_bottleneck_metrics(tasks_dir, plane_db),
-        wait_s=BOARD_BOTTLENECK_WAIT_S,
-    )
-    if hit is None:
-        return None
-    payload, age_s = hit
-    return {**cast(dict[str, Any], payload), "cache_age_s": round(age_s, 1)}
 
 
-def _board_pr_list(ctx: MonitorContext) -> ProbeResult:
-    cached = cache_get_or_compute(
-        ctx_scoped_ttl_key(ctx, "facade-board-pr-list"), BOARD_PR_LIST_TTL_S, cold_start_board._probe_gh_pr_list
-    )
-    # The board stamps elapsed_ms on the result; never mutate the shared cached copy.
-    return dataclasses.replace(cached)
 
 
-@router.get("/facade/metrics")
-@swr_route("fleet-facade-metrics", FACADE_TTL_S)
-def fleet_facade_metrics(ctx: MonitorContext = Depends(get_ctx), include_agent_success: bool = False) -> dict[str, Any]:
-    """Return authority-plane metrics through the existing collector."""
-    payload = _facade_authority_payload(collect_efficiency_metrics_authority, ctx)
-    if include_agent_success:
-        payload["agent_success"] = collect_agent_success(tasks_dir=ctx.roots.batch_state_dir / "tasks")
-    return payload
-
-
-@router.get("/facade/backlog")
-def fleet_facade_backlog(
-    limit: int = Query(default=100, ge=1, le=500),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Return the authority-plane delivery backlog; retired endpoints stay excluded."""
-    return _facade_backlog_payload(limit, ctx)
-
-
-@router.get("/facade/dead")
-def fleet_facade_dead(
-    limit: int = Query(default=100, ge=1, le=500),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Return the authority-plane dead-letter inventory without message bodies."""
-    return _facade_dead_letters_payload(limit, ctx)
-
-
-@router.get("/facade/broker-report")
-def fleet_facade_broker_report(
-    days: int = Query(default=7, ge=1, le=90),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Expose the legacy Broker Ops retirement report through its shared builder."""
-    root = ctx.roots.project_root if ctx.root is not None else state_root()
-    routes_db = root / "data" / "telemetry" / "legacy_comms_routes.db"
-    bridge_db = root / "data" / "telemetry" / "legacy_bridge"
-    payload = build_legacy_broker_report(
-        days, routes_db=routes_db, bridge_db=bridge_db if bridge_db.is_file() else routes_db
-    )
-    payload["response_schema_version"] = COMMS_RESPONSE_SCHEMA_VERSION
-    return payload
 
 
 def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
@@ -1609,447 +1440,11 @@ def fleet_authority_jobs(
         )
 
 
-def _message_item(row: sqlite3.Row, *, body_limit: int = MAX_BODY_PREVIEW_CHARS) -> dict[str, Any]:
-    data = dict(row)
-    metadata = _safe_metadata(data.get("metadata_json"))
-    authority_provenance = _safe_metadata(data.get("authority_provenance_json"))
-    metadata = {**metadata, **authority_provenance}
-    preview, truncated = _body_preview(data.get("body_inline"), limit=body_limit)
-    provenance = _provenance(
-        metadata=metadata,
-        source=authority_provenance.get("source") or data.get("conversation_source"),
-        agent=data.get("sender"),
-    )
-    return {
-        "message_id": data["message_id"],
-        "conversation_id": data["conversation_id"],
-        "in_reply_to": data.get("in_reply_to"),
-        "kind": data["kind"],
-        "sender": data["sender"],
-        "recipient": data.get("recipient"),
-        "request_state": data.get("request_state"),
-        "created_at": data["created_at"],
-        "body_preview": preview,
-        "body_truncated": truncated,
-        "body_available": bool(data.get("body_inline") or data.get("body_artifact_id")),
-        "artifact_available": bool(data.get("body_artifact_id")),
-        "metadata": metadata,
-        "read_only": True,
-        **provenance,
-    }
 
 
-@router.get("/messages")
-def fleet_messages(
-    kind: str | None = Query(default=None),
-    state: str | None = Query(default=None),
-    agent: str | None = Query(default=None),
-    source: str | None = Query(default=None),
-    conversation: str | None = Query(default=None),
-    since: str | None = Query(default=None),
-    until: str | None = Query(default=None),
-    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-    offset: int = Query(default=0, ge=0),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Message metadata and redacted inline previews, never artifact body content."""
-    since_value = _normalize_time(since, "since")
-    until_value = _normalize_time(until, "until")
-    filters = {
-        "kind": kind,
-        "state": state,
-        "agent": agent,
-        "source": source,
-        "conversation": conversation,
-        "since": since_value,
-        "until": until_value,
-    }
-    with _read_connection(ctx) as (connection, availability):
-        if connection is None:
-            return _empty_collection(
-                "messages", limit=limit, offset=offset, availability=availability, filters=filters
-            )
-        if not _table_exists(connection, "comms_messages"):
-            return _empty_collection(
-                "messages", limit=limit, offset=offset, availability="table_missing", filters=filters
-            )
-        has_conversations = _table_exists(connection, "conversations")
-        has_requests = _table_exists(connection, "requests")
-        has_authority_metadata = _table_exists(connection, "authority_message_metadata")
-        from_sql = " FROM comms_messages AS message"
-        source_select = "NULL AS conversation_source"
-        request_state_select = "NULL AS request_state"
-        authority_provenance_select = "NULL AS authority_provenance_json"
-        if has_conversations:
-            source_select = "conversation.source AS conversation_source"
-            from_sql += " LEFT JOIN conversations AS conversation ON conversation.conversation_id = message.conversation_id"
-        if has_requests:
-            request_state_select = "request.state AS request_state"
-            from_sql += " LEFT JOIN requests AS request ON request.request_message_id = message.message_id"
-        if has_authority_metadata:
-            authority_provenance_select = "authority_meta.provenance_json AS authority_provenance_json"
-            from_sql += (
-                " LEFT JOIN authority_message_metadata AS authority_meta"
-                " ON authority_meta.message_id = message.message_id"
-            )
-        clauses: list[str] = []
-        params: list[Any] = []
-        if kind is not None:
-            clauses.append("message.kind = ?")
-            params.append(kind)
-        if state is not None:
-            if has_requests:
-                clauses.append("request.state = ?")
-                params.append(state)
-            else:
-                clauses.append("1 = 0")
-        if agent is not None:
-            agent_clause = "message.sender = ? OR message.recipient = ?"
-            params.extend([agent, agent])
-            if has_authority_metadata:
-                agent_clause += " OR json_extract(authority_meta.provenance_json, '$.Agent') = ?"
-                params.append(agent)
-            clauses.append(f"({agent_clause})")
-        if source is not None:
-            source_expression = "message.sender"
-            if has_conversations:
-                source_expression = "COALESCE(conversation.source, message.sender)"
-            if has_authority_metadata:
-                source_expression = (
-                    "COALESCE(json_extract(authority_meta.provenance_json, '$.Source'), "
-                    f"{source_expression})"
-                )
-            clauses.append(f"{source_expression} = ?")
-            params.append(source)
-        if conversation is not None:
-            clauses.append("message.conversation_id = ?")
-            params.append(conversation)
-        _time_clauses(
-            "message.created_at",
-            since=since_value,
-            until=until_value,
-            clauses=clauses,
-            params=params,
-        )
-        return _paged_query(
-            connection,
-            key="messages",
-            select_sql=(
-                "SELECT message.message_id, message.conversation_id, message.in_reply_to, message.kind, "
-                "message.sender, message.recipient, message.body_inline, message.body_artifact_id, "
-                "message.metadata_json, message.created_at, "
-                f"{source_select}, {request_state_select}, {authority_provenance_select}"
-            ),
-            from_sql=from_sql,
-            clauses=clauses,
-            params=params,
-            order_sql="message.created_at DESC, message.message_id ASC",
-            limit=limit,
-            offset=offset,
-            filters=filters,
-            transform=_message_item,
-        )
 
 
-def _message_detail(connection: SQLiteConnection, message_id: str) -> dict[str, Any] | None:
-    if not _table_exists(connection, "comms_messages"):
-        return None
-    has_conversations = _table_exists(connection, "conversations")
-    has_requests = _table_exists(connection, "requests")
-    has_authority_metadata = _table_exists(connection, "authority_message_metadata")
-    from_sql = " FROM comms_messages AS message"
-    source_select = "NULL AS conversation_source"
-    request_state_select = "NULL AS request_state"
-    authority_provenance_select = "NULL AS authority_provenance_json"
-    if has_conversations:
-        source_select = "conversation.source AS conversation_source"
-        from_sql += " LEFT JOIN conversations AS conversation ON conversation.conversation_id = message.conversation_id"
-    if has_requests:
-        request_state_select = "request.state AS request_state"
-        from_sql += " LEFT JOIN requests AS request ON request.request_message_id = message.message_id"
-    if has_authority_metadata:
-        authority_provenance_select = "authority_meta.provenance_json AS authority_provenance_json"
-        from_sql += (
-            " LEFT JOIN authority_message_metadata AS authority_meta"
-            " ON authority_meta.message_id = message.message_id"
-        )
-    try:
-        row = connection.execute(
-            (
-                "SELECT message.message_id, message.conversation_id, message.in_reply_to, message.kind, "
-                "message.sender, message.recipient, message.body_inline, message.body_artifact_id, "
-                "message.metadata_json, message.created_at, "
-                f"{source_select}, {request_state_select}, {authority_provenance_select}"
-                f"{from_sql} WHERE message.message_id = ?"
-            ),
-            (message_id,),
-        ).fetchone()
-    except sqlite3.Error:
-        return None
-    return _message_item(row, body_limit=MAX_BODY_DETAIL_CHARS) if row is not None else None
 
-
-@router.get("/messages/{message_id}")
-def fleet_message_detail(
-    message_id: str,
-    ctx: MonitorContext = Depends(get_ctx),
-) -> JSONResponse:
-    """A no-store, explicitly bounded inline body preview for one message."""
-    with _read_connection(ctx) as (connection, _availability):
-        item = _message_detail(connection, message_id) if connection is not None else None
-    if item is None:
-        raise HTTPException(status_code=404, detail="Message not found")
-    return JSONResponse(
-        content={
-            "read_only": True,
-            "body_policy": {
-                "inline_preview_limit_chars": MAX_BODY_DETAIL_CHARS,
-                "artifact_content": "omitted",
-                "redaction": "credential_like_values_redacted",
-            },
-            "message": item,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
-
-
-def _discussion_item(row: sqlite3.Row) -> dict[str, Any]:
-    data = dict(row)
-    provenance = _provenance(source=data.get("source"), agent="conversation")
-    return {
-        "conversation_id": data["conversation_id"],
-        "source": provenance["source"],
-        "agent": provenance["agent"],
-        "via": provenance["via"],
-        "title": _safe_text(data.get("title"), limit=240, fallback="") or None,
-        "created_at": data["created_at"],
-        "latest_message_at": data.get("latest_message_at"),
-        "message_count": int(data.get("message_count") or 0),
-        "rounds_requested": data.get("rounds_requested"),
-        "read_only": True,
-    }
-
-
-@router.get("/discussions")
-def fleet_discussions(
-    kind: str | None = Query(default=None),
-    state: str | None = Query(default=None),
-    agent: str | None = Query(default=None),
-    source: str | None = Query(default=None),
-    conversation: str | None = Query(default=None),
-    since: str | None = Query(default=None),
-    until: str | None = Query(default=None),
-    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-    offset: int = Query(default=0, ge=0),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Conversations plus message/round counts; messages remain separately bounded."""
-    since_value = _normalize_time(since, "since")
-    until_value = _normalize_time(until, "until")
-    filters = {
-        "kind": kind,
-        "state": state,
-        "agent": agent,
-        "source": source,
-        "conversation": conversation,
-        "since": since_value,
-        "until": until_value,
-    }
-    with _read_connection(ctx) as (connection, availability):
-        if connection is None:
-            return _empty_collection(
-                "discussions", limit=limit, offset=offset, availability=availability, filters=filters
-            )
-        if not _table_exists(connection, "conversations"):
-            return _empty_collection(
-                "discussions", limit=limit, offset=offset, availability="table_missing", filters=filters
-            )
-        has_messages = _table_exists(connection, "comms_messages")
-        has_requests = _table_exists(connection, "requests")
-        has_acp = _table_exists(connection, "acp_conversations")
-        from_sql = " FROM conversations AS conversation"
-        message_count = "0 AS message_count"
-        latest_message = "NULL AS latest_message_at"
-        rounds = "NULL AS rounds_requested"
-        if has_messages:
-            message_count = "COUNT(message.message_id) AS message_count"
-            latest_message = "MAX(message.created_at) AS latest_message_at"
-            from_sql += " LEFT JOIN comms_messages AS message ON message.conversation_id = conversation.conversation_id"
-        if has_acp:
-            rounds = "MAX(acp.rounds_requested) AS rounds_requested"
-            from_sql += " LEFT JOIN acp_conversations AS acp ON acp.conversation_id = conversation.conversation_id"
-        clauses: list[str] = []
-        params: list[Any] = []
-        if source is not None:
-            clauses.append("conversation.source = ?")
-            params.append(source)
-        if conversation is not None:
-            clauses.append("conversation.conversation_id = ?")
-            params.append(conversation)
-        if kind is not None:
-            if has_messages:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM comms_messages AS kind_message "
-                    "WHERE kind_message.conversation_id = conversation.conversation_id "
-                    "AND kind_message.kind = ?)"
-                )
-                params.append(kind)
-            else:
-                clauses.append("1 = 0")
-        if agent is not None:
-            if has_messages:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM comms_messages AS agent_message "
-                    "WHERE agent_message.conversation_id = conversation.conversation_id "
-                    "AND (agent_message.sender = ? OR agent_message.recipient = ?))"
-                )
-                params.extend([agent, agent])
-            else:
-                clauses.append("1 = 0")
-        if state is not None:
-            if has_messages and has_requests:
-                clauses.append(
-                    "EXISTS (SELECT 1 FROM requests AS state_request "
-                    "JOIN comms_messages AS state_message "
-                    "ON state_message.message_id = state_request.request_message_id "
-                    "WHERE state_message.conversation_id = conversation.conversation_id "
-                    "AND state_request.state = ?)"
-                )
-                params.append(state)
-            else:
-                clauses.append("1 = 0")
-        _time_clauses(
-            "conversation.created_at",
-            since=since_value,
-            until=until_value,
-            clauses=clauses,
-            params=params,
-        )
-        where_sql = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        group_sql = " GROUP BY conversation.conversation_id, conversation.source, conversation.title, conversation.created_at"
-        try:
-            total = int(
-                connection.execute(
-                    f"SELECT COUNT(*) FROM conversations AS conversation{where_sql}", params
-                ).fetchone()[0]
-            )
-            latest_order = (
-                "COALESCE(MAX(message.created_at), conversation.created_at)"
-                if has_messages
-                else "conversation.created_at"
-            )
-            rows = connection.execute(
-                (
-                    "SELECT conversation.conversation_id, conversation.source, conversation.title, "
-                    f"conversation.created_at, {message_count}, {latest_message}, {rounds}{from_sql}{where_sql}"
-                    f"{group_sql} ORDER BY {latest_order} DESC, "
-                    "conversation.conversation_id ASC LIMIT ? OFFSET ?"
-                ),
-                [*params, limit, offset],
-            ).fetchall()
-        except sqlite3.Error:
-            logger.warning("Fleet observer discussion query failed")
-            return _empty_collection(
-                "discussions",
-                limit=limit,
-                offset=offset,
-                availability="db_unavailable",
-                filters=filters,
-            )
-        return _collection(
-            "discussions",
-            [_discussion_item(row) for row in rows],
-            total=total,
-            limit=limit,
-            offset=offset,
-            availability="available" if total else "empty",
-            filters=filters,
-        )
-
-
-@router.get("/discussions/{conversation_id}")
-def fleet_discussion_detail(
-    conversation_id: str,
-    limit: int = Query(default=50, ge=1, le=MAX_DETAIL_ROWS),
-    offset: int = Query(default=0, ge=0),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> JSONResponse:
-    """One bounded discussion timeline without artifact retrieval or write controls."""
-    with _read_connection(ctx) as (connection, _availability):
-        if connection is None or not _table_exists(connection, "conversations"):
-            raise HTTPException(status_code=404, detail="Discussion not found")
-        message_summary = (
-            "(SELECT COUNT(*) FROM comms_messages AS summary_message "
-            "WHERE summary_message.conversation_id = conversation.conversation_id) AS message_count, "
-            "(SELECT MAX(summary_message.created_at) FROM comms_messages AS summary_message "
-            "WHERE summary_message.conversation_id = conversation.conversation_id) AS latest_message_at"
-            if _table_exists(connection, "comms_messages")
-            else "0 AS message_count, NULL AS latest_message_at"
-        )
-        rounds_summary = (
-            "(SELECT MAX(summary_acp.rounds_requested) FROM acp_conversations AS summary_acp "
-            "WHERE summary_acp.conversation_id = conversation.conversation_id) AS rounds_requested"
-            if _table_exists(connection, "acp_conversations")
-            else "NULL AS rounds_requested"
-        )
-        row = connection.execute(
-            "SELECT conversation.conversation_id, conversation.source, conversation.title, "
-            f"conversation.created_at, {message_summary}, {rounds_summary} "
-            "FROM conversations AS conversation WHERE conversation.conversation_id = ?",
-            (conversation_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Discussion not found")
-        if not _table_exists(connection, "comms_messages"):
-            messages = _empty_collection(
-                "messages",
-                limit=limit,
-                offset=offset,
-                availability="table_missing",
-                filters={"conversation": conversation_id},
-            )
-        else:
-            has_authority_metadata = _table_exists(connection, "authority_message_metadata")
-            from_sql = " FROM comms_messages"
-            authority_provenance_select = "NULL AS authority_provenance_json"
-            if has_authority_metadata:
-                authority_provenance_select = "authority_meta.provenance_json AS authority_provenance_json"
-                from_sql += (
-                    " LEFT JOIN authority_message_metadata AS authority_meta"
-                    " ON authority_meta.message_id = comms_messages.message_id"
-                )
-            messages = _paged_query(
-                connection,
-                key="messages",
-                select_sql=(
-                    "SELECT comms_messages.message_id AS message_id, "
-                    "comms_messages.conversation_id AS conversation_id, "
-                    "comms_messages.in_reply_to AS in_reply_to, comms_messages.kind AS kind, "
-                    "comms_messages.sender AS sender, comms_messages.recipient AS recipient, "
-                    "comms_messages.body_inline AS body_inline, "
-                    "comms_messages.body_artifact_id AS body_artifact_id, "
-                    "comms_messages.metadata_json AS metadata_json, "
-                    "comms_messages.created_at AS created_at, NULL AS conversation_source, "
-                    f"NULL AS request_state, {authority_provenance_select}"
-                ),
-                from_sql=from_sql,
-                clauses=["comms_messages.conversation_id = ?"],
-                params=[conversation_id],
-                order_sql="comms_messages.created_at ASC, comms_messages.message_id ASC",
-                limit=limit,
-                offset=offset,
-                filters={"conversation": conversation_id},
-                transform=_message_item,
-            )
-    return JSONResponse(
-        content={
-            "read_only": True,
-            "body_policy": "redacted_inline_previews_only_artifact_content_omitted",
-            "discussion": _discussion_item(row),
-            "messages": messages,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
 
 
 def _review_item(row: sqlite3.Row) -> dict[str, Any]:
@@ -2073,7 +1468,6 @@ def _review_item(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-@router.get("/reviews")
 def fleet_reviews(
     kind: Annotated[str | None, Query()] = None,
     state: Annotated[str | None, Query()] = None,
@@ -2181,268 +1575,7 @@ def fleet_reviews(
         )
 
 
-@router.get("/reviews/{review_id}")
-def fleet_review_detail(
-    review_id: str,
-    attempt_limit: int = Query(default=MAX_DETAIL_ROWS, ge=1, le=MAX_DETAIL_ROWS),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> JSONResponse:
-    """Bounded formal-review detail; sealed verdict and raw captures are never read."""
-    with _read_connection(ctx) as (connection, _availability):
-        if connection is None or not _table_exists(connection, "formal_review_jobs"):
-            raise HTTPException(status_code=404, detail="Review not found")
-        row = connection.execute(
-            """
-            SELECT review_id, repository, pr_number, head_sha, gate_kind, state,
-                   sealed_verdict_artifact_id, created_at
-            FROM formal_review_jobs
-            WHERE review_id = ?
-            """,
-            (review_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Review not found")
-        attempts: list[dict[str, Any]] = []
-        if _table_exists(connection, "formal_review_attempts"):
-            attempts = [
-                {
-                    "review_attempt_id": attempt["review_attempt_id"],
-                    "attempt_number": attempt["attempt_number"],
-                    "completion_state": attempt["completion_state"],
-                    "created_at": attempt["created_at"],
-                }
-                for attempt in connection.execute(
-                    """
-                    SELECT review_attempt_id, attempt_number, completion_state, created_at
-                    FROM formal_review_attempts
-                    WHERE review_id = ?
-                    ORDER BY attempt_number DESC, review_attempt_id ASC
-                    LIMIT ?
-                    """,
-                    (review_id, attempt_limit),
-                ).fetchall()
-            ]
-        publications: list[dict[str, Any]] = []
-        if _table_exists(connection, "github_publications"):
-            publications = [
-                {
-                    "publication_id": publication["publication_id"],
-                    "head_sha": publication["head_sha"],
-                    "status_context": publication["status_context"],
-                    "published_at": publication["published_at"],
-                }
-                for publication in connection.execute(
-                    """
-                    SELECT publication_id, head_sha, status_context, published_at
-                    FROM github_publications
-                    WHERE review_id = ?
-                    ORDER BY published_at DESC, publication_id ASC
-                    LIMIT ?
-                    """,
-                    (review_id, attempt_limit),
-                ).fetchall()
-            ]
-    return JSONResponse(
-        content={
-            "read_only": True,
-            "detail_policy": "raw_capture_and_sealed_verdict_blobs_omitted",
-            "review": _review_item(row),
-            "attempts": attempts,
-            "publications": publications,
-        },
-        headers={"Cache-Control": "no-store"},
-    )
 
-
-def _dead_letter_item(row: sqlite3.Row) -> dict[str, Any]:
-    data = dict(row)
-    authority_provenance = _safe_metadata(data.get("authority_provenance_json"))
-    provenance = _provenance(
-        metadata=authority_provenance,
-        source=authority_provenance.get("source") or data.get("conversation_source"),
-        agent=data.get("resolved_recipient"),
-    )
-    return {
-        "dead_letter_id": data["dead_letter_id"],
-        "request_id": data.get("request_id"),
-        "delivery_id": data.get("delivery_id"),
-        "reason": _safe_text(data["reason"], limit=160),
-        "successor": data.get("successor"),
-        "original_expires_at": data.get("original_expires_at"),
-        "request_state": data.get("request_state"),
-        "created_at": data["created_at"],
-        "read_only": True,
-        **provenance,
-    }
-
-
-@router.get("/dead-letters")
-def fleet_dead_letters(
-    state: str | None = Query(default=None),
-    agent: str | None = Query(default=None),
-    source: str | None = Query(default=None),
-    since: str | None = Query(default=None),
-    until: str | None = Query(default=None),
-    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
-    offset: int = Query(default=0, ge=0),
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
-    """Current authority DLQ metadata, or the legacy read projection during rollback."""
-    since_value = _normalize_time(since, "since")
-    until_value = _normalize_time(until, "until")
-    filters = {
-        "state": state,
-        "agent": agent,
-        "source": source,
-        "since": since_value,
-        "until": until_value,
-    }
-    with _read_connection(ctx) as (connection, availability):
-        if connection is None:
-            return _empty_collection(
-                "dead_letters", limit=limit, offset=offset, availability=availability, filters=filters
-            )
-        if _safe_plane_status(ctx)["mode"] == "authority":
-            if not _table_exists(connection, "authority_dead_letters"):
-                return _empty_collection(
-                    "dead_letters",
-                    limit=limit,
-                    offset=offset,
-                    availability="table_missing",
-                    filters=filters,
-                )
-            clauses: list[str] = []
-            params: list[Any] = []
-            if state is not None:
-                clauses.append("COALESCE(delivery.state, job.state) = ?")
-                params.append(state)
-            if agent is not None:
-                clauses.append("COALESCE(delivery.recipient, 'authority-job') = ?")
-                params.append(agent)
-            if source is not None:
-                clauses.append(
-                    "COALESCE(json_extract(authority_meta.provenance_json, '$.Source'), "
-                    "'authority') = ?"
-                )
-                params.append(source)
-            _time_clauses(
-                "letter.created_at",
-                since=since_value,
-                until=until_value,
-                clauses=clauses,
-                params=params,
-            )
-            return _paged_query(
-                connection,
-                key="dead_letters",
-                select_sql=(
-                    "SELECT letter.dead_letter_id, job.subject_id AS request_id, "
-                    "letter.delivery_id, letter.reason_code AS reason, NULL AS successor, "
-                    "COALESCE(delivery.deadline_at, job.deadline_at) AS original_expires_at, "
-                    "letter.created_at, COALESCE(delivery.state, job.state) AS request_state, "
-                    "delivery.recipient AS resolved_recipient, 'authority' AS conversation_source, "
-                    "authority_meta.provenance_json AS authority_provenance_json"
-                ),
-                from_sql=(
-                    " FROM authority_dead_letters AS letter"
-                    " LEFT JOIN authority_deliveries AS delivery"
-                    " ON delivery.delivery_id = letter.delivery_id"
-                    " LEFT JOIN comms_messages AS message"
-                    " ON message.message_id = delivery.message_id"
-                    " LEFT JOIN authority_message_metadata AS authority_meta"
-                    " ON authority_meta.message_id = message.message_id"
-                    " LEFT JOIN authority_jobs AS job ON job.job_id = letter.job_id"
-                ),
-                clauses=clauses,
-                params=params,
-                order_sql="letter.created_at DESC, letter.dead_letter_id ASC",
-                limit=limit,
-                offset=offset,
-                filters=filters,
-                transform=_dead_letter_item,
-            )
-        if not _table_exists(connection, "dead_letters"):
-            return _empty_collection(
-                "dead_letters", limit=limit, offset=offset, availability="table_missing", filters=filters
-            )
-        has_requests = _table_exists(connection, "requests")
-        has_messages = _table_exists(connection, "comms_messages")
-        has_conversations = _table_exists(connection, "conversations")
-        has_authority_metadata = _table_exists(connection, "authority_message_metadata")
-        from_sql = " FROM dead_letters AS letter"
-        request_state = "NULL AS request_state"
-        resolved = "NULL AS resolved_recipient"
-        source_select = "NULL AS conversation_source"
-        authority_provenance_select = "NULL AS authority_provenance_json"
-        if has_requests:
-            request_state = "request.state AS request_state"
-            resolved = "request.resolved_recipient AS resolved_recipient"
-            from_sql += " LEFT JOIN requests AS request ON request.request_id = letter.request_id"
-        if has_requests and has_messages:
-            from_sql += " LEFT JOIN comms_messages AS message ON message.message_id = request.request_message_id"
-        if has_requests and has_messages and has_conversations:
-            source_select = "conversation.source AS conversation_source"
-            from_sql += " LEFT JOIN conversations AS conversation ON conversation.conversation_id = message.conversation_id"
-        if has_requests and has_messages and has_authority_metadata:
-            authority_provenance_select = "authority_meta.provenance_json AS authority_provenance_json"
-            from_sql += (
-                " LEFT JOIN authority_message_metadata AS authority_meta"
-                " ON authority_meta.message_id = message.message_id"
-            )
-        clauses: list[str] = []
-        params: list[Any] = []
-        if state is not None:
-            if has_requests:
-                clauses.append("request.state = ?")
-                params.append(state)
-            else:
-                clauses.append("1 = 0")
-        if agent is not None:
-            if has_requests:
-                agent_clause = "request.resolved_recipient = ?"
-                params.append(agent)
-                if has_messages and has_authority_metadata:
-                    agent_clause += " OR json_extract(authority_meta.provenance_json, '$.Agent') = ?"
-                    params.append(agent)
-                clauses.append(f"({agent_clause})")
-            else:
-                clauses.append("1 = 0")
-        if source is not None:
-            if has_requests and has_messages and has_conversations:
-                source_expression = "conversation.source"
-                if has_authority_metadata:
-                    source_expression = (
-                        "COALESCE(json_extract(authority_meta.provenance_json, '$.Source'), "
-                        f"{source_expression})"
-                    )
-                clauses.append(f"{source_expression} = ?")
-                params.append(source)
-            else:
-                clauses.append("1 = 0")
-        _time_clauses(
-            "letter.created_at",
-            since=since_value,
-            until=until_value,
-            clauses=clauses,
-            params=params,
-        )
-        return _paged_query(
-            connection,
-            key="dead_letters",
-            select_sql=(
-                "SELECT letter.dead_letter_id, letter.request_id, letter.delivery_id, letter.reason, "
-                "letter.successor, letter.original_expires_at, letter.created_at, "
-                f"{request_state}, {resolved}, {source_select}, {authority_provenance_select}"
-            ),
-            from_sql=from_sql,
-            clauses=clauses,
-            params=params,
-            order_sql="letter.created_at DESC, letter.dead_letter_id ASC",
-            limit=limit,
-            offset=offset,
-            filters=filters,
-            transform=_dead_letter_item,
-        )
 
 
 @router.get("/migrations")

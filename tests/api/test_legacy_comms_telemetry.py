@@ -54,16 +54,9 @@ def _rows(path: Path) -> list[tuple]:
 
 
 def test_route_matcher_is_exact_and_normalizes_parameters() -> None:
-    assert legacy_comms.match_legacy_route("GET", "/api/comms/messages") == "messages"
-    assert legacy_comms.match_legacy_route("GET", "/api/comms/conversations") == "conversations"
-    assert (
-        legacy_comms.match_legacy_route("GET", "/api/comms/conversation/private-task")
-        == "conversation_detail"
-    )
     assert legacy_comms.match_legacy_route("POST", "/api/comms/acknowledge/42") == "acknowledge"
-    assert legacy_comms.match_legacy_route("POST", "/api/comms/send") == "send"
-    assert legacy_comms.match_legacy_route("POST", "/api/comms/messages") is None
-    assert legacy_comms.match_legacy_route("GET", "/api/comms/messages/extra") is None
+    assert legacy_comms.match_legacy_route("GET", "/api/comms/acknowledge/42") is None
+    assert legacy_comms.match_legacy_route("POST", "/api/comms/acknowledge/42/extra") is None
     assert legacy_comms.match_legacy_route("GET", "/api/comms/channels/private/messages") is None
 
 
@@ -85,30 +78,14 @@ def test_all_legacy_routes_and_validation_failures_are_counted(
     client: TestClient,
     telemetry_db: Path,
 ) -> None:
-    assert client.get("/api/comms/messages").status_code == 200
-    assert client.get("/api/comms/conversations").status_code == 200
-    assert client.get("/api/comms/conversation/task-1").status_code == 200
     assert client.post("/api/comms/acknowledge/1").status_code == 410
-    assert client.post(
-        "/api/comms/send",
-        json={"from_llm": "a", "to_llm": "b", "content": "body"},
-    ).status_code == 410
-    assert client.post("/api/comms/send", json={"content": "invalid"}).status_code == 422
 
-    response = client.get("/api/telemetry/legacy-comms-routes?window=1h")
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["total"] == 6
-    assert payload["by_caller"] == {"test": 6}
-    assert payload["by_status"] == {"2xx": 3, "4xx": 3}
+    payload = legacy_comms.legacy_comms_summary("1h", db_path=telemetry_db)
+    assert payload["total"] == 1
+    assert payload["by_caller"] == {"test": 1}
+    assert payload["by_status"] == {"4xx": 1}
     assert payload["scope_note"].startswith("Direct ask-* CLI calls bypass")
-    assert {item["route_id"]: item["count"] for item in payload["routes"]} == {
-        "messages": 1,
-        "conversations": 1,
-        "conversation_detail": 1,
-        "acknowledge": 1,
-        "send": 2,
-    }
+    assert {item["route_id"]: item["count"] for item in payload["routes"]} == {"acknowledge": 1}
     assert telemetry_db.exists()
 
 
@@ -121,11 +98,12 @@ def test_route_writes_land_in_the_serving_context_root(tmp_path: Path, monkeypat
     app = FastAPI()
     app.state.ctx = fixture_context(ctx_root)
     app.include_router(comms_router.router, prefix="/api/comms")
-    app.include_router(telemetry_router.router)
 
     with TestClient(app, raise_server_exceptions=False) as test_client:
         assert test_client.post("/api/comms/acknowledge/1").status_code == 410
-        summary = test_client.get("/api/telemetry/legacy-comms-routes?window=1h").json()
+        summary = legacy_comms.legacy_comms_summary(
+            "1h", db_path=legacy_comms.db_path_for_root(ctx_root.resolve())
+        )
 
     assert summary["total"] == 1
     assert _rows(legacy_comms.db_path_for_root(ctx_root.resolve()))[0][1] == "acknowledge"
@@ -150,21 +128,14 @@ def test_telemetry_never_persists_paths_queries_bodies_credentials_or_raw_header
         "X-Learn-Uk-Caller": secrets["header-secret"],
         "User-Agent": "curl/8.0",
     }
-    assert client.get(
-        f"/api/comms/conversation/{secrets['path-secret']}?token={secrets['query-secret']}",
-        headers=headers,
-    ).status_code == 200
     assert client.post(
-        "/api/comms/send",
+        f"/api/comms/acknowledge/1?token={secrets['query-secret']}&note={secrets['path-secret']}&body={secrets['body-secret']}",
         headers=headers,
-        json={"from_llm": "a", "to_llm": "b", "content": secrets["body-secret"]},
     ).status_code == 410
 
     persisted = json.dumps(_rows(telemetry_db))
     assert all(secret not in persisted for secret in secrets.values())
-    assert '"conversation_detail"' in persisted
-    assert '"send"' in persisted
-    assert '"cli"' in persisted
+    assert '"acknowledge"' in persisted
 
 
 def test_summary_marks_window_incomplete_until_coverage_is_old_enough(
@@ -175,7 +146,8 @@ def test_summary_marks_window_incomplete_until_coverage_is_old_enough(
     payload = legacy_comms.legacy_comms_summary("7d", db_path=telemetry_db, now=now)
     assert payload["total"] == 0
     assert payload["window_fully_observed"] is False
-    assert len(payload["routes"]) == 5
+    assert len(payload["routes"]) == 1
+    assert payload["routes"][0]["route_id"] == "acknowledge"
 
 
 def test_retention_cleanup_is_bounded_and_idempotent(telemetry_db: Path) -> None:
@@ -187,7 +159,7 @@ def test_retention_cleanup_is_bounded_and_idempotent(telemetry_db: Path) -> None
             INSERT INTO legacy_comms_route_usage(
                 hour_utc, route_id, method, caller_class, status_class,
                 count, first_seen, last_seen
-            ) VALUES (?, 'messages', 'GET', 'unknown', '2xx', 1, ?, ?)
+            ) VALUES (?, 'acknowledge', 'POST', 'unknown', '4xx', 1, ?, ?)
             """,
             (
                 "2026-04-01T00:00:00Z",
@@ -199,17 +171,17 @@ def test_retention_cleanup_is_bounded_and_idempotent(telemetry_db: Path) -> None
 
     for _ in range(2):
         legacy_comms.record_legacy_route_usage(
-            "messages",
-            "GET",
+            "acknowledge",
+            "POST",
             "canary",
-            200,
+            410,
             db_path=telemetry_db,
             now=now,
         )
 
     rows = _rows(telemetry_db)
     assert len(rows) == 1
-    assert rows[0][1:6] == ("messages", "GET", "canary", "2xx", 2)
+    assert rows[0][1:6] == ("acknowledge", "POST", "canary", "4xx", 2)
 
 
 def test_concurrent_writers_increment_one_atomic_bucket(telemetry_db: Path) -> None:
@@ -217,10 +189,10 @@ def test_concurrent_writers_increment_one_atomic_bucket(telemetry_db: Path) -> N
 
     def record(_index: int) -> None:
         legacy_comms.record_legacy_route_usage(
-            "messages",
-            "GET",
+            "acknowledge",
+            "POST",
             "automation",
-            200,
+            410,
             db_path=telemetry_db,
             now=now,
         )
@@ -247,5 +219,5 @@ def test_storage_failure_does_not_break_legacy_route(
         raise OSError("synthetic telemetry outage")
 
     monkeypatch.setattr(legacy_comms, "record_legacy_route_usage", fail)
-    response = client.get("/api/comms/messages")
-    assert response.status_code == 200
+    response = client.post("/api/comms/acknowledge/1")
+    assert response.status_code == 410

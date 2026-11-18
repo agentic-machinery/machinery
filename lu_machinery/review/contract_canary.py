@@ -301,7 +301,7 @@ def record(task_id: str, root: Path | None = None) -> Path:
 
 
 _RUN_MODELS = {
-    "codex": ("gpt-6.1-sol", "--codex-account", "b-sub"),
+    "codex": ("gpt-6.2-sol", "--codex-account", "b-sub"),
     "claude": ("claude-sonnet-5-5", "--claude-account", "b"),
     "cursor": ("grok-4.7-high",),
     "agy": ("gemini-3.8-flash-high",),

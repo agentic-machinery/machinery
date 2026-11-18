@@ -64,13 +64,13 @@ def _cold_start_body(
 - **Stream:** `{stream_id}`
 - **Lease:** {lease_summary}
 - **Thread rollover:** {rollover_summary}
-- **Handoff dual-write:** `{handoff_rel}`
+- **Canary recall input:** `{handoff_rel}`
 - {binding_line}
 
 ## Immediate steps
 1. Confirm SessionStart reports either this exact rollover bound or no live rollover. Stop on any setup error.
 2. This is a fresh Codex task: never invoke `codex resume`, `codex fork`, or select a historical packet.
-3. Read the stream tail and this handoff, then load the `drive-epic` skill.
+3. Read the lane's DB note first: `lu-driver-state render --lane {epic}`, then `lu-driver-state show <its ID>`. It is the only handoff content authority; the canary recall input above is not. Then read the stream tail and load the `drive-epic` skill.
 4. The launcher already minted the canary. Score from memory later; PASS auto-hydrates and FAIL-HANDOFF writes handback and closes the exact lease.
 5. Continue only when the hydration capsule has `execution_allowed: true`.
 6. Codex has no Monitor-equivalent background capability: use only a bounded manual watch.
@@ -267,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--out-dir", default=None)
     score.add_argument("--answers", required=True)
     score.add_argument("--context-tokens", type=int, default=0)
-    score.add_argument("--model", default="gpt-6.1-sol")
+    score.add_argument("--model", default="gpt-6.2-sol")
     score.add_argument("--pass-ratio", type=float, default=_gl.DEFAULT_PASS_RATIO)
     score.add_argument("--threshold", type=float, default=_gl.DEFAULT_SIM_THRESHOLD)
     score.add_argument("--handoff", default=None)
