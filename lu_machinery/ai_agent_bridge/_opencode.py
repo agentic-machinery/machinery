@@ -435,7 +435,7 @@ def read_opencode_result(job_id: str) -> dict:
         result = authority.read_job_result(job_id)
         if result is None:
             raise AuthorityServiceError("opencode_terminal_result_missing")
-        payload = json.loads(result)
+        payload = json_depth.loads(result, max_depth=512)
         if not isinstance(payload, dict):
             raise AuthorityServiceError("opencode_terminal_result_invalid")
         return payload
@@ -452,7 +452,7 @@ def print_authority_asks(task_id: str | None = None) -> None:
         ).fetchall()
         print("ID  TASK  TO  STATUS  SENT" if rows else "No tracked asks.")
         for row in rows:
-            payload = json.loads(store.read_bytes(row["payload_artifact_id"]))
+            payload = json_depth.loads(store.read_bytes(row["payload_artifact_id"]), max_depth=512)
             metadata = payload["metadata"]
             print(f"{row['job_id']}  {metadata.get('task_id', '-')}  {payload['recipient']}  {row['state']}  {row['created_at']}")
 
@@ -692,7 +692,7 @@ def process_for_opencode(
     worker_id = new_id("opencode-worker")
     with AuthorityService() as authority:
         job = authority.get_job(message_id)
-        payload = json.loads(authority.store.read_bytes(job.payload_artifact_id))
+        payload = json_depth.loads(authority.store.read_bytes(job.payload_artifact_id), max_depth=512)
         metadata = payload["metadata"]
         if job.job_kind != "request" or metadata.get("transport") != "opencode" or metadata.get("target") != target:
             raise AuthorityServiceError("opencode_job_target_mismatch")
@@ -700,7 +700,7 @@ def process_for_opencode(
             raw = authority.read_job_result(job.job_id)
             if raw is None:
                 raise AuthorityServiceError("opencode_terminal_result_missing")
-            receipt = json.loads(raw)
+            receipt = json_depth.loads(raw, max_depth=512)
             if job.state != "complete":
                 raise SystemExit(receipt.get("error") or "opencode job failed")
             print(receipt["response"])
@@ -731,7 +731,7 @@ def process_for_opencode(
             "job_id": job.job_id, "request_message_id": job.subject_id,
             "task_id": metadata["task_id"], "from": target, "to": msg["from"],
             "from_model": actual_model, "to_model": metadata["from_model"],
-            "provenance": json.loads(provenance),
+            "provenance": json_depth.loads(provenance, max_depth=512),
         }
         try:
             content = authority.read_message_body(job.subject_id)
