@@ -916,9 +916,8 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     would fail the ownership rule and settlement's removal preserves them, so they are not undelivered task
     work. Every tracked change is task work, inside the scope or not (an edit outside it may be work the
     worker could not commit), and so is any untracked file of an unscoped task or one whose scope is
-    unreadable, and any nested repository: a checkout, whose files Git does not list, or a bare repository,
-    whose commits may hold work the published branch does not. The tree is read with _tree_changes, the reader
-    settlement's removal uses.
+    unreadable, and a tree holding any nested repository (_nested_repository), whose commits may hold work the
+    published branch does not. The tree is read with _tree_changes, the reader settlement's removal uses.
     """
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
@@ -938,17 +937,13 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
         except (TypeError, ValueError):
             owned = []  # an unreadable scope owns everything
         outside = set(ownership.outside_owned(untracked, owned)) if owned else set()
-        repositories: dict[Path, bool] = {}
-
-        def unrelated(name: str) -> bool:
-            return name in outside and not name.endswith("/") and not _in_git_directory(spec.worktree, name, repositories)
-
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
         delivery.update(worktree_dirty_on_exit=bool(changed or untracked),
                         worktree_untracked_only_on_exit=bool(untracked) and not changed,
                         worktree_unrelated_only_on_exit=bool(untracked) and not changed
-                        and all(map(unrelated, untracked)))
+                        and all(name in outside and not name.endswith("/") for name in untracked)
+                        and not _nested_repository(spec.worktree))
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -1257,30 +1252,40 @@ def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     return changed, untracked
 
 
-def _in_git_directory(tree: Path, name: str, seen: dict[Path, bool]) -> bool:
-    """Whether an untracked file lies in a nested Git directory, such as a bare repository, which status lists file by file.
+def _nested_repository(tree: Path) -> bool:
+    """Whether any directory under the tree, ignored or not, is a Git repository of its own.
 
-    Only a directory with a HEAD entry can be one (setup.c is_git_directory). Git itself decides each such
-    directory: run from it, it finds the directory as its own Git directory only when the directory is a
-    repository, and otherwise finds the tree's. A directory Git cannot answer for counts as one. ``seen``
-    caches the answer per directory.
+    Status cannot tell: it lists a nested checkout file by file when the tree tracks a path inside it, lists
+    none of it when the tree tracks or ignores all of it, and lists a bare repository as plain files. Only a
+    directory holding a .git entry (a checkout's directory, gitfile or link) or a HEAD entry (a bare
+    repository; setup.c is_git_directory) can be one, so Git decides each such directory: run from there, it
+    finds a Git directory other than the tree's only in a repository of its own, such as a nested checkout,
+    a bare repository or a submodule. A directory Git cannot answer for, or one the walk cannot read, counts
+    as one.
     """
-    directory = tree
-    for part in PurePosixPath(name).parts[:-1]:
-        directory = directory / part
-        if directory not in seen:
-            seen[directory] = False
-            if os.path.lexists(directory / "HEAD"):
-                try:
-                    found = execution_safe_git(["rev-parse", "--absolute-git-dir"], cwd=directory, capture_output=True,
-                                               check=True, timeout=30).stdout
-                    # Git ends the path with one LF; any other byte, blanks included, is part of the path.
-                    if not found.endswith(b"\n"):
-                        raise ValueError("rev-parse printed no path")
-                    seen[directory] = os.path.realpath(os.fsdecode(found[:-1])) == os.path.realpath(directory)
-                except (OSError, ValueError, subprocess.SubprocessError):
-                    seen[directory] = True
-        if seen[directory]:
+    def git_directory(directory: str) -> str:
+        found = execution_safe_git(["rev-parse", "--absolute-git-dir"], cwd=Path(directory), capture_output=True,
+                                   check=True, timeout=30).stdout
+        # Git ends the path with one LF; any other byte, blanks included, is part of the path.
+        if not found.endswith(b"\n"):
+            raise ValueError("rev-parse printed no path")
+        return os.path.realpath(os.fsdecode(found[:-1]))
+
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    own = git_directory(os.fspath(tree))
+    for directory, directories, files in os.walk(tree, onerror=unreadable):
+        if directory == os.fspath(tree):
+            if ".git" in directories:
+                directories.remove(".git")  # the tree's own repository
+            continue
+        if {".git", "HEAD"}.isdisjoint(directories) and {".git", "HEAD"}.isdisjoint(files):
+            continue
+        try:
+            if git_directory(directory) != own:
+                return True
+        except (OSError, ValueError, subprocess.SubprocessError):
             return True
     return False
 

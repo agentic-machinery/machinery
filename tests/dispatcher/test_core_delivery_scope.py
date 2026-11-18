@@ -161,6 +161,10 @@ LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nnam
     ("bare-symlink-head", None, False),  # Git still opens a bare repository whose HEAD is a symbolic link
     ("bare-trailing-blank", None, False),  # a repository name ending in a blank is still that repository
     ("marker-output", None, True),  # HEAD and objects/ files that Git would not open as a repository
+    ("nested-listed", None, False),  # a checkout under a path the tree tracks: status lists its files one by one
+    ("nested-gitfile", None, False),  # the same checkout, its .git a file naming a separate Git directory
+    ("nested-all-tracked", None, False),  # a checkout whose files the tree tracks: status lists none of them
+    ("nested-ignored", None, False),  # a checkout under an ignored path: status never lists it
     ("stat-hidden", None, False),  # a tracked edit the worker's stat settings would hide from status
     ("attributes-file", None, True),  # a configured attributes file keeps a clean checkout clean
 ])
@@ -175,8 +179,12 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
     run_git(tmp_path, "init", "-q", "-b", "main", str(work))
     for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
         run_git(work, "config", key, value)
-    (work / ".gitignore").write_text("*.log\n")
+    (work / ".gitignore").write_text("*.log\nignored/\n")
     (work / "delivered.txt").write_text("delivery\n")
+    nested = work / ("ignored/nested" if case == "nested-ignored" else "vendor/nested")
+    if case in {"nested-listed", "nested-gitfile", "nested-all-tracked"}:
+        nested.mkdir(parents=True)
+        (nested / "shared.txt").write_text("shared\n")
     if case == "attributes-file":  # checked out as CRLF only through the configured attributes file
         (tmp_path / "attributes").write_text("*.txt text eol=crlf\n")
         run_git(work, "config", "core.attributesFile", str(tmp_path / "attributes"))
@@ -198,6 +206,14 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
             (work / "scratch/nested.git/HEAD").symlink_to("refs/heads/main")
     elif case == "attributes-file":
         os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
+    elif case.startswith("nested-"):
+        separate = ["--separate-git-dir", str(tmp_path / "separate.git")] if case == "nested-gitfile" else []
+        run_git(tmp_path, "init", "-q", "-b", "main", *separate, str(nested))
+        committed = "shared.txt" if case == "nested-all-tracked" else "local.txt"
+        (nested / committed).write_text("shared\n" if committed == "shared.txt" else "local\n")
+        run_git(nested, "add", committed)
+        run_git(nested, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+                "commit", "-q", "-m", "work the delivery does not hold")
     elif case == "marker-output":
         (work / "scratch/output/objects").mkdir(parents=True)
         (work / "scratch/output/HEAD").write_text("generated report\n")
