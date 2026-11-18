@@ -1342,15 +1342,18 @@ def _snapshot_tree(tree: Path, task_id: str) -> str:
     """The tree object of the checkout's tracked and untracked (not ignored) files.
 
     They are staged in a scratch copy of the checkout's index, so its own index, HEAD and branch stay as they were.
-    The copy keeps the index's timestamps, so racily clean entries stay racy, and staging forces core.trustctime
-    and core.checkStat to their defaults, so it stages every edit _tree_changes reports.
+    The copy keeps the index's timestamps, so racily clean entries stay racy. Staging forces core.trustctime and
+    core.checkStat to their defaults and turns off core.fsmonitor and core.untrackedCache, as _tree_changes reads
+    them, so a worker's settings cannot keep an edit it reports out of the snapshot.
     """
     index = _git(tree, "rev-parse", "--path-format=absolute", "--git-path", "index", isolate=True)
     scratch = allocate(task_id + "-salvage")
     try:
         scratch.payload_dir.mkdir(exist_ok=True)
         env = {"GIT_INDEX_FILE": str(shutil.copy2(index, scratch.payload_dir / "index"))}
-        _git(tree, "-c", "core.trustctime=true", "-c", "core.checkStat=default", "add", "--all", isolate=True, env=env)
+        stat_forced = ("-c", "core.trustctime=true", "-c", "core.checkStat=default", "-c", "core.fsmonitor=false",
+                       "-c", "core.untrackedCache=false")
+        _git(tree, *stat_forced, "add", "--all", isolate=True, env=env)
         return _git(tree, "write-tree", isolate=True, env=env)
     finally:
         try:
