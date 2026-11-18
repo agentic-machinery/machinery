@@ -3,7 +3,9 @@
 This kit checks that a published lu-machinery release works by itself on a machine that has never
 seen a machinery checkout. It installs the release from GitHub into a fresh virtual environment,
 runs every consumer row against that install, rolls back to the previous release, runs every row
-again, and writes one JSON receipt per row per phase.
+again, and writes one JSON receipt per row per phase. It selects the same `api`, `postgres`, and
+`pytest` extras as the deployed consumer. The Monitor API needs Uvicorn, Fleet plane status needs
+psycopg, and the data-tier probe runs pytest.
 
 Rows that need things only a production host has run against mocks instead: a synthetic product
 checkout, small scrubbed extracts of real stores (`fixtures/`), fake credentials, stub command-line
