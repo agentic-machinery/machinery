@@ -20,9 +20,13 @@ Examples:
   .venv/bin/python -m scripts.lint.mypy_ratchet --write-baseline
 
 Outputs: one violation per new or stale identity on stderr, or a one-line
-pass message on stdout. ``--write-baseline`` rewrites the baseline JSON.
+pass message on stdout. ``--write-baseline`` is the only writer and only
+prunes: it runs a complete analysis, drops the entries mypy no longer
+reports, and replaces the baseline atomically. A new or reintroduced error,
+an incomplete analysis, or another mypy version writes nothing. CI never
+writes; the shrink is a reviewed baseline change.
 Exit codes: 0 pass or baseline written; 1 a new error, a stale entry, growth,
-or mypy could not run.
+a refused write, or mypy could not run.
 Related: #12642, scripts/hygiene/lint_source_db_writable_connects.py.
 """
 
@@ -35,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -71,6 +76,7 @@ _MYPY_KEYS = (
 )
 _GIT_TIMEOUT_SECONDS = 30
 _SHRINK_REFS = ("HEAD", "HEAD^", "origin/main")
+_PRUNE_COMMAND = "python -m lu_machinery.lint.mypy_ratchet --write-baseline"
 
 # path:line:col: error: message  [code]  — column is optional.
 _REPORT = re.compile(
@@ -520,8 +526,9 @@ def collect_errors(
     """Run mypy. Fatal runner failures come back as violation strings."""
 
     existing = [target for target in targets if (root / target).exists()]
-    if not existing:
-        return [], []
+    if len(existing) != len(targets):
+        missing = ", ".join(target for target in targets if target not in existing)
+        return [], [f"mypy target does not exist: {missing}"]
     if config_file is None:
         config_file = ratchet_config(root)
     command = mypy_command(
@@ -565,17 +572,12 @@ def compare(current: Sequence[MypyError], baseline: Sequence[MypyError]) -> list
     current_counts = _counts(current)
     baseline_counts = _counts(baseline)
     violations: list[str] = []
-    for identity in sorted(set(current_counts) | set(baseline_counts)):
-        path, code, message = identity
-        extra = current_counts[identity] - baseline_counts[identity]
-        if extra > 0:
-            suffix = f" x{extra}" if extra > 1 else ""
-            violations.append(f"{path}: new {code}{suffix}: {message}")
-        missing = baseline_counts[identity] - current_counts[identity]
-        if missing > 0:
-            suffix = f" x{missing}" if missing > 1 else ""
-            violations.append(f"{path}: stale baseline {code}{suffix}: {message}")
-    return violations
+    for kind, counts in (("new", current_counts - baseline_counts), ("stale baseline", baseline_counts - current_counts)):
+        for (path, code, message), n in counts.items():
+            suffix = f" x{n}" if n > 1 else ""
+            hint = f"; run {_PRUNE_COMMAND}" if kind == "stale baseline" else ""
+            violations.append(f"{path}: {kind} {code}{suffix}: {message}{hint}")
+    return sorted(violations)
 
 
 def _entries_from_rows(rows: object, where: str) -> list[MypyError]:
@@ -614,6 +616,8 @@ def load_entries(path: Path) -> list[MypyError]:
 
 
 def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
+    """Replace the baseline atomically: a failed write leaves the old file."""
+
     payload = {
         "schema": SCHEMA,
         "mypy": importlib.metadata.version("mypy"),
@@ -622,7 +626,18 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
             for error in sorted(entries)
         ],
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, path.stat().st_mode & 0o777 if path.exists() else 0o644)
+        os.replace(temp, path)
+    except BaseException:
+        Path(temp).unlink(missing_ok=True)
+        raise
 
 
 def _git_show(root: Path, ref: str, rel: str) -> bytes | None:
@@ -704,13 +719,43 @@ def evaluate(
     violations: list[str] = []
     if default_target in scoped:
         violations.extend(
-            f"{entry.path}: stale baseline {entry.code}: {entry.message}"
+            f"{entry.path}: stale baseline {entry.code}: {entry.message}; run {_PRUNE_COMMAND}"
             for entry in entries
             if not _in_scope(entry.path, (default_target,))
         )
     violations.extend(compare(current, relevant))
     violations.extend(shrink_violations(root, baseline, entries))
     return violations
+
+
+def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
+    """Drop the entries mypy no longer reports. Returns (removed, refusals).
+
+    The one writer. It only shrinks, and only on a complete analysis: the whole
+    product tree, the repository mypy config, the mypy version the baseline
+    records, and a clean mypy run. Anything else writes nothing.
+    """
+
+    if not (root / "pyproject.toml").is_file():
+        return 0, ["no pyproject.toml: the repository mypy config would not apply"]
+    payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
+    entries = _payload_entries(payload, str(baseline))
+    recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
+    if recorded != installed:
+        return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
+    current, fatal = collect_errors(root, [product_tree_path(root=root).name], incremental=False)
+    if fatal:
+        return 0, fatal
+    grown = _counts(current) - _counts(entries)
+    if grown:
+        return 0, [f"{path}: new {code}: {message}" for (path, code, message) in sorted(grown)]
+    refused = shrink_violations(root, baseline, current)
+    if refused:
+        return 0, refused
+    removed = len(entries) - len(current)
+    if removed:
+        write_baseline(baseline, current)
+    return removed, []
 
 
 def _python_targets(paths: Sequence[str], root: Path) -> list[str]:
@@ -748,30 +793,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--write-baseline",
         action="store_true",
-        help="Rewrite the baseline from the current mypy census and exit.",
+        help=(
+            "Prune stale entries after a complete analysis and exit. Writes nothing on a new "
+            "error, an incomplete analysis or another mypy version. Takes no paths."
+        ),
     )
     parser.add_argument(
         "--no-incremental",
         action="store_true",
-        help="Ignore the mypy cache. Tests use this; CI keeps the cache.",
+        help="Ignore the mypy cache. Tests use this; CI keeps the cache. --write-baseline always ignores it.",
     )
     args = parser.parse_args(argv)
+    if args.write_baseline and args.paths:
+        parser.error("--write-baseline analyses the whole tree; a path list would prune on a partial census")
     try:
         root = product_root(args.root.absolute() if args.root is not None else None).resolve()
         baseline = product_tree_path(*BASELINE_PATH.parts, root=root) if args.baseline is None else (
             args.baseline if args.baseline.is_absolute() else root / args.baseline
         )
-        targets = [product_tree_path(root=root).name] if args.write_baseline else _python_targets(args.paths, root)
         if args.write_baseline:
-            current, fatal = collect_errors(
-                root, targets, incremental=not args.no_incremental
-            )
-            if fatal:
-                print("\n".join(fatal), file=sys.stderr)
+            removed, refusals = prune_baseline(root, baseline)
+            if refusals:
+                print("baseline not written:\n" + "\n".join(refusals), file=sys.stderr)
                 return 1
-            write_baseline(baseline, current)
-            print(f"Wrote {len(current)} mypy errors to {baseline.relative_to(root)}")
+            print(f"Removed {removed} stale mypy entries from {baseline.relative_to(root)}")
             return 0
+        targets = _python_targets(args.paths, root)
         violations = evaluate(
             root, baseline, targets, incremental=not args.no_incremental
         )
