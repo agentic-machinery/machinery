@@ -151,8 +151,8 @@ def _load_behavior_proof_state(
     state_file: Path,
     *,
     target,
-) -> tuple[dict, str]:
-    """Load proof and its claim from the canonical frozen closeout state."""
+) -> tuple[dict, str, str]:
+    """Load proof, intended behavior, and profile from the frozen closeout state."""
     try:
         state = json_depth.loads(state_file.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeDecodeError) as exc:
