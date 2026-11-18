@@ -19,6 +19,7 @@ from lu_machinery.common import json_depth
 from lu_machinery.fleet import ignored_task_output
 from lu_machinery.orchestration import task_lifecycle as tl
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
+from lu_machinery.review.repair_round import RepairRefused, required_workflows
 
 
 class ObservationRefusal(tl.LifecycleError):
@@ -632,6 +633,21 @@ def _execution_succeeded(
         return False
 
 
+def required_merge_workflow(repository: str) -> str:
+    """The workflow whose latest merge-group run proves a merged PR: the repository's own ``required_workflow``.
+
+    The value comes from fleet_repos.yaml through the reader repair verification already uses (default
+    ``.github/workflows/ci.yml``). A row naming several workflows is refused: the closeout evidence binds one run.
+    """
+    try:
+        workflows = required_workflows(repository)
+    except RepairRefused as exc:
+        raise ObservationRefusal("CLOSEOUT_REQUIRED_WORKFLOW_UNKNOWN") from exc
+    if len(workflows) != 1:
+        raise ObservationRefusal("CLOSEOUT_REQUIRED_WORKFLOWS_UNSUPPORTED")
+    return workflows[0]
+
+
 def merged_run_evidence(
     ledger: Mapping[str, Any],
     observation: dict[str, Any],
@@ -672,11 +688,12 @@ def merged_run_evidence(
         raise ObservationRefusal("CLOSEOUT_MERGED_PR_MISMATCH")
     run_id, attempt = run.get("id"), run.get("run_attempt")
     run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
+    workflow = required_merge_workflow(repository)
     if (
         type(run_id) is not int or type(attempt) is not int or min(run_id, attempt) < 1
         or not isinstance(run.get("repository"), Mapping) or run["repository"].get("full_name") != repository
         or run.get("event") != "merge_group" or run.get("head_sha") != merge
-        or run.get("html_url") != run_url or run.get("path") != ".github/workflows/ci.yml"
+        or run.get("html_url") != run_url or run.get("path") != workflow
         or not re.fullmatch(rf"gh-readonly-queue/{re.escape(base_ref)}/pr-{pr_number}-[0-9a-f]+", str(run.get("head_branch", "")))
         or run.get("status") != "completed" or run.get("conclusion") != "success"
     ):

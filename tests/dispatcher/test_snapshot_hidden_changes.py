@@ -5,6 +5,7 @@ skip-worktree index flags and the submodule ignore settings, so a worker that ex
 tracked work was reported clean (``worktree_dirty_on_exit=False``) and passed the delivery rescue.
 """
 
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -262,3 +263,86 @@ def test_removal_reports_a_recursion_error_as_unknown_not_error(tmp_path, monkey
               "worktree_branch": "claude/deep", "worktree_base_sha": "0" * 40}
     disposition = git.settle_worktree(record)
     assert (disposition["worktree_disposition"], disposition["worktree_disposition_reason"]) == ("retained", "unknown")
+
+
+# Distinct names a text read of Git's output folds into one another (CR and CRLF become LF).
+LINE_BREAK_NAMES = ["scratch/cr\rname", "scratch/cr\nname", "scratch/crlf\r\nname", "scratch/crlf\nname",
+                    # A text read of the snapshot's list fails on the first and splits the second (#812 round 1).
+                    os.fsdecode(b"scratch/bad\xffname"), "scratch/line\u2028separator"]
+
+
+@pytest.mark.parametrize("case", ["untracked", "ignored", "stat-hidden", "attributes-file", "attributes-file-global",
+                                  "filtered", "filtered-global", "global-conversion"])
+def test_snapshot_and_removal_reads_reveal_at_least_what_main_did(tmp_path, monkeypatch, case):
+    """Defect class: a worker's stat settings hid a tracked edit from the exit snapshot and from removal, and
+    removal's text read folded CR and CRLF in untracked names, so it preserved names that do not exist (#524).
+    Each read stays the one main used (the snapshot's execution-safe read, removal's plain-Git read with every
+    config scope and the tree's filters) with controls that only reveal more, so neither reads a tree clean that
+    main read changed: an edit only a filter or a global conversion shows still keeps the tree (#807 rounds 1-3)."""
+    global_config = tmp_path / "global"
+    global_config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))  # this test's own global config, no system one
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    work = _repo(tmp_path / "tree")
+    _git(work, "config", "core.quotePath", "false")  # status prints high bytes in names as they are
+    (work / ".gitignore").write_text("*.log\n")
+    (work / "delivered.txt").write_text("delivery\n")
+    if case.startswith("attributes-file"):  # checked out as CRLF only through a configured attributes file
+        (tmp_path / "attributes").write_text("*.txt text eol=crlf\n")
+        if case == "attributes-file":
+            _git(work, "config", "core.attributesFile", str(tmp_path / "attributes"))
+        else:
+            global_config.write_text(f"[core]\n\tattributesFile = {tmp_path / 'attributes'}\n")
+        (work / "delivered.txt").write_bytes(b"delivery\r\n")
+    elif case == "global-conversion":  # stored with CRLF before any attribute applied
+        (work / "delivered.txt").write_bytes(b"delivery\r\n")
+    elif case.startswith("filtered"):  # a reversible filter: the checkout holds A, the stored blob B
+        if case == "filtered":
+            for kind in ("clean", "smudge"):
+                _git(work, "config", f"filter.swap.{kind}", "tr AB BA")
+            (work / ".gitattributes").write_text("sample.txt filter=swap\n")
+        else:  # the driver and the attribute only in the global config and its attributes file
+            (tmp_path / "global-attributes").write_text("sample.txt filter=swap\n")
+            global_config.write_text(f'[filter "swap"]\n\tclean = tr AB BA\n\tsmudge = tr AB BA\n'
+                                     f"[core]\n\tattributesFile = {tmp_path / 'global-attributes'}\n")
+        (work / "sample.txt").write_text("A\n")
+    os.utime(work / "delivered.txt", (1_000_000_000, 1_000_000_000))  # older than the index: not racily clean
+    _git(work, "add", ".")
+    _git(work, "commit", "-q", "-m", "delivery")
+    leftovers = {"untracked": LINE_BREAK_NAMES, "ignored": ["scratch/out.log"]}.get(case, [])
+    for name in leftovers:
+        (work / name).parent.mkdir(exist_ok=True)
+        (work / name).write_text(f"left over {name!r}\n")
+    if case.startswith("attributes-file"):
+        os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
+        assert _git(work, "status", "--porcelain") == ""
+    elif case == "global-conversion":
+        (tmp_path / "global-attributes").write_text("delivered.txt text\n")
+        global_config.write_text(f"[core]\n\tattributesFile = {tmp_path / 'global-attributes'}\n")
+        os.utime(work / "delivered.txt")  # same bytes; plain Git now normalizes them, so they differ from the blob
+        assert _git(work, "status", "--porcelain") == "M delivered.txt"
+    elif case.startswith("filtered"):
+        (work / "sample.txt").write_text("B\n")  # through the filter this is a change; raw, it equals the blob
+        assert _git(work, "status", "--porcelain") == "M sample.txt"
+    elif case == "stat-hidden":
+        # Same size and timestamps on a new inode: only the stat checks the worker switches off can see it.
+        before, rewrite = (work / "delivered.txt").stat(), work / "rewrite.tmp"
+        rewrite.write_text("DELIVERY\n")
+        os.utime(rewrite, ns=(before.st_atime_ns, before.st_mtime_ns))
+        rewrite.replace(work / "delivered.txt")
+        _git(work, "config", "core.trustctime", "false")
+        _git(work, "config", "core.checkStat", "minimal")
+        # Hidden from a plain status; --no-optional-locks keeps that probe from refreshing the index.
+        assert "delivered.txt" not in _git(work, "--no-optional-locks", "status", "--porcelain")
+    record = {"worktree_base_sha": _git(work, "rev-parse", "HEAD")}
+    observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
+    # The snapshot reads only the repository's config with filters off, as main's did: a global attributes file
+    # is unseen there (attributes-file-global), and a filtered or globally converted edit is unseen too.
+    assert observed["worktree_dirty_on_exit"] is (case in {"untracked", "stat-hidden", "attributes-file-global"})
+    assert observed["worktree_untracked_only_on_exit"] is (case == "untracked")
+    changed, untracked = git._tree_changes(work)
+    assert changed == {"stat-hidden": [" M delivered.txt"], "global-conversion": [" M delivered.txt"],
+                       "filtered": [" M sample.txt"], "filtered-global": [" M sample.txt"]}.get(case, [])
+    if case == "stat-hidden":  # salvage stages the edit the reader reports, never HEAD's tree again
+        assert git._snapshot_tree(work, "probe") != _git(work, "rev-parse", "HEAD^{tree}")
+    assert sorted(untracked) == sorted(LINE_BREAK_NAMES if case == "untracked" else [])

@@ -524,6 +524,7 @@ def collect_merged_run_evidence(
     """Freshly validate one bound ledger against its actual merged execution."""
     repository = ledger["identity"]["repository"]
     pr_number = ledger["pr"]["number"]
+    workflow = lifecycle_observation.required_merge_workflow(repository)
     pull = _closeout_api(repo_root, Request("read-pull", repo=repository, number=pr_number))
     if not isinstance(pull.get("head"), dict) or pull["head"].get("sha") != observation["github"]["pr"].get("head_sha"):
         raise MergeCloseoutError("CLOSEOUT_PR_HEAD_MOVED")
@@ -534,8 +535,7 @@ def collect_merged_run_evidence(
         repo_root, Request("read-runs", repo=repository, start=pull.get("created_at"), end=pull.get("merged_at"),
                            sha=merge_sha, paginate=True, slurp=True), "workflow_runs",
     )
-    candidates = [run for run in runs if run.get("path") == ".github/workflows/ci.yml"
-                  and run.get("head_sha") == merge_sha]
+    candidates = [run for run in runs if run.get("path") == workflow and run.get("head_sha") == merge_sha]
     if not candidates:
         raise MergeCloseoutError("CLOSEOUT_MERGE_RUN_MISSING")
     # Never fall back to an older green execution when the latest is red.
