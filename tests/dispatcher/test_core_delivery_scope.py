@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
 from lu_machinery.dispatcher import git, worker
@@ -89,6 +90,12 @@ def test_delivery_snapshot_does_not_execute_worker_git_config(sandbox):
     ("pushed", "workspace-write", ["delivered"], "no_deliverable", "outside_owned_paths: delivered.txt"),
     ("pushed-nested", "workspace-write", ["src/"], "done", None),
     ("pushed-dirty", "workspace-write", [], "no_deliverable", "worktree_dirty_or_unknown"),
+    # Untracked output outside the scope is generated or unrelated state; inside it, or unscoped, it is task work.
+    ("pushed-scratch", "workspace-write", ["delivered.txt"], "done", None),
+    ("pushed-scratch", "workspace-write", ["delivered.txt", "leftover/"], "no_deliverable", "worktree_dirty_or_unknown"),
+    ("pushed-scratch", "workspace-write", [], "no_deliverable", "worktree_dirty_or_unknown"),
+    # A tracked edit stays task work outside the scope too: the worker may have been unable to commit it.
+    ("pushed-dirty-outside", "workspace-write", ["delivered.txt"], "no_deliverable", "worktree_dirty_or_unknown"),
     ("echo", "read-only", [], "done", None),
     ("dirty", "read-only", [], "done", None),
     ("pushed", "read-only", [], "done", None),
@@ -104,6 +111,16 @@ def test_settle_rejects_out_of_scope_or_unpublished_write_delivery(sandbox, mode
     assert record.get("no_deliverable_reason") == cause
     assert record["returncode"] == 0
     assert Path(record["result_file"]).read_text() == "literal final response"
+    if model == "pushed-scratch":
+        # Delivery verdicts never discard the leftover file: settlement removed the tree only after preserving it.
+        assert record["worktree_dirty_on_exit"] is True
+        assert record["worktree_unrelated_only_on_exit"] is (state == "done")
+        assert record["push_state"] == ("pushed" if state == "done" else "unpushed")
+        assert record["worktree_disposition"] == "removed"
+        archive = record["branch_holder_archive"]
+        assert archive["retention_disposition"] == "retrieved"
+        assert (sandbox.repo / archive["location"] / "leftover/notes.txt").read_text() == "leftover notes\n"
+        assert [entry["path"] for entry in archive["paths"]] == ["leftover/notes.txt"]
 
 
 def test_v2_record_without_owned_paths_remains_readable(sandbox):
@@ -124,6 +141,44 @@ def test_write_settle_without_ownership(delivery_settle, owned, model, cause):
     assert result["status"] == ("no_deliverable" if cause else "done")
     assert result["error"] == cause
     assert ("owned_paths" in result) is (owned is not None)
+
+
+@pytest.mark.parametrize(("leftover", "grants", "unrelated"), [
+    ("scratch/notes.txt", None, True),
+    ("ignored.log", None, False),  # ignored output is not uncommitted state at all
+    ("scratch/notes.txt", ["scratch"], False),  # a grant bound to this run widens the scope
+    ("scratch/notes.txt", "unbound", False),  # an unreadable scope owns every untracked file
+    ("nested/", None, False),  # a nested repository's files are not listed, so it may hold task work
+])
+def test_snapshot_separates_unrelated_untracked_state(tmp_path, leftover, grants, unrelated):
+    """Defect class: settlement failed a pushed delivery for scratch the task does not own (#524).
+
+    Untracked files outside the effective owned paths are generated or unrelated state; anything the
+    scope covers, or cannot be shown not to cover, stays uncommitted task work.
+    """
+    work = tmp_path / "work"
+    run_git(tmp_path, "init", "-q", "-b", "main", str(work))
+    for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
+        run_git(work, "config", key, value)
+    (work / ".gitignore").write_text("*.log\n")
+    (work / "delivered.txt").write_text("delivery\n")
+    run_git(work, "add", ".")
+    run_git(work, "commit", "-q", "-m", "delivery")
+    if leftover == "nested/":
+        run_git(work, "init", "-q", "nested")
+        (work / "nested" / "scratch.txt").write_text("nested\n")
+    else:
+        (work / leftover).parent.mkdir(exist_ok=True)
+        (work / leftover).write_text("left over\n")
+    record = {"task_id": "probe", "run_nonce": "nonce", "owned_paths": ["delivered.txt"],
+              "worktree_base_sha": run_git(work, "rev-parse", "HEAD")}
+    if grants is not None:
+        record["owned_path_grants"] = [{"task_id": "probe", "run_nonce": "other" if grants == "unbound" else "nonce",
+                                        "grant_id": "g1", "owned_paths": ["scratch"]}]
+    observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
+    assert observed["worktree_dirty_on_exit"] is (leftover != "ignored.log")
+    assert observed["worktree_untracked_only_on_exit"] is (leftover != "ignored.log")
+    assert observed["worktree_unrelated_only_on_exit"] is unrelated
 
 
 @pytest.mark.parametrize("model,status,error", [

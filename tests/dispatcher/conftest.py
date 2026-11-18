@@ -121,8 +121,8 @@ SOURCE = machinery_root().parent
 # The production catalog does not gain them.
 STUB_MODELS = (
     "echo", "blocked", "tree", "governed", "escape", "pushed", "unpushed", "dirty",
-    "pushed-dirty", "pushed-nested", "capacity", "capacity-dirty", "file", "crash",
-    "error", "empty", "fail", "cancel", "vendor/model",
+    "pushed-dirty", "pushed-nested", "pushed-scratch", "pushed-dirty-outside", "capacity", "capacity-dirty",
+    "file", "crash", "error", "empty", "fail", "cancel", "vendor/model",
     "requested-model-is-not-proof", "explicit-model", "stub", "approved-model",
     "unknown-model",
 )

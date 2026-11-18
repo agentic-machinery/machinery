@@ -33,7 +33,7 @@ from lu_machinery.common.repo_root import (
 )
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
 from lu_machinery.common.task_store_paths import tasks_dir
-from lu_machinery.dispatcher import site_deps
+from lu_machinery.dispatcher import ownership, site_deps
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.orchestration.execution_safe_git import GIT as EXECUTION_SAFE_GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as execution_safe_git
@@ -909,10 +909,19 @@ def _batch_blobs(local, oids: list[str]) -> list[bytes]:
 
 
 def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
+    """Observe the exited task's tree and branch: head, commits, uncommitted state and publication.
+
+    ``worktree_dirty_on_exit`` is any uncommitted state. ``worktree_unrelated_only_on_exit`` says that state
+    is only generated or unrelated: untracked files outside the task's effective owned paths. Their commit
+    would fail the ownership rule and settlement's removal preserves them, so they are not undelivered task
+    work. Every tracked change is task work, inside the scope or not (an edit outside it may be work the
+    worker could not commit), and so is any untracked file of an unscoped task or one whose scope is
+    unreadable, and an untracked directory (a nested repository, whose files Git does not list).
+    """
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
         push_state="unknown", push_state_reason="observation_failed", commits_ahead=None,
-        worktree_dirty_on_exit=None, worktree_untracked_only_on_exit=None,
+        worktree_dirty_on_exit=None, worktree_untracked_only_on_exit=None, worktree_unrelated_only_on_exit=None,
     )
     try:
         start_sha = record.get("worktree_start_sha", record["worktree_base_sha"])
@@ -922,15 +931,24 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
         )
         # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
-        # edit or new submodule commit is reported whatever the tree configures.
-        status = [line for line in local(["status", "--porcelain", "--ignore-submodules=none"]).stdout.splitlines()
-                  if line]
-        hidden = _hidden_tracked_changes(spec.worktree)
+        # edit or new submodule commit is reported whatever the tree configures. -z keeps names unquoted and
+        # --untracked-files=all lists each untracked file, so each can be matched against the owned paths.
+        status = [os.fsdecode(entry) for entry in execution_safe_git(
+            ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+            cwd=spec.worktree, capture_output=True, check=True, timeout=30).stdout.split(b"\0") if entry]
+        untracked = [entry[3:] for entry in status if entry.startswith("?? ")]
+        tracked = len(untracked) < len(status) or _hidden_tracked_changes(spec.worktree)
+        try:
+            owned = ownership.effective_scope(record)
+        except (TypeError, ValueError):
+            owned = []  # an unreadable scope owns everything
+        outside = set(ownership.outside_owned(untracked, owned)) if owned else set()
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
-        delivery.update(worktree_dirty_on_exit=bool(status) or hidden,
-                        worktree_untracked_only_on_exit=bool(status) and not hidden
-                        and all(line.startswith("?? ") for line in status))
+        delivery.update(worktree_dirty_on_exit=tracked or bool(untracked),
+                        worktree_untracked_only_on_exit=bool(untracked) and not tracked,
+                        worktree_unrelated_only_on_exit=bool(untracked) and not tracked and all(
+                            name in outside and not name.endswith("/") for name in untracked))
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -955,7 +973,7 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     # RecursionError: submodules nested past the interpreter's limit leave the tree unknown, never clean.
     except (OSError, ValueError, RecursionError, subprocess.SubprocessError, TaskScratchError):
         pass
-    if spec.mode != "read-only" and delivery["worktree_dirty_on_exit"]:
+    if spec.mode != "read-only" and delivery["worktree_dirty_on_exit"] and not delivery["worktree_unrelated_only_on_exit"]:
         delivery["push_state"] = "unpushed"
         delivery["push_state_reason"] = "dirty_worktree"
     return delivery

@@ -90,7 +90,8 @@ def main():
             prompt.with_suffix(".grandchild.tmp").replace(prompt.with_suffix(".grandchild"))
         while not prompt.with_suffix(".release").exists():
             time.sleep(0.02)
-    if model in {"pushed", "unpushed", "dirty", "pushed-dirty", "pushed-nested", "capacity-dirty"}:
+    if model in {"pushed", "unpushed", "dirty", "pushed-dirty", "pushed-nested", "capacity-dirty", "pushed-scratch",
+                 "pushed-dirty-outside"}:
         delivered = Path("src/delivered.txt" if model == "pushed-nested" else "delivered.txt")
         delivered.parent.mkdir(exist_ok=True)
         delivered.write_text("literal delivered value\n")
@@ -101,6 +102,12 @@ def main():
             subprocess.run(["git", "push", "origin", "HEAD"], check=True, stdout=subprocess.DEVNULL, timeout=30)
         if model == "pushed-dirty":
             delivered.write_text("uncommitted delivery\n")
+        if model == "pushed-scratch":  # generated output left untracked beside the delivery
+            Path("leftover").mkdir()
+            Path("leftover/notes.txt").write_text("leftover notes\n")
+        if model == "pushed-dirty-outside":  # an uncommitted edit to a tracked file outside the delivery
+            with Path("lu_machinery/__init__.py").open("a") as handle:
+                handle.write("# uncommitted edit\n")
     if model == "crash":
         os.kill(os.getpid(), signal.SIGKILL)
     text = sys.stdin.buffer.read().decode()

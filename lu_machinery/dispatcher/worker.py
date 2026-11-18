@@ -639,7 +639,8 @@ def _enforce_delivery(record: dict) -> None:
         except (OSError, ValueError, TypeError, IndexError, KeyError, TaskScratchError, subprocess.SubprocessError) as exc:
             cause = _verification_cause(exc)
     if cause is None:
-        if record.get("worktree_dirty_on_exit") is not False:
+        # Uncommitted task work, not generated or unrelated state outside the scope (git.snapshot_delivery).
+        if record.get("worktree_dirty_on_exit") is not False and record.get("worktree_unrelated_only_on_exit") is not True:
             cause = "worktree_dirty_or_unknown"
         elif not record.get("commits_ahead"):
             cause = "no_commits_or_unknown"
