@@ -2,8 +2,8 @@
 """PreToolUse guard — block unsafe `gh pr merge`, including `--admin`.
 
 Reads the Claude Code hook payload on stdin (JSON with `tool_input.command`) and exits
-2 (block) when the command is a `gh pr merge ...` whose target PR is a draft, has red
-checks, has checks still running, or arms `--auto` on a branch that enforces nothing.
+2 (block) when a CTO seat in safe mode tries to merge, or when a `gh pr merge ...`
+targets a draft, has red or pending checks, or arms `--auto` on an unprotected branch.
 
 Division of labor with guard-admin-merge.py: that hook checks whether `--admin`
 would bypass a blocking failure (#M-0.5). This hook applies the ordinary PR
@@ -144,6 +144,7 @@ try:
     from lu_machinery.common.repo_root import product_root
 
     product_root()
+    from lu_machinery import cto_safe_mode
     from lu_machinery.ci.advisory_checks import is_advisory as is_advisory
     from lu_machinery.common.github_client import _gh_api_call
     from lu_machinery.publish.merge_guard import (
@@ -1733,6 +1734,9 @@ def main() -> int:
     try:
         if not _may_merge(command):
             return 0
+        if refusal := cto_safe_mode.refusal("pr-merge", os.environ):
+            sys.stderr.write(f"{refusal}\n")
+            return 2
         segments = _judged_segments(command)
     except _SplitQuoting:
         sys.stderr.write(

@@ -666,8 +666,37 @@ def test_red_non_advisory_check_is_blocked(monkeypatch):
     assert _run(monkeypatch, "gh pr merge 5 --squash", checks=(["boundary-and-tests"], [])) == 2
 
 
-def test_green_is_allowed(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash --delete-branch") == 0
+@pytest.mark.parametrize(
+    "seat,safe_mode,expected",
+    [
+        pytest.param("cto", False, 0, id="cto-normal"),
+        pytest.param("cto", True, 2, id="cto-safe-mode"),
+        pytest.param("driver", True, 0, id="non-cto-safe-mode"),
+    ],
+)
+def test_green_is_allowed(monkeypatch, tmp_path, capsys, seat, safe_mode, expected):
+    """A green PR still needs permission to merge when the CTO seat is in safe mode."""
+    from lu_machinery import config
+
+    path = tmp_path / "safe-mode.json"
+    monkeypatch.setattr(config, "CTO_SAFE_MODE_FILE", str(path))
+    for name in ("SESSION_EPIC", "LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SESSION_SEAT", seat)
+    if safe_mode:
+        path.write_text(
+            json.dumps(
+                {"set_at": "2026-11-18T18:00:00Z", "reason": "test outage", "generation": 1, "outage_id": "out-test"}
+            ),
+            encoding="utf-8",
+        )
+
+    assert _run(monkeypatch, "gh pr merge 5 --squash --delete-branch") == expected
+    stderr = capsys.readouterr().err
+    if expected == 2:
+        assert stderr.startswith("CTO_SAFE_MODE: pr-merge refused for the CTO seat")
+    else:
+        assert stderr == ""
 
 
 def test_pending_without_auto_is_blocked(monkeypatch):
