@@ -2239,8 +2239,10 @@ def _withdraw_routing_authorization(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> object:
-    """Serve the last failure scan and refresh it off-loop, retaining snapshot age."""
+def _with_live_lane_errors(
+    payload: dict[str, Any], tasks_dir: Path, cache_key: str, observed: _RoutingBudgetGeneration,
+) -> dict[str, Any]:
+    """Serve this snapshot's failure scan and refresh it off-loop without renewing its age."""
     if not isinstance(payload, dict) or not isinstance(payload.get("agents"), dict):
         return payload
     # Only snapshots displaying a failure need a second read. Healthy warm
@@ -2255,18 +2257,23 @@ def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> 
 
     def _scan() -> LaneHealthScan:
         try:
-            return scan_lane_health(tasks_dir)
+            health = scan_lane_health(tasks_dir)
         except Exception as exc:
-            return LaneHealthScan(observed=False, error=f"lane health scan failed: {type(exc).__name__}")
+            health = LaneHealthScan(observed=False, error=f"lane health scan failed: {type(exc).__name__}")
+        if not isinstance(health, LaneHealthScan):
+            health = LaneHealthScan(observed=False, error="lane health scan returned an invalid result")
+        observed.lane_errors = health
+        return health
 
     # Error text can change in place without a directory-token change. Start
     # one off-loop scan without making a warm read wait for a worker.
     health_key = f"{cache_key}:lane-errors"
-    stored = cache_get_stored(health_key)
+    # A completed or late scan belongs only to the snapshot that started it.
+    # The shared scheduler key coalesces work, never supplies an older result.
+    health = observed.lane_errors
     schedule_cache_refresh(health_key, 0.0, _scan)
-    if stored is None:
+    if health is None:
         return payload
-    health = cast(LaneHealthScan, stored[0])
     agents = {}
     for lane, info in payload["agents"].items():
         if isinstance(info, dict) and isinstance(info.get("health"), dict):
@@ -2308,6 +2315,7 @@ class _RoutingBudgetGeneration:
     directory_token: str
     started_at: float
     invalidated: threading.Event = field(default_factory=threading.Event)
+    lane_errors: LaneHealthScan | None = None
 
 
 def _routing_budget_compute(
@@ -2495,7 +2503,7 @@ async def routing_budget(
     # Past the stale threshold it no longer authorizes a lane.
     stored = cache_get_stored(cache_key)
     if stored is not None:
-        (observed, value), age_s = stored
+        (observed, value), age_s = cast(tuple[tuple[_RoutingBudgetGeneration, dict[str, Any]], float], stored)
         if observed.directory_token != delegate_api._dir_token(tasks_dir):
             observed.invalidated.set()
 
@@ -2508,7 +2516,7 @@ async def routing_budget(
             return False
 
         schedule_cache_refresh(cache_key, ROUTING_BUDGET_TTL_S, _compute, should_refresh=_needs_refresh)
-        value = _with_live_lane_errors(value, tasks_dir, cache_key)
+        value = _with_live_lane_errors(value, tasks_dir, cache_key, observed)
         # Stat-only serving withholds changed bindings and schedules their
         # validation in the background. A warm read never waits for it.
         claude_fields = claude_account_routing_fields()

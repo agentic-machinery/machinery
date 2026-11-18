@@ -42,13 +42,27 @@ async def _saturated_executor():
 
 
 def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
-    """A cached failure must return while the pool and off-loop scan are blocked."""
+    """Warm scans cannot wait on the pool or overwrite a newer snapshot's errors."""
     scan_threads = []
+    scan_workers = []
+    refreshed = {"value": False}
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1000.0)
+
+    def agents():
+        if refreshed["value"]:
+            return {
+                "codex": {"health": {"healthy": True}},
+                "claude": {"health": {"healthy": False, "last_error": "new failure"}},
+            }
+        return {
+            "codex": {"health": {"healthy": False, "last_error": "previous failure"}},
+            "claude": {"health": {"healthy": True}},
+        }
 
     def compute(**kwargs):
         kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
         return {
-            "agents": {"codex": {"health": {"error": "previous scan failure"}}},
+            "agents": agents(),
             "diagnostics": {"data_age_s": 0, "stale": False, "stale_threshold_s": 900},
         }
 
@@ -63,10 +77,12 @@ def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
 
         def scan(_tasks_dir):
             scan_threads.append(threading.get_ident())
+            scan_workers.append(threading.current_thread())
+            records = {lane: info["health"] for lane, info in agents().items()}
             loop.call_soon_threadsafe(scan_started.set)
             try:
                 release_scan.wait()
-                return LaneHealthScan(observed=False, error="fixture scan failure")
+                return LaneHealthScan(observed=True, records=records)
             finally:
                 loop.call_soon_threadsafe(scan_done.set)
 
@@ -87,6 +103,55 @@ def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
             finally:
                 release_scan.set()
                 await asyncio.wait_for(scan_done.wait(), timeout=5)
+                await asyncio.to_thread(scan_workers[-1].join, 5)
+                assert not scan_workers[-1].is_alive()
+
+            # Read the completed scan on the same snapshot before replacing it.
+            scan_started.clear()
+            completed = await client.get("/api/state/routing-budget")
+            assert completed.json()["agents"]["codex"]["health"] == {
+                "healthy": False, "reason_code": "provider_error",
+            }
+            assert completed.json()["agents"]["claude"]["health"] == {"healthy": True}
+            await asyncio.wait_for(scan_started.wait(), timeout=5)
+            await asyncio.to_thread(scan_workers[-1].join, 5)
+            assert not scan_workers[-1].is_alive()
+
+            # Publish a newer routing snapshot with reversed lane health. The
+            # previous completed error scan remains in the shared TTL cache.
+            # The clock stays fixed, so timestamps cannot stand in for identity.
+            refreshed["value"] = True
+            ctx = app.state.ctx
+            newer_snapshot = await asyncio.to_thread(state_router._routing_budget_compute(ctx, "dispatch", False))
+            key = state_router._ctx_cache_key(ctx, "routing-budget", "dispatch", 0)
+            state_helpers.cache_set(key, newer_snapshot)
+            scan_started.clear()
+            scan_done.clear()
+            release_scan.clear()
+            try:
+                async with _saturated_executor() as blocked:
+                    newer = await asyncio.wait_for(client.get("/api/state/routing-budget"), timeout=5)
+                    assert newer.status_code == 200
+                    assert newer.json()["agents"]["codex"]["health"] == {"healthy": True}
+                    assert newer.json()["agents"]["claude"]["health"] == {
+                        "healthy": False, "reason_code": "provider_error",
+                    }
+                    assert not blocked.done()
+                    await asyncio.wait_for(scan_started.wait(), timeout=5)
+            finally:
+                release_scan.set()
+                await asyncio.wait_for(scan_done.wait(), timeout=5)
+                await asyncio.to_thread(scan_workers[-1].join, 5)
+                assert not scan_workers[-1].is_alive()
+            scan_started.clear()
+            completed = await client.get("/api/state/routing-budget")
+            assert completed.json()["agents"]["codex"]["health"] == {"healthy": True}
+            assert completed.json()["agents"]["claude"]["health"] == {
+                "healthy": False, "reason_code": "provider_error",
+            }
+            await asyncio.wait_for(scan_started.wait(), timeout=5)
+            await asyncio.to_thread(scan_workers[-1].join, 5)
+            assert not scan_workers[-1].is_alive()
         assert scan_threads, "live lane errors were never refreshed"
         assert loop_thread not in scan_threads, "warm lane-error scan blocked the event loop"
 
