@@ -268,6 +268,12 @@ def _task_owner(tasks_root: Path, name: str) -> tuple[str, dict[str, Any]] | Non
     return None
 
 
+def _released(record: dict[str, Any]) -> bool:
+    """A released terminal status; anything else, a malformed value included, is live."""
+    status = record.get("status")
+    return isinstance(status, str) and status in RELEASED_TASK_STATUSES
+
+
 def _settled_at(record: dict[str, Any]) -> float | None:
     """When a released task finished, or None: unknown time never releases its state."""
     value = record.get("finished_at")
@@ -404,7 +410,7 @@ def prune_settled_tasks(
                 continue
             owner, record = owned
             settled = _settled_at(record)
-            if record.get("status") not in RELEASED_TASK_STATUSES:
+            if not _released(record):
                 status = "live"
             elif _held_task(holds, record, owner, name):
                 status = "held"
@@ -436,7 +442,7 @@ def prune_settled_tasks(
             try:
                 with task_state_lock(task_record_path(tasks_root, owner)):
                     again = _task_owner(tasks_root, name)
-                    if (again is None or again[0] != owner or again[1].get("status") not in RELEASED_TASK_STATUSES
+                    if (again is None or again[0] != owner or not _released(again[1])
                             or _settled_at(again[1]) != settled or _held_task(holds, again[1], owner, name)):
                         raise ContainmentError("the owner record changed before removal")
                     info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)

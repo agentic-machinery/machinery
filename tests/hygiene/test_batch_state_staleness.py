@@ -168,7 +168,7 @@ def test_settled_task_state_is_pruned_keeping_records_results_and_handoffs(batch
     (tasks / "archive" / "moved.artifacts").mkdir()
     (tasks / "archive" / "moved.artifacts" / "kept").write_text("archive is never touched")
     task(tasks, "old.v2", status="running", settled_days=None)  # the longest record id owns old.v2.artifacts
-    task(tasks, "running", status="running", settled_days=None)
+    task(tasks, "running", status=["done"], settled_days=None)  # malformed status: never read as released
     task(tasks, "recent", settled_days=1)
     task(tasks, "undated", settled_days=None)
     task(tasks, "pinned", worktree_retention_hold=True)
