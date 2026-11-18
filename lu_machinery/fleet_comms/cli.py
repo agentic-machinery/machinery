@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -399,7 +400,7 @@ def cmd_broker_report(_args: argparse.Namespace) -> int:
     """Refuse the retired legacy Broker Ops report: its stores are removed (#515)."""
     sys.stderr.write(
         "fleet broker-report is retired: the legacy broker store and its telemetry are removed (#515); "
-        "use `fleet metrics` for the authority plane\n"
+        f"use `{shlex.quote(sys.executable)} -I -m {_PACKAGE} fleet metrics` for the authority plane\n"
     )
     return 2
 

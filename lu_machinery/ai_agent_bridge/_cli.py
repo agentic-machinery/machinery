@@ -52,7 +52,7 @@ RETIRED_VERBS = {
     "send": f"{_PUBLISH} --recipient <slot>",
     "post": _PUBLISH,
     "p": f"{_PUBLISH} --recipient <slot>",
-    "channel": f"{_FLEET} channel create|subscribe|context|publish",
+    "channel": f"{_FLEET} channel --help (subcommands: create, subscribe, context, publish)",
     "conversation": "GET /api/fleet/acp/conversations (metadata only)",
     "thread": "GET /api/runtime/acp/conversations/<conversation-id>/transcript (loopback only)",
     "process": _RECEIVE,
@@ -67,13 +67,13 @@ RETIRED_VERBS = {
     "reconcile": f"{_FLEET} backlog",
     "cleanup": f"{_FLEET} deliveries expire-stale (expiry sweep) or {_FLEET} dead-letters (inventory)",
     "status": f"{_FLEET} fleet status",
-    "converse": f"{_PY} -m {BRIDGE_ENTRY} ask-agy",
-    "interactive": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat>",
+    "converse": f"{_PY} -m {BRIDGE_ENTRY} ask-agy <message>",
+    "interactive": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat> <message>",
 }
 # Verbs kept for Fleet request jobs that once also took a legacy integer message id.
 _JOB_ID_VERBS = {
     "read": RETIRED_VERBS["inbox"],
-    "process-ask": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat>",
+    "process-ask": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat> <message>",
 }
 
 

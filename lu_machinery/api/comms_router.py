@@ -331,23 +331,34 @@ def comms_inbox(
     The cheap cold-start "do I have work waiting" check (GH #1309), read from
     the authority plane (``pending_delivery_snapshot``). ``probe`` is ``ok``
     only when the plane was read; otherwise ``count`` is null (unknown, never
-    zero). Read the deliveries with
-    ``<python> -I -m lu_machinery.fleet_comms deliveries receive``.
+    zero). Read the deliveries with ``<python> -I -m lu_machinery.fleet_comms
+    deliveries receive --recipient <seat> --worker-id <seat>``.
     """
     from lu_machinery.fleet_comms.authority import (  # noqa: PLC0415 — authority stack on demand
+        DURABLE_CTO_RECIPIENT,
         _load_roster,
         pending_delivery_snapshot,
     )
+    from lu_machinery.orchestration.handoff_slot_registry import (  # noqa: PLC0415 — roster on demand
+        is_registered_slot,
+        registry_readable,
+    )
 
-    # Only a roster seat is queried, by the roster's own spelling: a request value
-    # never reaches the store lookups (task records, plane paths). Others are unknown.
-    # An unreadable roster (a registry symlink loop raises RuntimeError on 3.12) is
-    # unknown too, never a 500.
+    # Only a seat is queried: the CTO's durable recipient or a registered handoff
+    # slot, by the roster's own spelling, so a request value never reaches the store
+    # lookups (task records, plane paths). The delivery roster also admits external
+    # recipients (outside the launcher fleet); they, and every other name, are
+    # unknown. An unreadable roster or registry (a registry symlink loop raises
+    # RuntimeError on 3.12) is unknown too, never a 500.
     try:
         roster, _complete = _load_roster()
+        seat = next((name for name in sorted(roster) if name == agent), None)
+        if seat is not None and seat != DURABLE_CTO_RECIPIENT and not (
+            registry_readable() and is_registered_slot(seat)
+        ):
+            seat = None
     except (MachineryConfigError, OSError, RuntimeError, ValueError):
-        roster = frozenset()
-    seat = next((name for name in sorted(roster) if name == agent), None)
+        seat = None
     snapshot: dict = {"probe": "unknown"}
     if seat is not None:
         try:
