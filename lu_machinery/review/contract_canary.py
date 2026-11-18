@@ -500,8 +500,8 @@ def run(args: argparse.Namespace) -> int:
         wheelhouse,
     )
     # Force a full score even if this head's changed files do not touch the contract.
-    # Isolated host imports select the installed gate used by the keeper, not the candidate.
-    check = [str(interpreter), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
+    # The sealed candidate supplies the gate and catalog that will be installed together.
+    check = [str(work / "consumer/bin/python"), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
