@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import get_args
 
+from lu_machinery import cto_safe_mode
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.dispatcher import (
     admission,
@@ -377,7 +378,12 @@ def _dispatch(args) -> int:
         rules_core.require_core()
     except rules_core.RulesCoreMissing as exc:
         raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
-    agent = ALIASES.get(args.agent, args.agent)
+    # A CTO seat in safe mode starts no new write work; read-only diagnosis still runs (cto_safe_mode).
+    if args.mode != "read-only" and (
+        refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
+    ):
+        raise host_admission.Refused(f"❌ {refusal}", 2)
+    agent =ALIASES.get(args.agent, args.agent)
     if agent == "agy":
         # The requested Claude id is the catalog's AGY wire id, not the bare catalog id.
         from lu_machinery.dispatcher.providers.agy import transport_model

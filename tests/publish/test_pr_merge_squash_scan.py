@@ -140,6 +140,59 @@ def test_already_queued_head_does_not_enqueue_twice(queue_publisher):
     assert writes == []
 
 
+
+def _cto_safe_mode(monkeypatch, tmp_path, body):
+    """This process is the CTO seat; the safe-mode file holds ``body`` (``None``: absent)."""
+    from lu_machinery import config
+
+    path = tmp_path / "cto-seat" / "safe-mode.json"
+    monkeypatch.setattr(config, "CTO_SAFE_MODE_FILE", str(path))
+    for name in ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER", "SESSION_EPIC"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    if body is not None:
+        path.parent.mkdir()
+        path.write_text(body)
+    return path
+
+
+_SAFE_MODE = json.dumps({"set_at": "2026-11-18T18:00:00Z", "reason": "two fast deaths", "generation": 3,
+                         "outage_id": "out-7"})
+
+
+@pytest.mark.parametrize("body,reason", [(_SAFE_MODE, "CTO_SAFE_MODE: pr-merge refused"),
+                                         ('{"reason": 1}', "CTO_SAFE_MODE_UNREADABLE: pr-merge refused")],
+                         ids=["present", "malformed"])
+def test_cto_safe_mode_refuses_cto_pr_merge_before_any_read(queue_publisher, monkeypatch, tmp_path, capsys,
+                                                            body, reason):
+    """Defect class: the CTO seat lands a PR while in safe mode, or while its safe-mode state is unreadable."""
+    _cto_safe_mode(monkeypatch, tmp_path, body)
+    calls = []
+    assert publisher.main(["pr-merge", "--repo", "unit/public", "--number", "1", "--match-head", HEAD],
+                          runner=lambda args, **_kwargs: calls.append(args)) == 2
+    assert reason in capsys.readouterr().err
+    assert calls == []
+
+
+def test_cto_pr_merge_enqueues_without_a_safe_mode_file(queue_publisher, monkeypatch, tmp_path):
+    """Defect class: the safe-mode check blocks CTO landing when the seat is healthy."""
+    _cto_safe_mode(monkeypatch, tmp_path, None)
+    writes = []
+    assert publisher.main(["pr-merge", "--repo", "unit/public", "--number", "1", "--match-head", HEAD],
+                          runner=enqueue_transport(writes)) == 0
+    assert "enqueuePullRequest" in writes[0]["query"]
+
+
+def test_cto_safe_mode_leaves_worker_landing_alone(queue_publisher, monkeypatch, tmp_path):
+    """Defect class: safe mode stops a dispatched worker from landing its own PR."""
+    _cto_safe_mode(monkeypatch, tmp_path, _SAFE_MODE)
+    monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-task")
+    writes = []
+    assert publisher.main(["pr-merge", "--repo", "unit/public", "--number", "1", "--match-head", HEAD],
+                          runner=enqueue_transport(writes)) == 0
+    assert "enqueuePullRequest" in writes[0]["query"]
+
+
 @pytest.mark.parametrize("recorder", [True, False])
 def test_head_without_a_recorded_verdict_is_refused_only_where_the_recorder_is_used(
     monkeypatch, low_review, recorder,
