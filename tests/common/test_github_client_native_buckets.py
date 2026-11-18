@@ -161,6 +161,21 @@ def test_jq_on_a_non_json_200_body_is_a_typed_refusal_not_a_traceback(tmp_path):
     assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
 
 
+def test_jq_timeout_is_a_typed_refusal(tmp_path, monkeypatch):
+    """Class: a jq that outlives its timeout raised TimeoutExpired out of ``run`` instead of a typed result."""
+
+    def transport(method, endpoint, headers, body, timeout):
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"{}")
+
+    def hang(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    monkeypatch.setattr(gh.subprocess, "run", hang)
+    result = gh.run(["gh", "api", "repos/o/r/x", "--jq", ".x"], client=store, capture_output=True, check=False)
+    assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
+
+
 def test_jq_reads_a_raw_json_body_as_input(tmp_path):
     def transport(method, endpoint, headers, body, timeout):
         return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b'{"x": "v"}')
