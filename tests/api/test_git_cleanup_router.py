@@ -233,7 +233,9 @@ def test_git_cleanup_reuses_cherry_answers_until_a_tip_moves(tmp_path: Path, mon
 
 def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, monkeypatch) -> None:
     """Defect class: the cherry-free branch decision answers differently from ``git cherry``
-    (a branch reported merged that is not, or the reverse), or decides a branch it cannot judge."""
+    (a branch reported merged that is not, or the reverse), or decides a branch it cannot judge;
+    or git output that is not UTF-8 (a path, branch name, committer name or worktree path) makes the
+    report fail (HTTP 500) or drop the entry instead of naming its bytes."""
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
@@ -310,6 +312,33 @@ def test_merged_decision_matches_git_cherry_for_every_branch(tmp_path: Path, mon
     assert answers() == {**expected, "unrelated": False}
     keys = [(b["name"], b["_full_sha"]) for b in git_hygiene_router._list_local_branches(repo)]
     assert git_hygiene_router._decide_without_cherry(keys, main, repo) == {}
+
+    # Output that is not UTF-8 (a branch name, a committer name, a dispatch worktree path), with a
+    # committer name that holds U+2028, which ``str.splitlines`` would split on. ``main`` moves
+    # to a commit whose committer is latin-1, so the branch at it is merged, and a clean worktree
+    # sits at a latin-1 path. The report must name each by its bytes, over HTTP too.
+    tree = _git(repo, "rev-parse", "main^{tree}").strip()
+    commit = (
+        f"tree {tree}\nparent {main}\nauthor T <a@example.invalid> 1700000000 +0000\n"
+        "committer Jos\udce9\u2028K <a@example.invalid> 1700000000 +0000\n\nlatin-1 committer\n"
+    ).encode("utf-8", "surrogateescape")
+    sha = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"], cwd=repo, input=commit,
+        capture_output=True, check=True, timeout=30).stdout.decode().strip()
+    _git(repo, "update-ref", "refs/heads/main", sha)
+    subprocess.run(["git", "update-ref", b"refs/heads/br\xe9", sha], cwd=repo, check=True, timeout=30)
+    worktree = os.fsencode(repo) + b"/.worktrees/dispatch/codex/wt\xe9"
+    subprocess.run(["git", "worktree", "add", worktree, "in-main"], cwd=repo, check=True, capture_output=True, timeout=30)
+    monkeypatch.setattr(app.state, "ctx", app.state.ctx.with_roots(live_repo_root=repo, project_root=repo))
+    report = git_hygiene_router.compute_git_cleanup(repo)
+    response = TestClient(app).get("/api/git/cleanup")
+    assert response.status_code == 200
+    assert response.json()["stale_branches"] == [
+        branch.model_dump(mode="json") for branch in report.stale_branches]
+    stale = {branch.name: branch for branch in report.stale_branches}
+    assert stale["br\\xe9"].committer == "Jos\\xe9\u2028K"
+    assert [item.path for item in report.removable_worktrees] == [".worktrees/dispatch/codex/wt\\xe9"]
+    assert [item["path"] for item in response.json()["removable_worktrees"]] == [".worktrees/dispatch/codex/wt\\xe9"]
 
 
 def _graphql_result(monkeypatch, returncode: int, stdout: str) -> None:
