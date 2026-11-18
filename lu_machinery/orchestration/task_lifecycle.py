@@ -193,8 +193,9 @@ def stream_epic_url(repository: str, number: int) -> str:
 def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -> bool:
     url = identity["stream_epic_url"]
     if url is None:
-        return identity["repository"].casefold() == epic_repository.casefold()
-    return url.casefold() == stream_epic_url(epic_repository, identity["stream_epic"]).casefold()
+        repository = identity["repository"]
+        return repository_identity_valid(repository) and repository.casefold() == epic_repository.casefold()
+    return isinstance(url, str) and url.casefold() == stream_epic_url(epic_repository, identity["stream_epic"]).casefold()
 
 
 def stream_registry_repository(repository: str) -> str:
@@ -424,8 +425,8 @@ def resolve_live_ancestry(
                 "valid": True, "method": "native_chain", "epic": stream_epic,
                 "generated_at": None, "digest": None, "reason": None,
             }
-        if parent_repo != local_repo:
-            return _membership_refusal("live ancestry crosses a repository boundary at an unregistered parent")
+        if parent_repo != local_repo or local_repo != epic_repo:
+            return _membership_refusal("live ancestry crosses a repository boundary without a direct registered parent")
         visited.add(number)
         current = number
     return _membership_refusal("live ancestry exceeds the maximum sub-issue depth")
@@ -523,7 +524,7 @@ def resolve_membership(
                 ),
             }
         if parent_repo != local_repo or local_repo != epic_repo:
-            return _membership_refusal("native ancestry crosses a repository boundary at an unregistered parent")
+            return _membership_refusal("native ancestry crosses a repository boundary without a direct registered parent")
         return _resolve_native_chain(
             repository=repository,
             issue_number=issue_number,

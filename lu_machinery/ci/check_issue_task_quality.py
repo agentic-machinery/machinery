@@ -398,13 +398,15 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
             return section("root_exempt")
         parents: dict = {}
         current = number
+        crosses_repository = False
         for _ in range(audit._MAX_SUBISSUE_DEPTH):
             progress.stage = f"parent_{current}"
             parent = read_parent(repository, current)
             parents[current] = parent
+            crosses_repository = parent is not None and parent["repository"].casefold() != repository.casefold()
             if (
                 parent is None
-                or parent.get("repository", "").casefold() != repository.casefold()
+                or crosses_repository
                 or (local_registry and parent.get("number") in roots)
                 or parent.get("number") in parents
             ):
@@ -412,6 +414,8 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
             if type(parent.get("number")) is not int:
                 raise ValueError("malformed parent")
             current = parent["number"]
+        if not local_registry and not crosses_repository:
+            return section("membership_not_applicable")
         report = None
         if audit_orphans and local_registry and parents.get(number) is None:
             progress.stage = "cached_audit_validation"

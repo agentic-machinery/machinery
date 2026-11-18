@@ -1446,6 +1446,15 @@ def test_cmd_init_accepts_native_membership_without_a_live_audit(
     })
     verdict = check_issue_task_quality.observe_membership({}, "org/repo", 42)
     assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+    monkeypatch.setattr(check_issue_task_quality, "read_parent", lambda repo, number: (
+        {"number": 30, "repository": repo} if number == 42 else {"number": 10, "repository": epic_repo}
+    ))
+    verdict = check_issue_task_quality.observe_membership({}, "org/repo", 42)
+    assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+    monkeypatch.setattr(check_issue_task_quality, "read_parent", lambda repo, number: None)
+    assert check_issue_task_quality.observe_membership({}, "org/repo", 42) == {
+        "status": "membership_not_applicable", "errors": [],
+    }
 
 
 def test_cmd_init_rejects_wrong_native_parent_without_a_live_audit(
