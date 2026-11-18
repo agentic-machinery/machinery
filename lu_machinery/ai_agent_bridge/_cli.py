@@ -6,6 +6,8 @@ import logging
 import os
 import subprocess
 import sys
+from collections.abc import Callable
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -187,162 +189,76 @@ def _dispatch_interactive(action: str, parts: list[str]):
         print("Unknown command or missing arguments.")
 
 
-def process_all_gemini(model: str | None = None):
-    """Process ALL unread messages for the Gemini seat (routed to AGY via ACP).
-
-    Each message is routed through its recipient seat's registered ACP
-    participant (#6915); a message is consumed only when the routed seat
-    replies successfully, so failures stay in the inbox for retry.
-    """
+def _process_all_unread(recipient: str, label: str, process_one: Callable[[int], bool]) -> None:
+    """Drain the recipient's historical queue in message order."""
     from ._messaging import require_legacy_message_writes
 
     require_legacy_message_writes()
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT id, task_id, from_llm, message_type, substr(content, 1, 50), to_llm, data
-        FROM messages
-        WHERE to_llm = 'gemini' AND acknowledged = 0
-        ORDER BY id ASC
-    """)
-
-    rows = cursor.fetchall()
-    conn.close()
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, from_llm, substr(content, 1, 50), to_llm, data
+            FROM messages
+            WHERE to_llm = ? AND acknowledged = 0
+            ORDER BY id ASC
+            """,
+            (recipient,),
+        ).fetchall()
 
     if not rows:
-        print("📭 No unread messages for Gemini to process")
+        print(f"📭 No unread messages for {label} to process")
         return
 
-    print(f"📬 Processing {len(rows)} unread message(s) for Gemini...\n")
-
+    qualifier = " (headless)" if recipient == "claude" else ""
+    print(f"📬 Processing {len(rows)} unread message(s) for {label}{qualifier}...\n")
     success = 0
     failed = 0
     skipped = 0
 
-    for row in rows:
-        msg_id, _task_id, from_llm, _msg_type, preview, to_llm, data = row
+    for message_id, from_llm, preview, to_llm, data in rows:
         preview = preview.replace("\n", " ")[:40]
-        print(f"━━━ Processing [{msg_id}] from {from_llm}: {preview}...")
-        if skip_stored_kimi_row({"to": to_llm, "data": data}, msg_id):
+        print(f"━━━ Processing [{message_id}] from {from_llm}: {preview}...")
+        if skip_stored_kimi_row({"to": to_llm, "data": data}, message_id):
             skipped += 1
             continue
 
         try:
-            if process_message_for_recipient(msg_id, model=model):
+            if process_one(message_id):
                 success += 1
                 print("    ✅ Done\n")
             else:
                 failed += 1
                 print("    ❌ Failed (message left unconsumed)\n")
-        except Exception as e:
+        except Exception as exc:
             failed += 1
-            print(f"    ❌ Failed: {e}\n")
+            print(f"    ❌ Failed: {exc}\n")
 
     print(f"\n{'═' * 50}")
     print(f"📊 Results: {success} succeeded, {failed} failed, {skipped} skipped out of {len(rows)} total")
 
 
-def process_all_claude(new_session: bool = False):
-    """Process ALL unread messages for Claude in batch (headless)."""
-    from ._messaging import require_legacy_message_writes
-
-    require_legacy_message_writes()
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT id, task_id, from_llm, message_type, substr(content, 1, 50), to_llm, data
-        FROM messages
-        WHERE to_llm = 'claude' AND acknowledged = 0
-        ORDER BY id ASC
-    """)
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("📭 No unread messages for Claude to process")
-        return
-
-    print(f"📬 Processing {len(rows)} unread message(s) for Claude (headless)...\n")
-
-    success = 0
-    failed = 0
-    skipped = 0
-
-    for row in rows:
-        msg_id, _task_id, from_llm, _msg_type, preview, to_llm, data = row
-        preview = preview.replace("\n", " ")[:40]
-        print(f"━━━ Processing [{msg_id}] from {from_llm}: {preview}...")
-        if skip_stored_kimi_row({"to": to_llm, "data": data}, msg_id):
-            skipped += 1
-            continue
-
-        try:
-            if _process_target(msg_id, "claude", {"new_session": new_session}) is False:
-                failed += 1
-                print("    ❌ Failed (message left unconsumed)\n")
-                continue
-            success += 1
-            print("    ✅ Done\n")
-        except Exception as e:
-            failed += 1
-            print(f"    ❌ Failed: {e}\n")
-
-    print(f"\n{'═' * 50}")
-    print(f"📊 Results: {success} succeeded, {failed} failed, {skipped} skipped out of {len(rows)} total")
+def process_all_gemini(model: str | None = None) -> None:
+    """Drain unread Gemini messages through its recipient-derived ACP route."""
+    _process_all_unread(
+        "gemini", "Gemini",
+        lambda message_id: bool(process_message_for_recipient(message_id, model=model)),
+    )
 
 
-def process_all_codex(new_session: bool = False):
-    """Process ALL unread messages for Codex in batch (ordinary rows via ACP)."""
-    from ._messaging import require_legacy_message_writes
+def process_all_claude(new_session: bool = False) -> None:
+    """Drain unread Claude messages through ACP."""
+    _process_all_unread(
+        "claude", "Claude",
+        lambda message_id: _process_target(message_id, "claude", {"new_session": new_session}) is not False,
+    )
 
-    require_legacy_message_writes()
-    conn = get_db()
-    cursor = conn.cursor()
 
-    cursor.execute("""
-        SELECT id, task_id, from_llm, message_type, substr(content, 1, 50), to_llm, data
-        FROM messages
-        WHERE to_llm = 'codex' AND acknowledged = 0
-        ORDER BY id ASC
-    """)
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        print("📭 No unread messages for Codex to process")
-        return
-
-    print(f"📬 Processing {len(rows)} unread message(s) for Codex...\n")
-
-    success = 0
-    failed = 0
-    skipped = 0
-
-    for row in rows:
-        msg_id, _task_id, from_llm, _msg_type, preview, to_llm, data = row
-        preview = preview.replace("\n", " ")[:40]
-        print(f"━━━ Processing [{msg_id}] from {from_llm}: {preview}...")
-        if skip_stored_kimi_row({"to": to_llm, "data": data}, msg_id):
-            skipped += 1
-            continue
-
-        try:
-            if _process_target(msg_id, "codex", {"new_session": new_session}) is False:
-                failed += 1
-                print("    ❌ Failed (message left unconsumed)\n")
-                continue
-            success += 1
-            print("    ✅ Done\n")
-        except Exception as e:
-            failed += 1
-            print(f"    ❌ Failed: {e}\n")
-
-    print(f"\n{'═' * 50}")
-    print(f"📊 Results: {success} succeeded, {failed} failed, {skipped} skipped out of {len(rows)} total")
+def process_all_codex(new_session: bool = False) -> None:
+    """Drain unread Codex messages through ACP."""
+    _process_all_unread(
+        "codex", "Codex",
+        lambda message_id: _process_target(message_id, "codex", {"new_session": new_session}) is not False,
+    )
 
 
 def _parse_usage_window(window: str) -> int:
@@ -1273,30 +1189,6 @@ def _build_parser() -> argparse.ArgumentParser:
     slot_holder_parser.add_argument("slot", help="Slot name (e.g. claude-atlas, grok-infra)")
     slot_holder_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
 
-    # serve
-    serve_parser = subparsers.add_parser("serve", help="Serve local HTTP bridge surfaces")
-    serve_parser.add_argument(
-        "--openai",
-        action="store_true",
-        help="Serve the OpenAI-compatible proxy",
-    )
-    serve_parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Host for --openai (default: 127.0.0.1)",
-    )
-    serve_parser.add_argument(
-        "--port",
-        type=int,
-        default=8767,
-        help="Port for --openai (default: 8767)",
-    )
-    serve_parser.add_argument(
-        "--allow-remote",
-        action="store_true",
-        help="Allow binding to non-localhost (unsafe: no auth)",
-    )
-
     # interactive
     subparsers.add_parser("interactive", help="Interactive mode")
 
@@ -1405,22 +1297,7 @@ def _dispatch_command(args):
 
         if _legacy_writes_retired():
             raise SystemExit(_retired_legacy_write(args.command))
-    if args.command == "serve":
-        if not args.openai:
-            raise SystemExit("serve currently requires --openai")
-
-        if args.host != "127.0.0.1" and not args.allow_remote:
-            raise SystemExit(
-                "refusing to bind to non-localhost host without --allow-remote. "
-                "the proxy has no auth and exposes 4 agent CLIs to anyone on the network."
-            )
-
-        import uvicorn
-
-        from .openai_proxy import app
-
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    elif args.command == "inbox":
+    if args.command == "inbox":
         if getattr(args, "inbox_command", None):
             from ._channels_cli import dispatch_channel_command
 
@@ -1535,14 +1412,6 @@ def _dispatch_command(args):
             run_delivery_expiry_cleanup(dry_run=args.dry_run)
     elif args.command == "status":
         bridge_status()
-    elif args.command == "serve":
-        if not args.openai:
-            raise SystemExit("serve currently requires --openai")
-        import uvicorn
-
-        from .openai_proxy import app
-
-        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     elif args.command == "interactive":
         interactive_mode()
     elif args.command == "send-codex-ui":
@@ -1816,11 +1685,13 @@ def _handle_acp_compat(args, target: str) -> None:
     if not review and (subject_seats or subject_families):
         raise SystemExit("--subject-seat/--subject-family require review intent (--review, --type review, --pr or --branch)")
 
-    from ._agy import is_gemini_family_model
+    from ._gemini_review import (
+        gemini_pr_or_branch_content_error,
+        gemini_review_profile_error,
+        gemini_review_targets_model,
+    )
 
-    if review and (target in {"agy", "gemini"} or is_gemini_family_model(model)):
-        from ._agy import gemini_pr_or_branch_content_error, gemini_review_profile_error
-
+    if review and gemini_review_targets_model(agent=target, model=model):
         profile_error = gemini_review_profile_error(getattr(args, "review_profile", None))
         if profile_error is not None:
             raise SystemExit(profile_error)

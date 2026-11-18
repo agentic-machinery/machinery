@@ -58,13 +58,6 @@
       "occurrence": 0
     },
     {
-      "path": "tests/ai_agent_bridge/test_openai_proxy_healthz.py",
-      "kind": "sleep",
-      "scope": "_make_probes._make._probe",
-      "fingerprint": "547a641a5bbd6b09d4ca944f655ab52f10b54c975d33099b13a40f07865b4f4b",
-      "occurrence": 0
-    },
-    {
       "path": "tests/api/test_account_logins.py",
       "kind": "timer-poll",
       "scope": "test_incomplete_probe_is_unknown_and_leaves_no_process_or_reader",

@@ -595,11 +595,6 @@
    "sha256": "395136be6978424919a600588b723950391450923ca428786cdf027d82d5f6cd"
   },
   {
-   "path": "lu_machinery/ai_agent_bridge/openai_proxy.py",
-   "rule": "python.lang.correctness.tempfile.tempfile-without-flush",
-   "sha256": "395136be6978424919a600588b723950391450923ca428786cdf027d82d5f6cd"
-  },
-  {
    "path": "lu_machinery/fleet/ignored_task_output.py",
    "rule": "python.lang.correctness.tempfile.tempfile-without-flush",
    "sha256": "1bebbfd84cb30aa1ada66e881a60e39e885801fed60e1d118538b1082794687f"
@@ -1233,11 +1228,6 @@
    "path": "lu_machinery/ai_agent_bridge/_ui_agy.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "f1611e43d96cf8a98e9e43fda1e518bc5a6620cf7c8cc263a365ee91ad2ffb7c"
-  },
-  {
-   "path": "lu_machinery/ai_agent_bridge/openai_proxy.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "7db15016143f8a06e4e3dc2372d54cb23eadf9084f3a5cc821c09b6b73f8cb74"
   },
   {
    "path": "lu_machinery/api/claude_account_usage.py",

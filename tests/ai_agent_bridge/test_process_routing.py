@@ -432,28 +432,6 @@ def test_legacy_gemini_error_handler_never_acks(bridge_db):
     assert _replies(message_id)[0][2] == "error"
 
 
-def test_agy_error_handler_never_acks(bridge_db):
-    """Mutation check: removing the no-ack guard turns this red."""
-    from lu_machinery.ai_agent_bridge import _agy
-
-    message_id = _send("agy")
-    msg = {
-        "id": message_id,
-        "task_id": "task-6915",
-        "from": "qa-engineer",
-        "to": "agy",
-        "type": "advisory",
-        "content": "x",
-        "data": None,
-    }
-    _agy._handle_agy_error(msg, message_id, "boom")
-
-    acked, status = _row(message_id)
-    assert acked == 0, "agy error handler consumed a failed message"
-    assert status.startswith("failed:")
-    assert _replies(message_id)[0][2] == "error"
-
-
 def test_opencode_incomplete_turn_never_acks(bridge_db, tmp_path, monkeypatch):
     """Long attachment paths survive redaction and timeout without consuming legacy mail."""
     import json
@@ -514,14 +492,10 @@ def test_process_all_gemini_counts_failures_without_consuming(bridge_db, monkeyp
 def forbid_legacy_processors(monkeypatch):
     from unittest.mock import Mock
 
-    for module, name in [
-        ("_agy", "process_for_agy"),
-        ("_opencode", "process_for_opencode"),
-    ]:
-        monkeypatch.setattr(
-            f"lu_machinery.ai_agent_bridge.{module}.{name}",
-            Mock(side_effect=AssertionError("ordinary ask reached legacy provider processor")),
-        )
+    monkeypatch.setattr(
+        "lu_machinery.ai_agent_bridge._opencode.process_for_opencode",
+        Mock(side_effect=AssertionError("ordinary ask reached the OpenCode worker")),
+    )
 
 
 @pytest.mark.parametrize(
@@ -619,7 +593,7 @@ def test_detached_ordinary_worker_uses_acp_without_provider_fallback(
     assert _replies(message_id)[0][2] == "error"
 
 
-@pytest.mark.parametrize("target", ["claude", "codex", "grok", "grok-build", "cursor"])
+@pytest.mark.parametrize("target", ["claude", "codex", "agy", "grok", "grok-build", "cursor"])
 @pytest.mark.parametrize("review_intent", ["flag", "type", "target"])
 def test_removed_seat_review_is_unsupported_and_stays_out_of_acp(bridge_db, monkeypatch, target, review_intent):
     from unittest.mock import Mock
@@ -677,7 +651,10 @@ def test_batch_ordinary_drains_use_acp_and_report_failures(
     batch()
     acp.assert_called_once()
     assert _row(message_id)[0] == 0
-    assert "0 succeeded, 1 failed" in capsys.readouterr().out
+    label = {"claude": "Claude (headless)", "codex": "Codex"}[target]
+    output = capsys.readouterr().out
+    assert f"Processing 1 unread message(s) for {label}..." in output
+    assert "0 succeeded, 1 failed" in output
 
 
 def test_ordinary_process_failure_is_nonzero(bridge_db, monkeypatch):

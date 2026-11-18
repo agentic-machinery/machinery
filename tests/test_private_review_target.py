@@ -9,13 +9,13 @@ from pathlib import Path
 
 import pytest
 
-
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import main_checkout_root
 from lu_machinery.orchestration import fleet_repos
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.review import target_resolution
 from tests.agent_runtime.test_review_closeout_cli import _run_cli
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 # Fallbacks let this module collect on a tree that does not have the fix yet.
 PRIVATE_REVIEW_TARGET_UNRESOLVED = getattr(
@@ -473,7 +473,7 @@ def test_missing_or_unparsable_origin_is_not_kept(review_repositories, tmp_path)
 
 
 def test_same_repo_pr_head_pins_catalog_repository(tmp_path, monkeypatch):
-    from lu_machinery.ai_agent_bridge import _agy
+    from lu_machinery.ai_agent_bridge import _gemini_review
 
     repo = tmp_path / "public"
     catalog = load_fleet_repos()["public"].github
@@ -485,8 +485,8 @@ def test_same_repo_pr_head_pins_catalog_repository(tmp_path, monkeypatch):
         seen["args"] = args
         return json.dumps({"headRefName": "review", "headRefOid": sha, "isCrossRepository": False})
 
-    monkeypatch.setattr(_agy, "_run_changed_path_command", capture)
-    branch, resolved = _agy.resolve_same_repo_pr_head(9, repo_root=str(repo))
+    monkeypatch.setattr(_gemini_review, "_run_changed_path_command", capture)
+    branch, resolved = _gemini_review.resolve_same_repo_pr_head(9, repo_root=str(repo))
     assert branch == "review"
     assert resolved == sha
     assert seen["args"][seen["args"].index("--repo") + 1] == catalog
@@ -576,7 +576,5 @@ def test_repository_target_error_hides_unavailable_root_oserror():
     _assert_neutral_private_refusal(error)
     assert "absent-root" not in error
 
-
-from tests.helpers.product_tree import configured_roots  # noqa: E402, F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

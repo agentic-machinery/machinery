@@ -172,11 +172,6 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "bea382265465ea02401846d25d95ec489f7027dea9f66e84c2b577b74cc0fcee:1",
     ),
     (
-        _mp("ai_agent_bridge/_agy.py"),
-        "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
-        "aa58c8f3fac55b6716c1f17725ea574b98c1740d94fd59e3e0e472a6c32cfdd8:1 eb8a73e39f847acdd103c7e40afa373eea3483b0cd5261a32d9556d4e199134c:1",
-    ),
-    (
         _mp("ai_agent_bridge/_job_host_forward.py"),
         "Remote context; existing exit/signal cleanup traps own these files.",
         "66f0b828ce73cfa521a936ddc20086f876b0339568006cb5c280cad2c7d909df:1 bd9d67583ba97d091f3b3ae74e469afcda27b7119795018bc4f0b456c76a8d6d:1",
@@ -205,11 +200,6 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         _mp("ai_agent_bridge/_ui_codex.py"),
         "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
         "2f0039b6f6f39973b850edc9ae3e5d44e97e867b3100e389e38c31b38ec09fe4:1 86bbaca3bd72d7dce324066bc7911fe0ad32c21af44191bc6e6a6180820c6ed1:1",
-    ),
-    (
-        _mp("ai_agent_bridge/openai_proxy.py"),
-        "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
-        "dc055b00bb74f1636fd2dad29dd5ea4a465530e2f2922d1b73b41b346e797916:1",
     ),
     (
         _mp("ai_llm/fallback.py"),
