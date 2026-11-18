@@ -10,7 +10,6 @@ from unittest.mock import patch
 
 import pytest
 
-
 from lu_machinery.ai_agent_bridge import _ask_lifecycle, _cli, _db, _messaging
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
@@ -106,7 +105,7 @@ def test_live_driver_ack_is_distinct_from_plain_one_shot_ack(capsys):
     assert _message_consumption(one_shot_id) == (1, 0, None)
 
 
-def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys):
+def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys, monkeypatch):
     """Existing ack-all callers stay plain while the explicit flag marks live consumption."""
     plain_id = _messaging.send_message(
         "plain acknowledgement", task_id="review-pr-5687-plain", from_llm="claude", to_llm="codex", quiet=True
@@ -123,6 +122,7 @@ def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys):
     assert (acknowledged, consumed) == (1, 1)
     assert consumed_at is not None
 
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     assert _run_cli(["asks", "--task-id", "review-pr-5687-live"]) == 0
     asks = capsys.readouterr().out
     assert "CONSUMPTION" in asks

@@ -529,7 +529,7 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
     """
     from lu_machinery.fleet_comms.paths import default_plane_root
 
-    unknown = {"count": None, "ids": [], "probe": "unknown", "content_included": False}
+    unknown: dict[str, Any] = {"count": None, "ids": [], "probe": "unknown", "content_included": False}
     try:
         if type(limit) is not int or not 1 <= limit <= 500:
             return {**unknown, "reason": "invalid_pending_limit"}

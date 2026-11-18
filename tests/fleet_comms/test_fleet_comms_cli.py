@@ -24,7 +24,7 @@ from lu_machinery.fleet_comms.cli import (
 )
 from lu_machinery.fleet_comms.migrations import MIGRATIONS, apply_migrations
 from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 
 def _seed_plane_db(root: Path) -> Path:
@@ -130,7 +130,7 @@ def test_plane_status_cli_root_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPa
                 argv.append(action.option_strings[0])
             argv.append("1" if action.type is int else "fixture")
         entrypoints.append((argv, parser.get_default("func").__name__))
-    assert len(entrypoints) == 30
+    assert len(entrypoints) == 31
     for argv, handler_name in entrypoints:
         handler = Mock(side_effect=AssertionError("unsafe root reached command handler"))
         with monkeypatch.context() as guard:

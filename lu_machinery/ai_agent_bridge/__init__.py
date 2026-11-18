@@ -54,6 +54,18 @@ _EXPORTS = {
     'set_session': ('._db', 'set_session'),
 }
 
+_MODULES = {
+    '._broker': lambda: import_module('._broker', __name__),
+    '._cli': lambda: import_module('._cli', __name__),
+    '._config': lambda: import_module('._config', __name__),
+    '._db': lambda: import_module('._db', __name__),
+    '._gemini': lambda: import_module('._gemini', __name__),
+    '._github': lambda: import_module('._github', __name__),
+    '._messaging': lambda: import_module('._messaging', __name__),
+    '._model': lambda: import_module('._model', __name__),
+    '._prompts': lambda: import_module('._prompts', __name__),
+}
+
 __all__ = [
     "AGY_CLI",
     "CLAUDE_CMD",
@@ -114,7 +126,7 @@ def __getattr__(name: str):
         return getattr(import_module("._config", __name__), name)
     if name in _EXPORTS:
         module, attribute = _EXPORTS[name]
-        value = getattr(import_module(module, __name__), attribute)
+        value = getattr(_MODULES[module](), attribute)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

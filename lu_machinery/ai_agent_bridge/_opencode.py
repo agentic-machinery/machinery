@@ -20,9 +20,9 @@ from pathlib import Path
 
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.common.repo_root import project_interpreter, state_root
+from lu_machinery.contracts import new_id
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
-from lu_machinery.fleet_comms.contracts import new_id
 from lu_machinery.fleet_comms.paths import default_plane_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.review.model_catalog import activity_role_refusal
@@ -432,7 +432,10 @@ def read_opencode_result(job_id: str) -> dict:
         result = authority.read_job_result(job_id)
         if result is None:
             raise AuthorityServiceError("opencode_terminal_result_missing")
-        return json.loads(result)
+        payload = json.loads(result)
+        if not isinstance(payload, dict):
+            raise AuthorityServiceError("opencode_terminal_result_invalid")
+        return payload
 
 
 def print_authority_asks(task_id: str | None = None) -> None:
@@ -496,9 +499,13 @@ def _enqueue_opencode_ask(
         log_dir.mkdir(parents=True, exist_ok=True)
         try:
             with (log_dir / f"{job.job_id}.log").open("a", encoding="utf-8") as log:
+                # This allowlisted argv is never shell text or provider output.
+                command = [
+                    str(project_interpreter()), "-I", "-u", "-m", "lu_machinery.ai_agent_bridge",
+                    "process-ask", job.job_id, target,
+                ]
                 subprocess.Popen(
-                    [str(project_interpreter()), "-I", "-u", "-m", "lu_machinery.ai_agent_bridge",
-                     "process-ask", job.job_id, target],
+                    [*command],
                     stdout=log, stderr=subprocess.STDOUT, cwd=str(state_root()),
                     env=os.environ.copy(), start_new_session=True,
                 )

@@ -553,7 +553,7 @@ def process_background_ask(message_id: int | str, target: str) -> None:
     if target in {"opencode", "pool", "glm", "gemma"}:
         from ._opencode import process_for_opencode
 
-        process_for_opencode(message_id, target=target)
+        process_for_opencode(str(message_id), target=target)
         return
     message_id = int(message_id)
     from lu_machinery.agent_runtime.retired_seat_admission import KimiAdmissionRefused
@@ -995,7 +995,7 @@ def _process_target(message_id: int, target: str, options: dict[str, Any]) -> bo
     elif target in {"opencode", "pool", "glm", "gemma"}:
         from ._opencode import process_for_opencode
 
-        process_for_opencode(message_id, target=target, no_timeout=no_timeout, variant=options.get("variant"))
+        process_for_opencode(str(message_id), target=target, no_timeout=no_timeout, variant=options.get("variant"))
     else:
         raise ValueError(f"unsupported background ask target {target!r}")
 

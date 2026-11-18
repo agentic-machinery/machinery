@@ -109,9 +109,8 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
             f"#!{sys.executable}\nimport os, runpy, sys\n"
             "with open(os.environ['INBOX_PROBE_ARGS'], 'a') as log: log.write(' '.join(sys.argv[1:]) + chr(10))\n"
             "if sys.argv[1:4] == ['-I', '-m', 'lu_machinery.fleet_comms']:\n"
-            f" sys.path.insert(0, {str(HOOK.parents[3])!r})\n"
-            " sys.argv = sys.argv[3:]\n"
-            " runpy.run_module('lu_machinery.fleet_comms', run_name='__main__')\n"
+            f" bootstrap = {('import runpy, sys; sys.path.insert(0, ' + repr(str(HOOK.parents[3])) + '); runpy.run_module("lu_machinery.fleet_comms", run_name="__main__")')!r}\n"
+            f" os.execv({sys.executable!r}, [{sys.executable!r}, '-I', '-c', bootstrap, *sys.argv[4:]])\n"
             "else:\n"
             f" os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
         )
