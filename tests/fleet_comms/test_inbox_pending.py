@@ -13,7 +13,7 @@ import pytest
 
 from lu_machinery import inbox_pending
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.fleet_comms.authority import AuthorityService
+from lu_machinery.fleet_comms.authority import AuthorityService, pending_delivery_snapshot
 from tests.helpers.agy_inbox_fixtures import (
     BODY_MARKER,
     CLI_BOOTSTRAP,
@@ -23,7 +23,7 @@ from tests.helpers.agy_inbox_fixtures import (
     run_cli,
     snapshot,
 )
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -38,8 +38,10 @@ EXPECTED_UNKNOWN_NOTICE = (
 @pytest.mark.parametrize(
     ("acknowledged", "consumed", "expected"), [(0, 0, 1), (1, 0, 0), (0, 1, 0), (1, 1, 0), (None, None, 1)]
 )
-def test_legacy_delivery_states(stores, acknowledged, consumed, expected):
+def test_legacy_delivery_states(stores, roster, acknowledged, consumed, expected):
     add_legacy(stores[0], acknowledged=acknowledged, consumed=consumed)
+    add_legacy(stores[0], recipient="gemini", identifier=2, acknowledged=acknowledged, consumed=consumed)
+    add_legacy(stores[0], recipient="codex-core", identifier=3, acknowledged=acknowledged, consumed=consumed)
     assert inbox_pending.probe("gemini-infra") == {
         "count": 0,
         "ids": [],
@@ -47,6 +49,14 @@ def test_legacy_delivery_states(stores, acknowledged, consumed, expected):
         "stores": {"authority": None if expected else 0},
         "probe": "unknown" if expected else "ok",
     }
+    for alias in ("gemini-monitor", "codex-curriculum-upgrade"):
+        assert inbox_pending.probe(alias) == {
+            "count": 0,
+            "ids": [],
+            "truncated": False,
+            "stores": {"authority": None if expected else 0},
+            "probe": "unknown" if expected else "ok",
+        }
 
 
 @pytest.mark.parametrize(
@@ -396,11 +406,21 @@ def test_wal_reader_sees_latest_committed_order(stores):
         assert inbox_pending.probe("gemini-infra")["ids"] == [MESSAGE_ID]
 
 
-def test_retired_plane_and_relative_override_are_unknown(stores, monkeypatch, tmp_path):
+def test_retired_plane_and_relative_override_are_unknown(stores, monkeypatch, tmp_path, configured_roots):
     monkeypatch.delenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW")
     (tmp_path / "READ_ME_CANONICAL_ON_JOB_HOST.txt").write_text("retired")
     assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
+    assert pending_delivery_snapshot("gemini-infra", root=stores[1].parent)["probe"] == "unknown"
     monkeypatch.setenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW", "1")
+    (configured_roots.primary / "comms.sqlite3").write_bytes(stores[1].read_bytes())
+    assert pending_delivery_snapshot("gemini-infra", root=configured_roots.primary)["probe"] == "unknown"
+    monkeypatch.setenv("AB_DB_PATH", "messages.db")
+    assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
+    monkeypatch.setenv("AB_DB_PATH", str(stores[0]))
+    monkeypatch.chdir(tmp_path.parent)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", tmp_path.name)
+    assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
+    assert pending_delivery_snapshot("gemini-infra", root=Path(tmp_path.name))["probe"] == "unknown"
     monkeypatch.setenv("FLEET_COMMS_ROOT", "relative-plane")
     assert inbox_pending.probe("gemini-infra")["probe"] == "unknown"
 

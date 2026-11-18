@@ -24,7 +24,7 @@ from lu_machinery.fleet_comms.cli import (
 )
 from lu_machinery.fleet_comms.migrations import MIGRATIONS, apply_migrations
 from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
-from tests.helpers.product_tree import configured_roots as configured_roots  # noqa: PLC0414
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 
 def _seed_plane_db(root: Path) -> Path:

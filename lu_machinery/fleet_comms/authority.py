@@ -16,6 +16,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
@@ -527,7 +528,7 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
     Unknown storage or schema is an explicit refusal to report an empty inbox.
     Supervisory consumption is distinct from merely observing a wake receipt.
     """
-    from lu_machinery.fleet_comms.paths import default_plane_root
+    from lu_machinery.fleet_comms.paths import default_plane_root, local_plane_is_retired, validate_plane_root
 
     unknown: dict[str, Any] = {"count": None, "ids": [], "probe": "unknown", "content_included": False}
     try:
@@ -536,13 +537,18 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         recipient = _nonempty(recipient, field="recipient")
         _admit_recipients((recipient,), mode=BRIDGE_MODE, claiming=True)
         assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
-        from lu_machinery.agent_identity import seat_read_aliases
+        from lu_machinery.agent_identity import resolve_recipient_alias, seat_read_aliases
         from lu_machinery.common.bridge_paths import configured_bridge_db_path
         from lu_machinery.common.repo_root import state_root
 
         legacy_path = configured_bridge_db_path(state_root())
+        if not legacy_path.is_absolute():
+            return {**unknown, "reason": "pending_delivery_store_unavailable"}
         if legacy_path.exists():
-            aliases = seat_read_aliases(recipient) or (recipient,)
+            aliases = tuple(dict.fromkeys((
+                *seat_read_aliases(recipient),
+                *seat_read_aliases(resolve_recipient_alias(recipient)),
+            )))
             placeholders = ",".join("?" for _ in aliases)
             with contextlib.closing(open_readonly(legacy_path, timeout=1.0)) as legacy:
                 columns = {row[1] for row in legacy.execute("PRAGMA table_info(messages)")}
@@ -555,7 +561,15 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
                 # An id-only receipt cannot prove an unchanged import. Until
                 # #515 retires the source, never silently declare this empty.
                 return {**unknown, "reason": "legacy_unread_import_unverified"}
-        path = (root or default_plane_root()) / "comms.sqlite3"
+        plane_root = root
+        if plane_root is None and (override := os.environ.get("FLEET_COMMS_ROOT")):
+            plane_root = Path(override)
+        if plane_root is not None and not plane_root.is_absolute():
+            return {**unknown, "reason": "pending_delivery_store_unavailable"}
+        plane_root = validate_plane_root(plane_root) if plane_root is not None else default_plane_root()
+        if local_plane_is_retired(root=plane_root):
+            return {**unknown, "reason": "pending_delivery_store_unavailable"}
+        path = plane_root / "comms.sqlite3"
         with contextlib.closing(open_readonly(path, timeout=1.0)) as conn:
             conn.execute("BEGIN")
             conn.execute("SELECT delivery_id, state FROM authority_wake_receipts LIMIT 0")

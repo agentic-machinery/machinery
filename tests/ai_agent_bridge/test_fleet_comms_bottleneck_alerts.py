@@ -30,9 +30,6 @@ def isolate_broker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # checkout. These fixtures are plain non-git tmp dirs; since #6863 the
     # default hard-fails there, so they use the explicit operator override.
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
-    from lu_machinery.fleet_comms import authority
-    real = authority._registered_recipients
-    monkeypatch.setattr(authority, "_registered_recipients", lambda: real() | {"claude", "claude-infra"})
     with patch.dict(os.environ, {"AB_DB_PATH": str(broker_db)}):
         with AuthorityService():
             pass
@@ -48,7 +45,7 @@ def _metrics(*, age_s: float | None, threshold_s: int = 7_200, **_: object) -> d
             "gate_to_merge": 3_600,
         },
         "by_stream_epic": {
-            "4707": {
+            "7994": {
                 "dispatch": {"backlog_age_s": age_s, "raw": {"unfinished_count": 1}},
             }
         },
@@ -59,7 +56,7 @@ def _metrics(*, age_s: float | None, threshold_s: int = 7_200, **_: object) -> d
 def _open_lease(path: Path, *, holder: str = "claude") -> None:
     store = SessionStreamStore(SessionStreamDatabase(path))
     store.open_session(
-        stream_id="epic:4707",
+        stream_id="epic:7994",
         holder=LeaseHolder(
             agent=holder,
             harness="test",
@@ -137,7 +134,7 @@ def test_duplicate_scan_posts_one_action_required_system_alert(tmp_path: Path) -
         }
     finally:
         conn.close()
-    assert recipients == {"claude", "claude-infra"}
+    assert recipients == {"claude-core", "claude-infra"}
 
 
 def test_persistent_breach_rearms_at_next_threshold_multiple(tmp_path: Path) -> None:

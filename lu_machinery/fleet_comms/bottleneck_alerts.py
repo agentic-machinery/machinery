@@ -18,10 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery import agent_identity
-from lu_machinery.fleet_comms.authority import AuthorityService
+from lu_machinery.fleet_comms.authority import AuthorityService, _registered_recipients
 from lu_machinery.fleet_comms.efficiency_metrics import collect_stream_bottleneck_metrics
 from lu_machinery.fleet_comms.message_plane import default_plane_root
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
+from lu_machinery.orchestration.issue_stream_audit import load_registry
+from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.session_streams.db import SessionStreamDatabase, default_database_path
 from lu_machinery.session_streams.model import parse_timestamp
@@ -84,9 +86,21 @@ def _active_lease_holder(stream_epic: str, *, session_db: Path, now: datetime) -
         logger.error("bottleneck alerts: invalid lease expiry for epic %s", stream_epic)
         return None
     holder = str(row["holder_agent"] or "")
-    if expires_at <= now or holder not in agent_identity.get_valid_recipient_agents():
+    if expires_at <= now:
         return None
-    return holder
+    registered = _registered_recipients()
+    if holder in registered:
+        return holder
+    if holder not in agent_identity.STATIC_VALID_AGENTS:
+        return None
+    try:
+        streams = {name for name, epics in load_registry().items() if int(stream_epic) in epics}
+        lanes = {lane for stream, lane in load_launcher_bindings().values() if stream in streams}
+        candidates = {f"{holder}-{lane}" for lane in (lanes or streams)} & registered
+    except (OSError, ValueError, TypeError) as exc:
+        logger.error("bottleneck alerts: holder recipient lookup failed for epic %s: %s", stream_epic, exc)
+        return None
+    return next(iter(candidates)) if len(candidates) == 1 else None
 
 
 def _reserve_scan(conn: SQLiteConnection, *, now: datetime, rate_limit_seconds: int) -> bool:
