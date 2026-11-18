@@ -19,7 +19,8 @@ No real secret and no private data is used anywhere.
   dependency install fails on it, pass `--python "$(uv python find 3.12)"`.
 - `git` and `bash`.
 - `strace`. Each row runs under it, and any machinery code loaded from outside the installed
-  release fails the row. `--no-strace` skips this check, and the receipts then say the origin
+  release fails the row. Install `strace` on the kit's fixed system `PATH` (`/usr/local/bin:/usr/bin:/bin`).
+  `--no-strace` skips this check, and the receipts then say the origin
   was not checked.
 - `bwrap` (bubblewrap), recommended. Each row then runs in a sandbox that binds nothing of the
   host except the system directories (`/usr`, `/etc` and the `/bin`, `/lib` links) read-only, the
