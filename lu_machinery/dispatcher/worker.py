@@ -1259,8 +1259,9 @@ def _create_task_scratch(task_id: str) -> dict:
     return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino}
 
 
-# Scratch outcomes the scheduled sweep retries: a live holder let go, or a transient error.
-_SCRATCH_RETRY = frozenset({"in_use", "failed"})
+# Scratch outcomes the scheduled sweep retries: a provider that may have exited since, a live holder that may have
+# let go, a transient error.
+_SCRATCH_RETRY = frozenset({"retained", "in_use", "failed"})
 
 
 def _settle_task_scratch(record: dict) -> None:
@@ -1273,16 +1274,24 @@ def _settle_task_scratch(record: dict) -> None:
     sweep retries); absent; retained; refused. A refusal or failure never fails settlement.
     """
     reason = record.get("worktree_disposition_reason")
-    if record.get("worktree_disposition") is None or reason in store.PROVIDER_MAY_RUN:
-        record.update(task_scratch_disposition="retained", task_scratch_bytes=None,
+    earlier = record.get("task_scratch_bytes")
+    earlier = earlier if type(earlier) is int else 0
+    unsettled = record.get("worktree_disposition") is None
+    try:  # without settlement's own liveness verdict (a supervisor that died first), prove the provider gone here
+        may_run = reason in store.PROVIDER_MAY_RUN or (unsettled and _provider_alive(record) is not False)
+    except Exception:  # unknown liveness is not proof the provider is gone
+        may_run = True
+    if may_run:
+        record.update(task_scratch_disposition="retained", task_scratch_bytes=earlier or None,
                       task_scratch_disposition_reason=f"{reason or 'unsettled'}: the provider may still use it")
         return
     try:
         disposition, reason, size = _remove_task_scratch(record)
     except Exception as exc:  # recorded, never raised: settlement must still publish the record
         disposition, reason, size = "failed", f"{type(exc).__name__}: {exc}"[:300], None
+    total = earlier + (size or 0)  # a retry adds to what earlier passes freed
     record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
-                  task_scratch_bytes=size)
+                  task_scratch_bytes=total if size is not None or earlier else None)
 
 
 def _remove_task_scratch(record: dict) -> tuple[str, str, int | None]:
@@ -1411,8 +1420,10 @@ def _holds_task_caches(record: dict) -> bool:
 
 
 def _holds_task_scratch(record: dict) -> bool:
-    """Whether a finished task's scratch outcome is one the sweep retries (a holder let go, a transient error)."""
-    return record.get("status") not in store.ACTIVE and record.get("task_scratch_disposition") in _SCRATCH_RETRY
+    """Whether a finished task's scratch still waits: a retried outcome, or created and never settled (a dead supervisor)."""
+    if record.get("status") in store.ACTIVE or not isinstance(record.get("task_scratch"), dict):
+        return False
+    return "task_scratch_disposition" not in record or record.get("task_scratch_disposition") in _SCRATCH_RETRY
 
 
 def _unsettled(record: dict) -> bool:

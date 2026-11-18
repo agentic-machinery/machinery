@@ -146,7 +146,9 @@ def age(path: Path, days: float) -> None:
 
 
 def task(tasks: Path, task_id: str, status: str = "done", settled_days: float | None = 5, **fields) -> None:
-    record = {"schema_version": 2, "task_id": task_id, "status": status, **fields}
+    """A task record; a settled one carries settlement's verdict that its provider is gone."""
+    record = {"schema_version": 2, "task_id": task_id, "status": status, "worktree_disposition": "removed",
+              "worktree_disposition_reason": "clean", **fields}
     if settled_days is not None:
         record["finished_at"] = datetime.fromtimestamp(time.time() - settled_days * DAY, UTC).isoformat()
     (tasks / f"{task_id}.json").write_text(json.dumps(record))
@@ -185,7 +187,9 @@ def test_settled_task_state_is_pruned_keeping_records_results_and_handoffs(batch
     task(tasks, "listed")
     task(tasks, "touched")
     task(tasks, "lingering", worktree_disposition_reason="provider_processes_alive")  # terminal, provider not gone
-    for name in ("old.v2", "running", "recent", "undated", "pinned", "listed", "touched", "nobody", "lingering"):
+    task(tasks, "unsettled", status="crashed", worktree_disposition=None)  # its supervisor died before settling
+    for name in ("old.v2", "running", "recent", "undated", "pinned", "listed", "touched", "nobody", "lingering",
+                 "unsettled"):
         (tasks / f"{name}.artifacts").mkdir()
         (tasks / f"{name}.artifacts" / "payload").write_bytes(b"p" * 4096)
     age(tasks, 10)
@@ -204,7 +208,7 @@ def test_settled_task_state_is_pruned_keeping_records_results_and_handoffs(batch
     }
     assert dry["bytes"] > 65536
     assert {key: value for key, value in dry["counts"].items() if value} == {
-        "would_remove": 3, "live": 3, "held": 2, "settling": 1, "undated": 1, "fresh": 1, "unowned": 1}
+        "would_remove": 3, "live": 4, "held": 2, "settling": 1, "undated": 1, "fresh": 1, "unowned": 1}
 
     result = retention.prune_settled_tasks(tasks, holds=holds)
     assert result["counts"]["removed"] == 3 and not result["counts"]["failed"] and result["bytes"] >= 65536
@@ -217,7 +221,8 @@ def test_settled_task_state_is_pruned_keeping_records_results_and_handoffs(batch
     for kept in ("old.json", "old.result", "old.prompt", "old.handoff.md", "archive/moved.json",
                  "archive/moved.artifacts/kept"):
         assert (tasks / kept).is_file(), kept
-    for name in ("old.v2", "running", "recent", "undated", "pinned", "listed", "touched", "nobody", "lingering"):
+    for name in ("old.v2", "running", "recent", "undated", "pinned", "listed", "touched", "nobody", "lingering",
+                 "unsettled"):
         assert (tasks / f"{name}.artifacts" / "payload").read_bytes() == b"p" * 4096, name
     later = retention.prune_settled_tasks(tasks, holds=holds, dry_run=True, now=time.time() + 30 * DAY)
     assert "batch_state/tasks/old.artifacts/" not in {row["path"] for row in later["rows"]}
@@ -285,14 +290,18 @@ def test_prune_never_follows_links_crosses_mounts_or_trusts_a_damaged_record(bat
     (tasks / "damaged.json").write_text('{"schema_version": 2, "task_id": ')
     (tasks / "damaged.artifacts").mkdir()
     (tasks / "legacy.v2.json").write_text(json.dumps({"agent": "codex", "status": "running"}))  # no embedded id
+    task(tasks, "strv")
+    (tasks / "strv.v2.json").write_text('{"schema_version": "2", "status": "running"}')  # not read as a record
+    (tasks / "strv.v2.artifacts").mkdir()
     task(tasks, "legacy")
     (tasks / "legacy.v2.artifacts").mkdir()
     age(tasks, 10)
     real_mounts = retention.mount_points
     monkeypatch.setattr(retention, "mount_points", lambda: frozenset({str(tasks.resolve() / "linky.artifacts")}))
     result = retention.prune_settled_tasks(tasks, holds=[])
-    assert [row["path"] for row in result["rows"]] == ["batch_state/tasks/damaged.artifacts/"]
-    assert (result["counts"]["owner_unverified"], result["counts"]["mount"]) == (1, 1)  # decisions, not failures
+    assert [row["path"] for row in result["rows"]] == [
+        "batch_state/tasks/damaged.artifacts/", "batch_state/tasks/strv.v2.artifacts/"]
+    assert (result["counts"]["owner_unverified"], result["counts"]["mount"]) == (2, 1)  # decisions, not failures
     monkeypatch.setattr(retention, "mount_points", lambda: None)
     assert retention.prune_settled_tasks(tasks, holds=[])["rows"][1]["reason"] == "mount_probe_unknown"
     monkeypatch.setattr(retention, "mount_points", real_mounts)
@@ -305,12 +314,14 @@ def test_prune_never_follows_links_crosses_mounts_or_trusts_a_damaged_record(bat
     assert (outside / "keep").read_text() == "kept"
     assert (tasks / "aliased.artifacts").is_symlink() and (tasks / "damaged.artifacts").is_dir()
     assert (tasks / "legacy.v2.artifacts").is_dir()  # the running legacy record owns it, not settled "legacy"
+    assert (tasks / "strv.v2.artifacts").is_dir()  # an unverifiable claim at the longer id vetoes settled "strv"
     # A locked directory (mode 0) is repaired and taken, not left to fail every hourly run; a file whose two names
     # both go is counted once.
     task(tasks, "sealed")
     (tasks / "sealed.artifacts" / "locked").mkdir(parents=True)
     (tasks / "sealed.artifacts" / "big").write_bytes(b"b" * 65536)
-    os.link(tasks / "sealed.artifacts" / "big", tasks / "sealed.artifacts" / "big-link")
+    (tasks / "sealed.artifacts" / "sub").mkdir()
+    os.link(tasks / "sealed.artifacts" / "big", tasks / "sealed.artifacts" / "sub" / "big-link")  # another directory
     age(tasks / "sealed.artifacts", 10)
     (tasks / "sealed.artifacts" / "locked").chmod(0)
     sealed = retention.prune_settled_tasks(tasks, holds=[])

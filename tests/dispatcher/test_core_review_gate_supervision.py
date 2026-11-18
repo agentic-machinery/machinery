@@ -488,6 +488,8 @@ def test_write_task_scratch_is_created_private_and_refused_when_not_our_director
     base.mkdir()
     monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
     created = worker._create_task_scratch("scratch-task")
+    # A supervisor that dies after creating it leaves it pending: the sweep settles it once the provider is gone.
+    assert worker._holds_task_scratch({"status": "crashed", "task_scratch": created})
     info = (base / "scratch-task").stat()
     assert info.st_mode & 0o777 == 0o700 and (created["dev"], created["ino"]) == (info.st_dev, info.st_ino)
     elsewhere = tmp_path / "elsewhere"
