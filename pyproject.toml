@@ -44,7 +44,7 @@ test = ["hypothesis==6.170.15"]
 test = [
     "pip==26.3",
     "httpx2==2.16.0",  # ASGI transport used by the API and Work tests.
-    "mcp==1.29.0",  # FastMCP used by the opt-in permission test.
+    "mcp>=1.30.0",  # FastMCP used by the opt-in permission test.
     "PyMuPDF==2.1",
     "pymupdf4llm==2.1",
     "pytest-cov==7.1.0",
@@ -60,6 +60,19 @@ semgrep = ["semgrep==1.183.0"]
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).
 required-version = "==0.13.1"
+# Semgrep 1.183.0 pins vulnerable MCP and OpenTelemetry releases. Scope the
+# patched versions to that wheel and keep the entire scanner hash-locked.
+# The OpenTelemetry SDK, exporter and instrumentations share version pins.
+override-dependencies = [
+    { package = { name = "semgrep", version = "1.183.0" }, dependencies = [
+        "mcp==1.30.0",
+        "opentelemetry-api==1.45.2",
+        "opentelemetry-sdk==1.45.2",
+        "opentelemetry-exporter-otlp-proto-http==1.45.2",
+        "opentelemetry-instrumentation-requests==0.66b2",
+        "opentelemetry-instrumentation-threading==0.66b2",
+    ] },
+]
 
 [tool.setuptools]
 include-package-data = true
