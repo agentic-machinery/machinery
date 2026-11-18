@@ -45,8 +45,9 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.common import task_scratch as ownership
-from lu_machinery.common.pytest_scratch import NAMESPACE, RUNS_DIRNAME
 from lu_machinery.common.scratch import ScratchScanRootError, scratch_scan_roots
+from lu_machinery.common.task_scratch import PYTEST_NAMESPACE_DIRNAME as NAMESPACE
+from lu_machinery.common.task_scratch import PYTEST_RUNS_DIRNAME as RUNS_DIRNAME
 from lu_machinery.hygiene import tmp_sweep as sweep
 from lu_machinery.hygiene.tmp_sweep_ledger import Ledger
 

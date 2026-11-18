@@ -544,16 +544,15 @@ class Cut:
         self.step = "wheelhouse"
         house = self.work / "wheelhouse"
         house.mkdir()
-        # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
-        # group, with every hash (ci-gate.yml's dependency-audit and installed-wheel jobs export the
-        # same). --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
-        # required-version refuses any other uv release.
+        # Export core and the runtime extras with hashes, as in CI. The
+        # consumer lock keeps the bare release pin used by product CI.
         uv = shutil.which("uv")
         if uv is None:
             raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
         lock = self.work / "runtime-requirements.txt"
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
-                             "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
+                             "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test"],
+                            cwd=self.work / "src").stdout
         lock.write_text(exported, encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",

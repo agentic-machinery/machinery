@@ -7,36 +7,33 @@ name = "lu-machinery"
 version = "0.1.33"
 description = "Shared agent orchestration and development tooling"
 requires-python = ">=3.12"
-# Direct third-party imports under lu_machinery/, including the CI tools it runs.
-# Product-only packages are not index dependencies; their split is separate work.
+# Core commands also read routing and verification helpers from the API package.
 dependencies = [
-    "coverage>=7.17.0",
     "fastapi>=0.139.0",
     "filelock>=3.32.2",
-    "Flask>=3.1.3",
     "graphql-core==3.3.1",
     "ijson>=3.6.0",
-    "Jinja2>=3.1",
     "jsonschema>=4.20",
     "markdown-it-py>=4.2.0",
-    "mcp>=2.2,<3",
     "packaging>=26.3",
-    "pre-commit==4.6.0",
     "prometheus-client>=0.26.0",
     "psutil>=7.2",
-    "psycopg[binary]==3.3.6",
     "pydantic>=2.13.5",
     "PyJWT[crypto]>=2.15.0",
-    "pytest>=9.1.1",
-    "pytest-xdist>=3.6",
     "PyYAML>=6.0",
     "referencing>=0.37.0",
     "starlette>=1.3.1",
-    "uvicorn>=0.48.0",
 ]
 
 [project.optional-dependencies]
-test = ["hypothesis==6.170.15", "PyMuPDF==2.1"]
+api = [
+    "psycopg[binary]==3.3.6",  # Postgres-backed API routes need the binary driver.
+    "uvicorn>=0.48.0",
+]
+mcp = ["mcp>=2.2,<3"]
+postgres = ["psycopg[binary]==3.3.6"]
+pytest = ["coverage>=7.17.0", "pytest>=9.1.1", "pytest-xdist>=3.6"]
+test = ["hypothesis==6.170.15"]
 
 # Development tools, locked in uv.lock beside the runtime closure (PEP 735;
 # never part of the wheel's metadata). CI selects them per job with
@@ -46,6 +43,7 @@ test = ["hypothesis==6.170.15", "PyMuPDF==2.1"]
 # environment has no pip of its own.
 test = [
     "pip==26.3",
+    "PyMuPDF==2.1",
     "pymupdf4llm==2.1",
     "pytest-cov==7.1.0",
     "pytest-rerunfailures==16.7",
@@ -55,12 +53,14 @@ typecheck = ["mypy==2.1.0"]
 lint = ["ruff==0.15.21", "zizmor==1.31.1"]
 audit = ["pip-audit==2.10.1"]
 attribution = ["markdown-it-py>=4.2.0"]
+semgrep = ["semgrep==1.183.0"]
 
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).
 required-version = "==0.13.1"
-# Semgrep stays a hash-pinned install in ci-gate.yml and tests.yml: semgrep
-# 1.183.0 requires mcp==1.29.0, which this project's mcp>=2.2 excludes.
+# CI installs only the Semgrep group in its venv. Its MCP 1.x pin and the
+# runtime MCP 2.x extra cannot share one environment.
+conflicts = [[{ group = "semgrep" }, { extra = "mcp" }]]
 
 [tool.setuptools]
 include-package-data = true
