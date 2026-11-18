@@ -96,8 +96,8 @@ writes and reads it (`UV_VERSION` in `.github/workflows/pins.txt`), and
 CI's `uv sync --locked` fails when the lock no longer matches, and refuses
 any wheel whose hash differs from the lock. Semgrep runs in its own
 environment. The opt-in permission test gets MCP from the `test`
-dependency group. The release build tools and the product consumer's uv
-use hash-pinned installs.
+dependency group. The release build tools use hash-pinned installs. The
+product consumer check uses the job's checksum-verified `UV_VERSION`.
 
 The release wheelhouse includes core and the `api`, `postgres`, and
 `pytest` extras. This export excludes the project, development groups, and
@@ -109,8 +109,8 @@ uv export --locked --quiet --format requirements.txt --no-emit-project --no-defa
 
 The `Dependency audit` job audits this export. The `Installed wheel` job uses
 pip `--require-hashes` to install the wheel offline in separate core and
-per-extra environments. It checks those imports on the pinned Python and the
-`requires-python` floor. Core still includes FastAPI, Prometheus and their
+per-extra environments. It checks those imports on the pinned Python. Core
+still includes FastAPI, Prometheus and their
 dependency floors because routing and verification commands call into the API
 package. The wheel job calls those entry points in the core environment.
 
@@ -261,8 +261,9 @@ order:
      breaks it fails before merge. The `Installed wheel` job of CI Gate runs
      `release_cut consumer-collection` with the wheel built from the tested
      head, against the product commit in `.github/workflows/product-consumer.pin`.
-     The product environment is built from that commit's
-     `requirements-lock.txt`, and `LEARN_UKRAINIAN_PYTHON` names the candidate
+     The job runs `uv sync --locked` from that commit's `uv.lock` with the
+     product CI exclusions. It skips `torch`, `torchvision`, `open-clip-torch`,
+     `stanza`, and `lu-machinery`. `LEARN_UKRAINIAN_PYTHON` names the candidate
      interpreter. The job then runs the pin's key consumer tests and reports
      the pin and the wheel's SHA-256. The pin never follows product `main`.
      Bump it in its own PR to a product commit whose CI Gate passed, and update
