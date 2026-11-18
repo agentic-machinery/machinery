@@ -15,6 +15,7 @@ from lu_machinery.orchestration import fleet_repos
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.review import target_resolution
 from tests.agent_runtime.test_review_closeout_cli import _run_cli
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 # Fallbacks let this module collect on a tree that does not have the fix yet.
 PRIVATE_REVIEW_TARGET_UNRESOLVED = getattr(
@@ -575,7 +576,5 @@ def test_repository_target_error_hides_unavailable_root_oserror():
     _assert_neutral_private_refusal(error)
     assert "absent-root" not in error
 
-
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

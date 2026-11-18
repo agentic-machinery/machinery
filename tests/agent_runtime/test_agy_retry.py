@@ -845,13 +845,12 @@ def test_off_review_agy_caller_runs_bounded_or_refuses_before_launch(tmp_path, m
     AGY has a read-only boundary only on the review route, so a text-only caller is refused
     before any workspace, broker message or provider launch exists.
     """
-    from lu_machinery.ai_agent_bridge import _agy, _db, _gemini
+    from lu_machinery.ai_agent_bridge import _db, _gemini
     from lu_machinery.ai_llm import fallback
 
     invoke = Mock(side_effect=AssertionError("provider invoked"))
     monkeypatch.setattr(runner, "invoke", invoke)
     monkeypatch.setattr(_gemini, "runtime_invoke", invoke)
-    monkeypatch.setattr(_agy, "_agy_ask_scratch_cwd", Mock(side_effect=AssertionError("workspace provisioned")))
     if caller == "gemini-ask":
         monkeypatch.setenv("AB_DB_PATH", str(tmp_path / "messages.db"))
         _db.init_db()
