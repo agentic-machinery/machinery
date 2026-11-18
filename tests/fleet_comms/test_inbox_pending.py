@@ -407,5 +407,3 @@ def test_direct_invalid_payload_is_unknown(stores, payload):
     assert inbox_pending.hook(payload, "gemini-infra") == {
         "injectSteps": [{"ephemeralMessage": EXPECTED_UNKNOWN_NOTICE}]
     }
-
-

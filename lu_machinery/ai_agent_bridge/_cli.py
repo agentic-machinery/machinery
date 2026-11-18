@@ -36,8 +36,9 @@ from ._opencode import (
 )
 from ._prompts import require_core_or_exit
 
-# The interpreter running this command: a hint copied from any checkout or worktree runs.
-_PY = shlex.quote(sys.executable)
+# The interpreter running this command, isolated (-I) so a hint copied into any
+# checkout or worktree runs the installed release, never the package in the cwd.
+_PY = f"{shlex.quote(sys.executable)} -I"
 _FLEET = f"{_PY} -m {MACHINERY_PACKAGE}.fleet_comms"
 # Verbs of the removed legacy inbox, broker and channel stores (#515), each with
 # its Fleet Comms replacement. They stay registered so a caller gets this typed
@@ -401,7 +402,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Exit codes:\n"
             "  0 on successful command completion; 2 for a retired verb; other non-zero on CLI misuse or agent failure.\n\n"
             "Related:\n"
-            f"  Messages: .venv/bin/python -m {MACHINERY_PACKAGE}.fleet_comms --help\n"
+            f"  Messages: .venv/bin/python -I -m {MACHINERY_PACKAGE}.fleet_comms --help\n"
             f"  Runtime: {MACHINERY_PACKAGE}/agent_runtime/\n"
             "  Issue: #1379\n"
         ),

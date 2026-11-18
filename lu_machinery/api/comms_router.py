@@ -275,7 +275,12 @@ def _retired_read(replacement: str) -> JSONResponse:
     )
 
 
-_CHANNEL_READ_REPLACEMENT = "GET /api/fleet/acp/conversations; fleet_comms channel"
+_CHANNEL_READ_REPLACEMENT = (
+    "channel-wide history is retired; a seat reads its own deliveries with "
+    "fleet_comms deliveries pending|receive --recipient <slot>; ACP discussions: "
+    "GET /api/fleet/acp/conversations (metadata) and "
+    "GET /api/runtime/acp/conversations/<conversation-id>/transcript (loopback only)"
+)
 
 
 @router.get("/channels/{name}")

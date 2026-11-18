@@ -65,7 +65,7 @@ def authority_inbox_notice(recipient: str | None, *, file: TextIO | None = None)
     target = slot or "<slot>"
     print(
         f"Fleet Comms deliveries for {target}: {count} queued; read them with "
-        f"`{shlex.quote(sys.executable)} -m {_MACHINERY}.fleet_comms deliveries receive "
+        f"`{shlex.quote(sys.executable)} -I -m {_MACHINERY}.fleet_comms deliveries receive "
         f"--recipient {target} --worker-id {target}`.",
         file=file or sys.stdout,
     )
