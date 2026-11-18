@@ -83,8 +83,8 @@ detached `process-*` or `ask-*` worker — reads and applies every message marke
 or `read-but-not-live-consumed`, then records that consumption:
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet_comms deliveries receive --recipient "$SESSION_HANDOFF_AGENT" --worker-id "$SESSION_HANDOFF_AGENT"
-.venv/bin/python -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id "$SESSION_HANDOFF_AGENT" --fence-token <n>
+.venv/bin/python -I -m lu_machinery.fleet_comms deliveries receive --recipient "$SESSION_HANDOFF_AGENT" --worker-id "$SESSION_HANDOFF_AGENT"
+.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id "$SESSION_HANDOFF_AGENT" --fence-token <n>
 ```
 
 Record every order, in-flight task with its full run nonce, blocker, decision and

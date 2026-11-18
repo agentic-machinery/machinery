@@ -55,7 +55,7 @@ The prompt hook `check-agent-inbox.sh` reports queued Fleet Comms deliveries, an
 body-free count is the one-shot equivalent:
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"
+.venv/bin/python -I -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"
 ```
 
 It never reads a body and never claims a delivery. You still must run the required

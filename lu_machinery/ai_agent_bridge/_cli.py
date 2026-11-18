@@ -402,7 +402,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Exit codes:\n"
             "  0 on successful command completion; 2 for a retired verb; other non-zero on CLI misuse or agent failure.\n\n"
             "Related:\n"
-            f"  Messages: .venv/bin/python -I -m {MACHINERY_PACKAGE}.fleet_comms --help\n"
+            f"  Messages: {_FLEET} --help\n"
             f"  Runtime: {MACHINERY_PACKAGE}/agent_runtime/\n"
             "  Issue: #1379\n"
         ),

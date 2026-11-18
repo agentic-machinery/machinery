@@ -748,7 +748,7 @@ curl -s http://127.0.0.1:8765/api/fleet/acp/conversations/CONVERSATION_ID
 curl -s http://127.0.0.1:8765/api/runtime/acp/conversations/CONVERSATION_ID/transcript
 
   # Post (one recipient per --recipient; threading with --in-reply-to / --correlation-id)
-.venv/bin/python -m lu_machinery.fleet_comms channel publish reviews - \
+.venv/bin/python -I -m lu_machinery.fleet_comms channel publish reviews - \
   --sender "$SESSION_HANDOFF_AGENT" --recipient claude-cto --idempotency-key KEY < message.md
 
   # Multi-agent bounded discussion
