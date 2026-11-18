@@ -374,7 +374,7 @@ _REVIEW_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 _REVIEW_HEAD_RE = re.compile(
-    r"\b(?:at\s+)?head\b\s*[:=]?\s*`?([0-9a-f]{40})`?",
+    r"\b(?:at\s+)?head\b\s*(?:[:=]\s*)?`?([0-9a-f]{40})`?",
     re.IGNORECASE,
 )
 

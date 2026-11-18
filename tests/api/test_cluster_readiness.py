@@ -35,8 +35,11 @@ _PROBED_SQLITE_STORES = (StoreId.FLEET_COMMS, StoreId.WRITE_OWNERSHIP)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_readiness_stores(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_readiness_stores(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("LEARN_UKRAINIAN_OWNERSHIP_LEDGER", raising=False)
+    # The session pins one shared plane root; without this, _ready_context writes comms.sqlite3
+    # there and later tests that expect "no plane db" (test_comms_metrics_switch) see it.
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "plane"))
 
 
 def _ready_context(tmp_path: Path):
