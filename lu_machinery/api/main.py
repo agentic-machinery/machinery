@@ -20,6 +20,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -517,17 +518,24 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         raise RuntimeError(log_proc.stderr.strip() or "git log failed")
 
     # Only now, as before: a failed request must not write Git configuration.
-    # A bare-drifted primary is healed before either slow read starts (the status
-    # read repeats the heal as a read-only no-op); an error here is the status
-    # read's to report, with its fallback below. The status and authority reads
-    # are the two slow ones (a ``git status`` scan each); they run together.
-    with suppress(Exception):
+    # A bare-drifted primary is healed before the authority read starts, which
+    # needs a work tree. When that heal cannot confirm a ready checkout (it
+    # failed, for instance on a held config lock), the status read repeats it and
+    # finishes first, and the authority read follows it as it did when the reads
+    # were serial. Otherwise the two slow reads (a ``git status`` scan each) run
+    # together; an error in the status read keeps its fallback below.
+    try:
         worktree_containment.heal_primary_bare_if_needed(
             worktree_containment.resolve_main_root(resolved_ctx.roots.live_repo_root)
         )
+        checkout_ready = True
+    except Exception:
+        checkout_ready = False
     status_probe = _GIT_PROBE_EXECUTOR.submit(
         worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
     )
+    if not checkout_ready:
+        wait_for_futures([status_probe])
     authority_probe = _GIT_PROBE_EXECUTOR.submit(
         build_repository_authority,
         project_root=resolved_ctx.roots.project_root,
