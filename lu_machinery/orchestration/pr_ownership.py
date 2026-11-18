@@ -1165,26 +1165,29 @@ def _checkout_slug(cwd: Path) -> str | None:
 
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 
-    def git_lines(*args: str) -> list[str]:
+    def git_lines(*args: str) -> list[str] | None:
+        """Git's output lines; None when the call failed or timed out, which is never "no URLs"."""
         try:
             done = subprocess.run(
                 ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return []
-        return done.stdout.splitlines() if done.returncode == 0 else []
+            return None
+        return done.stdout.splitlines() if done.returncode == 0 else None
 
-    defined = [
-        line.partition("\t")[::2]
-        for line in git_lines("config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$")
-    ]
+    configured = git_lines("config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$")
+    fetch = git_lines("remote", "get-url", "--all", "origin")
+    push = git_lines("remote", "get-url", "--push", "--all", "origin")
+    if not configured or not fetch or not push:
+        return None
+    defined = [line.partition("\t")[::2] for line in configured]
     if not any(entry.startswith("remote.origin.url ") for _, entry in defined) or any(
         scope not in {"local", "worktree"} for scope, _ in defined
     ):
         return None
-    effective = [*git_lines("remote", "get-url", "--all", "origin"), *git_lines("remote", "get-url", "--push", "--all", "origin")]
+    effective = [*fetch, *push]
     matches = [next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None) for url in effective]
-    if not effective or None in matches:
+    if None in matches:
         return None
     slugs = [f"{match.group(1)}/{match.group(2)}" for match in matches if match]
     return slugs[0] if len({slug.casefold() for slug in slugs}) == 1 else None

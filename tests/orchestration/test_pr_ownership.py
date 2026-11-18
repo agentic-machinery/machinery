@@ -604,6 +604,18 @@ def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch
     assert own._checkout_slug(checkout) is None  # fetch and rewritten push URL name different repositories
     git(checkout, "config", "--unset", "url.https://github.com/sample/.pushInsteadOf")
     git(checkout, "config", "remote.origin.pushurl", url)
+    # A lookup that times out is no answer, whichever of Git's two URL lookups it is.
+    real_run = subprocess.run
+
+    def push_lookup_times_out(command, **kwargs):
+        if "--push" in command:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return real_run(command, **kwargs)
+
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    monkeypatch.setattr(subprocess, "run", push_lookup_times_out)
+    assert own._checkout_slug(checkout) is None
+    monkeypatch.setattr(subprocess, "run", real_run)
     # A push URL alone is not a repository: Git has no fetch origin there.
     git(checkout, "config", "--unset-all", "remote.origin.url")
     git(checkout, "config", "remote.origin.pushurl", url)
