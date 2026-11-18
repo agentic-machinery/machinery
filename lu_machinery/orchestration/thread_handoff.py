@@ -4134,26 +4134,18 @@ class _BundleReconcileTree:
         return fd
 
     @staticmethod
-    def existing(parent: int, name: str, *, temporary: bool = False) -> bytes | None:
-        """Read a validated local file in full, without the remote bundle cap.
-
-        Backups must preserve pre-existing local members of any size exactly.
-        A cap here would refuse recovery of valid large files; this local read
-        therefore has no byte bound and uses memory proportional to file size.
-        """
+    def existing(parent: int, name: str) -> bytes | None:
+        """Read a no-follow, single-link regular file in full."""
         try:
             info = os.stat(name, dir_fd=parent, follow_symlinks=False)
         except FileNotFoundError:
             return None
-        kind = "reconcile_temp" if temporary else "reconcile_member"
         if stat.S_ISFIFO(info.st_mode):
             raise BundleReconcileRefused("reconcile_fifo")
         if stat.S_ISLNK(info.st_mode):
-            raise BundleReconcileRefused(f"{kind}_symlink")
+            raise BundleReconcileRefused("reconcile_member_symlink")
         if info.st_nlink != 1:
-            raise BundleReconcileRefused(f"{kind}_hardlink")
-        if temporary:
-            raise BundleReconcileRefused("reconcile_temp_exists")
+            raise BundleReconcileRefused("reconcile_member_hardlink")
         if not stat.S_ISREG(info.st_mode):
             raise BundleReconcileRefused("reconcile_member_not_regular")
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)

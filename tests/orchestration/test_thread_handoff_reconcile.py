@@ -1,7 +1,11 @@
 """Retained no-follow read and descriptor-cleanup cases from the retired transport suite."""
 from __future__ import annotations
+
+import errno
 import os
+
 import pytest
+
 from lu_machinery.orchestration import thread_handoff as th
 
 
@@ -23,9 +27,11 @@ def test_symlink_redirect_refused_without_outside_write(tmp_path, component):
     target = targets[component]
     target.rename(outside / "original")
     target.symlink_to(outside / "original", target_is_directory=True)
-    with pytest.raises(th.BundleReconcileRefused, match="lineage_ancestor_symlink"):
-        with th._BundleReconcileTree(root, "cursor", "lineage"):
-            pass
+    with (
+        pytest.raises(th.BundleReconcileRefused, match="lineage_ancestor_symlink"),
+        th._BundleReconcileTree(root, "cursor", "lineage"),
+    ):
+        pass
     assert (outside / "sentinel").read_bytes() == b"untouched outside"
 
 
@@ -45,9 +51,11 @@ def test_member_leaf_is_never_overwritten(tmp_path, kind, code):
         os.link(outside, leaf)
     else:
         os.mkfifo(leaf)
-    with pytest.raises(th.BundleReconcileRefused, match=code):
-        with th._BundleReconcileTree(root, "cursor", "lineage") as tree:
-            tree.read_path(".agent/thread-rollovers/cursor/lineage/handoff.md")
+    with (
+        pytest.raises(th.BundleReconcileRefused, match=code),
+        th._BundleReconcileTree(root, "cursor", "lineage") as tree,
+    ):
+        tree.read_path(".agent/thread-rollovers/cursor/lineage/handoff.md")
     assert outside.read_bytes() == b"untouched outside"
 
 
@@ -95,3 +103,37 @@ def test_body_error_survives_exit_fd_close_failure(tmp_path, monkeypatch, caplog
     assert raised.value is failure
     assert any("injected fd close failure" in note for note in raised.value.__notes__)
     assert "bundle reconcile fd cleanup failed" in caplog.text
+
+
+def test_many_members_keep_directory_descriptors_bounded(tmp_path, monkeypatch):
+    """Defect class: retaining parent-directory descriptors exhausts the reader budget."""
+    root, lineage = _read_tree(tmp_path)
+    members = lineage / "many"
+    members.mkdir()
+    for index in range(80):
+        (members / f"{index}.txt").write_bytes(b"member\n")
+    native_open, native_close = os.open, os.close
+    held = set()
+    peak = 0
+
+    def bounded_open(path, flags, *args, **kwargs):
+        nonlocal peak
+        if flags & os.O_DIRECTORY and len(held) >= 32:
+            raise OSError(errno.EMFILE, "directory descriptor budget exhausted")
+        fd = native_open(path, flags, *args, **kwargs)
+        if flags & os.O_DIRECTORY:
+            held.add(fd)
+            peak = max(peak, len(held))
+        return fd
+
+    def tracked_close(fd):
+        held.discard(fd)
+        return native_close(fd)
+
+    monkeypatch.setattr(os, "open", bounded_open)
+    monkeypatch.setattr(os, "close", tracked_close)
+    with th._BundleReconcileTree(root, "cursor", "lineage") as tree:
+        for index in range(80):
+            assert tree.read_path(f".agent/thread-rollovers/cursor/lineage/many/{index}.txt") == b"member\n"
+    assert peak < 32
+    assert not held
