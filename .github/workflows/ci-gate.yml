@@ -93,9 +93,7 @@ concurrency:
 # host's build), installed by .github/actions/uv-python with the uv release
 # pinned below. Python dependencies come from uv.lock (`uv sync --locked`,
 # which checks every SHA-256 in the lock). The build tools that release_cut
-# reads from this file and the product consumer's uv use hash-pinned heredocs.
-# installed-wheel also runs on the requires-python floor, so the floor stays
-# proven while the pin is newer.
+# reads from this file use hash-pinned heredocs.
 # Cache only verified release archives, never venvs or repository build outputs.
 # Fork PRs restore only. No prefix restore keys.
 env:
@@ -1273,21 +1271,14 @@ jobs:
   # wheel from the tracked tree with pinned tools, fill a temporary wheelhouse
   # with the wheel and the runtime closure exported from uv.lock, install
   # offline with hashes required, then import every module from the installed
-  # wheel only. It runs twice: on the pinned Python (.python-version) and on
-  # the requires-python floor, so the floor stays proven while CI and the host
-  # run a newer pin. The product consumer check runs in the entry whose minor
-  # version is the product pin's .python-version, and an entry fails when
-  # neither entry matches it.
+  # wheel only. Use the pinned Python for the product consumer check, which
+  # requires a newer Python than the machinery package floor.
   installed-wheel:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: Installed wheel (${{ matrix.python }} Python)
+    name: Installed wheel (pinned Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        python: [pinned, floor]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1296,7 +1287,6 @@ jobs:
       - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         id: python
         with:
-          python: ${{ matrix.python }}
           uv-version: ${{ env.UV_VERSION }}
           uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
@@ -1606,60 +1596,35 @@ jobs:
           path: product
           persist-credentials: false
 
-      # The product environment needs the product's own Python minor version.
       - name: Match the product pin's Python
-        id: consumer
         env:
           PYTHON: ${{ steps.python.outputs.version }}
-          ENTRY: ${{ matrix.python }}
         run: |
           set -euo pipefail
-          minor() { sed -nE 's/^(3\.[0-9]+)(\.[0-9]+)?$/\1/p'; }
-          product="$(tr -d '[:space:]' < product/.python-version | minor)"
-          pinned="$(tr -d '[:space:]' < .python-version | minor)"
-          floor="$(sed -nE 's/^requires-python = ">=(3\.[0-9]+)"$/\1/p' pyproject.toml)"
-          here="$(printf '%s\n' "$PYTHON" | minor)"
-          echo "product pin Python ${product:-unreadable}; pinned ${pinned}; floor ${floor}; this entry (${ENTRY}) ${here}"
-          if [ -z "$product" ] || { [ "$product" != "$pinned" ] && [ "$product" != "$floor" ]; }; then
-            echo "::error::The product pin's Python ${product:-unreadable} is neither the pinned nor the floor minor; no entry would run the consumer check"
+          product_python="$(cat product/.python-version)"
+          if [ "$product_python" != "$PYTHON" ]; then
+            echo "::error::The product pin requires Python ${product_python}; this job uses ${PYTHON}"
             exit 1
-          fi
-          if [ "$product" = "$here" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "The ${ENTRY} entry skips the product consumer check; the entry on Python ${product} runs it." \
-              | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Build the product environment at the pin
-        if: steps.consumer.outputs.run == 'true'
+        env:
+          PYTHON: ${{ steps.python.outputs.version }}
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/installed-wheel/product-venv
+          UV_PYTHON_DOWNLOADS: never
+        working-directory: product
         run: |
           set -euo pipefail
-          work="$RUNNER_TEMP/installed-wheel"
-          product="$GITHUB_WORKSPACE/product"
-          cd "$work"
-          python -I -m venv uv-venv
-          cat > uv-requirements.txt <<'REQUIREMENTS'
-          uv==0.12.9 \
-              --hash=sha256:5badfd805fd88bf99b4b4f044f6e8f762f1892cab27477f4427bb473e93dd049
-          REQUIREMENTS
-          uv-venv/bin/python -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement uv-requirements.txt
-          uv="$work/uv-venv/bin/uv"
-          # The product's own CI install (.github/actions/python-ci-env at the
-          # pin), less its lu-machinery release: the candidate replaces it.
-          python -I -m venv --without-pip product-venv
-          grep -viE -e '^(torch|torchvision|open_clip_torch|stanza)==' -e '^\./packages/v4-runtime$' \
-            "$product/requirements-lock.txt" > product-requirements.txt
-          # --no-config: the product checkout sits inside this repository, whose
-          # pyproject.toml [tool.uv] pins this workflow's uv, not the product's.
-          "$uv" pip install --no-config --python product-venv/bin/python --no-deps -r product-requirements.txt
-          cd "$product"
-          "$uv" pip install --no-config --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
-          "$work/product-venv/bin/python" packages/v4-runtime/build_assets.py
+          # Match the pinned product's python-ci-env install. The release cut
+          # collection step overlays this environment behind the candidate wheel.
+          echo "uv sync --locked from product@$(git rev-parse HEAD)"
+          uv sync --locked --python "$PYTHON" \
+            --no-install-package torch --no-install-package torchvision \
+            --no-install-package open-clip-torch --no-install-package stanza \
+            --no-install-package lu-machinery
+          "$UV_PROJECT_ENVIRONMENT/bin/python" packages/v4-runtime/build_assets.py
 
       - name: Collect the product's tests with the candidate first
-        if: steps.consumer.outputs.run == 'true'
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/installed-wheel"
@@ -1682,7 +1647,6 @@ jobs:
           fi
 
       - name: Run the key consumer tests with the candidate first
-        if: steps.consumer.outputs.run == 'true'
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/installed-wheel"
