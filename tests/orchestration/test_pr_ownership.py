@@ -403,6 +403,11 @@ def test_accept_refuses_while_a_live_task_owns_the_branch_or_successor_is_not_li
     records = [task("live-owner"), task("succ", "claude/queue"), task("dead", "claude/d", "done")]
     with pytest.raises(own.OwnershipError, match="live-owner"):
         do_accept(own._empty(), records)
+    without_binding = [{**records[0], "repository": None}, *records[1:]]
+    data = own._empty()
+    with pytest.raises(own.OwnershipError, match="live-owner"):
+        do_accept(data, without_binding)
+    assert data["handoffs"] == {}
     with pytest.raises(own.OwnershipError, match="not live"):
         do_accept(own._empty(), records, successor="dead")
     with pytest.raises(own.OwnershipError, match="unknown"):
@@ -419,6 +424,9 @@ def test_custody_needs_the_live_waiting_owner_as_predecessor():
         do_accept(own._empty(), records, successor="integration", predecessor="waiter")
     with pytest.raises(own.OwnershipError, match="live owner"):
         do_accept(own._empty(), records, successor="integration", predecessor="stranger", custody=True)
+    without_binding = [{**records[0], "repository": None}, *records[1:]]
+    with pytest.raises(own.OwnershipError, match="live owner"):
+        do_accept(own._empty(), without_binding, successor="integration", predecessor="waiter", custody=True)
     data = own._empty()
     receipt = do_accept(data, records, successor="integration", predecessor="waiter", custody=True)
     assert receipt["custody"] == list(own.CUSTODY_COVERS) and receipt["predecessor"] == "waiter"

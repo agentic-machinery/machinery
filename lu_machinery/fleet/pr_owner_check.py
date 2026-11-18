@@ -24,7 +24,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.fleet.pr_identity import RecordRepositoryRefusal, record_repository
+from lu_machinery.fleet.pr_identity import (
+    ACTIVE_TASK_STATUSES,
+    RecordRepositoryRefusal,
+    record_repository,
+    supervisor_liveness,
+)
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 
 # The machinery package's import name, which is also the directory its files have in checkout
@@ -33,7 +38,6 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 # This CLI as it was started: by its import name under ``-m``, else by its file.
 _ENTRY = f"-m {__spec__.name}" if __spec__ is not None else os.fspath(__file__)
 
-_ACTIVE = {"spawning", "running"}
 _GH_TIMEOUT_SECONDS = 60
 _PR_LIMIT = 200
 # ``headRefOid`` lets the ownerless alert fetch the head commit's X-Agent trailer. Never list
@@ -51,21 +55,11 @@ class Unowned:
     unknown: bool = False
 
 
-def _supervisor_alive(record: dict) -> bool:
-    """True only on positive evidence: the recorded pid still has the recorded start identity."""
-    pid, started = record.get("pid"), record.get("process_start")
-    if not pid or not started:
-        return False
-    from lu_machinery.dispatcher.worker import _identity
-
-    return _identity(pid) == started
-
-
 def evaluate(
     open_prs: Mapping[str, list[dict]],
     records: list[dict],
     repos: Mapping[str, FleetRepo],
-    alive: Callable[[dict], bool] = _supervisor_alive,
+    alive: Callable[[dict], bool | None] = supervisor_liveness,
 ) -> list[Unowned]:
     """Return every open PR lacking a verifiably live, repository-bound owner."""
     by_branch: dict[tuple[str, str], list[dict]] = {}
@@ -77,7 +71,7 @@ def evaluate(
         try:
             slug = record_repository(record, repos)
         except RecordRepositoryRefusal as exc:
-            if record.get("status") in _ACTIVE and alive(record):
+            if record.get("status") in ACTIVE_TASK_STATUSES and alive(record) is not False:
                 unbound[branch] = exc.code
             continue
         by_branch.setdefault((slug.casefold(), branch), []).append(record)
@@ -87,21 +81,28 @@ def evaluate(
             branch = pr.get("headRefName") or ""
             fork = bool(pr.get("isCrossRepository"))
             tasks = [] if fork else by_branch.get((slug.casefold(), branch), [])
-            if any(t.get("status") in _ACTIVE and alive(t) for t in tasks):
+            states = {alive(t) for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES}
+            if True in states:
                 continue
             if not fork and branch in unbound:
                 unowned.append(Unowned(slug, int(pr["number"]), branch, unbound[branch], unknown=True))
                 continue
             last = max(tasks, key=lambda t: t.get("started_at") or "", default=None)
-            if last is None:
+            unknown = None in states
+            if unknown:
+                reason = "an active owner's supervisor is not verifiably alive"
+            elif last is None:
                 reason = "fork PR: no branch owner possible" if fork else "no task record owns this branch"
-            elif last.get("status") in _ACTIVE:
+            elif last.get("status") in ACTIVE_TASK_STATUSES:
                 reason = f"last owner {last['status']} but its supervisor is not verifiably alive"
             elif last.get("status") == "done":
                 reason = "last owner finished done, PR still open (not MERGED)"
             else:
                 reason = f"last owner ended {last.get('status')}, PR not MERGED"
-            unowned.append(Unowned(slug, int(pr["number"]), branch, reason, last.get("task_id") if last else None))
+            unowned.append(Unowned(
+                slug, int(pr["number"]), branch, reason, last.get("task_id") if last else None,
+                unknown=unknown,
+            ))
     return unowned
 
 

@@ -34,7 +34,7 @@ import re
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from lu_machinery.common import github_client, json_depth
 
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = 30.0
 _REPO_SLUG_TIMEOUT_SECONDS = 15.0
+ACTIVE_TASK_STATUSES = frozenset({"spawning", "running"})
 
 # Same isolation contract as the reaper modules: gh/git must resolve nothing
 # from a stray GIT_* environment pointing at an unrelated checkout.
@@ -97,6 +98,33 @@ def record_repository(record: Mapping[str, object], repos: Mapping[str, FleetRep
     if len(selected) != 1:
         raise RecordRepositoryRefusal("task_repository_conflict")
     return selected.pop()
+
+
+def supervisor_liveness(record: Mapping[str, Any] | None) -> bool | None:
+    """Check the dispatch supervisor's recorded boot ID and process start time.
+
+    ``None`` means the record or host lacks the evidence needed to decide.
+    """
+    if record is None or record.get("status") not in ACTIVE_TASK_STATUSES:
+        return False
+    pid, started = record.get("pid"), record.get("process_start")
+    if not pid or not isinstance(started, str) or not started:
+        return None
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+    except FileNotFoundError:
+        return False if Path("/proc/self/stat").exists() else None
+    except (OSError, ValueError, TypeError):
+        return None
+    try:
+        fields = stat.rsplit(")", 1)[1].split()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        start_ticks = fields[19]
+    except (OSError, IndexError):
+        return None
+    if fields[0] == "Z":
+        return False
+    return f"{boot}:{start_ticks}" == started
 
 
 def _sanitized_env() -> dict[str, str]:

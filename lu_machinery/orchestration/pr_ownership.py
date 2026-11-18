@@ -47,6 +47,7 @@ if __package__ in (None, ""):
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.task_store_paths import tasks_dir
+from lu_machinery.fleet.pr_identity import supervisor_liveness as liveness
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -67,7 +68,6 @@ CTO_CHANNEL = "cto"
 SENDER = "merge-queue-keeper"
 TASK_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 HISTORY_LIMIT = 200
-_ACTIVE = {"spawning", "running"}
 # Compiled at the call. A module-level ``re.compile`` plus a later method call is one
 # Semgrep match spanning every byte in between, so an edit in that span is a new finding.
 
@@ -468,35 +468,6 @@ class Finding:
     pr_state: str | None = None
 
 
-def liveness(record: Mapping[str, Any] | None) -> bool | None:
-    """True for a live supervisor, False for a finished task or a provably gone or replaced
-    supervisor, None when the record or the host gives no identity to observe.
-
-    The identity is the one ``scripts.dispatcher.worker`` records (boot id and process
-    start time), read here so that an unreadable source stays unknown instead of gone.
-    """
-    if record is None or record.get("status") not in _ACTIVE:
-        return False
-    pid, started = record.get("pid"), record.get("process_start")
-    if not pid or not started:
-        return None
-    try:
-        stat = Path(f"/proc/{int(pid)}/stat").read_text()
-    except FileNotFoundError:
-        return None if not Path("/proc/self/stat").exists() else False
-    except (OSError, ValueError, TypeError):
-        return None
-    try:
-        fields = stat.rsplit(")", 1)[1].split()
-        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        start_ticks = fields[19]
-    except (OSError, IndexError):
-        return None
-    if fields[0] == "Z":
-        return False
-    return f"{boot}:{start_ticks}" == started
-
-
 def _head_commit(pr: Mapping[str, Any]) -> Mapping[str, Any] | None:
     """The commit at ``headRefOid``. With no oid, the last commit. Never a different oid."""
     commits = pr.get("commits")
@@ -848,18 +819,21 @@ def accept(
         if previous and not decision_custody(previous) else {}
     )
 
-    def owns(record: Mapping[str, Any]) -> bool:
+    def ownership(record: Mapping[str, Any]) -> bool | None:
         target = {repo: [{**pr, "number": number}]}
-        return not findings(target, [dict(record)], repos, seated, live=lambda _record: True)
+        rows = findings(target, [dict(record)], repos, seated, live=lambda _record: True)
+        if not rows:
+            return True
+        return None if rows[0].unknown else False
 
     if custody and not (
-        (record := by_id.get(predecessor)) is not None and owns(record) and live(record) is True
+        (record := by_id.get(predecessor)) is not None and ownership(record) is True and live(record) is True
     ):
         raise OwnershipError("queue custody needs the PR's live owner that is waiting in the queue (--from)")
     blocking = sorted(
         record["task_id"] for record in records
         if record.get("task_id") not in {successor, predecessor}
-        and live(record) is not False and owns(record)
+        and live(record) is not False and ownership(record) is not False
     )
     if blocking:
         raise OwnershipError(f"one owner at a time: {', '.join(blocking)} may still own this PR")

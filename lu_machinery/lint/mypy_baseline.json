@@ -4673,11 +4673,6 @@
       "message": "Returning Any from function declared to return \"CompletedProcess[str]\""
     },
     {
-      "path": "lu_machinery/fleet/pr_owner_check.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"bool\""
-    },
-    {
       "path": "lu_machinery/fleet/quota_history.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
@@ -6836,11 +6831,6 @@
       "path": "lu_machinery/orchestration/orchestrator_control.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/orchestration/pr_ownership.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | bool\""
     },
     {
       "path": "lu_machinery/orchestration/pr_ownership.py",

@@ -3,6 +3,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +90,7 @@ def test_fork_pr_is_never_owned_by_a_same_named_branch():
 def test_legacy_record_needs_an_explicit_repository_binding():
     legacy = {"task_id": "old", "worktree_branch": "x", "status": "running", "started_at": "2026-10-01"}
     prs = {PUBLIC: [pr(1, "x")], MACHINERY: [pr(1, "x")]}
-    assert [(row.repo, row.unknown, row.reason) for row in run(prs, [legacy])] == [
+    assert [(row.repo, row.unknown, row.reason) for row in check.evaluate(prs, [legacy], REPOS)] == [
         (PUBLIC, True, "task_repository_missing"),
         (MACHINERY, True, "task_repository_missing"),
     ]
@@ -99,28 +100,39 @@ def test_legacy_record_needs_an_explicit_repository_binding():
     assert {row.reason for row in run(prs, [conflicting])} == {"task_repository_conflict"}
 
 
+def fake_supervisor(monkeypatch, *, running):
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if str(path) == "/proc/4242/stat":
+            if not running:
+                raise FileNotFoundError(path)
+            return "4242 (fixture) S" + " 0" * 18 + " 1 0"
+        if str(path) == "/proc/sys/kernel/random/boot_id":
+            return "boot\n"
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+
+
 @pytest.mark.parametrize(
     "extra",
     [
         {},  # spawning/running with no supervisor evidence
         {"pid": 4242},  # pid without the recorded start identity
         {"pid": 4242, "process_start": None},
-        {"pid": 4242, "process_start": "boot:1"},  # the pid is gone: identity lookup returns None
+        {"pid": 4242, "process_start": "boot:1"},  # the supervisor's proc entry is absent
     ],
 )
 def test_real_liveness_needs_positive_supervisor_identity(monkeypatch, extra):
-    from lu_machinery.dispatcher import worker
-
-    monkeypatch.setattr(worker, "_identity", lambda pid: None)
+    fake_supervisor(monkeypatch, running=False)
     for status in ("running", "spawning"):
         (finding,) = check.evaluate({PUBLIC: [pr(1, "x")]}, [task("t", "x", status, **extra)], REPOS)
         assert "not verifiably alive" in finding.reason
 
 
 def test_real_liveness_accepts_matching_identity(monkeypatch):
-    from lu_machinery.dispatcher import worker
-
-    monkeypatch.setattr(worker, "_identity", lambda pid: "boot:1" if pid == 4242 else None)
+    fake_supervisor(monkeypatch, running=True)
     live = task("t", "x", "running", pid=4242, process_start="boot:1")
     assert check.evaluate({PUBLIC: [pr(1, "x")]}, [live], REPOS) == []
     reused = task("t", "x", "running", pid=4242, process_start="boot:2")
@@ -132,9 +144,7 @@ def live(task_id, branch, repository=PUBLIC):
 
 
 def patch_world(monkeypatch, prs, records, repos=REPOS):
-    from lu_machinery.dispatcher import worker
-
-    monkeypatch.setattr(worker, "_identity", lambda pid: "boot:1")
+    fake_supervisor(monkeypatch, running=True)
     monkeypatch.setattr(check, "load_fleet_repos", lambda: repos)
     monkeypatch.setattr(check, "fetch_open_prs", lambda slug: prs.get(slug, []))
     from lu_machinery.dispatcher import store
@@ -152,6 +162,10 @@ def test_main_exit_codes_and_output(monkeypatch, capsys):
     patch_world(monkeypatch, prs, [*owners, live("m", "b", MACHINERY)])
     assert check.main([]) == 0
     assert capsys.readouterr().out == ""
+    patch_world(monkeypatch, prs, [*owners, task("unbound", "b", "spawning", repository=None)])
+    assert check.main(["--json"]) == 2
+    (row,) = json.loads(capsys.readouterr().out)
+    assert row["repo"] == MACHINERY and row["unknown"] and row["reason"] == "task_repository_missing"
 
 
 def test_unreadable_github_is_unknown_not_clean(monkeypatch, capsys):
