@@ -60,17 +60,22 @@ _CATEGORY_ORDER: tuple[str, ...] = (
     "other",
 )
 
+# ``\s*:?\s*`` is quadratic: the optional colon does not anchor the split, so a
+# keyword plus a long space run (and no ``#``) makes the two ``\s*`` try every
+# partition. ``\s*(?::\s*)?`` is the same language — whitespace, then an optional
+# colon and the whitespace after it — and that failure is linear.
 _SUPERSEDED_RE = re.compile(
     # ``superseded-by`` / ``supersedes`` / ``closes`` / ``replaces`` /
     # ``obsoletes``. Catches both the "this issue is-superseded-by X"
     # and "this issue supersedes X" phrasings (the latter flagged by
     # Codex on #1312 pre-merge as a regex gap).
     r"(?:superseded[- ]?by|supersedes|closes|replaces|obsoletes)"
-    r"\s*:?\s*(?:standalone\s+)?#(\d+)",
+    r"\s*(?::\s*)?(?:standalone\s+)?#(\d+)",
     re.IGNORECASE,
 )
 _MERGED_IN_RE = re.compile(
-    r"(?:merged[- ]?in|landed[- ]?in|shipped[- ]?in|fixed[- ]?in)\s*:?\s*(?:PR\s*)?#(\d+)",
+    r"(?:merged[- ]?in|landed[- ]?in|shipped[- ]?in|fixed[- ]?in)"
+    r"\s*(?::\s*)?(?:PR\s*)?#(\d+)",
     re.IGNORECASE,
 )
 
