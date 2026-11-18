@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -1597,20 +1598,34 @@ def _kimi_request_error(args) -> str | None:
     return None
 
 
+# argparse's own test for a positional that starts with "-": a negative number.
+_NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+
+
+def _is_option_token(token: str) -> bool:
+    """Whether argparse parses *token* as an option rather than a positional."""
+    return (
+        token.startswith("-")
+        and token != "-"
+        and " " not in token
+        and _NEGATIVE_NUMBER.fullmatch(token) is None
+    )
+
+
 def main():
     """CLI entry point."""
     argv = sys.argv[1:]
     # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
-    # A ``--`` may end options before the verb or before the id. Help (``-h``,
-    # ``--help``), the verbs' only option, goes to argparse; any other token in the
-    # id position (``12``, ``-12``, ``-``, ``-1.5``) is an id. _dispatch_command
-    # checks the parsed id again.
+    # A ``--`` may end options before the verb or before the id. An option token
+    # (help in any spelling argparse accepts: ``-h``, ``-hh``, ``--he``) goes to
+    # argparse. Tokens argparse reads as positionals (``12``, ``-12``, ``-``,
+    # ``-1.5``, ``- 12``) are ids. _dispatch_command checks the parsed id again.
     words = argv[1:] if argv[:1] == ["--"] else argv
     if words and words[0] in _JOB_ID_VERBS:
         rest = words[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
-        elif rest[:1] and rest[0] in ("-h", "--help"):
+        elif rest[:1] and _is_option_token(rest[0]):
             rest = []
         if rest and not rest[0].startswith("authority-job_"):
             refuse_retired_verb(f"{words[0]} <message-id>", _JOB_ID_VERBS[words[0]])
