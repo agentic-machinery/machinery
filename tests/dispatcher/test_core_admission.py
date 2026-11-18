@@ -1063,10 +1063,19 @@ def test_cto_safe_mode_refuses_a_cto_write_dispatch(admission_dispatch, tmp_path
     assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
 
 
-def test_cto_write_dispatch_runs_without_a_safe_mode_file(admission_dispatch, tmp_path, monkeypatch, capsys):
-    """Defect class: the safe-mode check refuses a CTO seat that is not in safe mode."""
-    _cto_seat(monkeypatch, tmp_path, None)
-    assert admission_dispatch.dispatch() == 0
+@pytest.mark.parametrize("directory_mode", [None, 0o300], ids=["no-directory", "cleared-traverse-only-directory"])
+def test_cto_write_dispatch_runs_without_a_safe_mode_file(admission_dispatch, tmp_path, monkeypatch, capsys,
+                                                         directory_mode):
+    """Defect class: the safe-mode check refuses a CTO seat that is not in safe mode, or once the file is cleared."""
+    path = _cto_seat(monkeypatch, tmp_path, None)
+    if directory_mode is not None:
+        path.parent.mkdir()
+        path.parent.chmod(directory_mode)
+    try:
+        assert admission_dispatch.dispatch() == 0
+    finally:
+        if directory_mode is not None:
+            path.parent.chmod(0o700)
     assert "CTO_SAFE_MODE" not in capsys.readouterr().err
     assert [record["task_id"] for record in admission_dispatch.spawned] == ["adm-worker"]
 
@@ -1097,11 +1106,12 @@ def test_cto_safe_mode_keeps_read_only_dispatch(admission_dispatch, tmp_path, mo
     assert bool(flags) is (len(captured.out.strip()) == 64)
 
 
-def test_cto_safe_mode_leaves_a_dispatched_worker_alone(admission_dispatch, tmp_path, monkeypatch, capsys):
-    """Defect class: safe mode stops a running worker's own chain (a worker inherits no CTO seat)."""
+@pytest.mark.parametrize("flags", [(), ("--initiator", "claude-cto")], ids=["plain", "copied-cto-initiator"])
+def test_cto_safe_mode_leaves_a_dispatched_worker_alone(admission_dispatch, tmp_path, monkeypatch, capsys, flags):
+    """Defect class: safe mode stops a running worker's own chain, even one that copies the CTO's initiator."""
     _cto_seat(monkeypatch, tmp_path, _SAFE_MODE)
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-parent")
-    assert admission_dispatch.dispatch() == 0
+    assert admission_dispatch.dispatch(*flags) == 0
     assert "CTO_SAFE_MODE" not in capsys.readouterr().err
     assert admission_dispatch.spawned[0]["parent_task_id"] == "worker-parent"
 

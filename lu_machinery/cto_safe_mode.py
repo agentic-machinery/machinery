@@ -15,8 +15,9 @@ The CTO seat is identified by the launcher's environment: ``start-claude-cto.sh`
 ``SESSION_SEAT=cto`` and every epics-lane driver exports ``SESSION_EPIC=epics``. A dispatched worker's
 environment is an allowlist (``dispatcher.environment.child_env``) that carries neither, and it always
 carries ``LEARN_UKRAINIAN_DISPATCH_TASK_ID``; a process inside a write boundary carries the broker
-variable. Either marker makes the caller a worker, never the CTO seat. A dispatch may also name the
-CTO seat explicitly with ``--initiator claude-cto`` (or a session id ``claude-cto-<id>``).
+variable. Either marker makes the caller a worker, never the CTO seat, whatever ``--initiator`` it
+passes (workers do copy the CTO's ``--initiator claude-cto``). Outside a worker, a dispatch that names
+the CTO seat with ``--initiator claude-cto`` (or a session id ``claude-cto-<id>``) is the CTO seat.
 """
 
 from __future__ import annotations
@@ -42,17 +43,34 @@ class SafeModeError(ValueError):
 
 
 def safe_mode_file() -> Path:
-    """The one configured location, expanded against the caller's home directory."""
-    return Path(config.CTO_SAFE_MODE_FILE).expanduser()
+    """The one configured location, expanded against the caller's home directory.
+
+    A home that cannot be resolved, or a location that does not expand to an absolute path, raises
+    ``SafeModeError``: the state is unknown, never absent.
+    """
+    value = config.CTO_SAFE_MODE_FILE
+    if value.startswith("~/"):
+        # Python expands an empty HOME to "/" and a relative one to a relative path; neither is the seat's home.
+        if "HOME" in os.environ and not os.path.isabs(os.environ["HOME"]):
+            raise SafeModeError("location cannot be resolved (HOME is empty or not absolute)")
+        try:
+            home = Path.home()
+        except (RuntimeError, KeyError):
+            raise SafeModeError("location cannot be resolved (no home directory)") from None
+        return home / value[2:]
+    path = Path(value)
+    if not path.is_absolute():
+        raise SafeModeError("location is not an absolute path")
+    return path
 
 
 def is_cto_caller(environment: Mapping[str, str], initiator: str | None = None) -> bool:
     """True when the caller is the CTO seat, by explicit initiator or by its launcher environment."""
+    if any(environment.get(marker) for marker in _WORKER_MARKERS):
+        return False
     name = " ".join(str(initiator or "").split())
     if name == CTO_SEAT or name.startswith(f"{CTO_SEAT}-"):
         return True
-    if any(environment.get(marker) for marker in _WORKER_MARKERS):
-        return False
     return environment.get("SESSION_SEAT") == "cto" or environment.get("SESSION_EPIC") == "epics"
 
 
@@ -61,7 +79,8 @@ def _read_bounded(path: Path) -> bytes:
 
     Only a missing parent directory or a missing entry raises ``FileNotFoundError``.
     """
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    # O_PATH needs only search permission on the directory, as a plain lookup of the file would.
+    directory = os.open(path.parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         fd = safe_open_below(directory, path.name, os.O_RDONLY)
     finally:
