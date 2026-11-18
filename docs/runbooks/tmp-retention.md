@@ -17,7 +17,7 @@ pytest scratch is deleted directly, without quarantine.
 
 `learn-ukrainian-tmp-sweep.timer` runs every hour at 30 minutes past, UTC,
 with up to 10 minutes of random delay. Missed runs catch up. It starts
-`learn-ukrainian-tmp-sweep.service`, which runs two steps in order:
+`learn-ukrainian-tmp-sweep.service`, which runs three steps in order:
 
 1. `lu_machinery.hygiene.batch_state_retention`: the read-only staleness report.
 2. `lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary`: the
@@ -25,6 +25,8 @@ with up to 10 minutes of random delay. Missed runs catch up. It starts
    ones and deletes inactive, unheld pytest run folders. It logs counts and
    byte totals only, never entry names; the ledger holds the quarantined
    names.
+3. `lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary`: explicit
+   batch_state scratch expiry (see below).
 
 The unit does not set `RestrictAddressFamilies=`. In a user manager every
 seccomp setting forces `NoNewPrivileges=yes`, and sudo then refuses to run.
@@ -190,19 +192,68 @@ overrides a task that is still unsettled.
 ### Dispatched task scratch
 
 Every dispatched worker gets `LU_TASK_SCRATCH=/var/tmp/<task-id>` in its
-environment; the worker creates the directory when it needs it, and `TMPDIR`
-is unchanged. When the task settles and the dispatcher removes its worktree
-(`worktree_disposition: removed`), it deletes that directory too, directly and
-without quarantine. A retained worktree keeps its scratch. The task record
-shows the result next to the worktree disposition: `task_scratch_disposition`
-(`removed`, `absent`, `retained`, `refused` or `failed`),
-`task_scratch_disposition_reason` and `task_scratch_bytes` (file bytes found
-before deletion). Only the exact child named by a valid task id is
-considered. A symlink, a non-directory, an entry another user owns, one on
-another filesystem or one with a mount below it is refused; deletion never
-follows a symlink and makes read-only directories writable before emptying
-them. A refusal or failure is recorded and never fails settlement; whatever
-stays is left to the rules above.
+environment. For a workspace-write worker it is also `TMPDIR`, so Python's
+`tempfile`, uv, Git and Node put their temp files there. Managed pytest
+scratch keeps its own root and removal ([Inactive pytest
+scratch](#inactive-pytest-scratch)). The supervisor creates
+the directory before any launch check runs a provider command with it, and
+records its identity as `task_scratch` (path, device, inode). Creation is
+exclusive: an entry already at the name is never adopted, and the launch fails
+as `task_scratch_unavailable`. The directory held after creation must be
+empty, private (mode 0700), owned by the agent user and on its base's mount,
+or the launch fails the same way. Read-only routes keep their boundary's
+private `TMPDIR`, and seats and hooks outside a task keep their own. A path a
+worker hard-codes, such as `/tmp/<name>`, is outside this scratch.
+
+Settlement removes exactly the recorded directory, directly and without
+quarantine, whatever the task's terminal status and even when the worktree is
+kept. It needs fresh proof, from the run's own launch identity, that the
+provider's whole process tree is gone. For a scope launch that is an empty
+scope cgroup, which covers every descendant. The recorded unit must be the one
+named for the task and its run nonce before either cgroup lookup, and a
+recorded cgroup counts only as that unit's canonical path; anything else is
+unknown and keeps the scratch. Another scope named for the same task and run
+nonce (a re-dispatch that reuses the nonce gets a fresh unit token) that still
+holds a process keeps it too. A fallback (non-scope) launch's tree is never
+proven gone, so settlement never releases its scratch: it is kept for good
+(`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit
+inventories `/tmp` only, so that rule reaches `/var/tmp` only in a run with
+`--temp-root /var/tmp`. A recorded disposition is never taken as proof. Once
+the provider is proven gone, when no task process is left to register another
+service, settlement stops and checks every service the record and the
+scratch's `task-services.txt` name, and a service not proven stopped keeps the
+scratch.
+
+The checks before removal keep the tree whole (`in_use`) when it holds a
+socket, a FIFO or an entry named `tmux-*` or `ssh-*` (the scratch's own name
+does not count), or when another process that `/proc` lets the agent user read
+holds any part of it as its working directory, root, executable, open
+descriptor or mapping. Holders are matched by device and inode through the
+process's view and each of its threads', never by name. A file also linked
+from outside the scratch, such as a package cache's link, counts only when the
+reference is not proven to come through an outside name. Once removal has
+started, an I/O error can leave part of the tree: that pass records `failed`,
+and the next pass checks and removes what remains.
+
+The task record shows the result next to the worktree disposition:
+`task_scratch_disposition`, `task_scratch_disposition_reason` and
+`task_scratch_bytes`: what the pass that recorded the disposition found
+before removal, in allocated bytes of the directories and of the files whose
+every name lies in the scratch (none when that pass did not measure). The
+dispositions are `removed`, `absent`, `retained` (the provider is not proven
+gone, or a service is not proven stopped), `in_use`, `failed`, `kept` and
+`refused`. The hourly settlement sweep retries `retained`, `in_use` and
+`failed`, and a scratch a dead supervisor never settled; only the walk before
+removal can refuse for good. Only the seven terminal statuses read as
+finished, and a record whose fields are malformed is left as it is and never
+stops the sweep. A directory the run did not record is refused, and so is a
+changed identity, a symlink, a non-directory, an entry another user owns, one
+on another filesystem or one with a mount below it. Removal never follows a
+symlink, never leaves the scratch's device or mount, and makes unreadable or
+unsearchable directories accessible to their owner before emptying them. A
+scratch path longer than 72 bytes refuses the launch, since a Unix socket
+below `TMPDIR` must fit the kernel's 107-byte limit. A refusal or failure is
+recorded and never fails settlement.
 
 ### Listening sockets
 

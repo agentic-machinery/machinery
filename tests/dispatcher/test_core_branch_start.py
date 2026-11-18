@@ -157,7 +157,7 @@ def test_additional_task_prs_recover_split_branch_delivery(
     world.record["repo"] = "fixture"
     monkeypatch.setattr(git, "resolve_repo", lambda _: (root, {}))
     monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
-    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
+    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _record, **_kwargs: None)
     monkeypatch.setattr(worker, "_reap_worktree", lambda record, **_: record.update(worktree_disposition="removed"))
     calls = []
 
@@ -722,15 +722,25 @@ def test_pushed_write_task_removes_its_worktree_at_settle(sandbox, model, flags,
     ("unpushed", ["--branch", "release"], "remote_mismatch"),
 ])
 def test_dirty_or_unpublished_write_task_keeps_worktree_with_reason(sandbox, model, flags, reason):
-    """Defect: settlement must never discard uncommitted or unpublished work, and must say why it kept it."""
+    """Defect: settlement must never discard uncommitted or unpublished work, and must say why it kept it.
+
+    Defect (CLEANUP-WORKFILES-1118): a write worker's temp files went to the host temp area. Its TMPDIR is now the
+    task scratch. These stub workers run as fallback launches, whose tree is never proven gone, so settlement keeps
+    the scratch for tmp_sweep's settled-task rule instead of removing it.
+    """
     run_git(sandbox.repo, "push", "origin", "main:release")
-    record = sandbox.settle(sandbox.dispatch(model, "--mode", "workspace-write", *flags), expected=1)
+    task = sandbox.dispatch(model, "--mode", "workspace-write", *flags)
+    record = sandbox.settle(task, expected=1)
     assert record["status"] == "no_deliverable"
     assert (record["worktree_disposition"], record["worktree_disposition_reason"]) == ("retained", reason)
     tree = Path(record["worktree_path"])
     assert (tree / "delivered.txt").exists()
     assert record["worktree_branch"] in local_branches(sandbox.repo)
     assert run_git(tree, "rev-parse", "HEAD") == record["head_sha"]
+    leftover = Path((sandbox.tasks / f"{task[0]}.tmpfile").read_text())
+    assert leftover.parent == sandbox.scratch_base / task[0] and leftover.read_bytes() == b"t" * 4096
+    assert (record["launch_mode"], record["task_scratch_disposition"]) == ("popen-fallback", "kept")
+    assert record["task_scratch_disposition_reason"].startswith("a fallback launch's process tree is never proven")
 
 
 @pytest.mark.usefixtures('configured_roots')

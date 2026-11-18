@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import shlex
+import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -16,7 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
 import yaml
-from lu_machinery.dispatcher import environment, store, worker
+from lu_machinery.dispatcher import environment, scratch, store, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.dispatcher.conftest import SOURCE, await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -283,11 +285,12 @@ def _settle_with_worktree(monkeypatch, tmp_path, state):
     base = tmp_path / "var-tmp"
     base.mkdir()
     monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)  # the test base is longer than a real one
     monkeypatch.setattr(worker, "_end_own_scope", lambda _record: None)
     monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
     monkeypatch.setattr(worker.git, "settle_worktree", lambda *_args, **_kwargs: {
         "worktree_disposition": state, "worktree_disposition_reason": "clean" if state == "removed" else "dirty"})
-    record = {"task_id": "scratch-task"}
+    record = {"task_id": "scratch-task", "launch_mode": "scope"}
     return base, record
 
 
@@ -385,21 +388,33 @@ def test_settlement_stops_a_task_scoped_transient_service(monkeypatch, tmp_path)
 
 def test_settlement_removes_the_task_scratch_including_a_read_only_directory(monkeypatch, tmp_path):
     """Defect class: scratch leak. A settled task whose worktree went left /var/tmp/<task-id> behind, and a
-    0500 directory a test left inside it refused deletion."""
+    0500 directory a test left inside it refused deletion. A readable directory without search permission
+    (0400, 0600) hid its entries from the walk, so every retry failed the same way (C4)."""
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    record["task_scratch"] = scratch.create("scratch-task")
     locked = base / "scratch-task" / "fixture" / "locked"
     locked.mkdir(parents=True)
-    (locked / "data").write_bytes(b"x" * 10)
+    (locked / "data").write_bytes(b"x" * 65536)
+    for mode in (0o400, 0o600):
+        unsearchable = base / "scratch-task" / f"mode-{mode:o}"
+        unsearchable.mkdir()
+        (unsearchable / "data").write_bytes(b"y" * 4096)
+        unsearchable.chmod(mode)
     locked.chmod(0o500)
     base.joinpath("scratch-task").chmod(0o500)
     worker._reap_settled(record)
-    assert not (base / "scratch-task").exists()
-    assert (record["task_scratch_disposition"], record["task_scratch_bytes"]) == ("removed", 10)
+    assert not (base / "scratch-task").exists(), record.get("task_scratch_disposition_reason")
+    assert record["task_scratch_disposition"] == "removed" and record["task_scratch_bytes"] >= 65536
 
 
 def test_settlement_refuses_a_symlinked_task_scratch_and_leaves_its_target(monkeypatch, tmp_path):
     """Defect class: symlink-following deletion. A symlink at /var/tmp/<task-id> led settlement to delete
-    the directory it points to."""
+    the directory it points to.
+
+    Defect class (CLEANUP-WORKFILES-1118, F1): removing a directory the run did not create. A task id can name
+    any entry of the base, so an entry already at the name is never adopted, and a directory swapped in before
+    the run held its own is accepted only when it is the fresh, empty, private directory the run would have had.
+    """
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
     target = tmp_path / "elsewhere"
     target.mkdir()
@@ -409,17 +424,344 @@ def test_settlement_refuses_a_symlinked_task_scratch_and_leaves_its_target(monke
     assert (base / "scratch-task").is_symlink() and (target / "keep").read_text() == "kept"
     assert record["task_scratch_disposition"] == "refused"
     assert record["worktree_disposition"] == "removed"  # the refusal never fails settlement
+    (base / "lu").mkdir()  # another service's directory at a task id's name
+    (base / "lu" / "shared").write_text("other service")
+    for taken in ("scratch-task", "lu"):
+        with pytest.raises(FileExistsError):
+            scratch.create(taken)
+    created = scratch.create("fresh-task")
+    info = (base / "fresh-task").stat()
+    assert info.st_mode & 0o777 == 0o700 and (created["dev"], created["ino"]) == (info.st_dev, info.st_ino)
+    for recorded in (None, {**created, "path": str(base / "lu")}, {**created, "dev": True}):
+        other = {"task_id": "lu", "launch_mode": "scope", "task_scratch": recorded}
+        worker._settle_task_scratch(other)
+        assert other["task_scratch_disposition"] == "refused" and (base / "lu" / "shared").exists()
+    real_mkdir = os.mkdir
+
+    def swapped(name, mode=0o777, *, dir_fd=None):  # another process fills the name before the run holds it
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        os.close(os.open(f"{name}/planted", os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=dir_fd))
+
+    monkeypatch.setattr(scratch.os, "mkdir", swapped)
+    with pytest.raises(ValueError, match="not a fresh private directory"):
+        scratch.create("swapped-task")
+    # F13: a TMPDIR too long for a Unix socket below it is refused before anything is created, with its reason.
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", len(str(base)) + 1 + len("short-id"))
+    with pytest.raises(ValueError, match="budget that leaves room for Unix sockets"):
+        scratch.create("short-id-but-longer")
+    assert not (base / "short-id-but-longer").exists()
 
 
-def test_retained_worktree_keeps_the_task_scratch(monkeypatch, tmp_path):
-    """Defect class: evidence loss. Scratch went while the worktree it serves was kept for inspection."""
+def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktree(monkeypatch, tmp_path):
+    """Defect class: temp leak (CLEANUP-WORKFILES-1118). The scratch is the write worker's TMPDIR, so keeping it
+    with a worktree retained for unpublished work kept its temp files for good.
+
+    Defect class (F9): deleting it under a provider that may still run. Only a fresh proof from the run's own
+    identity removes it, never a recorded disposition: a hold or damaged-record reason written while the
+    provider ran, or a supervisor that died first, still gets the probe, and a stale liveness reason is
+    probed again even when the worktree is gone.
+    """
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "retained")
-    (base / "scratch-task").mkdir()
-    (base / "scratch-task" / "log").write_text("evidence")
+    record["task_scratch"] = scratch.create("scratch-task")
+    (base / "scratch-task" / "pytest-of-user").write_bytes(b"x" * 65536)
     worker._reap_settled(record)
-    assert (base / "scratch-task" / "log").read_text() == "evidence"
-    assert record["task_scratch_disposition"] == "retained"
-    assert "worktree retained" in record["task_scratch_disposition_reason"]
+    assert not (base / "scratch-task").exists()
+    assert record["task_scratch_disposition"] == "removed" and record["task_scratch_bytes"] >= 65536
+    for reason in ("retention_hold", "task_record_damaged", None):
+        for alive in (True, None):
+            monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
+            held = {"task_id": "scratch-task", "status": "crashed", "worktree_disposition_reason": reason,
+                    "launch_mode": "scope", "task_scratch": scratch.create("scratch-task")}
+            (base / "scratch-task" / "in-use").write_text("live")
+            assert scratch.pending(held)
+            worker._settle_task_scratch(held)
+            assert (base / "scratch-task" / "in-use").read_text() == "live"
+            assert (held["task_scratch_disposition"], held["task_scratch_disposition_reason"]) == (
+                "retained", "the provider is not proven gone")
+            assert scratch.pending(held)
+            shutil.rmtree(base / "scratch-task")
+    # This pass's own verdict that the provider may run keeps the scratch even if a later probe would pass.
+    monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
+    stale = {"task_id": "scratch-task", "status": "done", "worktree_disposition": "retained", "launch_mode": "scope",
+             "worktree_disposition_reason": "provider_processes_alive", "task_scratch": scratch.create("scratch-task")}
+    worker._settle_task_scratch(stale, liveness_kept=True)
+    assert stale["task_scratch_disposition"] == "retained" and (base / "scratch-task").is_dir()
+    # A fallback launch's tree is never proven gone, so no pass (its supervisor's, the hourly sweep's, crash
+    # recovery's) releases its scratch, whatever the probe says: it is kept for tmp_sweep's settled-task rule.
+    for fallback_reason in ("provider_liveness_unknown", "borrowed_worktree", None):
+        fallback = {**stale, "launch_mode": "popen-fallback", "worktree_disposition_reason": fallback_reason}
+        worker._settle_task_scratch(fallback)
+        assert (fallback["task_scratch_disposition"], fallback["task_scratch_disposition_reason"]) == (
+            "kept", "a fallback launch's process tree is never proven gone; kept for tmp_sweep's settled-task rule")
+        assert (base / "scratch-task").is_dir() and not scratch.pending(fallback)
+    # The scratch holds task-services.txt, the list of services still to stop: one not proven stopped keeps it.
+    for stops in ([{"unit": "u", "postcondition": "false"}], [{"unit": "", "postcondition": "unknown"}], "damaged"):
+        unstopped = {**stale, "task_service_stops": stops}
+        worker._settle_task_scratch(unstopped)
+        assert (unstopped["task_scratch_disposition"], unstopped["task_scratch_disposition_reason"]) == (
+            "retained", "task services not proven stopped")
+        assert (base / "scratch-task").is_dir()
+    # A scope launch's later sweep pass probes again, whatever the stale reason, and the gone provider releases it.
+    stale["task_service_stops"] = [{"unit": "u", "postcondition": "true"}]
+    # F19: a service registered after the earlier stop is read from the scratch once the provider is proven gone,
+    # never before, and is stopped and checked before removal. One still active, or still deactivating after a
+    # failed stop (is-active exit 3), keeps the scratch.
+    from lu_machinery.orchestration import dispatch_isolation as iso
+
+    late = iso.task_service_name("scratch-task")
+    (base / "scratch-task" / "task-services.txt").write_text(f"{late}\n")
+    alerts: list[tuple[str, ...]] = []
+    monkeypatch.setattr(iso, "_publish_task_service_alert", lambda *args: alerts.append(args))
+    for code, state in ((0, "active"), (3, "deactivating")):
+        calls: list[list[str]] = []
+        monkeypatch.setattr(iso, "_systemctl", lambda argv, code=code, state=state, calls=calls: calls.append(
+            list(argv)) or subprocess.CompletedProcess(argv, 1 if "stop" in argv else code, stdout=f"{state}\n",
+                                                       stderr=""))
+        for alive, expected in ((True, "the provider is not proven gone"), (False, "task services not proven stopped")):
+            monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
+            registered = {**stale, "task_service_stops": list(stale["task_service_stops"])}
+            worker._settle_task_scratch(registered)
+            assert (registered["task_scratch_disposition"], registered["task_scratch_disposition_reason"]) == (
+                "retained", expected), state
+            assert (base / "scratch-task").is_dir() and bool(calls) is (not alive)
+        assert ["systemctl", "--user", "stop", f"{late}.service"] in calls
+    assert len(alerts) == 2  # one alert for each record whose service was left running
+    (base / "scratch-task" / "task-services.txt").unlink()
+    worker._settle_task_scratch(stale)
+    assert stale["task_scratch_disposition"] == "removed" and not (base / "scratch-task").exists()
+    assert not scratch.pending(stale)
+
+
+def test_settlement_keeps_a_scratch_holding_a_socket_fifo_agent_entry_or_held_path_whole(monkeypatch, tmp_path):
+    """Defect (2026-11-18): an age-only temp cleanup deleted a tmux server's socket directory and stranded the
+    live server. A server finds its socket or FIFO by path, so a scratch holding one, a tmux-*/ssh-* entry, or
+    anything another live process holds stays whole; the sweep retries it.
+
+    Defect class (F4): a holder matched by name misses a file literally named ``report (deleted)``, which /proc
+    spells like an unlinked one, and a process view misses a file a surviving thread holds after its leader
+    exited. Holders are matched by device and inode, through each thread's view too. The rule covers entries
+    inside the scratch, never the scratch's own name.
+    """
+    _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    (tmp_path / "linked").symlink_to(tmp_path, target_is_directory=True)
+    base = tmp_path / "linked" / "var-tmp"  # /proc names the real path; the base is reached through a link
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    tree = base / "scratch-task"
+
+    def settle(expected):
+        record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
+        worker._settle_task_scratch(record)
+        assert record["task_scratch_disposition"] == expected, record
+        return record
+
+    identity = scratch.create("scratch-task")
+    (tree / "pytest-of-user").mkdir()
+    (tree / "pytest-of-user" / "junk").write_bytes(b"j" * 65536)
+    (tree / "agents" / "tmux-1000").mkdir(parents=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    with listener:
+        monkeypatch.chdir(tree / "agents" / "tmux-1000")  # bind by relative name: the base can exceed sun_path
+        listener.bind("default")
+        listener.listen(1)
+        monkeypatch.chdir(tmp_path)
+        record = settle("in_use")
+        assert "socket, FIFO or tmux/ssh entry" in record["task_scratch_disposition_reason"]
+        assert scratch.pending(record) and (tree / "pytest-of-user" / "junk").exists()
+        monkeypatch.chdir(tree / "agents" / "tmux-1000")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect("default")  # the live server is still reachable
+        monkeypatch.chdir(tmp_path)
+    shutil.rmtree(tree / "agents")
+    for name in ("ssh-XXXXabcd", "tmux-1000"):
+        (tree / name).write_text("")
+        settle("in_use")
+        (tree / name).unlink()
+    os.mkfifo(tree / "pytest-of-user" / "pipe")
+    settle("in_use")
+    (tree / "pytest-of-user" / "pipe").unlink()
+    held = tree / "report (deleted)"
+    held.write_text("open")
+    # The first holder keeps the file in its main thread; the second in a thread that outlives its leader.
+    for code in ("import sys, time; f = open(sys.argv[1]); print(flush=True); time.sleep(120)",
+                 ("import ctypes, sys, threading, time\n"
+                  "ready = threading.Event()\n"
+                  "def hold():\n    f = open(sys.argv[1]); ready.set(); time.sleep(120)\n"
+                  "threading.Thread(target=hold).start(); ready.wait(); print(flush=True)\n"
+                  "ctypes.CDLL(None).pthread_exit(None)\n")):
+        holder = subprocess.Popen([sys.executable, "-c", code, str(held)], stdout=subprocess.PIPE)
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 30)
+            assert ready and holder.stdout.readline() == b"\n", "the holder never reported its open file"
+            record = settle("in_use")
+            assert record["task_scratch_disposition_reason"].endswith("1 live process(es) hold part of it")
+            assert held.read_text() == "open"
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+            holder.stdout.close()
+    # A file hard-linked in from outside (a package cache's link) keeps its outside name and data. A process that
+    # opened it through the scratch name holds a scratch path and keeps the scratch; one that opened it through
+    # the outside name holds nothing removal takes.
+    held.unlink()
+    cache = tmp_path / "cache.so"
+    cache.write_bytes(b"c" * 4096)
+    os.link(cache, tree / "linked.so")
+    code = "import sys, time; f = open(sys.argv[1]); print(flush=True); time.sleep(120)"
+    for opened, expected in ((tree / "linked.so", "in_use"), (cache, "removed")):
+        holder = subprocess.Popen([sys.executable, "-c", code, str(opened)], stdout=subprocess.PIPE)
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 30)
+            assert ready and holder.stdout.readline() == b"\n", "the holder never reported its open file"
+            record = settle(expected)
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+            holder.stdout.close()
+    assert not tree.exists() and record["task_scratch_bytes"] >= 65536 and cache.read_bytes() == b"c" * 4096
+    for name in ("tmux-task", "ssh-task"):  # a task id with an agent prefix names the scratch, not an entry in it
+        identity = scratch.create(name)
+        record = {"task_id": name, "status": "done", "launch_mode": "scope", "task_scratch": identity}
+        worker._settle_task_scratch(record)
+        assert record["task_scratch_disposition"] == "removed" and not (base / name).exists()
+
+
+def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(monkeypatch, tmp_path):
+    """Defect class (F12): a damaged record stopped the scheduled sweep or passed for proof. An array disposition or
+    status raised TypeError in a membership test, ending the pass before later records; such fields now read as
+    final or live. A recorded cgroup under the wrong parent made a missing cgroup file read as an exited provider,
+    and so did a missing or empty one, through a unit not bound to the task and run nonce, or a stale unit while a
+    scope of the same task and run nonce under a fresh token still ran. An out-of-range process-group id raised
+    OverflowError and ended the sweep.
+
+    Defect class (F10): bytes lost from the receipt. A removal that failed partway reported no bytes for the tree it
+    had found. The receipt is what the pass that recorded it found before removal, so a partial pass keeps it.
+    """
+    from lu_machinery.orchestration import dispatch_isolation as iso
+
+    base, _record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    (tmp_path / "tasks").mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    identity = scratch.create("scratch-task")
+    for damaged in ({"task_scratch_disposition": ["failed"]}, {"status": ["done"]}, {"status": None},
+                    {"status": "corrupt"}, {"task_scratch_disposition": {"in_use": 1}}):
+        record = {"task_id": "scratch-task", "status": "done", "task_scratch": identity, **damaged}
+        assert not scratch.pending(record)
+        assert not worker._holds_task_caches(record) or "status" not in damaged
+    for damaged in ({"status": ["done"]}, {"status": "corrupt"}, {"worktree_disposition_reason": ["dirty"]}):
+        assert not worker._unsettled({"task_id": "t", "status": "done", "worktree_disposition": "retained",
+                                      **damaged})
+        if "status" in damaged:  # read as live: nothing is walked or removed
+            assert worker._clear_task_caches({"task_id": "t", **damaged}) is False
+    assert not worker._same_tree(["damaged"], str(tmp_path)) and not worker._same_tree(str(tmp_path), 123)
+    # A recorded cgroup proves exit only as this launch's own scope; anything else is unknown, never gone.
+    monkeypatch.undo()
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)
+    monkeypatch.setattr(worker, "_end_own_scope", lambda _record: None)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    nonce = "0123456789abcdef0123456789abcdef"
+    unit = iso.scope_unit_name("scratch-task", nonce)
+    launch = {"task_id": "scratch-task", "run_nonce": nonce, "launch_mode": "scope", "launch_unit": unit}
+    canonical = iso.scope_cgroup(unit, uid=os.getuid())
+    for cgroup in (f"/nonexistent-parent/{unit}.scope", f"{canonical}/..", ["damaged"], [], ""):
+        assert worker._provider_alive({**launch, "launch_cgroup": cgroup}) is None
+    # The unit is bound to the task and run nonce before either lookup, so an unbound one is never looked up.
+    with monkeypatch.context() as bound:
+        bound.setattr(worker, "_scope_cgroups", lambda _unit: pytest.fail("an unbound unit was looked up"))
+        bound.setattr(worker, "_run_scope_cgroups", lambda *_args: pytest.fail("an unbound unit's run was looked up"))
+        for unbound in (iso.scope_unit_name("other-task", nonce), iso.scope_unit_name("scratch-task", "f" * 32),
+                        f"lu-worker-scratch-task-{nonce}", ["damaged"], None):
+            for cgroup in ({}, {"launch_cgroup": None}, {"launch_cgroup": []}, {"launch_cgroup": canonical}):
+                assert worker._provider_alive({**launch, "launch_unit": unbound, **cgroup}) is None
+    cgroup_v2 = Path("/sys/fs/cgroup/cgroup.controllers").exists()
+    if cgroup_v2:  # a gone canonical scope still proves exit
+        assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is False
+    # A re-dispatch that reuses the run nonce gets a fresh token: the recorded scope's absence proves nothing while
+    # another scope of this task and run nonce, whatever its token, holds a process (F12, round 1).
+    slice_dir = canonical.rpartition("/")[0]
+    sibling, foreign = iso.scope_unit_name("scratch-task", nonce), iso.scope_unit_name("other-task", nonce)
+    with monkeypatch.context() as listed:
+        listed.setattr(worker.os, "listdir", lambda path: [f"{sibling}.scope", f"{foreign}.scope", sibling, "x.scope"]
+                       if path == "/sys/fs/cgroup" + slice_dir else pytest.fail(f"listed {path}"))
+        assert worker._run_scope_cgroups(unit, "scratch-task", nonce) == [f"{slice_dir}/{sibling}.scope"]
+    with monkeypatch.context() as unlisted:
+        unlisted.setattr(worker, "_run_scope_cgroups", lambda *_args: None)  # the slice cannot be listed
+        assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is None
+    if cgroup_v2:
+        own = next(line.split("::", 1)[1] for line in Path("/proc/self/cgroup").read_text().splitlines()
+                   if line.startswith("0::"))
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        try:
+            with monkeypatch.context() as live:
+                live.setattr(worker, "_run_scope_cgroups", lambda *_args: [own])  # a sibling scope with a live process
+                assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is True
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+    # F18: a damaged process-group id is unknown liveness, never an OverflowError that ends the sweep.
+    for pgid in (2**63, -1, 0, "12", True, 1.5):
+        assert worker._provider_alive({"task_id": "t", "launch_mode": "popen-fallback", "provider_pgid": pgid}) is None
+    monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
+    # A damaged record is skipped, and the sweep still reaches the records after it.
+    reached = []
+    real_settle_left = worker._settle_left
+
+    def settle_left(record, salvage):
+        reached.append(record.get("task_id"))
+        real_settle_left(record, salvage)
+
+    damaged_records = [
+        {"schema_version": 2, "task_id": "bad-path", "status": "done", "worktree_path": ["bad"]},
+        {"schema_version": 2, "status": "done", "task_scratch": identity},
+        {"schema_version": 2, "task_id": "healthy", "status": "running"},
+    ]
+    monkeypatch.setattr(worker.store, "list_tasks", lambda: damaged_records)
+    monkeypatch.setattr(worker, "_observe", lambda record: record)
+    monkeypatch.setattr(worker, "_settle_left", settle_left)
+    worker.settle_left_worktrees()
+    assert reached == ["bad-path", None, "healthy"]
+    # Mount information a later pass may read is retried, a proven mount is final, at every check.
+    locked = base / "scratch-task" / "locked"
+    locked.mkdir()
+    info = locked.stat()
+    held = os.open(base / "scratch-task", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        device, mount_id = info.st_dev, scratch.task_scratch.fd_mount_id(held)
+        with monkeypatch.context() as unavailable:
+            unavailable.setattr(scratch.task_scratch, "fd_mount_id", lambda _fd: None)
+            with pytest.raises(scratch.task_scratch.ContainmentError) as error:
+                scratch._grant_owner_rwx(held, "locked", info, device=device, mount_id=mount_id)
+        assert scratch._census_outcome(error.value) == "failed"
+        with pytest.raises(scratch.task_scratch.ContainmentError) as error:
+            scratch._grant_owner_rwx(held, "locked", info, device=device, mount_id=mount_id + 1)
+        assert scratch._census_outcome(error.value) == "refused"
+    finally:
+        os.close(held)
+    locked.rmdir()
+    real_remove = scratch.task_scratch._remove_invocation_dir
+    for error in (scratch.task_scratch.ContainmentError("mount information unavailable for the namespace"),
+                  scratch.task_scratch.ContainmentError("refusing to repair permissions across a mount at 'x'")):
+        monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir",
+                            lambda *_args, error=error, **_kwargs: (_ for _ in ()).throw(error))
+        record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
+        worker._settle_task_scratch(record)
+        assert record["task_scratch_disposition"] == "failed" and scratch.pending(record)  # the census re-judges
+    (base / "scratch-task" / "first").write_bytes(b"a" * 65536)
+    (base / "scratch-task" / "second").write_bytes(b"b" * 65536)
+
+    def fails_partway(namespace_fd, name, **_kwargs):
+        os.unlink(f"{name}/first", dir_fd=namespace_fd)
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir", fails_partway)
+    record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
+    worker._settle_task_scratch(record)
+    assert record["task_scratch_disposition"] == "failed" and scratch.pending(record)
+    assert record["task_scratch_bytes"] >= 2 * 65536  # what the failed pass found, its partial removal included
+    monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir", real_remove)
+    worker._settle_task_scratch(record)
+    assert record["task_scratch_disposition"] == "removed", record["task_scratch_disposition_reason"]
+    assert not (base / "scratch-task").exists() and 65536 <= record["task_scratch_bytes"] < 2 * 65536
 
 
 def test_settlement_removes_only_recreatable_caches_from_the_task_output_directories(sandbox):

@@ -35,10 +35,11 @@ from lu_machinery.dispatcher import (
     ownership,
     providers,
     runtime_context,
+    scratch,
     store,
     write_boundary,
 )
-from lu_machinery.dispatcher.environment import child_env, task_scratch_path
+from lu_machinery.dispatcher.environment import child_env
 from lu_machinery.dispatcher.types import ParsedResult, TaskSpec
 from lu_machinery.dispatcher.watchdog import (
     TERMINAL_EXIT_GRACE_S,
@@ -105,7 +106,7 @@ def _remove_cache_entry(dir_fd: int, name: str) -> None:
     """Unlink a cache-named link, or remove one cache directory, relative to ``dir_fd``.
 
     A link is unlinked and never followed. A directory is removed by the same remover
-    ``_remove_task_scratch`` uses: this directory gets owner rwx when it lacks it, children
+    task scratch settlement uses (``scratch.settle``): this directory gets owner rwx when it lacks it, children
     are repaired on descent, and another device or a mount point is refused before anything
     is unlinked. The chmod and the deletion stay inside ``name``.
 
@@ -221,7 +222,7 @@ def _clear_task_caches(record: dict) -> bool:
     is recorded only when the provider was proven gone before the walk; while it may still run and
     write a cache, no result is recorded and the sweep walks again.
     """
-    if record.get("status") in store.ACTIVE:
+    if not _finished(record):
         return False
     try:
         gone = _provider_alive(record) is False
@@ -691,21 +692,56 @@ def _scope_cgroups(unit: str) -> list[str] | None:
     return None if failed else found
 
 
+def _run_scope_cgroups(unit: str, task_id: str, run_nonce: str) -> list[str] | None:
+    """Every scope in ``unit``'s dispatch slice named for this task and run nonce, whatever its launch token.
+
+    None when the slice cannot be listed; a slice that does not exist holds no scope.
+    """
+    from lu_machinery.orchestration import dispatch_isolation
+
+    parent = dispatch_isolation.scope_cgroup(unit, uid=os.getuid()).rpartition("/")[0]
+    try:
+        names = os.listdir("/sys/fs/cgroup" + parent)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    return [f"{parent}/{name}" for name in names if name.endswith(".scope") and dispatch_isolation.scope_unit_matches(
+        name.removesuffix(".scope"), task_id=task_id, run_nonce=run_nonce)]
+
+
 def _provider_alive(record: dict) -> bool | None:
     """Whether the provider's process tree still runs, from the identity recorded for it; None when unknown."""
     if record.get("launch_mode") == "scope":
-        # The scope holds every descendant, including ones that left the provider's process group.
-        unit = record.get("launch_unit")
-        if cgroup := record.get("launch_cgroup"):
+        # The scope holds every descendant, including ones that left the provider's process group. Only this
+        # launch's own scope proves anything, so the unit must be the one named for this task and run nonce
+        # before either lookup; any other unit is unknown.
+        from lu_machinery.orchestration import dispatch_isolation
+
+        unit, task_id, nonce = record.get("launch_unit"), record.get("task_id"), record.get("run_nonce")
+        if not (isinstance(unit, str) and re.fullmatch(r"lu-worker-[A-Za-z0-9._-]+", unit)
+                and isinstance(task_id, str) and isinstance(nonce, str)
+                and dispatch_isolation.scope_unit_matches(unit, task_id=task_id, run_nonce=nonce)):
+            return None
+        cgroup = record.get("launch_cgroup")
+        if cgroup is not None:
+            # A recorded cgroup counts only as that unit's canonical path. Anything else, [] or "" included, is
+            # unknown: a damaged path's missing cgroup file proves nothing.
+            if cgroup != dispatch_isolation.scope_cgroup(unit, uid=os.getuid()):
+                return None
             cgroups = [cgroup]
-        elif isinstance(unit, str) and re.fullmatch(r"lu-worker-[A-Za-z0-9._-]+", unit):
+        else:
             # A supervisor that ended before it read the provider's cgroup still named the scope's unit,
             # which is found wherever it was placed.
             cgroups = _scope_cgroups(unit)
             if cgroups is None:
                 return None
-        else:
+        # A re-dispatch that reuses the run nonce launches under a fresh token, so the recorded scope's absence proves
+        # nothing while another scope named for this task and run nonce still holds a process.
+        siblings = _run_scope_cgroups(unit, task_id, nonce)
+        if siblings is None:
             return None
+        cgroups = [*cgroups, *(sibling for sibling in siblings if sibling not in cgroups)]
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").exists()
         alive = False
         for cgroup in cgroups:
@@ -729,10 +765,13 @@ def _provider_alive(record: dict) -> bool | None:
             "spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed",
         }
         return False if never_ran and record.get("pid") is None and record.get("process_start") is None else None
-    if record["provider_pgid"] is None:
+    pgid = record["provider_pgid"]
+    if pgid is None:
         return False
+    if type(pgid) is not int or not 0 < pgid < 2**31:
+        return None  # a damaged group id is unknown, never an error that ends the sweep for later records
     try:
-        os.killpg(record["provider_pgid"], 0)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
         # A descendant that left the group is named by the stop that could not end it (#12520).
         return any(_identity(int(pid)) == identity for pid, identity in record.get("fallback_survivors", {}).items())
@@ -743,7 +782,7 @@ def _provider_alive(record: dict) -> bool | None:
 
 def _same_tree(left: str | None, right: str | None) -> bool:
     """Whether two recorded paths name one directory: by inode while both exist, else by resolved path."""
-    if not left or not right:
+    if not (left and right and isinstance(left, str) and isinstance(right, str)):
         return False
     with contextlib.suppress(OSError):
         return os.path.samefile(left, right)
@@ -758,7 +797,7 @@ def _borrowed(record: dict) -> bool:
     """
     return any(
         other.get("task_id") != record["task_id"] and _same_tree(other.get("worktree_path"), record.get("worktree_path"))
-        and (other.get("status") in store.ACTIVE or (other.get("pid") is not None and _provider_alive(other) is not False))
+        and (not _finished(other) or (other.get("pid") is not None and _provider_alive(other) is not False))
         for other in store.list_tasks())
 
 
@@ -838,7 +877,9 @@ def _agy_unfinished(parsed: ParsedResult) -> ParsedResult:
 # Admission and worker exit never retry unrelated tasks. A public-push refusal
 # (opsec_refused) and an owner retention hold (retention_hold) are absent on purpose:
 # automation must not retry either.
-RETRY_REASONS = frozenset({"dirty", "provider_processes_alive", "provider_liveness_unknown", "borrowed_by_live_task",
+# The worktree reasons settlement records when it cannot prove the provider's process tree gone.
+LIVENESS_REASONS = frozenset({"provider_processes_alive", "provider_liveness_unknown"})
+RETRY_REASONS = frozenset({"dirty", *LIVENESS_REASONS, "borrowed_by_live_task",
                            "unpublished", "remote_mismatch", "unknown", "removal_refused",
                            "worktree_remove_failed", "settlement_failed",
                            "salvage_failed", "salvage_unverified", "large_ignored_output",
@@ -1022,7 +1063,7 @@ def _cgroup_holds_other_active_task(record: dict, cgroup: str) -> bool:
         return True
     protected: set[int] = set()
     for other in others:
-        if other.get("task_id") == task_id or other.get("status") not in store.ACTIVE:
+        if other.get("task_id") == task_id or _finished(other):  # a damaged status counts as active
             continue
         for key in ("pid", "provider_pgid"):
             value = other.get(key)
@@ -1235,85 +1276,44 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
             record["closeout"] = next((r for r in receipts if r.get("returncode") != 0), receipts[0])
             if len(receipts) > 1:
                 record["closeouts"] = receipts
-        if "closeout" in record and record["closeout"].get("returncode") != 0:
-            record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
-                                                 f"{record['closeout'].get('returncode')}")
-    _settle_task_scratch(record)
+        closeout = record.get("closeout")
+        if "closeout" in record and (not isinstance(closeout, dict) or closeout.get("returncode") != 0):
+            closeout = closeout if isinstance(closeout, dict) else {}
+            record.update(status="failed", error=f"closeout_failed: PR {closeout.get('pr')} exit "
+                                                 f"{closeout.get('returncode')}")
+    if scratch.settleable(record):
+        liveness_kept = _text(record.get("worktree_disposition_reason")) in LIVENESS_REASONS
+        _settle_task_scratch(record, liveness_kept=liveness_kept)
 
 
-def _settle_task_scratch(record: dict) -> None:
-    """Remove the task's scratch once its worktree is removed; keep it while the worktree stays.
+def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
+    """Remove the task's scratch, its write worker's TMPDIR, once the provider is proven gone (scratch.settle).
 
-    Records ``task_scratch_disposition`` (removed, absent, retained, refused or failed) with its reason and
-    the bytes found. A refusal or failure is recorded and never fails settlement.
+    The proof is taken fresh from the run's own identity on every pass, whatever the worktree or task status
+    says. ``liveness_kept`` is this pass's own verdict that the provider may still run, which keeps it too.
+    A service this task started that is not proven stopped once the provider is gone keeps it too: the scratch
+    holds the list of them. Only a scope launch's probe sees every descendant from any process, so only a scope
+    launch's scratch is released here. A fallback launch's scratch is kept for good (``kept``) and left to
+    tmp_sweep's settled-task rule.
     """
-    worktree = record.get("worktree_disposition")
-    if worktree != "removed":
-        record.update(task_scratch_disposition="retained", task_scratch_bytes=None,
-                      task_scratch_disposition_reason=f"worktree {worktree or 'unsettled'}: scratch kept with it")
+
+    def provider_gone() -> bool:
+        return not liveness_kept and _provider_alive(record) is False
+
+    def services_running() -> str | None:
+        # Asked only once the provider is proven gone, when no task process is left to register another service.
+        # The scratch's task-services.txt names them (dispatch_isolation), so every one is stopped and checked first.
+        _stop_task_services(record)
+        stops = record.get("task_service_stops")
+        unstopped = stops is not None and (not isinstance(stops, list) or any(
+            not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops))
+        return "task services not proven stopped" if unstopped else None
+
+    if record.get("launch_mode") != "scope":
+        kept = "a fallback launch's process tree is never proven gone; kept for tmp_sweep's settled-task rule"
+        scratch.settle(record, provider_gone, kept, final=True)
         return
-    try:
-        disposition, reason, size = _remove_task_scratch(record.get("task_id"))
-    except Exception as exc:  # recorded, never raised: settlement must still publish the record
-        disposition, reason, size = "failed", f"{type(exc).__name__}: {exc}"[:300], None
-    record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
-                  task_scratch_bytes=size)
-
-
-def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
-    """Delete exactly ``<base>/<task-id>``; return (disposition, reason, bytes).
-
-    Refuses an invalid task id, a symlink, a non-directory, an entry another user owns, one on another
-    filesystem or with a mount below it. Deletion never follows a symlink, never leaves the entry's device
-    or mount, and gives a read-only directory owner rwx before emptying it (task_scratch's remover).
-    """
-    if not isinstance(task_id, str):
-        return "refused", "task id missing", None
-    try:
-        path = task_scratch_path(task_id)
-    except ValueError:
-        return "refused", "task id fails validation", None
-    base_fd = os.open(path.parent, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
-    try:
-        try:
-            info = os.stat(path.name, dir_fd=base_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return "absent", "no scratch directory", None
-        if stat.S_ISLNK(info.st_mode):
-            return "refused", "scratch path is a symlink", None
-        if not stat.S_ISDIR(info.st_mode):
-            return "refused", "scratch path is not a directory", None
-        if info.st_uid != os.geteuid():
-            return "refused", "scratch directory is owned by another user", None
-        base = os.fstat(base_fd)
-        mount_id = task_scratch.fd_mount_id(base_fd)
-        if info.st_dev != base.st_dev:
-            return "refused", "scratch directory is on another filesystem", None
-        if mount_id is None:
-            return "refused", "mount information unavailable", None
-        size = None
-        try:
-            if stat.S_IMODE(info.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
-                # A read-only top directory would refuse to give up its entries; children are repaired on descent.
-                task_scratch.grant_owner_rwx(base_fd, path.name, info, device=base.st_dev, mount_id=mount_id)
-            scratch_fd = os.open(path.name, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC, dir_fd=base_fd)
-            try:
-                held = os.fstat(scratch_fd)
-                if (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino):
-                    return "refused", "scratch directory changed during settlement", None
-                size, _newest = task_scratch._walk_stats(scratch_fd, device=base.st_dev, mount_id=mount_id,
-                                                         opaque_locked=True)
-            finally:
-                os.close(scratch_fd)
-            task_scratch._remove_invocation_dir(base_fd, path.name, namespace=path.parent,
-                                                expected_dev=info.st_dev, expected_ino=info.st_ino)
-        except task_scratch.ContainmentError as exc:
-            return "refused", str(exc)[:300], size
-        except OSError as exc:
-            return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], size
-        return "removed", "worktree removed", size
-    finally:
-        os.close(base_fd)
+    scratch.settle(record, provider_gone, hold=services_running)
 
 
 def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> None:
@@ -1369,14 +1369,24 @@ def _holds_task_caches(record: dict) -> bool:
     result was recorded, never reaped, or with a provider not yet proven gone) is walked by the locked
     removal, which records its result.
     """
-    if record.get("status") in store.ACTIVE:
+    if not _finished(record):
         return False
     return bool(record.get("task_cache_residue") != [])
 
 
+def _text(value: object) -> str | None:
+    """A record field read for a membership test: a string, else None, so a malformed value never raises."""
+    return value if isinstance(value, str) else None
+
+
+def _finished(record: dict) -> bool:
+    """A task with a known terminal status; a malformed or unknown status reads as live."""
+    return _text(record.get("status")) in store.TERMINAL
+
+
 def _unsettled(record: dict) -> bool:
-    return record.get("status") not in store.ACTIVE and (
-        "worktree_disposition" not in record or record.get("worktree_disposition_reason") in RETRY_REASONS)
+    return _finished(record) and (
+        "worktree_disposition" not in record or _text(record.get("worktree_disposition_reason")) in RETRY_REASONS)
 
 
 def settle_left_worktrees(salvage: bool = False) -> None:
@@ -1392,23 +1402,34 @@ def settle_left_worktrees(salvage: bool = False) -> None:
                 record = _observe(record)
             records.append(record)
     for record in records:
-        reap = _unsettled(record) and Path(record.get("worktree_path") or "").is_dir()
-        if not reap and not _holds_task_caches(record):
-            continue
-        try:
-            path = store.record_path(record["task_id"])
-        except (KeyError, TypeError, ValueError):
-            continue  # a damaged identity never ends the sweep for the records after it
-        # wait() takes this lock before it reports a terminal task, so it never returns mid-removal.
-        with contextlib.suppress(OSError, ValueError, KeyError), store.task_state_lock(path):
-            current = json_depth.loads(path.read_text(), max_depth=512)
-            if not reap or not _unsettled(current):
-                # A task settled without a worktree, or by an earlier pass, still sheds its caches.
-                if _clear_task_caches(current):
-                    store.replace(current, path)
-            else:
-                _reap_settled(current, salvage=salvage)
+        # A damaged record is skipped, never allowed to end the sweep for the records after it.
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError, AttributeError):
+            _settle_left(record, salvage)
+
+
+def _settle_left(record: dict, salvage: bool) -> None:
+    """One finished task's retry: its worktree, else its caches and scratch, under its task-state lock."""
+    worktree = record.get("worktree_path")
+    reap = _unsettled(record) and isinstance(worktree, str) and Path(worktree).is_dir()
+    if not reap and not _holds_task_caches(record) and not scratch.pending(record):
+        return
+    path = store.record_path(record["task_id"])
+    # wait() takes this lock before it reports a terminal task, so it never returns mid-removal.
+    with store.task_state_lock(path):
+        current = json_depth.loads(path.read_text(), max_depth=512)
+        if not isinstance(current, dict):
+            return
+        if not reap or not _unsettled(current):
+            # A task settled without a worktree, or by an earlier pass, still sheds its caches and scratch.
+            changed = _holds_task_caches(current) and _clear_task_caches(current)
+            if scratch.pending(current):
+                _settle_task_scratch(current)
+                changed = True
+            if changed:
                 store.replace(current, path)
+        else:
+            _reap_settled(current, salvage=salvage)
+            store.replace(current, path)
 
 
 def _end_lingering(child: subprocess.Popen, spec: TaskSpec) -> None:
@@ -1733,6 +1754,15 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status, error = "failed", "output schema binding invalid"
                 return
         provider = providers.load(spec.agent)
+        if spec.mode == "workspace-write":
+            try:
+                # The provider's TMPDIR (environment.child_env), made before any launch check runs a provider CLI
+                # with it, and persisted so settlement removes only this directory.
+                scratch.start(record, spec.task_id)
+                store.replace(record, path, require_existing=True)
+            except (OSError, ValueError) as exc:
+                status, error = "failed", f"task_scratch_unavailable: {exc}"
+                return
         invocation = runtime_context.build(spec, _provider_env(spec))
         record["runtime_input_sha256"] = hashlib.sha256(invocation.stdin or b"").hexdigest()
         pending_conversation = None
