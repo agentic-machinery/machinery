@@ -246,3 +246,18 @@ def test_cli_prune_takes_no_paths_and_check_mode_never_writes(tmp_path: Path, ca
     assert ratchet.main([*base, "--write-baseline"]) == 0
     assert load_entries(baseline) == []
     assert importlib.metadata.version("mypy") == json.loads(baseline.read_text(encoding="utf-8"))["mypy"]
+
+
+def test_whitespace_only_stderr_still_refuses_the_prune(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: stderr that strips to nothing reads as a clean run and wipes every entry."""
+    root, baseline, _real = _scripts_tree(tmp_path, _GOOD)
+    before = baseline.read_bytes()
+    monkeypatch.setattr(
+        ratchet.subprocess, "run", lambda command, **_kw: subprocess.CompletedProcess(command, 0, stdout="", stderr="\n")
+    )
+
+    removed, refusals = prune_baseline(root, baseline)
+
+    assert removed == 0
+    assert any("stderr" in item for item in refusals)
+    assert baseline.read_bytes() == before

@@ -564,9 +564,9 @@ def collect_errors(
     if result.returncode not in (0, 1):
         detail = (result.stderr or result.stdout).strip()
         return [], [f"mypy failed ({result.returncode}): {detail}"]
-    if result.stderr.strip():
+    if result.stderr:
         # mypy reports an invalid config or a runner problem on stderr and may still exit 0 or 1.
-        return [], [f"mypy reported on stderr: {result.stderr.strip()}"]
+        return [], [f"mypy reported on stderr: {result.stderr.strip() or repr(result.stderr)}"]
     errors, unparsed = parse_mypy_stdout(result.stdout, root)
     if unparsed:
         return [], [f"mypy report was not parseable: {unparsed[0]}"]
