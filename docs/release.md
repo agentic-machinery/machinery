@@ -35,6 +35,11 @@ was built from, and the SHA-256 of its wheel. The annotated tag `v<version>`
 points at that commit. Each version is built once. A defect in a published
 release is fixed by a new version, never by rebuilding or replacing assets.
 
+The cut needs only the registered machinery checkout's `user.name` and
+`user.email` (no environment variables). It passes that identity on the
+annotated tag and on every commit. A checkout without both fails in
+preflight, before the wheel build.
+
 ## Changelog
 
 `CHANGELOG.md` at the repository root follows
@@ -296,8 +301,10 @@ and opens the post-release PR, which records `[$V] [YANKED]` and moves `main`
 on so the next window cuts the next version. Each of these steps runs even if
 an earlier one fails. The host installs only versions the product has adopted.
 
-Commits in the command's fresh clones use the `user.name` and `user.email` of
-the registered machinery checkout, and each ends with the `--x-agent` trailer.
+The annotated tag and every commit in the command's fresh clones pass the
+`user.name` and `user.email` of the registered machinery checkout. The cut
+does not need environment variables to supply that identity. Each commit
+ends with the `--x-agent` trailer.
 
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by

@@ -465,7 +465,8 @@ class Cut:
     ci: str = ""
     section: str = ""
     notes: str = ""
-    # Fresh clones carry no identity; commits use the registered machinery checkout's user.name/user.email.
+    # Fresh clones carry no identity. Commits and the annotated tag pass the registered
+    # machinery checkout's user.name and user.email.
     git_identity: tuple[str, ...] = ()
     tag_pushed: bool = False  # the tag push was attempted; only the remote says whether it landed
     adopt_pr: int | None = None
@@ -552,6 +553,7 @@ class Cut:
 
     def preflight(self) -> tuple[Decision, list[str], str]:
         self.step = "preflight"
+        self.committer()  # tag and commits need it; refuse before the clone and the wheel build
         clone = self.work / "machinery"
         self.run(["git", "clone", "--quiet", "--no-checkout", self.machinery_remote, clone], timeout=900)
         self.head = self.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")
@@ -700,7 +702,7 @@ class Cut:
         self.step = "tag and publish"
         tag = f"v{self.version}"
         clone = self.work / "machinery"
-        self.git(clone, "tag", "-a", tag, self.head, "-m", f"lu-machinery {self.version}")
+        self.git(clone, *self.committer(), "tag", "-a", tag, self.head, "-m", f"lu-machinery {self.version}")
         self.notes = notes
         self.tag_pushed = True
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"refs/tags/{tag}"], timeout=300)
