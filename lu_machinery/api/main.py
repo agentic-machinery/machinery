@@ -20,7 +20,6 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import wait as wait_for_futures
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -504,6 +503,18 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
             ("log", "--oneline", "-5"),
         )
     ]
+    branch_proc, head_proc, full_head_proc, ahead_proc, log_proc = (probe.result() for probe in probes)
+
+    if branch_proc.returncode != 0:
+        raise RuntimeError(branch_proc.stderr.strip() or "git branch failed")
+    if head_proc.returncode != 0:
+        raise RuntimeError(head_proc.stderr.strip() or "git rev-parse failed")
+    if log_proc.returncode != 0:
+        raise RuntimeError(log_proc.stderr.strip() or "git log failed")
+
+    # Only now, as before: the status read heals a bare-drifted primary, and a
+    # failed request must not write Git configuration. The status and authority
+    # reads are the two slow ones (a ``git status`` scan each); they run together.
     status_probe = _GIT_PROBE_EXECUTOR.submit(
         worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
     )
@@ -512,18 +523,6 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         project_root=resolved_ctx.roots.project_root,
         live_repo_root=resolved_ctx.roots.live_repo_root,
     )
-    branch_proc, head_proc, full_head_proc, ahead_proc, log_proc = (probe.result() for probe in probes)
-
-    if any(proc.returncode != 0 for proc in (branch_proc, head_proc, log_proc)):
-        # The status and authority reads started with the others; do not leave
-        # them running past the failure the caller is about to see.
-        wait_for_futures([status_probe, authority_probe])
-    if branch_proc.returncode != 0:
-        raise RuntimeError(branch_proc.stderr.strip() or "git branch failed")
-    if head_proc.returncode != 0:
-        raise RuntimeError(head_proc.stderr.strip() or "git rev-parse failed")
-    if log_proc.returncode != 0:
-        raise RuntimeError(log_proc.stderr.strip() or "git log failed")
 
     recent_commits = []
     # One ``--oneline`` record per physical line; a subject may contain NEL/LS/PS.
@@ -557,9 +556,12 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
     try:
         authority = authority_probe.result()
     except RepositoryAuthorityError:
-        # The status read above heals a bare-drifted primary before it counts
-        # entries; the concurrent authority read can lose that race. Read it
-        # again now that the heal has run; a second failure is a real one.
+        # Only a heal explains a failure here that a serial read would not have
+        # had: the status read heals a bare-drifted primary before it counts
+        # entries, and the concurrent authority read can lose that race. Read it
+        # again then; every other failure, and a second one, propagates.
+        if primary_status.get("bare_healed") is not True:
+            raise
         authority = build_repository_authority(
             project_root=resolved_ctx.roots.project_root,
             live_repo_root=resolved_ctx.roots.live_repo_root,
@@ -914,7 +916,7 @@ def _due_for_stale_serve(cache_key: str, ttl: float) -> bool:
     last value at once, labelled ``stale`` and ``refreshing``, instead of
     waiting out the join for a collector that usually outlasts it. A section
     nobody read for two TTLs holds an old value, so its first read waits for
-    fresh data. A zero TTL means "never stale".
+    fresh data. A zero TTL never takes this shortcut.
     """
     last_good = _detached_orient_last_good.get(cache_key)
     return ttl > 0 and last_good is not None and _orient_clock() - last_good[2] < ttl * 2
@@ -937,7 +939,8 @@ async def _cached_detached_orient_section(
     up to ``DETACHED_ORIENT_INLINE_WAIT_S`` only if *this* call started
     that worker (so cheap test doubles still populate the same response),
     except a refresh that has only just come due (``_due_for_stale_serve``),
-    which serves last-good at once. ``fresh`` always waits.
+    which serves last-good at once. ``fresh`` waits for the live worker, whoever
+    started it.
     Overlapping requests and live hangs return last-good or fallback with
     honest ``meta.error``.
     """
@@ -961,9 +964,13 @@ async def _cached_detached_orient_section(
 
     started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
     thread = _detached_orient_threads.get(cache_key)
-    if started and thread is not None and thread.is_alive() and (fresh or not _due_for_stale_serve(cache_key, ttl)):
+    if thread is not None and thread.is_alive() and (fresh or (started and not _due_for_stale_serve(cache_key, ttl))):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
 
+    # Sampled before any value is read: a value older than the worker's result
+    # can only be returned while the worker was still alive at this point, so
+    # the labels below never call an expired value current.
+    refreshing = thread is not None and thread.is_alive()
     if ttl > 0:
         cached = cache_get(cache_key, ttl=ttl)
         if cached is not None:
@@ -990,8 +997,8 @@ async def _cached_detached_orient_section(
             "stale_after_s": ttl,
             "source": source,
             "cache": "miss",
-            "stale": (thread is not None and thread.is_alive()) or cache_key in _detached_orient_last_error,
-            "refreshing": thread is not None and thread.is_alive(),
+            "stale": refreshing or cache_key in _detached_orient_last_error,
+            "refreshing": refreshing,
         }
         last_error = _detached_orient_last_error.get(cache_key)
         if last_error is not None:
@@ -1004,7 +1011,7 @@ async def _cached_detached_orient_section(
         "stale_after_s": ttl,
         "source": source,
         "cache": "miss",
-        "refreshing": thread is not None and thread.is_alive(),
+        "refreshing": refreshing,
         "error": short_err,
     }
     if isinstance(fallback, dict):
