@@ -2,6 +2,8 @@
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 import httpx2 as httpx
 from fastapi import FastAPI
@@ -19,13 +21,29 @@ def _app(monkeypatch, tmp_path, compute):
     return app
 
 
-def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
-    """A cached lane failure must not cause synchronous directory scans on GET."""
-    scan_threads = []
+@asynccontextmanager
+async def _saturated_executor():
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    entered = asyncio.Event()
+    release = threading.Event()
 
-    def scan(_tasks_dir):
-        scan_threads.append(threading.get_ident())
-        return LaneHealthScan(observed=False, error="fixture scan failure")
+    def blocker():
+        loop.call_soon_threadsafe(entered.set)
+        release.wait()
+
+    blocked = loop.run_in_executor(None, blocker)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        yield blocked
+    finally:
+        release.set()
+        await blocked
+
+
+def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
+    """A cached failure must return while the pool and off-loop scan are blocked."""
+    scan_threads = []
 
     def compute(**kwargs):
         kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
@@ -34,18 +52,41 @@ def test_warm_lane_error_never_scans_tasks_on_event_loop(monkeypatch, tmp_path):
             "diagnostics": {"data_age_s": 0, "stale": False, "stale_threshold_s": 900},
         }
 
-    monkeypatch.setattr(state_router, "scan_lane_health", scan)
     app = _app(monkeypatch, tmp_path, compute)
 
     async def scenario():
         loop_thread = threading.get_ident()
+        loop = asyncio.get_running_loop()
+        scan_started = asyncio.Event()
+        scan_done = asyncio.Event()
+        release_scan = threading.Event()
+
+        def scan(_tasks_dir):
+            scan_threads.append(threading.get_ident())
+            loop.call_soon_threadsafe(scan_started.set)
+            try:
+                release_scan.wait()
+                return LaneHealthScan(observed=False, error="fixture scan failure")
+            finally:
+                loop.call_soon_threadsafe(scan_done.set)
+
+        monkeypatch.setattr(state_router, "scan_lane_health", scan)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             cold = await client.get("/api/state/routing-budget")
             assert cold.status_code == 200
-            for _ in range(2):
-                warm = await client.get("/api/state/routing-budget")
-                assert warm.status_code == 200
-                assert warm.json()["agents"]["codex"]["health"]["reason_code"] == "provider_error"
+            try:
+                async with _saturated_executor() as blocked:
+                    for _ in range(2):
+                        warm = await asyncio.wait_for(client.get("/api/state/routing-budget"), timeout=5)
+                        assert warm.status_code == 200
+                        assert warm.json()["agents"]["codex"]["health"]["reason_code"] == "provider_error"
+                        assert not blocked.done()
+                    await asyncio.wait_for(scan_started.wait(), timeout=5)
+                    assert not scan_done.is_set()
+                    assert len(scan_threads) == 1, "concurrent warm reads must coalesce the scan"
+            finally:
+                release_scan.set()
+                await asyncio.wait_for(scan_done.wait(), timeout=5)
         assert scan_threads, "live lane errors were never refreshed"
         assert loop_thread not in scan_threads, "warm lane-error scan blocked the event loop"
 
@@ -74,8 +115,10 @@ def test_slow_compute_duration_counts_toward_served_age(monkeypatch, tmp_path):
             cold = await client.get("/api/state/routing-budget")
             assert cold.status_code == 200
             clock["t"] += 3
-            warm = await client.get("/api/state/routing-budget")
-            assert warm.status_code == 200
+            async with _saturated_executor() as blocked:
+                warm = await asyncio.wait_for(client.get("/api/state/routing-budget"), timeout=5)
+                assert warm.status_code == 200
+                assert not blocked.done()
         for response, expected_age in ((cold, 915.0), (warm, 918.0)):
             body = response.json()
             assert body["diagnostics"] == {

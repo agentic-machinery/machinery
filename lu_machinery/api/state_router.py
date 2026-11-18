@@ -2239,8 +2239,8 @@ def _withdraw_routing_authorization(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-async def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> object:
-    """Refresh displayed failure text off-loop while retaining snapshot age."""
+def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: str) -> object:
+    """Serve the last failure scan and refresh it off-loop, retaining snapshot age."""
     if not isinstance(payload, dict) or not isinstance(payload.get("agents"), dict):
         return payload
     # Only snapshots displaying a failure need a second read. Healthy warm
@@ -2259,9 +2259,14 @@ async def _with_live_lane_errors(payload: object, tasks_dir: Path, cache_key: st
         except Exception as exc:
             return LaneHealthScan(observed=False, error=f"lane health scan failed: {type(exc).__name__}")
 
-    # Error text can change in place without a directory-token change. Read
-    # it off-loop, coalescing concurrent reads without caching old excerpts.
-    health = await cache_get_or_compute_async(f"{cache_key}:lane-errors", 0.0, _scan)
+    # Error text can change in place without a directory-token change. Start
+    # one off-loop scan without making a warm read wait for a worker.
+    health_key = f"{cache_key}:lane-errors"
+    stored = cache_get_stored(health_key)
+    schedule_cache_refresh(health_key, 0.0, _scan)
+    if stored is None:
+        return payload
+    health, _age_s = stored
     agents = {}
     for lane, info in payload["agents"].items():
         if isinstance(info, dict) and isinstance(info.get("health"), dict):
@@ -2479,7 +2484,7 @@ async def routing_budget(
     """
     if fresh_codexbar:
         trigger_background_refresh()
-    cache_key = await asyncio.to_thread(_ctx_cache_key, ctx, "routing-budget", transport, int(fresh_codexbar))
+    cache_key = _ctx_cache_key(ctx, "routing-budget", transport, int(fresh_codexbar))
     # Directory checks are cheap enough for warm reads. All-file validation
     # runs beside the request to detect in-place rewrites without pool waits.
     tasks_dir = ctx.roots.batch_state_dir / "tasks"
@@ -2491,7 +2496,7 @@ async def routing_budget(
     stored = cache_get_stored(cache_key)
     if stored is not None:
         (observed, value), age_s = stored
-        if observed.directory_token != await asyncio.to_thread(delegate_api._dir_token, tasks_dir):
+        if observed.directory_token != delegate_api._dir_token(tasks_dir):
             observed.invalidated.set()
 
         def _needs_refresh() -> bool:
@@ -2503,8 +2508,10 @@ async def routing_budget(
             return False
 
         schedule_cache_refresh(cache_key, ROUTING_BUDGET_TTL_S, _compute, should_refresh=_needs_refresh)
-        value = await _with_live_lane_errors(value, tasks_dir, cache_key)
-        claude_fields = await revalidated_routing_budget_fields()
+        value = _with_live_lane_errors(value, tasks_dir, cache_key)
+        # Stat-only serving withholds changed bindings and schedules their
+        # validation in the background. A warm read never waits for it.
+        claude_fields = claude_account_routing_fields()
         payload = _public_routing_budget(_aged_routing_budget(
             value,
             state_helpers._ttl_clock() - observed.started_at,
