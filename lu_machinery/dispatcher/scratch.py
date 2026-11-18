@@ -24,7 +24,7 @@ from lu_machinery.common import task_scratch
 from lu_machinery.dispatcher import environment, store
 
 # Outcomes the scheduled sweep retries: a provider not yet proven gone, a holder or rendezvous entry that may go
-# away, a transient error. Every other outcome is final.
+# away, a transient error. Every other outcome (removed, absent, refused, kept) is final.
 RETRY = frozenset({"retained", "in_use", "failed"})
 # Names tmux and ssh-agent give the directories that hold their sockets.
 _AGENT_PREFIXES = ("tmux-", "ssh-")
@@ -66,8 +66,7 @@ def create(task_id: str) -> dict:
 
 
 # What settlement records about a scratch. A new scratch starts with none of them.
-_OUTCOME_FIELDS = ("task_scratch_disposition", "task_scratch_disposition_reason", "task_scratch_bytes",
-                   "task_scratch_unmeasured_bytes")
+_OUTCOME_FIELDS = ("task_scratch_disposition", "task_scratch_disposition_reason", "task_scratch_bytes")
 
 
 def start(record: dict, task_id: str) -> None:
@@ -100,143 +99,105 @@ def pending(record: dict) -> bool:
             and settleable(record))
 
 
-def settle(record: dict, provider_gone: Callable[[], bool], kept: str | None = None) -> None:
+def settle(record: dict, provider_gone: Callable[[], bool], kept: str | None = None, *, final: bool = False) -> None:
     """Remove the recorded scratch once ``provider_gone()`` proves the provider's process tree gone.
 
     The scratch is the worker's temp area, never deliverable state, so a kept worktree does not keep it.
     ``provider_gone`` is asked only when there is a recorded scratch to remove, and anything but ``True`` keeps
-    it. ``kept``, a reason the caller has for keeping it (state that lives in it), keeps it too.
-    ``task_scratch_bytes`` counts the allocated bytes every pass so far has freed. A removal that fails partway
-    counts what it found less what is left; when what is left cannot be measured, it records what it
-    found as ``task_scratch_unmeasured_bytes`` and the next pass that measures the tree counts the difference.
-    A refusal or failure is recorded and never raised.
+    it. ``kept``, a reason the caller has for keeping it, keeps it too: as ``retained`` (retried), or as ``kept``
+    (final) with ``final``. ``task_scratch_bytes`` is what the pass that recorded the disposition found: the
+    allocated bytes of the directories and files whose every name lies in the scratch, measured before removal
+    (None when the pass did not measure). A refusal or failure is recorded and never raised.
     """
-    earlier, carried = (_count(record.get(key)) for key in ("task_scratch_bytes", "task_scratch_unmeasured_bytes"))
     try:
-        disposition, reason, freed, carry = _remove(record, provider_gone, carried, kept)
+        disposition, reason, found = _remove(record, provider_gone, kept, final)
     except Exception as exc:  # recorded, never raised: settlement must still publish the record
-        disposition, reason, freed, carry = "failed", f"{type(exc).__name__}: {exc}"[:300], 0, carried
+        disposition, reason, found = "failed", f"{type(exc).__name__}: {exc}"[:300], None
     record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
-                  task_scratch_bytes=(earlier or 0) + freed)
-    if carry is None:
-        record.pop("task_scratch_unmeasured_bytes", None)
-    else:
-        record["task_scratch_unmeasured_bytes"] = carry
+                  task_scratch_bytes=found)
 
 
-def _count(value: object) -> int | None:
-    return value if type(value) is int and value >= 0 else None
+# (disposition, reason, allocated bytes this pass found, or None when it did not measure)
+_Outcome = tuple[str, str, int | None]
 
 
-# (disposition, reason, bytes this pass freed, bytes a failed removal left unmeasured)
-_Outcome = tuple[str, str, int, int | None]
-
-
-def _remove(record: dict, provider_gone: Callable[[], bool], carried: int | None, kept: str | None) -> _Outcome:
+def _remove(record: dict, provider_gone: Callable[[], bool], kept: str | None, final: bool) -> _Outcome:
     task_id, created = record.get("task_id"), record.get("task_scratch")
     if not isinstance(task_id, str):
-        return "refused", "task id missing", 0, carried
+        return "refused", "task id missing", None
     try:
         path = environment.task_scratch_path(task_id)
     except ValueError:
-        return "refused", "task id fails validation", 0, carried
+        return "refused", "task id fails validation", None
     if created is None:
         if os.path.lexists(path):
-            return "refused", "the scratch directory was not created by this run", 0, carried
-        return "absent", "no scratch created by this run", 0, carried
+            return "refused", "the scratch directory was not created by this run", None
+        return "absent", "no scratch created by this run", None
     if (not isinstance(created, dict) or created.get("path") != str(path)
             or type(created.get("dev")) is not int or type(created.get("ino")) is not int):
-        return "refused", "the recorded scratch identity is malformed", 0, carried
+        return "refused", "the recorded scratch identity is malformed", None
     if kept:
-        return "retained", kept, 0, carried
+        return ("kept" if final else "retained"), kept, None
     try:
         gone = provider_gone() is True
     except Exception:  # unknown liveness is not proof the provider is gone
         gone = False
     if not gone:
-        return "retained", "the provider is not proven gone", 0, carried
+        return "retained", "the provider is not proven gone", None
     base_fd = os.open(path.parent, _DIR_FLAGS)
     try:
-        return _remove_held(base_fd, path.name, (created["dev"], created["ino"]), carried)
+        return _remove_held(base_fd, path.name, (created["dev"], created["ino"]))
     finally:
         os.close(base_fd)
 
 
-def _containment(exc: task_scratch.ContainmentError) -> str:
-    """A refusal is final, except unavailable mount information, which a later pass may read."""
+def _census_outcome(exc: task_scratch.ContainmentError) -> str:
+    """A census refusal is final, except unavailable mount information, which a later pass may read."""
     return "failed" if "mount information unavailable" in str(exc) else "refused"
 
 
-def _remove_held(base_fd: int, name: str, identity: tuple[int, int], carried: int | None) -> _Outcome:
+def _remove_held(base_fd: int, name: str, identity: tuple[int, int]) -> _Outcome:
     try:
         info = os.stat(name, dir_fd=base_fd, follow_symlinks=False)
     except FileNotFoundError:
-        # Gone since a removal that failed unmeasured: that pass, or what followed it, freed what it found.
-        return "absent", "no scratch directory", carried or 0, None
+        return "absent", "no scratch directory", None
     if (info.st_dev, info.st_ino) != identity:
-        return "refused", "the scratch directory is not the one this run created", 0, carried
+        return "refused", "the scratch directory is not the one this run created", None
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
-        return "refused", "the scratch path is not a directory this user owns", 0, carried
+        return "refused", "the scratch path is not a directory this user owns", None
     device, mount_id, mounts = os.fstat(base_fd).st_dev, task_scratch.fd_mount_id(base_fd), task_scratch.mount_points()
     if info.st_dev != device:
-        return "refused", "the scratch directory is on another filesystem", 0, carried
+        return "refused", "the scratch directory is on another filesystem", None
     if mount_id is None or mounts is None:
-        return "failed", "mount information unavailable", 0, carried
+        return "failed", "mount information unavailable", None
     # /proc names real paths: compare against the held base's, whatever symlinks lead to it.
     base = Path(os.readlink(f"/proc/self/fd/{base_fd}"))
     if task_scratch._mounts_below(base / name, mounts):
-        return "refused", "a mount point lies below the scratch directory", 0, carried
+        return "refused", "a mount point lies below the scratch directory", None
     try:
         found = _census(base_fd, name, info, device=device, mount_id=mount_id)
     except task_scratch.ContainmentError as exc:
-        return _containment(exc), str(exc)[:300], 0, carried
-    # What a removal that failed unmeasured had already freed is what it found less what is here now.
-    reconciled = max(carried - found.allocated, 0) if carried is not None else 0
+        return _census_outcome(exc), str(exc)[:300], None
     if found.rendezvous:
-        return ("in_use", f"provider gone; kept whole for {found.rendezvous} socket, FIFO or tmux/ssh entry",
-                reconciled, None)
-    holders = _holders(found.owned_inodes)
+        reason = f"provider gone; kept whole for {found.rendezvous} socket, FIFO or tmux/ssh entry"
+        return "in_use", reason, found.allocated
+    holders = _holders(found, str(base / name))
     if holders is None:
-        return "failed", "the process table cannot be listed", reconciled, None
+        return "failed", "the process table cannot be listed", found.allocated
     if holders:
-        return "in_use", f"provider gone; kept whole while {holders} live process(es) hold part of it", reconciled, None
+        return "in_use", f"provider gone; kept whole while {holders} live process(es) hold part of it", found.allocated
     try:
         task_scratch._remove_invocation_dir(base_fd, name, namespace=base, expected_dev=info.st_dev,
                                             expected_ino=info.st_ino)
-    except task_scratch.ContainmentError as exc:
-        disposition, detail = _containment(exc), str(exc)
-    except OSError as exc:
-        disposition, detail = "failed", f"{type(exc).__name__}: {exc.strerror or exc}"
-    else:
-        return "removed", "provider gone", reconciled + found.allocated, None
-    # A removal that stopped partway has still freed what it unlinked: count it, or carry what it found.
-    freed = _freed_after_failure(base_fd, name, info, found, device=device, mount_id=mount_id)
-    if freed is None:
-        return disposition, f"{detail}; bytes freed by this pass not yet measured"[:300], reconciled, found.allocated
-    return disposition, detail[:300], reconciled + freed, None
-
-
-def _freed_after_failure(base_fd: int, name: str, info: os.stat_result, before: _Census, *, device: int,
-                         mount_id: int) -> int | None:
-    """Bytes a removal freed before it stopped: what it found less what is left; None when that is unknown."""
-    try:
-        now = os.stat(name, dir_fd=base_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return before.allocated
-    except OSError:
-        return None
-    if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino):
-        return None
-    try:
-        left = _census(base_fd, name, now, device=device, mount_id=mount_id)
-    except (task_scratch.ContainmentError, OSError, RecursionError):
-        return None
-    return max(before.allocated - left.allocated, 0)
+    except (task_scratch.ContainmentError, OSError) as exc:
+        # Retried: the next pass's census decides afresh, and only a census refusal is final.
+        return "failed", f"{type(exc).__name__}: {exc}"[:300], found.allocated
+    return "removed", "provider gone", found.allocated
 
 
 @dataclass
 class _Census:
-    """One walk of the scratch: its inodes and link counts, its rendezvous entries and the bytes removal frees."""
+    """One walk of the scratch: its inodes and link counts, its rendezvous entries and the bytes it holds."""
 
     rendezvous: int = 0
     # (device, inode) -> [allocated bytes, link count, names seen in the tree, is a directory]
@@ -252,21 +213,19 @@ class _Census:
         entry[2] += 1
 
     @property
-    def owned_inodes(self) -> set[tuple[int, int]]:
-        """The inodes removal can take from a holder: directories and files with every name in the tree.
-
-        A file hard-linked from outside (a package cache's link into a virtual environment, say) keeps its
-        outside name and its data, so a process mapping that cache file holds nothing removal takes.
-        """
+    def owned(self) -> set[tuple[int, int]]:
+        """Directories and the files whose every name lies in the tree."""
         return {key for key, (_size, links, seen, is_dir) in self._links.items() if is_dir or seen >= links}
 
     @property
-    def allocated(self) -> int:
-        """Allocated bytes of the directories and of every inode whose names all lie in the tree.
+    def shared(self) -> set[tuple[int, int]]:
+        """Files also linked from outside the tree, such as a package cache's link into a virtual environment."""
+        return set(self._links) - self.owned
 
-        A file hard-linked from outside (a package cache's link, say) keeps its blocks, so it is not counted.
-        """
-        return sum(size for size, links, seen, is_dir in self._links.values() if is_dir or seen >= links)
+    @property
+    def allocated(self) -> int:
+        """Allocated bytes of the owned inodes: a shared file keeps its outside name and its blocks."""
+        return sum(self._links[key][0] for key in self.owned)
 
 
 def _census(base_fd: int, name: str, info: os.stat_result, *, device: int, mount_id: int) -> _Census:
@@ -286,6 +245,27 @@ def _census(base_fd: int, name: str, info: os.stat_result, *, device: int, mount
     return found
 
 
+def _grant_owner_rwx(dir_fd: int, name: str, info: os.stat_result, *, device: int, mount_id: int) -> None:
+    """Give owner rwx to the directory ``name`` below ``dir_fd`` through a descriptor proven to be it.
+
+    As ``task_scratch.grant_owner_rwx``, except that unavailable mount information is reported as such (a later
+    pass may read it), apart from a proven mismatch (final).
+    """
+    fd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    try:
+        held = os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino) or held.st_uid != os.geteuid():
+            raise task_scratch.ContainmentError(f"directory {name!r} changed before its permission repair")
+        held_mount = task_scratch.fd_mount_id(fd)
+        if held_mount is None:
+            raise task_scratch.ContainmentError(f"mount information unavailable for {name!r}; refusing to repair")
+        if held.st_dev != device or held_mount != mount_id:
+            raise task_scratch.ContainmentError(f"refusing to repair permissions across a mount at {name!r}")
+        os.chmod(f"/proc/self/fd/{fd}", stat.S_IMODE(held.st_mode) | stat.S_IRWXU)
+    finally:
+        os.close(fd)
+
+
 def _open_proven(dir_fd: int, name: str, info: os.stat_result, *, device: int, mount_id: int) -> int:
     if info.st_dev != device:
         raise task_scratch.ContainmentError(f"refusing to cross a mount boundary at {name!r}")
@@ -294,7 +274,7 @@ def _open_proven(dir_fd: int, name: str, info: os.stat_result, *, device: int, m
     except PermissionError:
         if info.st_uid != os.geteuid():
             raise task_scratch.ContainmentError(f"directory {name!r} belongs to another user") from None
-        task_scratch.grant_owner_rwx(dir_fd, name, info, device=device, mount_id=mount_id)
+        _grant_owner_rwx(dir_fd, name, info, device=device, mount_id=mount_id)
         fd = task_scratch._open_dir_at(dir_fd, name)
     try:
         held = task_scratch._verify_held_dir(fd, expected_dev=info.st_dev, expected_ino=info.st_ino, device=device,
@@ -321,50 +301,64 @@ def _walk(dir_fd: int, found: _Census, *, device: int, mount_id: int) -> None:
                 os.close(child)
 
 
-def _holders(inodes: set[tuple[int, int]]) -> int | None:
-    """Count the other processes holding one of ``inodes``; None when ``/proc`` cannot be listed.
+def _holders(found: _Census, root: str) -> int | None:
+    """Count the other processes holding part of the scratch at ``root``; None when ``/proc`` cannot be listed.
 
-    A holder is a working directory, root, executable, open descriptor or file mapping. Each is compared by
-    device and inode, never by name, so a renamed, deleted or oddly named file is still seen. A process the
-    kernel will not let this user inspect is skipped: the caller's provider-exit proof, not this scan, covers
-    the task's own processes.
+    A holder is a working directory, root, executable, open descriptor or file mapping, matched by device and
+    inode, never by name, so a renamed, deleted or oddly named file is still seen, through the process's view
+    and each of its threads' (a leader that exited before its threads). A file also linked from outside counts
+    unless the reference is proven to come through an outside name. A process the kernel will not let this user
+    inspect is skipped: the caller's provider-exit proof, not this scan, covers the task's own processes.
     """
     try:
         pids = [name for name in os.listdir("/proc") if name.isdigit()]
     except OSError:
         return None
-    me = str(os.getpid())
-    return sum(1 for pid in pids if pid != me and _holds(Path("/proc", pid), inodes))
+    me, owned, shared = str(os.getpid()), found.owned, found.shared
+    return sum(1 for pid in pids if pid != me and _holds(Path("/proc", pid), owned, shared, root))
 
 
-def _holds(proc: Path, inodes: set[tuple[int, int]]) -> bool:
-    """Whether the process holds one of ``inodes``, seen through it and through each of its threads.
-
-    A thread's view stays readable when the process view is not (a leader that exited before its threads).
-    """
+def _holds(proc: Path, owned: set[tuple[int, int]], shared: set[tuple[int, int]], root: str) -> bool:
     views = [proc]
     with contextlib.suppress(OSError):
         views += [proc / "task" / tid for tid in os.listdir(proc / "task")]
-    return any(_view_holds(view, inodes) for view in views)
+    return any(_view_holds(view, owned, shared, root) for view in views)
 
 
-def _view_holds(proc: Path, inodes: set[tuple[int, int]]) -> bool:
+def _inside(reference: str | None, root: str) -> bool:
+    """Whether a reference may come through the scratch: unknown, relative, or below ``root`` as written."""
+    if reference is None or not reference.startswith("/"):
+        return True
+    spellings = (reference, reference.removesuffix(" (deleted)"))
+    return any(path == root or path.startswith(root + "/") for path in spellings)
+
+
+def _view_holds(proc: Path, owned: set[tuple[int, int]], shared: set[tuple[int, int]], root: str) -> bool:
     links = [proc / "cwd", proc / "root", proc / "exe"]
     with contextlib.suppress(OSError):
         links += [proc / "fd" / fd for fd in os.listdir(proc / "fd")]
     for link in links:
         with contextlib.suppress(OSError):
             held = os.stat(link)
-            if (held.st_dev, held.st_ino) in inodes:
+            key = (held.st_dev, held.st_ino)
+            if key in owned:
                 return True
+            if key in shared:
+                try:
+                    reference: str | None = os.readlink(link)
+                except OSError:
+                    reference = None
+                if _inside(reference, root):
+                    return True
     try:
-        lines = (proc / "maps").read_text(encoding="ascii", errors="replace").splitlines()
+        lines = (proc / "maps").read_text(encoding="utf-8", errors="surrogateescape").splitlines()
     except OSError:
         return False
     for line in lines:
         fields = line.split(maxsplit=5)
         with contextlib.suppress(IndexError, ValueError):
             major, minor = fields[3].split(":")
-            if (os.makedev(int(major, 16), int(minor, 16)), int(fields[4])) in inodes:
+            key = (os.makedev(int(major, 16), int(minor, 16)), int(fields[4]))
+            if key in owned or (key in shared and _inside(fields[5] if len(fields) == 6 else None, root)):
                 return True
     return False

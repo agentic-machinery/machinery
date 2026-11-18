@@ -208,29 +208,43 @@ worker hard-codes, such as `/tmp/<name>`, is outside this scratch.
 Settlement removes exactly the recorded directory, directly and without
 quarantine, whatever the task's terminal status and even when the worktree is
 kept. It needs fresh proof, from the run's own launch identity, that the
-provider's whole process tree is gone (for a scope launch, an empty scope
-cgroup, which covers every descendant). A recorded disposition is never
-taken as that proof. Removal takes the whole tree or nothing. The tree is
-kept whole (`in_use`) when it holds a socket, a FIFO or an entry named
-`tmux-*` or `ssh-*`, or when another process that `/proc` lets the agent user
-read holds any part of it as its working directory, root, executable, open
-descriptor or mapping. Holders are matched by device and inode, never by name.
+provider's whole process tree is gone. For a scope launch that is an empty
+scope cgroup, which covers every descendant; a recorded cgroup counts only
+when it is the canonical path of the launch's own unit. A fallback launch's
+tree is proven gone only by its own supervisor, which stopped the process
+group and adopted what left it; any later pass keeps that scratch for good
+(`kept`). A recorded disposition is never taken as proof. The scratch also
+holds `task-services.txt`, so the sweep stops the task's services before it
+settles the scratch, and a service not proven stopped keeps the scratch.
+
+Removal takes the whole tree or nothing. The tree is kept whole (`in_use`)
+when it holds a socket, a FIFO or an entry named `tmux-*` or `ssh-*` (the
+scratch's own name does not count), or when another process that `/proc` lets
+the agent user read holds any part of it as its working directory, root,
+executable, open descriptor or mapping. Holders are matched by device and
+inode through the process's view and each of its threads', never by name. A
+file also linked from outside the scratch, such as a package cache's link,
+counts only when the reference is not proven to come through an outside name.
 
 The task record shows the result next to the worktree disposition:
 `task_scratch_disposition`, `task_scratch_disposition_reason` and
-`task_scratch_bytes`: the allocated bytes every pass so far has freed,
-including what a pass that failed partway had already removed. A file
-hard-linked from outside the scratch frees nothing and is not counted. The
+`task_scratch_bytes`: what the pass that recorded the disposition found
+before removal, in allocated bytes of the directories and of the files whose
+every name lies in the scratch (none when that pass did not measure). The
 dispositions are `removed`, `absent`, `retained` (the provider is not proven
-gone), `in_use`, `failed` and `refused`. The hourly settlement sweep retries
-`retained`, `in_use` and `failed`, and a scratch a dead supervisor never
-settled. A record whose fields are malformed is left as it is and never stops
-the sweep. A directory the run did not record is refused, and so is a changed
-identity, a symlink, a non-directory, an entry another user owns, one on
-another filesystem or one with a mount below it. Removal never follows a
-symlink, never leaves the scratch's device or mount, and makes read-only
-directories writable before emptying them. A refusal or failure is recorded
-and never fails settlement.
+gone, or a service is not proven stopped), `in_use`, `failed`, `kept` and
+`refused`. The hourly settlement sweep retries `retained`, `in_use` and
+`failed`, and a scratch a dead supervisor never settled; only the walk before
+removal can refuse for good. Only the seven terminal statuses read as
+finished, and a record whose fields are malformed is left as it is and never
+stops the sweep. A directory the run did not record is refused, and so is a
+changed identity, a symlink, a non-directory, an entry another user owns, one
+on another filesystem or one with a mount below it. Removal never follows a
+symlink, never leaves the scratch's device or mount, and makes unreadable or
+unsearchable directories accessible to their owner before emptying them. A
+scratch path longer than 72 bytes refuses the launch, since a Unix socket
+below `TMPDIR` must fit the kernel's 107-byte limit. A refusal or failure is
+recorded and never fails settlement.
 
 ### Listening sockets
 

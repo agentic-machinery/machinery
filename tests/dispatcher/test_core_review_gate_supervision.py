@@ -433,7 +433,7 @@ def test_settlement_refuses_a_symlinked_task_scratch_and_leaves_its_target(monke
     info = (base / "fresh-task").stat()
     assert info.st_mode & 0o777 == 0o700 and (created["dev"], created["ino"]) == (info.st_dev, info.st_ino)
     for recorded in (None, {**created, "path": str(base / "lu")}, {**created, "dev": True}):
-        other = {"task_id": "lu", "task_scratch": recorded}
+        other = {"task_id": "lu", "launch_mode": "scope", "task_scratch": recorded}
         worker._settle_task_scratch(other)
         assert other["task_scratch_disposition"] == "refused" and (base / "lu" / "shared").exists()
     real_mkdir = os.mkdir
@@ -486,12 +486,14 @@ def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktre
              "worktree_disposition_reason": "provider_processes_alive", "task_scratch": scratch.create("scratch-task")}
     worker._settle_task_scratch(stale, liveness_kept=True)
     assert stale["task_scratch_disposition"] == "retained" and (base / "scratch-task").is_dir()
-    # A fallback launch's probe cannot see a descendant that left its process group: the recorded verdict that
-    # liveness was not proven stands until a worktree pass stops that group again and replaces it.
-    for fallback_reason in ("provider_liveness_unknown", "provider_processes_alive"):
+    # A fallback launch's whole tree is proven gone only by its own supervisor, the subreaper that stopped its
+    # group: any later pass (the hourly sweep, crash recovery) keeps that scratch for good, whatever the probe says.
+    for fallback_reason in ("provider_liveness_unknown", "borrowed_worktree", None):
         fallback = {**stale, "launch_mode": "popen-fallback", "worktree_disposition_reason": fallback_reason}
         worker._settle_task_scratch(fallback)
-        assert fallback["task_scratch_disposition"] == "retained" and (base / "scratch-task").is_dir()
+        assert (fallback["task_scratch_disposition"], fallback["task_scratch_disposition_reason"]) == (
+            "kept", "a fallback launch's exit is proven only by its own supervisor")
+        assert (base / "scratch-task").is_dir() and not scratch.pending(fallback)
     # The scratch holds task-services.txt, the list of services still to stop: one not proven stopped keeps it.
     for stops in ([{"unit": "u", "postcondition": "false"}], [{"unit": "", "postcondition": "unknown"}], "damaged"):
         unstopped = {**stale, "task_service_stops": stops}
@@ -523,7 +525,7 @@ def test_settlement_keeps_a_scratch_holding_a_socket_fifo_agent_entry_or_held_pa
     tree = base / "scratch-task"
 
     def settle(expected):
-        record = {"task_id": "scratch-task", "status": "done", "task_scratch": identity}
+        record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
         worker._settle_task_scratch(record)
         assert record["task_scratch_disposition"] == expected, record
         return record
@@ -573,37 +575,42 @@ def test_settlement_keeps_a_scratch_holding_a_socket_fifo_agent_entry_or_held_pa
             holder.kill()
             holder.wait(timeout=30)
             holder.stdout.close()
-    # A file hard-linked in from outside (a package cache's link) keeps its outside name and data: a process
-    # holding that cache file holds nothing removal takes, so it never keeps the scratch.
+    # A file hard-linked in from outside (a package cache's link) keeps its outside name and data. A process that
+    # opened it through the scratch name holds a scratch path and keeps the scratch; one that opened it through
+    # the outside name holds nothing removal takes.
     held.unlink()
     cache = tmp_path / "cache.so"
     cache.write_bytes(b"c" * 4096)
     os.link(cache, tree / "linked.so")
     code = "import sys, time; f = open(sys.argv[1]); print(flush=True); time.sleep(120)"
-    holder = subprocess.Popen([sys.executable, "-c", code, str(cache)], stdout=subprocess.PIPE)
-    try:
-        ready, _, _ = select.select([holder.stdout], [], [], 30)
-        assert ready and holder.stdout.readline() == b"\n", "the holder never reported its open file"
-        record = settle("removed")
-    finally:
-        holder.kill()
-        holder.wait(timeout=30)
-        holder.stdout.close()
+    for opened, expected in ((tree / "linked.so", "in_use"), (cache, "removed")):
+        holder = subprocess.Popen([sys.executable, "-c", code, str(opened)], stdout=subprocess.PIPE)
+        try:
+            ready, _, _ = select.select([holder.stdout], [], [], 30)
+            assert ready and holder.stdout.readline() == b"\n", "the holder never reported its open file"
+            record = settle(expected)
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+            holder.stdout.close()
     assert not tree.exists() and record["task_scratch_bytes"] >= 65536 and cache.read_bytes() == b"c" * 4096
     for name in ("tmux-task", "ssh-task"):  # a task id with an agent prefix names the scratch, not an entry in it
         identity = scratch.create(name)
-        record = {"task_id": name, "status": "done", "task_scratch": identity}
+        record = {"task_id": name, "status": "done", "launch_mode": "scope", "task_scratch": identity}
         worker._settle_task_scratch(record)
         assert record["task_scratch_disposition"] == "removed" and not (base / name).exists()
 
 
 def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(monkeypatch, tmp_path):
-    """Defect class (F12): a damaged record stopped the scheduled sweep. An array disposition or status raised
-    TypeError in a membership test, ending the pass before later records; such fields now read as final or live.
+    """Defect class (F12): a damaged record stopped the scheduled sweep or passed for proof. An array disposition or
+    status raised TypeError in a membership test, ending the pass before later records; such fields now read as
+    final or live. A recorded cgroup under the wrong parent made a missing cgroup file read as an exited provider.
 
-    Defect class (F10): bytes lost from the receipt. A removal that failed partway dropped what it had already
-    freed, though its unlinks cannot be undone; the retry adds the rest.
+    Defect class (F10): bytes lost from the receipt. A removal that failed partway reported no bytes for the tree it
+    had found. The receipt is what the pass that recorded it found before removal, so a partial pass keeps it.
     """
+    from lu_machinery.orchestration import dispatch_isolation as iso
+
     base, _record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
     (tmp_path / "tasks").mkdir()
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
@@ -619,6 +626,23 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
         if "status" in damaged:  # read as live: nothing is walked or removed
             assert worker._clear_task_caches({"task_id": "t", **damaged}) is False
     assert not worker._same_tree(["damaged"], str(tmp_path)) and not worker._same_tree(str(tmp_path), 123)
+    # A recorded cgroup proves exit only as this launch's own scope; anything else is unknown, never gone.
+    monkeypatch.undo()
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)
+    monkeypatch.setattr(worker, "_end_own_scope", lambda _record: None)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    nonce = "0123456789abcdef0123456789abcdef"
+    unit = iso.scope_unit_name("scratch-task", nonce)
+    launch = {"task_id": "scratch-task", "run_nonce": nonce, "launch_mode": "scope", "launch_unit": unit}
+    canonical = iso.scope_cgroup(unit, uid=os.getuid())
+    for cgroup in (f"/nonexistent-parent/{unit}.scope", f"{canonical}/..", ["damaged"]):
+        assert worker._provider_alive({**launch, "launch_cgroup": cgroup}) is None
+    assert worker._provider_alive({**launch, "launch_unit": iso.scope_unit_name("other-task", nonce),
+                                   "launch_cgroup": canonical}) is None
+    if Path("/sys/fs/cgroup/cgroup.controllers").exists():  # a gone canonical scope still proves exit
+        assert worker._provider_alive({**launch, "launch_cgroup": canonical}) is False
+    monkeypatch.setattr(worker, "_provider_alive", lambda _record: False)
     # A damaged record is skipped, and the sweep still reaches the records after it.
     reached = []
     real_settle_left = worker._settle_left
@@ -637,13 +661,32 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
     monkeypatch.setattr(worker, "_settle_left", settle_left)
     worker.settle_left_worktrees()
     assert reached == ["bad-path", None, "healthy"]
-    # Mount information a later pass may read is a retried failure, never a final refusal.
+    # Mount information a later pass may read is retried, a proven mount is final, at every check.
+    locked = base / "scratch-task" / "locked"
+    locked.mkdir()
+    info = locked.stat()
+    held = os.open(base / "scratch-task", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        device, mount_id = info.st_dev, scratch.task_scratch.fd_mount_id(held)
+        with monkeypatch.context() as unavailable:
+            unavailable.setattr(scratch.task_scratch, "fd_mount_id", lambda _fd: None)
+            with pytest.raises(scratch.task_scratch.ContainmentError) as error:
+                scratch._grant_owner_rwx(held, "locked", info, device=device, mount_id=mount_id)
+        assert scratch._census_outcome(error.value) == "failed"
+        with pytest.raises(scratch.task_scratch.ContainmentError) as error:
+            scratch._grant_owner_rwx(held, "locked", info, device=device, mount_id=mount_id + 1)
+        assert scratch._census_outcome(error.value) == "refused"
+    finally:
+        os.close(held)
+    locked.rmdir()
     real_remove = scratch.task_scratch._remove_invocation_dir
-    monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir", lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        scratch.task_scratch.ContainmentError("mount information unavailable for the namespace; refusing to delete")))
-    record = {"task_id": "scratch-task", "status": "done", "task_scratch": identity}
-    worker._settle_task_scratch(record)
-    assert record["task_scratch_disposition"] == "failed" and scratch.pending(record)
+    for error in (scratch.task_scratch.ContainmentError("mount information unavailable for the namespace"),
+                  scratch.task_scratch.ContainmentError("refusing to repair permissions across a mount at 'x'")):
+        monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir",
+                            lambda *_args, error=error, **_kwargs: (_ for _ in ()).throw(error))
+        record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
+        worker._settle_task_scratch(record)
+        assert record["task_scratch_disposition"] == "failed" and scratch.pending(record)  # the census re-judges
     (base / "scratch-task" / "first").write_bytes(b"a" * 65536)
     (base / "scratch-task" / "second").write_bytes(b"b" * 65536)
 
@@ -652,22 +695,14 @@ def test_scratch_retry_survives_malformed_record_fields_and_keeps_partial_bytes(
         raise OSError(5, "Input/output error")
 
     monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir", fails_partway)
-    record = {"task_id": "scratch-task", "status": "done", "task_scratch": identity}
+    record = {"task_id": "scratch-task", "status": "done", "launch_mode": "scope", "task_scratch": identity}
     worker._settle_task_scratch(record)
     assert record["task_scratch_disposition"] == "failed" and scratch.pending(record)
-    assert 65536 <= record["task_scratch_bytes"] < 2 * 65536
-    # When what is left cannot be measured either, the next pass that measures the tree counts the difference.
-    (base / "scratch-task" / "first").write_bytes(b"a" * 65536)
-    monkeypatch.setattr(scratch, "_freed_after_failure", lambda *_args, **_kwargs: None)
-    record = {"task_id": "scratch-task", "status": "done", "task_scratch": identity}
-    worker._settle_task_scratch(record)
-    assert (record["task_scratch_disposition"], record["task_scratch_bytes"]) == ("failed", 0)
-    assert record["task_scratch_unmeasured_bytes"] >= 2 * 65536
+    assert record["task_scratch_bytes"] >= 2 * 65536  # what the failed pass found, its partial removal included
     monkeypatch.setattr(scratch.task_scratch, "_remove_invocation_dir", real_remove)
     worker._settle_task_scratch(record)
     assert record["task_scratch_disposition"] == "removed", record["task_scratch_disposition_reason"]
-    assert not (base / "scratch-task").exists()
-    assert record["task_scratch_bytes"] >= 2 * 65536 and "task_scratch_unmeasured_bytes" not in record
+    assert not (base / "scratch-task").exists() and 65536 <= record["task_scratch_bytes"] < 2 * 65536
 
 
 def test_settlement_removes_only_recreatable_caches_from_the_task_output_directories(sandbox):

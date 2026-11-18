@@ -699,9 +699,13 @@ def _provider_alive(record: dict) -> bool | None:
         unit = record.get("launch_unit")
         unit = unit if isinstance(unit, str) and re.fullmatch(r"lu-worker-[A-Za-z0-9._-]+", unit) else None
         if cgroup := record.get("launch_cgroup"):
-            # Only the unit's own scope proves anything: a damaged path's missing cgroup file proves nothing.
-            if not (unit and isinstance(cgroup, str) and cgroup.endswith(f"/{unit}.scope")
-                    and cgroup.startswith("/") and not {"", ".", ".."} & set(cgroup.split("/")[1:])):
+            # Only this launch's own scope proves anything: a damaged path's missing cgroup file proves nothing.
+            from lu_machinery.orchestration import dispatch_isolation
+
+            task_id, nonce = record.get("task_id"), record.get("run_nonce")
+            if not (unit and isinstance(task_id, str) and isinstance(nonce, str)
+                    and dispatch_isolation.scope_unit_matches(unit, task_id=task_id, run_nonce=nonce)
+                    and cgroup == dispatch_isolation.scope_cgroup(unit, uid=os.getuid())):
                 return None
             cgroups = [cgroup]
         elif unit:
@@ -1216,7 +1220,7 @@ def _run_merge_closeout(request: dict) -> dict:
     return {"pr": pr, "returncode": result.returncode, "stdout": result.stdout[-4000:], "stderr": result.stderr[-2000:]}
 
 
-def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> None:
+def _reap_settled(record: dict, patience: float = 0, salvage: bool = False, own_run: bool = False) -> None:
     """Settle services and the worktree, close out merged delivery, then remove scratch.
 
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
@@ -1249,30 +1253,31 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
             record.update(status="failed", error=f"closeout_failed: PR {closeout.get('pr')} exit "
                                                  f"{closeout.get('returncode')}")
     if scratch.settleable(record):
-        _settle_task_scratch(record, liveness_kept=_text(record.get("worktree_disposition_reason")) in LIVENESS_REASONS)
+        liveness_kept = _text(record.get("worktree_disposition_reason")) in LIVENESS_REASONS
+        _settle_task_scratch(record, liveness_kept=liveness_kept, own_run=own_run)
 
 
-def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
+def _settle_task_scratch(record: dict, *, liveness_kept: bool = False, own_run: bool = False) -> None:
     """Remove the task's scratch, its write worker's TMPDIR, once the provider is proven gone (scratch.settle).
 
     The proof is taken fresh from the run's own identity on every pass, whatever the worktree or task status
     says. ``liveness_kept`` is this pass's own verdict that the provider may still run, which keeps it too.
     A service this task started that is not proven stopped keeps it too: the scratch holds the list of them.
-    Only a scope launch's probe sees every descendant. A fallback launch's probe cannot see one that left the
-    provider's process group, so a liveness reason recorded for it stands until a worktree pass, which stops
-    that group again, replaces it.
+    Only a scope launch's probe sees every descendant from any process. A fallback launch's whole tree is
+    proven gone only by its own supervisor (``own_run``), the subreaper that stopped the group and adopted
+    what left it; any later pass keeps that scratch for good.
     """
     stops = record.get("task_service_stops")
     unstopped = stops is not None and (not isinstance(stops, list) or any(
         not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops))
 
     def provider_gone() -> bool:
-        if liveness_kept:
-            return False
-        recorded = _text(record.get("worktree_disposition_reason"))
-        if record.get("launch_mode") != "scope" and recorded in LIVENESS_REASONS:
-            return False
-        return _provider_alive(record) is False
+        return not liveness_kept and _provider_alive(record) is False
+
+    if record.get("launch_mode") != "scope" and not own_run:
+        kept = "a fallback launch's exit is proven only by its own supervisor"
+        scratch.settle(record, provider_gone, kept, final=True)
+        return
 
     # Its task-services.txt names the transient services still to stop (dispatch_isolation): it stays with them.
     scratch.settle(record, provider_gone, "task services not proven stopped" if unstopped else None)
@@ -2047,7 +2052,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
-                    _reap_settled(record, patience=SETTLE_PATIENCE)
+                    _reap_settled(record, patience=SETTLE_PATIENCE, own_run=True)
                 try:
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
