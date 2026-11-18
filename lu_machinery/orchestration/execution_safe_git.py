@@ -713,6 +713,7 @@ def run_git(
     timeout: float | None = 30,
     integrity: bool = False,
     stat_integrity: bool = False,
+    user_config: bool = False,
     profile: str = "local",
     **kwargs: Any,
 ) -> subprocess.CompletedProcess:
@@ -720,7 +721,9 @@ def run_git(
 
     ``stat_integrity`` forces core.trustctime and core.checkStat to their defaults, so the tree's config cannot
     stop status comparing the stat data that reveals an edit. ``integrity`` does that and also ignores a
-    configured core.attributesFile.
+    configured core.attributesFile. ``user_config`` reads the global and system config files the caller's
+    environment selects, as plain Git does, instead of none; the compulsory controls still override every
+    driver, hook and command those files set, since the config inventory reads them too.
     """
     if runner is not None and type(runner) is not SafeGitRunner:
         raise TypeError("runner must be a SafeGitRunner executable constraint")
@@ -774,6 +777,12 @@ def run_git(
     ):
         raise ValueError("branch description editing may invoke an editor")
     safe_env = safe_git_env(env)
+    if user_config:
+        selection = os.environ if env is None else env
+        for key in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"):
+            safe_env.pop(key)
+            if key in selection:
+                safe_env[key] = selection[key]
     prefix = [executable, "--no-pager", "--no-lazy-fetch"]
     if integrity:
         prefix.extend(["-c", f"core.attributesFile={os.devnull}"])

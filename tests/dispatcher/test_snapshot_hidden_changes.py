@@ -269,13 +269,20 @@ def test_removal_reports_a_recursion_error_as_unknown_not_error(tmp_path, monkey
 LINE_BREAK_NAMES = ["scratch/cr\rname", "scratch/cr\nname", "scratch/crlf\r\nname", "scratch/crlf\nname"]
 
 
-@pytest.mark.parametrize("case", ["untracked", "ignored", "stat-hidden", "attributes-file", "filtered"])
-def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
+@pytest.mark.parametrize("case", ["untracked", "ignored", "stat-hidden", "attributes-file", "filtered", "filtered-global",
+                                  "dormant-driver", "global-conversion"])
+def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, monkeypatch, case):
     """Defect class: the exit snapshot and removal read the tree differently, a worker's stat settings hid a
     tracked edit from both, and removal's text read folded CR and CRLF in untracked names, so it preserved names
     that do not exist (#524 F1, F2, F4). Both now read through one byte-exact, stat-forced reader that keeps the
     tree's attributes, so a configured attributes file leaves a clean checkout clean. With filter drivers
-    disabled, an edit to a filtered file that matches its stored blob reads clean, so such a tree is never clean."""
+    disabled, an edit to a filtered file that matches its stored blob reads clean, so such a tree is never clean,
+    wherever plain Git would find the driver or the attribute; a driver no attribute names changes nothing. A
+    conversion configured only in the global config still counts, as plain Git applies it."""
+    global_config = tmp_path / "global"
+    global_config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))  # this test's own global config, no system one
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     work = _repo(tmp_path / "tree")
     (work / ".gitignore").write_text("*.log\n")
     (work / "delivered.txt").write_text("delivery\n")
@@ -283,11 +290,20 @@ def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
         (tmp_path / "attributes").write_text("*.txt text eol=crlf\n")
         _git(work, "config", "core.attributesFile", str(tmp_path / "attributes"))
         (work / "delivered.txt").write_bytes(b"delivery\r\n")
-    elif case == "filtered":  # a reversible filter: the checkout holds A, the stored blob B
-        for kind in ("clean", "smudge"):
-            _git(work, "config", f"filter.swap.{kind}", "tr AB BA")
-        (work / ".gitattributes").write_text("sample.txt filter=swap\n")
+    elif case == "global-conversion":  # stored with CRLF before any attribute applied
+        (work / "delivered.txt").write_bytes(b"delivery\r\n")
+    elif case.startswith("filtered"):  # a reversible filter: the checkout holds A, the stored blob B
+        if case == "filtered":
+            for kind in ("clean", "smudge"):
+                _git(work, "config", f"filter.swap.{kind}", "tr AB BA")
+            (work / ".gitattributes").write_text("sample.txt filter=swap\n")
+        else:  # the driver and the attribute only in the global config and its attributes file
+            (tmp_path / "global-attributes").write_text("sample.txt filter=swap\n")
+            global_config.write_text(f'[filter "swap"]\n\tclean = tr AB BA\n\tsmudge = tr AB BA\n'
+                                     f"[core]\n\tattributesFile = {tmp_path / 'global-attributes'}\n")
         (work / "sample.txt").write_text("A\n")
+    elif case == "dormant-driver":  # a defined driver no attribute names, called as Git's unspecified state
+        _git(work, "config", "filter.unspecified.clean", "tr AB BA")
     os.utime(work / "delivered.txt", (1_000_000_000, 1_000_000_000))  # older than the index: not racily clean
     _git(work, "add", ".")
     _git(work, "commit", "-q", "-m", "delivery")
@@ -297,7 +313,12 @@ def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
         (work / name).write_text(f"left over {name!r}\n")
     if case == "attributes-file":
         os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
-    elif case == "filtered":
+    elif case == "global-conversion":
+        (tmp_path / "global-attributes").write_text("delivered.txt text\n")
+        global_config.write_text(f"[core]\n\tattributesFile = {tmp_path / 'global-attributes'}\n")
+        os.utime(work / "delivered.txt")  # same bytes; plain Git now normalizes them, so they differ from the blob
+        assert _git(work, "status", "--porcelain") == "M delivered.txt"
+    elif case.startswith("filtered"):
         (work / "sample.txt").write_text("B\n")  # through the filter this is a change; raw, it equals the blob
         assert _git(work, "status", "--porcelain") == "M sample.txt"
     elif case == "stat-hidden":
@@ -310,12 +331,14 @@ def test_snapshot_and_removal_read_the_same_exact_tree(tmp_path, case):
         _git(work, "config", "core.checkStat", "minimal")
         # Hidden from a plain status; --no-optional-locks keeps that probe from refreshing the index.
         assert "delivered.txt" not in _git(work, "--no-optional-locks", "status", "--porcelain")
+    expected = {"stat-hidden": [" M delivered.txt"], "global-conversion": [" M delivered.txt"],
+                "filtered": ["hidden tracked changes"], "filtered-global": ["hidden tracked changes"]}.get(case, [])
     record = {"worktree_base_sha": _git(work, "rev-parse", "HEAD")}
     observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
-    assert observed["worktree_dirty_on_exit"] is (case in {"untracked", "stat-hidden", "filtered"})
+    assert observed["worktree_dirty_on_exit"] is (bool(expected) or case == "untracked")
     assert observed["worktree_untracked_only_on_exit"] is (case == "untracked")
     changed, untracked = git._tree_changes(work)
-    assert changed == {"stat-hidden": [" M delivered.txt"], "filtered": ["hidden tracked changes"]}.get(case, [])
+    assert changed == expected
     if case == "stat-hidden":  # salvage stages the edit the reader reports, never HEAD's tree again
         assert git._snapshot_tree(work, "probe") != _git(work, "rev-parse", "HEAD^{tree}")
     assert sorted(untracked) == sorted(LINE_BREAK_NAMES if case == "untracked" else [])
