@@ -669,6 +669,7 @@ def test_cold_start_reads_answer_a_typed_warming_503_not_a_504(monkeypatch, tmp_
     monkeypatch.setattr(state_router, "revalidated_routing_budget_fields", no_claude_fields)
 
     ctx = fixture_context(tmp_path)
+    state_router.routing_budget_startup_begins(ctx)  # what the app lifespan marks at process start
     probe_app = FastAPI()
     probe_app.state.ctx = ctx
     probe_app.include_router(delegate_router.router, prefix="/api/delegate")

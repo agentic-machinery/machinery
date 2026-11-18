@@ -113,7 +113,7 @@ from .state_helpers import (
     first_collections_settled,
 )
 from .state_router import router as state_router
-from .state_router import schedule_state_scan_warmup
+from .state_router import routing_budget_startup_begins, schedule_state_scan_warmup
 from .telemetry.response import add_json_telemetry, session_id_from_request
 from .telemetry_router import router as telemetry_router
 from .work_router import drain_context_background_work, refresh_projection_cache_periodically, warm_projection_cache
@@ -222,6 +222,8 @@ async def _lifespan(_app: FastAPI):
             handoff_root=ctx.roots.live_repo_root,
             ctx=ctx,
         )
+        # Cold routing-budget reads answer fast until the startup warmup's first attempt ends.
+        routing_budget_startup_begins(ctx)
         _app.state.background_work = lambda: _run_background_work(ctx, product)
         yield
     finally:
