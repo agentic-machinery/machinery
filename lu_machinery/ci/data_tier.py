@@ -28,9 +28,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import cast, get_args
-
-import pytest
+from typing import TYPE_CHECKING, cast, get_args
 
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth, test_slots
@@ -44,6 +42,9 @@ from lu_machinery.common.repo_root import (
 from lu_machinery.orchestration import pool_headroom, worktree_claims
 from lu_machinery.orchestration.dispatch_isolation import _parse_bytes, build_scope_argv
 from lu_machinery.storage.topology import STORE_FILES, StoreBinding, StoreId, resolve_store, unavailable_store_path
+
+if TYPE_CHECKING:
+    import pytest
 
 # The product checkout under test owns its audited selection and known failures.
 SELECTION = PurePosixPath("scripts/ci/data_tier_selection.json")
@@ -578,6 +579,8 @@ class SelectionPlugin:
 
 def pytest_child(args: argparse.Namespace) -> int:
     require_read_only(args.read_only)
+    import pytest
+
     selection, _digest = load_selection(Path.cwd(), args.selection_sha256)
     plugin = SelectionPlugin(selection, args.only, args.bulk_reason, Path(args.collected))
     files = [args.only] if args.only else selection["files"]

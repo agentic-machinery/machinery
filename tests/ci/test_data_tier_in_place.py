@@ -369,7 +369,7 @@ def test_child_passes_only_selected_ids_to_two_workers(tmp_path: Path, monkeypat
         junit.write_text('<testsuite><testcase classname="tests.test_sample" name="test_data"/></testsuite>')
         return 0
 
-    monkeypatch.setattr(data_tier.pytest, "main", collect)
+    monkeypatch.setattr(pytest, "main", collect)
     monkeypatch.setattr(data_tier, "run_process_group", execute)
     junit = tmp_path / "junit.xml"
     args = SimpleNamespace(read_only=[], selection_sha256="0" * 64, junit=str(junit), collected=str(tmp_path / "collected.json"), only=None, bulk_reason=None)
@@ -393,7 +393,7 @@ def test_collection_time_data_skip_is_in_junit(tmp_path: Path, monkeypatch: pyte
         plugins[0].pytest_collectreport(report)
         return 5
 
-    monkeypatch.setattr(data_tier.pytest, "main", collect)
+    monkeypatch.setattr(pytest, "main", collect)
     junit = tmp_path / "junit.xml"
     args = SimpleNamespace(read_only=[], selection_sha256="0" * 64, junit=str(junit), collected=str(tmp_path / "collected.json"), only=None, bulk_reason=None)
     assert data_tier.pytest_child(args) == 0

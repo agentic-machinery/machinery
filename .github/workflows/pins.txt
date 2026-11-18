@@ -49,21 +49,12 @@ SEMGREP_VERSION=1.183.0
 #   https://github.com/semgrep/semgrep/releases/tag/v1.183.0
 #   The release has no binary assets; the install comes from PyPI.
 SEMGREP_WHEEL_MANYLINUX_2_34_X86_64_SHA256=f36115c4d0cb43056ceb308273421a2f6a35e055e7e029601e130850f836646e
-#   https://pypi.org/project/semgrep/1.183.0/ (uploaded 2026-10-29). The sast
-#   job of ci-gate.yml pins all 66 packages of the dependency closure for
-#   CPython 3.12 on x86_64 Linux by SHA-256, with 76 wheel hashes because some
-#   packages accept more than one wheel.
+#   https://pypi.org/project/semgrep/1.183.0/ (uploaded 2026-10-29). CI installs
+#   its closure from the isolated semgrep group in uv.lock.
 SEMGREP_CORE_LINUX_X86_64_SHA256=e19fedac1f7c292522b498a8f8394361e6ed389aeef9dd754c26d181bf3d8460
 #   semgrep-1.183.0.data/purelib/semgrep/bin/semgrep-core inside that wheel
 #   (checked 2026-11-04 after verifying the wheel against the pin above).
 #   prepublication-gate.sh refuses a Semgrep venv with any other engine.
-SEMGREP_PYTHON=3.12
-#   CPython minor ABI for the hash-pinned wheels, a uv-managed CPython 3.12 (the
-#   latest patch uv UV_VERSION knows; no Semgrep check requires an exact patch).
-#   Semgrep is the one tool outside uv.lock: semgrep 1.183.0 requires
-#   mcp==1.29.0, which pyproject.toml's mcp>=2.2,<3 excludes, so one lock
-#   cannot hold both. The sast job and tests.yml's scanner tests keep this
-#   heredoc closure until mcp becomes an extra and Semgrep a lock group.
 SEMGREP_RULES_REPOSITORY=https://github.com/semgrep/semgrep-rules
 SEMGREP_RULES_COMMIT=16b9e6d45f10649f6a531ec4838ed9924372c3bc
 #   Commit dated 2026-10-21 ("add php docker rule (#4114)"); the develop head
@@ -98,7 +89,7 @@ CI_GATE_PYTHON=.python-version
 #   Every job runs the uv-managed CPython named in the repository's
 #   .python-version (3.14.8 on 2026-11-17), the build the host's uv installs.
 #   installed-wheel also runs on the requires-python floor of pyproject.toml
-#   (3.12), and sast on SEMGREP_PYTHON. .github/actions/uv-python checks the
+#   (3.12). .github/actions/uv-python checks the
 #   interpreter it puts on PATH. UV_PYTHON_PREFERENCE=only-managed keeps uv
 #   off the runner's own Pythons.
 UV_VERSION=0.13.1
@@ -131,8 +122,8 @@ MYPY_VERSION=2.1.0
 #   repository's requirements-lock.txt version, which recorded the
 #   lu_machinery/lint/mypy_baseline.json census. Checked 2026-11-08.
 #   uv.lock (typecheck group) holds its wheel hashes. The mypy job installs
-#   it with the whole [project] dependency closure from the same lock
-#   (`uv sync --locked --no-install-project --group typecheck`). The closure
+#   it with the core and runtime extras from the same lock
+#   (`uv sync --locked --no-install-project --all-extras --no-extra test --group typecheck`). The closure
 #   is required: typed packages change the error census, and on 2026-11-08 a
 #   venv with only mypy and its own dependencies reported 16 ratchet
 #   violations on a tree the full closure passes. uv.lock was first written
