@@ -119,8 +119,22 @@ LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
   --x-agent claude/claude-cto
 ```
 
-If the installed release predates `lu_machinery.release_cut`, run the same
-command without `-I` and with `PYTHONPATH` set to a machinery `main` checkout.
+The first cut after the move to `uv.lock` needs the updated release tool.
+Older installed releases still read `requirements-machinery.lock`. For this
+cut, use the release-candidate checkout of machinery `main` as `$MACHINERY`
+and put the uv version from `.github/workflows/pins.txt` on `PATH`:
+
+```bash
+PYTHONPATH="$MACHINERY" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+  "$PRIMARY/.venv/bin/python" -P -m lu_machinery.release_cut cut \
+  --x-agent claude/claude-cto
+```
+
+Run the first cut this way before returning to the installed command. The
+source invocation also covers installed releases that predate
+`lu_machinery.release_cut`. When running the matching `contract_canary`
+directly during the transition, use the same `PYTHONPATH` and `-P` so it
+loads the version that exports the candidate's `uv.lock`.
 
 Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
 the command stops at that step and sends a Fleet alert to `claude-cto` that

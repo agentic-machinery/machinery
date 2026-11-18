@@ -246,8 +246,10 @@ LU_MACHINERY_WHEELHOUSE=<host-wheelhouse> .venv/bin/python -m lu_machinery.revie
 ```
 
 The host needs the existing provider credentials and account bindings, a working
-systemd user bus, `git`, `mksquashfs`, `snapfuse` and `fusermount3` (or
-`fusermount`). Use the configured project interpreter and primary/product roots.
+systemd user bus, `git`, `uv` at the candidate's pinned version, `mksquashfs`,
+`snapfuse` and `fusermount3` (or `fusermount`). Use the configured project
+interpreter and primary/product roots. For the first cut after the move to
+`uv.lock`, use the source invocation in [Releasing lu-machinery](../release.md#cut-a-release).
 An optional `LU_MACHINERY_WHEELHOUSE` (the host wheelhouse's absolute path) is a
 local wheel source for the consumer install; a machinery lock pins only
 dependencies and also installs without it. The command does not install host
@@ -271,9 +273,9 @@ image. It removes the checkout once the image exists. It also fetches
 the candidate object from GitHub into the registered primary's Git object store so the
 existing dispatcher can create its pinned review worktrees there. It mounts
 the image read-only beneath the home directory, where fusermount permits
-unmounting, and creates a disposable venv with the candidate's hash-locked
-`requirements-machinery.lock` dependencies. With a wheelhouse set, pip also finds
-wheels there; the lock's hashes decide which bytes install. A `.pth` file names the mount;
+unmounting. It exports the candidate's runtime dependencies with
+`uv export --locked` and installs the hash-checked wheels into a disposable
+venv. With a wheelhouse set, pip also looks for wheels there. A `.pth` file names the mount;
 `lu-machinery` itself is loaded from the sealed checkout. Before spending any
 provider calls it checks the candidate dispatcher's head, clean bytes and
 read-only mount attestation.
