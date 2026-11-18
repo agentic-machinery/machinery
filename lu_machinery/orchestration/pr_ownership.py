@@ -1154,44 +1154,40 @@ def build_parser() -> argparse.ArgumentParser:
 def _checkout_slug(cwd: Path) -> str | None:
     """The ``owner/name`` of the checkout's own origin, else None.
 
-    One read of every origin URL (fetch and push), with Git's repository redirects (``GIT_*``) cleared.
-    Each value must come from the checkout's repository or worktree configuration (includes followed), and
-    all must name the same GitHub repository: a user-level, system-level or command-line value applies to
-    any directory, and distinct values, or an insteadOf rule that rewrites one, leave the checkout's
-    repository ambiguous.
+    The answer is what Git itself reports for the origin's fetch and push URLs
+    (``git remote get-url --all`` and ``--push --all``: ``insteadOf`` rules, push URLs and includes
+    applied), provided the origin is defined by the checkout's own repository or worktree
+    configuration, with Git's repository redirects (``GIT_*``) cleared from every call. A user-level,
+    system-level or command-line origin applies to any directory, so it names no checkout. Every URL must
+    be a GitHub repository URL and all must agree (names compare case-insensitively); else None.
     """
     from lu_machinery.fleet.pr_identity import _GITHUB_REMOTE_PATTERNS
 
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    try:
-        done = subprocess.run(
-            ["git", "config", "--show-scope", "--includes", "--get-regexp",
-             r"^(remote\.origin\.(push)?url|url\..*\.(push)?insteadof)$"],
-            cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+
+    def git_lines(*args: str) -> list[str]:
+        try:
+            done = subprocess.run(
+                ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return done.stdout.splitlines() if done.returncode == 0 else []
+
+    defined = [
+        line.partition("\t")[::2]
+        for line in git_lines("config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$")
+    ]
+    if not any(entry.startswith("remote.origin.url ") for _, entry in defined) or any(
+        scope not in {"local", "worktree"} for scope, _ in defined
+    ):
         return None
-    rows: list[tuple[str, str | None]] = []
-    urls: list[str] = []
-    rewrites: list[str] = []
-    for line in done.stdout.splitlines():
-        scope, _, entry = line.partition("\t")
-        key, _, url = entry.partition(" ")
-        url = url.strip()
-        if not key.startswith("remote.origin."):
-            rewrites.append(url)
-            continue
-        match = next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None)
-        rows.append((key, f"{match.group(1)}/{match.group(2)}" if match and scope in {"local", "worktree"} else None))
-        urls.append(url)
-    slugs = [slug for _, slug in rows]
-    # GitHub names are case-insensitive. A repository needs a fetch URL; a push URL only has to agree with it.
-    # A URL that an insteadOf rule rewrites is not the repository Git uses.
-    if done.returncode or None in slugs or len({str(slug).casefold() for slug in slugs}) != 1:
+    effective = [*git_lines("remote", "get-url", "--all", "origin"), *git_lines("remote", "get-url", "--push", "--all", "origin")]
+    matches = [next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None) for url in effective]
+    if not effective or None in matches:
         return None
-    if any(url.startswith(prefix) for url in urls for prefix in rewrites if prefix):
-        return None
-    return next((slug for key, slug in rows if key == "remote.origin.url"), None)
+    slugs = [f"{match.group(1)}/{match.group(2)}" for match in matches if match]
+    return slugs[0] if len({slug.casefold() for slug in slugs}) == 1 else None
 
 
 def _repo_or_checkout(repo: str | None) -> str:

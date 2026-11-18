@@ -584,14 +584,26 @@ def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch
     assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"  # names differ only in case
     git(checkout, "config", "remote.origin.pushurl", "https://github.com/sample/elsewhere.git")
     assert own._checkout_slug(checkout) is None
-    # An insteadOf rule that rewrites the origin means Git uses another repository; one that does not match is inert.
     git(checkout, "config", "remote.origin.pushurl", url)
-    git(checkout, "config", "url.https://github.com/sample/.insteadOf", "https://github.com/learn-ukrainian/")
-    assert own._checkout_slug(checkout) is None
-    git(checkout, "config", "--unset", "url.https://github.com/sample/.insteadOf")
-    git(checkout, "config", "url.https://github.com/sample/.insteadOf", "https://example.org/")
-    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
-    git(checkout, "config", "--unset", "url.https://github.com/sample/.insteadOf")
+    # The answer is Git's own effective URL: rewrites are applied, a rewrite Git does not apply is inert.
+    rewrite = "url.https://github.com/sample/.insteadOf"
+    git(checkout, "config", rewrite, "https://github.com/learn-ukrainian/")
+    git(checkout, "config", "remote.origin.pushurl", "https://github.com/sample/machinery.git")
+    assert own._checkout_slug(checkout) == "sample/machinery"
+    git(checkout, "config", "--unset", rewrite)
+    git(checkout, "config", "url." + str(tmp_path / "a mirror") + "/.insteadOf", "https://github.com/learn-ukrainian/")
+    git(checkout, "config", "remote.origin.pushurl", url)
+    assert own._checkout_slug(checkout) is None  # rewritten to a path with a space: not GitHub
+    git(checkout, "config", "--unset", "url." + str(tmp_path / "a mirror") + "/.insteadOf")
+    git(checkout, "config", rewrite, "")
+    assert own._checkout_slug(checkout) is None  # an empty prefix rewrites every URL
+    git(checkout, "config", "--unset", rewrite)
+    git(checkout, "config", "url.https://github.com/sample/.pushInsteadOf", "https://github.com/learn-ukrainian/")
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"  # an explicit push URL is not rewritten
+    git(checkout, "config", "--unset", "remote.origin.pushurl")
+    assert own._checkout_slug(checkout) is None  # fetch and rewritten push URL name different repositories
+    git(checkout, "config", "--unset", "url.https://github.com/sample/.pushInsteadOf")
+    git(checkout, "config", "remote.origin.pushurl", url)
     # A push URL alone is not a repository: Git has no fetch origin there.
     git(checkout, "config", "--unset-all", "remote.origin.url")
     git(checkout, "config", "remote.origin.pushurl", url)
