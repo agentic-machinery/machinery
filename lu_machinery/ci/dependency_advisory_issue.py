@@ -88,6 +88,7 @@ def collect_python_findings(report: dict) -> list[Finding]:
         if not isinstance(dep, dict):
             continue
         package = str(dep.get("name", "")).strip()
+        version = str(dep.get("version", "")).strip()
         for vuln in dep.get("vulns", []) or []:
             if not isinstance(vuln, dict):
                 continue
@@ -96,6 +97,7 @@ def collect_python_findings(report: dict) -> list[Finding]:
                 {
                     "ecosystem": "python",
                     "package": package,
+                    "locked_version": version,
                     "advisory_id": str(vuln.get("id", "")).strip() or "unknown",
                     "severity": str(vuln.get("severity", "")).strip() or "unknown",
                     "fixed_version": ", ".join(fix_versions) if fix_versions else "none",
@@ -235,7 +237,7 @@ def build_issue_body(findings: list[Finding]) -> str:
     """Render the tracking-issue body for a non-empty findings list."""
     rows = sorted(
         findings,
-        key=lambda f: (f["ecosystem"], f["package"], f["advisory_id"]),
+        key=lambda f: (f["ecosystem"], f["package"], f.get("locked_version", ""), f["advisory_id"]),
     )
     lines = [
         "The scheduled dependency audit on the default branch found **unsuppressed** "
@@ -245,10 +247,13 @@ def build_issue_body(findings: list[Finding]) -> str:
         "| --- | --- | --- | --- | --- |",
     ]
     for finding in rows:
+        package = finding["package"]
+        if version := finding.get("locked_version"):
+            package = f"{package}=={version}"
         lines.append(
             "| {eco} | {pkg} | {adv} | {sev} | {fix} |".format(
                 eco=_cell(finding["ecosystem"]),
-                pkg=_cell(finding["package"]),
+                pkg=_cell(package),
                 adv=_cell(finding["advisory_id"]),
                 sev=_cell(finding["severity"]),
                 fix=_cell(finding["fixed_version"]),

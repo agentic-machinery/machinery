@@ -403,6 +403,13 @@ def _verify_uv_machinery_wheel(package: dict) -> None:
     _hash_checked_wheel(_LuMachineryPin(version, frozenset({match[1].lower()})), "uv.lock")
 
 
+def _resolve_audit_path(path: Path, description: str) -> Path:
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise LuMachineryAuditWheelError(f"cannot resolve {description}") from exc
+
+
 def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str]]]:
     """Export every locked registry version, checking direct sources before excluding them."""
     uv = shutil.which("uv")
@@ -429,10 +436,7 @@ def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str
                 if name in {"torch", "torchvision"} and origin.rstrip("/") == "https://download.pytorch.org/whl/cpu":
                     cpu_versions.add((name, version))
             elif kind in {"directory", "editable", "virtual"}:
-                try:
-                    local = (repo_root / origin).resolve(strict=True)
-                except (OSError, RuntimeError) as exc:
-                    raise LuMachineryAuditWheelError(f"uv.lock has an unreadable local source for {name}") from exc
+                local = _resolve_audit_path(repo_root / origin, f"uv.lock local source for {name}")
                 if not local.is_relative_to(repo_root):
                     raise LuMachineryAuditWheelError(f"uv.lock local source for {name} escapes the checkout")
                 excluded[name] = "local project; registry dependencies are audited"
@@ -483,7 +487,7 @@ def _uv_audit_export(repo_root: Path, lock: Path) -> dict[str, dict[str, set[str
 @contextmanager
 def legacy_python_audit_input(repo_root: Path) -> Iterator[tuple[str, dict[str, str] | None]]:
     """Shared legacy input and checked-wheel environment for both audit callers."""
-    repo_root = repo_root.resolve()
+    repo_root = _resolve_audit_path(repo_root, "the audit checkout")
     requirements = repo_root / "requirements-lock.txt"
     if not requirements.is_file():
         raise LuMachineryAuditWheelError(f"{requirements} not found; missing required inputs fail closed")
@@ -516,7 +520,7 @@ def _checked_audit_report(result: subprocess.CompletedProcess[str], expected: se
 
 def audit_uv_python(repo_root: Path, ignored_ids: list[str]) -> dict[str, list[dict]] | None:
     """Audit all locked registry versions. Return None only for a legacy checkout."""
-    repo_root = repo_root.resolve()
+    repo_root = _resolve_audit_path(repo_root, "the audit checkout")
     lock = repo_root / "uv.lock"
     if not os.path.lexists(lock):
         return None
