@@ -395,7 +395,8 @@ Code-profile `closeout_cli resolve-reviewer` requires a resolved target or an ow
   * **Top advisors**: Opus 5.5 / Sol 6.2 for advice, critiques and design input; they hold
     designated approval by agreeing; when one authored the proposal, the other's approval
     completes it, and any other author needs both (#9583, #9616).
-  * **Other advisors**: none outside a council (`drive-epic` `references/decision-report.md` § Council). Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 3.8 Flash is not an advisor for
+  * **Other advisors**: Gemini 4 Neon provides supplemental review and hard-problem advice
+    under [Gemini 4 Neon advisory routing](#gemini-4-neon-advisory-routing). Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 3.8 Flash is not an advisor for
     planning or design (operator decision 2026-10-03, #9584); its task-level uses stay as listed in the routing tables. (Kimi is retired, OO-58.)
   * Legacy Terra review qualification does not authorize GPT-6.1 Terra review
     or advisory work; its current admission is routine coding only.
@@ -472,7 +473,7 @@ or count as a formal review.
   operator 2026-11-07, REMOVE-UNNEEDED-1107). No executable routing, reviewer
   ladder or substitution may select the retired ones. GLM is neither local nor free.
 * **Current subscriptions:** Codex Sol 6.2 and Luna,
-  AGY Gemini 4 Hydrogen, 3.8 Flash High, 4 Carbon and 4 Argon, OpenCode DeepSeek V4.1 Flash on OpenCode credit,
+  AGY Gemini 4 Hydrogen, 3.8 Flash High, 4 Neon and 4 Argon, OpenCode DeepSeek V4.1 Flash on OpenCode credit,
   native Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5, and Cursor Grok 4.7 (`grok-4.7-high`, C-5307).
   Muse Wonder Full is retired (MUSE-RETIRE-1112, 2026-11-12) and is not a current subscription.
 * **OpenRouter:** no general fleet routing. Existing DeepSeek compatibility
@@ -877,9 +878,9 @@ seats rotate — operator wording; the catalog-refresh contract §above owns nam
 | Ukrainian language & pedagogy | Opus · Sol (sanctioned language seats ONLY). Gemini joins only as task-level content reviewer under a fixed brief, never for planning or advice on new design (operator decision 2026-10-03, #9584) | LANGUAGE-LANES RULE binds |
 | Architecture & process design | Sol (designer) · Opus (counter-reader); designated approval needs the non-author's approval when Opus or Sol authored the proposal, both otherwise | fleet topology §above |
 | Code & infrastructure review | Opus 5.5 · GPT-6.2 Sol | Historical Terra review arcs on #5896/#5925/#5926/#5931 (defect-finding record) |
-| Security-sensitive changes | Sol · Opus | ambient-Anthropic-token→z.ai leak caught pre-merge (#5931 arc) |
-| Debugging & forensics | Sol · Opus | Historical: retired Grok found the #5932 root cause (#5950 workaround); GLM: operator statement, #5933 comment 2026-07-28 |
-| Long-context sweeps & harness infra | Gemini (sweeps and recon only; not planning or design input, operator decision 2026-10-03, #9584) | model catalog §above (window/tooling) |
+| Security-sensitive changes | Sol · Opus · Neon for supplemental review | #5931 review evidence for the authority seats. Neon outcomes under measurement |
+| Debugging & forensics | Sol · Opus · Neon for hard-problem advice | Historical: retired Grok found the #5932 root cause (#5950 workaround); GLM: operator statement, #5933 comment 2026-07-28 |
+| Long-context sweeps & harness infra | Gemini for sweeps and recon · Neon for hard-problem advice | Model catalog and [Gemini 4 Neon advisory routing](#gemini-4-neon-advisory-routing) |
 
 Historical Terra findings support the evidence record, not a current routing choice.
 The ordinary Codex advisor-panel participant is GPT-6.2 Sol. Routine Codex code review
@@ -990,9 +991,8 @@ permanent capability claim. Confirm exact live strings in native CLI catalogs an
 Operator order HYDROGEN-REPLACES-38 (2026-11-15): Google is retiring Gemini 3.8 Flash, and
 **Gemini 4 Hydrogen at medium (`gemini-4-hydrogen-medium`) is the AGY work default**
 (the AGY adapter, registry and interactive `start-gemini.sh` default; dispatch `--agent agy --model gemini-4-hydrogen-medium`).
-Hydrogen holds work roles only. Gemini 4 Carbon is used for read-only review and
-security-review dispatches outside the review-of-record ladders and for advisory asks, and is
-not a work route (operator 2026-11-17); it holds no review role, so it is never a review of record. Gemini 3.8 Flash keeps the Gemini review seat (low/medium code review), the Ukrainian review
+Hydrogen holds work roles only. Gemini 3.8 Flash keeps the Gemini review seat (low/medium code
+review), the Ukrainian review
 seat, the certified Gemini driver seat, the ACP `ask-agy` consultation pin and the legacy
 `gemini` runtime lane, and stays selectable by explicit pin until Google retires it.
 Earlier history: 3.8 Flash was the AGY top default from 2026-09-02; operator 2026-09-22 found
@@ -1002,6 +1002,8 @@ Gemini 3.7, 3.6 and 3.5 Flash are retired.
 | Model | Catalog slug | Tier | Use |
 | --- | --- | --- | --- |
 | Gemini 4 Hydrogen (Medium) | `gemini-4-hydrogen-medium` | `frontier_practical` | Default AGY work dispatch for routine AND deep work; subagents; fast tool loops; day-to-day coding. No review, Ukrainian review or advisory role |
+| Gemini 4 Neon | `gemini-4-neon-high`, `gemini-4-neon-medium` | `frontier_practical` | [Advisory and supplemental read-only review](#gemini-4-neon-advisory-routing) |
+| Gemini 4 Carbon | `gemini-4-carbon-medium` | `frontier_practical` | Retired. Existing receipts retain their Carbon model IDs |
 | Gemini 3.8 Flash (High) | `gemini-3.8-flash-high` | `frontier_practical` | Explicit pin; Gemini review and Ukrainian review seat, certified driver id, ACP consultation pin; Google is retiring it |
 | Gemini 3.7 Flash (High) | `gemini-3.7-flash-high` | `frontier_practical` | Retired; use `gemini-3.8-flash-high` |
 | Gemini 3.6 Flash (High) | `gemini-3.6-flash-high` | `frontier_practical` | Retired; use `gemini-3.8-flash-high` |
@@ -1009,6 +1011,37 @@ Gemini 3.7, 3.6 and 3.5 Flash are retired.
 | Gemini 3.5 Flash (High) | `gemini-3.5-flash-high` | `strong_efficient` | Retired; use `gemini-3.8-flash-high` |
 
 **Tier calibration (operator claim checked):** 3.8 Flash is roughly **Terra / Sonnet 5 class** for agentic coding throughput — **not** Sol/Opus authority, but operator 2026-09-22 confirmed 3.8 Flash High outperformed 3.1 Pro (since retired). Gemini 4 Hydrogen replaces it as the work default (2026-11-15). Escalate cross-family to Opus / Sol when critical authority is required; Pro is retired, not subscribed.
+
+### Gemini 4 Neon advisory routing
+
+NEON-REPLACES-CARBON-1118 (2026-11-18) retires Carbon and moves its advisory work to Neon.
+Use Neon through native read-only AGY for supplemental review, supplemental security review,
+hard-problem advice and the independent answer in a non-Ukrainian council. The formal
+review ladders and designated approval rules still apply.
+
+Set `pr_number` to the PR number, when applicable, and `task_id` to the stable dispatch or
+discussion ID when you have one. Select the wire ID as follows.
+
+```bash
+neon_model=gemini-4-neon-high
+if [[ -n ${pr_number:-} ]]; then
+    [[ $pr_number =~ ^[1-9][0-9]*$ ]] || exit 2
+    case ${pr_number: -1} in
+        [02468]) neon_model=gemini-4-neon-medium ;;
+    esac
+elif [[ -n ${task_id:-} ]]; then
+    task_digest=$(printf '%s' "$task_id" | sha256sum) || exit 2
+    case ${task_digest:0:1} in
+        [02468ace]) neon_model=gemini-4-neon-medium ;;
+    esac
+fi
+```
+
+Pass `--agent agy --model "$neon_model" --mode read-only --research-role advisory` to
+`lu_machinery.dispatch dispatch`. For PR work, pass the exact head with `--pinned-head` and
+put the PR number in the brief. `--pr` or a review profile would request review-of-record
+admission. Keep the literal model ID in the advisory record and check it against the model
+reported by AGY in the settled dispatch. Compare review outcomes by selector.
 
 ## Codex routing — GPT-6 driver, workers, reviewer, and advisor
 

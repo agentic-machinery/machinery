@@ -303,8 +303,8 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
 
-def test_mixed_family_head_refuses_carbon(dispatch, monkeypatch, tmp_path, capsys):
-    """Defect class: Carbon is still admitted as a second reviewer of a mixed-family head."""
+def test_mixed_family_head_refuses_neon(dispatch, monkeypatch, tmp_path, capsys):
+    """Defect class: advisory Neon can satisfy a mixed-family review gate."""
     repo, origin = tmp_path / "repo", tmp_path / "origin.git"
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t",
@@ -315,12 +315,10 @@ def test_mixed_family_head_refuses_carbon(dispatch, monkeypatch, tmp_path, capsy
         return subprocess.run(command, check=True, capture_output=True, text=True, env=env, timeout=30).stdout.strip()
 
     repo.mkdir()
-    run("init", "-q")
+    run("init", "-q", "--initial-branch=main")
     run("commit", "-q", "--allow-empty", "-m", "base")
-    run("init", "-q", "--bare", str(origin))
-    run("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    run("clone", "-q", "--bare", str(repo), str(origin))
     run("remote", "add", "origin", str(origin))
-    run("push", "-q", "origin", "HEAD:refs/heads/main")
     for trailer in ("claude/claude-opus-5-5", f"codex/{CURRENT_SOL}"):
         run("commit", "-q", "--allow-empty", "-m", f"work\n\nX-Agent: {trailer}")
     head = run("rev-parse", "HEAD")
@@ -332,5 +330,5 @@ def test_mixed_family_head_refuses_carbon(dispatch, monkeypatch, tmp_path, capsy
     review = ("--mode", "read-only", "--branch", "review/target", "--review-profile", "infra", "--risk", "critical")
     dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2)
     assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
-    dispatch(*review, agent="agy", model="gemini-4-carbon-medium", expected=2)
+    dispatch(*review, agent="agy", model="gemini-4-neon-high", expected=2)
     assert "holds no review" in capsys.readouterr().err

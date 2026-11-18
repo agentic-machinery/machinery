@@ -26,8 +26,8 @@ def test_split_is_a_pinned_hash_so_tuning_never_reaches_the_held_out_split() -> 
     evalset = review_eval.load_set(SET_DIR)
     reversed_set = review_eval.EvalSet(evalset.cases[::-1], evalset.controls[::-1], evalset.protocol)
     for split in review_eval.SPLITS:
-        forward = {i.entry["id"] for i in review_eval.plan(evalset, "carbon", split, "t")}
-        backward = {i.entry["id"] for i in review_eval.plan(reversed_set, "carbon", split, "t")}
+        forward = {i.entry["id"] for i in review_eval.plan(evalset, "neon", split, "t")}
+        backward = {i.entry["id"] for i in review_eval.plan(reversed_set, "neon", split, "t")}
         assert forward == backward
     test_ids = {i.entry["id"] for i in review_eval.plan(evalset, "sol", "test", "t")}
     tune_ids = {i.entry["id"] for i in review_eval.plan(evalset, "sol", "tune", "t")}
@@ -98,10 +98,10 @@ def test_dry_run_prints_the_plan_and_dispatches_nothing(monkeypatch, capsys) -> 
 
     monkeypatch.setattr(subprocess, "run", refuse)
     monkeypatch.setattr(subprocess, "Popen", refuse)
-    code = review_eval.main(["--seat", "sol", "--seat", "carbon", "--dry-run", "--set-dir", str(SET_DIR),
+    code = review_eval.main(["--seat", "sol", "--seat", "neon", "--dry-run", "--set-dir", str(SET_DIR),
                              "--run-label", "t"])
     assert code == 0
     out = capsys.readouterr().out
     assert f"lu_machinery.dispatch dispatch --agent codex --model {CURRENT_SOL}" in out
-    assert "--agent agy --model gemini-4-carbon-medium" in out
+    assert "--agent agy --model gemini-4-neon-high" in out
     assert '"reviews": 33' in out
