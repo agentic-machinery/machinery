@@ -194,3 +194,43 @@ def test_slow_compute_duration_counts_toward_served_age(monkeypatch, tmp_path):
             assert body["ranked_by_headroom"] == []
 
     asyncio.run(scenario())
+
+
+def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypatch, tmp_path):
+    """Defect class: right after a restart the cold routing-budget read awaited the startup
+    warmup's computation with no bound, so the request middleware cut it off with a 504.
+    While the first attempt runs, even with the default executor saturated, the read answers
+    the typed warming 503 with Retry-After inside the request timeout, then 200 once it lands."""
+    from lu_machinery.api import resilience
+
+    monkeypatch.setenv("API_REQUEST_TIMEOUT_S", "4")
+    release = threading.Event()
+
+    def compute(**kwargs):
+        assert release.wait(30), "the test did not release the startup computation"
+        kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
+        return {"agents": {}, "diagnostics": {"data_age_s": 0, "stale": False, "stale_threshold_s": 900}}
+
+    app = _app(monkeypatch, tmp_path, compute)
+    app.middleware("http")(resilience.resilience_middleware)
+    warmup = state_router.schedule_state_scan_warmup(app.state.ctx)  # what the lifespan starts at process start
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            try:
+                async with _saturated_executor():
+                    started = asyncio.get_running_loop().time()
+                    cold = await client.get("/api/state/routing-budget")
+                    elapsed = asyncio.get_running_loop().time() - started
+            finally:
+                release.set()
+            assert cold.status_code == 503, cold.text
+            assert cold.json() == {"detail": "routing budget warming"}
+            assert cold.headers["Retry-After"] == "2"
+            assert cold.headers["X-Snapshot-Age-S"] == "unknown"
+            assert elapsed < resilience.request_timeout_s() - 1
+            await asyncio.to_thread(warmup.join, 30)
+            assert not warmup.is_alive()
+            assert (await client.get("/api/state/routing-budget")).status_code == 200
+
+    asyncio.run(scenario())
