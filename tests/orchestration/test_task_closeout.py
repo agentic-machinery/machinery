@@ -1436,7 +1436,23 @@ def test_cmd_init_accepts_native_membership_without_a_live_audit(
     assert ledger["identity"]["stream_epic_url"] == "https://github.com/org/product/issues/10"
     assert ledger["lifecycle_id"] != task_lifecycle.lifecycle_id(_identity_dict())
 
+    observation = _observation()
+    result = task_lifecycle.evaluate(ledger, observation)
+    assert result["membership"]["valid"] is False
+    assert result["membership"]["reason"] == "identity stream epic URL does not match the registered repository and number"
+    adapter = FakeAdapter(observation)
+    with pytest.raises(task_lifecycle.LifecycleError, match="stream epic URL does not match"):
+        task_closeout.perform_mutation(
+            tmp_path / "lifecycle.json", adapter, action="sync-acs", authorized_by="codex/test",
+            branch=None, worktree=None, now=NOW,
+        )
+    assert not adapter.calls
+
     # The child shares an issue number with a registered epic in the other repository.
+    registry = {"epics": [10, 42]}
+    foreign_audit = {**_body_audit(), "repository": epic_repo}
+    verdict = check_issue_task_quality.evaluate_membership({}, "org/repo", 42, registry, {}, foreign_audit)
+    assert verdict["errors"][0]["code"] == "membership_audit_repository_mismatch"
     monkeypatch.setattr(check_issue_task_quality, "read_parent", lambda repo, number: {
         "number": 10, "repository": epic_repo,
     })

@@ -425,8 +425,10 @@ def resolve_live_ancestry(
                 "valid": True, "method": "native_chain", "epic": stream_epic,
                 "generated_at": None, "digest": None, "reason": None,
             }
-        if parent_repo != local_repo or local_repo != epic_repo:
-            return _membership_refusal("live ancestry crosses a repository boundary without a direct registered parent")
+        if local_repo != epic_repo:
+            return _membership_refusal("cross-repository live ancestry requires a direct registered parent")
+        if parent_repo != local_repo:
+            return _membership_refusal("live ancestry crosses a repository boundary")
         visited.add(number)
         current = number
     return _membership_refusal("live ancestry exceeds the maximum sub-issue depth")
@@ -523,8 +525,10 @@ def resolve_membership(
                     "issue has a native parent epic that differs from the identity's exact registered stream epic"
                 ),
             }
-        if parent_repo != local_repo or local_repo != epic_repo:
-            return _membership_refusal("native ancestry crosses a repository boundary without a direct registered parent")
+        if local_repo != epic_repo:
+            return _membership_refusal("cross-repository native ancestry requires a direct registered parent")
+        if parent_repo != local_repo:
+            return _membership_refusal("native ancestry crosses a repository boundary")
         return _resolve_native_chain(
             repository=repository,
             issue_number=issue_number,
@@ -1991,22 +1995,25 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
         hard.append("authoritative GitHub repository does not match task identity")
     registered_epics = github.get("registered_stream_epics")
     epic_repository = github.get("stream_epic_repository")
-    if repository_identity_valid(epic_repository) and not stream_epic_url_matches(identity, epic_repository):
-        hard.append("identity stream epic URL does not match the registered repository and number")
+    if epic_repository is None:
+        epic_repository = identity["repository"]
     if issue.get("number") != identity["github_issue_number"]:
         hard.append("authoritative GitHub issue does not match task identity")
     if issue.get("url") != identity["github_issue_url"]:
         hard.append("authoritative GitHub issue URL does not match task identity")
-    membership = resolve_membership(
-        issue_number=identity["github_issue_number"],
-        stream_epic=identity["stream_epic"],
-        native_parent_epic=issue.get("parent_epic"),
-        repository=identity["repository"],
-        native_parent_repository=issue.get("parent_repository"),
-        epic_repository=epic_repository,
-        registered_epics=registered_epics,
-        membership_report=github.get("membership_audit"),
-    )
+    if not repository_identity_valid(epic_repository) or not stream_epic_url_matches(identity, epic_repository):
+        membership = _membership_refusal("identity stream epic URL does not match the registered repository and number")
+    else:
+        membership = resolve_membership(
+            issue_number=identity["github_issue_number"],
+            stream_epic=identity["stream_epic"],
+            native_parent_epic=issue.get("parent_epic"),
+            repository=identity["repository"],
+            native_parent_repository=issue.get("parent_repository"),
+            epic_repository=epic_repository,
+            registered_epics=registered_epics,
+            membership_report=github.get("membership_audit"),
+        )
     if not membership["valid"]:
         hard.append(
             f"issue membership does not resolve to the identity's exact registered stream epic: {membership['reason']}"

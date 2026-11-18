@@ -21,6 +21,7 @@ from lu_machinery.orchestration.issue_stream_audit import (
     make_issue_resolver,
     make_membership_resolver,
 )
+from lu_machinery.orchestration.task_closeout import GhGitHubAdapter
 
 import pytest
 
@@ -107,8 +108,12 @@ def test_membership_and_issue_resolvers_accept_program_child_only_under_its_epic
     assert make_issue_resolver(report)(str(CHILD)) is True
 
 
-def test_lifecycle_resolves_program_child_to_registered_epic_natively():
-    registered = _registered(audit_only=True)
+def test_lifecycle_resolves_program_child_to_registered_epic_natively(tmp_path, monkeypatch):
+    adapter = GhGitHubAdapter(tmp_path)
+    monkeypatch.setattr(adapter, "_json", lambda command: {"nameWithOwner": "org/repo"})
+    monkeypatch.setattr(task_lifecycle, "stream_registry_repository", lambda repo: repo)
+    epic_repository, registered = adapter.registered_stream_epics("org/repo")
+    assert epic_repository == "org/repo"
     assert LIVE in registered
     assert PARENT not in registered and PROGRAM not in registered
     report = _audit_report({LIVE: [PARENT], PARENT: [CHILD]}, [PARENT, CHILD])

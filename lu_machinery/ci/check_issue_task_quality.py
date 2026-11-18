@@ -310,12 +310,12 @@ def evaluate_membership(
     epic_repository = repository if epic_repository is None else epic_repository
     local_registry = repository.casefold() == epic_repository.casefold()
     roots = [n for ns in registry.values() for n in ns]
-    if local_registry and number in roots:
-        return section("root_exempt")
     if report is not None:
         refusal = _audit_refusal(report, repository, registry, cached=cached)
         if refusal:
             return refusal
+    if local_registry and number in roots:
+        return section("root_exempt")
     index = (report or {}).get("effective_membership", {})
     entry = index.get(str(number), {})
     if entry and entry.get("unique_stream") is not True:
@@ -359,7 +359,7 @@ def evaluate_membership(
             "and refresh the membership audit.",
         )
     reason = result["reason"]
-    if any(s in reason for s in ("cyclic", "crosses a repository", "different registered", "multi-homed")):
+    if any(s in reason for s in ("cyclic", "crosses a repository", "direct registered parent", "different registered", "multi-homed")):
         code = "membership_conflicting_ancestry"
     elif parents.get(number) is None and not entry:
         code = "membership_missing_parent"
@@ -368,7 +368,9 @@ def evaluate_membership(
     return membership_error(code)
 
 
-def cached_membership(issue: dict, repository: str, number: int, registry: dict, parents: dict) -> dict:
+def cached_membership(
+    issue: dict, repository: str, number: int, registry: dict, parents: dict, *, epic_repository: str,
+) -> dict:
     """Read shared audit evidence, then apply the canonical validator and resolver."""
     path = state_root() / "batch_state" / "issue_stream_audit.json"
     try:
@@ -377,7 +379,9 @@ def cached_membership(issue: dict, repository: str, number: int, registry: dict,
         return membership_error("membership_audit_cache_missing")
     except (OSError, ValueError):
         return membership_error("membership_audit_cache_unreadable")
-    return evaluate_membership(issue, repository, number, registry, parents, report, cached=True)
+    return evaluate_membership(
+        issue, repository, number, registry, parents, report, cached=True, epic_repository=epic_repository,
+    )
 
 
 def observe_membership(issue: dict, repository: str, number: int, *, audit_orphans: bool = True) -> dict:
@@ -419,7 +423,7 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
         report = None
         if audit_orphans and local_registry and parents.get(number) is None:
             progress.stage = "cached_audit_validation"
-            cached = cached_membership(issue, repository, number, registry, parents)
+            cached = cached_membership(issue, repository, number, registry, parents, epic_repository=epic_repository)
             if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
                 return cached
             cache_rejection = cached["errors"][0]["code"]

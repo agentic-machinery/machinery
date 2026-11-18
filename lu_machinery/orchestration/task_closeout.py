@@ -795,6 +795,8 @@ def _assert_live_memberships(
 ) -> None:
     """Revalidate all targets using this invocation's registry and live audit."""
     identity = ledger["identity"]
+    if epic_repository is None:
+        epic_repository = identity["repository"]
     if task_lifecycle.repository_identity_valid(epic_repository) and not task_lifecycle.stream_epic_url_matches(
         identity, epic_repository
     ):
