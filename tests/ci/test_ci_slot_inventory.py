@@ -408,7 +408,7 @@ def test_input_verification_and_source_lock_drift(repo, manifest):
 
     uv_lock = repo / "uv.lock"
     uv_lock.write_text("version = 1\n")
-    subprocess.run(["git", "add", "uv.lock"], cwd=repo, check=True)
+    git(repo, "add", "uv.lock")
     path.write_text(json.dumps(input_wrapper(repo, manifest)))
     uv_lock.write_text("version = 1\nrevision = 2\n")
     with pytest.raises(ValueError, match="stale"):

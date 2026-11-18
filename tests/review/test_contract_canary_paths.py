@@ -307,6 +307,7 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "git clone" not in output and "fetch --quiet --no-tags --depth 1 " in output
     assert output.index("mksquashfs") < output.index("/source (the image holds") < output.index("snapfuse")
     assert "dispatch admission's disk refuse level" in output
+    assert "--no-emit-project --no-default-groups --all-extras --no-extra test" in output
     # lu-machinery is on no package index: the host wheelhouse supplies it, the lock's hashes pick the bytes.
     assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
     assert "--codex-account b-sub" in output and "--claude-account b" in output

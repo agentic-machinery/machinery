@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -146,6 +147,8 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
     wheel = tmp_path / filename
     wheel.write_bytes(payload)
     monkeypatch.setenv("LU_MACHINERY_WHEELHOUSE", str(tmp_path))
+    runtime = tmp_path / "packages/runtime"
+    runtime.mkdir(parents=True)
     (tmp_path / "uv.lock").write_text(
         'version = 1\n'
         '[[package]]\nname = "lu-machinery"\nversion = "1.2.3"\n'
@@ -155,31 +158,51 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
         f'source = {{ git = "https://example.invalid/git-dep?rev=main#{"a" * 40}" }}\n'
         '[[package]]\nname = "torch"\nversion = "1.2.3+cpu"\n'
         'source = { registry = "https://download.pytorch.org/whl/cpu" }\n'
-        '[[package]]\nname = "package"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+        '[[package]]\nname = "package"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }\n'
+        '[[package]]\nname = "package"\nversion = "2.0.0"\nsource = { registry = "https://pypi.org/simple" }\n',
         encoding="utf-8",
     )
     monkeypatch.setattr("lu_machinery.ci.audit_dependencies.shutil.which", lambda _: "uv")
 
+    incomplete_report = False
+
     def uv_or_audit(argv, **_kwargs):
         if argv[0] == "uv":
             assert argv[1:4] == ["export", "--locked", "--offline"]
+            assert "--no-build" in argv
             assert {argv[i + 1] for i, arg in enumerate(argv) if arg == "--no-emit-package"} == {
                 "git-dep", "lu-machinery", "runtime",
             }
-            return MagicMock(returncode=0, stdout=f"package==1.0.0 --hash=sha256:{digest}\n"
-                             f"torch==1.2.3+cpu --hash=sha256:{digest}\n")
+            return MagicMock(returncode=0, stdout=(
+                f"package==1.0.0 ; sys_platform != 'win32' --hash=sha256:{digest}\n"
+                f"package==2.0.0 ; sys_platform == 'win32' --hash=sha256:{digest}\n"
+                f"torch==1.2.3+cpu --hash=sha256:{digest}\n"
+            ))
         assert {"--require-hashes", "--disable-pip", "--strict", "CVE-TEST"} <= set(argv)
-        assert Path(argv[argv.index("-r") + 1]).read_text(encoding="utf-8") == (
-            f"package==1.0.0 --hash=sha256:{digest}\ntorch==1.2.3 --hash=sha256:{digest}\n"
-        )
-        return MagicMock(returncode=0, stdout="No known vulnerabilities found", stderr="")
+        pins = Path(argv[argv.index("-r") + 1]).read_text(encoding="utf-8")
+        if pins.startswith("package==1.0.0"):
+            assert pins == f"package==1.0.0 --hash=sha256:{digest}\ntorch==1.2.3 --hash=sha256:{digest}\n"
+            audited = [("package", "1.0.0"), ("torch", "1.2.3")]
+        else:
+            assert pins == f"package==2.0.0 --hash=sha256:{digest}\n"
+            audited = [] if incomplete_report else [("package", "2.0.0")]
+        return MagicMock(returncode=0, stdout=json.dumps({
+            "dependencies": [{"name": name, "version": version, "vulns": []} for name, version in audited],
+        }))
 
     mock_run.reset_mock()
     mock_run.side_effect = uv_or_audit
     assert audit_python(tmp_path, ignore_file) == 0
-    assert mock_run.call_count == 2
+    assert mock_run.call_count == 3
+    incomplete_report = True
+    assert audit_python(tmp_path, ignore_file) == 1
     mock_run.reset_mock()
     wheel.write_bytes(b"tampered")
+    assert audit_python(tmp_path, ignore_file) == 1
+    mock_run.assert_not_called()
+    wheel.write_bytes(payload)
+    runtime.rmdir()
+    runtime.symlink_to(runtime.name)
     assert audit_python(tmp_path, ignore_file) == 1
     mock_run.assert_not_called()
 

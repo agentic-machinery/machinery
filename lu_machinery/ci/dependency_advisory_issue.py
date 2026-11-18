@@ -14,7 +14,7 @@ issue body. The workflow applies the action with ``gh``.
 Reuses the suppression logic from ``scripts/ci/audit_dependencies.py`` so
 "unsuppressed" means exactly what the blocking audit enforces: every pip-audit
 finding, and High/Critical npm findings. The pip-audit invocation shares
-``python_audit_input`` with that blocking audit, so a first-party
+its locked inputs with that blocking audit, so a first-party
 ``lu-machinery`` requirement resolves from ``LU_MACHINERY_WHEELHOUSE`` instead
 of PyPI.
 """
@@ -31,10 +31,11 @@ from pathlib import Path
 
 from lu_machinery.ci._location import checkout_relative, module_name
 from lu_machinery.ci.audit_dependencies import (
+    audit_uv_python,
     filter_npm_audit_vulnerabilities,
+    legacy_python_audit_input,
     load_npm_audit_ignores,
     load_pip_audit_ignores,
-    python_audit_input,
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
@@ -181,23 +182,25 @@ def run_collect(
     findings: list[Finding] = []
 
     pip_ignore = pip_ignore_file or repo_root / "scripts/config/pip-audit-ignore.yaml"
-    pip_options = ["--format", "json", "--progress-spinner=off"]
-    for vuln_id in load_pip_audit_ignores(pip_ignore):
-        pip_options.extend(["--ignore-vuln", vuln_id])
-    with python_audit_input(repo_root) as (audit_args, env):
-        pip_report, pip_code = _run_json_command(
-            [sys.executable, "-m", "pip_audit", *audit_args, *pip_options],
-            cwd=repo_root,
-            timeout=PIP_AUDIT_TIMEOUT_SECONDS,
-            label="pip-audit",
-            env=env,
-        )
-    if pip_code not in (0, 1):
-        raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
-    python_findings = collect_python_findings(pip_report)
-    if not isinstance(pip_report.get("dependencies"), list) or (pip_code != 0 and not python_findings):
-        raise RuntimeError(f"pip-audit returned an invalid report (exit={pip_code})")
-    findings.extend(python_findings)
+    ignored = load_pip_audit_ignores(pip_ignore)
+    pip_report = audit_uv_python(repo_root, ignored)
+    if pip_report is None:
+        pip_options = ["--format", "json", "--progress-spinner=off"]
+        for vuln_id in ignored:
+            pip_options.extend(["--ignore-vuln", vuln_id])
+        with legacy_python_audit_input(repo_root) as (requirements, env):
+            pip_report, pip_code = _run_json_command(
+                [sys.executable, "-m", "pip_audit", "-r", requirements, *pip_options],
+                cwd=repo_root,
+                timeout=PIP_AUDIT_TIMEOUT_SECONDS,
+                label="pip-audit",
+                env=env,
+            )
+        if pip_code not in (0, 1):
+            raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
+        if not isinstance(pip_report.get("dependencies"), list) or (pip_code and not collect_python_findings(pip_report)):
+            raise RuntimeError(f"pip-audit returned an invalid report (exit={pip_code})")
+    findings.extend(collect_python_findings(pip_report))
 
     npm_ignore = npm_ignore_file or repo_root / "scripts/config/npm-audit-ignore.yaml"
     ignored_ids = load_npm_audit_ignores(npm_ignore) if npm_ignore.exists() else []
