@@ -510,6 +510,11 @@ def test_cli_without_repo_targets_the_checkout_not_the_default_fleet_repository(
     assert own.main(["accept", "--pr", "42"]) == 2
     assert own.main(["queue-exit", "--pr", "42"]) == 2
     assert "repository unresolved" in capsys.readouterr().err and seen == []
+    # An explicit --repo is never replaced by the checkout, and only an owner/name spelling is a repository.
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: "learn-ukrainian/machinery")
+    for bad in ("", "github.com/learn-ukrainian/machinery", "https://github.com/learn-ukrainian/machinery"):
+        assert own.main(["accept", "--pr", "42", "--repo", bad]) == 2
+    assert "invalid --repo" in capsys.readouterr().err and seen == []
 
 
 def test_coordinator_custody_never_takes_the_repository_from_the_checkout(world, monkeypatch, capsys):

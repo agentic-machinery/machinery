@@ -1169,8 +1169,10 @@ def _checkout_slug(cwd: Path) -> str | None:
 
 
 def _repo_or_checkout(repo: str | None) -> str:
-    """The ``--repo`` value, else the checkout's origin; never another repository by default."""
-    if repo:
+    """The ``--repo`` value (``owner/name`` only), else the checkout's origin; never another repository by default."""
+    if repo is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise OwnershipError(f"invalid --repo {repo!r}: expected owner/name")
         return repo
     slug = _checkout_slug(Path.cwd())
     if slug is None:
@@ -1192,12 +1194,12 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     from lu_machinery.dispatcher import store
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-    if not args.repo:
+    if args.repo is None:
         # Custody is recorded from the coordinator seat, whose checkout is not the alert's repository.
         print(json.dumps({"accepted": False, "reason": "recorded custody needs --repo owner/name"}))
         return 1
     repos = load_fleet_repos()
-    repo = args.repo
+    repo = _repo_or_checkout(args.repo)
     pr = _gh_pr(repo, args.pr)
     now = datetime.now(UTC)
     records = [] if args.release else store.list_tasks(strict=True)
