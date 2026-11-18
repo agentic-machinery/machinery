@@ -201,6 +201,22 @@ def _project_prefix(project_root: Path) -> str:
     return text if text.endswith(os.sep) else text + os.sep
 
 
+def _discovery_ancestry_verified(discovery: str) -> bool:
+    """True when a non-following walk from ``discovery`` cannot leave that directory.
+
+    ``.`` and ``..`` components, and a symlink anywhere in the path, make the
+    lexical prefix a different place from ``Path.resolve()``. Those walks keep
+    the resolved containment check. One realpath of the start directory covers
+    the whole walk: directory symlinks below it are not followed.
+    """
+    if any(part in {".", ".."} for part in discovery.split(os.sep)):
+        return False
+    try:
+        return os.path.realpath(discovery) == discovery
+    except OSError:
+        return False
+
+
 def _is_excluded(rel_posix: str) -> bool:
     return any(rel_posix == excl or rel_posix.startswith(f"{excl}/") for excl in DISCOVERY_EXCLUDES)
 
@@ -219,20 +235,23 @@ def _relative_under(path: str, root: str) -> str | None:
     return path[len(prefix):].replace(os.sep, "/")
 
 
-def _iter_discovery_files(project_prefix: str) -> Iterator[tuple[str, str, str, bool]]:
-    """Yield ``(path, name, project-relative posix, is_symlink)`` under docs/ and audit/.
+def _iter_discovery_files(project_prefix: str) -> Iterator[tuple[str, str, str, bool, bool]]:
+    """Yield ``(path, name, project-relative posix, is_symlink, ancestry_verified)``.
 
     Directory symlinks are not followed, matching ``Path.rglob``. Hidden names
     and ``DISCOVERY_EXCLUDES`` are pruned. Unreadable directories are skipped.
+    ``ancestry_verified`` is false when the discovery path itself contains
+    ``.`` or ``..`` or any symlink, so the caller still resolves those files.
     """
     for name in ("docs", "audit"):
         discovery = project_prefix + name
         if not os.path.isdir(discovery):
             continue
+        verified = _discovery_ancestry_verified(discovery)
         stack = [discovery]
         while stack:
             current = stack.pop()
-            children: list[tuple[str, str, str, bool]] = []
+            children: list[tuple[str, str, str, bool, bool]] = []
             subdirs: list[str] = []
             try:
                 with os.scandir(current) as scanned:
@@ -264,7 +283,7 @@ def _iter_discovery_files(project_prefix: str) -> Iterator[tuple[str, str, str, 
                             symlink = entry.is_symlink()
                         except OSError:
                             symlink = True
-                        children.append((entry.path, entry.name, rel, symlink))
+                        children.append((entry.path, entry.name, rel, symlink, verified))
             except OSError:
                 continue
             yield from children
@@ -377,7 +396,7 @@ def collect_artifacts(
     artifacts: list[dict] = []
     type_set = set(types)
 
-    for path, name, rel, symlink in _iter_discovery_files(project_prefix):
+    for path, name, rel, symlink, ancestry_verified in _iter_discovery_files(project_prefix):
         suffix = os.path.splitext(name)[1].lower()
         if suffix == ".html":
             if "html" not in type_set:
@@ -402,12 +421,13 @@ def collect_artifacts(
         if root_key is None or root_path is None:
             continue
 
-        # Path.resolve() realpaths every parent. On this tree that was most of
-        # a cold collect, and a non-symlink walked without following directory
-        # links cannot leave its lexical root. Symlinks, and any path that is
-        # not a lexical child, still go through _assert_under_root (HTTP 403).
+        # Path.resolve() realpaths every parent and dominated a cold collect.
+        # Skip it only when this walk's start directory is a real lexical path
+        # (no ".", "..", or symlink) and the file itself is not a symlink.
+        # Anything else still goes through _assert_under_root, which rejects
+        # a resolved path outside the serving root with HTTP 403.
         url_rel = _relative_under(path, root_text)
-        if symlink or url_rel is None:
+        if symlink or not ancestry_verified or url_rel is None or ".." in path.split(os.sep):
             _assert_under_root(Path(path), root_path)
         if url_rel is None:
             url_rel = _relative_to_root(Path(path), root_path)
