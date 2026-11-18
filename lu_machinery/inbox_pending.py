@@ -64,7 +64,7 @@ def authority_inbox_notice(recipient: str | None, *, file: TextIO | None = None)
     target = slot or "<slot>"
     print(
         f"Fleet Comms deliveries for {target}: {count} queued; read them with "
-        f"`.venv/bin/python -m {_MACHINERY}.fleet_comms deliveries receive --recipient {target}`.",
+        f"`.venv/bin/python -m {_MACHINERY}.fleet_comms deliveries receive --recipient {target} --worker-id {target}`.",
         file=file or sys.stdout,
     )
 

@@ -39,30 +39,37 @@ _FLEET = f".venv/bin/python -m {MACHINERY_PACKAGE}.fleet_comms"
 # Verbs of the removed legacy inbox, broker and channel stores (#515), each with
 # its Fleet Comms replacement. They stay registered so a caller gets this typed
 # refusal (exit 2) instead of an argparse "invalid choice".
+_RECEIVE = f"{_FLEET} deliveries receive --recipient <slot> --worker-id <slot>"
+_PUBLISH = f"{_FLEET} channel publish <channel> - --sender <slot> --idempotency-key <key>"
 RETIRED_VERBS = {
-    "inbox": f"{_FLEET} deliveries pending|receive --recipient <slot>",
+    "inbox": f"{_FLEET} deliveries pending --recipient <slot>, then {_RECEIVE}",
     "ack": f"{_FLEET} deliveries ack <delivery-id> --worker-id <slot> --fence-token <n>",
     "ack-all": f"{_FLEET} deliveries ack <delivery-id> --worker-id <slot> --fence-token <n>",
-    "send": f"{_FLEET} channel publish <channel> - --sender <slot> --recipient <slot>",
-    "post": f"{_FLEET} channel publish <channel> - --sender <slot>",
-    "p": f"{_FLEET} channel publish <channel> - --sender <slot> --recipient <slot>",
+    "send": f"{_PUBLISH} --recipient <slot>",
+    "post": _PUBLISH,
+    "p": f"{_PUBLISH} --recipient <slot>",
     "channel": f"{_FLEET} channel create|subscribe|context|publish",
     "conversation": "GET /api/fleet/acp/conversations",
     "thread": "GET /api/fleet/acp/conversations/<conversation-id>",
-    "process": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-claude": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-codex": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-grok": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-grok-build": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-all": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-claude-all": f"{_FLEET} deliveries receive --recipient <slot>",
-    "process-codex-all": f"{_FLEET} deliveries receive --recipient <slot>",
-    "sync": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process": _RECEIVE,
+    "process-claude": _RECEIVE,
+    "process-codex": _RECEIVE,
+    "process-grok": _RECEIVE,
+    "process-grok-build": _RECEIVE,
+    "process-all": _RECEIVE,
+    "process-claude-all": _RECEIVE,
+    "process-codex-all": _RECEIVE,
+    "sync": _RECEIVE,
     "reconcile": f"{_FLEET} backlog",
-    "cleanup": f"{_FLEET} dead",
-    "status": f"{_FLEET} status",
-    "converse": f"{BRIDGE_ENTRY} ask-agy",
-    "interactive": f"{BRIDGE_ENTRY} ask-<seat>",
+    "cleanup": f"{_FLEET} dead-letters",
+    "status": f"{_FLEET} fleet status",
+    "converse": f".venv/bin/python -m {BRIDGE_ENTRY} ask-agy",
+    "interactive": f".venv/bin/python -m {BRIDGE_ENTRY} ask-<seat>",
+}
+# Verbs kept for Fleet request jobs that once also took a legacy integer message id.
+_JOB_ID_VERBS = {
+    "read": RETIRED_VERBS["inbox"],
+    "process-ask": f".venv/bin/python -m {BRIDGE_ENTRY} ask-<seat>",
 }
 
 
@@ -971,8 +978,6 @@ def _dispatch_command(args):
     if replacement is not None:
         refuse_retired_verb(args.command, replacement)
     if args.command == "read":
-        if not str(args.message_id).startswith("authority-job_"):
-            refuse_retired_verb("read <message-id>", RETIRED_VERBS["inbox"])
         from ._opencode import read_opencode_result
 
         print(json.dumps(read_opencode_result(args.message_id), sort_keys=True))
@@ -1587,8 +1592,12 @@ def _kimi_request_error(args) -> str | None:
 
 def main():
     """CLI entry point."""
+    argv = sys.argv[1:]
+    # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
+    if len(argv) >= 2 and argv[0] in _JOB_ID_VERBS and not argv[1].startswith("authority-job_"):
+        refuse_retired_verb(f"{argv[0]} <message-id>", _JOB_ID_VERBS[argv[0]])
     parser = _build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     # A Kimi request stops here, before telemetry or any provider call.
     refusal = _kimi_request_error(args)
     if refusal:
