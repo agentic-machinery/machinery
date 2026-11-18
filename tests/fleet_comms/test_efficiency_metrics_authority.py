@@ -605,19 +605,23 @@ def test_recent_failures_exclude_old_events_and_group_recipients(tmp_path: Path,
     monkeypatch.setattr(efficiency_metrics, "datetime", FrozenDatetime)
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(db.parent))
     monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
-    with TestClient(create_app(fixture_context(tmp_path), product=ProductContribution())) as client:
+    app = create_app(fixture_context(tmp_path), product=ProductContribution())
+    app.state.metrics_snapshot.interval = float("inf")  # refresh after each fixture state change
+    with TestClient(app) as client:
         response = client.get('/api/comms/v1/metrics')
         assert response.status_code == 200
         public = response.json()
         assert public['failure_lifetime'] == {'dead_letters': 2, 'failed_deliveries': 3, 'failed_jobs': 1}
         assert 'private/session-identity' not in response.text
         assert public['failure_windows']['24h']['dead_letters']['by_recipient'] == {'other': 1}
+        app.state.metrics_snapshot.refresh()
         scrape = client.get('/metrics')
         assert scrape.status_code == 200
         assert 'lu_fleet_comms_dead_letters_recent{window="24h"} 1.0' in scrape.text
         assert 'lu_fleet_comms_collection_success 1.0' in scrape.text
         assert 'private/session-identity' not in scrape.text
         monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / 'absent'))
+        app.state.metrics_snapshot.refresh()
         unavailable = client.get('/metrics').text
         assert 'lu_fleet_comms_collection_success 0.0' in unavailable
         assert 'lu_fleet_comms_dead_letters_recent{' not in unavailable
