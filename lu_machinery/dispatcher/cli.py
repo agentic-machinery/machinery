@@ -29,7 +29,7 @@ from lu_machinery.dispatcher import (
     store,
     worker,
 )
-from lu_machinery.dispatcher.environment import child_env
+from lu_machinery.dispatcher.environment import child_env, probe_env
 from lu_machinery.dispatcher.types import ReviewAccess, TaskSpec
 from lu_machinery.dispatcher.watchdog import DEFAULT_INITIAL_RESPONSE_TIMEOUT_S, DEFAULT_SILENCE_TIMEOUT_S, deadlines
 
@@ -542,7 +542,7 @@ def _dispatch(args) -> int:
     checks.check_private_input(spec, info["key"])
     # Before any worktree or task record: an endpoint without access or funds is refused, never switched.
     if agent == "opencode" and (refusal := opencode.endpoint_refusal(
-        spec.provider, child_env(spec), worktree=worktree, repo=None if args.cwd else repo, sha=sha,
+        spec.provider, probe_env(spec), worktree=worktree, repo=None if args.cwd else repo, sha=sha,
     )):
         raise ValueError(refusal)
     if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):

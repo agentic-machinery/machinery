@@ -226,7 +226,6 @@ def build_scope_argv(
 
 
 _SERVICE_SUFFIX = ".service"
-_SERVICE_ALIVE = frozenset({"active", "activating", "reloading", "refreshing", "maintenance"})
 _SERVICE_GONE = frozenset({"inactive", "failed", "unknown"})
 
 
@@ -366,13 +365,14 @@ def _systemctl(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
 
 
 def _service_gone(proc: subprocess.CompletedProcess[str]) -> bool:
+    """Whether ``systemctl is-active`` proves the service stopped: a terminal state (inactive, failed, or unknown
+    with exit 3 or 4). A transitional state such as deactivating, which can still hold processes, or an empty or
+    unrecognized reply is not proof, whatever the exit code."""
     state = (proc.stdout or "").strip().splitlines()
     text = state[-1] if state else ""
-    if text in _SERVICE_ALIVE or proc.returncode == 0:
+    if proc.returncode == 0 or text not in _SERVICE_GONE:
         return False
-    if text == "unknown" and proc.returncode not in {3, 4}:
-        return False
-    return proc.returncode in {3, 4} or text in _SERVICE_GONE
+    return text != "unknown" or proc.returncode in {3, 4}
 
 
 def _publish_task_service_alert(task_id: str, unit: str, reason: str) -> None:
