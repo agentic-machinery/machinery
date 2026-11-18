@@ -1260,8 +1260,8 @@ def _settle_task_scratch(record: dict) -> None:
 
     The scratch is the worker's TMPDIR, never deliverable state, so a worktree kept for unpublished or dirty
     work does not keep it. Only a provider that may still run does; the scheduled sweep retries that tree and
-    its scratch with it. Records ``task_scratch_disposition`` (removed, absent, retained, refused or failed)
-    with its reason and the bytes freed. A refusal or failure is recorded and never fails settlement.
+    its scratch with it. Records ``task_scratch_disposition`` (removed, partial, absent, retained, refused or
+    failed) with its reason and the bytes freed. A refusal or failure is recorded and never fails settlement.
     """
     reason = record.get("worktree_disposition_reason")
     if record.get("worktree_disposition") is None or reason in _PROVIDER_MAY_RUN:
@@ -1277,12 +1277,16 @@ def _settle_task_scratch(record: dict) -> None:
 
 
 def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
-    """Delete exactly ``<base>/<task-id>``; return (disposition, reason, bytes).
+    """Prune exactly ``<base>/<task-id>``; return (disposition, reason, bytes freed).
 
     Refuses an invalid task id, a symlink, a non-directory, an entry another user owns, one on another
-    filesystem or with a mount below it. Deletion never follows a symlink, never leaves the entry's device
-    or mount, and gives a read-only directory owner rwx before emptying it (task_scratch's remover).
+    filesystem or with a mount below it. Pruning never follows a symlink, never leaves the entry's device
+    or mount, and gives a read-only directory owner rwx before emptying it. It keeps sockets, FIFOs,
+    ``tmux-*``/``ssh-*`` directories and anything a live process uses (batch_state_retention.prune_tree):
+    then the disposition is ``partial`` and those entries, with the directories holding them, stay.
     """
+    from lu_machinery.hygiene.batch_state_retention import paths_in_use, prune_tree
+
     if not isinstance(task_id, str):
         return "refused", "task id missing", None
     try:
@@ -1305,28 +1309,20 @@ def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
         mount_id = task_scratch.fd_mount_id(base_fd)
         if info.st_dev != base.st_dev:
             return "refused", "scratch directory is on another filesystem", None
-        if mount_id is None:
+        mounts = task_scratch.mount_points()
+        if mount_id is None or mounts is None:
             return "refused", "mount information unavailable", None
-        size = None
+        if task_scratch._mounts_below(path, mounts):
+            return "refused", "a mount point lies below the scratch directory", None
         try:
-            if stat.S_IMODE(info.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
-                # A read-only top directory would refuse to give up its entries; children are repaired on descent.
-                task_scratch.grant_owner_rwx(base_fd, path.name, info, device=base.st_dev, mount_id=mount_id)
-            scratch_fd = os.open(path.name, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC, dir_fd=base_fd)
-            try:
-                held = os.fstat(scratch_fd)
-                if (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino):
-                    return "refused", "scratch directory changed during settlement", None
-                size, _newest = task_scratch._walk_stats(scratch_fd, device=base.st_dev, mount_id=mount_id,
-                                                         opaque_locked=True)
-            finally:
-                os.close(scratch_fd)
-            task_scratch._remove_invocation_dir(base_fd, path.name, namespace=path.parent,
-                                                expected_dev=info.st_dev, expected_ino=info.st_ino)
+            size, kept = prune_tree(base_fd, path.name, info, path=path, device=base.st_dev, mount_id=mount_id,
+                                    in_use=paths_in_use(), keep_handoffs=False)
         except task_scratch.ContainmentError as exc:
-            return "refused", str(exc)[:300], size
+            return "refused", str(exc)[:300], None
         except OSError as exc:
-            return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], size
+            return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], None
+        if kept:
+            return "partial", f"provider gone; kept {kept} socket, FIFO or in-use entries", size
         return "removed", "provider gone", size
     finally:
         os.close(base_fd)

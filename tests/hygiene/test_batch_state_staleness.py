@@ -197,7 +197,7 @@ def test_settled_task_state_is_pruned_keeping_records_results_and_handoffs(batch
     result = retention.prune_settled_tasks(tasks, holds=holds)
     assert result["counts"]["removed"] == 3 and not result["counts"]["failed"] and result["bytes"] >= 65536
     removed = {row["path"]: row for row in result["rows"]}
-    assert removed["batch_state/tasks/old.artifacts/"]["kept_md"] == 1
+    assert removed["batch_state/tasks/old.artifacts/"]["kept"] == 1
     assert [p.relative_to(tasks).as_posix() for p in (tasks / "old.artifacts").rglob("*")] == [
         "old.artifacts/notes", "old.artifacts/notes/handoff.md"]
     assert not (tasks / "old.evidence").exists() and not (tasks / "moved.snapshots").exists()
@@ -238,7 +238,8 @@ def test_a_live_task_is_never_pruned_even_when_it_becomes_live_during_the_run(ba
 
 def test_prune_never_follows_links_crosses_mounts_or_trusts_a_damaged_record(batch, tmp_path, monkeypatch):
     """Defect class: deletion outside the task store. A link inside a pruned directory goes, never its target;
-    a linked task directory, a mount below one and an unreadable owner record leave it untouched."""
+    a linked task directory, a mount below one and an unreadable owner record leave it untouched, and a FIFO
+    (a rendezvous a process finds by path) stays."""
     tasks = batch / "tasks"
     tasks.mkdir()
     outside = tmp_path / "outside"
@@ -247,6 +248,8 @@ def test_prune_never_follows_links_crosses_mounts_or_trusts_a_damaged_record(bat
     task(tasks, "linky")
     (tasks / "linky.artifacts").mkdir()
     (tasks / "linky.artifacts" / "to-outside").symlink_to(outside, target_is_directory=True)
+    (tasks / "linky.artifacts" / "run").mkdir()
+    os.mkfifo(tasks / "linky.artifacts" / "run" / "control")  # found by path: never removed
     task(tasks, "aliased")
     (tasks / "aliased.artifacts").symlink_to(outside, target_is_directory=True)
     (tasks / "damaged.json").write_text('{"schema_version": 2, "task_id": ')
@@ -260,8 +263,10 @@ def test_prune_never_follows_links_crosses_mounts_or_trusts_a_damaged_record(bat
     monkeypatch.setattr(retention, "mount_points", lambda: None)
     assert retention.prune_settled_tasks(tasks, holds=[])["rows"][1]["reason"] == "mount_probe_unknown"
     monkeypatch.setattr(retention, "mount_points", real_mounts)
-    assert retention.prune_settled_tasks(tasks, holds=[])["counts"]["removed"] == 1
-    assert not (tasks / "linky.artifacts").exists() and (outside / "keep").read_text() == "kept"
+    pruned = retention.prune_settled_tasks(tasks, holds=[])
+    assert pruned["counts"]["removed"] == 1 and pruned["rows"][1]["kept"] == 1
+    assert sorted(p.name for p in (tasks / "linky.artifacts").rglob("*")) == ["control", "run"]
+    assert (outside / "keep").read_text() == "kept"
     assert (tasks / "aliased.artifacts").is_symlink() and (tasks / "damaged.artifacts").is_dir()
     with pytest.raises(ValueError, match="finite and positive"):
         retention.prune_settled_tasks(tasks, holds=[], settled_days=0)

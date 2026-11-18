@@ -8,6 +8,8 @@ import os
 import shlex
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import time
@@ -389,12 +391,12 @@ def test_settlement_removes_the_task_scratch_including_a_read_only_directory(mon
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
     locked = base / "scratch-task" / "fixture" / "locked"
     locked.mkdir(parents=True)
-    (locked / "data").write_bytes(b"x" * 10)
+    (locked / "data").write_bytes(b"x" * 65536)
     locked.chmod(0o500)
     base.joinpath("scratch-task").chmod(0o500)
     worker._reap_settled(record)
     assert not (base / "scratch-task").exists()
-    assert (record["task_scratch_disposition"], record["task_scratch_bytes"]) == ("removed", 10)
+    assert record["task_scratch_disposition"] == "removed" and record["task_scratch_bytes"] >= 65536
 
 
 def test_settlement_refuses_a_symlinked_task_scratch_and_leaves_its_target(monkeypatch, tmp_path):
@@ -417,10 +419,10 @@ def test_task_scratch_outlives_only_a_provider_that_may_still_run(monkeypatch, t
     may still run would pull its TMPDIR from under it."""
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "retained")
     (base / "scratch-task").mkdir()
-    (base / "scratch-task" / "pytest-of-user").write_bytes(b"x" * 10)
+    (base / "scratch-task" / "pytest-of-user").write_bytes(b"x" * 65536)
     worker._reap_settled(record)
     assert not (base / "scratch-task").exists()
-    assert (record["task_scratch_disposition"], record["task_scratch_bytes"]) == ("removed", 10)
+    assert record["task_scratch_disposition"] == "removed" and record["task_scratch_bytes"] >= 65536
     for alive in (True, None):
         monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
         (base / "scratch-task").mkdir()
@@ -431,6 +433,39 @@ def test_task_scratch_outlives_only_a_provider_that_may_still_run(monkeypatch, t
         assert record["task_scratch_disposition"] == "retained"
         assert record["task_scratch_disposition_reason"].startswith(record["worktree_disposition_reason"])
         shutil.rmtree(base / "scratch-task")
+
+
+def test_settlement_never_removes_sockets_fifos_agent_directories_or_paths_in_use(monkeypatch, tmp_path):
+    """Defect (2026-11-18): an age-only temp cleanup deleted a tmux server's socket directory and stranded the
+    live server. A server finds its socket or FIFO by path, so those, tmux-*/ssh-* directories and anything a
+    live process holds open stay; the rest of the scratch still goes."""
+    base, record = _settle_with_worktree(monkeypatch, tmp_path, "removed")
+    scratch = base / "scratch-task"
+    (scratch / "tmux-1000").mkdir(parents=True)
+    (scratch / "ssh-agentdir").mkdir()
+    (scratch / "pytest-of-user" / "basetemp").mkdir(parents=True)
+    (scratch / "pytest-of-user" / "basetemp" / "junk").write_bytes(b"j" * 65536)
+    os.mkfifo(scratch / "pytest-of-user" / "pipe")
+    held = (scratch / "held.log").open("w")
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        monkeypatch.chdir(scratch / "tmux-1000")  # bind by relative name: the base can exceed sun_path
+        listener.bind("default")
+        listener.listen(1)
+        monkeypatch.chdir(tmp_path)
+        worker._reap_settled(record)
+        assert (record["task_scratch_disposition"], record["task_scratch_disposition_reason"]) == (
+            "partial", "provider gone; kept 4 socket, FIFO or in-use entries")
+        assert record["task_scratch_bytes"] >= 65536
+        assert not (scratch / "pytest-of-user" / "basetemp").exists()
+        assert stat.S_ISFIFO((scratch / "pytest-of-user" / "pipe").lstat().st_mode)
+        assert (scratch / "held.log").is_file() and (scratch / "ssh-agentdir").is_dir()
+        monkeypatch.chdir(scratch / "tmux-1000")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect("default")  # the live server is still reachable
+    finally:
+        listener.close()
+        held.close()
 
 
 def test_write_task_scratch_is_created_private_and_refused_when_not_our_directory(monkeypatch, tmp_path):
