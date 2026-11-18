@@ -953,16 +953,23 @@ class Cut:
             path = clone / name
             path.write_text(bump_version_file(name, path.read_text(encoding="utf-8"), self.version, upcoming),
                             encoding="utf-8")
+        version_files = list(VERSION_FILES)
+        if (clone / "uv.lock").is_file():
+            uv = shutil.which("uv")
+            if uv is None:
+                raise CutError("uv is not on PATH; cannot refresh uv.lock for the next version")
+            self.run([uv, "lock", "--offline", "--no-python-downloads"], cwd=clone)
+            version_files.append("uv.lock")
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
-        self.git(clone, "add", "CHANGELOG.md", *VERSION_FILES)
+        self.git(clone, "add", "CHANGELOG.md", *version_files)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"{title}\n\nX-Agent: {self.x_agent}")
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
         body.write_text(
             f"Records the {self.version} section of `CHANGELOG.md`, generated from the merged PR titles in "
-            f"`v{self.baseline}..v{self.version}`, and moves `pyproject.toml`, `package.json` and "
-            f"`package-lock.json` to {upcoming}, the version the next release cut tags.\n\n"
+            f"`v{self.baseline}..v{self.version}`, and updates the version files to {upcoming}, "
+            "the version the next release cut tags.\n\n"
             "Opened by the release cut (`docs/release.md`). It needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
         )

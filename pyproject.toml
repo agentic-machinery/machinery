@@ -54,6 +54,7 @@ test = [
 typecheck = ["mypy==2.1.0"]
 lint = ["ruff==0.15.21", "zizmor==1.31.1"]
 audit = ["pip-audit==2.10.1"]
+attribution = ["markdown-it-py>=4.2.0"]
 
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).

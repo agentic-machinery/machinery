@@ -1112,6 +1112,9 @@ test = [
 ]
 
 [package.dev-dependencies]
+attribution = [
+    { name = "markdown-it-py" },
+]
 audit = [
     { name = "pip-audit" },
 ]
@@ -1161,6 +1164,7 @@ requires-dist = [
 provides-extras = ["test"]
 
 [package.metadata.requires-dev]
+attribution = [{ name = "markdown-it-py", specifier = ">=4.2.0" }]
 audit = [{ name = "pip-audit", specifier = "==2.10.1" }]
 lint = [
     { name = "ruff", specifier = "==0.15.21" },

@@ -139,7 +139,7 @@ jobs:
           rm -rf "$venv"
           # The runtime closure with every extra, plus the test and typecheck
           # groups; the project itself comes from the built wheel below.
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-install-project --all-extras \
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --no-install-project --all-extras \
             --group test --group typecheck
           "$venv/bin/python" -I -m pip check --disable-pip-version-check
           reported="$("$venv/bin/python" -I -c 'import platform; print(platform.python_version())')"
@@ -462,7 +462,7 @@ jobs:
           rm -rf "$venv"
           # The pins are CPython ${SEMGREP_PYTHON} wheels (ci-gate.yml sast job).
           uv python install --quiet "$SEMGREP_PYTHON"
-          base="$(uv python find --no-project --managed-python "$SEMGREP_PYTHON")"
+          base="$(uv python find --no-project "$SEMGREP_PYTHON")"
           "$base" -I -m venv "$venv"
           requirements="$RUNNER_TEMP/semgrep-requirements.txt"
           cat > "$requirements" <<'REQUIREMENTS'

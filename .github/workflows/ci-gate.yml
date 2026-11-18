@@ -295,7 +295,7 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/ruff-venv"
           rm -rf "$venv"
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --only-group lint
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group lint
           reported="$("$venv/bin/ruff" --version)"
           if [ "$reported" != "ruff ${RUFF_VERSION}" ]; then
             echo "::error::Expected ruff ${RUFF_VERSION}, got: ${reported}"
@@ -456,7 +456,7 @@ jobs:
           # mypy and the whole [project] dependency closure, without the project
           # itself (the ratchet imports the checkout). Typed packages change the
           # error census, so mypy alone does not reproduce the baseline. See pins.txt.
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-install-project --group typecheck
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --no-install-project --group typecheck
           reported="$("$venv/bin/python" -I -m mypy --version)"
           case "$reported" in
             "mypy ${MYPY_VERSION} "*) ;;
@@ -507,10 +507,10 @@ jobs:
           # origin/main, and skips a ref it cannot read.
           fetch-depth: 2
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Fetch origin/main for the shrink check
         run: |
@@ -659,7 +659,7 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/zizmor-venv"
           rm -rf "$venv"
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --only-group lint
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group lint
           reported="$("$venv/bin/zizmor" --version)"
           if [ "$reported" != "zizmor ${ZIZMOR_VERSION}" ]; then
             echo "::error::Expected zizmor ${ZIZMOR_VERSION}, got: ${reported}"
@@ -1314,7 +1314,7 @@ jobs:
           set -euo pipefail
           venv="$RUNNER_TEMP/pip-audit-venv"
           rm -rf "$venv"
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --only-group audit
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group audit
           reported="$("$venv/bin/pip-audit" --version)"
           if [ "$reported" != "pip-audit ${PIP_AUDIT_VERSION}" ]; then
             echo "::error::Expected pip-audit ${PIP_AUDIT_VERSION}, got: ${reported}"
@@ -1737,27 +1737,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
-      - name: Install the declaration parser (hash-pinned wheels)
+      - name: Install the declaration parser (uv.lock)
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
-          venv="$RUNNER_TEMP/verified-trailer-venv"
-          rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/verified-trailer-requirements.txt"
-          cat > "$requirements" <<'REQUIREMENTS'
-          markdown-it-py==4.2.0 \
-              --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
-          mdurl==0.1.2 \
-              --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/python" uv sync --locked --no-build --only-group attribution
 
       - name: Check the verification line
         env:
@@ -1768,7 +1756,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          py="$RUNNER_TEMP/verified-trailer-venv/bin/python"
+          py="$RUNNER_TEMP/python/bin/python"
           "$py" -c 'import lu_machinery.ci.check_agent_attribution as checker; raise SystemExit(0 if checker.DEFAULT_VERIFIED_MODE == "observe" else 1)'
           case "$EVENT_NAME" in
             pull_request)

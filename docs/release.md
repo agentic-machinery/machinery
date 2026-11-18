@@ -82,16 +82,18 @@ The `/machinery` page links the installed version to
 ## Dependency lock
 
 `uv.lock` is the one lock: the runtime closure of `pyproject.toml` and the
-development groups (`[dependency-groups]`: test, typecheck, lint, audit), each
+development groups (`[dependency-groups]`: test, typecheck, lint, audit,
+attribution), each
 package at one version with the SHA-256 of every wheel and sdist PyPI serves.
 `pyproject.toml` `[tool.uv] required-version` names the one uv release that
 writes and reads it (`UV_VERSION` in `.github/workflows/pins.txt`), and
-`.python-version` names the CPython that CI and the host run;
+`.python-version` names the CPython that machinery CI runs;
 `requires-python` stays the supported floor. Change a dependency in
 `pyproject.toml`, then run `uv lock` (or `uv lock --upgrade-package NAME`);
 CI's `uv sync --locked` fails when the lock no longer matches, and refuses
-any wheel whose hash differs from the lock. Semgrep is the one tool outside
-the lock (pins.txt `SEMGREP_PYTHON` records why).
+any wheel whose hash differs from the lock. Semgrep keeps its own hash-pinned
+requirements (pins.txt `SEMGREP_PYTHON` records why). The release build tools
+and the product consumer's uv also keep their hash-pinned installs.
 
 The release's runtime closure is the lock's export without the project and
 without any dependency group, with every hash:
@@ -258,7 +260,8 @@ order:
    adopt PR ready for review.
 10. **Post-release PR.** One machinery PR, titled
     `chore(release): record $V and start <next>`, records the changelog
-    section and moves the version files to the next patch version.
+    section and moves the version files to the next patch version. It refreshes
+    `uv.lock` offline so the updated project version passes locked CI.
 11. **Notice.** One Fleet message tells `claude-cto` that both PRs are open.
     Each still needs a review of record and a green CI Gate.
 
