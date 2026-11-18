@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import stat
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -21,7 +23,96 @@ from lu_machinery.fleet_comms.contracts import CompletionState
 from lu_machinery.fleet_comms.paths import PlaneRootAnchorError
 from lu_machinery.fleet_comms.request_executor import RequestExecutor
 
+_COLLECTION_FLEET_ROOT = os.environ.get("FLEET_COMMS_ROOT")
+_COLLECTION_PRIMARY_ROOT = os.environ.get("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
+
 # ── PR-C: artifact store ────────────────────────────────────────────────────
+
+
+def test_non_release_code_cannot_migrate_live_store(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: worktree migrations brick the shared store's installed readers."""
+    from lu_machinery.fleet_comms import migrations, paths
+    from lu_machinery.fleet_comms.authority import AuthorityService
+
+    primary = tmp_path / "primary"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    live = primary / paths.DEFAULT_ROOT_REL
+    live.mkdir(parents=True)
+    db = live / "comms.sqlite3"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE sentinel (value TEXT)")
+        conn.commit()
+    before = db.read_bytes()
+    contents = sorted(live.rglob("*"))
+    alias = tmp_path / "live-alias"
+    alias.symlink_to(live, target_is_directory=True)
+    db_alias = tmp_path / "db-alias"
+    db_alias.mkdir()
+    (db_alias / "comms.sqlite3").symlink_to(db)
+    hardlink = tmp_path / "db-hardlink"
+    hardlink.mkdir()
+    (hardlink / "comms.sqlite3").hardlink_to(db)
+    for selection in (
+        {}, {"root": live}, {"root": alias}, {"root": db_alias}, {"root": hardlink}, {"repo_root": primary}
+    ):
+        with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release") as exc:
+            ArtifactStore(**selection)
+        assert exc.value.reason_code == "live_store_requires_installed_release"
+        assert exc.value.store.samefile(db)
+        assert str(Path(paths.__file__).resolve().parents[1]) in str(exc.value)
+        assert db.read_bytes() == before
+        assert sorted(live.rglob("*")) == contents
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(alias))
+    with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
+        AuthorityService()
+    with (
+        closing(sqlite3.connect(db)) as conn,
+        pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"),
+    ):
+        migrations.apply_migrations(conn)
+    assert db.read_bytes() == before
+    assert sorted(live.rglob("*")) == contents
+    # Explicit non-default stores retain normal migrations, even with a live override.
+    with AuthorityService(root=tmp_path / "private-plane") as service:
+        assert service.store.connection.execute(
+            "SELECT MAX(version) FROM comms_schema_migrations"
+        ).fetchone()[0] == max(m.version for m in migrations.MIGRATIONS)
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
+    with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
+        ArtifactStore(root=tmp_path / "unknown-plane")
+    assert not (tmp_path / "unknown-plane").exists()
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    loop = tmp_path / "identity-loop"
+    loop.symlink_to(loop)
+    with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
+        paths.assert_store_write_allowed(db, package_file=str(loop / "fleet_comms" / "artifacts.py"))
+    live.rename(live.with_name("original-live"))
+    live.symlink_to(loop)
+    with pytest.raises(PlaneRootAnchorError, match="live_store_identity_unknown"):
+        ArtifactStore(root=tmp_path / "loop-identity-plane")
+    assert not (tmp_path / "loop-identity-plane").exists()
+
+
+def test_test_session_fleet_root_is_isolated(fleet_comms_root, fleet_comms_primary) -> None:
+    """Defect class: a test omitting its root opens the live Fleet store."""
+    from lu_machinery.fleet_comms.authority import AuthorityService
+    from lu_machinery.fleet_comms.paths import default_plane_root
+
+    assert str(fleet_comms_root) == _COLLECTION_FLEET_ROOT
+    assert str(fleet_comms_primary) == _COLLECTION_PRIMARY_ROOT
+    assert Path(os.environ["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"]) == fleet_comms_primary
+    assert fleet_comms_primary.is_relative_to(fleet_comms_root)
+    assert fleet_comms_root.is_dir()
+    assert Path(os.environ["FLEET_COMMS_ROOT"]) == fleet_comms_root
+    assert default_plane_root() == fleet_comms_root
+    with AuthorityService() as service:
+        assert service.store.db_path == fleet_comms_root / "comms.sqlite3"
+        service.store.store_text("isolated test session", producer="test")
 
 
 def test_artifact_store_round_trip_and_dedup(tmp_path: Path) -> None:

@@ -125,6 +125,25 @@ pytest_plugins = [
 
 
 @pytest.fixture(scope="session", autouse=True)
+def fleet_comms_root(pytestconfig: pytest.Config) -> Path:
+    """Expose the private default installed before test-module collection."""
+    return pytestconfig._fleet_comms_root
+
+
+@pytest.fixture(scope="session", autouse=True)
+def fleet_comms_primary(pytestconfig: pytest.Config) -> Path:
+    """Expose the test-owned primary configured before test-module collection."""
+    return pytestconfig._fleet_comms_primary
+
+
+@pytest.fixture
+def unconfigured_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise missing-anchor refusals without the session's private primary."""
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+
+
+@pytest.fixture(scope="session", autouse=True)
 def sources_log_dir(tmp_path_factory: pytest.TempPathFactory) -> Generator[Path, None, None]:
     """Keep sources request logs outside the checkout in each pytest worker."""
     log_dir = tmp_path_factory.mktemp("mcp-sources-logs")
@@ -2982,6 +3001,21 @@ def pytest_configure_node(node: Any) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # A session fixture alone starts after collection: test-module imports can
+    # also open stores. Set the default before importing any test module.
+    fleet_root = tempfile.TemporaryDirectory(prefix="fleet-comms-")
+    config.add_cleanup(fleet_root.cleanup)
+    config._fleet_comms_root = Path(fleet_root.name).resolve(strict=True)
+    primary = config._fleet_comms_root / "primary"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    config._fleet_comms_primary = primary
+    fleet_env = pytest.MonkeyPatch()
+    config.add_cleanup(fleet_env.undo)
+    fleet_env.setenv("FLEET_COMMS_ROOT", str(config._fleet_comms_root))
+    fleet_env.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    fleet_env.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
     config.addinivalue_line("markers", "reads_content: test reads a controlled content or policy fixture")
     config.pluginmanager.register(
         _TelemetryIsolation(
