@@ -7013,11 +7013,6 @@
       "message": "Returning Any from function declared to return \"str\""
     },
     {
-      "path": "lu_machinery/orchestration/task_closeout.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None\" has no attribute \"casefold\""
-    },
-    {
       "path": "lu_machinery/orchestration/task_family/cli.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None\" has no attribute \"__iter__\" (not iterable)"
@@ -7374,11 +7369,6 @@
     },
     {
       "path": "lu_machinery/orchestration/task_lifecycle.py",
-      "code": "attr-defined",
-      "message": "\"object\" has no attribute \"casefold\""
-    },
-    {
-      "path": "lu_machinery/orchestration/task_lifecycle.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
@@ -7386,11 +7376,6 @@
       "path": "lu_machinery/orchestration/task_lifecycle.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/task_lifecycle.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"None | str\" has no attribute \"casefold\""
     },
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",

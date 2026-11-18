@@ -2318,10 +2318,22 @@ def test_resolve_membership_registered_but_different_native_parent_ignores_chain
     import time
 
     report = _fresh_report(time.time(), {"42": _native(10), "20": _native(10)})
-    result = _chain(report, native_parent_epic=20)
+    result = task_lifecycle.resolve_membership(
+        repository="org/repo", issue_number=42, stream_epic=10,
+        epic_repository="org/product", registered_epics=[10, 20],
+        native_parent_epic=20, native_parent_repository="org/product",
+        membership_report=report,
+    )
     assert result["valid"] is False
     assert result["epic"] == 20
     assert "native parent epic that differs" in result["reason"]
+    live = task_lifecycle.resolve_live_ancestry(
+        repository="org/repo", issue_number=42, stream_epic=10,
+        epic_repository="org/product", registered_epics=[10, 20],
+        read_parent=lambda repo, number: {"number": 20, "repository": "org/product"},
+        membership_report=report,
+    )
+    assert "different registered stream epic" in live["reason"]
 
 
 @pytest.mark.parametrize(
@@ -2335,7 +2347,10 @@ def test_resolve_membership_registered_but_different_native_parent_ignores_chain
     ids=["no-parent", "unregistered-parent", "matching-parent", "registered-different-parent"],
 )
 def test_membership_needs_audit(native_parent_epic: int | None, registered_epics: list[int], expected: bool) -> None:
-    assert task_lifecycle.membership_needs_audit(native_parent_epic, registered_epics) is expected
+    assert task_lifecycle.membership_needs_audit(
+        native_parent_epic, registered_epics, repository="org/repo",
+        epic_repository="org/repo", native_parent_repository="org/repo",
+    ) is expected
 
 
 # --------------------------------------------------------------------------- #
@@ -2549,7 +2564,7 @@ def test_actual_closeout_init_accepts_equivalent_checkbox_forms(tmp_path, monkey
     monkeypatch.setattr(task_closeout.GhGitHubAdapter, "read_issue", lambda self, repo, number: {
         "body": line, "parent_epic": 10, "parent_repository": "org/repo",
     })
-    monkeypatch.setattr(task_closeout.GhGitHubAdapter, "registered_stream_epics", lambda self, repository: [10])
+    monkeypatch.setattr(task_closeout.GhGitHubAdapter, "registered_stream_epics", lambda self, repository: (repository, [10]))
     monkeypatch.setattr(task_closeout.GhGitHubAdapter, "read_issue_parent",
                         lambda self, repo, number: {"number": 10, "repository": repo})
     args = task_closeout.build_parser().parse_args([
@@ -2652,11 +2667,18 @@ def test_9794_repository_refusal_precedes_every_native_membership_branch(parent_
 
 def test_9794_parent_repository_compare_is_case_insensitive():
     result = task_lifecycle.resolve_membership(
-        issue_number=42, stream_epic=10, native_parent_epic=10,
-        repository="org/repo", native_parent_repository="ORG/Repo",
+        issue_number=10, stream_epic=10, native_parent_epic=10,
+        repository="org/repo", native_parent_repository="ORG/Product",
+        epic_repository="org/product",
         registered_epics=[10], membership_report=None,
     )
     assert result["valid"] is True
+    live = task_lifecycle.resolve_live_ancestry(
+        repository="org/repo", issue_number=10, stream_epic=10,
+        epic_repository="org/product", registered_epics=[10],
+        read_parent=lambda repo, number: {"number": 10, "repository": "ORG/Product"},
+    )
+    assert live["valid"] is True
 
 
 @pytest.mark.parametrize("parents,valid,reason,read_count", [
@@ -3131,7 +3153,7 @@ def test_closeout_observation_keeps_comment_trust_fields(tmp_path: Path, monkeyp
             "parent_repository": "org/repo",
         },
     )
-    monkeypatch.setattr(adapter, "registered_stream_epics", lambda repository=None: [10])
+    monkeypatch.setattr(adapter, "registered_stream_epics", lambda repository=None: (repository, [10]))
     monkeypatch.setattr(
         adapter,
         "_read_pr",
