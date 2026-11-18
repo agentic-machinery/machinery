@@ -16,6 +16,7 @@ import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
@@ -25,6 +26,7 @@ from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 from lu_machinery.fleet_comms.paths import default_plane_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
+from lu_machinery.orchestration.dispatch_isolation import DispatchIsolationError, spawn_detached_worker
 from lu_machinery.review.model_catalog import activity_role_refusal
 from lu_machinery.secret_redactor import redact_text, redact_value
 
@@ -504,12 +506,13 @@ def _enqueue_opencode_ask(
                     str(project_interpreter()), "-I", "-u", "-m", "lu_machinery.ai_agent_bridge",
                     "process-ask", job.job_id, target,
                 ]
-                subprocess.Popen(
-                    [*command],
-                    stdout=log, stderr=subprocess.STDOUT, cwd=str(state_root()),
-                    env=os.environ.copy(), start_new_session=True,
+                spawn_detached_worker(
+                    command, task_id=job.job_id, run_nonce=new_id("opencode-launch"),
+                    popen=partial(subprocess.Popen, cwd=str(state_root())),
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    stderr_log=log_dir / f"{job.job_id}.log", env=os.environ.copy(),
                 )
-        except OSError as exc:
+        except (OSError, DispatchIsolationError) as exc:
             # Leave the durable request queued for explicit process-ask recovery.
             raise AuthorityServiceError("opencode_worker_launch_failed_job_queued") from exc
         print(f"OpenCode job queued: {job.job_id}")
