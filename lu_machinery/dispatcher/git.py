@@ -361,7 +361,7 @@ def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
         item["github"] = slug
     if item.get("default"):
         return main_checkout_root(product_root()).resolve(), item
-    if "local_name" not in item:
+    if not item.get("local_name", "").strip():
         raise ValueError("repository registry entry requires a local name")
     return (state_root().parent / item["local_name"]).resolve(), item
 

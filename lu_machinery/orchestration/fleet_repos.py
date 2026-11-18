@@ -58,7 +58,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
     out: dict[str, FleetRepo] = {}
     defaults = 0
     for key, body in repos_raw.items():
-        github = body["github"]
+        github = body.get("github")
         local_name = body.get("local_name")
         role = body.get("role") or ""
         default = bool(body.get("default", False))

@@ -20,7 +20,7 @@ CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
 
 @cache
 def repository_registry(path: Path) -> dict:
-    """Keep the installed release's repository registry for this process."""
+    """Cache registry row types; each reader requires the fields it uses."""
     try:
         registry = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError:
@@ -30,9 +30,9 @@ def repository_registry(path: Path) -> dict:
         raise ValueError("invalid fleet repository registry")
     for key, entry in repos.items():
         if (not isinstance(key, str) or not key.strip() or not isinstance(entry, dict)
-                or not isinstance(entry.get("github"), str) or not entry["github"].strip()
+                or not isinstance(entry.get("github", ""), str)
                 or entry.get("transport", "ssh") not in ("file", "https", "ssh")
-                or ("local_name" in entry and (not isinstance(entry["local_name"], str) or not entry["local_name"].strip()))
+                or not isinstance(entry.get("local_name", ""), str)
                 or not isinstance(entry.get("default", False), bool)):
             raise ValueError("invalid fleet repository registry")
     return repos
@@ -40,7 +40,9 @@ def repository_registry(path: Path) -> dict:
 
 def canonical_origins(repository: dict) -> tuple[str, ...]:
     """Derive exact destinations from registry identity, not clone transport."""
-    github = repository["github"]
+    github = repository.get("github")
+    if not isinstance(github, str):
+        raise ValueError("invalid registered repository identity")
     transport = repository.get("transport", "ssh")
     if transport == "file" and Path(github).is_absolute():
         return (github,)
