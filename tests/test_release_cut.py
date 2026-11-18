@@ -246,9 +246,11 @@ def test_missing_x_agent_is_refused(capsys):
             assert "x-agent" in capsys.readouterr().err.lower()
 
 
-def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, tmp_path, capsys):
+@pytest.mark.usefixtures("unconfigured_primary")
+def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys):
     """Defect class: syntactically valid release trailers leave the PR author unresolved."""
-    _host(monkeypatch, tmp_path, Path(sys.executable))
+    monkeypatch.delenv("LU_TASKS_DIR", raising=False)
+    monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
     monkeypatch.setattr(release_cut, "_run", lambda args: 0)
     for command in ("cut", "post-release"):
         with pytest.raises(SystemExit) as caught:
@@ -260,9 +262,11 @@ def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, tmp_path, ca
         assert "author family" in error
 
 
-def test_resolvable_x_agent_reaches_release_runner(monkeypatch, tmp_path):
-    """Defect class: parse-time attribution rejects an explicit catalog model."""
-    _host(monkeypatch, tmp_path, Path(sys.executable))
+@pytest.mark.usefixtures("unconfigured_primary")
+def test_resolvable_x_agent_reaches_release_runner(monkeypatch):
+    """Defect class: parse-time attribution rejects an explicit model without a checkout."""
+    monkeypatch.delenv("LU_TASKS_DIR", raising=False)
+    monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
     parsed = []
 
     def run(args):

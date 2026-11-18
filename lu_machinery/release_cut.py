@@ -97,25 +97,38 @@ def x_agent_value(value: str, *, command: str) -> str:
     if not _X_AGENT.fullmatch(value):
         raise argparse.ArgumentTypeError(f"{value!r} must be <agent>/<task-or-seat>, for example {_X_AGENT_EXAMPLE}")
 
+    from lu_machinery.common.repo_root import (
+        MachineryConfigError,
+        StateRootError,
+        configured_github_slug,
+    )
     from lu_machinery.common.task_store_paths import tasks_dir
-    from lu_machinery.dispatcher.git import resolve_repo
+    from lu_machinery.orchestration.fleet_repos import (
+        FleetRepoError,
+        default_repo_key,
+        load_fleet_repos,
+    )
     from lu_machinery.review.record_cf_verdict import RecordError, _attribute_trailer
     from lu_machinery.review.reviewer_resolver import UNKNOWN_AUTHOR_FAMILY
 
-    task_root = tasks_dir()
-    repository_keys = ("machinery", None) if command == "cut" else ("machinery",)
-    for repository_key in repository_keys:
-        repository = resolve_repo(repository_key)[1]["github"]
-        error = (
-            f"{value!r} must resolve to an author family for review in {repository}. "
-            f"Use a value such as {_X_AGENT_EXAMPLE}."
-        )
+    error = f"{value!r} must resolve to an author family for review. Use a value such as {_X_AGENT_EXAMPLE}."
+    try:
         try:
+            task_root = tasks_dir()
+        except StateRootError:
+            # Without a state anchor, the recorder can only use the trailer itself.
+            task_root = Path(os.devnull)
+
+        repos = load_fleet_repos()
+        destinations = [repos["machinery"].github]
+        if command == "cut":
+            destinations.append(configured_github_slug() or repos[default_repo_key(repos)].github)
+        for repository in destinations:
             attribution = _attribute_trailer(None, value, repository=repository, task_root=task_root)
-        except RecordError as exc:
-            raise argparse.ArgumentTypeError(f"{error} {exc}") from exc
-        if attribution.family == UNKNOWN_AUTHOR_FAMILY:
-            raise argparse.ArgumentTypeError(error)
+            if attribution.family == UNKNOWN_AUTHOR_FAMILY:
+                raise argparse.ArgumentTypeError(f"{error} Unresolved in {repository}.")
+    except (FleetRepoError, MachineryConfigError, OSError, RecordError) as exc:
+        raise argparse.ArgumentTypeError(f"{error} {exc}") from exc
     return value
 
 
