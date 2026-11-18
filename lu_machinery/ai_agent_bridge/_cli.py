@@ -209,7 +209,7 @@ def _process_all_unread(recipient: str, label: str, process_one: Callable[[int],
         print(f"📭 No unread messages for {label} to process")
         return
 
-    qualifier = " (headless)" if recipient in {"claude", "codex"} else ""
+    qualifier = " (headless)" if recipient == "claude" else ""
     print(f"📬 Processing {len(rows)} unread message(s) for {label}{qualifier}...\n")
     success = 0
     failed = 0

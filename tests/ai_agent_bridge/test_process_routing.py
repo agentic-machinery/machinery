@@ -651,7 +651,10 @@ def test_batch_ordinary_drains_use_acp_and_report_failures(
     batch()
     acp.assert_called_once()
     assert _row(message_id)[0] == 0
-    assert "0 succeeded, 1 failed" in capsys.readouterr().out
+    label = {"claude": "Claude (headless)", "codex": "Codex"}[target]
+    output = capsys.readouterr().out
+    assert f"Processing 1 unread message(s) for {label}..." in output
+    assert "0 succeeded, 1 failed" in output
 
 
 def test_ordinary_process_failure_is_nonzero(bridge_db, monkeypatch):
