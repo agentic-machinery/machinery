@@ -24,11 +24,10 @@
 #   is codeql.yml beside this file, outside the gate. installed-wheel builds the release wheel
 #   from the tracked tree, installs it offline with the uv.lock runtime export
 #   (pip --require-hashes) into clean core and per-extra venvs and imports
-#   every lu_machinery module, on the pinned Python and the requires-python
-#   floor. It then checks that wheel against the product commit
-#   pinned in product-consumer.pin beside this file: the release cut's
-#   consumer test collection (release_cut consumer-collection) and the pin's
-#   key consumer tests, on PRs and merge groups alike. pytest calls tests.yml for the full six-shard suite on
+#   every lu_machinery module on the pinned Python. On PRs and merge groups it
+#   checks the wheel against the product commit in product-consumer.pin. It runs
+#   release_cut consumer-collection and the pin's key consumer tests.
+#   pytest calls tests.yml for the full six-shard suite on
 #   merge_group, unmatched push and workflow_dispatch. pull_request calls that workflow
 #   as pr-affected and does not run the full suite.
 # - The mypy job imports lu_machinery from the checkout: it runs the ratchet
