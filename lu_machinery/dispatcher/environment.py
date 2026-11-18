@@ -16,9 +16,10 @@ from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
 from lu_machinery.dispatcher.types import TaskSpec
 
-# A worker's scratch lives at /var/tmp/<task-id>, exported as LU_TASK_SCRATCH. The worker creates it on
-# demand; settlement removes it together with the task's worktree (worker._settle_task_scratch). Inside a
-# read-only review's boundary the launcher points it under the private TMPDIR instead. Tests replace the base.
+# A worker's scratch lives at /var/tmp/<task-id>, exported as LU_TASK_SCRATCH. A write worker's TMPDIR is that
+# scratch: the supervisor creates it before launch and settlement removes it once the provider is proven gone,
+# whatever the terminal status (worker._settle_task_scratch). Inside a read-only boundary the launcher points
+# both under the boundary's private TMPDIR instead. Tests replace the base.
 TASK_SCRATCH_BASE = Path("/var/tmp")
 
 
@@ -123,7 +124,12 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         # os.tmpdir()/node-compile-cache for every new worktree path and is never removed (#12474).
         NODE_DISABLE_COMPILE_CACHE="1",
     )
-    if spec.agent == "codex" and spec.mode == "read-only":
+    if spec.mode == "workspace-write":
+        # A write worker runs on the host. Python (pytest's basetemp included), uv, Git and Node take their temp
+        # directory from TMPDIR, so whatever they leave goes when the task settles. Only dispatched workers get
+        # this: a seat or hook outside a task keeps its own TMPDIR.
+        env["TMPDIR"] = env["LU_TASK_SCRATCH"]
+    elif spec.agent == "codex":
         # Its read-only boundary exposes this private temp lease; the worker creates and removes it.
         env["TMPDIR"] = str(dispatch_lease(spec.task_id))
     if spec.mode == "read-only":

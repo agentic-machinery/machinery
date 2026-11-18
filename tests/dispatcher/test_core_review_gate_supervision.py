@@ -411,15 +411,42 @@ def test_settlement_refuses_a_symlinked_task_scratch_and_leaves_its_target(monke
     assert record["worktree_disposition"] == "removed"  # the refusal never fails settlement
 
 
-def test_retained_worktree_keeps_the_task_scratch(monkeypatch, tmp_path):
-    """Defect class: evidence loss. Scratch went while the worktree it serves was kept for inspection."""
+def test_task_scratch_outlives_only_a_provider_that_may_still_run(monkeypatch, tmp_path):
+    """Defect class: temp leak (CLEANUP-WORKFILES-1118). The scratch is the write worker's TMPDIR, so keeping it
+    with a worktree retained for unpublished work kept its temp files for good; deleting it under a provider that
+    may still run would pull its TMPDIR from under it."""
     base, record = _settle_with_worktree(monkeypatch, tmp_path, "retained")
     (base / "scratch-task").mkdir()
-    (base / "scratch-task" / "log").write_text("evidence")
+    (base / "scratch-task" / "pytest-of-user").write_bytes(b"x" * 10)
     worker._reap_settled(record)
-    assert (base / "scratch-task" / "log").read_text() == "evidence"
-    assert record["task_scratch_disposition"] == "retained"
-    assert "worktree retained" in record["task_scratch_disposition_reason"]
+    assert not (base / "scratch-task").exists()
+    assert (record["task_scratch_disposition"], record["task_scratch_bytes"]) == ("removed", 10)
+    for alive in (True, None):
+        monkeypatch.setattr(worker, "_provider_alive", lambda _record, alive=alive: alive)
+        (base / "scratch-task").mkdir()
+        (base / "scratch-task" / "in-use").write_text("live")
+        record = {"task_id": "scratch-task"}
+        worker._reap_settled(record)
+        assert (base / "scratch-task" / "in-use").read_text() == "live"
+        assert record["task_scratch_disposition"] == "retained"
+        assert record["task_scratch_disposition_reason"].startswith(record["worktree_disposition_reason"])
+        shutil.rmtree(base / "scratch-task")
+
+
+def test_write_task_scratch_is_created_private_and_refused_when_not_our_directory(monkeypatch, tmp_path):
+    """Defect class: unusable TMPDIR. A write worker's TMPDIR must exist at launch (Node and uv fail on a missing
+    one, Python silently falls back to /tmp), and a planted symlink must never become it."""
+    base = tmp_path / "var-tmp"
+    base.mkdir()
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    worker._create_task_scratch("scratch-task")
+    assert (base / "scratch-task").stat().st_mode & 0o777 == 0o700
+    worker._create_task_scratch("scratch-task")  # a relaunch of the same task reuses it
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (base / "linked-task").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(ValueError, match="not a directory owned"):
+        worker._create_task_scratch("linked-task")
 
 
 def test_settlement_removes_only_recreatable_caches_from_the_task_output_directories(sandbox):

@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -91,6 +92,11 @@ def main():
         while not prompt.with_suffix(".release").exists():
             time.sleep(0.02)
     if model in {"pushed", "unpushed", "dirty", "pushed-dirty", "pushed-nested", "capacity-dirty"}:
+        # Temp output a write worker leaves behind; its TMPDIR is the task scratch settlement removes.
+        handle, leftover = tempfile.mkstemp(prefix="stub-")
+        os.write(handle, b"t" * 4096)
+        os.close(handle)
+        prompt.with_suffix(".tmpfile").write_text(leftover)
         delivered = Path("src/delivered.txt" if model == "pushed-nested" else "delivered.txt")
         delivered.parent.mkdir(exist_ok=True)
         delivered.write_text("literal delivered value\n")

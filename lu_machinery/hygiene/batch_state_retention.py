@@ -1,11 +1,17 @@
-"""Report batch_state staleness and declare/validate explicit scratch expiry (#9737, #11365).
+"""Prune settled tasks' bulky state, report batch_state staleness, declare scratch expiry (#9737, #11365).
 
-A directory is stale when nothing below it was written for ``stale_days``.
-Live machinery (``tasks/``, ``preserved/``, ``reports/``, ``branch-archive/``)
-is excluded, and paths listed in ``batch_state_retention.json`` are reported
-as held evidence instead of stale candidates. Sizing and digesting of task
-snapshot sidecars stays with ``scripts.maintenance.batch_state_retention``
-(#8783). Deletion belongs to the existing tmp_sweep quarantine and purge path.
+Settled-task pruning (CLEANUP-WORKFILES-1118): ``settled_days`` after a task
+reached a released terminal status, everything in its ``tasks/<task>.*``
+directories goes except hand-off ``.md`` files. The task record, its
+``.result`` and every other file beside it stay. A live, held, damaged or
+recently written task is never touched, nor is the archive directory.
+
+A top-level directory is stale when nothing below it was written for
+``stale_days``. Live machinery (``tasks/``, ``preserved/``, ``reports/``,
+``branch-archive/``) is excluded, and paths listed in
+``batch_state_retention.json`` are reported as held evidence instead of stale
+candidates. Unclassified top-level state is only reported: its deletion
+belongs to the tmp_sweep quarantine and purge path, through explicit expiry.
 """
 
 from __future__ import annotations
@@ -21,9 +27,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.repo_root import state_root
-from lu_machinery.common.task_scratch import mount_points
+from lu_machinery.common.task_scratch import ContainmentError, mount_points
+from lu_machinery.orchestration.task_record_store import (
+    ARCHIVE_DIR_NAME,
+    archived_task_record_path,
+    read_task_record,
+    task_record_path,
+    task_state_lock,
+)
+from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 
 # Deepest JSON this module reads (json_depth): batch-state scratch expiry metadata.
 _JSON_MAX_DEPTH = 128
@@ -47,6 +61,9 @@ SCHEMA = "batch-state-retention.v1"
 EXCLUDED = frozenset({"tasks", "preserved", "reports", "branch-archive"})
 RETENTION_LIST = Path(__file__).with_name("batch_state_retention.json")
 EXPIRY_FILE = ".scratch-expiry.json"
+DEFAULT_SETTLED_DAYS = 2.0
+# Hand-off notes survive inside a pruned directory; everything else in it goes.
+KEPT_SUFFIX = ".md"
 
 
 class RetentionListError(ValueError):
@@ -231,21 +248,202 @@ def report(
     }
 
 
+def _task_owner(tasks_root: Path, name: str) -> tuple[str, dict[str, Any]] | None:
+    """The task whose record names ``name`` as its ``<task>.<suffix>`` directory: the longest such id.
+
+    The hot record wins over an archived one (a re-dispatch). Raises for a damaged record.
+    """
+    parts = name.split(".")
+    for end in range(len(parts) - 1, 0, -1):
+        task_id = ".".join(parts[:end])
+        for path in (task_record_path(tasks_root, task_id), archived_task_record_path(tasks_root, task_id)):
+            if path.is_file() and not path.is_symlink():
+                record = read_task_record(path)
+                if record is not None and record.get("task_id") == task_id:
+                    return task_id, record
+    return None
+
+
+def _settled_at(record: dict[str, Any]) -> float | None:
+    """When a released task finished, or None: unknown time never releases its state."""
+    value = record.get("finished_at")
+    try:
+        finished = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else None
+    except ValueError:
+        return None
+    return finished.timestamp() if finished is not None and finished.tzinfo is not None else None
+
+
+def _held_task(holds: list[dict[str, Any]], record: dict[str, Any], owner: str, name: str) -> bool:
+    """A retention-list path naming the task store, this directory or any file of the task, or a record hold."""
+    if record.get("worktree_retention_hold") is not False and "worktree_retention_hold" in record:
+        return True  # true, or malformed: never read as permission
+    return any(
+        hold["parts"][0] == "tasks"
+        and (len(hold["parts"]) == 1 or hold["parts"][1] == name or hold["parts"][1].startswith(f"{owner}."))
+        for hold in holds
+    )
+
+
+def _prune_dir(parent_fd: int, name: str, expected: os.stat_result, *, device: int, mount_id: int) -> tuple[int, int]:
+    """Unlink everything below ``name`` but hand-off ``.md`` files; remove what is left empty.
+
+    Returns (bytes freed, files kept). Never follows a symlink or leaves the device and mount: each
+    descent re-proves identity on its descriptor, and each ``rmdir`` re-identifies the emptied directory
+    (the task-scratch remover's checks). A directory without owner rwx gets it first.
+    """
+    try:
+        fd = task_scratch._open_dir_at(parent_fd, name)
+    except PermissionError:
+        task_scratch.grant_owner_rwx(parent_fd, name, expected, device=device, mount_id=mount_id)
+        fd = task_scratch._open_dir_at(parent_fd, name)
+    try:
+        held = task_scratch._verify_held_dir(fd, expected_dev=expected.st_dev, expected_ino=expected.st_ino,
+                                             device=device, mount_id=mount_id, what=f"directory {name!r}")
+        if stat.S_IMODE(held.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
+            os.fchmod(fd, stat.S_IMODE(held.st_mode) | stat.S_IRWXU)
+        with os.scandir(fd) as entries:
+            children = [(entry.name, entry.stat(follow_symlinks=False)) for entry in entries]
+        freed = kept = 0
+        for child, info in children:
+            if stat.S_ISDIR(info.st_mode):
+                if info.st_dev != device:
+                    raise ContainmentError(f"refusing to cross a mount boundary at {child!r}")
+                child_freed, child_kept = _prune_dir(fd, child, info, device=device, mount_id=mount_id)
+                freed, kept = freed + child_freed, kept + child_kept
+            elif stat.S_ISREG(info.st_mode) and child.endswith(KEPT_SUFFIX):
+                kept += 1
+            else:
+                os.unlink(child, dir_fd=fd)
+                freed += info.st_blocks * 512 if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 else 0
+        if not kept:
+            task_scratch._rmdir_held(parent_fd, name, held_fd=fd, held_st=held)
+        return freed, kept
+    finally:
+        os.close(fd)
+
+
+def prune_settled_tasks(
+    tasks_root: Path,
+    *,
+    holds: list[dict[str, Any]],
+    settled_days: float = DEFAULT_SETTLED_DAYS,
+    now: float | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Remove settled tasks' ``<task>.*`` directories, keeping hand-off ``.md`` files; ``dry_run`` only lists them.
+
+    A directory is pruned only when its owner record (hot, else archived) has a released terminal status
+    and a completion time older than ``settled_days``, no hold names it, and nothing below it was written
+    since that cutoff. The record is read again under its task-state lock before removal, which keeps that
+    lock: a re-dispatch of the same id cannot start in between. A directory with no owner record, a damaged
+    record or an unknown completion time is left alone and counted, never guessed.
+    """
+    if not math.isfinite(settled_days) or settled_days <= 0:
+        raise ValueError("settled days must be finite and positive")
+    if tasks_root.is_symlink() or (os.path.lexists(tasks_root) and not tasks_root.is_dir()):
+        raise ValueError("task store must be a real directory")
+    now = time.time() if now is None else now
+    cutoff = now - settled_days * 86400
+    counts = dict.fromkeys(("removed", "would_remove", "live", "held", "settling", "fresh", "undated",
+                            "unowned", "owner_unreadable", "unknown", "failed"), 0)
+    rows: list[dict[str, Any]] = []
+    result = {"schema": "batch-state-task-prune.v1", "dry_run": dry_run, "settled_days": settled_days,
+              "counts": counts, "rows": rows}
+    if not tasks_root.exists():
+        return {**result, "bytes": 0}  # a machine that never dispatched has nothing to prune
+    tasks_root = tasks_root.resolve(strict=True)
+    mounts = mount_points()
+    root_fd = os.open(tasks_root, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
+    try:
+        device, mount_id = os.fstat(root_fd).st_dev, task_scratch.fd_mount_id(root_fd)
+        with os.scandir(root_fd) as entries:
+            names = sorted(entry.name for entry in entries
+                           if not entry.name.startswith(".") and entry.name != ARCHIVE_DIR_NAME
+                           and entry.is_dir(follow_symlinks=False))
+        for name in names:
+            row: dict[str, Any] = {"path": f"batch_state/tasks/{name}/"}
+            try:
+                owned = _task_owner(tasks_root, name)
+            except (OSError, ValueError, RecursionError) as error:
+                counts["owner_unreadable"] += 1
+                rows.append({**row, "status": "owner_unreadable", "reason": type(error).__name__})
+                continue
+            if owned is None:
+                counts["unowned"] += 1
+                continue
+            owner, record = owned
+            settled = _settled_at(record)
+            if record.get("status") not in RELEASED_TASK_STATUSES:
+                status = "live"
+            elif _held_task(holds, record, owner, name):
+                status = "held"
+            elif settled is None:
+                status = "undated"
+            elif settled >= cutoff:
+                status = "settling"
+            else:
+                status = None
+            if status is not None:
+                counts[status] += 1
+                continue
+            allocated, newest, reason = tree_activity(tasks_root / name, cutoff)
+            if mounts is None or mount_id is None:
+                reason = "mount_probe_unknown"
+            elif task_scratch._mounts_below(tasks_root / name, mounts):
+                reason = "mount_point"
+            if reason:
+                counts["unknown"] += 1
+                rows.append({**row, "status": "unknown", "reason": reason})
+                continue
+            if newest >= cutoff:
+                counts["fresh"] += 1
+                continue
+            if dry_run:
+                counts["would_remove"] += 1
+                rows.append({**row, "status": "would_remove", "task_id": owner, "bytes": allocated})
+                continue
+            try:
+                with task_state_lock(task_record_path(tasks_root, owner)):
+                    again = _task_owner(tasks_root, name)
+                    if (again is None or again[0] != owner or again[1].get("status") not in RELEASED_TASK_STATUSES
+                            or _settled_at(again[1]) != settled or _held_task(holds, again[1], owner, name)):
+                        raise ContainmentError("the owner record changed before removal")
+                    info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+                        raise ContainmentError("not a directory this user owns")
+                    if mount_id is None:  # classified unknown above; never delete without it
+                        raise ContainmentError("mount information unavailable")
+                    freed, kept = _prune_dir(root_fd, name, info, device=device, mount_id=mount_id)
+            except (OSError, ValueError, RecursionError, task_scratch.TaskScratchError) as error:
+                counts["failed"] += 1
+                rows.append({**row, "status": "failed", "task_id": owner, "reason": f"{type(error).__name__}: {error}"[:300]})
+                continue
+            counts["removed"] += 1
+            rows.append({**row, "status": "removed", "task_id": owner, "bytes": freed, "kept_md": kept})
+    finally:
+        os.close(root_fd)
+    return {**result, "bytes": sum(row["bytes"] for row in rows if row["status"] in {"removed", "would_remove"})}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Report top-level batch_state directories with no write for N days, with size and newest write.\n"
-            "Report only: it never deletes. Use it to pick cleanup candidates; hold evidence in the retention list."
+            "Prune settled tasks' bulky state, then report top-level batch_state directories with no write for N days.\n"
+            "Removes, after --settled-days, everything in a settled task's tasks/<task>.* directories except hand-off\n"
+            ".md files; records, .result files, live or held tasks and tasks/archive stay. --dry-run lists instead.\n"
+            "Top-level stale directories are only reported; hold evidence in the retention list."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            f"  .venv/bin/python -m {_mod('hygiene', 'batch_state_retention')}\n"
-            f"  .venv/bin/python -m {_mod('hygiene', 'batch_state_retention')} --json --stale-days 14\n"
-            "Outputs: stdout table (or --json); no files written, nothing deleted.\n"
-            "Exit codes: 0 report complete; 1 some directories could not be scanned; "
+            f"  .venv/bin/python -m {_mod('hygiene', 'batch_state_retention')} --dry-run\n"
+            f"  .venv/bin/python -m {_mod('hygiene', 'batch_state_retention')} --json --settled-days 3\n"
+            "Outputs: stdout table (or --json) with the prune rows and the staleness rows; no files written.\n"
+            "Exit codes: 0 complete; 1 some directories could not be scanned or removed; "
             "2 invalid arguments or malformed retention list.\n"
-            f"Related: #9737; {_mp('hygiene/batch_state_retention.json')}; docs/runbooks/tmp-retention.md."
+            f"Related: #9737; CLEANUP-WORKFILES-1118; {_mp('hygiene/batch_state_retention.json')}; "
+            "docs/runbooks/tmp-retention.md."
         ),
     )
     parser.add_argument(
@@ -260,6 +458,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Evidence-retention list (default {_mp('hygiene/batch_state_retention.json')}).",
     )
     parser.add_argument(
+        "--settled-days",
+        type=float,
+        default=DEFAULT_SETTLED_DAYS,
+        help=f"Days after a task settled before its directories are pruned (default {DEFAULT_SETTLED_DAYS:g}).",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="List what the prune would remove; delete nothing (default: remove)."
+    )
+    parser.add_argument(
         "--stale-days", type=float, default=7, help="Days without any write before a directory is stale (default 7)."
     )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON (default Markdown table).")
@@ -269,14 +476,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    batch_root = args.batch_root or default_batch_root()
     try:
         holds = load_holds(args.retention_list)
-        result = report(args.batch_root or default_batch_root(), holds=holds, stale_days=args.stale_days)
+        pruned = prune_settled_tasks(batch_root / "tasks", holds=holds, settled_days=args.settled_days,
+                                     dry_run=args.dry_run)
+        result = report(batch_root, holds=holds, stale_days=args.stale_days)
     except (ValueError, OSError) as error:
         parser.error(str(error))
     if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
+        print(json.dumps({**result, "task_prune": pruned}, indent=2, sort_keys=True))
     else:
+        print("| Task directory | Status | Bytes | Note |")
+        print("|---|---|---:|---|")
+        for row in pruned["rows"]:
+            print(f"| {row['path']} | {row['status']} | {row.get('bytes', '')} | {row.get('reason', '')} |")
+        counts = " ".join(f"{key}={value}" for key, value in pruned["counts"].items())
+        print(f"settled_days={pruned['settled_days']} dry_run={pruned['dry_run']} {counts} bytes={pruned['bytes']}")
         print("| Directory | Status | Allocated bytes | Newest write (UTC) | Note |")
         print("|---|---|---:|---|---|")
         for row in result["rows"]:
@@ -287,7 +503,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         counts = " ".join(f"{key}={value}" for key, value in result["counts"].items())
         print(f"stale_days={result['stale_days']} {counts} stale_bytes={result['stale_bytes']}")
-    return 1 if result["counts"]["unknown"] else 0
+    return 1 if result["counts"]["unknown"] or pruned["counts"]["unknown"] or pruned["counts"]["failed"] else 0
 
 
 if __name__ == "__main__":

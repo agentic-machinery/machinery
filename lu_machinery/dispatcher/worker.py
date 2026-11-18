@@ -1241,16 +1241,32 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     _settle_task_scratch(record)
 
 
-def _settle_task_scratch(record: dict) -> None:
-    """Remove the task's scratch once its worktree is removed; keep it while the worktree stays.
+# Worktree reasons recorded before the provider's whole process tree is proven gone: it may still use its TMPDIR.
+_PROVIDER_MAY_RUN = frozenset({"provider_processes_alive", "provider_liveness_unknown"})
 
-    Records ``task_scratch_disposition`` (removed, absent, retained, refused or failed) with its reason and
-    the bytes found. A refusal or failure is recorded and never fails settlement.
+
+def _create_task_scratch(task_id: str) -> None:
+    """Create a write task's scratch, its TMPDIR, before launch; refuse anything but a directory this user owns."""
+    path = task_scratch_path(task_id)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(path, 0o700)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError(f"{path} is not a directory owned by uid {os.geteuid()}")
+
+
+def _settle_task_scratch(record: dict) -> None:
+    """Remove the task's scratch whatever its terminal status, once its provider is proven gone.
+
+    The scratch is the worker's TMPDIR, never deliverable state, so a worktree kept for unpublished or dirty
+    work does not keep it. Only a provider that may still run does; the scheduled sweep retries that tree and
+    its scratch with it. Records ``task_scratch_disposition`` (removed, absent, retained, refused or failed)
+    with its reason and the bytes freed. A refusal or failure is recorded and never fails settlement.
     """
-    worktree = record.get("worktree_disposition")
-    if worktree != "removed":
+    reason = record.get("worktree_disposition_reason")
+    if record.get("worktree_disposition") is None or reason in _PROVIDER_MAY_RUN:
         record.update(task_scratch_disposition="retained", task_scratch_bytes=None,
-                      task_scratch_disposition_reason=f"worktree {worktree or 'unsettled'}: scratch kept with it")
+                      task_scratch_disposition_reason=f"{reason or 'unsettled'}: the provider may still use it")
         return
     try:
         disposition, reason, size = _remove_task_scratch(record.get("task_id"))
@@ -1311,7 +1327,7 @@ def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
             return "refused", str(exc)[:300], size
         except OSError as exc:
             return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], size
-        return "removed", "worktree removed", size
+        return "removed", "provider gone", size
     finally:
         os.close(base_fd)
 
@@ -1756,6 +1772,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         except ValueError as exc:
             status, error = "failed", str(exc)
             return
+        if spec.mode == "workspace-write":
+            try:
+                _create_task_scratch(spec.task_id)  # the provider's TMPDIR (environment.child_env)
+            except (OSError, ValueError) as exc:
+                status, error = "failed", f"task_scratch_unavailable: {exc}"
+                return
         if spec.agent == "codex" and spec.mode == "read-only":
             try:
                 # Persisted before the lease exists, so crash recovery under another scratch root still finds it.
