@@ -23,14 +23,14 @@ from contextlib import contextmanager, suppress
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from jsonschema import Draft202012Validator, FormatChecker
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.github_check_rollup import group_collapsed_by_name
-from lu_machinery.orchestration import issue_stream_audit, task_identity
+from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
 
 SCHEMA_VERSION = "task-lifecycle.v1"
@@ -174,27 +174,58 @@ def lifecycle_id(identity: Mapping[str, Any]) -> str:
     issue = canonical.get("github_issue_number")
     if issue is None:
         raise LifecycleError("non-trivial lifecycle work requires a GitHub issue")
-    return digest(
-        {
-            "repository": canonical["repository"],
-            "issue": issue,
-            "stream_epic": canonical["stream_epic"],
-        }
+    scope = {
+        "repository": canonical["repository"],
+        "issue": issue,
+        "stream_epic": canonical["stream_epic"],
+    }
+    epic_url = canonical["stream_epic_url"]
+    local_url = stream_epic_url(canonical["repository"], canonical["stream_epic"])
+    if epic_url and epic_url.casefold() != local_url.casefold():
+        scope["stream_epic_url"] = epic_url
+    return digest(scope)
+
+
+def stream_epic_url(repository: str, number: int) -> str:
+    return f"https://github.com/{repository}/issues/{number}"
+
+
+def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -> bool:
+    url = identity["stream_epic_url"]
+    if url is None:
+        repository = identity["repository"]
+        return repository_identity_valid(repository) and repository.casefold() == epic_repository.casefold()
+    return isinstance(url, str) and url.casefold() == stream_epic_url(epic_repository, identity["stream_epic"]).casefold()
+
+
+def stream_registry_repository(repository: str) -> str:
+    """Bind the numeric stream registry to its owner in the fleet catalog."""
+    repos = fleet_repos.load_fleet_repos().values()
+    if not any(repo.github.casefold() == repository.casefold() for repo in repos):
+        raise LifecycleError("task repository is not configured in the fleet")
+    owners = [repo.github for repo in repos if repo.role == "public-monorepo"]
+    if len(owners) != 1 or not repository_identity_valid(owners[0]):
+        raise LifecycleError("issue-stream registry must have one configured repository")
+    return owners[0]
+
+
+def membership_needs_audit(
+    native_parent_epic: int | None,
+    registered_epics: list[int],
+    *,
+    repository: str,
+    epic_repository: str,
+    native_parent_repository: str | None,
+) -> bool:
+    """Consult the repository-local audit only for body or native-chain evidence."""
+    return repository.casefold() == epic_repository.casefold() and (
+        native_parent_epic is None
+        or (
+            repository_identity_valid(native_parent_repository)
+            and native_parent_repository.casefold() == epic_repository.casefold()
+            and native_parent_epic not in registered_epics
+        )
     )
-
-
-def membership_needs_audit(native_parent_epic: int | None, registered_epics: list[int] | None) -> bool:
-    """Whether :func:`resolve_membership` must consult the live audit (#9783).
-
-    A native parent that is itself a registered stream epic decides alone
-    (accept when it is the identity's epic, refuse otherwise), so fetching a
-    live audit there would only let an unrelated audit failure mask that
-    decision. No native parent (body path) or an unregistered native parent
-    (native-chain path) can only be decided by the fresh audit.
-    """
-    if native_parent_epic is None:
-        return True
-    return isinstance(registered_epics, list) and native_parent_epic not in registered_epics
 
 
 def _fresh_membership_audit(
@@ -292,7 +323,7 @@ def _membership_refusal(reason: str) -> dict[str, Any]:
     }
 
 
-def repository_identity_valid(repository: object) -> bool:
+def repository_identity_valid(repository: object) -> TypeGuard[str]:
     """Require a typed owner/name identity, never an issue-number inference."""
     return isinstance(repository, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is not None
 
@@ -315,6 +346,7 @@ def resolve_live_ancestry(
     stream_epic: int,
     registered_epics: list[int] | None,
     read_parent: Callable[[str, int], Mapping[str, Any] | None],
+    epic_repository: str | None = None,
     membership_report: Mapping[str, Any] | None = None,
     max_age_s: int = 3600,
 ) -> dict[str, Any]:
@@ -328,8 +360,13 @@ def resolve_live_ancestry(
     """
     if not repository_identity_valid(repository):
         return _membership_refusal("live ancestry repository identity is malformed")
+    epic_repository = repository if epic_repository is None else epic_repository
+    if not repository_identity_valid(epic_repository):
+        return _membership_refusal("issue-stream registry repository identity is malformed")
     if not isinstance(registered_epics, list) or stream_epic not in registered_epics:
         return _membership_refusal("identity stream epic is absent from the registered issue-stream epics")
+    local_repo = repository.casefold()
+    epic_repo = epic_repository.casefold()
     current = issue_number
     visited = {current}
     for _ in range(issue_stream_audit._MAX_SUBISSUE_DEPTH):
@@ -340,6 +377,8 @@ def resolve_live_ancestry(
         if parent is None:
             if current != issue_number or membership_report is None:
                 return _membership_refusal(f"live ancestry parent of #{current} is missing")
+            if local_repo != epic_repo:
+                return _membership_refusal("live body membership audit cannot prove cross-repository ancestry")
             report, failure = _fresh_membership_audit(membership_report, max_age_s)
             if report is None:
                 return _membership_refusal(str(failure))
@@ -373,20 +412,23 @@ def resolve_live_ancestry(
             }
         if not isinstance(parent, Mapping) or not repository_identity_valid(parent.get("repository")):
             return _membership_refusal("live ancestry parent repository identity is malformed")
-        if parent["repository"].casefold() != repository.casefold():
-            return _membership_refusal("live ancestry crosses a repository boundary")
+        parent_repo = parent["repository"].casefold()
         number = parent.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number < 1:
             return _membership_refusal("live ancestry parent number is malformed")
-        if number in visited:
+        if parent_repo == local_repo and number in visited:
             return _membership_refusal("live ancestry is cyclic")
-        if number in registered_epics:
+        if parent_repo == epic_repo and number in registered_epics:
             if number != stream_epic:
                 return _membership_refusal("live ancestry reaches a different registered stream epic")
             return {
                 "valid": True, "method": "native_chain", "epic": stream_epic,
                 "generated_at": None, "digest": None, "reason": None,
             }
+        if local_repo != epic_repo:
+            return _membership_refusal("cross-repository live ancestry requires a direct registered parent")
+        if parent_repo != local_repo:
+            return _membership_refusal("live ancestry crosses a repository boundary")
         visited.add(number)
         current = number
     return _membership_refusal("live ancestry exceeds the maximum sub-issue depth")
@@ -401,6 +443,7 @@ def resolve_membership(
     native_parent_repository: str | None,
     registered_epics: list[int] | None,
     membership_report: Mapping[str, Any] | None,
+    epic_repository: str | None = None,
     max_age_s: int = 3600,
 ) -> dict[str, Any]:
     """Canonical native-or-unique-body membership proof (issue #6028).
@@ -411,8 +454,9 @@ def resolve_membership(
     (``task_closeout._assert_mutation_ready``) — so drift discovered by any
     one of them is enforced identically by all the others.
 
-    Native parents require typed repository identity matching ``repository``
-    case-insensitively, before any number-based branch. Snapshot agreement is
+    Epic numbers are scoped to the registry's repository, which defaults to
+    the issue repository for same-repository evidence. A foreign native parent
+    must itself be a registered epic. Snapshot agreement is
     read-only evidence; membership-reliant writes additionally require
     :func:`resolve_live_ancestry`, including transferred-scope follow-ups.
     Audit evidence on either snapshot path must name the same repository.
@@ -446,21 +490,22 @@ def resolve_membership(
     persist identical provenance regardless of which path accepted (or
     rejected) the proof.
     """
+    epic_repository = repository if epic_repository is None else epic_repository
+    if not repository_identity_valid(epic_repository):
+        return _membership_refusal("issue-stream registry repository identity is malformed")
     if not isinstance(registered_epics, list) or stream_epic not in registered_epics:
-        return {
-            "valid": False,
-            "method": None,
-            "epic": None,
-            "generated_at": None,
-            "digest": None,
-            "reason": "identity stream epic is absent from the registered issue-stream epics",
-        }
+        return _membership_refusal("identity stream epic is absent from the registered issue-stream epics")
+    if not repository_identity_valid(repository):
+        return _membership_refusal("task repository identity is malformed")
+    local_repo = repository.casefold()
+    epic_repo = epic_repository.casefold()
     if native_parent_epic is not None:
-        if not repository_identity_valid(repository) or not repository_identity_valid(native_parent_repository):
+        if not repository_identity_valid(native_parent_repository):
             return _membership_refusal("native parent repository identity is missing or malformed")
-        if native_parent_repository.casefold() != repository.casefold():
-            return _membership_refusal("native ancestry crosses a repository boundary")
-        if native_parent_epic == stream_epic:
+        if type(native_parent_epic) is not int or native_parent_epic < 1:
+            return _membership_refusal("native parent number is malformed")
+        parent_repo = native_parent_repository.casefold()
+        if parent_repo == epic_repo and native_parent_epic == stream_epic:
             return {
                 "valid": True,
                 "method": "native",
@@ -469,7 +514,7 @@ def resolve_membership(
                 "digest": None,
                 "reason": None,
             }
-        if native_parent_epic in registered_epics:
+        if parent_repo == epic_repo and native_parent_epic in registered_epics:
             return {
                 "valid": False,
                 "method": None,
@@ -480,6 +525,10 @@ def resolve_membership(
                     "issue has a native parent epic that differs from the identity's exact registered stream epic"
                 ),
             }
+        if local_repo != epic_repo:
+            return _membership_refusal("cross-repository native ancestry requires a direct registered parent")
+        if parent_repo != local_repo:
+            return _membership_refusal("native ancestry crosses a repository boundary")
         return _resolve_native_chain(
             repository=repository,
             issue_number=issue_number,
@@ -488,6 +537,8 @@ def resolve_membership(
             membership_report=membership_report,
             max_age_s=max_age_s,
         )
+    if local_repo != epic_repo:
+        return _membership_refusal("membership audit cannot prove cross-repository ancestry")
     validated_report, failure = _fresh_membership_audit(membership_report, max_age_s)
     if validated_report is None:
         return {
@@ -1210,6 +1261,8 @@ def bind_successor(
             raise EvidencePolicyError(
                 code, f"successor {field} {successor.get(field)!r} differs from the predecessor's {previous.get(field)!r}"
             )
+    if lifecycle_id(successor) != prior["lifecycle_id"]:
+        raise EvidencePolicyError("SUCCESSOR_STREAM_MISMATCH", "successor stream epic repository differs")
     if successor == previous:
         raise EvidencePolicyError(
             "SUCCESSOR_IDENTITY_UNCHANGED", "the successor identity equals the predecessor's; use init --reuse"
@@ -1941,19 +1994,26 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
     if github.get("repository") != identity["repository"]:
         hard.append("authoritative GitHub repository does not match task identity")
     registered_epics = github.get("registered_stream_epics")
+    epic_repository = github.get("stream_epic_repository")
+    if epic_repository is None:
+        epic_repository = identity["repository"]
     if issue.get("number") != identity["github_issue_number"]:
         hard.append("authoritative GitHub issue does not match task identity")
     if issue.get("url") != identity["github_issue_url"]:
         hard.append("authoritative GitHub issue URL does not match task identity")
-    membership = resolve_membership(
-        issue_number=identity["github_issue_number"],
-        stream_epic=identity["stream_epic"],
-        native_parent_epic=issue.get("parent_epic"),
-        repository=identity["repository"],
-        native_parent_repository=issue.get("parent_repository"),
-        registered_epics=registered_epics,
-        membership_report=github.get("membership_audit"),
-    )
+    if not repository_identity_valid(epic_repository) or not stream_epic_url_matches(identity, epic_repository):
+        membership = _membership_refusal("identity stream epic URL does not match the registered repository and number")
+    else:
+        membership = resolve_membership(
+            issue_number=identity["github_issue_number"],
+            stream_epic=identity["stream_epic"],
+            native_parent_epic=issue.get("parent_epic"),
+            repository=identity["repository"],
+            native_parent_repository=issue.get("parent_repository"),
+            epic_repository=epic_repository,
+            registered_epics=registered_epics,
+            membership_report=github.get("membership_audit"),
+        )
     if not membership["valid"]:
         hard.append(
             f"issue membership does not resolve to the identity's exact registered stream epic: {membership['reason']}"
@@ -2152,6 +2212,7 @@ def evaluate(payload: Mapping[str, Any], observation: Mapping[str, Any]) -> dict
             native_parent_epic=follow_up.get("parent_epic"),
             repository=identity["repository"],
             native_parent_repository=follow_up.get("parent_repository"),
+            epic_repository=epic_repository,
             registered_epics=registered_epics,
             membership_report=github.get("membership_audit"),
         )

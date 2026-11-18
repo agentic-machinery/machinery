@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from datetime import UTC, datetime, timedelta
 
-import lu_machinery.api.main as api_main
-import lu_machinery.api.state_helpers as state_helpers
-import lu_machinery.github_rest_cache as github_rest
 import pytest
 from fastapi.testclient import TestClient
+
+import lu_machinery.api.main as api_main
+import lu_machinery.github_rest_cache as github_rest
+from lu_machinery.api import state_helpers
 from lu_machinery.api.state_helpers import cache_invalidate
+from lu_machinery.common import github_client
 from lu_machinery.work.attention import _pr_check_state, derive_health
 from lu_machinery.work.normalize import _assignee_logins, _label_names
 from lu_machinery.work.sources_public import (
@@ -20,6 +23,7 @@ from lu_machinery.work.sources_public import (
     fetch_issue_states_batched,
     fetch_open_issues,
 )
+
 pytestmark = pytest.mark.usefixtures("monitor_roots")
 
 REPO = "learn-ukrainian/learn-ukrainian.github.io"
@@ -46,11 +50,31 @@ def _load_app():
     """Build the app for this product. See tests/work/test_work_api.py."""
     from lu_machinery.api.main import create_app
     from lu_machinery.api.monitor_context import production_context
+    from lu_machinery.api.product_contribution import ProductContribution
 
-    return create_app(production_context())
+    return create_app(production_context(), product=ProductContribution())
 
 
 client = _Lazy(lambda: TestClient(_load_app(), raise_server_exceptions=False))
+
+
+@pytest.fixture
+def make_cache(tmp_path):
+    def make(transport, *, credential="fixture-token", **options):
+        def send(method, path, headers, body, timeout):
+            assert method == "GET"
+            return github_client.Response(*transport(path, headers, timeout))
+
+        return github_rest.GitHubRestCache(
+            github_client.GitHubClient(
+                cache_dir=tmp_path / "rest-cache",
+                env={"GH_TOKEN": credential},
+                transport=send,
+                **options,
+            )
+        )
+
+    return make
 
 
 def _transport_from(script):
@@ -63,27 +87,40 @@ def _transport_from(script):
     return calls, transport
 
 
-def test_etag_is_stored_and_sent_on_the_next_request():
-    calls, transport = _transport_from(
-        lambda path, headers, timeout, n: (
-            (200, {"etag": '"v1"'}, b'[{"number": 1}]') if n == 1 else (304, {"etag": '"v1"'}, b"")
-        )
-    )
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+def test_etag_revalidation_preserves_body_link_and_freshness(make_cache):
+    path = "repos/o/r/issues?state=open"
+    next_url = "https://api.github.com/repos/o/r/issues?page=2"
+    now = 1000
+    responses = [
+        (200, {"etag": '"v1"', "link": f'<{next_url}>; rel=next'}, b'[{"number": 1}]'),
+        (304, {"etag": '"v2"'}, b""),
+        (403, {"retry-after": "60"}, b""),
+    ]
+    calls, transport = _transport_from(lambda path, headers, timeout, n: responses[n - 1])
+    cache = make_cache(transport, allow_stale=True, clock=lambda: now)
 
-    first = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    second = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
+    first = cache.get_json(path, timeout=1)
+    now = 1010
+    second = cache.get_json(path, timeout=1)
+    now = 1040
+    stale = cache.get_json(path, timeout=1)
 
-    assert first.status == 200
-    assert calls[0][1] is None
-    assert calls[1][1] == '"v1"'
-    assert second.status == 304
-    assert second.not_modified is True
-    assert second.body == [{"number": 1}]
-    assert second.body == first.body
+    assert calls == [(path, None), (path, '"v1"'), (path, '"v2"')]
+    assert (first.status, first.body, first.link_next) == (200, [{"number": 1}], next_url)
+    assert (second.status, second.not_modified, second.etag) == (304, True, '"v2"')
+    assert not first.stale and not second.stale and second.age_seconds == 0
+    assert second.body == first.body and second.link_next == next_url
+    assert stale.stale and stale.age_seconds == 30
+    assert stale.body == first.body and stale.link_next == next_url
+
+    # The same budget and cached response cannot make a fresh-only client return stale data.
+    with pytest.raises(github_rest.GitHubRestRateLimited) as exc:
+        make_cache(transport, clock=lambda: now).get_json(path, timeout=1)
+    assert (exc.value.reason, exc.value.reset_at) == ("retry_after", 1100)
+    assert len(calls) == 3
 
 
-def test_non_304_replaces_the_cached_body_and_etag():
+def test_non_304_replaces_the_cached_body_and_etag(make_cache):
     payloads = [b'[{"n": 1}]', b'[{"n": 2}]']
     etags = ['"a"', '"b"']
 
@@ -94,7 +131,7 @@ def test_non_304_replaces_the_cached_body_and_etag():
         return 200, {"etag": etags[index]}, payloads[index]
 
     calls, transport = _transport_from(script)
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
 
     first = cache.get_json("repos/o/r/pulls?state=open", timeout=1.0)
     second = cache.get_json("repos/o/r/pulls?state=open", timeout=1.0)
@@ -106,27 +143,30 @@ def test_non_304_replaces_the_cached_body_and_etag():
     assert calls[2][1] == '"b"'
 
 
-def test_error_is_not_cached_and_the_previous_etag_is_replayed():
-    def script(path, headers, timeout, n):
-        if n == 1:
-            return 200, {"etag": '"v1"'}, b'[{"ok": 1}]'
-        if n == 2:
-            return 500, {"etag": '"err"'}, b'{"message": "boom"}'
-        return 304, {"etag": '"v1"'}, b'[{"ok": 999}]'
+def test_error_is_not_cached_and_the_previous_etag_is_replayed(make_cache):
+    path = "repos/o/r/issues?state=open"
+    responses = [
+        (200, {"etag": '"v1"'}, b'[{"ok": 1}]'),
+        (500, {"etag": '"err"'}, b'{"message": "boom"}'),
+        (200, {"etag": '"empty"'}, b""),
+        (204, {"etag": '"empty"'}, b""),
+        (304, {"etag": '"v1"'}, b'[{"ok": 999}]'),
+    ]
+    calls, transport = _transport_from(lambda path, headers, timeout, n: responses[n - 1])
+    cache = make_cache(transport)
 
-    calls, transport = _transport_from(script)
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
-
-    first = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    with pytest.raises(github_rest.GitHubRestError):
-        cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    third = cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-
+    first = cache.get_json(path, timeout=1)
     assert first.body == [{"ok": 1}]
-    assert third.body == [{"ok": 1}]
-    assert calls[1][1] == '"v1"'
-    assert calls[2][1] == '"v1"'
-    assert cache.cached_body("repos/o/r/issues?state=open") == [{"ok": 1}]
+    with pytest.raises(github_rest.GitHubRestError) as server_error:
+        cache.get_json(path, timeout=1)
+    assert server_error.value.status == 500
+    with pytest.raises(github_rest.GitHubRestError, match="invalid GitHub JSON"):
+        cache.get_json(path, timeout=1)
+    with pytest.raises(github_rest.GitHubRestError) as no_content:
+        cache.get_json(path, timeout=1)
+    assert no_content.value.status == 204
+    assert cache.get_json(path, timeout=1).body == first.body
+    assert calls == [(path, None)] + [(path, '"v1"')] * 4
 
 
 def test_issue_projection_keeps_only_fields_consumers_read():
@@ -422,7 +462,7 @@ def _scripted_repo():
     return resources
 
 
-def test_open_pr_detail_is_conditional_and_bounded_to_open_pulls():
+def test_open_pr_detail_is_conditional_and_bounded_to_open_pulls(make_cache):
     resources = _scripted_repo()
     calls: list[tuple[str, str | None]] = []
 
@@ -433,7 +473,7 @@ def test_open_pr_detail_is_conditional_and_bounded_to_open_pulls():
             return 304, {"etag": etag}, b""
         return 200, {"etag": etag}, json.dumps(body).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
     first = github_rest.list_open_prs(REPO, limit=1000, timeout=2.0, cache=cache, include_comments=True)
     second = github_rest.list_open_prs(REPO, limit=1000, timeout=2.0, cache=cache, include_comments=True)
 
@@ -448,16 +488,17 @@ def test_open_pr_detail_is_conditional_and_bounded_to_open_pulls():
     assert all(etag for _, etag in calls[7:])
 
 
-def test_check_run_error_keeps_pr_membership_with_unknown_details():
+def test_check_run_error_keeps_pr_membership_with_unknown_details(make_cache):
     resources = _scripted_repo()
 
     def transport(path, headers, timeout):
         if "check-runs" in path:
-            return 500, {}, b"unavailable"
+            assert "If-None-Match" not in headers
+            return 500, {"etag": '"error"'}, b"unavailable"
         etag, body = resources[path]
         return 200, {"etag": etag}, json.dumps(body).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
     result = github_rest.list_open_prs(REPO, limit=10, timeout=2.0, cache=cache)
     assert len(result) == 1
     assert result[0]["number"] == 77
@@ -465,12 +506,12 @@ def test_check_run_error_keeps_pr_membership_with_unknown_details():
     assert result[0]["statusCheckRollup"] is None
     assert result[0]["reviewDecision"] is None
     assert result[0]["mergeStateStatus"] is None
-    check_path = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1"
-    assert cache.cached_body(check_path) is None
+    again = github_rest.list_open_prs(REPO, limit=10, timeout=2.0, cache=cache)
+    assert again[0]["statusCheckRollup"] is None
 
 
-@pytest.mark.parametrize("error", [github_rest.GitHubRestError("unavailable"), github_rest.GitHubRestTimeout(2)])
-def test_one_failed_pr_detail_does_not_discard_other_prs(error):
+@pytest.mark.parametrize("error", [OSError("unavailable"), subprocess.TimeoutExpired("gh", 2)])
+def test_one_failed_pr_detail_does_not_discard_other_prs(make_cache, error):
     resources = _scripted_repo()
     pull_list = f"repos/{REPO}/pulls?state=open&per_page=100&sort=created&direction=desc"
     etag, pulls = resources[pull_list]
@@ -482,7 +523,7 @@ def test_one_failed_pr_detail_does_not_discard_other_prs(error):
         tag, body = resources[path]
         return 200, {"etag": tag}, json.dumps(body).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="fixture")
+    cache = make_cache(transport)
     result = github_rest.list_open_prs(REPO, limit=10, timeout=2, cache=cache)
     assert [pr["number"] for pr in result] == [77, 78]
     assert result.truncated is False
@@ -504,37 +545,36 @@ def test_fetch_open_issues_rest_timeout_is_not_a_successful_section(monkeypatch)
     assert section.payload is None
 
 
-def test_issue_state_rest_omits_404_and_does_not_cache_it():
+def test_issue_state_rest_omits_404_and_does_not_cache_it(make_cache):
     resources = _scripted_repo()
 
     def transport(path, headers, timeout):
         if path.endswith("/issues/404"):
-            return 404, {}, b""
+            assert "If-None-Match" not in headers
+            return 404, {"etag": '"missing"'}, b""
         if path.endswith("/issues/500"):
+            assert "If-None-Match" not in headers
             return 500, {"etag": '"nope"'}, b"boom"
         etag, body = resources[path]
         if headers.get("If-None-Match") == etag:
             return 304, {"etag": etag}, b""
         return 200, {"etag": etag}, json.dumps(body).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
     found = github_rest.issue_states(REPO, [9, 1, 404, 500], timeout=1.0, cache=cache)
     assert found == {9: "open", 1: "closed"}
-    assert cache.cached_body(f"repos/{REPO}/issues/404") is None
-    assert cache.cached_body(f"repos/{REPO}/issues/500") is None
-    again = github_rest.issue_states(REPO, [1], timeout=1.0, cache=cache)
+    again = github_rest.issue_states(REPO, [1, 404, 500], timeout=1.0, cache=cache)
     assert again == {1: "closed"}
 
 
-def test_fetch_issue_states_rest_contract(monkeypatch):
+def test_fetch_issue_states_rest_contract(make_cache, monkeypatch):
     resources = _scripted_repo()
-    cache = github_rest.GitHubRestCache(
-        transport=lambda path, headers, timeout: (
+    cache = make_cache(
+        lambda path, headers, timeout: (
             200,
             {"etag": resources[path][0]},
             json.dumps(resources[path][1]).encode(),
         ),
-        identity="octocat",
     )
     monkeypatch.setattr(github_rest, "shared_cache", lambda: cache)
 
@@ -628,38 +668,18 @@ def test_orient_idle_prs_endpoint_contract(monkeypatch):
     assert row["minutes_idle"] >= 60
 
 
-def test_work_projection_endpoint_contract(monkeypatch):
-    monkeypatch.setattr(
-        github_rest,
-        "list_open_issues",
-        lambda *args, **kwargs: [
-            github_rest.project_issue(
-                _scripted_repo()[f"repos/{REPO}/issues?state=open&per_page=100&sort=created&direction=desc"][1][1]
-            )
-        ],
-    )
-    projected_pr = github_rest.project_pull_request(
-        _scripted_repo()[f"repos/{REPO}/pulls?state=open&per_page=100&sort=created&direction=desc"][1][0],
-        pull={"mergeable_state": "clean", "requested_reviewers": []},
-        check_runs=[
-            {
-                "name": "CI Gate",
-                "status": "completed",
-                "conclusion": "success",
-                "started_at": "2026-08-13T08:00:00Z",
-                "completed_at": "2026-08-13T08:10:00Z",
-            }
-        ],
-        statuses=[],
-        reviews=[{"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": SHA}],
-        comments=[],
-    )
-    monkeypatch.setattr(github_rest, "list_open_prs", lambda *args, **kwargs: [projected_pr])
-    monkeypatch.setattr(
-        github_rest,
-        "issue_states",
-        lambda *args, **kwargs: {1: "closed"},
-    )
+def test_work_projection_endpoint_contract(make_cache, monkeypatch):
+    resources = _scripted_repo()
+    resources[f"repos/{REPO}/pulls/77"][1]["mergeable_state"] = "clean"
+
+    def transport(path, headers, timeout):
+        etag, body = resources[path]
+        if headers.get("If-None-Match") == etag:
+            return 304, {}, b""
+        return 200, {"etag": etag}, json.dumps(body).encode()
+
+    cache = make_cache(transport)
+    monkeypatch.setattr(github_rest, "shared_cache", lambda: cache)
 
     from lu_machinery.work import sources_public
 
@@ -722,7 +742,7 @@ def test_work_projection_endpoint_contract(monkeypatch):
     from lu_machinery.api.state_helpers import cache_get_with_age
     from lu_machinery.api.work_router import projection_cache_key
 
-    cached, _age = cache_get_with_age(projection_cache_key({}), float("inf"))
+    cached, _age = cache_get_with_age(projection_cache_key({}, client.app.state.ctx), float("inf"))
     pull = next(item for item in cached["items"] if item["resource_kind"] == "pr")
     assert pull["lifecycle"] == "open"
     assert pull["flags"]["is_draft"] is False
@@ -784,7 +804,7 @@ def test_one_approval_is_not_approved_and_fails_closed():
     )
 
 
-def test_pagination_follows_next_and_a_page_cap_is_truncated(monkeypatch):
+def test_pagination_follows_next_and_a_page_cap_is_truncated(make_cache, monkeypatch):
     """Issues drop pull requests without shrinking the issue count, and a page cap is truncated."""
     issues_path = f"repos/{REPO}/issues?state=open&per_page=100&sort=created&direction=desc"
     page_two = "https://api.github.com/repos/o/r/issues?page=2"
@@ -820,13 +840,19 @@ def test_pagination_follows_next_and_a_page_cap_is_truncated(monkeypatch):
             headers_out["link"] = link
         return 200, headers_out, json.dumps(body).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
     found = github_rest.list_open_issues(REPO, limit=1000, timeout=2.0, cache=cache)
     assert [item["number"] for item in found] == [9]
     assert found.truncated is False
 
+    first_page = pages[issues_path]
+    pages[issues_path] = ('"p3"', [], '<https://example.invalid/issues?page=2>; rel="next"')
+    with pytest.raises(github_rest.GitHubRestError, match="GitHub endpoint host mismatch"):
+        github_rest.list_open_issues(REPO, limit=1000, timeout=2.0, cache=cache)
+    pages[issues_path] = first_page
+
     monkeypatch.setattr(github_rest, "_MAX_PAGES", 1)
-    capped = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    capped = make_cache(transport)
     short = github_rest.list_open_issues(REPO, limit=1000, timeout=2.0, cache=capped)
     assert short.truncated is True
     assert [item["number"] for item in short] == []
@@ -917,7 +943,7 @@ def test_pagination_follows_next_and_a_page_cap_is_truncated(monkeypatch):
         return 200, headers_out, json.dumps(body).encode()
 
     monkeypatch.setattr(github_rest, "_MAX_PAGES", 20)
-    full = github_rest.GitHubRestCache(transport=detail_transport, identity="octocat")
+    full = make_cache(detail_transport)
     projected = github_rest.list_open_prs(REPO, limit=10, timeout=2.0, cache=full)
     assert projected[0]["reviewFacts"]["latest_by_reviewer"] == {
         "a": "APPROVED",
@@ -927,7 +953,7 @@ def test_pagination_follows_next_and_a_page_cap_is_truncated(monkeypatch):
     assert _pr_check_state(projected[0]) == "failing"
 
     monkeypatch.setattr(github_rest, "_MAX_PAGES", 1)
-    partial = github_rest.GitHubRestCache(transport=detail_transport, identity="octocat")
+    partial = make_cache(detail_transport)
     unknown = github_rest.list_open_prs(REPO, limit=10, timeout=2.0, cache=partial)
     assert unknown.truncated is False
     assert unknown[0]["reviewDecision"] is None
@@ -935,112 +961,70 @@ def test_pagination_follows_next_and_a_page_cap_is_truncated(monkeypatch):
     assert _pr_check_state(unknown[0]) == "unknown"
 
 
-def test_cache_is_keyed_by_login_and_bounds_detail_urls(monkeypatch):
-    user_calls: list[dict[str, str]] = []
-    bodies = {"repos/o/r/pulls/1": {"n": 1}, "repos/o/r/issues?state=open": [{"n": 2}]}
-
-    def transport(path, headers, timeout):
-        if path == "user":
-            user_calls.append(dict(headers))
-            return 200, {"etag": '"user"'}, b'{"login": "octocat"}'
-        body = bodies.get(path, {"n": path})
-        return 200, {"etag": f'"{path}"'}, json.dumps(body).encode()
-
-    cache = github_rest.GitHubRestCache(transport=transport)
-    cache.get_json("repos/o/r/pulls/1", timeout=1.0)
-    cache.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    cache.get_json("repos/o/r/pulls/1", timeout=1.0)
-    assert len(user_calls) == 1
-    assert "authorization" not in {key.lower() for key in user_calls[0]}
-    assert list(cache._entries) == [
-        ("octocat", "repos/o/r/issues?state=open"),
-        ("octocat", "repos/o/r/pulls/1"),
-    ]
-    assert "ghp_" not in repr(list(cache._entries))
-
-    cache._identity = "other"
-    assert cache.cached_body("repos/o/r/pulls/1") is None
-    sent: list[str | None] = []
-
-    def other_transport(path, headers, timeout):
-        sent.append(headers.get("If-None-Match"))
-        return 200, {"etag": '"other"'}, b'{"n": 9}'
-
-    cache._transport = other_transport
-    fresh = cache.get_json("repos/o/r/pulls/1", timeout=1.0)
-    assert sent == [None]
-    assert fresh.body == {"n": 9}
-    assert ("octocat", "repos/o/r/pulls/1") in cache._entries
-    assert ("other", "repos/o/r/pulls/1") in cache._entries
-
-    monkeypatch.setattr(github_rest, "_CACHE_MAX_ENTRIES", 2)
-    bounded = github_rest.GitHubRestCache(
-        transport=lambda path, headers, timeout: (200, {"etag": '"e"'}, b'{"ok": 1}'),
-        identity="octocat",
+def test_cache_is_scoped_by_credentials_and_expires_at_the_common_client_ttl(make_cache):
+    path = "repos/o/r/pulls/1"
+    now = 1000
+    first_calls, first_transport = _transport_from(
+        lambda path, headers, timeout, n: (
+            (304, {}, b"") if headers.get("If-None-Match") == '"first"'
+            else (200, {"etag": '"first"'}, b'{"n": 1}')
+        ),
     )
-    for number in range(4):
-        bounded.get_json(f"repos/o/r/pulls/{number}", timeout=1.0)
-    assert len(bounded._entries) == 2
-    assert ("octocat", "repos/o/r/pulls/0") not in bounded._entries
-    assert ("octocat", "repos/o/r/pulls/3") in bounded._entries
+    second_calls, second_transport = _transport_from(
+        lambda path, headers, timeout, n: (200, {"etag": '"second"'}, b'{"n": 2}'),
+    )
 
-    timed = github_rest.GitHubRestCache(transport=transport, identity="octocat")
-    timed.get_json("repos/o/r/pulls/1", timeout=1.0)
-    timed.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    detail_key = ("octocat", "repos/o/r/pulls/1")
-    list_key = ("octocat", "repos/o/r/issues?state=open")
-    timed._entries[detail_key].stored_at -= github_rest._DETAIL_TTL_S + 1
-    timed._entries[list_key].stored_at -= github_rest._DETAIL_TTL_S + 1
-    conditional: list[tuple[str, str | None]] = []
+    first = make_cache(first_transport, credential="first-token", clock=lambda: now, cache_ttl_seconds=30)
+    second = make_cache(second_transport, credential="second-token", clock=lambda: now, cache_ttl_seconds=30)
+    assert first.get_json(path, timeout=1).body == {"n": 1}
+    assert second.get_json(path, timeout=1).body == {"n": 2}
 
-    def replay(path, headers, timeout):
-        conditional.append((path, headers.get("If-None-Match")))
-        return 200, {"etag": '"again"'}, b'{"fresh": 1}'
-
-    timed._transport = replay
-    timed.get_json("repos/o/r/pulls/1", timeout=1.0)
-    timed.get_json("repos/o/r/issues?state=open", timeout=1.0)
-    assert conditional[0] == ("repos/o/r/pulls/1", None)
-    assert conditional[1][0] == "repos/o/r/issues?state=open"
-    assert conditional[1][1] == '"repos/o/r/issues?state=open"'
+    # A new adapter over the same credential and database can reuse the original validator.
+    same = make_cache(first_transport, credential="first-token", clock=lambda: now, cache_ttl_seconds=30)
+    assert same.get_json(path, timeout=1).body == {"n": 1}
+    now = 1030
+    assert same.get_json(path, timeout=1).body == {"n": 1}
+    assert first_calls == [(path, None), (path, '"first"'), (path, None)]
+    assert second_calls == [(path, None)]
 
 
-def test_older_response_does_not_overwrite_a_newer_cached_body():
+def test_older_response_does_not_overwrite_a_newer_cached_body(make_cache):
     older_entered = threading.Event()
     release_older = threading.Event()
+    now = 1000
 
     def transport(path, headers, timeout):
-        seq = github_rest.current_request_seq()
-        if seq == 1:
+        if not older_entered.is_set():
             older_entered.set()
             assert release_older.wait(timeout=2)
             return 200, {"etag": '"old"', "date": "Tue, 01 Jan 2020 00:00:00 GMT"}, b'{"v": "old"}'
-        assert seq == 2
+        if "If-None-Match" in headers:
+            assert headers["If-None-Match"] == '"new"'
+            return 304, {}, b""
         return 200, {"etag": '"new"', "date": "Wed, 02 Jan 2020 00:00:00 GMT"}, b'{"v": "new"}'
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport, clock=lambda: now)
     path = "repos/o/r/pulls/1"
-    errors: list[BaseException] = []
+    results = []
 
     def run_old():
-        try:
-            cache.get_json(path, timeout=2.0)
-        except BaseException as exc:
-            errors.append(exc)
+        results.append(cache.get_json(path, timeout=2))
 
     older = threading.Thread(target=run_old)
     older.start()
-    assert older_entered.wait(timeout=2)
-    newer = cache.get_json(path, timeout=2.0)
-    assert newer.body == {"v": "new"}
-    assert cache.cached_body(path) == {"v": "new"}
-    release_older.set()
-    older.join(timeout=2)
-    assert not errors
-    assert cache.cached_body(path) == {"v": "new"}
+    try:
+        assert older_entered.wait(timeout=2)
+        now = 1001
+        assert cache.get_json(path, timeout=2).body == {"v": "new"}
+    finally:
+        release_older.set()
+        older.join(timeout=2)
+    assert not older.is_alive()
+    assert [result.body for result in results] == [{"v": "old"}]
+    assert cache.get_json(path, timeout=2).body == {"v": "new"}
 
 
-def _check_run_page(body: dict, link: str | None = None) -> tuple[list[dict], bool]:
+def _check_run_page(make_cache, body: dict, link: str | None = None) -> tuple[list[dict], bool]:
     page = f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100&page=1"
     pages = {page: (body, link)}
     if link:
@@ -1054,7 +1038,7 @@ def _check_run_page(body: dict, link: str | None = None) -> tuple[list[dict], bo
             headers_out["link"] = next_link
         return 200, headers_out, json.dumps(payload).encode()
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
+    cache = make_cache(transport)
     return github_rest._check_runs(
         cache,
         REPO,
@@ -1064,15 +1048,15 @@ def _check_run_page(body: dict, link: str | None = None) -> tuple[list[dict], bo
     )
 
 
-def test_empty_check_run_page_is_incomplete_when_total_or_next_remains():
+def test_empty_check_run_page_is_incomplete_when_total_or_next_remains(make_cache):
     """Completeness is no next link and len(runs) == total_count."""
-    assert _check_run_page({"total_count": 2, "check_runs": []}) == ([], False)
+    assert _check_run_page(make_cache, {"total_count": 2, "check_runs": []}) == ([], False)
     next_link = f'<https://api.github.com/repos/{REPO}/commits/{SHA}/check-runs?page=2>; rel="next"'
-    assert _check_run_page({"total_count": 2, "check_runs": []}, next_link) == ([], False)
-    assert _check_run_page({"total_count": 0, "check_runs": []}) == ([], True)
+    assert _check_run_page(make_cache, {"total_count": 2, "check_runs": []}, next_link) == ([], False)
+    assert _check_run_page(make_cache, {"total_count": 0, "check_runs": []}) == ([], True)
 
 
-def test_later_request_wins_when_last_modified_predates_the_cached_date():
+def test_later_request_wins_when_last_modified_predates_the_cached_date(make_cache):
     path = "repos/o/r/pulls/1"
     responses = [
         (200, {"etag": '"old"', "date": "Wed, 02 Jan 2020 00:00:00 GMT"}, b'{"v": "old"}'),
@@ -1083,41 +1067,37 @@ def test_later_request_wins_when_last_modified_predates_the_cached_date():
         ),
     ]
 
-    def transport(ignored_path, headers, timeout):
-        return responses.pop(0)
+    responses.append((304, {}, b""))
+    calls, transport = _transport_from(lambda path, headers, timeout, n: responses[n - 1])
+    cache = make_cache(transport)
+    assert cache.get_json(path, timeout=1).body == {"v": "old"}
+    assert cache.get_json(path, timeout=1).body == {"v": "new"}
+    assert cache.get_json(path, timeout=1).body == {"v": "new"}
+    assert calls == [(path, None), (path, '"old"'), (path, '"new"')]
 
-    cache = github_rest.GitHubRestCache(transport=transport, identity="octocat")
-    assert cache.get_json(path, timeout=1.0).body == {"v": "old"}
-    assert cache.get_json(path, timeout=1.0).body == {"v": "new"}
-    assert cache.cached_body(path) == {"v": "new"}
 
+def test_concurrent_forbidden_reads_keep_the_http_status(make_cache):
+    path = "repos/o/r/pulls/1"
+    in_transport = threading.Barrier(2)
+    errors = []
 
-def test_concurrent_login_failures_keep_the_http_status():
-    workers = 64
+    def transport(endpoint, headers, timeout):
+        assert endpoint == path and "If-None-Match" not in headers
+        in_transport.wait(timeout=2)
+        return 403, {}, b"forbidden"
 
-    def transport(path, headers, timeout):
-        if path == "user":
-            return 403, {}, b"forbidden"
-        return 200, {"etag": '"body"'}, b'{"ok": 1}'
-
-    cache = github_rest.GitHubRestCache(transport=transport)
-    start = threading.Barrier(workers)
-    errors: list[BaseException] = []
-    errors_lock = threading.Lock()
+    cache = make_cache(transport)
 
     def worker():
-        start.wait(timeout=5)
         try:
-            cache.get_json("repos/o/r/pulls/1", timeout=2.0)
-        except BaseException as exc:
-            with errors_lock:
-                errors.append(exc)
+            cache.get_json(path, timeout=2)
+        except github_rest.GitHubRestError as exc:
+            errors.append(exc.status)
 
-    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    threads = [threading.Thread(target=worker) for _ in range(2)]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(timeout=5)
+        thread.join(timeout=3)
     assert all(not thread.is_alive() for thread in threads)
-    assert len(errors) == workers
-    assert all(isinstance(exc, github_rest.GitHubRestError) and exc.status == 403 for exc in errors)
+    assert errors == [403, 403]

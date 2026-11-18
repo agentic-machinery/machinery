@@ -176,21 +176,25 @@ def valid_agy_hook_files(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("candidate", ["absent_home", "valid_home", "invalid_home", "invalid_workspace", "no_guard"])
-def test_agy_bridge_real_scratch_wiring(tmp_path, monkeypatch, candidate):
-    """AGY scratch launch must provision and validate the actual packaged guard registrations."""
-    from lu_machinery.agent_runtime.agy_hook_config import GUARD_NAME, AgyHookConfigError, guard_registration
-    from lu_machinery.ai_agent_bridge import _agy as bridge
+def test_agy_adapter_validates_the_workspace_guard(tmp_path, monkeypatch, candidate):
+    """The adapter must enforce the packaged guard in an out-of-tree workspace."""
+    from lu_machinery.agent_runtime.agy_hook_config import (
+        GUARD_NAME,
+        AgyHookConfigError,
+        guard_registration,
+        provision_workspace_guard,
+    )
 
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
     fake = tmp_path / "bin/agy"
     fake.parent.mkdir()
     fake.write_text("#!/bin/sh\nprintf '2.0.0\\n'\n")
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake.parent}:/usr/bin:/bin")
-    workspace = bridge._agy_ask_scratch_cwd()
-    assert workspace == tmp_path / "scratch/learn-ukrainian-bridge-asks/agy"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provision_workspace_guard(workspace)
     assert not (workspace / ".git").exists()
     hooks = workspace / ".agents/hooks.json"
     original = hooks.read_bytes()
