@@ -30,6 +30,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 
 from packaging.requirements import Requirement
@@ -44,6 +45,7 @@ _BUMP = re.compile(r"chore\(release\): record \d+\.\d+\.\d+ and start \d+\.\d+\.
 _VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
 _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
+_X_AGENT_EXAMPLE = "claude/claude-opus-5-5"
 _TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
@@ -90,14 +92,47 @@ class Decision:
     version: str
 
 
-# --- Pure decisions -------------------------------------------------------------------------
-
-
-def x_agent_value(value: str) -> str:
-    """Refuse an empty or malformed ``--x-agent``. There is no default."""
+def x_agent_value(value: str, *, command: str) -> str:
+    """Require an X-Agent trailer the review recorder can attribute on each destination PR."""
     if not _X_AGENT.fullmatch(value):
-        raise argparse.ArgumentTypeError("--x-agent must be <agent>/<task-or-seat>, for example claude/claude-cto")
+        raise argparse.ArgumentTypeError(f"{value!r} must be <agent>/<task-or-seat>, for example {_X_AGENT_EXAMPLE}")
+
+    from lu_machinery.common.repo_root import (
+        MachineryConfigError,
+        StateRootError,
+        configured_github_slug,
+    )
+    from lu_machinery.common.task_store_paths import tasks_dir
+    from lu_machinery.orchestration.fleet_repos import (
+        FleetRepoError,
+        default_repo_key,
+        load_fleet_repos,
+    )
+    from lu_machinery.review.record_cf_verdict import RecordError, _attribute_trailer
+    from lu_machinery.review.reviewer_resolver import UNKNOWN_AUTHOR_FAMILY
+
+    error = f"{value!r} must resolve to an author family for review. Use a value such as {_X_AGENT_EXAMPLE}."
+    try:
+        try:
+            task_root = tasks_dir()
+        except StateRootError:
+            # Without a state anchor, the recorder can only use the trailer itself.
+            task_root = Path(os.devnull)
+
+        repos = load_fleet_repos()
+        destinations = [repos["machinery"].github]
+        if command == "cut":
+            destinations.append(configured_github_slug() or repos[default_repo_key(repos)].github)
+        for repository in destinations:
+            attribution = _attribute_trailer(None, value, repository=repository, task_root=task_root)
+            if attribution.family == UNKNOWN_AUTHOR_FAMILY:
+                raise argparse.ArgumentTypeError(f"{error} Unresolved in {repository}.")
+    except (FleetRepoError, MachineryConfigError, OSError, RecordError) as exc:
+        raise argparse.ArgumentTypeError(f"{error} {exc}") from exc
     return value
+
+
+# --- Pure decisions -------------------------------------------------------------------------
 
 
 def next_version(version: str) -> str:
@@ -1196,9 +1231,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__.splitlines()[0] + "\nRun on the host with gh and push credentials, outside a worker.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut cut --x-agent claude/claude-cto\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-cto\n"
-        "  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto\n"
+        f"  .venv/bin/python -I -m lu_machinery.release_cut cut --x-agent {_X_AGENT_EXAMPLE}\n"
+        f"  .venv/bin/python -I -m lu_machinery.release_cut cut --dry-run --x-agent {_X_AGENT_EXAMPLE}\n"
+        f"  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent {_X_AGENT_EXAMPLE}\n"
         "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
         "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
         "Outputs: step lines on stdout; successful cuts keep cut.log, dist, wheelhouse and release evidence;\n"
@@ -1211,8 +1246,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, text in (("cut", "Tag main's HEAD as the next version, publish, accept and open adoption"),
                        ("post-release", "Open the post-release PR for the last tag (record changelog, bump)")):
         command = sub.add_parser(name, help=text, description=text)
-        command.add_argument("--x-agent", required=True, type=x_agent_value,
-                             help="<agent>/<task-or-seat> trailer, for example claude/claude-cto; required, no default")
+        command.add_argument("--x-agent", required=True, type=partial(x_agent_value, command=name),
+                             help=f"Required <agent>/<task-or-seat> trailer. The review recorder must resolve its "
+                                  f"author family. Example: {_X_AGENT_EXAMPLE}")
         command.add_argument("--work", type=Path, help="Empty work directory (default: a new ~/.lu-release-cut-*)")
         command.add_argument("--machinery-remote", help="Machinery Git remote (default: its GitHub URL)")
         command.add_argument("--product-remote", help="Product Git remote or local path (default: its GitHub URL)")

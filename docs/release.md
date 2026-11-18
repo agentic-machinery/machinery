@@ -119,7 +119,7 @@ product checkout:
 ```bash
 LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
   "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut \
-  --x-agent claude/claude-cto
+  --x-agent claude/claude-opus-5-5
 ```
 
 The first cut after the move to `uv.lock` needs the updated release tool.
@@ -130,7 +130,7 @@ and put the uv version from `.github/workflows/pins.txt` on `PATH`:
 ```bash
 PYTHONPATH="$MACHINERY" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
   "$PRIMARY/.venv/bin/python" -P -m lu_machinery.release_cut cut \
-  --x-agent claude/claude-cto
+  --x-agent claude/claude-opus-5-5
 ```
 
 Run the first cut this way before returning to the installed command. The
@@ -151,12 +151,14 @@ cuts keep the entire work directory for diagnosis. The command adds
 022 to the caller's umask for the whole run, so nothing it creates is group- or
 other-writable and Node admission accepts the prefix it provisions. `cut` and
 `post-release` require `--x-agent <agent>/<task-or-seat>`. The value is the
-`X-Agent` trailer on the adopt commit and the post-release commit. An empty
-or malformed value is refused, and there is no default. Examples:
+`X-Agent` trailer on the adopt commit and the post-release commit. The review
+recorder must resolve its author family to verify reviewer independence. The
+CLI checks the trailer against each destination repository during argument
+parsing.
 
 ```bash
-"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-cto
-"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut post-release --x-agent claude/claude-cto
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-opus-5-5
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5
 ```
 
 `cut --dry-run` runs everything except the tag, the publish, the two PRs and
