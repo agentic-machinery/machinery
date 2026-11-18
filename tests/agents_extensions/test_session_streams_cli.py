@@ -53,7 +53,7 @@ def test_help_is_self_sufficient() -> None:
     assert "Outputs:" in help_text
     assert "Exit codes:" in help_text
     assert "Related:" in help_text
-    assert "do not use it to cut over or retire file handoffs" in help_text
+    assert "A lane's handoff content is its DB note" in help_text
 
 
 def test_tail_json_preserves_pinned_plus_last_n(tmp_path: Path, capsys) -> None:
