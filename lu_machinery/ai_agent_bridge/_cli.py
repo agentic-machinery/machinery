@@ -4,7 +4,6 @@ import argparse
 import json
 import logging
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -981,8 +980,8 @@ def _dispatch_command(args):
     replacement = getattr(args, "retired_replacement", None)
     if replacement is not None:
         refuse_retired_verb(args.command, replacement)
-    # The pre-parse guard in main() cannot see every token argparse accepts as
-    # the id (``-``, ``-1.5``): the parsed id is checked again here.
+    # main()'s pre-parse guard reads the id with a parser that lacks the verb's
+    # own options, so the id the real parser chose is checked again here.
     if args.command in _JOB_ID_VERBS and not str(args.message_id).startswith("authority-job_"):
         refuse_retired_verb(f"{args.command} <message-id>", _JOB_ID_VERBS[args.command])
     if args.command == "read":
@@ -1598,36 +1597,30 @@ def _kimi_request_error(args) -> str | None:
     return None
 
 
-# argparse's own test for a positional that starts with "-": a negative number.
-_NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+def _job_message_id(rest: list[str]) -> str | None:
+    """The message id argparse reads from the words after a kept job verb; None when there is none.
 
-
-def _is_option_token(token: str) -> bool:
-    """Whether argparse parses *token* as an option rather than a positional."""
-    return (
-        token.startswith("-")
-        and token != "-"
-        and " " not in token
-        and _NEGATIVE_NUMBER.fullmatch(token) is None
-    )
+    The running interpreter's argparse decides which tokens are ids, so the
+    guard follows its rules (``-1_000`` is an id on Python 3.14, an option on
+    3.12) instead of copying them.
+    """
+    probe = argparse.ArgumentParser(prog="ab", add_help=False, exit_on_error=False)
+    probe.add_argument("message_id", nargs="?")
+    message_id = probe.parse_known_args(rest)[0].message_id
+    return None if message_id is None else str(message_id)
 
 
 def main():
     """CLI entry point."""
     argv = sys.argv[1:]
-    # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
-    # A ``--`` may end options before the verb or before the id. An option token
-    # (help in any spelling argparse accepts: ``-h``, ``-hh``, ``--he``) goes to
-    # argparse. Tokens argparse reads as positionals (``12``, ``-12``, ``-``,
-    # ``-1.5``, ``- 12``) are ids. _dispatch_command checks the parsed id again.
+    # A legacy message id on a kept job verb is refused before parsing, whatever follows it
+    # (``--help`` included). argparse itself reads the id; help in any spelling
+    # (``-h``, ``-hh``, ``--he``) with no id still reaches the real parser.
+    # _dispatch_command checks the parsed id again.
     words = argv[1:] if argv[:1] == ["--"] else argv
     if words and words[0] in _JOB_ID_VERBS:
-        rest = words[1:]
-        if rest[:1] == ["--"]:
-            rest = rest[1:]
-        elif rest[:1] and _is_option_token(rest[0]):
-            rest = []
-        if rest and not rest[0].startswith("authority-job_"):
+        message_id = _job_message_id(words[1:])
+        if message_id is not None and not message_id.startswith("authority-job_"):
             refuse_retired_verb(f"{words[0]} <message-id>", _JOB_ID_VERBS[words[0]])
     parser = _build_parser()
     args = parser.parse_args(argv)
