@@ -379,6 +379,11 @@ def delivery_settle(sandbox):
         if owned is None:
             record.pop("owned_paths")
         path = sandbox.tasks / f"{record['task_id']}.json"
+        # Each probe supervises this one record again, which production never does (a task id is dispatched once).
+        # The previous probe ran as a fallback launch, whose scratch settlement keeps for tmp_sweep's settled-task
+        # rule; it is cleared here as that sweep would, so the exclusive scratch creation sees a fresh name.
+        if (kept := sandbox.scratch_base / record["task_id"]).exists():
+            shutil.rmtree(kept)
         path.write_text(json.dumps(record))
         subprocess.run([
             sys.executable, "-c", "import sys; from pathlib import Path; "
