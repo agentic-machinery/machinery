@@ -15,7 +15,7 @@ from lu_machinery import release_cut
 from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
 from lu_machinery.common import repo_root
 from lu_machinery.dispatcher import git as git_module
-from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes, x_agent_value
+from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes
 
 HEAD = "a" * 40
 TAG_COMMIT = "b" * 40
@@ -234,7 +234,6 @@ def test_notes_are_generated_from_every_merged_title_except_the_bump():
 
 def test_missing_x_agent_is_refused(capsys):
     """Defect class: a release command with no X-Agent value writes a commit review cannot attribute."""
-    assert x_agent_value("claude/claude-cto") == "claude/claude-cto"
     for command in ("cut", "post-release"):
         with pytest.raises(SystemExit) as caught:
             main([command])
@@ -245,6 +244,35 @@ def test_missing_x_agent_is_refused(capsys):
                 main([command, "--x-agent", value])
             assert malformed.value.code == 2
             assert "x-agent" in capsys.readouterr().err.lower()
+
+
+def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, tmp_path, capsys):
+    """Defect class: syntactically valid release trailers leave the PR author unresolved."""
+    _host(monkeypatch, tmp_path, Path(sys.executable))
+    monkeypatch.setattr(release_cut, "_run", lambda args: 0)
+    for command in ("cut", "post-release"):
+        with pytest.raises(SystemExit) as caught:
+            main([command, "--x-agent", "claude/claude-cto"])
+        assert caught.value.code == 2
+        error = capsys.readouterr().err
+        assert "claude/claude-cto" in error
+        assert "claude/claude-opus-5-5" in error
+        assert "author family" in error
+
+
+def test_resolvable_x_agent_reaches_release_runner(monkeypatch, tmp_path):
+    """Defect class: parse-time attribution rejects an explicit catalog model."""
+    _host(monkeypatch, tmp_path, Path(sys.executable))
+    parsed = []
+
+    def run(args):
+        parsed.append((args.command, args.x_agent))
+        return 0
+
+    monkeypatch.setattr(release_cut, "_run", run)
+    for command in ("cut", "post-release"):
+        assert main([command, "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert parsed == [("cut", "claude/claude-opus-5-5"), ("post-release", "claude/claude-opus-5-5")]
 
 
 def _git(repo, *args):
@@ -553,6 +581,7 @@ def _host(monkeypatch, tmp_path, interpreter):
     """Point main() at a fixture primary checkout and interpreter instead of the registered repositories."""
     primary = tmp_path / "primary"
     _init_repo(primary)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (primary, {"github": f"learn-ukrainian/{name or 'learn-ukrainian'}"}))
     monkeypatch.setattr(repo_root, "primary_root", lambda: primary)
     monkeypatch.setattr(repo_root, "project_interpreter", lambda: interpreter)
@@ -584,7 +613,7 @@ def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeyp
         return 0
 
     monkeypatch.setattr(release_cut, "execute", execute)
-    assert main(["cut", "--dry-run", "--no-alert", "--work", str(work), "--x-agent", "claude/claude-cto"]) == 0
+    assert main(["cut", "--dry-run", "--no-alert", "--work", str(work), "--x-agent", "claude/claude-opus-5-5"]) == 0
     prefix = work / "accept/share/lu-machinery/node/0.1.23-lock"
     _check_node_artifact(prefix / ".nvmrc")
     for directory in (prefix, prefix.parent):
@@ -617,7 +646,7 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
         raise CutError("Unsafe Node dependency artifact")
 
     monkeypatch.setattr(release_cut, "execute", execute)
-    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
+    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-opus-5-5"]) == 1
     assert "alert to claude-cto failed" not in capsys.readouterr().err
     toplevel, argv, body = record.read_text(encoding="utf-8").split("\n", 2)
     assert Path(toplevel).resolve() == primary.resolve()
