@@ -16,10 +16,11 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from lu_machinery.api.opsec_scan import scan_text
+from lu_machinery.api.opsec_scan import BOUNDED_FILESYSTEM_ROOTS, scan_text
 from lu_machinery.common import json_depth
 
 REDACTED_ABSOLUTE_PATH = "[redacted-path]"
@@ -28,7 +29,8 @@ _UNCHANGED = object()
 
 def sanitize_text(text: str) -> str:
     """Replace leaked absolute filesystem-root tokens in one string."""
-    if not text:
+    # The scanner builds its filesystem pattern from these literal roots.
+    if not any(root in text for root in BOUNDED_FILESYSTEM_ROOTS):
         return text
     findings = [finding for finding in scan_text(text) if finding.kind == "filesystem-root"]
     if not findings:
@@ -146,7 +148,7 @@ async def sanitize_json_response(response: Response) -> Response:
     if not _is_json_content(response):
         return response
     raw = await _read_response_body(response)
-    sanitized, original = sanitize_json_bytes(raw)
+    sanitized, original = await run_in_threadpool(sanitize_json_bytes, raw)
     if sanitized is _UNCHANGED:
         if _response_body_bytes(response):
             return response
