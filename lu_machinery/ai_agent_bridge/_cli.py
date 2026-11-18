@@ -75,6 +75,9 @@ _JOB_ID_VERBS = {
     "read": RETIRED_VERBS["inbox"],
     "process-ask": f"{_PY} -m {BRIDGE_ENTRY} ask-<seat> <message>",
 }
+# The only process-ask targets: OpenCode's detached workers (keep-list). Every other
+# seat's process worker is retired with the legacy stores.
+_PROCESS_ASK_TARGETS = frozenset({"opencode", "pool", "glm", "gemma"})
 
 
 def refuse_retired_verb(verb: str, replacement: str) -> NoReturn:
@@ -985,6 +988,8 @@ def _dispatch_command(args):
     # own options, so the id the real parser chose is checked again here.
     if args.command in _JOB_ID_VERBS and not str(args.message_id).startswith("authority-job_"):
         refuse_retired_verb(f"{args.command} <message-id>", _JOB_ID_VERBS[args.command])
+    if args.command == "process-ask" and args.target not in _PROCESS_ASK_TARGETS:
+        refuse_retired_verb(f"process-ask <target {args.target}>", _JOB_ID_VERBS["process-ask"])
     if args.command == "read":
         from ._opencode import read_opencode_result
 
