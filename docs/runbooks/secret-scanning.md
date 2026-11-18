@@ -334,7 +334,7 @@ At this review's evidence snapshot, #8 and #9 each also have 24 open instances
 on `refs/heads/gh-readonly-queue/main/pr-*`. The same temporary-ref accumulation
 affects #6 and #14 (24 each) and #24 (12). Refreshing the main rows does not
 clear these instances or prove their older SARIF flows match. The dismissal
-verb must continue to refuse missing or different evidence on any open instance.
+verb still refuses missing or different evidence on active refs and requires an open triage-branch instance matching the reviewed row; only `refs/pull/<n>/merge` instances whose PR is confirmed closed or merged may be ignored, with that PR state rechecked before sending. An open PR's instance must still match the reviewed location and SARIF evidence.
 
 `.github/workflows/codeql.yml` no longer runs on `merge_group`, so CodeQL does not
 upload analyses for temporary `refs/heads/gh-readonly-queue/main/pr-*` refs;
@@ -349,7 +349,7 @@ For a retained real branch, a successful current analysis can mark an absent
 finding fixed; these obsolete queue candidates should not be recreated merely
 to manufacture matching evidence. Any analysis cleanup needs separate authority
 and a fresh instance inventory before the interactive seat retries dismissal.
-Dismissal checks are unchanged, and stopping the workflow does not delete existing analyses.
+Stopping the workflow does not delete existing analyses.
 
 ### Deleting one obsolete queue-ref analysis
 
@@ -417,7 +417,7 @@ at the base branch's current resolved head, explicitly in `refs/heads/` so a
 same-named tag cannot select the triage. The alert's current triage row
 must be byte-identical to the reviewed row; removal or reclassification
 refuses the write. Duplicate rows also count when padded with whitespace or
-written without optional outer table pipes. The publisher checks the alert and every open branch instance, and compares their SARIF
+written without optional outer table pipes. Except for the closed-PR merge-ref rule above, the publisher checks the alert and every open branch instance, and compares their SARIF
 rule, location, messages and flow evidence with the analysis at the triage
 merge. Analysis-local indexes are resolved before comparison. Missing analysis,
 unknown evidence or drift refuses the write. If a later change moves a location

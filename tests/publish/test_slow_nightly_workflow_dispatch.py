@@ -362,6 +362,16 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
         "code-scanning/analyses/2": copy.deepcopy(sarif),
         "code-scanning/analyses/3": copy.deepcopy(sarif),
     }
+    # Stale merge refs may retain older locations after their PRs stop being active.
+    for number, merged in ((3, True), (4, False)):
+        documents[f"pulls/{number}"] = {
+            "number": number, "state": "closed", "merged": merged,
+            "html_url": f"https://github.com/unit/public/pull/{number}",
+        }
+        stale = copy.deepcopy(instance)
+        stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
+        stale["location"]["start_line"] = 8
+        documents["code-scanning/alerts/1/instances?per_page=100"][0].append(stale)
     writes, calls = [], []
     options = {"reason": "false positive", "readback": {}, "write_error": None, "read_error": None}
 
@@ -469,7 +479,12 @@ def test_dismissal_refuses_missing_or_changed_reviewed_evidence(dismissal_transp
     elif fault == "tool":
         documents["code-scanning/analyses/3"]["runs"][0]["tool"]["driver"]["semanticVersion"] = "2.0.0"
     elif fault == "branch":
-        instance = dict(documents["code-scanning/alerts/1/instances?per_page=100"][0][0], ref="refs/heads/other")
+        documents["pulls/5"] = {
+            "number": 5, "state": "open", "merged": False,
+            "html_url": "https://github.com/unit/public/pull/5",
+        }
+        instance = dict(documents["code-scanning/alerts/1/instances?per_page=100"][0][0],
+                        ref="refs/pull/5/merge", location={"path": "sample.py", "start_line": 8})
         documents["code-scanning/alerts/1/instances?per_page=100"][0].append(instance)
     else:
         documents["code-scanning/analyses/3"]["runs"][0]["results"] = []
