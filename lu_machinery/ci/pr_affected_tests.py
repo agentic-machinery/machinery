@@ -61,6 +61,7 @@ INFRA = {
     "setup.cfg",
     "uv.lock",
     "requirements.txt",
+    "requirements-dev.txt",
     "requirements-lock.txt",
     "requirements-machinery.lock",
     ".python-version",

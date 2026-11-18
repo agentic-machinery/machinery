@@ -308,6 +308,13 @@ def test_main_dry_run_never_deletes(monkeypatch: pytest.MonkeyPatch, tmp_path, c
     assert "; 1 not managed" in out
     assert "delete 1 entries, 0.25 GB; remaining 3 entries, 0.74 GB" in out
 
+    monkeypatch.chdir(tmp_path)
+    uv_lock = tmp_path / "uv.lock"
+    uv_lock.write_text("version = 1\n")
+    entries.append(CacheEntry.from_api(_raw(5, UV + lock_hash(uv_lock))))
+    assert cache_hygiene.main(["--repo", "owner/repo"]) == 0
+    assert "1 uv for the current lock" in capsys.readouterr().out
+
 
 @pytest.mark.parametrize(
     "failure",

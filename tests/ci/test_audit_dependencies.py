@@ -122,7 +122,7 @@ def test_audit_python_no_lockfile(tmp_path: Path):
 
 
 @patch("subprocess.run")
-def test_audit_python_success(mock_run: MagicMock, tmp_path: Path):
+def test_audit_python_success(mock_run: MagicMock, tmp_path: Path, monkeypatch):
     req_file = tmp_path / "requirements-lock.txt"
     req_file.write_text("package==1.0.0\n", encoding="utf-8")
     ignore_file = tmp_path / "ignore.yaml"
@@ -138,6 +138,50 @@ def test_audit_python_success(mock_run: MagicMock, tmp_path: Path):
     assert "--ignore-vuln" in cmd
     assert "CVE-TEST" in cmd
     assert kwargs.get("timeout") == 300
+
+    payload = b"verified wheel bytes"
+    digest = hashlib.sha256(payload).hexdigest()
+    filename = "lu_machinery-1.2.3-py3-none-any.whl"
+    url = f"https://example.invalid/releases/download/v1.2.3/{filename}"
+    wheel = tmp_path / filename
+    wheel.write_bytes(payload)
+    monkeypatch.setenv("LU_MACHINERY_WHEELHOUSE", str(tmp_path))
+    (tmp_path / "uv.lock").write_text(
+        'version = 1\n'
+        '[[package]]\nname = "lu-machinery"\nversion = "1.2.3"\n'
+        f'source = {{ url = "{url}" }}\nwheels = [{{ url = "{url}", hash = "sha256:{digest}" }}]\n'
+        '[[package]]\nname = "runtime"\nsource = { directory = "packages/runtime" }\n'
+        '[[package]]\nname = "git-dep"\n'
+        f'source = {{ git = "https://example.invalid/git-dep?rev=main#{"a" * 40}" }}\n'
+        '[[package]]\nname = "torch"\nversion = "1.2.3+cpu"\n'
+        'source = { registry = "https://download.pytorch.org/whl/cpu" }\n'
+        '[[package]]\nname = "package"\nversion = "1.0.0"\nsource = { registry = "https://pypi.org/simple" }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lu_machinery.ci.audit_dependencies.shutil.which", lambda _: "uv")
+
+    def uv_or_audit(argv, **_kwargs):
+        if argv[0] == "uv":
+            assert argv[1:4] == ["export", "--locked", "--offline"]
+            assert {argv[i + 1] for i, arg in enumerate(argv) if arg == "--no-emit-package"} == {
+                "git-dep", "lu-machinery", "runtime",
+            }
+            return MagicMock(returncode=0, stdout=f"package==1.0.0 --hash=sha256:{digest}\n"
+                             f"torch==1.2.3+cpu --hash=sha256:{digest}\n")
+        assert {"--require-hashes", "--disable-pip", "--strict", "CVE-TEST"} <= set(argv)
+        assert Path(argv[argv.index("-r") + 1]).read_text(encoding="utf-8") == (
+            f"package==1.0.0 --hash=sha256:{digest}\ntorch==1.2.3 --hash=sha256:{digest}\n"
+        )
+        return MagicMock(returncode=0, stdout="No known vulnerabilities found", stderr="")
+
+    mock_run.reset_mock()
+    mock_run.side_effect = uv_or_audit
+    assert audit_python(tmp_path, ignore_file) == 0
+    assert mock_run.call_count == 2
+    mock_run.reset_mock()
+    wheel.write_bytes(b"tampered")
+    assert audit_python(tmp_path, ignore_file) == 1
+    mock_run.assert_not_called()
 
 
 @patch("subprocess.run")

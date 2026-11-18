@@ -42,9 +42,11 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 # or reply handling. Every one is a machinery file, named wherever the machinery package is and
 # whatever it is called; the schema is packaged.
 CONTRACT_PATHS: tuple[str, ...] = (
+    "uv.lock",  # the dependencies the canary installs before running any route
     f"{_MACHINERY}/review/contract_canary.py",  # this gate: a change to it is proven on live routes too
     f"{_MACHINERY}/schemas/code-review-findings.v1.schema.json",
     f"{_MACHINERY}/review/review_contract.py",
+    f"{_MACHINERY}/review/render_contract.py",
     f"{_MACHINERY}/review/verdict_parser.py",
     f"{_MACHINERY}/review/record_cf_verdict.py",
     f"{_MACHINERY}/dispatcher/worker.py",

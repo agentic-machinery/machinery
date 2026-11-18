@@ -2,7 +2,7 @@
 
 Two subcommands support the scheduled ``security-audit.yml`` job:
 
-``collect`` runs pip-audit (requirements-lock.txt) and npm audit (root and
+``collect`` runs pip-audit (uv.lock or requirements-lock.txt) and npm audit (root and
 ``site/``), keeps only *unsuppressed* findings after the audited ignore files,
 and writes them as JSON. Tool failures exit non-zero so a broken audit never
 closes the tracking issue.
@@ -14,7 +14,7 @@ issue body. The workflow applies the action with ``gh``.
 Reuses the suppression logic from ``scripts/ci/audit_dependencies.py`` so
 "unsuppressed" means exactly what the blocking audit enforces: every pip-audit
 finding, and High/Critical npm findings. The pip-audit invocation shares
-``pip_audit_requirement_env`` with that blocking audit, so a first-party
+``python_audit_input`` with that blocking audit, so a first-party
 ``lu-machinery`` requirement resolves from ``LU_MACHINERY_WHEELHOUSE`` instead
 of PyPI.
 """
@@ -34,7 +34,7 @@ from lu_machinery.ci.audit_dependencies import (
     filter_npm_audit_vulnerabilities,
     load_npm_audit_ignores,
     load_pip_audit_ignores,
-    pip_audit_requirement_env,
+    python_audit_input,
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
@@ -180,33 +180,24 @@ def run_collect(
     """
     findings: list[Finding] = []
 
-    req_file = repo_root / "requirements-lock.txt"
-    if not req_file.exists():
-        raise RuntimeError(f"{req_file} not found; missing required inputs fail closed")
     pip_ignore = pip_ignore_file or repo_root / "scripts/config/pip-audit-ignore.yaml"
-    pip_cmd = [
-        sys.executable,
-        "-m",
-        "pip_audit",
-        "-r",
-        str(req_file),
-        "--format",
-        "json",
-        "--progress-spinner=off",
-    ]
+    pip_options = ["--format", "json", "--progress-spinner=off"]
     for vuln_id in load_pip_audit_ignores(pip_ignore):
-        pip_cmd.extend(["--ignore-vuln", vuln_id])
-    with pip_audit_requirement_env(repo_root, req_file) as extra:
+        pip_options.extend(["--ignore-vuln", vuln_id])
+    with python_audit_input(repo_root) as (audit_args, env):
         pip_report, pip_code = _run_json_command(
-            pip_cmd,
+            [sys.executable, "-m", "pip_audit", *audit_args, *pip_options],
             cwd=repo_root,
             timeout=PIP_AUDIT_TIMEOUT_SECONDS,
             label="pip-audit",
-            env=({**os.environ, **extra} if extra else None),
+            env=env,
         )
     if pip_code not in (0, 1):
         raise RuntimeError(f"pip-audit failed with exit code {pip_code}")
-    findings.extend(collect_python_findings(pip_report))
+    python_findings = collect_python_findings(pip_report)
+    if not isinstance(pip_report.get("dependencies"), list) or (pip_code != 0 and not python_findings):
+        raise RuntimeError(f"pip-audit returned an invalid report (exit={pip_code})")
+    findings.extend(python_findings)
 
     npm_ignore = npm_ignore_file or repo_root / "scripts/config/npm-audit-ignore.yaml"
     ignored_ids = load_npm_audit_ignores(npm_ignore) if npm_ignore.exists() else []
@@ -331,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "repository root holding requirements-lock.txt plus root and site/ npm manifests "
+            "repository root holding uv.lock (or requirements-lock.txt) plus root and site/ npm manifests "
             "(default: the selected product checkout)"
         ),
     )

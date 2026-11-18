@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import subprocess
 import sys
@@ -112,7 +113,7 @@ def lock_hash(*lock_files: Path) -> str:
     """Hash setup-uv puts at the end of its cache key for ``cache-dependency-glob``.
 
     Same algorithm as ``hashFiles()``: SHA-256 over each matched file's
-    SHA-256 digest, in match order. The composite action matches
+    SHA-256 digest, in match order. The legacy action matches
     requirements-lock.txt, then requirements-machinery.lock.
     """
     combined = hashlib.sha256()
@@ -281,19 +282,31 @@ def main(argv: list[str] | None = None) -> int:
         "--lock-file",
         type=Path,
         action="append",
-        help="lock file in cache-dependency-glob order; repeat for each (default: requirements-lock.txt)",
+        help="lock file in cache-dependency-glob order; repeat to override uv.lock or the legacy locks",
     )
     parser.add_argument("--uv-grace-hours", type=float, default=DEFAULT_UV_GRACE_HOURS)
     parser.add_argument("--apply", action="store_true", help="delete the planned entries (default: dry run)")
     args = parser.parse_args(argv)
 
+    lock_files = args.lock_file
+    if not lock_files:
+        lock_files = [Path("uv.lock")]
+        if not os.path.lexists(lock_files[0]):
+            lock_files = [Path("requirements-lock.txt")]
+            machinery_lock = Path("requirements-machinery.lock")
+            if os.path.lexists(machinery_lock):
+                lock_files.append(machinery_lock)
     try:
+        current_lock_hash = lock_hash(*lock_files)
         entries = list_caches(args.repo)
         pr_base_shas = open_pr_base_shas(args.repo)
     except subprocess.CalledProcessError as exc:
         if exc.returncode == 75:
             raise
         print(f"aborting, nothing deleted: {exc.stderr}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"aborting, nothing deleted: {exc}", file=sys.stderr)
         return 2
     except (IncompleteListingError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
         detail = getattr(exc, "stderr", None) or exc
@@ -304,7 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     plan = plan_deletions(
         entries,
-        current_lock_hash=lock_hash(*(args.lock_file or [Path("requirements-lock.txt")])),
+        current_lock_hash=current_lock_hash,
         now=datetime.now(UTC),
         pr_base_shas=pr_base_shas,
         uv_grace=timedelta(hours=args.uv_grace_hours),
