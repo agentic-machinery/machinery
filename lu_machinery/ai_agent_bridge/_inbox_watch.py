@@ -4,7 +4,7 @@ Every mode reads Fleet Comms supervisory deliveries and works through the
 existing launcher and session supervisor. The legacy inbox notification mode
 and the Codex resume on legacy inbox rows are removed with the legacy stores
 (#515); a driver's own deliveries are reported by the check-agent-inbox hook
-and ``fleet_comms deliveries pending``.
+and ``<python> -I -m lu_machinery.fleet_comms deliveries pending``.
 """
 
 from __future__ import annotations

@@ -92,8 +92,9 @@ def register_discuss_command(subparsers: Any) -> None:
 def _authoring_context_exists(channel: str) -> bool:
     """Whether the product's authoring tree has a context file for *channel*.
 
-    Such a file must be sealed into Fleet Comms (``fleet_comms channel
-    context``) before a discussion uses the channel, never silently skipped.
+    Such a file must be sealed into Fleet Comms (``<python> -I -m
+    lu_machinery.fleet_comms channel context``) before a discussion uses the
+    channel, never silently skipped.
     ``AB_CONTEXT_DIR`` overrides the authoring root. An invalid channel name,
     or a context path that escapes that root, raises ``ValueError``: the
     caller refuses the discussion rather than treating it as "no context".

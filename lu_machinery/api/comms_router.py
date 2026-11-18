@@ -331,7 +331,8 @@ def comms_inbox(
     The cheap cold-start "do I have work waiting" check (GH #1309), read from
     the authority plane (``pending_delivery_snapshot``). ``probe`` is ``ok``
     only when the plane was read; otherwise ``count`` is null (unknown, never
-    zero). Read the deliveries with ``fleet_comms deliveries receive``.
+    zero). Read the deliveries with
+    ``<python> -I -m lu_machinery.fleet_comms deliveries receive``.
     """
     from lu_machinery.fleet_comms.authority import (  # noqa: PLC0415 — authority stack on demand
         _load_roster,
