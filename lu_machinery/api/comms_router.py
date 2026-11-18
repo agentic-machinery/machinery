@@ -319,7 +319,7 @@ def comms_inbox(
     limit: int = Query(10, ge=1, le=50, description="Max delivery message ids to return."),
     ctx: MonitorContext = Depends(get_ctx),
 ):
-    """Queued Fleet Comms deliveries for one agent: count and message ids, never bodies.
+    """Queued Fleet Comms deliveries for one roster seat: count and message ids, never bodies.
 
     The cheap cold-start "do I have work waiting" check (GH #1309), read from
     the authority plane (``pending_delivery_snapshot``). ``probe`` is ``ok``
@@ -327,16 +327,22 @@ def comms_inbox(
     zero). Read the deliveries with ``fleet_comms deliveries receive``.
     """
     from lu_machinery.fleet_comms.authority import (  # noqa: PLC0415 — authority stack on demand
+        _load_roster,
         pending_delivery_snapshot,
     )
 
-    try:
-        plane_root = default_plane_root(repo_root=ctx.roots.state_root)
-    except (PlaneRootAnchorError, MachineryConfigError, OSError, ValueError):
-        # Same fail-open rule as the metrics route: an unanchored plane is unknown, never a 500.
-        snapshot: dict = {"probe": "unknown"}
-    else:
-        snapshot = pending_delivery_snapshot(agent, root=plane_root, limit=limit)
+    # Only a roster seat is queried, by the roster's own spelling: a request value
+    # never reaches the store lookups (task records, plane paths). Others are unknown.
+    roster, _complete = _load_roster()
+    seat = next((name for name in sorted(roster) if name == agent), None)
+    snapshot: dict = {"probe": "unknown"}
+    if seat is not None:
+        try:
+            plane_root = default_plane_root(repo_root=ctx.roots.state_root)
+        except (PlaneRootAnchorError, MachineryConfigError, OSError, ValueError):
+            pass  # same fail-open rule as the metrics route: an unanchored plane is unknown, never a 500
+        else:
+            snapshot = pending_delivery_snapshot(seat, root=plane_root, limit=limit)
     return {
         "agent": agent,
         "count": snapshot.get("count"),
