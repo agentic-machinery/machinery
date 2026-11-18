@@ -11,7 +11,10 @@ import pytest
 from lu_machinery.orchestration import merge_closeout as mc
 from lu_machinery.orchestration import task_lifecycle as tl
 from lu_machinery.orchestration import worktree_git as rw
+from tests.orchestration import closeout_fixtures
 from tests.orchestration.test_task_lifecycle import NOW, _identity
+
+bound_case = closeout_fixtures.bound_case
 
 _REAL_RUN = subprocess.run
 
@@ -970,6 +973,30 @@ def test_criterion_receipts_skip_non_ledger_files(tmp_path: Path, monkeypatch: p
     )
 
     assert reports == []
+
+
+def test_merged_run_evidence_reads_the_repository_required_workflow(bound_case, tmp_path, monkeypatch) -> None:
+    """Defect class: a repository whose required gate is not ci.yml can never prove a merged run (#516 blocker)."""
+    ledger, observation, _, run, _ = bound_case
+    run["path"] = ".github/workflows/ci-gate.yml"
+    closeout_fixtures.fleet_row(monkeypatch, required_workflow=".github/workflows/ci-gate.yml")
+    monkeypatch.setattr(mc, "_closeout_api", closeout_fixtures.closeout_reads(bound_case, tmp_path))
+
+    _, report = mc.collect_merged_run_evidence(tmp_path, ledger, observation, now=NOW)
+
+    assert (report["run_id"], report["run_attempt"], report["merge_sha"]) == (123, 2, run["head_sha"])
+    assert report["execution"]["run"]["path"] == ".github/workflows/ci-gate.yml"
+
+
+def test_merged_run_evidence_default_workflow_still_refuses_other_runs(bound_case, tmp_path, monkeypatch) -> None:
+    """Defect class: a row without required_workflow accepting a run of some workflow other than ci.yml."""
+    ledger, observation, _, run, _ = bound_case
+    run["path"] = ".github/workflows/ci-gate.yml"
+    closeout_fixtures.fleet_row(monkeypatch)
+    monkeypatch.setattr(mc, "_closeout_api", closeout_fixtures.closeout_reads(bound_case, tmp_path))
+
+    with pytest.raises(mc.MergeCloseoutError, match="CLOSEOUT_MERGE_RUN_MISSING"):
+        mc.collect_merged_run_evidence(tmp_path, ledger, observation, now=NOW)
 
 
 def test_text_report_renders_cleanup_and_criterion_residuals():

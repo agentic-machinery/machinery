@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from lu_machinery.opsec import prepublish
 from lu_machinery.orchestration import lifecycle_observation as lo
 from lu_machinery.orchestration import task_lifecycle as tl
 from tests.orchestration.test_task_lifecycle import HEAD, MERGE, NOW, REVIEW_URL, _identity, _observation
@@ -62,3 +63,23 @@ def bound_case():
 def derive(case):
     ledger, observation, pull, run, jobs = case
     return lo.merged_run_evidence(ledger, observation, pull=pull, run=run, jobs=jobs, now=NOW)
+
+
+def closeout_reads(case, root):
+    """merge_closeout._closeout_api stand-in answering the case's named GitHub reads, read at call time."""
+    _, _, pull, run, jobs = case
+
+    def api(request_root, request):
+        assert request_root == root
+        assert request.fields["repo"] == "org/repo"
+        return {
+            "read-pull": pull, "read-runs": [{"total_count": 1, "workflow_runs": [run]}],
+            "read-run": run, "read-jobs": [{"total_count": len(jobs), "jobs": jobs}],
+        }[request.verb]
+
+    return api
+
+
+def fleet_row(monkeypatch, **row):
+    """Register the case repository (org/repo) as the only fleet_repos.yaml row, with the given keys."""
+    monkeypatch.setattr(prepublish, "catalog", lambda: {"case": {"github": "org/repo", **row}})
