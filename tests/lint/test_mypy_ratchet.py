@@ -198,9 +198,22 @@ def _tree_is_a_file(root: Path, _baseline: Path) -> None:
     (root / "scripts").write_text(_GOOD, encoding="utf-8")
 
 
+def _tool_is_not_a_table(root: Path, _baseline: Path) -> None:
+    (root / "pyproject.toml").write_text("tool = false\n", encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     "damage",
-    [_remove_config, _other_mypy, _remove_tree, _break_syntax, _no_mypy_table, _invalid_config, _tree_is_a_file],
+    [
+        _remove_config,
+        _other_mypy,
+        _remove_tree,
+        _break_syntax,
+        _no_mypy_table,
+        _invalid_config,
+        _tree_is_a_file,
+        _tool_is_not_a_table,
+    ],
 )
 def test_incomplete_analysis_never_prunes(tmp_path: Path, damage: Callable[[Path, Path], None]) -> None:
     """Defect class: a missing config or tree, another mypy, or a failed run reads as 'no errors' and wipes debt."""
@@ -254,3 +267,26 @@ def test_concurrent_prune_is_refused_and_malformed_baselines_fail_cleanly(
     # A message that looks like the normalizer's own slot marker is data, not a slot.
     spoof = ratchet._normalize_message('Missing keys ("b", "a") \ue0000\ue001')
     assert spoof == 'Missing keys ("a", "b") \ue0000\ue001'
+    with pytest.raises(ValueError, match="private-use"):
+        ratchet._normalize_message("".join(map(chr, range(0xE000, 0xF900))))
+
+
+def test_prune_runs_mypy_on_the_validated_config_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: the config vanishes after validation and mypy falls back to another file, dropping a live error."""
+    root, baseline, _real = _scripts_tree(tmp_path, "from typing import Any\n\n\ndef f(x: Any) -> int:\n    return x\n")
+    (root / "pyproject.toml").write_text('[tool.mypy]\npython_version = "3.12"\nwarn_return_any = true\n', encoding="utf-8")
+    live, fatal = collect_errors(root, ["scripts"], incremental=False)
+    assert fatal == [] and [error.code for error in live] == ["no-any-return"]
+    write_baseline(baseline, live)
+    before = baseline.read_bytes()
+    real_config = ratchet.ratchet_config
+
+    def vanishing(root: Path, **kwargs: bool) -> Path | None:
+        config = real_config(root, **kwargs)
+        (root / "pyproject.toml").unlink()
+        (root / "mypy.ini").write_text("[mypy]\nwarn_return_any = False\n", encoding="utf-8")
+        return config
+
+    monkeypatch.setattr(ratchet, "ratchet_config", vanishing)
+    assert prune_baseline(root, baseline) == (0, [])
+    assert baseline.read_bytes() == before

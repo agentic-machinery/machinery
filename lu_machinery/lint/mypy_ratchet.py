@@ -335,8 +335,9 @@ def _normalize_message(message: str) -> str:
     message = _LINE_REFERENCE.sub("", message)
     # Slot markers are private-use characters the message does not contain, so
     # message text can never be read back as a slot.
-    free = (chr(code) for code in range(0xE000, 0xF900) if chr(code) not in message)
-    mark = next(free)
+    mark = next((chr(code) for code in range(0xE000, 0xF900) if chr(code) not in message), None)
+    if mark is None:
+        raise ValueError("message uses every private-use character the normalizer reserves for slots")
     slot_pattern = re.compile(f"{mark}(\\d+){mark}")
     slots: list[str] = []
 
@@ -414,17 +415,25 @@ def _toml(value: object) -> str:
     raise ValueError(f"unsupported mypy config value: {value!r}")
 
 
-def ratchet_config(root: Path) -> Path | None:
+def ratchet_config(root: Path, *, require_table: bool = False) -> Path | None:
     """Point mypy at the repo config plus overrides for wheels CI does not install.
 
     ``files`` is omitted so the paths passed on the command line are the whole
     check. An unknown ``[tool.mypy]`` key fails closed instead of being dropped.
+    ``require_table`` refuses a pyproject with no ``[tool.mypy]`` table instead of
+    running mypy with its defaults. The returned file is a snapshot: mypy reads it,
+    never the repository's own config.
     """
 
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
         return None
-    tool = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("mypy", {})
+    tools = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {})
+    if not isinstance(tools, dict):
+        raise ValueError("pyproject [tool] is not a table")
+    if require_table and "mypy" not in tools:
+        raise ValueError("pyproject.toml has no [tool.mypy] table: the repository mypy config would not apply")
+    tool = tools.get("mypy", {})
     if not isinstance(tool, dict):
         raise ValueError("pyproject [tool.mypy] is not a table")
     unknown = sorted(set(tool) - set(_MYPY_KEYS) - {"files"})
@@ -637,6 +646,7 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
         ],
     }
     text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    path = path.resolve()  # replace the file a symlink points at, never the link
     # A new file keeps mkstemp's owner-only mode; a rewrite keeps the mode it had.
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -767,11 +777,12 @@ def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
     baseline records, and a clean mypy run. Anything else writes nothing.
     """
 
-    pyproject = root / "pyproject.toml"
-    if not pyproject.is_file():
+    try:
+        config = ratchet_config(root, require_table=True)
+    except ValueError as exc:
+        return 0, [str(exc)]
+    if config is None:
         return 0, ["no pyproject.toml: the repository mypy config would not apply"]
-    if not isinstance(tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("mypy"), dict):
-        return 0, ["pyproject.toml has no [tool.mypy] table: the repository mypy config would not apply"]
     tree = product_tree_path(root=root)
     if not tree.is_dir():
         return 0, [f"{tree.name} is not a directory: there is no tree to analyse"]
@@ -781,7 +792,7 @@ def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
         recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
         if recorded != installed:
             return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
-        current, fatal = collect_errors(root, [tree.name], incremental=False)
+        current, fatal = collect_errors(root, [tree.name], config_file=config, incremental=False)
         if fatal:
             return 0, fatal
         grown = _counts(current) - _counts(entries)
