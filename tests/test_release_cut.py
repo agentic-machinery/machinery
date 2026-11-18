@@ -418,6 +418,9 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     (product / "uv.lock").write_text('package = "invalid"\n', encoding="utf-8")
     with pytest.raises(CutError, match="uv.lock package must be an array of tables"):
         release_cut.wheel_only_requirements("", product / "uv.lock")
+    manifest.write_text("tool = []\n", encoding="utf-8")
+    with pytest.raises(CutError, match="pyproject.toml tool must be a table"):
+        cut.update_adopt_inputs(lock, product)
 
 
 def _released_history(tmp_path, commits, releases):
@@ -608,26 +611,18 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
     )
     publisher.chmod(0o755)
     primary = _host(monkeypatch, tmp_path, publisher)
-    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
 
     def execute(cut):
-        cut.tag_pushed = True
-        cut.step = "adopt PR"
-        release_cut.adopt_manifest("tool = []\n", "https://example.invalid/releases/download", "0.1.23")
-
-    def cleanup(_cut, failed_step):
-        assert failed_step == "adopt PR"
-        return "fixture pre-release withdrawn"
+        cut.step = "Node provisioning"
+        raise CutError("Unsafe Node dependency artifact")
 
     monkeypatch.setattr(release_cut, "execute", execute)
-    monkeypatch.setattr(Cut, "clean_up", cleanup)
-    assert main(["cut", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
+    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-cto"]) == 1
     assert "alert to claude-cto failed" not in capsys.readouterr().err
     toplevel, argv, body = record.read_text(encoding="utf-8").split("\n", 2)
     assert Path(toplevel).resolve() == primary.resolve()
     assert "channel publish cto - --sender release-cut --source release --recipient claude-cto" in argv
-    assert body.startswith("release-cut FAILED (cut) at adopt PR: pyproject.toml tool must be a table")
-    assert "fixture pre-release withdrawn" in body
+    assert body.startswith("release-cut FAILED (dry run) at Node provisioning: Unsafe Node dependency artifact")
 
 
 def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeypatch, tmp_path):
