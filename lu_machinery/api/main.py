@@ -126,56 +126,64 @@ from .worktrees_router import router as worktrees_router
 os.environ.setdefault("GIT_OPTIONAL_LOCKS", "0")
 
 @asynccontextmanager
-async def _routers_started(app: FastAPI):
-    """The innermost lifespan: the core router is included last, so every router lifespan has started.
+async def _background_work_lifespan(app: FastAPI):
+    """Run the app lifespan's background work inside every router lifespan.
 
-    Router lifespans run after the app lifespan's startup (FastAPI nests them
-    inside it). The app lifespan's background work waits for this signal.
+    The core router is included last, so this is the innermost lifespan: it
+    starts once every router lifespan (and so every snapshot writer) has
+    started, and it stops the work first at shutdown, before any router tears
+    down. An app built with its own lifespan sets no background work.
     """
-    started = getattr(app.state, "routers_started", None)
-    if started is not None:
-        started.set()
-    yield
+    start = getattr(app.state, "background_work", None)
+    task = None if start is None else asyncio.create_task(start(), name="startup-background-work")
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Startup background work failed")
 
 
-core_router = APIRouter(lifespan=_routers_started)
+core_router = APIRouter(lifespan=_background_work_lifespan)
 # Startup holds the warmups at most this long for the snapshot writers' first collections.
 STARTUP_SNAPSHOT_FIRST_WAIT_S = 10.0
 
 
-async def _run_background_work(ctx: MonitorContext, product: ProductContribution, routers_started: asyncio.Event) -> None:
-    """Warm and refresh the slow collectors once every router lifespan has started.
+def _start_warmup(name: str, start: Callable[[], object]) -> None:
+    try:
+        start()
+    except Exception as exc:
+        logger.warning("%s on startup failed: %s", name, exc)
+
+
+async def _run_background_work(ctx: MonitorContext, product: ProductContribution) -> None:
+    """Warm and refresh the slow collectors once the snapshot writers' first collections have settled.
 
     The snapshot writers (the delegate lists, the fleet worker map) start in
     router lifespans, and the warmups wait (bounded) for their first
     collections. Those get the shared task-scan lock and the GIL before the
     heavy warmups (routing budget, work projection, orient, issue audit) take
     them: before, a restart answered those panels with 503s while their first
-    collection queued behind seconds of warmup scans. Runs until cancelled at
-    shutdown.
+    collection queued behind seconds of warmup scans. One warmup that fails is
+    logged and does not stop the others. Runs until cancelled at shutdown.
     """
-    await routers_started.wait()
     await first_collections_settled(STARTUP_SNAPSHOT_FIRST_WAIT_S)
     tasks: list[asyncio.Task] = []
     try:
-        warm_panel_metrics(ctx)
-        warm_pull_requests(ctx)
-        try:
-            isa.schedule_refresh(force=False)
-        except Exception as exc:
-            logger.warning("Issue stream audit refresh schedule on startup failed: %s", exc)
-        try:
-            warm_projection_cache(ctx=ctx)
-        except Exception as exc:
-            logger.warning("Work projection warmup schedule on startup failed: %s", exc)
-        try:
-            schedule_state_scan_warmup(ctx, product.warmup)
-        except Exception as exc:
-            logger.warning("State scan warmup schedule on startup failed: %s", exc)
+        _start_warmup("Comms panel metrics warmup", lambda: warm_panel_metrics(ctx))
+        _start_warmup("Pull request warmup", lambda: warm_pull_requests(ctx))
+        _start_warmup("Issue stream audit refresh schedule", lambda: isa.schedule_refresh(force=False))
+        _start_warmup("Work projection warmup schedule", lambda: warm_projection_cache(ctx=ctx))
+        _start_warmup("State scan warmup schedule", lambda: schedule_state_scan_warmup(ctx, product.warmup))
         tasks.append(asyncio.create_task(refresh_projection_cache_periodically(ctx), name="work-projection-refresh"))
         tasks.append(asyncio.create_task(refresh_panel_metrics_periodically(ctx), name="comms-metrics-refresh"))
         tasks.append(asyncio.create_task(refresh_orient_periodically(ctx, product), name="orient-refresh"))
-        start_periodic_refresh()
+        _start_warmup("CodexBar periodic refresh", start_periodic_refresh)
         await asyncio.Event().wait()
     finally:
         for task in reversed(tasks):
@@ -194,12 +202,10 @@ async def _lifespan(_app: FastAPI):
     Startup uses the authority-service interlock. An authority that component
     cannot write refuses startup, so plane-status cannot report a store the
     seats do not write. Sqlite and shadow stay allowed. Warmups and periodic
-    refreshes start after the router lifespans (``_run_background_work``).
+    refreshes run inside the router lifespans (``_background_work_lifespan``).
     """
     ctx = _app.state.ctx
     product: ProductContribution = _app.state.product
-    routers_started = _app.state.routers_started = asyncio.Event()
-    background_work = None
     try:
         # Reuse assert_component_supported; do not add a second allow-list.
         # ControlPlaneUnsupportedComponentError names the store and authority
@@ -214,15 +220,10 @@ async def _lifespan(_app: FastAPI):
             handoff_root=ctx.roots.live_repo_root,
             ctx=ctx,
         )
-        background_work = asyncio.create_task(
-            _run_background_work(ctx, product, routers_started), name="startup-background-work"
-        )
+        _app.state.background_work = lambda: _run_background_work(ctx, product)
         yield
     finally:
-        if background_work is not None:
-            background_work.cancel()
-            with suppress(asyncio.CancelledError):
-                await background_work
+        _app.state.background_work = None
         try:
             stop_periodic_refresh()
         finally:

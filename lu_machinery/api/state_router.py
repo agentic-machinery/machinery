@@ -61,9 +61,8 @@ from .rules_router import rules_hash
 from .runtime_router import summarize_runtime_usage
 from .session_router import session_hash
 from .state_helpers import (
-    SWR_DORMANT_READ_WAIT_S,
+    cache_first_value,
     cache_get_or_compute,
-    cache_get_or_compute_async,
     cache_get_stored,
     ctx_scoped_ttl_key,
     schedule_cache_refresh,
@@ -2528,17 +2527,14 @@ async def routing_budget(
             claude_fields=claude_fields,
         ))
         return _routing_budget_response(payload)
-    try:
-        # Nothing stored yet (a fresh process): wait a bounded time for the first
-        # snapshot, which the startup warmup is already computing. The compute is
-        # shared and shielded, so a read that stops waiting leaves it running, and
-        # the caller gets the typed warming 503 with Retry-After, never the 504 of
-        # the 10 s request timeout.
-        observed, value = await asyncio.wait_for(
-            cache_get_or_compute_async(cache_key, ROUTING_BUDGET_TTL_S, _compute), timeout=SWR_DORMANT_READ_WAIT_S,
-        )
-    except TimeoutError:
-        raise warming_unavailable("routing budget warming") from None
+    # Nothing stored for this key yet: wait a bounded time for its first snapshot
+    # (the startup warmup is already computing the default key). The computation
+    # is shared and keeps running past the wait; the caller then gets the typed
+    # warming 503 with Retry-After, never the 504 of the 10 s request timeout.
+    settled, first = await cache_first_value(cache_key, ROUTING_BUDGET_TTL_S, _compute)
+    if not settled or first is None:
+        raise warming_unavailable("routing budget warming")
+    observed, value = first
     claude_fields = await revalidated_routing_budget_fields()
     payload = _public_routing_budget(_aged_routing_budget(
         value,

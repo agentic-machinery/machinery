@@ -62,9 +62,16 @@ DEMAND_WINDOW_S = 120.0
 DORMANT_READ_WAIT_S = 2.0
 # A stale-while-revalidate route read that finds its value dormant waits this
 # long for the refresh it starts; under the 1 s panel budget, then the stored
-# value with its true age. A first read, with nothing stored yet, waits the same
-# bound for the first computation, then answers the typed warming 503.
+# value with its true age.
 SWR_DORMANT_READ_WAIT_S = 0.5
+# A read of a key with nothing stored yet waits this long for the key's first
+# computation, then answers the typed warming 503 (the computation keeps running
+# and stores its value). Longer than a warm server's first computation of a key
+# (about 2 s for a routing-budget variant on live data), so a one-shot reader on
+# a running server still gets its answer; shorter than the programmatic readers'
+# own timeouts (5-8 s) and the 10 s request timeout, so a cold start answers a
+# typed 503 instead of a 504.
+COLD_READ_WAIT_S = 4.0
 # Retry-After of every warming 503: the first collection usually lands by then.
 WARMING_RETRY_AFTER_S = 2
 
@@ -191,7 +198,8 @@ class PeriodicSnapshot[T]:
             return  # the writer needs this thread; answer from the last observation
         with self._settled:
             wait_s = DORMANT_READ_WAIT_S if self.dormant_wait_s is None else self.dormant_wait_s
-            self._settled.wait_for(lambda: self._attempts != pending, timeout=wait_s)
+            # A writer that stops (shutdown) settles nothing more: stop waiting then too.
+            self._settled.wait_for(lambda: self._attempts != pending or self._loop is None, timeout=wait_s)
 
     async def _refresh(self) -> None:
         work = asyncio.create_task(asyncio.to_thread(self.refresh))
@@ -208,6 +216,7 @@ class PeriodicSnapshot[T]:
         ready = asyncio.Event()
         wake = asyncio.Event()
         self._loop, self._wake, self._ready = asyncio.get_running_loop(), wake, ready
+        self._demand.touch()  # the startup collection, however long ago the snapshot was built
         _running_snapshots.add(self)
 
         async def repeat() -> None:
@@ -438,27 +447,79 @@ async def cache_get_or_compute_async(  # noqa: UP047 — ruff pyflakes lacks PEP
     assert fut is not None
 
     if leader:
-
-        async def _lead() -> None:
-            try:
-                value = await asyncio.to_thread(compute)
-                cache_set(key, value)
-                if not fut.done():
-                    fut.set_result(value)
-            except Exception as exc:
-                if not fut.done():
-                    fut.set_exception(exc)
-            finally:
-                with _inflight_lock:
-                    if _inflight_futures.get(key) is fut:
-                        _inflight_futures.pop(key, None)
-
-        task = asyncio.create_task(_lead())
-        _lead_tasks.add(task)
-        task.add_done_callback(_lead_tasks.discard)
+        _lead_async_flight(key, fut, compute)
 
     # shield: cancelling this waiter must not cancel the shared future.
     return await asyncio.shield(asyncio.wrap_future(fut))
+
+
+def _lead_async_flight(key: str, fut: concurrent.futures.Future, compute: Callable[[], object]) -> None:
+    """Run the leader's computation in a worker thread and publish one result for every waiter."""
+
+    async def _lead() -> None:
+        try:
+            value = await asyncio.to_thread(compute)
+            cache_set(key, value)
+            if not fut.done():
+                fut.set_result(value)
+        except Exception as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+        finally:
+            with _inflight_lock:
+                if _inflight_futures.get(key) is fut:
+                    _inflight_futures.pop(key, None)
+
+    task = asyncio.create_task(_lead())
+    _lead_tasks.add(task)
+    task.add_done_callback(_lead_tasks.discard)
+
+
+# Keys whose first computation failed after its reader had stopped waiting.
+_late_first_failures: dict[str, BaseException] = {}
+
+
+async def cache_first_value(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-param support here
+    key: str, ttl: float, compute: Callable[[], T], *, wait_s: float | None = None,
+) -> tuple[bool, T | None]:
+    """A cold key's value within ``wait_s`` (default :data:`COLD_READ_WAIT_S`): ``(True, value)``, or ``(False, None)``.
+
+    ``(False, None)`` means the key's first computation is still running.
+
+    The computation is the key's one shared flight (:func:`cache_get_or_compute_async`)
+    and keeps running past the wait, then stores its value. Its own exception
+    propagates, a ``TimeoutError`` included. A flight that fails after its reader
+    stopped waiting is reported to the next reader that times out on the key: a
+    failing collector reads as failing, never as still warming.
+    """
+    cached = cache_get(key, ttl)
+    if cached is not None:
+        return True, cached  # type: ignore[return-value]
+    fut, leader, cached = _claim_flight(key, ttl, force=False)
+    if cached is not None:
+        return True, cached  # type: ignore[return-value]
+    assert fut is not None
+    if leader:
+        _lead_async_flight(key, fut, compute)
+    waiter = asyncio.wrap_future(fut)
+    done, _pending = await asyncio.wait({waiter}, timeout=COLD_READ_WAIT_S if wait_s is None else wait_s)
+    if waiter in done:
+        _late_first_failures.pop(key, None)
+        return True, waiter.result()
+
+    def _settled(finished: asyncio.Future) -> None:
+        # Read the outcome, so a late failure is never an unretrieved exception, and keep it for the next reader.
+        error = None if finished.cancelled() else finished.exception()
+        if error is None:
+            _late_first_failures.pop(key, None)
+        else:
+            _late_first_failures[key] = error
+
+    waiter.add_done_callback(_settled)
+    earlier = _late_first_failures.get(key)
+    if earlier is not None:
+        raise earlier.with_traceback(None)
+    return False, None
 
 
 def schedule_cache_refresh(
@@ -534,9 +595,9 @@ async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-pa
     :data:`SWR_DORMANT_READ_WAIT_S`; a slower refresh leaves it the stored value
     with its true age. Only the first read of a key waits for the whole
     computation, which concurrent first reads share, for at most
-    :data:`SWR_DORMANT_READ_WAIT_S`; a slower first computation keeps running
-    and stores its value, and the read gets the typed warming 503 meanwhile.
-    The age is the time since the value was stored.
+    :data:`COLD_READ_WAIT_S` (:func:`cache_first_value`); a slower first
+    computation keeps running and stores its value, and the read gets the typed
+    warming 503 meanwhile. The age is the time since the value was stored.
 
     A refresh that fails, or whose value ``storable`` rejects (the value reports
     its own failure), leaves the previous value in place, still ageing. When
@@ -559,13 +620,9 @@ async def cache_read_swr(  # noqa: UP047 — ruff pyflakes lacks PEP 695 type-pa
                 return dormant[0], dormant[1], True  # type: ignore[return-value]
             stored = None
         if stored is None:
-            try:
-                # The computation is shared and shielded: a read that stops waiting leaves it running.
-                first = await asyncio.wait_for(
-                    cache_get_or_compute_async(key, ttl, guarded), timeout=SWR_DORMANT_READ_WAIT_S,
-                )
-            except TimeoutError:
-                raise warming_unavailable("snapshot warming") from None
+            settled, first = await cache_first_value(key, ttl, guarded)
+            if not settled:
+                raise warming_unavailable("snapshot warming")
             stored = cache_get_stored(key)
             return first, 0.0 if stored is None else stored[1], True
     except _Unstorable as failed:
