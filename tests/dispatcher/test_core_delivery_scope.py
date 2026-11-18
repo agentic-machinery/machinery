@@ -159,6 +159,7 @@ LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nnam
     ("nested", None, False),  # a nested checkout's files are not listed, so it may hold task work
     ("bare", None, False),  # a nested bare repository's commits may hold work the delivery does not
     ("bare-symlink-head", None, False),  # Git still opens a bare repository whose HEAD is a symbolic link
+    ("bare-trailing-blank", None, False),  # a repository name ending in a blank is still that repository
     ("marker-output", None, True),  # HEAD and objects/ files that Git would not open as a repository
     ("stat-hidden", None, False),  # a tracked edit the worker's stat settings would hide from status
     ("attributes-file", None, True),  # a configured attributes file keeps a clean checkout clean
@@ -190,8 +191,8 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, un
     if case == "nested":
         run_git(work, "init", "-q", "scratch/nested")
         (work / "scratch/nested/inner.txt").write_text("nested\n")
-    elif case in {"bare", "bare-symlink-head"}:
-        run_git(work, "init", "-q", "--bare", "scratch/nested.git")
+    elif case in {"bare", "bare-symlink-head", "bare-trailing-blank"}:
+        run_git(work, "init", "-q", "--bare", "scratch/nested.git" + (" " if case == "bare-trailing-blank" else ""))
         if case == "bare-symlink-head":  # the legacy form; its branch may exist only as a packed ref
             (work / "scratch/nested.git/HEAD").unlink()
             (work / "scratch/nested.git/HEAD").symlink_to("refs/heads/main")

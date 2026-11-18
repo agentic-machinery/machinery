@@ -1279,8 +1279,11 @@ def _in_git_directory(tree: Path, name: str, seen: dict[Path, bool]) -> bool:
             if os.path.lexists(directory / "HEAD"):
                 try:
                     found = execution_safe_git(["rev-parse", "--absolute-git-dir"], cwd=directory, capture_output=True,
-                                               check=True, timeout=30).stdout.strip()
-                    seen[directory] = os.path.realpath(os.fsdecode(found)) == os.path.realpath(directory)
+                                               check=True, timeout=30).stdout
+                    # Git ends the path with one LF; any other byte, blanks included, is part of the path.
+                    if not found.endswith(b"\n"):
+                        raise ValueError("rev-parse printed no path")
+                    seen[directory] = os.path.realpath(os.fsdecode(found[:-1])) == os.path.realpath(directory)
                 except (OSError, ValueError, subprocess.SubprocessError):
                     seen[directory] = True
         if seen[directory]:
