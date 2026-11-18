@@ -292,7 +292,7 @@ def fake_setup(argv, cwd) -> None:
 
 
 def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypatch, capsys):
-    """A worker can inspect the complete plan without escaping its write boundary."""
+    """Defect class: scoring candidate routes with an installed gate that rejects new models."""
     import sys
 
     monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-585")
@@ -312,7 +312,9 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output
-    assert f"{sys.executable} -I -B -m lu_machinery.review.contract_canary check" in output
+    candidate = runner_roots / ".lu-contract-canary-DRY-RUN/consumer/bin/python"
+    assert f"{candidate} -I -B -m lu_machinery.review.contract_canary check" in output
+    assert f"{sys.executable} -I -B -m lu_machinery.review.contract_canary check" not in output
     assert output.count("systemd-run --user") == 4
     assert list(runner_roots.iterdir()) == []
     assert canary.main(["run", "--head", "a" * 40]) == 2
@@ -337,8 +339,6 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
     runner_roots, monkeypatch, capsys, failure,
 ):
     """Route/check failure fails closed; setup and cleanup errors preserve a mounted tree."""
-    import sys
-
     commands = []
     mounted = False
 
@@ -366,8 +366,8 @@ def test_runner_failures_cannot_score_green_or_delete_a_live_mount(
             code = 1 if failure == "route" and route == "claude" else 0
             output = "" if failure == "unit-lost" else "CANARY-ROUTE-SETTLED\n"
         if "check" in argv:
-            assert argv[:5] == [sys.executable, "-I", "-B", "-m", "lu_machinery.review.contract_canary"]
-            assert "consumer" not in argv[0]
+            assert argv[:5] == [str(cwd / "consumer/bin/python"), "-I", "-B", "-m",
+                               "lu_machinery.review.contract_canary"]
             code = 1 if failure == "check" else 0
             output = "needs-contract-canary: missing: codex\n" if code else "ok\n"
         if "-u" in argv:

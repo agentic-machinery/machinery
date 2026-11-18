@@ -795,7 +795,7 @@ class Cut:
         return summary
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
-        """The candidate's own canary orchestration on the host; its receipt check uses the installed gate."""
+        """The candidate's canary orchestration and sealed candidate receipt gate."""
         argv: list[str | Path] = [self.host_python, "-m", "lu_machinery.review.contract_canary", "run", "--repo",
                 "machinery", "--head", self.head]
         return self.run([*argv, "--dry-run"] if self.dry_run else argv, timeout=2400, check=False,

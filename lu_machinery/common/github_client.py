@@ -1714,7 +1714,8 @@ def _canonical_endpoint(endpoint, host="github.com"):
         return "rejected", endpoint
     # gh accepts leading slashes and bare x:y as relative endpoint paths.
     # Only an initial scheme selects a host; query and fragment text never do.
-    absolute = re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", endpoint) is not None
+    # The explicit ^ keeps the scan to one start position: linear on any input.
+    absolute = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", endpoint) is not None
     endpoint_path = re.split(r"[?#]", endpoint, maxsplit=1)[0]
     if not absolute:
         return "relative", endpoint_path.lstrip("/")

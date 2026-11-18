@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import sysconfig
 from pathlib import Path
 
-from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.repo_root import MachineryConfigError, resolve_path, state_root
 from lu_machinery.guardrails.worktree_containment import (
     NotAGitRepositoryError,
     canonicalize,
@@ -26,6 +27,45 @@ RETIRED_LOCAL_PLANE_MESSAGE = (
 
 class PlaneRootAnchorError(RuntimeError):
     """Raised when the plane root cannot be anchored to the primary checkout."""
+
+
+class LiveStoreReleaseError(PlaneRootAnchorError):
+    """A writer cannot establish installed-release authority for the live store."""
+
+    def __init__(self, reason_code: str, package_path: Path, store: Path) -> None:
+        self.reason_code = reason_code
+        self.package_path = package_path
+        self.store = store
+        super().__init__(f"{reason_code}: package={package_path}; store={store}")
+
+
+def assert_store_write_allowed(store: Path, *, package_file: str) -> None:
+    """Only the primary venv's installed package may write the default store.
+
+    An override or explicit argument naming the live root is still live. Resolve
+    aliases before comparing; unknown shared-state identity never grants a write.
+    The venv's site directory may be symlinked, but a package symlink pointing
+    back to source is not an installed release. No subprocess or store open is
+    needed to establish this boundary.
+    """
+    package = Path(package_file).parent.parent
+    try:
+        package = resolve_path(package_file).parents[1]
+        primary = resolve_path(state_root(), strict=True)
+        live_store = resolve_path(primary / DEFAULT_ROOT_REL / "comms.sqlite3")
+        store = resolve_path(store)
+        if store != live_store and not (
+            store.exists() and live_store.exists() and store.samefile(live_store)
+        ):
+            return
+        venv = str(primary / ".venv")
+        site = resolve_path(sysconfig.get_path(
+            "purelib", scheme="venv", vars={"base": venv, "platbase": venv}
+        ))
+    except (MachineryConfigError, OSError, RuntimeError, KeyError, ValueError) as exc:
+        raise LiveStoreReleaseError("live_store_identity_unknown", package, store) from exc
+    if package != site / "lu_machinery":
+        raise LiveStoreReleaseError("live_store_requires_installed_release", package, store)
 
 
 def validate_plane_root(root: Path) -> Path:
