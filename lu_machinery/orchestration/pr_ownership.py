@@ -1097,6 +1097,17 @@ def release_decision_custody(
     return {"released": True, "pr": key, "how": how}
 
 
+def _repo_slug(text: str) -> str:
+    """The repository exactly as named: ``owner/name``.
+
+    Empty text would let gh pick its own repository; a host, URL or ``.git`` spelling would key the ledger on text
+    no owner check ever produces.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", text) or text.endswith(".git"):
+        raise argparse.ArgumentTypeError(f"--repo must be owner/name, got {text!r}")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1135,7 +1146,7 @@ def build_parser() -> argparse.ArgumentParser:
                        ("queue-exit", "Exit 0 when this waiting owner may end under queue custody")):
         sub = subs.add_parser(name, help=text)
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
-        sub.add_argument("--repo", required=True,
+        sub.add_argument("--repo", required=True, type=_repo_slug,
                          help="owner/name of the PR's repository; never inferred from the checkout")
         if name == "accept":
             sub.add_argument("--custody", action="store_true",

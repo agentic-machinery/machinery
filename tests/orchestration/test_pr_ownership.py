@@ -496,6 +496,11 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
             own.main([verb, "--pr", "42"])
         assert refused.value.code == 2
         assert "--repo" in capsys.readouterr().err
+        # An empty repository lets native gh pick GH_REPO or its checkout; host, URL and .git spellings key dead handoffs.
+        for spelled in ("", "github.com/o/r", "https://github.com/o/r", "o/r.git", "machinery"):
+            with pytest.raises(SystemExit):
+                own.main([verb, "--pr", "42", "--repo", spelled])
+            assert "owner/name" in capsys.readouterr().err
     assert own.main(["status"]) == 0
 
 

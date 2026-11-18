@@ -1606,8 +1606,8 @@ class GitHubClient:
             reset_at=budget[1] if budget else None,
             now=now,
         )
-        if cacheable and method == "GET" and response.status == 200 and not response.body:
-            # Keep a missing JSON document distinct from a valid JSON null.
+        if not graphql and 200 <= response.status < 300 and not response.body and not result.error:
+            # Keep a missing JSON document distinct from a valid JSON null, for ``--jq`` and every other method.
             result.value = response.body
         value = result.value
         # Counted once the call's own writes are committed, in a transaction of its own: a row SQLite
