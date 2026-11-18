@@ -12,9 +12,9 @@ of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Mo
 splits by the concrete model id and the effective effort (``unset`` when none was recorded); a bare Claude alias
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
 CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
-otherwise a write. Verdict figures count only reviews of record (a review that names its PR and the author's
-model) whose reply parsed; review rounds are the distinct pinned heads such reviews judged per PR. Only counts and
-model, effort, class, pool and repository labels leave this module: no prompt, body, path, account or task id.
+otherwise a write. Reviewer totals include structured results from every lane. Author figures use reviews of
+record (reviews that name a PR and the author's model). Only counts and model, effort, class, pool and repository
+labels leave this module: no prompt, body, path, account or task id.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 
-from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp
+from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp, variant_effort
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
 from .state_helpers import cache_get_or_compute, cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key
@@ -176,8 +176,8 @@ class _Row:
     tokens: tuple[int, int, int]
     trailer: bool
     delivery: bool
-    # A review of record's verdict and finding priorities; None for every other task.
-    review: tuple[str, Counter[str]] | None
+    # A review's verdict and, when recorded, its finding priorities. None for write tasks.
+    review: tuple[str, Counter[str] | None] | None
     author: str | None
     allowance: tuple[str, float] | None
     raw: Mapping[str, Any]
@@ -252,11 +252,10 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         status = raw.get("status")
         role = "review" if raw.get("role") == "review" else "write"
         review = raw.get("review") if isinstance(raw.get("review"), Mapping) else None
-        # A review of record names the reviewed PR and the author's model; advice, critics and canaries do not.
+        # Author outcomes still require a review of record.
         author = raw.get("author_model") if role == "review" and raw.get("pr") is not None else None
-        if not author:
-            review = author = None
-        priorities = review.get("priorities") if review and isinstance(review.get("priorities"), Mapping) else {}
+        verdict = review.get("verdict") if review else None
+        priorities = review.get("priorities") if review else None
         counts = cast(dict[str, Any], raw.get("tokens")) if isinstance(raw.get("tokens"), Mapping) else {}
         yield _Row(
             task_id=raw["task_id"], model=resolve(str(raw.get("model") or "unknown"), moment),
@@ -266,10 +265,10 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             duration=_number(raw.get("duration_s")),
             tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
-            review=((review.get("verdict") if review.get("verdict") in VERDICTS else "unparsed"),
-                    Counter({p: int(n) for p, n in priorities.items() if isinstance(n, int)})) if review else None,
+            review=(verdict if verdict in VERDICTS else "unparsed",
+                    Counter(priorities) if isinstance(priorities, Mapping) else None) if role == "review" else None,
             author=resolve(str(author), moment) if author else None,
-            allowance=_allowance(raw.get("allowance")) if role == "write" else None,
+            allowance=_allowance(raw.get("allowance")),
             raw=raw,
         )
 
@@ -282,6 +281,7 @@ class _Group:
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
         self.priorities: Counter[str] = Counter()
+        self.findings_n = 0
         self.allowance: Counter[str] = Counter()
         self.points = 0.0
 
@@ -293,9 +293,10 @@ class _Group:
         self.landed += row.landed
         if row.review is not None:
             self.verdicts[row.review[0]] += 1
-            if row.review[0] != "unparsed":
+            if row.review[0] != "unparsed" and row.review[1] is not None:
                 self.priorities.update(row.review[1])
-        if row.allowance is not None:
+                self.findings_n += 1
+        if row.role == "write" and row.allowance is not None:
             if row.allowance[1] < 0:  # the weekly window reset between the readings
                 self.allowance["reset_crossed"] += 1
             else:
@@ -311,6 +312,7 @@ class _Group:
         self.landed += other.landed
         self.verdicts.update(other.verdicts)
         self.priorities.update(other.priorities)
+        self.findings_n += other.findings_n
         self.allowance.update(other.allowance)
         self.points += other.points
         return self
@@ -340,13 +342,15 @@ class _Group:
                 allowance_pct_points_per_landed=_rate(self.points, self.allowance["landed"], 2),
             )
         else:
-            # Reviews of record only; an unparsed reply is shown but enters no rate.
+            # A verdict alone attests no findings count.
             parsed = sum(self.verdicts[v] for v in VERDICTS[:3])
             out.update(
                 verdicts={name: self.verdicts[name] for name in VERDICTS},
+                findings=sum(self.priorities.values()) if self.findings_n else None,
+                findings_n=self.findings_n,
                 approve_rate=_rate(self.verdicts["correct"], parsed),
-                blocking_per_review=_rate(sum(self.priorities[p] for p in BLOCKING), parsed),
-                p0_p2_per_review=_rate(sum(self.priorities[p] for p in P0_P2), parsed),
+                blocking_per_review=_rate(sum(self.priorities[p] for p in BLOCKING), self.findings_n),
+                p0_p2_per_review=_rate(sum(self.priorities[p] for p in P0_P2), self.findings_n),
             )
         return out
 
@@ -430,8 +434,9 @@ def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
             "reviewer": reviewer, "class": review_class, "after_block": after_block,
             "approved": any(r[2] == "correct" for h in heads for r in h),
             # Findings of each round: the head's first review.
-            "blocking": sum(h[0][3][p] for h in heads for p in BLOCKING),
-            "p0_p2": sum(h[0][3][p] for h in heads for p in P0_P2),
+            "blocking": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in BLOCKING),
+            "p0_p2": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in P0_P2),
+            "findings_known": all(h[0][3] is not None for h in heads),
         })
     return outcomes
 
@@ -448,8 +453,10 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
         counts["rounds"] += pr["rounds"]
         counts["approved"] += pr["approved"]
         counts["first_round_approved"] += pr["first"] == "correct"
-        counts["blocking"] += pr["blocking"]
-        counts["p0_p2"] += pr["p0_p2"]
+        if pr["findings_known"]:
+            counts["findings_known"] += 1
+            counts["blocking"] += pr["blocking"]
+            counts["p0_p2"] += pr["p0_p2"]
         if pr["after_block"] is not None:
             counts["blocked"] += 1
             counts[pr["after_block"]] += 1
@@ -458,8 +465,8 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
          "rounds_per_pr": _rate(c["rounds"], c["prs"], 2),
          "approved_eventually": _rate(c["approved"], c["prs"]),
          "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
-         "blocking_per_pr": _rate(c["blocking"], c["prs"], 2),
-         "p0_p2_per_pr": _rate(c["p0_p2"], c["prs"], 2),
+         "blocking_per_pr": _rate(c["blocking"], c["findings_known"], 2),
+         "p0_p2_per_pr": _rate(c["p0_p2"], c["findings_known"], 2),
          # After a first round that did not approve: did a later round approve a new head (the author changed the
          # code), the same head (approved without a change), or nothing yet in this window?
          "after_blocked_first_round": {"blocked": c["blocked"],
@@ -485,7 +492,7 @@ def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
     """Weekly allowance spent per landed write task per pool, model and effort; unknown readings are excluded."""
     groups: dict[tuple[str, str, str], _Group] = defaultdict(_Group)
     for row in rows:
-        if row.allowance is not None:
+        if row.role == "write" and row.allowance is not None:
             groups[(row.allowance[0], row.model, row.effort)].add(row)
     return [
         {"pool": pool, "model": model, "effort": effort, "tasks": g.allowance["tasks"],
@@ -496,15 +503,114 @@ def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
     ]
 
 
+_PrKey = tuple[str, int]
+
+
+def _reviewed_pr(row: _Row) -> _PrKey | None:
+    pr = row.raw.get("pr")
+    return (row.raw["repo"], pr) if isinstance(pr, int) and pr > 0 else None
+
+
+def _review_order(row: _Row) -> tuple[datetime, str]:
+    return (row.started or row.moment, row.task_id)
+
+
+def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list[_Row]) -> list[dict[str, Any]]:
+    """Compare reviews of the same first round and match supplemental results by their exact head."""
+    first: dict[_PrKey, _Row] = {}
+    prs_by_head: dict[tuple[str, str], set[_PrKey]] = defaultdict(set)
+    landed: set[_PrKey] = set()
+    for row in history:
+        head = row.raw.get("pinned_head")
+        if row.landed and row.delivery:
+            landed.add((row.raw["repo"], row.raw["landing"]["pr"]))
+        if row.role == "review" and (pr := _reviewed_pr(row)) is not None:
+            if head:
+                prs_by_head[(pr[0], head)].add(pr)
+            if pr not in first or _review_order(row) < _review_order(first[pr]):
+                first[pr] = row
+
+    linked: dict[tuple[str, str], list[tuple[_PrKey, _Row]]] = defaultdict(list)
+    for row in rows:
+        if row.role != "review":
+            continue
+        pr = _reviewed_pr(row)
+        head = row.raw.get("pinned_head")
+        if pr is None and isinstance(head, str):
+            matches = prs_by_head.get((row.raw["repo"], head))
+            if matches and len(matches) == 1:
+                pr = next(iter(matches))
+        if pr is not None:
+            linked[(row.model, row.effort)].append((pr, row))
+
+    comparisons = []
+    for model in models:
+        if model["role"] != "review":
+            continue
+        name = model["model"]
+        observed = {level["effort"]: level for level in model["by_effort"]}
+        levels = sorted(set(observed) | _model_runtime_levels(name))
+        comparisons.append({"model": name, "levels": [
+            _review_level(level, observed.get(level), linked[(name, level)], first, landed) for level in levels
+        ]})
+    return comparisons
+
+
+def _review_level(level: str, observed: Mapping[str, Any] | None, linked: list[tuple[_PrKey, _Row]],
+                  first: Mapping[_PrKey, _Row], landed: set[_PrKey]) -> dict[str, Any]:
+    first_by_pr: dict[_PrKey, _Row] = {}
+    landed_reviewed: set[_PrKey] = set()
+    points: dict[str, float] = defaultdict(float)
+    metered_landings: dict[str, set[_PrKey]] = defaultdict(set)
+    for pr, row in linked:
+        initial = first[pr]
+        head = initial.raw.get("pinned_head")
+        if (row is initial or (head is not None and row.raw.get("pinned_head") == head)) and (
+            pr not in first_by_pr or _review_order(row) < _review_order(first_by_pr[pr])
+        ):
+            first_by_pr[pr] = row
+        if pr in landed:
+            landed_reviewed.add(pr)
+        if row.allowance is not None:
+            pool, spent = row.allowance
+            if spent >= 0:
+                points[pool] += spent
+                if pr in landed:
+                    metered_landings[pool].add(pr)
+    verdicts = Counter(row.review[0] for row in first_by_pr.values() if row.review is not None)
+    first_n = sum(verdicts[v] for v in VERDICTS[:3])
+    durations = [row.duration for _, row in linked if row.duration is not None]
+    wall = _rate(sum(durations) / 60, len(landed_reviewed), 1)
+    if len(durations) != len(linked):
+        wall["value"] = None
+    return {
+        "effort": level,
+        "tasks": observed["tasks"] if observed else 0,
+        "results": observed["approve_rate"]["n"] if observed else 0,
+        "findings": observed["findings"] if observed else None,
+        "findings_n": observed["findings_n"] if observed else 0,
+        "first_round_approved": _rate(verdicts["correct"], first_n),
+        "first_round_missing": verdicts["unparsed"],
+        "median_seconds": observed["wall_seconds"]["median"] if observed else None,
+        "wall_minutes_per_landed": wall,
+        "allowance_per_landed": [
+            {"pool": pool, **_rate(spent, len(metered_landings[pool]), 2)}
+            for pool, spent in sorted(points.items())
+        ],
+    }
+
+
 def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
-              prs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+              prs: list[dict[str, Any]] | None = None, *, history: list[_Row] | None = None) -> dict[str, Any]:
     """Every figure of one window's rows."""
     selected = list(rows)
     fine = _fine(selected) if fine is None else fine
     prs = _prs(selected) if prs is None else prs
+    models = _models(fine)
     used = {model for model, *_ in fine}
     return {
-        "models": _models(fine), "authors": _authors(prs), "first_round_matrix": _matrix(prs),
+        "models": models, "authors": _authors(prs), "first_round_matrix": _matrix(prs),
+        "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "records": len(selected),
         # Every model the catalog still routes (not retired) that ran no task in this window.
         "idle_catalog_models": sorted(_routed_models() - used),
@@ -537,6 +643,17 @@ def _routed_models() -> frozenset[str]:
         return frozenset()
     return frozenset(mid for mid, info in models.items()
                      if isinstance(info, Mapping) and info.get("lifecycle") != "retired")
+
+
+@lru_cache(maxsize=256)
+def _model_runtime_levels(model: str) -> frozenset[str]:
+    """Include catalogued selectors with no results yet, without guessing a level from a model name."""
+    try:
+        info = _catalog_models().get(model, {})
+    except Exception:  # a missing catalog cannot supply a selector
+        return frozenset()
+    selectors = [*info.get("routing_wire_ids", {}).values(), *info.get("runtime_model_ids", ())]
+    return frozenset(level for selector in selectors if (level := variant_effort(selector)))
 
 
 # What a model label that is not a catalog id stands for; the page groups and labels these apart.
@@ -611,7 +728,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         windows[name] = {
             "window": {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                        "cohort": "finished_at, else started_at, in [since, until)"},
-            **summarize(selected, fine, prs),
+            **summarize(selected, fine, prs, history=rows),
         }
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         metric_windows[name] = {"models": _models(_bounded(fine)), "authors": _authors(prs, metric_model)}

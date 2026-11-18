@@ -29,18 +29,18 @@ advisory lock, the same kind of store as the Monitor's `batch_state/load-samples
 400 tasks a day, about 520 bytes a row) it grows by roughly 75 MB a year. Past about 500,000 rows, revisit the
 store (an indexed table or weekly roll-ups).
 
-### Backfill (once, after the release that adds the rows)
+### Recover summary rows
 
 ```
 .venv/bin/python -m lu_machinery.api.model_stats_rows backfill --dry-run
 .venv/bin/python -m lu_machinery.api.model_stats_rows backfill
 ```
 
-Run from the product checkout. It reads every hot and archived task record (the hot record outranks an archived
-copy of the same task id), adds a row for each settled task that has none, supersedes a stored row taken from an
-older version of its record (`refreshed`), and prints the counts. A malformed review result is read as `unparsed`
-and never stops it. It never changes a task record, and rerunning it adds nothing new, so it is also the repair for
-a row a settlement failed to write.
+Run from the product checkout. Start with `--dry-run` to see how many rows the command would add or refresh.
+The command reads hot and archived task records, with the hot copy taking precedence. It appends missing rows,
+refreshes older rows, and recovers review evidence from retained results. Rerunning it with the same evidence
+makes no changes. The command leaves task records intact. Results removed by retention can contribute only
+the evidence already in their summary rows.
 
 ## Speed
 
@@ -95,14 +95,16 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   duration; `wall_seconds.n` counts the tasks that have one. Tokens per landed task are computed the same way. Fresh input
   includes cache writes; output includes reasoning tokens (Codex `output_tokens` already include them; the
   reasoning or thinking counts of Cursor, AGY and OpenCode are added).
-- **Review figures** come from each finished review's `.result`, read once into its row with the review contract's
-  own parser (bare JSON, one fenced JSON object, or the `VERDICT:`/`SCORE:` envelope): `overall.correctness` and
-  finding priorities; anything else, including a findings container that is not a list, is `unparsed`. Only a
-  **review of record** has verdict figures: a review task that names the reviewed PR and the author's model.
-  Advice, approvals, critics and canaries are read-only tasks without them; they count in tasks, status and time,
-  never in a verdict. `verdicts` still shows a review of record whose reply did not parse, but no rate counts it:
-  approval and findings per review divide by parsed reviews of record. Blocking means P0 or P1, as the review
-  policy defines it; P0–P2 is shown too because the 2026-11-15 reference script counted that.
+- **Review figures** use structured findings and recorded verdicts from every reviewer. The missing-verdict
+  count includes every settled review task without a readable verdict. The approval rate uses parsed verdicts,
+  while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
+  unknown. The author figures and first-round matrix use **reviews of record**, which name the PR and the
+  author's model.
+- **Reviewer levels** use the runtime model selector where available. First-round approval uses the earliest
+  review for that level on the PR's first reviewed head. A supplemental review without a PR number can join
+  a PR through an exact head match in the same repository. The time per landed PR divides time across PR-linked
+  reviews by linked PRs with recorded merges. Quota uses valid readings and counts landed PRs once per pool.
+  Levels with fewer than 10 parsed verdicts show “not enough data yet.”
 - **Author figures**: per PR reviewed in the window, only parsed reviews of record count; an unparsed reply is no
   round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
   review; the first round is the earliest review of the earliest head. "Approved eventually" means any parsed
@@ -147,7 +149,7 @@ rows and the route. No task ids, paths or accounts.
 | `lu_model_stats_wall_seconds_median` | window, model, effort, role | median wall seconds |
 | `lu_model_stats_wall_seconds_p90` | window, model, effort, role | 90th percentile wall seconds |
 | `lu_model_stats_output_tokens_per_landed` | window, model, effort, role=write | output tokens of all writes per landed task |
-| `lu_model_stats_blocking_findings_per_review` | window, model, effort, role=review | P0–P1 findings per parsed review of record |
+| `lu_model_stats_blocking_findings_per_review` | window, model, effort, role=review | P0–P1 findings per review with a recorded findings count |
 | `lu_model_stats_review_rounds_per_pr` | window, model, effort=all, role=author | heads judged by a parsed review of record per authored PR |
 | `lu_model_stats_allowance_pct_points_per_landed` | window, model, effort, role=write | weekly allowance points per landed task, tasks with both readings |
 | `lu_model_stats_week_tasks` | week, model, effort, role | settled tasks per ISO week |
