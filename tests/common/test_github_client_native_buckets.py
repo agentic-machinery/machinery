@@ -149,10 +149,13 @@ def test_jq_on_an_empty_200_body_prints_nothing_instead_of_raising_typeerror(tmp
     result = gh.run(args, client=store, capture_output=True)
     assert (result.returncode, result.stdout) == (0, b"")
     # Class: an empty 200 on a non-cacheable call (HEAD, POST) printed JSON ``null`` instead of nothing.
-    for method in ("HEAD", "POST"):
-        other = ["gh", "api", "repos/o/r/x", "-X", method, "--jq", "."]
+    for other in (
+        ["gh", "api", "repos/o/r/x", "-X", "HEAD", "--jq", "."],
+        ["gh", "api", "repos/o/r/x", "-X", "POST", "--jq", "."],
+        ["gh", "api", "graphql", "-f", "query=query { viewer { login } }", "--jq", "."],
+    ):
         result = gh.run(other, client=store, capture_output=True)
-        assert (result.returncode, result.stdout) == (0, b""), method
+        assert (result.returncode, result.stdout) == (0, b""), other
 
 
 def test_jq_on_a_non_json_200_body_is_a_typed_refusal_not_a_traceback(tmp_path):
