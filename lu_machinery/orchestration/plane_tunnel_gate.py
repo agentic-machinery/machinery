@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import sys
 import urllib.error
 import urllib.request
@@ -20,6 +21,9 @@ from typing import Any, Literal
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
 # are also its directories in checkout-relative paths.
+
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 _PACKAGE = f"{Path(os.path.abspath(__file__)).parents[1].name}.{Path(os.path.abspath(__file__)).parent.name}"
 _PACKAGE_DIR = _PACKAGE.replace(".", "/")
 _MACHINERY = _PACKAGE.partition(".")[0]
@@ -40,7 +44,7 @@ def _monitor_base() -> str:
 def _get_json(path: str, *, timeout: float) -> dict[str, Any]:
     url = f"{_monitor_base()}{path}"
     with urllib.request.urlopen(url, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+        payload = _json_loads(response.read().decode("utf-8"), max_depth=512)
     if not isinstance(payload, dict):
         raise ValueError("monitor payload is not an object")
     return payload

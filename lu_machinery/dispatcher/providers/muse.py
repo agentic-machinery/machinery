@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from lu_machinery.agent_runtime.adapters.muse import _PROFILES, _TOOLS, confined_muse_argv
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 
@@ -32,7 +33,7 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
     error = f"muse exited with code {returncode}" if returncode else None
     for line in jsonl_lines(stdout):
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             continue
         if not isinstance(event, dict):

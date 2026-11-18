@@ -44,8 +44,7 @@ from typing import Any, TypeGuard
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.common.task_store_paths import tasks_dir
 
@@ -158,7 +157,7 @@ def load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return _empty()
     try:
-        data = json.loads(path.read_text())
+        data = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError) as exc:
         raise OwnershipError(f"ownership state unreadable: {type(exc).__name__}") from exc
     if not isinstance(data, dict) or data.get("schema") != 1 or not all(
@@ -401,7 +400,7 @@ def _reconcile_seated_outbox(outbox: list[dict[str, str]], seated: set[str]) -> 
             kept.append(entry)
             continue
         try:
-            rows = json.loads(raw)
+            rows = json_depth.loads(raw, max_depth=512)
         except json.JSONDecodeError:
             kept.append(entry)
             continue
@@ -568,7 +567,7 @@ def _with_head_commit(slug: str, pr: dict[str, Any]) -> dict[str, Any]:
         capture_output=True, text=True, check=False, timeout=60,
     )
     try:
-        message = json.loads(proc.stdout).get("message") if proc.returncode == 0 else None
+        message = json_depth.loads(proc.stdout, max_depth=512).get("message") if proc.returncode == 0 else None
     except (ValueError, AttributeError):
         message = None
     if not isinstance(message, str):
@@ -753,7 +752,7 @@ def _gh_pr(repo: str, number: int) -> dict[str, Any]:
         capture_output=True, text=True, check=False, timeout=60,
     )
     try:
-        pr = json.loads(proc.stdout) if proc.returncode == 0 else None
+        pr = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
     except ValueError:
         pr = None
     if not isinstance(pr, dict) or not isinstance(pr.get("headRefOid"), str):

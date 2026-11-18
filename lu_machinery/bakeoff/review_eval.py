@@ -41,7 +41,7 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.model_families import canonical_cursor_model
 
 SPLITS = ("tune", "test")
@@ -282,7 +282,7 @@ def json_objects(text: str) -> Iterator[dict[str, Any]]:
     start = text.find("{")
     while start >= 0:
         try:
-            value, end = decoder.raw_decode(text[start:])
+            value, end = json_depth.raw_decode(text[start:], max_depth=512, decoder=decoder)
         except ValueError:
             start = text.find("{", start + 1)
             continue
@@ -297,7 +297,7 @@ def first_json_object(text: str) -> dict[str, Any] | None:
 
 
 def _findings_validator() -> Any:
-    schema = json.loads((Path(__file__).resolve().parents[1] / "schemas" / Path(FINDINGS_SCHEMA).name).read_text())
+    schema = json_depth.loads((Path(__file__).resolve().parents[1] / "schemas" / Path(FINDINGS_SCHEMA).name).read_text(), max_depth=512)
     return Draft202012Validator(schema)
 
 
@@ -459,7 +459,7 @@ class Journal:
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self.events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        self.events = [json_depth.loads(line, max_depth=512) for line in path.read_text().splitlines()] if path.exists() else []
 
     def _write(self, event: dict[str, Any]) -> None:
         self.events.append(event)
@@ -550,7 +550,7 @@ def judge_argv(evalset: EvalSet, judge: dict[str, Any], task_id: str, brief: Pat
 
 def _rows(path: Path) -> list[dict[str, Any]]:
     """Rows of a results file, oldest first; a later row for a seat and case supersedes earlier ones."""
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [json_depth.loads(line, max_depth=512) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def attested(seat: dict[str, Any], record: dict[str, Any]) -> bool:

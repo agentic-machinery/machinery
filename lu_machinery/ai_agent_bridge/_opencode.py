@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.common.repo_root import project_interpreter, state_root
 from lu_machinery.contracts import new_id
@@ -181,7 +182,7 @@ def read_opencode_turn_status(
         if not line.startswith("{"):
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         if not isinstance(event, dict):
@@ -302,7 +303,7 @@ def read_opencode_turn_status(
                     msg_row = cur.fetchone()
                     if msg_row and msg_row[0]:
                         try:
-                            msg_data = json.loads(msg_row[0])
+                            msg_data = json_depth.loads(msg_row[0], max_depth=512)
                             if isinstance(msg_data, dict):
                                 err = msg_data.get("error")
                                 if isinstance(err, dict):
@@ -322,7 +323,7 @@ def read_opencode_turn_status(
                         if not part_row or not part_row[0]:
                             continue
                         try:
-                            pdata = json.loads(part_row[0])
+                            pdata = json_depth.loads(part_row[0], max_depth=512)
                             if isinstance(pdata, dict):
                                 ptype = pdata.get("type")
                                 if ptype in ("step-finish", "step_finish"):
@@ -1103,7 +1104,7 @@ def _parse_opencode_stream(stdout: str) -> OpencodeStreamParse:
         if not line.startswith("{"):
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         event_type = event.get("type")

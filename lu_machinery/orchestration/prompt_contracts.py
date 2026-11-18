@@ -21,8 +21,8 @@ from jsonschema import Draft202012Validator
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
 from lu_machinery.agent_deploy import plan as release_plan
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, machinery_path, product_root
 from lu_machinery.common.schema_check import check_schema as check_schema_memoised
 from lu_machinery.lib.rules_core import _PRODUCT_RULES, RulesCoreMissing, source_path
@@ -368,10 +368,10 @@ def resolve_profile_selectors(
 def _load_json(path: Path) -> dict[str, Any]:
     raw = _read_bytes(path)
     try:
-        value = json.loads(
+        value = json_depth.loads(
             raw.decode("utf-8", errors="strict"),
             object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_json_constant,
+            parse_constant=_reject_json_constant, max_depth=512,
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PromptContractError(f"invalid UTF-8/JSON in {path}: {exc}") from exc

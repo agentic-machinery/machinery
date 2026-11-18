@@ -7,6 +7,7 @@ import math
 import subprocess
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 
@@ -120,7 +121,7 @@ def _resolved_config(env: dict[str, str]) -> object:
     except (OSError, subprocess.SubprocessError):
         return None
     try:
-        return json.loads(done.stdout) if done.returncode == 0 else None
+        return json_depth.loads(done.stdout, max_depth=512) if done.returncode == 0 else None
     except ValueError:
         return None
 
@@ -205,7 +206,7 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
     error = f"opencode exited with code {returncode}" if returncode else None
     for line in jsonl_lines(stdout):
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             continue
         if not isinstance(event, dict):

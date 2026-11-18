@@ -72,7 +72,9 @@ def main() -> int:
         if len(sys.argv) != 2:
             raise ValueError("one fleet guard path required")
         argv = guard_argv(sys.argv[1])
-        payload = json.load(sys.stdin)
+        from lu_machinery.common import json_depth
+
+        payload = json_depth.load(sys.stdin, max_depth=512)
         if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
             raise ValueError("invalid PreToolUse event")
         tool_name = _TOOL_NAMES.get(payload.get("toolName"))
@@ -87,7 +89,7 @@ def main() -> int:
         translated["tool_input"].setdefault("cwd", payload.get("cwd"))
         result = subprocess.run(argv, input=json.dumps(translated), text=True, check=False, timeout=10)
         return 0 if result.returncode == 0 else 2
-    except (ImportError, OSError, ValueError, TypeError, subprocess.TimeoutExpired) as exc:
+    except (ImportError, OSError, ValueError, TypeError, RecursionError, subprocess.TimeoutExpired) as exc:
         detail = f": {exc}" if isinstance(exc, GuardInvocationError) else ""
         print(f"BLOCKED by grok reviewer hook bridge: {type(exc).__name__}{detail}.", file=sys.stderr)
         return 2

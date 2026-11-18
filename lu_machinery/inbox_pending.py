@@ -11,7 +11,7 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import (
     HOOK_BOOTSTRAP_DIAGNOSTIC,
     HOOK_BOOTSTRAP_REASON,
@@ -56,7 +56,7 @@ def _reject_constant(_value: str) -> None:
 def hook(stdin_text: str, recipient: str) -> dict:
     """Render one bounded ephemeral announcement, or silence for proven zero."""
     try:
-        payload = json.loads(stdin_text, parse_constant=_reject_constant)
+        payload = json_depth.loads(stdin_text, parse_constant=_reject_constant, max_depth=512)
         if not isinstance(payload, dict):
             raise ValueError
         result = probe(recipient)

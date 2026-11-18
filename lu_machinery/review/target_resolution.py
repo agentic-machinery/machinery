@@ -21,7 +21,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import main_checkout_root
 from lu_machinery.orchestration.fleet_repos import (
@@ -468,7 +468,7 @@ def resolve_pr_target(repo_root: Path, pr_number: int, *, expected_head_sha: str
     if proc.returncode != 0:
         raise TargetResolutionError(f"gh pr view failed for #{pr_number}: {proc.stderr.strip() or proc.stdout.strip()}")
     try:
-        payload = json.loads(proc.stdout or "{}")
+        payload = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         raise TargetResolutionError(f"invalid JSON from gh pr view #{pr_number}") from exc
     if not isinstance(payload, dict):

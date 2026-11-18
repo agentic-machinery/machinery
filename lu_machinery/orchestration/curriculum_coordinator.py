@@ -20,6 +20,7 @@ import yaml
 from filelock import FileLock, Timeout
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, main_checkout_root
 from lu_machinery.common.repo_root import product_root as resolve_product_root
 from lu_machinery.fleet import claude_account_lane, credit_lane
@@ -83,7 +84,7 @@ def _parse_time(raw: str) -> datetime:
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+        value = json_depth.loads(path.read_text(encoding="utf-8", errors="strict"), max_depth=512)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CoordinatorError(f"invalid JSON document {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -1380,7 +1381,7 @@ def _bounded_module_result(
         ledger_path = repo_root / ledger_path
     try:
         raw = ledger_path.read_bytes()
-        ledger = json.loads(raw.decode("utf-8"))
+        ledger = json_depth.loads(raw.decode("utf-8"), max_depth=512)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CoordinatorError(f"invalid authoritative track-completion ledger: {exc}") from exc
     if not isinstance(ledger, Mapping):

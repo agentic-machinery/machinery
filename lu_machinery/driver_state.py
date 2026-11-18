@@ -396,7 +396,7 @@ def last_model_text(transcript_path: str | None) -> str:
         chunk = handle.read().decode("utf-8", errors="replace")
     for line in reversed(jsonl_lines(chunk)):
         try:
-            row = json.loads(line)
+            row = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
         except json.JSONDecodeError:
             continue
         if row.get("source") == "MODEL" and row.get("type") == "PLANNER_RESPONSE":
@@ -491,7 +491,7 @@ def _fetch_monitor_task(task_id: str, *, run_nonce: str) -> dict | None:
     client = MonitorClient(os.environ.get("DELEGATE_MONITOR_API"), timeout_s=2)
     path = f"/api/delegate/tasks/{quote(task_id, safe='')}?run_nonce={quote(run_nonce, safe='')}"
     status, body, _ = client.get(path)
-    return json.loads(body) if status == 200 else None
+    return json_depth.loads(body, max_depth=_JSON_MAX_DEPTH) if status == 200 else None
 
 
 def running_workers(initiator: str) -> int | None:

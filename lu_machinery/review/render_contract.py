@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.lib import rules_core
 
 #: The sources server a review seat calls, relative to a checkout.
@@ -341,7 +342,7 @@ def _read_render_record(prompt_file: Path | None) -> tuple[dict[str, Any], dict[
         )
     sidecar = render_record_path(Path(prompt_file))
     try:
-        reads = json.loads(sidecar.read_text(encoding="utf-8"))
+        reads = json_depth.loads(sidecar.read_text(encoding="utf-8"), max_depth=512)
         record = reads.get(RENDER_RECORD_KEY)
     except (OSError, ValueError, AttributeError) as exc:
         raise ReviewContractError(

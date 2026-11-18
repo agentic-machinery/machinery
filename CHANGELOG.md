@@ -9,6 +9,26 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.32"></a>
+## [0.1.32] - 2026-11-18
+
+### Changed
+
+- Serve /api/git/cleanup cold in under a second ([#769](https://github.com/learn-ukrainian/machinery/pull/769))
+
+### Fixed
+
+- Close the open code-scanning alerts at their source ([#767](https://github.com/learn-ukrainian/machinery/pull/767))
+- Isolate the test session primary (Supersedes #755) ([#763](https://github.com/learn-ukrainian/machinery/pull/763))
+- Allow stale closed-PR scanning instances ([#771](https://github.com/learn-ukrainian/machinery/pull/771))
+- Keep issue-hint regexes linear on long space runs ([#773](https://github.com/learn-ukrainian/machinery/pull/773))
+- Serve warm routing budgets without executor waits ([#774](https://github.com/learn-ukrainian/machinery/pull/774))
+- Keep issue-relation regexes linear on long space runs ([#776](https://github.com/learn-ukrainian/machinery/pull/776))
+
+### Removed
+
+- Retire bundle transport and registry CLI ([#768](https://github.com/learn-ukrainian/machinery/pull/768))
+
 <a id="v0.1.31"></a>
 ## [0.1.31] - 2026-11-18
 
@@ -864,7 +884,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...HEAD
+[0.1.32]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...v0.1.32
 [0.1.31]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.31
 [0.1.30]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.30
 [0.1.29]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.29

@@ -1078,7 +1078,7 @@ def read_helper_creator(worktree: Path, *, repo_root: Path) -> tuple[Path, dict[
     try:
         if path.is_symlink() or path.parent.is_symlink():
             raise ValueError("linked helper creator record")
-        record = json.loads(path.read_bytes())
+        record = json_depth.loads(path.read_bytes(), max_depth=_JSON_MAX_DEPTH)
     except FileNotFoundError:
         return None
     if (

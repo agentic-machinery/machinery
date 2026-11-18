@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import machinery_path
@@ -443,7 +444,7 @@ def _read_review_temp_root_manifest(root: Path) -> dict[str, Any] | None:
             if not stat.S_ISREG(manifest_stat.st_mode) or manifest_stat.st_nlink != 1:
                 return None
             content = os.read(manifest_fd, 4096)
-            data = json.loads(content.decode("utf-8"))
+            data = json_depth.loads(content.decode("utf-8"), max_depth=512)
             if isinstance(data, dict) and data.get("schema_version") == "lu-review-root-v2":
                 return data
             return None
@@ -1289,9 +1290,12 @@ _SEALED_READ_MCP_SOURCE = r"""#!/usr/bin/python3
 import hashlib
 import json
 import os
+import runpy
 import stat
 import sys
 from pathlib import Path, PurePosixPath
+
+_json_loads = runpy.run_path(str(Path(__file__).with_name("sealed-json-depth.py")))["loads"]
 
 if len(sys.argv) not in {2, 3}:
     raise ValueError("invalid_arguments")
@@ -1408,7 +1412,7 @@ def required_paths():
     if not manifest_chunk["eof"]:
         raise ValueError("required_manifest_split_required")
     try:
-        manifest = json.loads(manifest_chunk["content"])
+        manifest = _json_loads(manifest_chunk["content"], max_depth=512)
     except json.JSONDecodeError as exc:
         raise ValueError("required_manifest_invalid") from exc
     changed = manifest.get("changed_paths") if isinstance(manifest, dict) else None
@@ -1629,7 +1633,7 @@ for raw in sys.stdin:
     request = None
     request_id = None
     try:
-        request = json.loads(raw)
+        request = _json_loads(raw, max_depth=512)
         method = request.get("method")
         request_id = request.get("id")
         if method == "initialize":
@@ -1658,15 +1662,19 @@ for raw in sys.stdin:
 def _stage_sealed_read_mcp(exec_root: Path) -> Path:
     """Stage the parent-owned read-only MCP helper beside the pinned reviewer."""
     helper = exec_root / "sealed-read-mcp.py"
-    fd = os.open(
-        helper,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        0o400,
-    )
-    try:
-        _write_fd_all(fd, _SEALED_READ_MCP_SOURCE.encode("utf-8"))
-    finally:
-        os.close(fd)
+    for path, payload in (
+        (helper.with_name("sealed-json-depth.py"), Path(json_depth.__file__).read_bytes()),
+        (helper, _SEALED_READ_MCP_SOURCE.encode("utf-8")),
+    ):
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o400,
+        )
+        try:
+            _write_fd_all(fd, payload)
+        finally:
+            os.close(fd)
     return helper
 
 
@@ -1741,7 +1749,7 @@ def _sealed_reader_python_runtime(
             f"sealed_reader_python_runtime_probe_failed:rc={completed.returncode}:{(completed.stderr or '')[:160]}"
         )
     try:
-        payload = json.loads(completed.stdout)
+        payload = json_depth.loads(completed.stdout, max_depth=512)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ReviewIsolationError("sealed_reader_python_runtime_probe_malformed") from exc
     if not isinstance(payload, dict):
@@ -1852,11 +1860,11 @@ def _probe_sealed_read_mcp(
             f"sealed_reader_probe_failed:rc={completed.returncode}:{(completed.stderr or '')[:160]}"
         )
     try:
-        responses = [json.loads(line) for line in jsonl_lines(completed.stdout) if line.strip()]
+        responses = [json_depth.loads(line, max_depth=512) for line in jsonl_lines(completed.stdout) if line.strip()]
         listed = {tool["name"] for tool in responses[1]["result"]["tools"]}
-        payload = json.loads(responses[2]["result"]["content"][0]["text"])
-        required_payload = json.loads(responses[3]["result"]["content"][0]["text"])
-        required_all_payload = json.loads(responses[4]["result"]["content"][0]["text"])
+        payload = json_depth.loads(responses[2]["result"]["content"][0]["text"], max_depth=512)
+        required_payload = json_depth.loads(responses[3]["result"]["content"][0]["text"], max_depth=512)
+        required_all_payload = json_depth.loads(responses[4]["result"]["content"][0]["text"], max_depth=512)
     except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ReviewIsolationError("sealed_reader_probe_malformed") from exc
     if {
@@ -2992,7 +3000,7 @@ def stage_engine_auth(
                             "LANG": "C.UTF-8",
                         },
                     )
-                    credential = json.loads(completed.stdout) if completed.returncode == 0 else {}
+                    credential = json_depth.loads(completed.stdout, max_depth=512) if completed.returncode == 0 else {}
                     oauth = credential.get("claudeAiOauth", {})
                     token = oauth.get("accessToken") if isinstance(oauth, dict) else None
                     expires_at = oauth.get("expiresAt") if isinstance(oauth, dict) else None

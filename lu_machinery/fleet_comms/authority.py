@@ -33,6 +33,7 @@ from lu_machinery.agent_runtime.target_admission import (
     stored_kimi_request,
     stored_kimi_row,
 )
+from lu_machinery.common import json_depth
 from lu_machinery.control_plane.storage import (
     Authority,
     ControlPlaneUnsupportedComponentError,
@@ -362,7 +363,7 @@ def _safe_json_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
     try:
         encoded = _canonical_json(dict(value))
-        loaded = json.loads(encoded)
+        loaded = json_depth.loads(encoded, max_depth=512)
     except (TypeError, ValueError) as exc:
         raise AuthorityServiceError("metadata_must_be_json_serializable") from exc
     if not isinstance(loaded, dict):  # pragma: no cover - dict(value) guarantees this
@@ -2692,7 +2693,7 @@ class AuthorityService:
         subset: bool = False,
     ) -> None:
         try:
-            actual = json.loads(self.store.read_bytes(job.payload_artifact_id).decode("utf-8"))
+            actual = json_depth.loads(self.store.read_bytes(job.payload_artifact_id).decode("utf-8"), max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AuthorityServiceError("job_payload_corrupt") from exc
         if not isinstance(actual, dict):
@@ -2874,7 +2875,7 @@ class AuthorityService:
         if cached is not None:
             return cached
         try:
-            payload = json.loads(self.store.read_bytes(artifact_id).decode("utf-8"))
+            payload = json_depth.loads(self.store.read_bytes(artifact_id).decode("utf-8"), max_depth=512)
         except (ArtifactStoreError, UnicodeDecodeError, json.JSONDecodeError):
             return True
         if not isinstance(payload, dict):
@@ -3218,7 +3219,7 @@ class AuthorityService:
         metadata: dict[str, Any] = {}
         if data_value:
             try:
-                parsed = json.loads(str(data_value))
+                parsed = json_depth.loads(str(data_value), max_depth=512)
                 if isinstance(parsed, dict):
                     metadata = parsed
             except json.JSONDecodeError:
@@ -3471,7 +3472,7 @@ class AuthorityService:
     @staticmethod
     def _decode_mapping(raw: Any, *, field: str) -> dict[str, Any]:
         try:
-            decoded = json.loads(str(raw or "{}"))
+            decoded = json_depth.loads(str(raw or "{}"), max_depth=512)
         except json.JSONDecodeError as exc:
             raise AuthorityServiceError(f"{field}_corrupt") from exc
         if not isinstance(decoded, dict):

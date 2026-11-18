@@ -27,6 +27,7 @@ from pathlib import Path, PurePosixPath
 from lu_machinery.ci import deploy_paths, frontend_change_scope
 from lu_machinery.ci._location import checkout_relative, module_name, package_dir_name
 from lu_machinery.ci.junit_results import parse_junit
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.repo_root import _PRODUCT_TREE, machinery_path, product_root, project_interpreter
 from lu_machinery.storage.test_baseline import nodeid_to_junit_id
@@ -68,7 +69,7 @@ def repo_path(value: str) -> str:
 def load_manifest(path: Path | None = None) -> dict:
     """Validate structural safety before applying any ownership or command."""
     path = path or (product_root() / "scripts/ci/components.json")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if data["schema_version"] != 1 or set(data["components"]) != set(NODE_IDS):
         raise ValueError("expected schema version 1 and the eight approved nodes")
     for pattern, owners in list(data["exact_paths"].items()) + [
@@ -536,7 +537,7 @@ def import_graph(manifest: dict, root: Path | None = None) -> dict:
 @lru_cache(maxsize=2)
 def cached_import_graph(sources: tuple, known_paths: tuple, manifest_json: str) -> dict:
     """Reuse node lifting only while sources, indexed paths and manifest agree."""
-    manifest = json.loads(manifest_json)
+    manifest = json_depth.loads(manifest_json, max_depth=512)
     graph = cached_import_scan(sources, known_paths)
     owners = {path: assign_path(path, manifest)[0]
               for path in {path for edge in graph["file_edges"] for path in edge}}
@@ -722,7 +723,7 @@ def collect_vitest(files: Sequence[str], root: Path | None = None) -> tuple[list
                             env=os.environ | {"npm_config_offline": "true"})
     if result.returncode:
         return [], result.returncode
-    rows = json.loads(result.stdout)
+    rows = json_depth.loads(result.stdout, max_depth=512)
     if not isinstance(rows, list) or not rows:
         return [], 5
     return rows, 0
@@ -775,7 +776,7 @@ def verify_inputs(path: Path, component: str, manifest: dict, root: Path | None 
     These byte/identity checks do not grant publication or semantic approval.
     """
     root = root or product_root()
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     if data.get("schema") != "component-inputs.v1" or data.get("component") != component:
         raise ValueError("input wrapper schema/component mismatch")
     if data.get("identities") != current_identities(component, manifest, root):
@@ -836,7 +837,7 @@ def partial_test_results(journal: Path) -> dict:
         for line in jsonl_lines(journal.read_text(encoding="utf-8")):
             if not line:
                 continue
-            row = json.loads(line)
+            row = json_depth.loads(line, max_depth=512)
             if row["outcome"] == "failed" or outcomes.get(row["id"]) == "failed":
                 outcomes[row["id"]] = "failed"
             elif row["outcome"] == "skipped" or row["when"] == "call":

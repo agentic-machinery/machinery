@@ -10,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from lu_machinery.ci._location import module_name
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import machinery_root, product_root, rules_dir
 from lu_machinery.review.target_resolution import is_test_path
@@ -145,7 +146,7 @@ def report(
         result["limits"] = {"changed_non_test_lines": int(limits[1])}
         base, head = args.base, args.head
         if args.event_path:
-            event = json.loads(args.event_path.read_text(encoding="utf-8"))
+            event = json_depth.loads(args.event_path.read_text(encoding="utf-8"), max_depth=512)
             pr = event["pull_request"]
             base, head = pr["base"]["sha"], pr["head"]["sha"]
             body = pr["body"]

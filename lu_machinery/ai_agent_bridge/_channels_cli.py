@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.retired_seat_admission import is_kimi_seat
+from lu_machinery.common import json_depth
 
 from . import _channels, _config
 from ._channels_watch import watch_channel_events
@@ -1875,7 +1876,7 @@ def _handle_discuss(args) -> int:
             if authority_job.state != "complete" or replay is None:
                 print("❌ prior ACP discussion is terminal and failed", file=sys.stderr)
                 return 1
-            payload = json.loads(replay)
+            payload = json_depth.loads(replay, max_depth=512)
             lease = None
         else:
             lease = authority.claim_job(

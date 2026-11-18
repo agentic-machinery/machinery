@@ -26,6 +26,7 @@ import json
 import os
 import plistlib
 import re
+import runpy
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,8 @@ from pathlib import Path
 from typing import Any
 from xml.parsers.expat import ExpatError
 
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 
 def _load_sibling(module_name: str, filename: str):
     """Load a sibling module by FILE PATH — see check_venv_integrity.py."""
@@ -123,7 +126,7 @@ def latest_receipt_observed_at(receipts: Path) -> datetime | None:
     newest: datetime | None = None
     for path in receipts.glob("*.json"):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = _json_loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError):
             continue
         raw = payload.get("observed_at")

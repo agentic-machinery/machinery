@@ -31,6 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.storage import paths
 
@@ -163,7 +164,7 @@ def _load_manifest(repo: Path, group: str, commit: str | None = None) -> dict:
             group, "*", f"check that {commit} is the phase branch head carrying {rel}", f"manifest missing at {commit}"
         )
     try:
-        manifest = json.loads(proc.stdout)
+        manifest = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid manifest JSON at {commit}:{rel}: {exc}") from exc
     return paths.validate_manifest(manifest, group, f"{commit}:{rel}")
@@ -609,7 +610,7 @@ def _checkout_gone_reason(repo: Path, owner: Path) -> str | None:
 
 def _recover_journal(repo: Path, store: Path, journal: Path) -> int:
     """Roll one journal back or clear it; return 1 when handled, 0 when it belongs to another checkout."""
-    record = json.loads(journal.read_text(encoding="utf-8"))
+    record = json_depth.loads(journal.read_text(encoding="utf-8"), max_depth=512)
     owner = record.get("repo")
     if not isinstance(owner, str) or not owner:
         raise ValueError(f"invalid publish recovery record: {journal}")
@@ -1425,7 +1426,7 @@ def _import_tarball_locked(repo: Path, tarball: Path) -> int:
             raise ValueError("archive manifest is not a regular file")
         manifest_stream = archive.extractfile(manifest_member)
         assert manifest_stream is not None
-        manifest = json.load(manifest_stream)
+        manifest = json_depth.load(manifest_stream, max_depth=512)
         group = paths.checked_group(manifest["group"])
         local = paths.load_manifest(group, repo)
         local_entries = {entry["path"]: (entry["sha256"], entry["size"]) for entry in local["entries"]}
@@ -1627,7 +1628,7 @@ def main(argv: list[str] | None = None, *, repo: Path | None = None) -> int:
             print(publish(repo, args.group, args.path, args.source, args.producer))
             return 0
         elif args.command == "publish-set":
-            plan = json.loads(args.plan.read_text(encoding="utf-8"))
+            plan = json_depth.loads(args.plan.read_text(encoding="utf-8"), max_depth=512)
             changes = [
                 ArtifactChange(
                     row["operation"],

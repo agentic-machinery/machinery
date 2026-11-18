@@ -54,6 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, main_checkout_root, product_root, state_root
 from lu_machinery.common.scratch import (
     DEFAULT_SCRATCH_ROOT,
@@ -192,7 +193,7 @@ def _receipt_owner(path: Path, stem: str, raw: bytes) -> str | None:
     """
     if not _is_dispatcher_sidecar(path):
         return None
-    data = json.loads(raw)
+    data = json_depth.loads(raw, max_depth=512)
     owner = data.get("task_id") if isinstance(data, dict) else None
     return owner if isinstance(owner, str) and owner and owner != stem else None
 
@@ -207,7 +208,7 @@ def _carries_task_identity(path: Path, raw: bytes) -> bool:
     those two fields are dropped, is a task claim.
     """
     try:
-        data = json.loads(raw)
+        data = json_depth.loads(raw, max_depth=512)
     except ValueError:
         return False  # Not JSON: the reader already refused every record-shaped damage.
     if not isinstance(data, dict):
@@ -271,7 +272,7 @@ def load_tasks(root: Path) -> TaskInventory:
             if data is None:
                 owner = _receipt_owner(path, stem, raw)
                 if owner is not None:
-                    receipts.append((owner, json.loads(raw)))
+                    receipts.append((owner, json_depth.loads(raw, max_depth=512)))
                     continue
                 if _carries_task_identity(path, raw):
                     raise ValueError("task claim without a record shape")

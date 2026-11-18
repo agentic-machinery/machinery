@@ -19,7 +19,7 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet.ignored_task_output import succession_streams
@@ -311,7 +311,7 @@ def tick(args, *, now: datetime) -> dict[str, Any]:
     args.state_file.parent.mkdir(parents=True, exist_ok=True)
     with args.state_file.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        last = json.loads(args.state_file.read_text()) if args.state_file.exists() else {}
+        last = json_depth.loads(args.state_file.read_text(), max_depth=512) if args.state_file.exists() else {}
         if not isinstance(last, dict) or any(
             key not in {"report", "route"} or type(value) is not int or value < 0 for key, value in last.items()
         ):

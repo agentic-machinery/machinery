@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.fleet_comms.contracts import AssistantSegment, CompletionState, ResponseEnvelope
 
@@ -87,7 +88,7 @@ def _parse_jsonl(text: str) -> list[dict[str, Any]]:
         if not line or not line.startswith("{"):
             continue
         try:
-            payload = json.loads(line)
+            payload = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         if isinstance(payload, dict):
@@ -671,7 +672,7 @@ def _parse_json_object_tolerant(stdout: str) -> dict[str, Any] | None:
     if not text:
         return None
     try:
-        value = json.loads(text)
+        value = json_depth.loads(text, max_depth=512)
         return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
         pass
@@ -679,7 +680,7 @@ def _parse_json_object_tolerant(stdout: str) -> dict[str, Any] | None:
     end = text.rfind("}")
     if start != -1 and end > start:
         try:
-            value = json.loads(text[start : end + 1])
+            value = json_depth.loads(text[start : end + 1], max_depth=512)
             return value if isinstance(value, dict) else None
         except json.JSONDecodeError:
             return None

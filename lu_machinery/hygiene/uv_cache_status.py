@@ -39,6 +39,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 
 
@@ -201,7 +202,7 @@ def read_history(dir_fd: int | None) -> list[dict[str, float]]:
     samples: list[dict[str, float]] = []
     for line in lines:
         try:
-            row = json.loads(line)
+            row = json_depth.loads(line, max_depth=512)
             ts, size = float(row["ts"]), float(row["bytes"])
         except (ValueError, KeyError, TypeError):
             continue

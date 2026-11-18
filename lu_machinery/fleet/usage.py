@@ -20,7 +20,7 @@ from typing import Any, cast
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.http_status import has_http_status
 from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.prepaid_status import api_lane_status_from_account
@@ -39,7 +39,7 @@ def read_budget(*, fresh: bool = False, transport: str = "dispatch", for_display
         query = urllib.parse.urlencode({"transport": transport})
         try:
             with urllib.request.urlopen(f"{base}/api/state/routing-budget?{query}", timeout=5) as response:
-                budget = json.load(response)
+                budget = json_depth.load(response, max_depth=512)
             if not isinstance(budget, dict) or not all(
                 isinstance(budget.get(k), dict) for k in ("agents", "api_accounts")
             ):

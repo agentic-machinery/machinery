@@ -62,12 +62,14 @@ import importlib.util
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 def _load_sibling(module_name: str, filename: str):
     """Load a sibling module by FILE PATH — see the identical helper (and its
     docstring explaining why) in ``check_node_modules_integrity.py``."""
@@ -238,7 +240,7 @@ def check_sentinel_imports(python_exe: Path, *, timeout: float = 30.0) -> tuple[
     if proc.returncode != 0:
         return [], f"probe subprocess exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
     try:
-        return json.loads(proc.stdout.strip() or "[]"), None
+        return _json_loads(proc.stdout.strip() or "[]", max_depth=512), None
     except json.JSONDecodeError as exc:
         return [], f"probe produced unparseable output: {exc}"
 

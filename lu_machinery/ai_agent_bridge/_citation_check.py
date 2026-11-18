@@ -65,6 +65,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 
@@ -324,7 +325,7 @@ def _garbled_esum_catalog() -> dict[str, dict]:
     path = product_root() / "registry" / "lexicon" / "esum_garbled_etymologies.json"
     catalog: dict[str, dict] = {}
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         payload = {}
     for entry in payload.get("entries") or []:

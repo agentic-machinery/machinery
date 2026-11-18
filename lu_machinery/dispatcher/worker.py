@@ -23,7 +23,7 @@ import psutil
 from lu_machinery.agent_runtime import bounded_advisory, model_pause
 from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, resolve_codex_account_label
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
-from lu_machinery.common import task_scratch
+from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.repo_root import in_tree_source, machinery_path, primary_root, state_root
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.common.task_scratch import TaskScratchError
@@ -1401,7 +1401,7 @@ def settle_left_worktrees(salvage: bool = False) -> None:
             continue  # a damaged identity never ends the sweep for the records after it
         # wait() takes this lock before it reports a terminal task, so it never returns mid-removal.
         with contextlib.suppress(OSError, ValueError, KeyError), store.task_state_lock(path):
-            current = json.loads(path.read_text())
+            current = json_depth.loads(path.read_text(), max_depth=512)
             if not reap or not _unsettled(current):
                 # A task settled without a worktree, or by an earlier pass, still sheds its caches.
                 if _clear_task_caches(current):
@@ -1630,7 +1630,7 @@ def _allowance(record: dict, side: str) -> dict:
 
 def supervise(path: Path, options: dict | None = None, hard_timeout: float | None = None) -> None:
     os.umask(0o077)
-    record = json.loads(path.read_text())
+    record = json_depth.loads(path.read_text(), max_depth=512)
     load_post_start_code(bool(record.get("review_attempt")))
     if record.get("require_review_verdict") is True:
         # The code this supervisor loaded; settlement records it again (#12399).
@@ -2115,5 +2115,5 @@ if __name__ == "__main__":
     # Run as -m, this module is __main__; a later `import scripts.dispatcher.worker` (the removal chokepoint's
     # liveness proof) must get this running copy, not a second one loaded from a checkout that has moved since.
     sys.modules.setdefault("lu_machinery.dispatcher.worker", sys.modules[__name__])
-    settings = json.load(sys.stdin)
+    settings = json_depth.load(sys.stdin, max_depth=512)
     supervise(Path(sys.argv[1]), **settings)

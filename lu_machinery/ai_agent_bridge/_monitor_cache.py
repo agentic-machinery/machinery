@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
 # Allow environment override for tests / alternate checkouts. Respects
@@ -82,7 +83,7 @@ def get(key: str, expected_hash: str) -> str | None:
     if not body_path.is_file() or not meta_path.is_file():
         return None
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = json_depth.loads(meta_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     if meta.get("hash") != expected_hash:
@@ -107,7 +108,7 @@ def peek(key: str) -> CacheEntry | None:
     if not body_path.is_file() or not meta_path.is_file():
         return None
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = json_depth.loads(meta_path.read_text(encoding="utf-8"), max_depth=512)
         body = body_path.read_text(encoding="utf-8")
     except (OSError, json.JSONDecodeError):
         return None

@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.task_family import codex_state
 from lu_machinery.orchestration.task_family import git_safety as safety
 from lu_machinery.orchestration.task_family.model import LifecycleState, OperationReceipt, ReceiptAction
@@ -173,7 +174,7 @@ def _load_persisted_plan(repo_root: Path, plan: CleanupPlan) -> dict[str, Any]:
     """Read the planner-owned immutable plan; executor never creates or rewrites it."""
     path = plan_path(repo_root, plan)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError as exc:
         raise ExecutorError(f"persisted immutable plan missing: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -204,7 +205,7 @@ def _load_persisted_plan(repo_root: Path, plan: CleanupPlan) -> dict[str, Any]:
 def _assert_manifest_task_ids(repo_root: Path, plan: CleanupPlan, selected_ids: set[str]) -> None:
     path = manifest_path(repo_root, plan)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError as exc:
         raise ExecutorError(f"persisted manifest missing: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -337,7 +338,7 @@ def load_state(repo_root: Path, plan: CleanupPlan) -> dict[str, Any]:
         return _ensure_ids(_default_state(plan), plan)
 
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except json.JSONDecodeError as exc:
         raise ExecutionStateError(f"state file {path} is invalid JSON") from exc
     if not isinstance(raw, dict):
@@ -517,7 +518,7 @@ def _capture_initial_receipt(path: Path, payload: dict[str, Any]) -> dict[str, A
         return payload
     receipt_file = path.with_name("receipt.json")
     try:
-        raw = json.loads(receipt_file.read_text(encoding="utf-8"))
+        raw = json_depth.loads(receipt_file.read_text(encoding="utf-8"), max_depth=512)
         receipt = OperationReceipt.from_dict(raw)
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
         receipt = _initial_receipt(payload)

@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import runpy
 import shlex
 import subprocess
 import sys
@@ -35,6 +36,10 @@ from typing import Any, Literal
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
 # are also its directories in checkout-relative paths.
+
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
+
 _PACKAGE = f"{Path(os.path.abspath(__file__)).parents[1].name}.{Path(os.path.abspath(__file__)).parent.name}"
 _PACKAGE_DIR = _PACKAGE.replace(".", "/")
 _MACHINERY = _PACKAGE.partition(".")[0]
@@ -168,7 +173,7 @@ def fetch_occupancy(*, timeout: float = 2.0) -> dict[str, Any] | None:
     url = f"{_monitor_base()}/api/occupancy?fresh=true"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            payload = _json_loads(response.read().decode("utf-8"), max_depth=512)
     except (
         OSError,
         TimeoutError,

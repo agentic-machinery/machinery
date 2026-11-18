@@ -41,6 +41,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root, product_tree_path
 
 BASELINE_PATH = Path("lint/mypy_baseline.json")
@@ -609,7 +610,7 @@ def _payload_entries(payload: object, where: str) -> list[MypyError]:
 
 
 def load_entries(path: Path) -> list[MypyError]:
-    return _payload_entries(json.loads(path.read_text(encoding="utf-8")), str(path))
+    return _payload_entries(json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512), str(path))
 
 
 def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
@@ -639,7 +640,7 @@ def _baseline_at(root: Path, ref: str, rel: str) -> list[MypyError] | None:
     raw = _git_show(root, ref, rel)
     if raw is None:
         return None
-    return _payload_entries(json.loads(raw), f"{ref}:{rel}")
+    return _payload_entries(json_depth.loads(raw, max_depth=512), f"{ref}:{rel}")
 
 
 def _is_subset(current: Sequence[MypyError], previous: Sequence[MypyError]) -> bool:

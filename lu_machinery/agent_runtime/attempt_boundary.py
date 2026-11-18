@@ -33,6 +33,8 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import json_depth
+
 from .attempt_safe_read import (
     MAX_ATTEMPT_READ_BYTES as MAX_ATTEMPT_READ_BYTES,
 )
@@ -371,7 +373,7 @@ def _read_private_json(
         return None
     try:
         # A decode or duplicate-key error is a ValueError; its text is never kept.
-        data = json.loads(raw, object_pairs_hook=_unique_json_keys)
+        data = json_depth.loads(raw, object_pairs_hook=_unique_json_keys, max_depth=512)
     except ValueError:
         raise ClaudeAccountRefused(f"{code}_invalid") from None
     if data is None:
@@ -823,7 +825,7 @@ def _claude_selected_identity(token: str) -> tuple[str, object]:
         raw = response.read(65537)
         if response.status != 200 or len(raw) > 65536:
             raise ClaudeAccountRefused("claude_account_identity_unavailable")
-        profile = json.loads(raw, object_pairs_hook=_unique_json_keys)
+        profile = json_depth.loads(raw, object_pairs_hook=_unique_json_keys, max_depth=512)
         identity = profile["account"]["uuid"]
         if not isinstance(identity, str) or not _CLAUDE_ACCOUNT_UUID_RE.fullmatch(identity):
             raise ClaudeAccountRefused("claude_account_identity_unavailable")
@@ -945,7 +947,7 @@ def _claude_oauth_state(path: Path, *, dir_fd: int | None = None) -> tuple[str, 
         raw = os.read(fd, 65537)
         if len(raw) > 65536:
             raise ReviewIsolationError("attempt_claude_auth_oversized")
-        oauth = json.loads(raw, object_pairs_hook=_unique_json_keys)["claudeAiOauth"]
+        oauth = json_depth.loads(raw, object_pairs_hook=_unique_json_keys, max_depth=512)["claudeAiOauth"]
         token, expires = oauth["accessToken"], oauth["expiresAt"]
         if not isinstance(expires, int) or isinstance(expires, bool):
             raise ReviewIsolationError("attempt_claude_auth_invalid")
@@ -1290,7 +1292,7 @@ class AttemptBoundary:
         config = Path(tool_config["mcp_config_path"])
         verify_review_attempt_paths(config)
         self.config_path = config
-        server = json.loads(config.read_bytes())["mcpServers"]["sources"]
+        server = json_depth.loads(config.read_bytes(), max_depth=512)["mcpServers"]["sources"]
         access = "full" if self.full else "isolated"
         if server["env"].get("LU_REVIEW_ACCESS") != access:
             raise ReviewIsolationError("attempt_review_access_mismatch")
@@ -1653,7 +1655,7 @@ def prepare_attempt_boundary(agent: str, mode: str, session_id: str | None, tool
         raise ReviewIsolationError("full_review_write_denial_conflict")
     config = Path(tc["mcp_config_path"])
     verify_review_attempt_paths(config)
-    server = json.loads(config.read_bytes())["mcpServers"]["sources"]
+    server = json_depth.loads(config.read_bytes(), max_depth=512)["mcpServers"]["sources"]
     if (
         hashlib.sha256(Path(tc["review_manifest"]).read_bytes()).hexdigest()
         != server["env"]["LU_REVIEW_MANIFEST_SHA256"]

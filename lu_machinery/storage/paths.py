@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 
@@ -113,7 +114,7 @@ def load_manifest(group: str, repo: Path | None = None) -> dict:
             f".venv/bin/python -m {_mod('storage', 'artifacts')} manifest build --group {group} --pre <commit>",
             "manifest missing",
         )
-    return validate_manifest(json.loads(path.read_text(encoding="utf-8")), group, str(path))
+    return validate_manifest(json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512), group, str(path))
 
 
 def validate_manifest(manifest: object, group: str, path: str) -> dict:
@@ -190,7 +191,7 @@ def _pending_publication(repo: Path) -> bool:
         return False
     for journal in directory.glob("*.json"):
         try:
-            record = json.loads(journal.read_text(encoding="utf-8"))
+            record = json_depth.loads(journal.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, ValueError):
             return True
         if record.get("repo") == str(repo.resolve()):
@@ -209,7 +210,7 @@ def artifact_set(group: str, *, repo: Path | None = None, members: set[str] | No
         raw = None
         try:
             raw = _read_regular(manifest_file, repo / "registry")
-            manifest = validate_manifest(json.loads(raw), group, str(manifest_file))
+            manifest = validate_manifest(json_depth.loads(raw, max_depth=512), group, str(manifest_file))
             descriptor = manifest.get("set_descriptor") or {
                 "members": sorted(entry["path"][5:] for entry in manifest["entries"]),
                 "companions": {},
@@ -307,7 +308,7 @@ def artifact_path(group: str, rel: str, *, repo: Path | None = None) -> Path:
         raise MissingArtifactError(group, rel, command, f"size {stat.st_size} != {entry.get('size')}")
     cache_path = artifact_store_root(repo) / ".verification-cache.json"
     try:
-        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache = json_depth.loads(cache_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         cache = {}
     key = f"{repo.resolve()}:{group}:{rel}"

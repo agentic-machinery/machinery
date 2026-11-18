@@ -6,6 +6,8 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 
 NATIVE_ASK_TOOL_CONTRACT = (
@@ -46,7 +48,7 @@ def request_metadata(message: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(data, Mapping):
         return dict(data)
     try:
-        decoded = json.loads(data)
+        decoded = json_depth.loads(data, max_depth=512)
     except (TypeError, json.JSONDecodeError):
         return {}
     return dict(decoded) if isinstance(decoded, Mapping) else {}

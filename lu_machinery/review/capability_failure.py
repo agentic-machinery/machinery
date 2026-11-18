@@ -130,7 +130,7 @@ def run_started(record: Mapping[str, Any]) -> str | None:
 def _declared(reply: str) -> frozenset[str]:
     """The capabilities a structured reply declares missing; a malformed declaration refuses."""
     try:
-        payload = json.loads(reply)
+        payload = json_depth.loads(reply, max_depth=_JSON_MAX_DEPTH)
     except ValueError:
         return frozenset()
     if not isinstance(payload, dict) or DECLARATION_FIELD not in payload:

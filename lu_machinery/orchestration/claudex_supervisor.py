@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.repo_root import state_root as shared_state_root
 from lu_machinery.lib.session_record import validate_session_id
@@ -176,7 +177,7 @@ def _load_json(path: Path, *, max_bytes: int = 65_536) -> dict[str, Any]:
     try:
         if path.stat().st_size > max_bytes:
             raise SupervisorError(f"runtime JSON exceeds {max_bytes} bytes")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:

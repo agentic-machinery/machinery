@@ -534,7 +534,7 @@ def test_disallowed_shell_actions_return_typed_refusal_before_native_permissions
     from lu_machinery.agent_runtime.grok_reviewer_permissions import REFUSAL_CODE
 
     result = subprocess.run(
-        [sys.executable, "-I", str(machinery_path("agent_runtime/grok_reviewer_permissions.py")), "--review-root", str(ROOT)],
+        [sys.executable, "-I", "-S", str(machinery_path("agent_runtime/grok_reviewer_permissions.py")), "--review-root", str(ROOT)],
         input=json.dumps({
             "hook_event_name": "PreToolUse", "toolName": "run_terminal_command", "toolInput": {"command": command},
         }), capture_output=True, text=True, timeout=30,
@@ -582,7 +582,7 @@ def test_permission_guard_cli_admits_read_command_and_denies_bad_json():
         "hook_event_name": "PreToolUse", "toolName": "run_terminal_command", "toolInput": {"command": "pwd"},
     }), 0), ("broken json", 2)]:
         result = subprocess.run(
-            [sys.executable, "-I", str(machinery_path("agent_runtime/grok_reviewer_permissions.py")), "--review-root", str(ROOT)],
+            [sys.executable, "-I", "-S", str(machinery_path("agent_runtime/grok_reviewer_permissions.py")), "--review-root", str(ROOT)],
             input=event, capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == expected
@@ -716,7 +716,9 @@ def test_main_denies_interpreter_level_input_errors(tracked_review_root, monkeyp
     def fail(*args, **kwargs):
         raise error("private input error")
 
-    monkeypatch.setattr(policy.json, "load", fail)
+    from lu_machinery.common import json_depth
+
+    monkeypatch.setattr(json_depth, "load", fail)
     monkeypatch.setattr(sys, "argv", ["guard", "--review-root", str(tracked_review_root)])
     assert policy.main() == 2
     assert capsys.readouterr().err.startswith(policy.REFUSAL_CODE + ":")

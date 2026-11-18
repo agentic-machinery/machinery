@@ -1,5 +1,7 @@
 """One stream-json model observer, shared by every provider that attests from its own stdout."""
 
+from lu_machinery.common import json_depth
+
 # The one definition of the Sources MCP server: only completed calls to it count toward
 # ParsedResult.sources_mcp_call_count (#10074, #12503).
 SOURCES_SERVER = "sources"
@@ -34,9 +36,8 @@ def model_observer(stdout_path, extract):
 
 
 def json_event(line: bytes):
-    import json
 
-    return json.loads(line.decode())
+    return json_depth.loads(line.decode(), max_depth=512)
 
 
 def one_model(models: set[str]) -> str | None:

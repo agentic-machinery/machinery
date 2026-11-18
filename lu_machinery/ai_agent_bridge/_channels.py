@@ -60,6 +60,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.secret_redactor import redact_text, redact_value
 
 from . import _config
@@ -490,7 +491,7 @@ def fetch_monitor_state(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status != 200:
                 return None
-            return json.loads(resp.read().decode("utf-8"))
+            return json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except Exception:
         # Broad catch is deliberate (Gemini B.2 review non-blocker #2):
         # urllib.error.URLError covers most network errors but not
@@ -1289,11 +1290,11 @@ def _row_to_message(row) -> dict[str, Any]:
         "kind": row["kind"],
         "priority": row["priority"],
         "body": redact_text(row["body"]) or "",
-        "attachments": (redact_value(json.loads(row["attachments"])) if row["attachments"] else None),
+        "attachments": (redact_value(json_depth.loads(row["attachments"], max_depth=512)) if row["attachments"] else None),
         "context_rev_shared": row["context_rev_shared"],
         "context_rev_channel": row["context_rev_channel"],
         "monitor_state_snapshot": (
-            redact_value(json.loads(row["monitor_state_snapshot"])) if row["monitor_state_snapshot"] else None
+            redact_value(json_depth.loads(row["monitor_state_snapshot"], max_depth=512)) if row["monitor_state_snapshot"] else None
         ),
         "created_at": row["created_at"],
     }

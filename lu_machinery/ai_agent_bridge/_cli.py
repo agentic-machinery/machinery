@@ -14,7 +14,7 @@ from lu_machinery.agent_runtime.attribution import resolve_invocation_attributio
 from lu_machinery.agent_runtime.errors import AgentTimeoutError, RateLimitedError
 from lu_machinery.agent_runtime.retired_seat_admission import KimiAdmissionRefused
 from lu_machinery.agent_runtime.runner import InterAgentTransportError
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 
 from ._ask_contract import EFFORT_CHOICES
@@ -1653,7 +1653,7 @@ def _resolve_same_repo_pr_head(pr_number: int, *, repo_root: Path | None = None)
             f"ask --pr {pr_number}: gh pr view failed (exit {proc.returncode}); refusing to review main"
         )
     try:
-        payload = json.loads(proc.stdout or "")
+        payload = json_depth.loads(proc.stdout or "", max_depth=512)
     except json.JSONDecodeError as exc:
         raise SystemExit(f"ask --pr {pr_number}: gh pr view returned invalid JSON; refusing to review main") from exc
     if not isinstance(payload, dict):

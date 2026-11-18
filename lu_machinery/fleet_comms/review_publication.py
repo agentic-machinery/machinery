@@ -25,6 +25,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
+
 VALID_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 DEFAULT_GATE_KIND = "cross-family-review"
 DEFAULT_STATUS_CONTEXT = "fleet/cross-family-review"
@@ -485,7 +487,7 @@ def parse_sealed_verdict_payload(payload: Mapping[str, Any] | str | bytes) -> Se
     if isinstance(payload, (str, bytes)):
         raw = payload.decode("utf-8") if isinstance(payload, bytes) else payload
         try:
-            loaded = json.loads(raw)
+            loaded = json_depth.loads(raw, max_depth=512)
         except json.JSONDecodeError as exc:
             raise ReviewPublicationError(f"sealed_payload_invalid_json: {exc.msg}") from exc
         if not isinstance(loaded, dict):

@@ -10,20 +10,19 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import AfterValidator, BaseModel
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.orchestration.task_record_store import (
@@ -51,18 +50,31 @@ GIT_CLEANUP_TTL_S = 60.0
 
 
 
+def _json_text(value: str) -> str:
+    """``value`` with each byte that is not UTF-8 spelled as a backslash, ``x`` and two hex digits.
+
+    Names and paths are read from git losslessly (``surrogateescape``), and a lone
+    surrogate cannot be written as JSON. The spelling keeps the exact bytes visible.
+    """
+    return value.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+
+
+# A name or path git printed, as the report shows it; the same text for UTF-8 data.
+GitText = Annotated[str, AfterValidator(_json_text)]
+
+
 class StaleBranch(BaseModel):
-    name: str
+    name: GitText
     upstream_gone: bool
     fully_merged_to_main: bool
     last_commit_sha: str
     last_commit_date: str
-    committer: str
+    committer: GitText
 
 
 class Worktree(BaseModel):
-    path: str
-    branch: str
+    path: GitText
+    branch: GitText
     clean: bool | None = None
     upstream_gone: bool | None = None
     fully_merged_to_main: bool | None = None
@@ -82,14 +94,20 @@ class CleanupReport(BaseModel):
 def _git_dir_options(cwd: Path) -> list[str]:
     git_path = cwd / ".git"
     if git_path.is_file():
-        line = git_path.read_text(encoding="utf-8").strip()
-        if line.startswith("gitdir:"):
-            raw_git_dir = Path(line.removeprefix("gitdir:").strip())
+        # As git reads a gitfile: bytes, ``gitdir: `` then the path, only the trailing CR and LF removed
+        # (a path may end in any other character, even a Unicode space).
+        line = git_path.read_bytes().decode("utf-8", "surrogateescape").rstrip("\r\n")
+        if line.startswith("gitdir: "):
+            raw_git_dir = Path(line.removeprefix("gitdir: "))
             git_dir = raw_git_dir if raw_git_dir.is_absolute() else cwd / raw_git_dir
             return [f"--git-dir={git_dir}", f"--work-tree={cwd}"]
     if git_path.is_dir():
         return [f"--git-dir={git_path}", f"--work-tree={cwd}"]
     return []
+
+
+def _decode(data: bytes) -> str:
+    return data.decode("utf-8", "surrogateescape")
 
 
 def _run_git(
@@ -98,22 +116,23 @@ def _run_git(
     cwd: Path,
     input_text: str | None = None,
     timeout_s: float = _GIT_TIMEOUT_S,
-    errors: str = "strict",
 ) -> tuple[int, str, str]:
+    """Run git; the output is read as bytes and decoded losslessly (``surrogateescape``).
+
+    A name or path that is not UTF-8 keeps its exact bytes, and a carriage return is not turned into a newline.
+    """
     try:
         env = sanitized_git_env()
         proc = subprocess.run(
             ["git", "--no-optional-locks", *_git_dir_options(cwd), *args],
             cwd=cwd,
             env=env,
-            input=input_text,
+            input=None if input_text is None else input_text.encode("utf-8", "surrogateescape"),
             capture_output=True,
-            text=True,
-            errors=errors,
             timeout=timeout_s,
             check=False,
         )
-        return proc.returncode, proc.stdout, proc.stderr
+        return proc.returncode, _decode(proc.stdout), _decode(proc.stderr)
     except subprocess.TimeoutExpired as exc:
         return 124, "", f"TimeoutExpired after {exc.timeout}s"
     except (FileNotFoundError, PermissionError, OSError, AssertionError) as exc:
@@ -140,7 +159,8 @@ def _list_local_branches(cwd: Path) -> list[dict[str, Any]]:
         return []
 
     branches: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
+    # ``split("\n")``, not ``splitlines()``: a name may hold a character that one splits on (U+2028, U+0085).
+    for line in stdout.split("\n"):
         parts = line.split("\x00")
         if len(parts) != 7:
             continue
@@ -168,8 +188,8 @@ def _list_worktrees(cwd: Path) -> list[dict[str, Any]]:
 
     worktrees: list[dict[str, Any]] = []
     current: dict[str, Any] = {}
-    for line in stdout.splitlines():
-        if not line.strip():
+    for line in stdout.split("\n"):
+        if not line:
             if current:
                 worktrees.append(current)
                 current = {}
@@ -213,12 +233,12 @@ def _log_records(args: list[str], cwd: Path) -> list[tuple[list[str], _PathSet]]
 
     The paths are spelled as git hashes them. A commit with a path git quotes (a
     control character, quote or backslash in the name) has no sure spelling: its path set is ``None``.
-    Output is read losslessly (``surrogateescape``), so a path that is not UTF-8 keeps its exact bytes
-    and whitespace removal and comparison act on the bytes git hashes.
+    A path that is not UTF-8 keeps its exact bytes (``_run_git`` reads losslessly), so
+    whitespace removal and comparison act on the bytes git hashes.
     """
     code, stdout, _stderr = _run_git(
         ["-c", "core.quotePath=false", "log", "--root", "--no-renames", "--name-only",
-         f"--format={_RECORD}%H %P", *args], cwd=cwd, errors="surrogateescape")
+         f"--format={_RECORD}%H %P", *args], cwd=cwd)
     if code != 0:
         return None
     records: list[tuple[list[str], _PathSet]] = []
@@ -364,7 +384,8 @@ def _merged_to_main_answer(branch: str, cwd: Path, *, main: str = "main", tip: s
     code, stdout, _stderr = _run_git(["branch", "--merged", main, "--format=%(refname:short)"], cwd=cwd)
     if code != 0:
         return False, False
-    return branch in {line.strip() for line in stdout.splitlines() if line.strip()}, False
+    # Split on newlines only and keep each name exactly: a ref may end in, or hold, any Unicode space.
+    return branch in {line for line in stdout.split("\n") if line}, False
 
 
 def _is_worktree_clean(path: Path) -> bool:
@@ -378,6 +399,8 @@ def _disk_bytes(path: Path) -> int | None:
             ["du", "-sk", str(path)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
             timeout=_GIT_TIMEOUT_S,
             check=False,
         )
@@ -729,7 +752,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     if proc.returncode != 0:
         return _unknown_pull_requests("github_unavailable", observed_at)
     try:
-        data = json.loads(proc.stdout or "")["data"]
+        data = json_depth.loads(proc.stdout or "", max_depth=512)["data"]
     except (ValueError, KeyError, TypeError):
         return _unknown_pull_requests("github_invalid_response", observed_at)
     if not isinstance(data, dict):

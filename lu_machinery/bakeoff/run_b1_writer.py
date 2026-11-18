@@ -39,6 +39,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 
 def _product_hooks() -> Any:
     """Load the product hook named by the product checkout's bakeoff configuration.
@@ -50,7 +52,7 @@ def _product_hooks() -> Any:
     from lu_machinery.ops.product_entry import load_configured_module
 
     root = product_root()
-    payload = json.loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"))
+    payload = json_depth.loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"), max_depth=512)
     return load_configured_module(payload["module"], product_root=root)
 
 

@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import runpy
 import shutil
 import signal
 import stat
@@ -20,6 +21,8 @@ import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 _SENSITIVE_NAME_RE = re.compile(
     r"TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE|CREDENTIALS?|API_?KEY|"
     r"ACCESS_?KEY|AUTH|COOKIE",
@@ -865,7 +868,7 @@ def _json_fingerprint(path: Path, select: Callable[[object], object]) -> str:
     if len(fingerprint) != 64:
         return fingerprint
     try:
-        data = json.loads(path.read_bytes())
+        data = _json_loads(path.read_bytes(), max_depth=512)
     except (OSError, ValueError):
         return "invalid"
     return _canonical_digest(select(data))

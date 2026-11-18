@@ -31,6 +31,7 @@ import os
 import time
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
 #: Default cooldown window after a 429. 1h matches Gemini API's typical
@@ -123,7 +124,7 @@ def _read_expires_at(path: Path) -> float | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text("utf-8"))
+        data = json_depth.loads(path.read_text("utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):

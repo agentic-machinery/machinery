@@ -31,6 +31,7 @@ import argparse
 import ast
 import hashlib
 import json
+import runpy
 import subprocess
 import sys
 import tomllib
@@ -38,6 +39,9 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 
 SCHEMA = "test-waits-baseline.v1"
 BASELINE_PATH = Path("lu_machinery/lint/test_waits_baseline.json")
@@ -545,7 +549,7 @@ def _entries_from_rows(rows: object, where: str) -> list[WaitFinding]:
 
 
 def load_entries(path: Path) -> list[WaitFinding]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = _json_loads(path.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{path}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), str(path))
@@ -607,7 +611,7 @@ def _baseline_at(root: Path, ref: str, rel: str) -> list[WaitFinding] | None:
     raw = _git_show(root, ref, rel)
     if raw is None:
         return None
-    payload = json.loads(raw)
+    payload = _json_loads(raw, max_depth=512)
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise ValueError(f"{ref}:{rel}: schema must be {SCHEMA}")
     return _entries_from_rows(payload.get("entries"), f"{ref}:{rel}")

@@ -27,7 +27,7 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.review.evidence import compute_target_input_fingerprint
@@ -76,7 +76,7 @@ def _load_state(state_file: Path) -> dict:
             "findings": [],
         }
     try:
-        state = json.loads(state_file.read_text(encoding="utf-8"))
+        state = json_depth.loads(state_file.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeDecodeError) as exc:
         raise CloseoutStateError(f"state_unreadable:{exc}") from exc
     except json.JSONDecodeError as exc:
@@ -457,7 +457,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
         )
         return 1
     if args.routing_snapshot_file:
-        routing_snapshot = json.loads(Path(args.routing_snapshot_file).read_text(encoding="utf-8"))
+        routing_snapshot = json_depth.loads(Path(args.routing_snapshot_file).read_text(encoding="utf-8"), max_depth=512)
         snapshot_source = "file"
     else:
         routing_snapshot = credit_lane.read_routing_budget(timeout=8.0)
@@ -757,7 +757,7 @@ def load_pull_request_comments(
         if completed.returncode:
             raise CloseoutStateError("ukrainian_behavior_proof_comments_unavailable")
         try:
-            return json.loads(completed.stdout or "null")
+            return json_depth.loads(completed.stdout or "null", max_depth=512)
         except json.JSONDecodeError as exc:
             raise CloseoutStateError("ukrainian_behavior_proof_comments_unavailable") from exc
 

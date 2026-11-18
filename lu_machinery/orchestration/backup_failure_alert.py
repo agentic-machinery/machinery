@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
 DEFAULT_STATE_DIR = Path("batch_state") / "backups" / "alerts"
@@ -68,7 +69,7 @@ def state_path(state_dir: Path, unit: str) -> Path:
 
 def read_state(path: Path) -> dict[str, str]:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return {}
     except (OSError, ValueError):
@@ -129,7 +130,7 @@ def finish_pending(path: Path, publish: Publisher) -> None:
     """
     pending_path = path.with_name(path.name + ".pending")
     try:
-        pending = json.loads(pending_path.read_text(encoding="utf-8"))
+        pending = json_depth.loads(pending_path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return
     except ValueError as error:
@@ -161,7 +162,7 @@ def publish_transition(path: Path, publish: Publisher, message: str, key: str, s
 
 def receipt_summary(project_root: Path) -> str:
     try:
-        receipt = json.loads((project_root / LAST_RUN_RECEIPT).read_text(encoding="utf-8"))
+        receipt = json_depth.loads((project_root / LAST_RUN_RECEIPT).read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return "last-run receipt: absent or unreadable"
     if not isinstance(receipt, dict):
@@ -226,7 +227,7 @@ def fleet_comms_publisher(project_root: Path) -> Publisher:
             # Untrusted output can contain credentials or private storage paths.
             raise AlertError(f"fleet_comms delivery exited {result.returncode}")
         try:
-            receipt = json.loads(result.stdout)
+            receipt = json_depth.loads(result.stdout, max_depth=512)
         except ValueError as error:
             raise AlertError("fleet_comms delivery returned malformed JSON") from error
         if not isinstance(receipt, dict):

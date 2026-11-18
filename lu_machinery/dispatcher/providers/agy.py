@@ -6,6 +6,7 @@ import re
 from dataclasses import replace
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.dispatcher.providers import read_only_refusal
@@ -60,7 +61,7 @@ def _stderr_capacity(stderr: str) -> str | None:
         if not line.startswith(_AGY_ERROR_PREFIX):
             continue
         try:
-            payload = json.loads(line[len(_AGY_ERROR_PREFIX) :].strip())
+            payload = json_depth.loads(line[len(_AGY_ERROR_PREFIX) :].strip(), max_depth=512)
         except ValueError:
             return None
         if not isinstance(payload, dict):
@@ -191,7 +192,7 @@ def terminal_result_observer(stdout_path):
         pending = lines.pop()
         for line in lines:
             try:
-                event = json.loads(line)
+                event = json_depth.loads(line, max_depth=512)
             except (ValueError, UnicodeDecodeError):
                 continue
             if isinstance(event, dict) and event.get("event") == "result" and isinstance(event.get("result"), dict):
@@ -334,7 +335,7 @@ def continuation(invocation: Invocation, conversation: str) -> Invocation:
     argv = list(invocation.argv)
     if not any(argument.startswith("--conversation=") for argument in argv):
         argv.append(f"--conversation={conversation}")
-    message = json.loads(invocation.stdin or b"{}")
+    message = json_depth.loads(invocation.stdin or b"{}", max_depth=512)
     message["message"]["content"][0]["text"] = _CONTINUE_TEXT
     stdin = (json.dumps(message) + "\n").encode("utf-8")
     return replace(invocation, argv=argv, stdin=stdin)
@@ -377,7 +378,7 @@ def parse(
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except ValueError:
             error = error or "agy: invalid JSON stream"
             stream_clean = False

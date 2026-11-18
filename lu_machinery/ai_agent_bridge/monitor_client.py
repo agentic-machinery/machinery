@@ -35,6 +35,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 from . import _monitor_cache as cache
 
 DEFAULT_BASE_URL = "http://localhost:8765"
@@ -218,7 +220,7 @@ def _parse_projection(body: str) -> dict[str, Any]:
     than raising — this feeds a diff, not a validator.
     """
     try:
-        data = json.loads(body)
+        data = json_depth.loads(body, max_depth=512)
     except (json.JSONDecodeError, TypeError):
         return {"enabled": False, "records": []}
     if not isinstance(data, dict):
@@ -275,7 +277,7 @@ def _is_app_origin_503(status: int, body: str, _headers: dict[str, str]) -> bool
     if status != 503:
         return False
     try:
-        data = json.loads(body) if body else None
+        data = json_depth.loads(body, max_depth=512) if body else None
     except (json.JSONDecodeError, TypeError):
         return False
     return isinstance(data, dict) and data.get("status") in _APP_ORIGIN_503_STATUS_VALUES
@@ -523,7 +525,7 @@ class MonitorClient:
         status, body, _ = self._get("/api/cluster/readiness")
         if status == 200 and body:
             try:
-                return json.loads(body)
+                return json_depth.loads(body, max_depth=512)
             except Exception:
                 pass
         return {
@@ -538,7 +540,7 @@ class MonitorClient:
     def manifest(self) -> dict[str, Any]:
         """Fetch the cold-start manifest. Small, always current."""
         _, body, _ = self._get("/api/state/manifest")
-        return json.loads(body)
+        return json_depth.loads(body, max_depth=512)
 
     def rules(
         self, *, manifest: dict[str, Any] | None = None, scope: str | None = None

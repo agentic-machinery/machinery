@@ -52,9 +52,9 @@ Environment:
 Users: the dispatch pytest plugin (``scripts/ci/pytest_dispatch_cap.py``), the pre-push gate's pytest stage,
 dispatch admission's queue-depth check, ``GET /api/ops/v1/test-slots`` and the CLI below.
 
-Stdlib only and self-contained: the pre-push gate loads this one file by path before any project import is
-trustworthy, so it imports no project module, not even ``scratch.py``. It follows that module's scratch-root
-convention through the two constants below, which a test keeps equal to ``scratch.py``.
+Stdlib only, without package imports: direct-by-path consumers load this file before project package imports
+are trustworthy. It loads only the stdlib-only ``json_depth.py`` sibling for bounded record decoding. It follows
+``scratch.py``'s scratch-root convention through the two constants below, which a test keeps equal to that module.
 """
 
 from __future__ import annotations
@@ -68,6 +68,7 @@ import json
 import math
 import os
 import re
+import runpy
 import secrets
 import stat
 import sys
@@ -76,6 +77,10 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import NamedTuple
+
+# This module also runs directly by path, including under -I. Load only its
+# stdlib-only sibling, without importing the rest of the project package.
+_json_loads = runpy.run_path(str(Path(__file__).with_name("json_depth.py")))["loads"]
 
 # The fleet scratch-root convention of scripts/common/scratch.py, minus its per-process temp fallback.
 SCRATCH_ROOT_ENV = "LU_SCRATCH_ROOT"
@@ -458,7 +463,7 @@ def _discard(path: Path, fd: int) -> None:
 def _read_record(fd: int) -> dict[str, object]:
     try:
         data = os.pread(fd, MAX_RECORD_BYTES + 1, 0)
-        record = json.loads(data) if len(data) <= MAX_RECORD_BYTES else None
+        record = _json_loads(data, max_depth=512) if len(data) <= MAX_RECORD_BYTES else None
     except (OSError, ValueError):
         return {}
     return record if isinstance(record, dict) else {}

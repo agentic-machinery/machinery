@@ -101,7 +101,7 @@ def read_supervisory_request(service: AuthorityService, delivery_id: str, stream
     body = service.read_message_body(message.message_id)
     if len(body.encode("utf-8")) > 1024:
         raise ValueError("supervisory event exceeds the bounded envelope")
-    payload = json.loads(body)
+    payload = json_depth.loads(body, max_depth=_JSON_MAX_DEPTH)
     if (
         not isinstance(payload, dict)
         or set(payload) != {"schema", "action", "stream_id", "generation"}

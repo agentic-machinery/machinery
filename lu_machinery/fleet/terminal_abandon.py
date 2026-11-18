@@ -18,9 +18,8 @@ from typing import Any
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
-
 from lu_machinery.agent_runtime.attribution import resolve_invocation_attribution
-from lu_machinery.common import task_store_paths
+from lu_machinery.common import json_depth, task_store_paths
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.fleet import ignored_task_output as output
 from lu_machinery.orchestration import worktree_artifacts as artifacts
@@ -186,7 +185,7 @@ def _recover_creator(
             continue
         try:
             raw = _regular_bytes(source, primary)
-            archived = json.loads(raw)
+            archived = json_depth.loads(raw, max_depth=512)
             if not isinstance(archived, dict):
                 continue
             recovered = output.recovered_creator(archived, record, tree)
@@ -276,7 +275,7 @@ def record_abandon(
     recovery_reason = f"manual item {task_id}: {RECOVERY}" if recover_creator else RECOVERY
     if path is None:
         raise Refusal("CREATOR_RECOVERY_REQUIRED", recovery_reason)
-    record = json.loads(_regular_bytes(path, primary))
+    record = json_depth.loads(_regular_bytes(path, primary), max_depth=512)
     if not isinstance(record, dict) or (not recover_creator and not output.record_created_worktree(record)):
         raise Refusal("CREATOR_RECOVERY_REQUIRED", recovery_reason)
     if recover_creator and record.get("task_id") != task_id:
@@ -358,7 +357,7 @@ def record_abandon(
             if old["head_sha"] != head or old["reason"] != reason:
                 raise Refusal("ALREADY_RECORDED", "existing abandon differs; no overwrite is permitted")
         bundle = bundle if bundle.is_absolute() else primary / bundle
-        supplied = json.loads(_regular_bytes(bundle, primary))
+        supplied = json_depth.loads(_regular_bytes(bundle, primary), max_depth=512)
         if not isinstance(supplied, dict):
             raise Refusal("PRESERVATION_INVALID", "preservation bundle must be a JSON object")
         # Use an already trusted directory outside the target. A temporary

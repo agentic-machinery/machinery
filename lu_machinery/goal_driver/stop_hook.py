@@ -35,6 +35,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines as split_jsonl_lines
 from lu_machinery.common.repo_root import native_hook_roots
 from lu_machinery.goal_driver.status_lines import (
@@ -57,7 +58,7 @@ def main(stdin: str | None = None) -> int:
     """Hook entry. ``stdin`` is provided in tests; production reads sys.stdin."""
     payload_text = stdin if stdin is not None else sys.stdin.read()
     try:
-        payload = json.loads(payload_text) if payload_text.strip() else {}
+        payload = json_depth.loads(payload_text, max_depth=512) if payload_text.strip() else {}
     except json.JSONDecodeError:
         return 0  # malformed input — never block Stop
 
@@ -178,7 +179,7 @@ def _last_status_from_transcript(transcript_path: Path) -> StatusLine | None:
         if not line.strip():
             continue
         try:
-            event = json.loads(line)
+            event = json_depth.loads(line, max_depth=512)
         except json.JSONDecodeError:
             continue
         text = _extract_assistant_text(event)
@@ -247,7 +248,7 @@ def _query_active_dispatches() -> dict[str, Any] | None:
     try:
         with urllib.request.urlopen(url, timeout=DELEGATE_HTTP_TIMEOUT_S) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-        parsed = json.loads(body)
+        parsed = json_depth.loads(body, max_depth=512)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return None
     return parsed if isinstance(parsed, dict) else None

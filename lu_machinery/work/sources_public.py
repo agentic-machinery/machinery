@@ -26,7 +26,7 @@ from functools import lru_cache
 from typing import Any
 
 import lu_machinery.github_rest_cache as github_rest
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.work import SOURCE_PRIVATE, SOURCE_PUBLIC
 
 GH_ENUM_LIMIT = 1000
@@ -530,7 +530,7 @@ def fetch_open_issues(
             reason=(stderr.strip() or "gh_issue_list_failed")[:200],
         )
     try:
-        payload = json.loads(stdout or "[]")
+        payload = json_depth.loads(stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         return SectionResult("issues", "degraded", reason=f"invalid_gh_json:{exc}")
     if not isinstance(payload, list):
@@ -631,7 +631,7 @@ def _fetch_prs(
             reason=(stderr.strip() or "gh_pr_list_failed")[:200],
         )
     try:
-        payload = json.loads(stdout or "[]")
+        payload = json_depth.loads(stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         return SectionResult(name, "degraded", reason=f"invalid_gh_json:{exc}")
     if not isinstance(payload, list):
@@ -725,7 +725,7 @@ def fetch_issue_states_batched(
         return states
 
     try:
-        payload = json.loads(stdout)
+        payload = json_depth.loads(stdout, max_depth=512)
     except (json.JSONDecodeError, TypeError):
         return states
 

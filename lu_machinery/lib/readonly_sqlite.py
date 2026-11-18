@@ -11,7 +11,6 @@ import fcntl
 import functools
 import importlib
 import inspect
-import json
 import os
 import re
 import sqlite3
@@ -318,7 +317,7 @@ def _declared_writer_paths() -> frozenset[str]:
     candidate = machinery_path("hygiene/sqlite_reference_allowlist.json")
     if not candidate.is_file():
         return frozenset()
-    entries = json.loads(candidate.read_text(encoding="utf-8"))
+    entries = json_depth.loads(candidate.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
     return frozenset(entry["path"] for entry in entries if entry.get("kind") == "writer")
 
 

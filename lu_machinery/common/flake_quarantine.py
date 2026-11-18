@@ -19,6 +19,7 @@ from pathlib import Path
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 REQUIRED = {
@@ -186,10 +187,10 @@ def _check_admission(entry: dict, *, repository: str, destination: Path) -> None
         raise ValueError("admission start date must not be in the future")
 
     endpoint = f"repos/{repository}"
-    issue = json.loads(_gh("api", f"{endpoint}/issues/{entry['fix_issue']}"))
+    issue = json_depth.loads(_gh("api", f"{endpoint}/issues/{entry['fix_issue']}"), max_depth=512)
     if issue.get("state") != "open" or "pull_request" in issue:
         raise ValueError("admission requires an open repair issue, not a PR")
-    approval = json.loads(_gh("api", f"{endpoint}/issues/comments/{entry['admission_approval']}"))
+    approval = json_depth.loads(_gh("api", f"{endpoint}/issues/comments/{entry['admission_approval']}"), max_depth=512)
     marker = f"<!-- flake-quarantine-admission:{admission_digest(entry)}:APPROVE -->"
     if (
         approval.get("issue_url") != issue.get("url")
@@ -200,7 +201,7 @@ def _check_admission(entry: dict, *, repository: str, destination: Path) -> None
     merge_groups: list[tuple[int, datetime]] = []
     main_runs = 0
     for run_id in entry["observed_run_ids"]:
-        run = json.loads(_gh("api", f"{endpoint}/actions/runs/{run_id}"))
+        run = json_depth.loads(_gh("api", f"{endpoint}/actions/runs/{run_id}"), max_depth=512)
         sha = run.get("head_sha", "")
         if (
             run.get("head_repository", {}).get("full_name") != repository
@@ -215,7 +216,7 @@ def _check_admission(entry: dict, *, repository: str, destination: Path) -> None
         else:
             if run.get("head_branch") != "main":
                 raise ValueError(f"run {run_id}: expected completed CI on unmodified main in this repository")
-            comparison = json.loads(_gh("api", f"{endpoint}/compare/{sha}...main"))
+            comparison = json_depth.loads(_gh("api", f"{endpoint}/compare/{sha}...main"), max_depth=512)
             if comparison.get("merge_base_commit", {}).get("sha") != sha:
                 raise ValueError(f"run {run_id}: head is not an ancestor of main")
             main_runs += 1
@@ -282,7 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     if all(entry in previous for entry in entries):
         print(f"Quarantine admission: {len(entries)} entries, 0 changed; offline lint passed")
         return 0
-    repository = json.loads(_gh("repo", "view", "--json", "nameWithOwner"))["nameWithOwner"]
+    repository = json_depth.loads(_gh("repo", "view", "--json", "nameWithOwner"), max_depth=512)["nameWithOwner"]
     try:
         checked = check_admissions(entries, previous, repository=repository)
     except ValueError as exc:

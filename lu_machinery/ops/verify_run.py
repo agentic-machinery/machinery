@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
@@ -262,7 +263,7 @@ def discover_api_paths(
         reason = detail or "openapi.json did not answer"
         raise VerifyFailure(reason, check=_openapi_check(status, elapsed, reason))
     try:
-        document = json.loads(payload.decode("utf-8"))
+        document = json_depth.loads(payload.decode("utf-8"), max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise VerifyFailure(
             "openapi.json was not JSON",
@@ -338,7 +339,7 @@ def _health_ok(status: int | None, payload: bytes) -> bool:
     if status != 200:
         return False
     try:
-        document = json.loads(payload.decode("utf-8"))
+        document = json_depth.loads(payload.decode("utf-8"), max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     return isinstance(document, dict) and document.get("status") == "ok"
@@ -346,7 +347,7 @@ def _health_ok(status: int | None, payload: bytes) -> bool:
 
 def _verify_word_ok(payload: bytes) -> bool:
     try:
-        document = json.loads(payload.decode("utf-8"))
+        document = json_depth.loads(payload.decode("utf-8"), max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     result = document.get("result") if isinstance(document, dict) else None

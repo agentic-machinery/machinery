@@ -27,7 +27,6 @@ host-load cache that only the product routes keep.
 from __future__ import annotations
 
 import functools
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -251,7 +250,7 @@ class _RegistryOnlyAtlas:
 def _registry_only_atlas() -> AtlasProvider | None:
     path = config.PRODUCT_ROOT / ATLAS_REGISTRY_DATA
     try:
-        name = json.loads(path.read_text(encoding="utf-8"))["module"]
+        name = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)["module"]
         jobs = load_configured_module(name, product_root=config.PRODUCT_ROOT)
     except (OSError, ValueError, KeyError, TypeError, ImportError):
         return None

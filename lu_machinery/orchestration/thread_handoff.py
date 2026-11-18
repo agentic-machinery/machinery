@@ -34,7 +34,7 @@ from typing import Any
 # This selects code only; product and shared-state roots remain explicitly configured.
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.common.repo_root import state_root as shared_state_root
 from lu_machinery.identity import KNOWN_HARNESS_EXECUTABLES
@@ -262,7 +262,7 @@ def refuse_live_legacy_successor(state_root: Path, *, agent: str, thread_id: str
     if lease_path.is_symlink():
         raise ValueError("successor heartbeat lease must not be a symlink")
     if lease_path.exists():
-        lease = json.loads(lease_path.read_text(encoding="utf-8"))
+        lease = json_depth.loads(lease_path.read_text(encoding="utf-8"), max_depth=512)
         if not isinstance(lease, dict):
             raise ValueError("successor heartbeat lease is malformed")
         if lease.get("owner_thread_id") == thread_id and lease.get("heartbeat_at"):
@@ -377,7 +377,7 @@ def http_get_json(base_url: str, path: str, timeout_s: float = 3.0) -> dict[str,
     except (OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
         return {"_error": f"{type(exc).__name__}: {exc}"}
     try:
-        data = json.loads(body)
+        data = json_depth.loads(body, max_depth=512)
     except json.JSONDecodeError as exc:
         return {"_error": f"JSONDecodeError: {exc}"}
     return data if isinstance(data, dict) else {"value": data}
@@ -406,7 +406,7 @@ def gh_json(repo_root: Path, args: list[str], timeout_s: int = 15) -> Any:
     if result.returncode != 0:
         return {"_error": result.stderr or result.stdout or "gh command failed"}
     try:
-        return json.loads(result.stdout or "[]")
+        return json_depth.loads(result.stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         return {"_error": f"JSONDecodeError: {exc}"}
 
@@ -658,7 +658,7 @@ def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -843,7 +843,7 @@ def _read_lease_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
         return None, None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
     if not isinstance(payload, dict):
@@ -1774,7 +1774,7 @@ def request_claudex_rollover(
         detail = result.stderr or result.stdout or "request command failed"
         raise ValueError(f"Claudex rollover request failed: {detail}")
     try:
-        payload = json.loads(result.stdout)
+        payload = json_depth.loads(result.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         raise ValueError("Claudex rollover request returned malformed JSON") from exc
     if (
@@ -4426,7 +4426,7 @@ def newer_lane_handoff(
         try:
             with _BundleReconcileTree(state_root, packet_agent, lineage_id) as tree:
                 payload = tree.read_path(receipt_path)
-            receipt = json.loads(payload) if payload is not None else None
+            receipt = json_depth.loads(payload, max_depth=512) if payload is not None else None
             if (
                 isinstance(receipt, dict)
                 and receipt.get("schema") == "rollover-bundle-receipt.v1"

@@ -32,6 +32,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
+
 from .adapters.base import InvocationPlan
 from .registry import AGENTS
 
@@ -132,7 +134,7 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None

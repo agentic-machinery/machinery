@@ -62,9 +62,8 @@ from xml.etree import ElementTree
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.ci._location import module_name
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import product_root, product_tree_path
 
 DEFAULT_DURATIONS = Path("ci/pytest-file-durations.json")
@@ -114,7 +113,7 @@ def resolve_duration_path(refresh_result: str, snapshot: Path) -> Path:
     if duration_source_decision(refresh_result) == SOURCE_COMMITTED:
         return product_tree_path(*DEFAULT_DURATIONS.parts).relative_to(product_root())
     try:
-        validate_durations(json.loads(snapshot.read_text(encoding="utf-8")))
+        validate_durations(json_depth.loads(snapshot.read_text(encoding="utf-8"), max_depth=512))
     except (OSError, ValueError):
         raise DurationSnapshotRequired(
             "refresh succeeded but the shared duration snapshot is unavailable"
@@ -180,7 +179,7 @@ def archive_durations(payload: bytes) -> dict[str, float]:
             data = member.read(MAX_MEMBER_BYTES + 1)
         if len(data) > MAX_MEMBER_BYTES:
             raise ValueError("timing member exceeds size limit")
-    return validate_durations(json.loads(data))
+    return validate_durations(json_depth.loads(data, max_depth=512))
 
 
 def refresh_durations(repo: str, fallback: Path, output: Path, limit: int = SAMPLE_LIMIT) -> int:
@@ -192,13 +191,13 @@ def refresh_durations(repo: str, fallback: Path, output: Path, limit: int = SAMP
     """
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", repo) or not 1 <= limit <= 20:
         raise ValueError("expected owner/repo and a sample limit in 1..20")
-    recorded = validate_durations(json.loads(fallback.read_text(encoding="utf-8")))
+    recorded = validate_durations(json_depth.loads(fallback.read_text(encoding="utf-8"), max_depth=512))
     samples = []
     try:
-        runs = json.loads(
-            github_api(f"repos/{repo}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100")
+        runs = json_depth.loads(
+            github_api(f"repos/{repo}/actions/workflows/ci.yml/runs?event=merge_group&status=success&per_page=100"), max_depth=512
         )["workflow_runs"]
-        listing = json.loads(github_api(f"repos/{repo}/actions/artifacts?name={TIMING_ARTIFACT}&per_page=100"))
+        listing = json_depth.loads(github_api(f"repos/{repo}/actions/artifacts?name={TIMING_ARTIFACT}&per_page=100"), max_depth=512)
         by_run: dict[int, list[dict]] = defaultdict(list)
         for artifact in listing["artifacts"]:
             if artifact["name"] == TIMING_ARTIFACT and not artifact["expired"]:
@@ -348,7 +347,7 @@ def shard_file_seconds(results: Path) -> tuple[dict[str, float], dict[str, float
         files = listing.read_text(encoding="utf-8").split()
         observed = junit_file_seconds([listing.with_name(f"{shard}.xml")])
         weights_path = listing.with_name(f"{shard}-weights.json")
-        weights = json.loads(weights_path.read_text(encoding="utf-8")) if weights_path.exists() else {}
+        weights = json_depth.loads(weights_path.read_text(encoding="utf-8"), max_depth=512) if weights_path.exists() else {}
         if weights:
             validate_durations(weights)
         speeds[shard] = speed = runner_speed(observed, {name: weights[name] for name in files if name in weights})
@@ -444,7 +443,7 @@ Related: .github/workflows/ci.yml; issues #9065 and #11040.
         return 0
     if args.command == "validate":
         try:
-            validate_durations(json.loads(args.snapshot.read_text(encoding="utf-8")))
+            validate_durations(json_depth.loads(args.snapshot.read_text(encoding="utf-8"), max_depth=512))
         except (OSError, ValueError):
             print("duration snapshot unavailable or invalid", file=sys.stderr)
             return 1
@@ -477,7 +476,7 @@ Related: .github/workflows/ci.yml; issues #9065 and #11040.
         parser.error("no test files on stdin")
     durations_path = args.durations if args.durations is not None else product_tree_path(*DEFAULT_DURATIONS.parts)
     history_path = args.history if args.history is not None else product_tree_path(*DEFAULT_HISTORY.parts)
-    recorded = validate_durations(json.loads(durations_path.read_text(encoding="utf-8")))
+    recorded = validate_durations(json_depth.loads(durations_path.read_text(encoding="utf-8"), max_depth=512))
     shard = assign(files, recorded, args.shard_count, read_list(history_path))[args.shard - 1]
     if args.weights_out is not None:
         weights = {name: recorded[name] for name in shard if name in recorded}

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import os
 import subprocess
 import sys
@@ -33,8 +32,8 @@ from pathlib import Path, PurePosixPath
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.ci._location import checkout_relative
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 DENOMINATOR_REL = "scripts/ci/dependency_change_denominator.json"
@@ -65,7 +64,7 @@ def denominator_path(root: Path | None = None) -> Path:
 
 def load_denominator(path: Path | None = None) -> dict:
     target = path or denominator_path()
-    data = json.loads(target.read_text(encoding="utf-8"))
+    data = json_depth.loads(target.read_text(encoding="utf-8"), max_depth=512)
     if not isinstance(data, dict):
         raise ValueError(f"{target}: expected a JSON object")
     paths = data.get("paths")

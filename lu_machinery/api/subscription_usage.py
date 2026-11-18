@@ -35,6 +35,7 @@ from lu_machinery.agent_runtime.codex_accounts import (
     DEFAULT_CODEX_ACCOUNT,
 )
 from lu_machinery.api.state_helpers import cache_get_with_age, cache_invalidate, cache_set
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.fleet.credit_lane import SUBSCRIPTION_NEAR_CAP_USED_PCT
 
@@ -1089,7 +1090,7 @@ def _probe_antigravity_native(*, timeout_s: float) -> dict[str, Any]:
             )
         )
     try:
-        payload = json.loads(completed.stdout or "")
+        payload = json_depth.loads(completed.stdout or "", max_depth=512)
     except json.JSONDecodeError:
         return _agy_finish_unparsed(
             _normalize_provider_error(
@@ -2375,7 +2376,7 @@ def _provider_lkg_path() -> Path:
 def _read_provider_lkg() -> dict[str, Any]:
     path = _provider_lkg_path()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
