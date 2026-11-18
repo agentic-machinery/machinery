@@ -389,6 +389,9 @@ def test_retired_non_native_lease_with_bound_fallback_projects_replacement_creat
 
     assert lease["replacement"]["title_transition"]["state"] == "fallback_recorded"
     assert record["state"] == registry.RolloverState.REPLACEMENT_CREATED.value
+    assert registry.next_safe_action(record) == (
+        "run bootstrap-replacement with the exact lineage, rollover and authoritative replacement thread ID"
+    )
 
 
 def test_stale_age_is_read_only_and_never_deletes_packet(tmp_path: Path) -> None:
@@ -1029,3 +1032,7 @@ def test_every_success_boundary_is_idempotent_after_crash_retry(tmp_path: Path) 
 
         assert first == second
         assert sum(event.get("operation_id") == operation_id for event in second["history"]) == 1
+        if boundary is registry.RolloverState.PREDECESSOR_ARCHIVED:
+            assert registry.next_safe_action(second) == (
+                "request FINISH_CLEANUP library maintenance with exact heartbeat retirement proof and authorization"
+            )

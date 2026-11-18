@@ -41,12 +41,11 @@ heartbeat-retired records are excluded from live-pending detection.
 
 ## Detection and audit
 
-Exact selectors are ANDed when more than one is supplied:
-
-- `--source-thread-id`
-- `--replacement-thread-id`
-- `--lineage-id`
-- `--rollover-id`
+The retained `rollover_registry.select_exact(records, ...)` library API ANDs
+its supplied `agent`, `source_thread_id`, `replacement_thread_id`, `lineage_id`
+and `rollover_id` selectors. A caller must require one unique match before
+mutation. Ordinary replacement resume uses `thread_handoff bootstrap-replacement`
+with the exact lineage, rollover and replacement thread IDs.
 
 One exact unique match may proceed even while unrelated packets are pending. A
 generic lookup with multiple live matches is read-only and returns every
@@ -54,7 +53,7 @@ candidate's title, issue/epic, exact IDs, state, age, last successful boundary,
 and next safe action. Any corrupt durable source also makes generic detection
 non-mutating. It never chooses by recency, title, or filesystem order.
 
-`audit` classifies every valid or corrupt entry as one of:
+The retained `audit_fleet(state_root)` library API classifies every valid or corrupt entry as one of:
 
 - active and resumable;
 - awaiting native action;
@@ -78,8 +77,8 @@ require an explicit receipted disposition.
 
 ## Authoritative reconciliation
 
-`reconcile-exact` consumes an operator-captured JSON snapshot bound to the exact
-registry key. The snapshot contains:
+The retained `reconcile_snapshot(record, snapshot)` library API compares an
+operator-captured JSON snapshot bound to the exact registry key. The snapshot contains:
 
 - `source`: exact predecessor ID, archive state, and archive receipt path;
 - `replacement`: existence, exact replacement ID, and native title;
@@ -92,17 +91,25 @@ registry key. The snapshot contains:
 
 Reconciliation never infers creation, archival, confirmation, or heartbeat
 retirement from a title, task absence, local process absence, or elapsed time.
-It is read-only unless `--apply` is supplied. Apply writes a deterministic
-receipt under the exact registry record and refuses inconsistent snapshots.
+`reconcile_snapshot` is read-only. Explicitly authorized
+`apply_reconciliation(state_root, record=record, snapshot=snapshot)` writes a
+deterministic receipt under the exact registry record and refuses inconsistent
+snapshots.
 
 ## Maintenance
 
-The safe commands are `resume-exact`, `reconcile-exact`,
-`finish-cleanup-exact`, `supersede-exact`, `abandon-exact`, and
-`dispose-exited-successor-exact`. Cleanup,
-supersession, and abandonment are two-step `--plan` / `--apply` operations.
-Apply validates the immutable plan's digest, action, and exact key before any
-mutation and writes an apply intent plus durable receipt.
+The retained library separates planning from apply:
+
+- `create_maintenance_plan(state_root, record=record, action=action, proof=proof)`
+  validates exact evidence and returns an immutable `plan_path`.
+- `apply_maintenance_plan(state_root, plan_path=path)` revalidates the plan's
+  digest, action and exact key, then writes an apply intent and durable receipt.
+
+The supported `MaintenanceAction` values are `FINISH_CLEANUP`, `SUPERSEDE`,
+`ABANDON`, `DISPOSE_EXITED_SUCCESSOR` and `DISPOSE_LEGACY_RESUMED`. These APIs
+retain their authorization and proof requirements; planning is not permission
+to apply or to change a lease. Native replacement resume, confirmation and
+archive continue through the retained `thread_handoff` commands.
 
 Supersession or abandonment proof must assert all of the following and include
 durable evidence paths:
@@ -120,11 +127,11 @@ cleanup.
 
 ### Exited successor disposition
 
-`dispose-exited-successor-exact` is the runtime-backed maintenance exception for an
+`MaintenanceAction.DISPOSE_EXITED_SUCCESSOR` is the runtime-backed maintenance exception for an
 exited resumed or confirmed successor. It records `ABANDONED_WITH_PROOF`,
 retains the last successful boundary and all packet and lease files, and uses
 the existing immutable plan, lineage lock, apply intent and receipt. The
-supersede and abandon commands still refuse confirmed successors.
+`SUPERSEDE` and `ABANDON` actions still refuse confirmed successors.
 
 The proof must contain exactly the selected `agent`, `lineage_id`,
 `rollover_id`, UTC `captured_at`, nonempty `reason`, `assertions`,
@@ -164,10 +171,10 @@ are not substitutes.
 
 ### Operator disposition of a legacy resumed successor
 
-`dispose-legacy-resumed-exact` admits only an exact Codex `RESUMED` record
+`MaintenanceAction.DISPOSE_LEGACY_RESUMED` admits only an exact Codex `RESUMED` record
 whose native creation is `legacy_or_unrecorded` and whose successor has no
 supervisor runtime. This is an attributed operator disposition, not proof of
-native exit. `dispose-exited-successor-exact` still refuses missing, active or
+native exit. `DISPOSE_EXITED_SUCCESSOR` still refuses missing, active or
 non-exited runtime evidence.
 
 The proof contains exactly `agent`, `lineage_id`, `rollover_id`, UTC
@@ -195,7 +202,8 @@ excludes that exact terminal record. It neither deletes nor releases a lease.
 
 ## Migration
 
-Migration scans versioned lease files and immutable task-family plans. Planning
+The retained `migrate_existing(state_root, apply=False, evidence="")` library
+API scans versioned lease files and immutable task-family plans. Planning
 is read-only. Apply refuses corrupt inputs, preserves historical proof paths and
 receipts, appends a migration event, and writes a migration receipt. It never
 rewrites or deletes legacy history.
