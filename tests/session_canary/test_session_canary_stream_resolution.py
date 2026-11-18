@@ -7,10 +7,11 @@ import subprocess
 
 import pytest
 import yaml
-from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.session_canary import codex_lane, gemini_lane, grok_lane, handoff_select
 
-LANES = (codex_lane, gemini_lane, grok_lane)
+from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.session_canary import codex_lane, gemini_lane, handoff_select, recall_core
+
+LANES = (codex_lane, gemini_lane, recall_core)
 
 
 def _selectors() -> list[str]:

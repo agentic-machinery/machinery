@@ -7,8 +7,8 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from lu_machinery.session_canary import diary, grok_lane, handoff_select, muse_lane
 
+from lu_machinery.session_canary import diary, handoff_select, muse_lane, recall_core
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -60,7 +60,7 @@ def test_mint_and_score_real_ten_anchor_pass_and_fail(
 ) -> None:
     monkeypatch.setenv("SESSION_STREAM_ID", "epic:999999")  # Ambient foreign lease cannot retarget mint.
     monkeypatch.delenv("LU_RULES_SEAT", raising=False)
-    monkeypatch.setattr(grok_lane, "_load_ranked", lambda *a, **kw: [])
+    monkeypatch.setattr(recall_core, "_load_ranked", lambda *a, **kw: [])
     monkeypatch.setattr(
         handoff_select,
         "load_stream_entries",
@@ -82,7 +82,7 @@ def test_mint_and_score_real_ten_anchor_pass_and_fail(
         ),
     )
     monkeypatch.setattr(diary, "try_stream_state_note", lambda *a, **kw: None)
-    monkeypatch.setattr(grok_lane, "emit_hydrate_capsule", lambda **kw: "test hydration")
+    monkeypatch.setattr(recall_core, "emit_hydrate_capsule", lambda **kw: "test hydration")
     handoff = tmp_path / "MUSE-DRIVER-HANDOFF.md"
     handoff.write_text("## Next drive order\n- Score canary at rollover\n## Hands-off\n- Foreign lanes\n")
     canary = tmp_path / "canary"
@@ -136,7 +136,7 @@ def test_mint_and_score_real_ten_anchor_pass_and_fail(
 
 def test_missing_anchors_is_a_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *a, **kw: [])
-    monkeypatch.setattr(grok_lane, "_load_ranked", lambda *a, **kw: [])
+    monkeypatch.setattr(recall_core, "_load_ranked", lambda *a, **kw: [])
     assert muse_lane.main(["--repo", str(tmp_path), "mint", "--epic", "devops"]) == 1
     assert list(tmp_path.iterdir()) == []
 
@@ -170,8 +170,8 @@ def test_alias_admission_uses_canonical_stream_without_running_canary(
         return 0
 
     monkeypatch.delenv("LU_RULES_SEAT", raising=False)
-    monkeypatch.setattr(grok_lane, "cmd_mint", capture)
-    monkeypatch.setattr(grok_lane, "cmd_score", capture)
+    monkeypatch.setattr(recall_core, "cmd_mint", capture)
+    monkeypatch.setattr(recall_core, "cmd_score", capture)
     args = ["--repo", str(tmp_path), command, "--epic", selector]
     if command == "score":
         args += ["--answers", "unused.json"]

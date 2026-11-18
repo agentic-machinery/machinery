@@ -221,7 +221,7 @@ def test_bare_codex_prepare_inside_a_lane_uses_the_launcher_slot(tmp_path, monke
 
 def test_2026_11_02_relaunch_resumes_the_lane_packet_and_mints_ten_anchors(tmp_path, monkeypatch, capsys):
     """Packet under the lane slot, older bare-namespace packets, empty markdown, DB handoff present."""
-    from lu_machinery.session_canary import codex_lane, grok_lane, handoff_select
+    from lu_machinery.session_canary import codex_lane, handoff_select, recall_core
 
     _rollover_fixture(monkeypatch)
     for index in range(5):  # The lane's earlier, never-resumed packets under `codex`.
@@ -272,7 +272,7 @@ def test_2026_11_02_relaunch_resumes_the_lane_packet_and_mints_ten_anchors(tmp_p
     }
     reads = []
     monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_a, **_k: list(stream))
-    monkeypatch.setattr(grok_lane.subprocess, "run", lambda command, **_k: subprocess.CompletedProcess(command, 0, "", ""))
+    monkeypatch.setattr(recall_core.subprocess, "run", lambda command, **_k: subprocess.CompletedProcess(command, 0, "", ""))
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
     monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane))
     mint = ["--repo", str(tmp_path), "mint", "--epic", "curriculum-upgrade", "--stream", "epic:1001"]

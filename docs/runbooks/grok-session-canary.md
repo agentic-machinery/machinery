@@ -1,5 +1,7 @@
 # Grok session canary + diary dual-write policy
 
+The Grok lane canary CLI (`session_canary.grok_lane`) was retired in #512; no launcher starts a Grok driver. Its mint/score core is `lu_machinery/session_canary/recall_core.py`, used by the Codex, Gemini and Muse lanes.
+
 For an authorized CLI seat move, follow [Move a driver seat to another CLI](driver-seat-cli-move.md); the launcher owns lease release.
 
 ## Problem
@@ -34,14 +36,6 @@ hydrate, or re-load the diary. Restart only when FAIL-HANDOFF ends the seat
 
 Promote load-bearing mid-flight facts **before** compact risk (~60–70% context or after each batch):
 
-```bash
-.venv/bin/python -m lu_machinery.session_canary.grok_lane stamp --epic <epic> \
-  --title "pre-compact promote" \
-  --bullet "what just finished" \
-  --next "concrete next action" \
-  --workset "open blocker / phase receipt path / pilot clone path"
-```
-
 Mintable sections: **## Next Drive**, **## Active Working Set**, **## Hands-off**.
 
 After every compact (including when canary still PASSes):
@@ -65,7 +59,7 @@ The dual-write board under `.claude/<epic>-epic/*-DRIVER-HANDOFF.md` is a **diar
 ### Mintable sections (keep short)
 
 Canary mint pulls bullets from headings matching **Next Drive** / **Active Working Set** /
-**Hands-off** (see `lu_machinery/session_canary/grok_lane.py`). Prefer:
+**Hands-off** (see `lu_machinery/session_canary/handoff_select.py`). Prefer:
 
 ```markdown
 ## Next Drive
@@ -84,39 +78,6 @@ Canary mint pulls bullets from headings matching **Next Drive** / **Active Worki
 
 Never put API keys, private teacher PII, or private-repo secrets in the diary.
 
-### CLI
-
-```bash
-# Post-compact (automatic): score FROM MEMORY — PASS auto-prints hydrate capsule
-.venv/bin/python -m lu_machinery.session_canary.grok_lane score \
-  --epic harness --answers .claude/harness-epic/canary/answers.json \
-  --context-tokens 250000
-# Optional: --no-hydrate to skip; --hydrate-write for canary/hydrate.md receipt
-# Standalone hydrate only if you need a re-print:
-#   .venv/bin/python -m scripts.session_canary.grok_lane hydrate --epic harness
-
-# Mid-batch diary stamp + refresh Next Drive
-.venv/bin/python -m lu_machinery.session_canary.grok_lane stamp --epic harness \
-  --title "merged continuity PRs" \
-  --bullet "#5532 MERGED" --bullet "#5533 MERGED" \
-  --next "Dispatch Terra B1" --next "Start Grok PR-C"
-
-# Clean close while canary still PASS
-.venv/bin/python -m lu_machinery.session_canary.grok_lane handback --epic harness \
-  --reason "clean end" \
-  --canary-line "canary PASS 10/10 @ ~200k tok" \
-  --next "Resume Wave 1 B1" \
-  --pin "Sol SHIP memo binding" \
-  --open-pr "none"
-
-# FAIL-HANDOFF is automatic on score rc 2; optional overrides:
-.venv/bin/python -m lu_machinery.session_canary.grok_lane score \
-  --epic harness --answers .claude/harness-epic/canary/answers.json \
-  --context-tokens 250000 \
-  --next-drive "Load STATE AT HANDBACK; mint; resume B1" \
-  --open-prs "PR #N still open"
-```
-
 Implementation: `lu_machinery/session_canary/diary.py`.
 
 ## Operator config (recommended)
@@ -129,24 +90,6 @@ auto_compact_threshold_percent = 85
 ```
 
 Operator 2026-09-21: keep the product default of 85%. Do not raise it.
-
-## CLI (canary)
-
-```bash
-# Within thread-rollover, after launcher lease setup + diary load
-.venv/bin/python -m lu_machinery.session_canary.grok_lane mint --epic atlas --stream epic:4387
-.venv/bin/python -m lu_machinery.session_canary.grok_lane questions --epic atlas
-
-# Mid-session / post-compact (answers FROM MEMORY — do not re-open probe.json)
-.venv/bin/python -m lu_machinery.session_canary.grok_lane score \
-  --epic atlas \
-  --answers .claude/atlas-epic/canary/answers.json \
-  --context-tokens 250000 \
-  --model grok-4.7
-
-.venv/bin/python -m lu_machinery.session_canary.grok_lane status --epic atlas
-.venv/bin/python -m lu_machinery.session_canary.grok_lane protocol --epic atlas
-```
 
 Artifacts live under gitignored `.claude/<epic>-epic/canary/`.
 

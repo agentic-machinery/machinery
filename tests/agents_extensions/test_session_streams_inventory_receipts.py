@@ -10,10 +10,6 @@ import pytest
 import yaml
 
 from lu_machinery.session_streams import inventory as stream_inventory
-
-
-
-
 from lu_machinery.session_streams.cli import main
 from lu_machinery.session_streams.db import SessionStreamDatabase, load_migrations
 from lu_machinery.session_streams.inventory import (
@@ -26,7 +22,6 @@ from lu_machinery.session_streams.inventory import (
 from lu_machinery.session_streams.receipts import (
     inventory_registration_summary,
     list_migration_state,
-    record_projection_receipt,
     register_manifest_inventory,
 )
 from lu_machinery.session_streams.store import SessionStreamStore
@@ -328,30 +323,6 @@ def test_register_manifest_inventory_writes_receipts(tmp_path: Path) -> None:
         statuses = {str(r["status"]) for r in inv_rows}
         assert "inventoried" in statuses
         assert "missing" in statuses
-
-
-def test_projection_receipt_records_drift(tmp_path: Path) -> None:
-    repo = _fixture_repo(tmp_path)
-    store = SessionStreamStore(SessionStreamDatabase(tmp_path / "streams.sqlite3"))
-    register_manifest_inventory(store, repo)
-    pid = record_projection_receipt(
-        store,
-        stream_id="epic:1001",
-        target_path=".claude/alpha-epic/CLAUDE-DRIVER-HANDOFF.md",
-        target_sha256="a" * 64,
-        projection_body="projected body",
-        status="drift",
-        error="file hash diverged",
-    )
-    assert pid >= 1
-    summary = inventory_registration_summary(store)
-    assert summary["projection_receipts"] == 1
-    with store._read_snapshot() as conn:
-        events = conn.execute(
-            "SELECT event_type FROM stream_control_events "
-            "WHERE stream_id = 'epic:1001' AND event_type = 'drift_detected'"
-        ).fetchall()
-        assert len(events) == 1
 
 
 def test_cli_inventory_json_and_register(tmp_path: Path, capsys) -> None:

@@ -1,7 +1,8 @@
-"""Diary dual-write helpers for Grok lane canary recovery."""
+"""Diary helpers for recall canary recovery."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -10,8 +11,9 @@ import threading
 from pathlib import Path
 
 import pytest
+
 from lu_machinery.session_canary import diary as d
-from lu_machinery.session_canary import grok_lane as gl
+from lu_machinery.session_canary import recall_core as gl
 
 
 def test_append_diary_stamp_and_next_drive(tmp_path: Path) -> None:
@@ -84,24 +86,26 @@ def test_score_fail_writes_handback(tmp_path: Path, monkeypatch) -> None:
         "lu_machinery.session_canary.diary.resolve_handoff_path",
         lambda repo, epic, override=None, preferred=None: handoff,
     )
-    rc = gl.main(
-        [
-            "--repo",
-            str(tmp_path),
-            "score",
-            "--epic",
-            "harness",
-            "--out-dir",
-            str(canary),
-            "--answers",
-            str(answers),
-            "--context-tokens",
-            "999",
-            "--handoff",
-            str(handoff),
-            "--next-drive",
-            "Load handback; mint",
-        ]
+    rc = gl.cmd_score(
+        argparse.Namespace(
+            repo=tmp_path,
+            epic="harness",
+            out_dir=str(canary),
+            answers=str(answers),
+            context_tokens=999,
+            model="test-model",
+            pass_ratio=gl.DEFAULT_PASS_RATIO,
+            threshold=gl.DEFAULT_SIM_THRESHOLD,
+            handoff=str(handoff),
+            next_drive="Load handback; mint",
+            pins="",
+            open_prs="",
+            hands_off="",
+            pending_user="",
+            worktrees="",
+            no_hydrate=False,
+            preferred=None,
+        )
     )
     assert rc == 2
     text = handoff.read_text(encoding="utf-8")

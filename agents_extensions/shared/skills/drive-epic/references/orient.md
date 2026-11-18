@@ -21,7 +21,6 @@ curl -sS --max-time 2 "http://127.0.0.1:8765/api/orient?lean=true" || true
 curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/projection?stream=<your-stream>" || true  # best-effort: local server, degraded/absent sources are normal
 curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/next?stream=<your-stream>" || true  # stream-scoped pick list (#6880)
 .venv/bin/python -m lu_machinery.fleet_comms plane-status        # message-plane mode/parity
-.venv/bin/python -m lu_machinery.session_streams dual-write-status
 ```
 
 `cold-start-board` probes fleet, plane, and stream state so you orient from live data,
@@ -30,8 +29,7 @@ hard-code a mode in prose; always query it fresh.
 
 Know your `SESSION_EPIC`, your stream, and your handoff slot (the launcher already
 claimed the stream lease — do **not** open or resume it yourself). Establish your
-session-health signal **by seat**: **grok / gemini** have a canary lane —
-`.venv/bin/python -m lu_machinery.session_canary.grok_lane mint --epic <epic>` or
+session-health signal **by seat**: **gemini** has a canary lane —
 `.venv/bin/python -m lu_machinery.session_canary.gemini_lane mint --epic <epic>`;
 **Claude / Sonnet** have **no** canary lane and use the native SessionStart / PostCompact
 hook chain + thread-handoff instead (do not call a non-existent `<model>_lane`).

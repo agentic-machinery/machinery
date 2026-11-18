@@ -17,10 +17,10 @@ from typing import Any
 
 from lu_machinery.common.epic_selector import validate_epic
 from lu_machinery.common.repo_root import state_root
-from lu_machinery.session_canary import grok_lane as _gl
 from lu_machinery.session_canary import handoff_select, shared_hydration
+from lu_machinery.session_canary import recall_core as _gl
 
-# This package's import name, as ``python -m`` names its modules (derived once, in grok_lane).
+# This package's import name, as ``python -m`` names its modules (derived once, in recall_core).
 _PACKAGE = _gl._PACKAGE
 
 _HOLDER_AGENT = "gemini"

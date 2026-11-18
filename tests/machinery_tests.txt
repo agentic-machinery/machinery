@@ -169,9 +169,7 @@ tests/agents_extensions/test_rules_core_structural_coverage.py
 tests/agents_extensions/test_session_stream_handoff.py
 tests/agents_extensions/test_session_streams.py
 tests/agents_extensions/test_session_streams_cli.py
-tests/agents_extensions/test_session_streams_dual_write_status.py
 tests/agents_extensions/test_session_streams_inventory_receipts.py
-tests/agents_extensions/test_session_streams_projection.py
 tests/agents_extensions/test_shell_redirects.py
 tests/agents_extensions/test_skill_instruction_routes.py
 tests/agents_extensions/test_tool_timing_hook.py
@@ -600,7 +598,7 @@ tests/safe_env/test_safe_env.py
 tests/session_canary/test_codex_lane_canary.py
 tests/session_canary/test_gemini_lane_session_canary.py
 tests/session_canary/test_git_probe_timeouts.py
-tests/session_canary/test_grok_lane_session_canary.py
+tests/session_canary/test_recall_core.py
 tests/session_canary/test_session_canary_diary.py
 tests/session_canary/test_session_canary_handoff_select.py
 tests/session_canary/test_session_canary_muse_lane.py

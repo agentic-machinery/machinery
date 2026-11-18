@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -10,7 +11,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from lu_machinery.session_canary import codex_lane, diary, gemini_lane, grok_lane, handoff_select
+
+from lu_machinery.session_canary import codex_lane, diary, gemini_lane, handoff_select, recall_core
 
 _STREAM = [
     {"type": "binding_order", "body": f"Binding order {i} forbids shortcuts in this lane."} for i in range(1, 5)
@@ -22,7 +24,6 @@ _STREAM = [
 _LANES = (
     (codex_lane, "CODEX-DRIVER-HANDOFF.md"),
     (gemini_lane, "GEMINI-DRIVER-HANDOFF.md"),
-    (grok_lane, "GROK-DRIVER-HANDOFF.md"),
 )
 
 
@@ -63,11 +64,48 @@ def _patch_mint(monkeypatch: pytest.MonkeyPatch) -> None:
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
 
-    monkeypatch.setattr(grok_lane.subprocess, "run", _freeze)
+    monkeypatch.setattr(recall_core.subprocess, "run", _freeze)
+
+
+def _core_main(argv: list[str]) -> int:
+    """Drive the lane-neutral core the way the retired Grok CLI did (#512)."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", type=Path)
+    sub = parser.add_subparsers(dest="command", required=True)
+    mint = sub.add_parser("mint")
+    mint.add_argument("--epic", required=True)
+    mint.add_argument("--stream", default=None)
+    mint.add_argument("--handoff", default=None)
+    mint.add_argument("--out-dir", default=None)
+    mint.add_argument("--stream-limit", type=int, default=40)
+    mint.set_defaults(func=recall_core.cmd_mint)
+    score = sub.add_parser("score")
+    score.add_argument("--epic", required=True)
+    score.add_argument("--stream", default=None)
+    score.add_argument("--out-dir", default=None)
+    score.add_argument("--answers", required=True)
+    score.add_argument("--handoff", default=None)
+    score.add_argument("--no-hydrate", action="store_true")
+    score.set_defaults(
+        func=recall_core.cmd_score,
+        context_tokens=0,
+        model="test-model",
+        pass_ratio=recall_core.DEFAULT_PASS_RATIO,
+        threshold=recall_core.DEFAULT_SIM_THRESHOLD,
+        next_drive="",
+        pins="",
+        open_prs="",
+        hands_off="",
+        pending_user="",
+        worktrees="",
+    )
+    args = parser.parse_args(argv)
+    return int(args.func(args))
 
 
 def _mint(module, tmp_path: Path, extra: list[str] | None = None) -> int:
-    return module.main(
+    main = _core_main if module is recall_core else module.main
+    return main(
         [
             "--repo",
             str(tmp_path),
@@ -138,7 +176,7 @@ def test_touched_undated_interim_loses_to_dated_claude(tmp_path: Path) -> None:
     epic = _epic(tmp_path)
     _write(epic / "INTERIM-DRIVER-HANDOFF.md", "# Interim\n\nno session heading\n", mtime=5_000_000_000)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", "## Session 2026-09-23\n\nfresh\n", mtime=50)
-    assert _existing(grok_lane._handoff_candidates(tmp_path, "atlas"))[0] == "CLAUDE-DRIVER-HANDOFF.md"
+    assert _existing(recall_core._handoff_candidates(tmp_path, "atlas"))[0] == "CLAUDE-DRIVER-HANDOFF.md"
 
 
 def test_session_heading_beats_equal_mtime_and_a_later_touch(tmp_path: Path) -> None:
@@ -148,12 +186,12 @@ def test_session_heading_beats_equal_mtime_and_a_later_touch(tmp_path: Path) -> 
     _write(interim, "## Session 2026-09-14\n\nstale\n", mtime=5_000_000_000)
     _write(claude, "## Session 2026-09-23\n\nfresh\n", mtime=50)
     # Equalize after the touched-stale case is covered by the huge interim mtime.
-    ranked = _existing(grok_lane._handoff_candidates(tmp_path, "atlas"))
+    ranked = _existing(recall_core._handoff_candidates(tmp_path, "atlas"))
     assert ranked[0] == "CLAUDE-DRIVER-HANDOFF.md"
 
     os.utime(interim, (50, 50))
     os.utime(claude, (50, 50))
-    ranked = _existing(grok_lane._handoff_candidates(tmp_path, "atlas"))
+    ranked = _existing(recall_core._handoff_candidates(tmp_path, "atlas"))
     assert ranked[0] == "CLAUDE-DRIVER-HANDOFF.md"
 
 
@@ -177,7 +215,7 @@ def test_mint_picks_fresh_claude_over_stale_interim(tmp_path: Path, monkeypatch:
         mtime=9_000_000_000,
     )
 
-    assert _mint(grok_lane, tmp_path) == 0
+    assert _mint(recall_core, tmp_path) == 0
     answers = _answers(tmp_path)
     assert "claude-sentinel" in answers
     assert "interim-sentinel" not in answers
@@ -209,7 +247,7 @@ def test_explicit_handoff_overrides_a_fresher_candidate(
     _write(explicit, _full("explicit-sentinel"), mtime=100)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", _full("claude-sentinel"), mtime=9_000)
 
-    assert _mint(grok_lane, tmp_path, ["--handoff", str(explicit)]) == 0
+    assert _mint(recall_core, tmp_path, ["--handoff", str(explicit)]) == 0
     answers = _answers(tmp_path)
     assert "explicit-sentinel" in answers
     assert "claude-sentinel" not in answers
@@ -223,7 +261,7 @@ def test_explicit_shortfall_falls_through_before_failing(
     _write(explicit, "# Operator\n\nEmpty of sections.\n", mtime=9_000)
     _write(_epic(tmp_path) / "CLAUDE-DRIVER-HANDOFF.md", _full("claude-sentinel"), mtime=1_000)
 
-    assert _mint(grok_lane, tmp_path, ["--handoff", str(explicit)]) == 0
+    assert _mint(recall_core, tmp_path, ["--handoff", str(explicit)]) == 0
     assert "claude-sentinel" in _answers(tmp_path)
 
 
@@ -269,7 +307,7 @@ def test_explicit_superseded_path_is_not_minted(tmp_path: Path, monkeypatch: pyt
     _write(superseded, _full("superseded-sentinel"), mtime=9_000)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", _full("claude-sentinel"), mtime=1_000)
 
-    assert _mint(grok_lane, tmp_path, ["--handoff", str(superseded)]) == 0
+    assert _mint(recall_core, tmp_path, ["--handoff", str(superseded)]) == 0
     answers = _answers(tmp_path)
     assert "claude-sentinel" in answers
     assert "superseded-sentinel" not in answers
@@ -348,7 +386,7 @@ def test_score_and_board_fail_closed_when_the_recorded_handoff_is_removed(
             ]
         )
     with pytest.raises(handoff_select.RecordedHandoffMissingError, match=re.escape("GEMINI-DRIVER-HANDOFF.md")):
-        grok_lane.emit_hydrate_capsule(
+        recall_core.emit_hydrate_capsule(
             repo=tmp_path,
             epic="atlas",
             out_dir=canary,
@@ -357,7 +395,7 @@ def test_score_and_board_fail_closed_when_the_recorded_handoff_is_removed(
 
     # Restore the recorded file: the normal recorded-file path still wins.
     _write(gemini, _full("gemini-sentinel", session="2026-09-23"), mtime=9_000)
-    bound = grok_lane._bound_handoff_path(tmp_path, "atlas", out_dir=canary)
+    bound = recall_core._bound_handoff_path(tmp_path, "atlas", out_dir=canary)
     assert bound == gemini
 
 
@@ -376,14 +414,14 @@ def _patch_stream(monkeypatch: pytest.MonkeyPatch, entries: list[dict[str, str]]
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
 
-    monkeypatch.setattr(grok_lane.subprocess, "run", _freeze)
+    monkeypatch.setattr(recall_core.subprocess, "run", _freeze)
 
 
 def _score(tmp_path: Path, epic_canary: Path, facts: list[dict[str, str]]) -> int:
     (epic_canary / "probe.json").write_text(json.dumps({"anchors": facts}), encoding="utf-8")
     answers = tmp_path / "answers.json"
     answers.write_text(json.dumps({fact["id"]: fact["a"] for fact in facts}), encoding="utf-8")
-    return grok_lane.main(
+    return _core_main(
         [
             "--repo",
             str(tmp_path),
@@ -447,12 +485,12 @@ def test_recorded_no_handoff_stays_when_a_file_appears_later(
     assert "GEMINI-DRIVER-HANDOFF.md" not in board
 
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
-    assert grok_lane._bound_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
+    assert recall_core._bound_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
 
     assert _score(tmp_path, canary, facts) == 0
     scored = capsys.readouterr().out
     assert "diary: (no handoff)" in scored
-    hydrate_rc, hydrate_meta = grok_lane.emit_hydrate_capsule(
+    hydrate_rc, hydrate_meta = recall_core.emit_hydrate_capsule(
         repo=tmp_path,
         epic="atlas",
         out_dir=canary,
@@ -492,7 +530,7 @@ def test_unreadable_recorded_handoff_is_not_swallowed_by_score(
     assert "GEMINI-DRIVER-HANDOFF.md" in str(scored.value)
 
     with pytest.raises(handoff_select.RecordedHandoffMissingError, match="PermissionError") as hydrated:
-        grok_lane.emit_hydrate_capsule(
+        recall_core.emit_hydrate_capsule(
             repo=tmp_path,
             epic="atlas",
             out_dir=canary,
@@ -520,7 +558,7 @@ def test_mint_uses_the_selected_text_when_the_file_changes_after_select(
 
     monkeypatch.setattr(handoff_select, "select_handoff", _select_then_rewrite)
 
-    assert _mint(grok_lane, tmp_path) == 0
+    assert _mint(recall_core, tmp_path) == 0
     assert "selected-sentinel" in _answers(tmp_path)
     assert "rewritten" not in _answers(tmp_path)
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
@@ -610,7 +648,7 @@ def test_explicit_handoff_after_mint_does_not_rewrite_the_record(
     _write(other, _full("other-sentinel"), mtime=1)
     before_recorded = recorded.read_text(encoding="utf-8")
 
-    rc = grok_lane.main(
+    rc = _core_main(
         [
             "--repo",
             str(tmp_path),
@@ -633,7 +671,7 @@ def test_explicit_handoff_after_mint_does_not_rewrite_the_record(
     assert after["handoff"].endswith("GEMINI-DRIVER-HANDOFF.md")
     assert "canary score PASS" in other.read_text(encoding="utf-8")
     assert recorded.read_text(encoding="utf-8") == before_recorded
-    assert grok_lane._bound_handoff_path(tmp_path, "atlas", out_dir=canary) == recorded
+    assert recall_core._bound_handoff_path(tmp_path, "atlas", out_dir=canary) == recorded
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) == recorded
 
 
@@ -659,7 +697,7 @@ def test_board_and_mint_share_a_custom_stream_limit(
     def _freeze(command, **_kwargs):
         return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
 
-    monkeypatch.setattr(grok_lane.subprocess, "run", _freeze)
+    monkeypatch.setattr(recall_core.subprocess, "run", _freeze)
     epic = _epic(tmp_path)
     _write(
         epic / "GEMINI-DRIVER-HANDOFF.md",

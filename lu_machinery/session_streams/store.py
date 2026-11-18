@@ -2683,58 +2683,6 @@ class SessionStreamStore:
                 ),
             }
 
-    def record_legacy_mirror(
-        self,
-        lease: Lease,
-        *,
-        profile: str,
-        source_path: str,
-        source_sha256: str,
-        source_bytes: int,
-        entry: Entry,
-        now: datetime | None = None,
-    ) -> int:
-        """Append an idempotent receipt after a legacy file was mirrored into an entry."""
-        self._validate_identity("profile", profile)
-        if not source_path or "\x00" in source_path:
-            raise ValueError("source_path must be non-empty text without NUL")
-        if len(source_sha256) != 64:
-            raise ValueError("source_sha256 must be a SHA-256 hex digest")
-        if source_bytes <= 0:
-            raise ValueError("source_bytes must be positive")
-        timestamp = isoformat_z(now or utc_now())
-        with self._transaction(now=now) as connection:
-            self._require_current_lease(
-                connection,
-                lease,
-                require_valid_at=parse_timestamp(timestamp),
-            )
-            if entry.stream_id != lease.stream_id or entry.session_id != lease.session_id:
-                raise LeaseConflictError("legacy mirror entry must belong to the exact current leased session")
-            connection.execute(
-                "INSERT OR IGNORE INTO legacy_mirrors("
-                "profile, source_path, source_sha256, source_bytes, stream_id, session_id, entry_id, mirrored_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    profile,
-                    source_path,
-                    source_sha256,
-                    source_bytes,
-                    entry.stream_id,
-                    entry.session_id,
-                    entry.entry_id,
-                    timestamp,
-                ),
-            )
-            row = connection.execute(
-                "SELECT mirror_id, entry_id FROM legacy_mirrors "
-                "WHERE profile = ? AND source_path = ? AND source_sha256 = ?",
-                (profile, source_path, source_sha256),
-            ).fetchone()
-            if row is None or int(row["entry_id"]) != entry.entry_id:
-                raise SessionStreamError("legacy mirror identity already binds a different entry")
-            return int(row["mirror_id"])
-
     def session_state(self, stream_id: str, session_id: str) -> SessionState:
         """Read the exact current state without inferring a session by recency."""
         stream_id = validate_stream_id(stream_id)

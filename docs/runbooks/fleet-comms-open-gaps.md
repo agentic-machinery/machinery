@@ -37,14 +37,7 @@ just because the inline body looks short.
 **This PR:** dual-write inventory without retiring files:
 
 ```bash
-.venv/bin/python -m lu_machinery.session_streams dual-write-status
 .venv/bin/python -m lu_machinery.session_streams inventory --register
-# DB-first projection receipts + drift detection (no file rewrite / no cutover):
-.venv/bin/python -m lu_machinery.session_streams project
-.venv/bin/python -m lu_machinery.session_streams check-drift
-# under an active lease (SESSION_STREAM_* env):
-.venv/bin/python -m lu_machinery.session_streams mirror-handoff \
-  --stream epic:4387
 ```
 
 Registry: manifest inventory from `lu_machinery/config/issue_streams.yaml` via
