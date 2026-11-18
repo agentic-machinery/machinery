@@ -20,9 +20,14 @@ Examples:
   .venv/bin/python -m scripts.lint.mypy_ratchet --write-baseline
 
 Outputs: one violation per new or stale identity on stderr, or a one-line
-pass message on stdout. ``--write-baseline`` rewrites the baseline JSON.
+pass message on stdout. ``--write-baseline`` is the only writer and only
+prunes: it runs a complete analysis, drops the entries mypy no longer reports,
+and replaces the baseline atomically. A new or reintroduced error, an incomplete
+analysis, or another mypy version writes nothing. CI never writes; the shrink
+is a reviewed baseline change. The baseline file and the command are trusted
+local inputs of one maintainer: no concurrent runs, no hostile content.
 Exit codes: 0 pass or baseline written; 1 a new error, a stale entry, growth,
-or mypy could not run.
+a refused write, or mypy could not run.
 Related: #12642, scripts/hygiene/lint_source_db_writable_connects.py.
 """
 
@@ -33,8 +38,10 @@ import importlib.metadata
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import tomllib
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -71,6 +78,7 @@ _MYPY_KEYS = (
 )
 _GIT_TIMEOUT_SECONDS = 30
 _SHRINK_REFS = ("HEAD", "HEAD^", "origin/main")
+_PRUNE_COMMAND = "python -m lu_machinery.lint.mypy_ratchet --write-baseline"
 
 # path:line:col: error: message  [code]  — column is optional.
 _REPORT = re.compile(
@@ -401,17 +409,24 @@ def _toml(value: object) -> str:
     raise ValueError(f"unsupported mypy config value: {value!r}")
 
 
-def ratchet_config(root: Path) -> Path | None:
+def ratchet_config(root: Path, *, require_table: bool = False) -> Path | None:
     """Point mypy at the repo config plus overrides for wheels CI does not install.
 
     ``files`` is omitted so the paths passed on the command line are the whole
     check. An unknown ``[tool.mypy]`` key fails closed instead of being dropped.
+    ``require_table`` refuses a pyproject with no ``[tool.mypy]`` table instead of
+    running mypy with its defaults.
     """
 
     pyproject = root / "pyproject.toml"
     if not pyproject.is_file():
         return None
-    tool = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {}).get("mypy", {})
+    tools = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("tool", {})
+    if not isinstance(tools, dict):
+        raise ValueError("pyproject [tool] is not a table")
+    if require_table and "mypy" not in tools:
+        raise ValueError("pyproject.toml has no [tool.mypy] table: the repository mypy config would not apply")
+    tool = tools.get("mypy", {})
     if not isinstance(tool, dict):
         raise ValueError("pyproject [tool.mypy] is not a table")
     unknown = sorted(set(tool) - set(_MYPY_KEYS) - {"files"})
@@ -549,6 +564,9 @@ def collect_errors(
     if result.returncode not in (0, 1):
         detail = (result.stderr or result.stdout).strip()
         return [], [f"mypy failed ({result.returncode}): {detail}"]
+    if result.stderr.strip():
+        # mypy reports an invalid config or a runner problem on stderr and may still exit 0 or 1.
+        return [], [f"mypy reported on stderr: {result.stderr.strip()}"]
     errors, unparsed = parse_mypy_stdout(result.stdout, root)
     if unparsed:
         return [], [f"mypy report was not parseable: {unparsed[0]}"]
@@ -574,7 +592,7 @@ def compare(current: Sequence[MypyError], baseline: Sequence[MypyError]) -> list
         missing = baseline_counts[identity] - current_counts[identity]
         if missing > 0:
             suffix = f" x{missing}" if missing > 1 else ""
-            violations.append(f"{path}: stale baseline {code}{suffix}: {message}")
+            violations.append(f"{path}: stale baseline {code}{suffix}: {message}; run {_PRUNE_COMMAND}")
     return violations
 
 
@@ -614,6 +632,8 @@ def load_entries(path: Path) -> list[MypyError]:
 
 
 def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
+    """Replace the baseline atomically: a failed write leaves the old file."""
+
     payload = {
         "schema": SCHEMA,
         "mypy": importlib.metadata.version("mypy"),
@@ -622,7 +642,21 @@ def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
             for error in sorted(entries)
         ],
     }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    # A new file keeps mkstemp's owner-only mode; a rewrite keeps the mode it had.
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            if mode is not None:
+                os.fchmod(handle.fileno(), mode)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        Path(temp).unlink(missing_ok=True)
+        raise
 
 
 def _git_show(root: Path, ref: str, rel: str) -> bytes | None:
@@ -704,13 +738,50 @@ def evaluate(
     violations: list[str] = []
     if default_target in scoped:
         violations.extend(
-            f"{entry.path}: stale baseline {entry.code}: {entry.message}"
+            f"{entry.path}: stale baseline {entry.code}: {entry.message}; run {_PRUNE_COMMAND}"
             for entry in entries
             if not _in_scope(entry.path, (default_target,))
         )
     violations.extend(compare(current, relevant))
     violations.extend(shrink_violations(root, baseline, entries))
     return violations
+
+
+def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
+    """Drop the entries mypy no longer reports. Returns (removed, refusals).
+
+    The one writer. It only shrinks, and only on a complete analysis: the whole
+    product tree, the repository's own ``[tool.mypy]`` table, the mypy version the
+    baseline records, and a clean mypy run. Anything else writes nothing.
+    """
+
+    tree = product_tree_path(root=root)
+    if not tree.is_dir():
+        return 0, [f"{tree.name} is not a directory: there is no tree to analyse"]
+    try:
+        config = ratchet_config(root, require_table=True)
+    except ValueError as exc:
+        return 0, [str(exc)]
+    if config is None:
+        return 0, ["no pyproject.toml: the repository mypy config would not apply"]
+    payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
+    entries = _payload_entries(payload, str(baseline))
+    recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
+    if recorded != installed:
+        return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
+    current, fatal = collect_errors(root, [tree.name], config_file=config, incremental=False)
+    if fatal:
+        return 0, fatal
+    grown = _counts(current) - _counts(entries)
+    if grown:
+        return 0, [f"{path}: new {code}: {message}" for (path, code, message) in sorted(grown)]
+    refused = shrink_violations(root, baseline, current)
+    if refused:
+        return 0, refused
+    removed = len(entries) - len(current)
+    if removed:
+        write_baseline(baseline, current)
+    return removed, []
 
 
 def _python_targets(paths: Sequence[str], root: Path) -> list[str]:
@@ -748,32 +819,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--write-baseline",
         action="store_true",
-        help="Rewrite the baseline from the current mypy census and exit.",
+        help=(
+            "Prune stale entries after a complete analysis and exit. Writes nothing on a new "
+            "error, an incomplete analysis or another mypy version. Takes no paths."
+        ),
     )
     parser.add_argument(
         "--no-incremental",
         action="store_true",
-        help="Ignore the mypy cache. Tests use this; CI keeps the cache.",
+        help="Ignore the mypy cache. Tests use this; CI keeps the cache. --write-baseline always ignores it.",
     )
     args = parser.parse_args(argv)
+    if args.write_baseline and args.paths:
+        parser.error("--write-baseline analyses the whole tree; a path list would prune on a partial census")
     try:
         root = product_root(args.root.absolute() if args.root is not None else None).resolve()
         baseline = product_tree_path(*BASELINE_PATH.parts, root=root) if args.baseline is None else (
             args.baseline if args.baseline.is_absolute() else root / args.baseline
         )
-        targets = [product_tree_path(root=root).name] if args.write_baseline else _python_targets(args.paths, root)
         if args.write_baseline:
-            current, fatal = collect_errors(
-                root, targets, incremental=not args.no_incremental
-            )
-            if fatal:
-                print("\n".join(fatal), file=sys.stderr)
+            removed, refusals = prune_baseline(root, baseline)
+            if refusals:
+                print("baseline not written:\n" + "\n".join(refusals), file=sys.stderr)
                 return 1
-            write_baseline(baseline, current)
-            print(f"Wrote {len(current)} mypy errors to {baseline.relative_to(root)}")
+            print(f"Removed {removed} stale mypy entries from {baseline.relative_to(root)}")
             return 0
         violations = evaluate(
-            root, baseline, targets, incremental=not args.no_incremental
+            root, baseline, _python_targets(args.paths, root), incremental=not args.no_incremental
         )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(f"mypy ratchet could not run: {exc}", file=sys.stderr)
