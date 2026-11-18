@@ -284,7 +284,9 @@ def _git_checkout(tmp_path: Path, *, bare: bool) -> Path:
     repo.mkdir()
 
     def git(*args: str) -> None:
-        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=sanitized_git_env())
+        subprocess.run(
+            ["git", "-C", str(repo), *args], check=True, capture_output=True, env=sanitized_git_env(), timeout=30,
+        )
 
     git("init", "-q", "-b", "main")
     git("-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
@@ -321,7 +323,7 @@ def _record_slow_git_reads(monkeypatch, events: list[str], *, status_waits_for: 
 def _core_bare(repo: Path) -> str:
     return subprocess.run(
         ["git", "-C", str(repo), "config", "--get", "core.bare"],
-        capture_output=True, text=True, check=False, env=sanitized_git_env(),
+        capture_output=True, text=True, check=True, env=sanitized_git_env(), timeout=30,
     ).stdout.strip()
 
 
