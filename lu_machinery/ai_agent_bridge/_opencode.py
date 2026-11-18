@@ -485,11 +485,11 @@ def _enqueue_opencode_ask(
         "transport": "opencode", "target": target, "task_id": task_id,
         "requested_model": model, "from_model": from_model, "effort": effort,
         "variant": variant, "effort_reason": effort_reason,
-        "data": str(attachment) if attachment is not None else None,
         "msg_type": msg_type, "no_timeout": no_timeout,
     }
     metadata = redact_value(metadata)
-    # Generated integrity data is trusted, not caller text for secret redaction.
+    # Resolved file locators and generated integrity data must remain usable.
+    metadata["data"] = str(attachment) if attachment is not None else None
     metadata["attachment_sha256"] = hashlib.sha256(attachment.read_bytes()).hexdigest() if attachment is not None else None
     digest = hashlib.sha256(json.dumps(
         {"sender": from_llm, "body": content, "metadata": metadata}, sort_keys=True,

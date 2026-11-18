@@ -455,14 +455,16 @@ def test_agy_error_handler_never_acks(bridge_db):
 
 
 def test_opencode_incomplete_turn_never_acks(bridge_db, tmp_path, monkeypatch):
-    """A timeout preserves attachment integrity without consuming legacy mail."""
+    """Long attachment paths survive redaction and timeout without consuming legacy mail."""
     import json
+    import string
 
     from lu_machinery.ai_agent_bridge import _opencode
     from lu_machinery.fleet_comms.authority import AuthorityService
 
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
-    attachment = tmp_path / "attachment.txt"
+    attachment = tmp_path / (string.ascii_letters + string.digits) / "attachment.txt"
+    attachment.parent.mkdir(parents=True)
     attachment.write_text("frozen attachment")
     monkeypatch.chdir(tmp_path)
     status = _opencode.OpencodeTurnStatus(outcome="timeout", cancellation_category=None, reason="hard timeout")
@@ -471,7 +473,7 @@ def test_opencode_incomplete_turn_never_acks(bridge_db, tmp_path, monkeypatch):
         raise _opencode.OpencodeTurnError(status, "partial narration")
     monkeypatch.setattr(_opencode, "_invoke_opencode", incomplete)
     with pytest.raises(SystemExit, match="opencode turn aborted"):
-        _opencode.ask_opencode("Question", "task-6915", model="deepseek/deepseek-v4.1-flash", data="attachment.txt")
+        _opencode.ask_opencode("Question", "task-6915", model="deepseek/deepseek-v4.1-flash", data=str(attachment.relative_to(tmp_path)))
     with AuthorityService() as service:
         row = service.store.connection.execute("SELECT job_id, state FROM authority_jobs").fetchone()
         assert row["state"] == "failed"
