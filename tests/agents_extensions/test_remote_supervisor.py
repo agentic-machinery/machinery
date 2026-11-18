@@ -342,50 +342,6 @@ def test_supervisory_duplicate_wake_never_starts_second_live_driver(supervisory_
     assert supervisor.close_driver(role="driver", lease=lease) == "closed"
 
 
-def test_bridge_inbox_turn_preserves_occupied_remote_lease(supervisory_cycle, tmp_path, monkeypatch):
-    from unittest.mock import Mock
-
-    from lu_machinery.ai_agent_bridge import _ui_codex
-    from lu_machinery.ai_agent_bridge._inbox_watch import InboxEvent, wake_driver_once
-    from lu_machinery.session_streams.model import utc_now
-
-    now = utc_now()
-    monkeypatch.setattr("lu_machinery.api.epics_router.utc_now", lambda: now)
-    service, supervisor = supervisory_cycle
-    lease = _open_supervisory_driver(supervisor)
-    before = supervisor.remote.stream(lease.stream_id)
-    thread = "019e6063-c3da-78d1-acaa-4cd684a08786"
-    rollout = tmp_path / f"rollout-fixture-{thread}.jsonl"
-    records = [
-        {"type": "session_meta", "payload": {"id": thread, "cwd": str(tmp_path)}},
-        {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "fixture-turn"}},
-        {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "fixture-turn"}},
-    ]
-    rollout.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
-    monkeypatch.setattr(
-        _ui_codex, "find_live_session", lambda _: _ui_codex.LiveSession(thread, tmp_path, {}, rollout=rollout),
-    )
-    def resume(**kwargs):
-        kwargs["before_resume"]()
-        with rollout.open("a") as stream:
-            for kind in ("task_started", "task_complete"):
-                stream.write(json.dumps({"type": "event_msg", "payload": {"type": kind, "turn_id": "resume"}}) + "\n")
-        return {"exit_code": 0, "events": [{"type": "turn.started"}, {"type": "turn.completed"}]}
-    send = Mock(side_effect=resume)
-    monkeypatch.setattr(_ui_codex, "send", send)
-    start = Mock(side_effect=AssertionError("live lease forbids launcher"))
-    assert wake_driver_once(
-        service, supervisor.remote, stream_id=lease.stream_id,
-        launcher=Path("start-codex-driver.sh"), epic="fixture", run=start,
-        inbox_events=[InboxEvent(1, "fixture-sender", "fixture-request", "pending work")],
-    )
-    assert send.call_args.kwargs["thread_id"] == thread
-    assert "pending work" in send.call_args.kwargs["message"]
-    start.assert_not_called()
-    assert supervisor.remote.stream(lease.stream_id) == before
-    assert supervisor.close_driver(role="driver", lease=lease) == "closed"
-
-
 @pytest.mark.parametrize("already_prepared", [False, True])
 def test_unavailable_restart_cli_does_not_claim_or_replay_delivery(supervisory_cycle, already_prepared):
     from datetime import UTC, datetime, timedelta

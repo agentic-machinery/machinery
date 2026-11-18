@@ -848,25 +848,6 @@ def test_remaining_shell_programs_select_the_rule_and_refuse_invalid(tmp_path: P
         assert installed_log.read_text(encoding="utf-8") == "", call
         assert log.read_text(encoding="utf-8") == "", call
 
-    _executable(tmp_path / "bin/curl", """#!/bin/sh
-url=
-for arg in "$@"; do url=$arg; done
-case $url in
-  */api/state/summary) printf '%s\\n' '{"totals":{"total":1,"research_done":0,"content_done":0,"audit_passing":0,"final_review_done":0},"tracks":{}}' ;;
-  */api/batch/active) printf '%s\\n' '[]' ;;
-  *) printf '%s\\n' '{}' ;;
-esac
-""")
-    session_log = tmp_path / "session.log"
-    session_python = _record(tmp_path / "session-python", session_log, code=1)
-    session = _run(
-        [str(SOURCE / "lu_machinery/session_start.sh")],
-        cwd=worktree,
-        env={**base, "PATH": f"{tmp_path / 'bin'}:{base['PATH']}", "LEARN_UKRAINIAN_PYTHON": str(session_python)},
-    )
-    assert session.returncode == 0, session.stderr
-    assert str(session_python) in session_log.read_text(encoding="utf-8"), session.stderr
-
     copied = primary / "lu_machinery/wt.sh"
     copied.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(SOURCE / "lu_machinery/wt.sh", copied)

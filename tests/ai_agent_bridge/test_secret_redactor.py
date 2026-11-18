@@ -1,33 +1,7 @@
-import json
-import sqlite3
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from lu_machinery.secret_redactor import REDACTION, redact_text, redact_value
-
-
-@pytest.fixture
-def msg_db(tmp_path, monkeypatch):
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
-    db_path = tmp_path / "msg.db"
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("""CREATE TABLE messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id TEXT, from_llm TEXT NOT NULL, to_llm TEXT NOT NULL,
-        message_type TEXT DEFAULT 'message', content TEXT NOT NULL,
-        data TEXT, timestamp TEXT NOT NULL, acknowledged INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'pending'
-    )""")
-    conn.commit()
-    conn.close()
-
-    def _fresh_conn():
-        return sqlite3.connect(str(db_path))
-
-    with patch("lu_machinery.ai_agent_bridge._messaging.get_db", side_effect=_fresh_conn):
-        yield db_path
 
 
 @pytest.mark.parametrize("key", ["PASSWORD", "PASS", "SECRET_KEY", "API_TOKEN", "ACCESS_KEY", "API_KEY"])
@@ -310,109 +284,6 @@ def test_redact_text_handles_quoted_and_spaced_assignments():
     assert "hunter2" not in redacted
     assert "sk-" not in redacted
     assert redacted.count(REDACTION) == 2
-
-
-def test_github_comment_redacts_body_before_subprocess(monkeypatch):
-    from lu_machinery.ai_agent_bridge import _github
-    from lu_machinery.publish.github import request_run
-
-    posted = []
-    def send(args, **kwargs):
-        body = Path(args[args.index("--body-file") + 1]).read_text()
-        assert "sk-" not in body
-        assert REDACTION in body
-        posted.append(body)
-        return MagicMock(returncode=0)
-
-    def bridge(request, **kwargs):
-        assert "sk-" not in request.fields["body"]
-        assert REDACTION in request.fields["body"]
-        return request_run(request, runner=send, **kwargs)
-
-    monkeypatch.setattr(_github, "request_run", bridge)
-    assert _github._gh_comment(123, "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456") is True
-    assert len(posted) == 1
-    assert "sk-" not in posted[0]
-    assert REDACTION in posted[0]
-
-
-def test_send_message_redacts_content_and_data(msg_db):
-    from lu_machinery.ai_agent_bridge._messaging import send_message
-
-    with patch("subprocess.run"):
-        msg_id = send_message(
-            "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz1234567890",
-            data=json.dumps(
-                {
-                    "OPENAI_API_KEY": "sk-abcdefghijklmnopqrstuvwxyz123456",
-                    "note": "AIzaabcdefghijklmnopqrstuvwxyz123456",
-                }
-            ),
-            quiet=True,
-        )
-
-    conn = sqlite3.connect(str(msg_db))
-    row = conn.execute(
-        "SELECT content, data FROM messages WHERE id = ?",
-        (msg_id,),
-    ).fetchone()
-    conn.close()
-
-    assert "ghp_" not in row[0]
-    assert REDACTION in row[0]
-    parsed = json.loads(row[1])
-    assert parsed["OPENAI_API_KEY"] == REDACTION
-    assert "AIza" not in parsed["note"]
-
-
-@pytest.mark.parametrize("password", [
-    "canary?tail#end",
-    *("".join(("beforeCanary", delimiter, "https", "://", "afterCanary")) for delimiter in (":", "/", "?", "#", ",", ";")),
-])
-def test_send_message_redacts_malformed_url_password_before_storage(msg_db, password):
-    from lu_machinery.ai_agent_bridge._messaging import send_message
-
-    raw = "".join(("https", "://", "u:", password, "@", "host.invalid", "/api"))
-    expected = "".join(("https", "://", "u:", REDACTION, "@", "host.invalid", "/api"))
-    with patch("subprocess.run"):
-        send_message(raw, data=json.dumps({"detail": raw}), quiet=True)
-    with sqlite3.connect(str(msg_db)) as conn:
-        content, data = conn.execute("SELECT content, data FROM messages").fetchone()
-    assert content == expected
-    assert json.loads(data) == {"detail": expected}
-
-
-def test_read_message_redacts_existing_unredacted_rows(msg_db):
-    from lu_machinery.ai_agent_bridge._messaging import read_message
-
-    conn = sqlite3.connect(str(msg_db))
-    conn.execute(
-        """
-        INSERT INTO messages (
-            task_id, from_llm, to_llm, message_type, content, data, timestamp, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            "t1",
-            "gemini",
-            "claude",
-            "response",
-            "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456",
-            '{"GITHUB_TOKEN": "ghp_abcdefghijklmnopqrstuvwxyz1234567890"}',
-            "2026-01-01T00:00:00+00:00",
-            "pending",
-        ),
-    )
-    msg_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.commit()
-    conn.close()
-
-    msg = read_message(msg_id, quiet=True)
-
-    assert "sk-" not in msg["content"]
-    assert "ghp_" not in msg["data"]
-    assert REDACTION in msg["content"]
-    assert REDACTION in msg["data"]
 
 
 @pytest.fixture(autouse=True)

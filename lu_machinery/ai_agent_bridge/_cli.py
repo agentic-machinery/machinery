@@ -6,11 +6,11 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Callable
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
+from lu_machinery.agent_identity import get_valid_agents, resolve_recipient_alias
 from lu_machinery.agent_runtime import usage as runtime_usage
 from lu_machinery.agent_runtime.attribution import resolve_invocation_attribution
 from lu_machinery.agent_runtime.errors import AgentTimeoutError, RateLimitedError
@@ -20,30 +20,10 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 
 from ._ask_contract import EFFORT_CHOICES
-from ._ask_lifecycle import (
-    _process_target,
-    mark_timeout_notices_shown,
-    print_asks,
-    print_timeout_notice,
-    process_background_ask,
-    skip_stored_kimi_row,
-)
-from ._broker import bridge_status, broker_cleanup
 from ._config import BRIDGE_ENTRY, DISPATCH_ENTRY, MACHINERY_PACKAGE
-from ._db import get_db
 from ._dispatch_wrappers import (
     REVIEW_DEEP_INSTRUCTIONS,
     handle_review_deep,
-)
-from ._gemini import converse_gemini
-from ._messaging import (
-    acknowledge,
-    acknowledge_all,
-    check_inbox,
-    get_conversation,
-    read_message,
-    resolve_thread,
-    send_message,
 )
 from ._model import GROK_BUILD_DEFAULT_MODEL, check_model
 from ._opencode import (
@@ -53,8 +33,48 @@ from ._opencode import (
     POOL_DEFAULT_VARIANT,
     POOL_MODEL,
 )
-from ._process import process_message_for_recipient
 from ._prompts import require_core_or_exit
+
+_FLEET = f".venv/bin/python -m {MACHINERY_PACKAGE}.fleet_comms"
+# Verbs of the removed legacy inbox, broker and channel stores (#515), each with
+# its Fleet Comms replacement. They stay registered so a caller gets this typed
+# refusal (exit 2) instead of an argparse "invalid choice".
+RETIRED_VERBS = {
+    "inbox": f"{_FLEET} deliveries pending|receive --recipient <slot>",
+    "ack": f"{_FLEET} deliveries ack <delivery-id> --worker-id <slot> --fence-token <n>",
+    "ack-all": f"{_FLEET} deliveries ack <delivery-id> --worker-id <slot> --fence-token <n>",
+    "send": f"{_FLEET} channel publish <channel> - --sender <slot> --recipient <slot>",
+    "post": f"{_FLEET} channel publish <channel> - --sender <slot>",
+    "p": f"{_FLEET} channel publish <channel> - --sender <slot> --recipient <slot>",
+    "channel": f"{_FLEET} channel create|subscribe|context|publish",
+    "conversation": "GET /api/fleet/acp/conversations",
+    "thread": "GET /api/fleet/acp/conversations/<conversation-id>",
+    "process": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-claude": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-codex": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-grok": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-grok-build": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-all": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-claude-all": f"{_FLEET} deliveries receive --recipient <slot>",
+    "process-codex-all": f"{_FLEET} deliveries receive --recipient <slot>",
+    "sync": f"{_FLEET} deliveries receive --recipient <slot>",
+    "reconcile": f"{_FLEET} backlog",
+    "cleanup": f"{_FLEET} dead",
+    "status": f"{_FLEET} status",
+    "converse": f"{BRIDGE_ENTRY} ask-agy",
+    "interactive": f"{BRIDGE_ENTRY} ask-<seat>",
+}
+
+
+def refuse_retired_verb(verb: str, replacement: str) -> NoReturn:
+    """Refuse a retired legacy verb with exit 2 and one line naming its replacement."""
+    print(
+        f"ab {verb} is retired: the legacy inbox, broker and channel stores are removed (#515); "
+        f"use {replacement}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
 
 _CALLER_IDENTITY_ENV_HINTS = (
     # Order mirrors _detect_caller_identity_from_env; SESSION_HANDOFF_AGENT is
@@ -71,9 +91,7 @@ _CALLER_IDENTITY_ENV_HINTS = (
 
 
 def _detect_caller_identity_from_env() -> str | None:
-    """Infer the sending agent for legacy ask-* commands from wrapper env."""
-    from . import _channels
-
+    """Infer the sending agent for ask-* commands from wrapper env."""
     handoff_agent = os.environ.get("SESSION_HANDOFF_AGENT")
     if handoff_agent:
         # Phantom `{provider}-{empty-slots-area}` handoff identities (minted by
@@ -82,8 +100,8 @@ def _detect_caller_identity_from_env() -> str | None:
         # CLAUDE_PROJECT_DIR heuristics below.
         resolved = resolve_invocation_attribution(env={"SESSION_HANDOFF_AGENT": handoff_agent})
         if resolved.source == "session_env":
-            normalized = _channels.resolve_recipient_alias(resolved.initiator)
-            if normalized in _channels.get_valid_agents():
+            normalized = resolve_recipient_alias(resolved.initiator)
+            if normalized in get_valid_agents():
                 return normalized
             return resolved.initiator
     claude_name = os.environ.get("CLAUDE_AGENT_NAME")
@@ -133,131 +151,6 @@ def _resolve_from_llm(args) -> str:
     raise SystemExit(
         "Cannot infer sender for ask-* command. Pass --from explicitly or "
         f"run under a known agent wrapper that sets one of: {hint_list}."
-    )
-
-
-def interactive_mode():
-    """Interactive mode for testing."""
-    print("🔄 AI Agent Bridge Interactive Mode")
-    print("Commands: inbox [agent], read <id>, send <text> --to <agent>, ack <id>, conv <task_id>, process <id>, quit")
-    print()
-
-    while True:
-        try:
-            cmd = input("bridge> ").strip()
-            if not cmd:
-                continue
-
-            if cmd.lower() in ["quit", "q", "exit"]:
-                break
-
-            parts = cmd.split()
-            action = parts[0].lower()
-
-            _dispatch_interactive(action, parts)
-
-        except KeyboardInterrupt:
-            print("\nBye!")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-
-
-def _dispatch_interactive(action: str, parts: list[str]):
-    """Dispatch a single interactive mode command."""
-    if action in {"send", "process"}:
-        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
-
-        if _legacy_writes_retired():
-            return _retired_legacy_write(action)
-    if action == "inbox":
-        agent = parts[1] if len(parts) > 1 else "gemini"
-        check_inbox(agent)
-    elif action == "read" and len(parts) > 1:
-        read_message(int(parts[1]))
-    elif action == "send" and len(parts) > 1:
-        content = " ".join(parts[1:])
-        send_message(content)
-    elif action == "ack" and len(parts) > 1:
-        ids = [int(x) for x in parts[1:]]
-        acknowledge(ids)
-    elif action == "conv" and len(parts) > 1:
-        get_conversation(parts[1])
-    elif action == "process" and len(parts) > 1:
-        process_message_for_recipient(int(parts[1]))
-    else:
-        print("Unknown command or missing arguments.")
-
-
-def _process_all_unread(recipient: str, label: str, process_one: Callable[[int], bool]) -> None:
-    """Drain the recipient's historical queue in message order."""
-    from ._messaging import require_legacy_message_writes
-
-    require_legacy_message_writes()
-    with closing(get_db()) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, from_llm, substr(content, 1, 50), to_llm, data
-            FROM messages
-            WHERE to_llm = ? AND acknowledged = 0
-            ORDER BY id ASC
-            """,
-            (recipient,),
-        ).fetchall()
-
-    if not rows:
-        print(f"📭 No unread messages for {label} to process")
-        return
-
-    qualifier = " (headless)" if recipient == "claude" else ""
-    print(f"📬 Processing {len(rows)} unread message(s) for {label}{qualifier}...\n")
-    success = 0
-    failed = 0
-    skipped = 0
-
-    for message_id, from_llm, preview, to_llm, data in rows:
-        preview = preview.replace("\n", " ")[:40]
-        print(f"━━━ Processing [{message_id}] from {from_llm}: {preview}...")
-        if skip_stored_kimi_row({"to": to_llm, "data": data}, message_id):
-            skipped += 1
-            continue
-
-        try:
-            if process_one(message_id):
-                success += 1
-                print("    ✅ Done\n")
-            else:
-                failed += 1
-                print("    ❌ Failed (message left unconsumed)\n")
-        except Exception as exc:
-            failed += 1
-            print(f"    ❌ Failed: {exc}\n")
-
-    print(f"\n{'═' * 50}")
-    print(f"📊 Results: {success} succeeded, {failed} failed, {skipped} skipped out of {len(rows)} total")
-
-
-def process_all_gemini(model: str | None = None) -> None:
-    """Drain unread Gemini messages through its recipient-derived ACP route."""
-    _process_all_unread(
-        "gemini", "Gemini",
-        lambda message_id: bool(process_message_for_recipient(message_id, model=model)),
-    )
-
-
-def process_all_claude(new_session: bool = False) -> None:
-    """Drain unread Claude messages through ACP."""
-    _process_all_unread(
-        "claude", "Claude",
-        lambda message_id: _process_target(message_id, "claude", {"new_session": new_session}) is not False,
-    )
-
-
-def process_all_codex(new_session: bool = False) -> None:
-    """Drain unread Codex messages through ACP."""
-    _process_all_unread(
-        "codex", "Codex",
-        lambda message_id: _process_target(message_id, "codex", {"new_session": new_session}) is not False,
     )
 
 
@@ -482,31 +375,23 @@ def _add_review_options(parser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
-    # Recipient/inbox choices must cover EVERY valid agent, not just the
-    # original claude/gemini/codex trio — otherwise grok-build, grok, kimi, agy, and
-    # cursor cannot be targeted by `send --to`, listed by `inbox --for`, or
-    # cleared by `ack-all`, which silently second-classes those lanes.
-    from . import _channels
-
-    recipient_choices = sorted(_channels.get_valid_recipient_agents())
     parser = argparse.ArgumentParser(
         description=(
-            "Bridge CLI for Claude, Gemini, and Codex message passing.\n"
-            "Use it for brokered multi-agent communication; do not use it as a substitute for direct local shell commands."
+            "Agent bridge: one-shot ACP asks and bounded ACP discussions.\n"
+            "Fleet Comms is the only message store; the legacy inbox, broker and channel verbs are retired."
         ),
         epilog=(
             "Examples:\n"
-            f"  .venv/bin/python -m {BRIDGE_ENTRY} inbox --for gemini\n"
             f"  .venv/bin/python -m {BRIDGE_ENTRY} ask-codex - --from claude --task-id query-123 < prompt.md\n"
             f"  .venv/bin/python -m {BRIDGE_ENTRY} ask-claude - --type review --task-id review-123 < prompt.md\n\n"
             f"Authoring: {DISPATCH_ENTRY} dispatch --agent <agent> --model <model>\n"
             "  --mode workspace-write --owned-path <path> --prompt-file <brief>.\n\n"
             "Outputs:\n"
-            "  Reads and writes broker messages, may invoke agent CLIs, and can post follow-up data to GitHub.\n\n"
+            "  Invokes agent CLIs over ACP; discussions are recorded as Fleet Comms jobs.\n\n"
             "Exit codes:\n"
-            "  0 on successful command completion; non-zero on CLI misuse, broker failures, or agent invocation failures.\n\n"
+            "  0 on successful command completion; 2 for a retired verb; other non-zero on CLI misuse or agent failure.\n\n"
             "Related:\n"
-            "  Broker DB: batch_state/agent_comms.db\n"
+            f"  Messages: .venv/bin/python -m {MACHINERY_PACKAGE}.fleet_comms --help\n"
             f"  Runtime: {MACHINERY_PACKAGE}/agent_runtime/\n"
             "  Issue: #1379\n"
         ),
@@ -514,162 +399,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # inbox
-    inbox_parser = subparsers.add_parser("inbox", help="Check inbox for messages")
-    inbox_parser.add_argument(
-        "--for",
-        dest="for_llm",
-        default=None,
-        # type= runs before choices: an already-minted phantom
-        # `{provider}-{empty-slots-area}` (e.g. codex-monitor, #7597)
-        # normalizes to its provider so live sessions can drain.
-        type=_channels.resolve_recipient_alias,
-        choices=recipient_choices,
-        help="Check inbox for which agent (default: gemini)",
-    )
-
-    # read
-    read_parser = subparsers.add_parser("read", help="Read a specific message")
-    read_parser.add_argument("message_id", help="Fleet job ID or historical integer message ID to read")
-
-    # send
-    send_parser = subparsers.add_parser("send", help="Send message to another agent")
-    send_parser.add_argument("content", help="Message content")
-    send_parser.add_argument(
-        "--to",
-        dest="to_llm",
-        default="claude",
-        type=_channels.resolve_recipient_alias,
-        choices=recipient_choices,
-        help="Target agent (default: claude)",
-    )
-    send_parser.add_argument("--from", dest="from_llm", default="gemini", help="Sender agent name (default: gemini)")
-    send_parser.add_argument("--task-id", help="Task ID for grouping")
-    send_parser.add_argument("--type", default="response", help="Message type")
-    send_parser.add_argument("--data", help="Path to data file to attach")
-    send_parser.add_argument("--from-model", dest="from_model", help="Specific model ID of sender")
-    send_parser.add_argument("--to-model", dest="to_model", help="Specific model ID of receiver")
-
-    # ack
-    ack_parser = subparsers.add_parser("ack", help="Acknowledge message(s)")
-    ack_parser.add_argument("message_ids", type=int, nargs="+", help="Message ID(s) to acknowledge")
-    ack_parser.add_argument(
-        "--consumed-by-live-driver",
-        action="store_true",
-        help="Record that this live driver's own loop consumed the message(s)",
-    )
-
-    # ack-all
-    ack_all_parser = subparsers.add_parser("ack-all", help="Acknowledge ALL unread messages for an agent")
-    ack_all_parser.add_argument(
-        "agent",
-        type=_channels.resolve_recipient_alias,
-        choices=recipient_choices,
-        help="Agent whose inbox to clear",
-    )
-    ack_all_parser.add_argument(
-        "--consumed-by-live-driver",
-        action="store_true",
-        help="Record that this live driver's own loop consumed the unread messages",
-    )
-
-    # conversation
-    conv_parser = subparsers.add_parser("conversation", help="Get conversation history")
-    conv_parser.add_argument("task_id", help="Task ID")
-
-    # thread — unified retrieval (#4837 item 5): accepts either identifier
-    # `conversation` wants (task-id) or `read` wants (numeric message id).
-    thread_parser = subparsers.add_parser(
-        "thread",
-        help="Show the full thread for a task ID or a numeric message ID",
-    )
-    thread_parser.add_argument("identifier", help="Task ID or numeric message ID")
-
-    # process — recipient-derived: routes via the message's To: seat (#6915)
-    proc_parser = subparsers.add_parser(
-        "process",
-        help="Process a broker message via its recipient seat's registered ACP route",
-    )
-    proc_parser.add_argument("message_id", type=int, help="Message ID to process")
-    proc_parser.add_argument(
-        "--model",
-        default=None,
-        help="Optional model override; must equal the recipient seat's registered ACP pin",
-    )
-    proc_parser.add_argument(
-        "--no-timeout",
-        dest="no_timeout",
-        action="store_true",
-        help="Run sync without timeout (used internally by fire-and-forget)",
-    )
-
-    # process-claude
-    proc_claude_parser = subparsers.add_parser(
-        "process-claude", help="Drain a queued ask via ACP; explicit reviews remain toolful"
-    )
-    proc_claude_parser.add_argument("message_id", type=int, help="Message ID for Claude to process")
-    proc_claude_parser.add_argument(
-        "--new-session",
-        dest="new_session",
-        action="store_true",
-        help="Force new session even if one exists for this task",
-    )
-    proc_claude_parser.add_argument(
-        "--async",
-        dest="fire_and_forget",
-        action="store_true",
-        help="Legacy review background option; rejected for ordinary ACP asks.",
-    )
-    proc_claude_parser.add_argument(
-        "--no-timeout",
-        dest="no_timeout",
-        action="store_true",
-        help="Run sync without timeout (used internally by fire-and-forget)",
-    )
-
-    # process-codex
-    proc_codex_parser = subparsers.add_parser(
-        "process-codex", help="Drain a queued ask via ACP; explicit reviews remain toolful"
-    )
-    proc_codex_parser.add_argument("message_id", type=int, help="Message ID for Codex to process")
-    proc_codex_parser.add_argument(
-        "--new-session", dest="new_session", action="store_true", help="Force new session even if one exists"
-    )
-    proc_codex_parser.add_argument(
-        "--no-timeout", dest="no_timeout", action="store_true", help="Run sync without timeout"
-    )
-
-    # process-grok (canonical) + process-grok-build (permanent alias)
-    proc_grok_build_parser = subparsers.add_parser(
-        "process-grok",
-        aliases=["process-grok-build"],
-        help="Drain a queued ask via ACP; explicit reviews remain toolful (alias: process-grok-build)",
-    )
-    proc_grok_build_parser.add_argument("message_id", type=int, help="Message ID for grok to process")
-    proc_grok_build_parser.add_argument(
-        "--new-session",
-        dest="new_session",
-        action="store_true",
-        help="Accepted for parity; grok always starts fresh",
-    )
-    proc_grok_build_parser.add_argument(
-        "--no-timeout", dest="no_timeout", action="store_true", help="Run sync without timeout"
-    )
-    proc_grok_build_parser.add_argument("--review", action="store_true", help="Prepend docs/review-protocol.md")
-
-
     # process-ask is the detached-worker re-entry point for ``ask-* --background``.
     proc_ask_parser = subparsers.add_parser("process-ask", help=argparse.SUPPRESS)
-    proc_ask_parser.add_argument("message_id", help="Fleet job ID, or a historical integer ask ID")
+    proc_ask_parser.add_argument("message_id", help="Fleet request job ID (authority-job_...)")
     proc_ask_parser.add_argument("target")
+
+    read_parser = subparsers.add_parser("read", help="Print the receipt of a Fleet request job")
+    read_parser.add_argument("message_id", help="Fleet request job ID (authority-job_...)")
 
     asks_parser = subparsers.add_parser("asks", help="List tracked one-shot ask lifecycle states")
     asks_parser.add_argument("--task-id", help="Only show asks for this task ID")
-    asks_parser.add_argument(
-        "--watchdog",
-        action="store_true",
-        help="Run the ask watchdog to re-fire dead workers lacking clean completion once",
-    )
 
     # ask-claude
     ask_claude_parser = subparsers.add_parser(
@@ -768,9 +507,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_gemini_parser.add_argument(
         "--no-github", dest="no_github", action="store_true", help="Skip auto-posting review to GitHub issue"
     )
-    # `--auth` mirrors the option on `inbox run` / `sync` (defined in
-    # _channels_cli.py, value space ["auto", "subscription", "api-key",
-    # "api"]). Wired through ask_gemini() → process_and_respond() →
+    # `--auth` takes ["auto", "subscription", "api-key", "api"]. Wired through ask_gemini() → process_and_respond() →
     # runtime_invoke() as tool_config.auth_mode. Default None lets the
     # runtime fall back to its environment-driven detection.
     ask_gemini_parser.add_argument(
@@ -1048,43 +785,6 @@ def _build_parser() -> argparse.ArgumentParser:
             help="Send immediately and process in a detached worker; print the message ID.",
         )
 
-    # converse — multi-turn conversation with Gemini
-    converse_parser = subparsers.add_parser("converse", help="Multi-turn conversation with Gemini (includes history)")
-    converse_parser.add_argument("content", help="Message content (use '-' to read from stdin)")
-    converse_parser.add_argument("--task-id", required=True, help="Conversation thread ID (e.g., 'a1-1-planning')")
-    converse_parser.add_argument(
-        "--model",
-        default=None,
-        help="Legacy Gemini model slug; mapped to the AGY seat's live registry pin "
-        "(default: the pin itself — never an independently hardcoded slug)",
-    )
-    converse_parser.add_argument(
-        "--no-github", dest="no_github", action="store_true", help="Skip auto-posting to GitHub"
-    )
-
-    # process-all
-    proc_all_parser = subparsers.add_parser(
-        "process-all",
-        help="Process ALL unread messages for the Gemini seat via its ACP route (agy)",
-    )
-    proc_all_parser.add_argument(
-        "--model",
-        default=None,
-        help="Optional model override; must equal the seat's registered ACP pin",
-    )
-
-    # process-claude-all
-    proc_claude_all_parser = subparsers.add_parser("process-claude-all", help="Process ALL unread messages with Claude")
-    proc_claude_all_parser.add_argument(
-        "--new-session", dest="new_session", action="store_true", help="Force new sessions for each message"
-    )
-
-    # process-codex-all
-    proc_codex_all_parser = subparsers.add_parser("process-codex-all", help="Process ALL unread messages with Codex")
-    proc_codex_all_parser.add_argument(
-        "--new-session", dest="new_session", action="store_true", help="Force new sessions for each message"
-    )
-
     # codex-usage
     codex_usage_parser = subparsers.add_parser(
         "codex-usage",
@@ -1160,27 +860,6 @@ def _build_parser() -> argparse.ArgumentParser:
     check_model_parser.add_argument("model", help="Model slug or display label")
     check_model_parser.add_argument("--agent", choices=["agy"], default="agy")
 
-    # cleanup
-    cleanup_parser = subparsers.add_parser("cleanup", help="Clean stuck broker state and old acknowledged rows")
-    cleanup_parser.add_argument("--max-age", type=int, default=24, help="Force-ack stuck messages older than N hours")
-    cleanup_parser.add_argument(
-        "--older-than",
-        default="30d",
-        help="Delete acknowledged/terminal broker rows older than this age (default: 30d)",
-    )
-    cleanup_parser.add_argument("--dry-run", action="store_true", help="Report what would be cleaned")
-    cleanup_parser.add_argument(
-        "--expire",
-        action="store_true",
-        help=(
-            "Also run the channel-delivery TTL auto-expire + dead-lane "
-            "bulk-expire sweep (#4837 item 4). Honors --dry-run."
-        ),
-    )
-
-    # status
-    subparsers.add_parser("status", help="Show running bridge processes")
-
     # slot-holder (step 4b)
     slot_holder_parser = subparsers.add_parser(
         "slot-holder",
@@ -1188,9 +867,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     slot_holder_parser.add_argument("slot", help="Slot name (e.g. claude-atlas, grok-infra)")
     slot_holder_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-
-    # interactive
-    subparsers.add_parser("interactive", help="Interactive mode")
 
     # send-codex-ui — Lane 1 from issue #2285 (agent bridge to running UI)
     send_codex_ui_parser = subparsers.add_parser(
@@ -1277,89 +953,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inline message text. Mutually exclusive with --from-file.",
     )
 
-    # Channel bridge commands (#1190) — registered in _channels_cli
-    from ._channels_cli import register_channel_commands
+    from ._discuss import register_discuss_command
 
-    register_channel_commands(subparsers)
+    register_discuss_command(subparsers)
+    for verb, replacement in RETIRED_VERBS.items():
+        # No option prefix: every word after the verb, flags included, is swallowed.
+        retired = subparsers.add_parser(verb, help=argparse.SUPPRESS, add_help=False, prefix_chars="\x00")
+        retired.add_argument("retired_args", nargs=argparse.REMAINDER)
+        retired.set_defaults(retired_replacement=replacement)
 
     return parser
 
 
 def _dispatch_command(args):
     """Dispatch parsed CLI arguments to the appropriate handler."""
-    legacy_process = args.command == "process" or (
-        args.command is not None and args.command.startswith("process-") and args.command != "process-ask"
-    ) or (args.command == "process-ask" and args.target not in {"opencode", "pool", "glm", "gemma"}) or (
-        args.command == "asks" and getattr(args, "watchdog", False)
-    )
-    if legacy_process:
-        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+    replacement = getattr(args, "retired_replacement", None)
+    if replacement is not None:
+        refuse_retired_verb(args.command, replacement)
+    if args.command == "read":
+        if not str(args.message_id).startswith("authority-job_"):
+            refuse_retired_verb("read <message-id>", RETIRED_VERBS["inbox"])
+        from ._opencode import read_opencode_result
 
-        if _legacy_writes_retired():
-            raise SystemExit(_retired_legacy_write(args.command))
-    if args.command == "inbox":
-        if getattr(args, "inbox_command", None):
-            from ._channels_cli import dispatch_channel_command
-
-            rc = dispatch_channel_command(args)
-            sys.exit(rc)
-        check_inbox(args.for_llm or "gemini")
-    elif args.command == "read":
-        if str(args.message_id).startswith("authority-job_"):
-            from ._opencode import read_opencode_result
-
-            print(json.dumps(read_opencode_result(args.message_id), sort_keys=True))
-        else:
-            read_message(int(args.message_id))
-    elif args.command == "send":
-        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
-
-        if _legacy_writes_retired():
-            raise SystemExit(_retired_legacy_write("send"))
-        data = None
-        if args.data:
-            data = Path(args.data).read_text()
-        send_message(
-            args.content, args.task_id, args.type, data, args.from_llm, args.to_llm, args.from_model, args.to_model
-        )
-    elif args.command == "ack":
-        acknowledge(
-            args.message_ids,
-            consumed_by_live_driver=getattr(args, "consumed_by_live_driver", False),
-        )
-    elif args.command == "ack-all":
-        acknowledge_all(
-            args.agent,
-            consumed_by_live_driver=getattr(args, "consumed_by_live_driver", False),
-        )
-    elif args.command == "conversation":
-        get_conversation(args.task_id)
-    elif args.command == "thread":
-        resolve_thread(args.identifier)
-    elif args.command == "process":
-        try:
-            process_message_for_recipient(args.message_id, model=args.model, no_timeout=args.no_timeout)
-        except KimiAdmissionRefused as exc:
-            raise SystemExit(f"❌ {exc}") from exc
-    elif args.command in {"process-claude", "process-codex", "process-grok", "process-grok-build"}:
-        try:
-            processed = _process_target(args.message_id, args.command.removeprefix("process-"), vars(args))
-        except KimiAdmissionRefused as exc:
-            raise SystemExit(f"❌ {exc}") from exc
-        if processed is False:
-            raise SystemExit("ACP processing failed; message left unconsumed")
+        print(json.dumps(read_opencode_result(args.message_id), sort_keys=True))
     elif args.command == "process-ask":
-        process_background_ask(args.message_id, args.target)
-    elif args.command == "asks":
-        if getattr(args, "watchdog", False):
-            from ._ask_lifecycle import run_ask_watchdog
+        from ._opencode import process_for_opencode
 
-            retried = run_ask_watchdog()
-            if retried:
-                print(f"Watchdog re-fired {len(retried)} ask(s): {', '.join(map(str, retried))}")
-            else:
-                print("Watchdog run complete: no dead asks eligible for retry.")
-        print_asks(args.task_id)
+        process_for_opencode(str(args.message_id), target=args.target)
+    elif args.command == "asks":
+        from ._opencode import print_authority_asks
+
+        print_authority_asks(args.task_id)
     elif args.command == "ask-claude":
         _handle_ask_claude(args)
     elif args.command == "ask-codex":
@@ -1382,21 +1006,6 @@ def _dispatch_command(args):
         _handle_ask_cursor(args)
     elif args.command in {"ask-grok", "ask-grok-build"}:
         _handle_ask_grok_build(args)
-    elif args.command == "converse":
-        from ._acp_compat import resolve_compat_model
-
-        content = sys.stdin.read() if args.content == "-" else args.content
-        # None (the default) lets converse_gemini apply the live registry pin;
-        # legacy gemini* slugs map to that same pin (#6929).
-        selected = resolve_compat_model("gemini", getattr(args, "model", None))
-        if converse_gemini(content, args.task_id, selected, getattr(args, "no_github", False)) is None:
-            sys.exit(1)
-    elif args.command == "process-all":
-        process_all_gemini(args.model)
-    elif args.command == "process-claude-all":
-        process_all_claude(args.new_session)
-    elif args.command == "process-codex-all":
-        process_all_codex(args.new_session)
     elif args.command == "codex-usage":
         _handle_codex_usage(args)
     elif args.command == "review-deep":
@@ -1404,16 +1013,6 @@ def _dispatch_command(args):
     elif args.command == "check-model":
         ok = check_model(args.model, agent=args.agent, force=True)
         sys.exit(0 if ok else 1)
-    elif args.command == "cleanup":
-        broker_cleanup(args.max_age, args.dry_run, args.older_than)
-        if args.expire:
-            from ._channels_cli import run_delivery_expiry_cleanup
-
-            run_delivery_expiry_cleanup(dry_run=args.dry_run)
-    elif args.command == "status":
-        bridge_status()
-    elif args.command == "interactive":
-        interactive_mode()
     elif args.command == "send-codex-ui":
         from ._ui_codex import cli_main as _ui_codex_cli_main
 
@@ -1454,12 +1053,10 @@ def _dispatch_command(args):
         sys.exit(rc)
     elif args.command == "slot-holder":
         _handle_slot_holder(args)
-    elif args.command in ("channel", "post", "p", "reconcile", "sync", "discuss"):
-        # Channel bridge commands (#1190)
-        from ._channels_cli import dispatch_channel_command
+    elif args.command == "discuss":
+        from ._discuss import handle_discuss
 
-        rc = dispatch_channel_command(args)
-        sys.exit(rc)
+        sys.exit(handle_discuss(args))
     else:
         return False
     return True
@@ -1941,20 +1538,6 @@ def _handle_slot_holder(args):
             print(f"no-live-holder (queue: {res.queue_location})")
 
 
-def _resolve_backlog_warn_agent(args) -> str | None:
-    """Seat whose queue an ``inbox`` backlog warning may name.
-
-    Identity order: the positional agent on ``inbox show``/``inbox run``, then
-    an explicit ``--for``, then ``SESSION_HANDOFF_AGENT``. ``None`` means no
-    seat identity is known, so no warning is emitted — only the owning seat
-    can drain its queue, and every other seat would see pure noise.
-    """
-    identity = getattr(args, "agent", None) or getattr(args, "for_llm", None)
-    if identity:
-        return identity
-    return os.environ.get("SESSION_HANDOFF_AGENT") or None
-
-
 def _attachment_text(args) -> str | None:
     """The ``--data`` attachment's text for the Kimi gate; None when absent or unreadable.
 
@@ -1973,43 +1556,24 @@ def _attachment_text(args) -> str | None:
 def _kimi_request_error(args) -> str | None:
     """The Kimi refusal for a bridge command, decided from its arguments alone; None when admitted.
 
-    Kimi is not a bridge recipient: no ask, send, post, channel subscription,
-    inbox command, drain or discussion may name a Kimi seat or model. Every
-    seat and model on the command line is checked against the static route
-    registry, with no broker access, so a refusal leaves the broker DB and its
-    ``-wal``/``-shm`` sidecars exactly as they were. A message already
-    addressed to a Kimi seat or model is skipped by the drain after its read.
+    Kimi is not a bridge recipient: no ask, background ask worker or
+    discussion may name a Kimi seat or model. Every seat and model on the
+    command line is checked against the static route registry before any
+    store or provider is touched.
     """
     from lu_machinery.agent_runtime.acpx_discuss import AcpxDiscussionError, refuse_kimi_discussion
 
-    from ._acp_compat import refuse_kimi_compat, refuse_kimi_recipients
-    from ._channels_cli import _parse_agent_models, _parse_csv
+    from ._acp_compat import refuse_kimi_compat
+    from ._discuss import _parse_agent_models, _parse_csv
 
     command = args.command or ""
     model = getattr(args, "to_model", None) or getattr(args, "model", None)
-    inbox_command = getattr(args, "inbox_command", None)
     data = _attachment_text(args)
     try:
         if command.startswith("ask-"):
             refuse_kimi_compat(command.removeprefix("ask-"), model=model, data=data)
         elif command == "process-ask":
             refuse_kimi_compat(args.target, model=model, data=data)
-        elif command.startswith("process"):
-            refuse_kimi_compat(command.removeprefix("process").removeprefix("-"), model=model, data=data)
-        elif command == "send":
-            refuse_kimi_recipients((args.to_llm,), (model,), attachments=(data,))
-        elif command == "inbox":
-            refuse_kimi_recipients(
-                (getattr(args, "for_llm", None), getattr(args, "agent", None) if inbox_command else None)
-            )
-        elif command in {"ack-all", "sync"}:
-            refuse_kimi_recipients((args.agent,))
-        elif command == "post":
-            refuse_kimi_recipients(_parse_csv(args.to) if args.to else (), (model,))
-        elif command == "p":
-            refuse_kimi_recipients(_parse_csv(args.agent) if args.agent else ())
-        elif command == "channel" and getattr(args, "channel_command", None) == "new":
-            refuse_kimi_recipients(_parse_csv(args.agents) if args.agents else ())
         elif command == "discuss":
             try:
                 models = _parse_agent_models(args.models) if getattr(args, "models", None) else {}
@@ -2025,33 +1589,9 @@ def main():
     """CLI entry point."""
     parser = _build_parser()
     args = parser.parse_args()
-    # A Kimi request stops here, before the backlog warning, the timeout
-    # notices, telemetry or any broker connection: an existing WAL-mode broker
-    # DB would otherwise gain -wal/-shm sidecars before the refusal.
+    # A Kimi request stops here, before telemetry or any provider call.
     refusal = _kimi_request_error(args)
     if refusal:
         raise SystemExit(refusal)
-    if args.command in {"inbox", "read", "ack", "ack-all"}:
-        from ._channels_cli import authority_inbox_notice
-
-        authority_inbox_notice(
-            getattr(args, "agent", None) or getattr(args, "for_llm", None) or os.environ.get("SESSION_HANDOFF_AGENT")
-        )
-    if args.command == "inbox":
-        from ._channels_cli import _maybe_print_backlog_warnings
-
-        _maybe_print_backlog_warnings(_resolve_backlog_warn_agent(args))
-    # The notices are read query-only and marked shown only once the command
-    # succeeds, so a command its own handler refuses leaves the rows as they were.
-    from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
-
-    notices = print_timeout_notice() if args.command is not None and resolve_plane_mode() != "authority" else []
-    try:
-        handled = _dispatch_command(args)
-    except SystemExit as exc:
-        if exc.code in (None, 0):
-            mark_timeout_notices_shown(notices)
-        raise
-    mark_timeout_notices_shown(notices)
-    if not handled:
+    if not _dispatch_command(args):
         parser.print_help()

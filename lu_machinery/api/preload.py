@@ -55,16 +55,9 @@ PRELOAD_MODULES = [
     "lu_machinery.research.registry",
 ]
 
-# Heavy or optional dependencies (try/except ImportError, record skipped)
-OPTIONAL_MODULES = [
-    # Bridge modules use the canonical `scripts.` identity only (#6812):
-    # preloading the bare `ai_agent_bridge` name would create a second,
-    # divergent sys.modules identity in the long-lived API process.
-    "lu_machinery.ai_agent_bridge",
-    "lu_machinery.ai_agent_bridge._channels",
-    "lu_machinery.ai_agent_bridge._db",
-    "lu_machinery.ai_agent_bridge.broker_indexes",
-]
+# Heavy or optional dependencies (try/except ImportError, record skipped); the
+# product contributes its own through ``preload_optional``.
+OPTIONAL_MODULES: list[str] = []
 
 DYNAMIC_LOADERS = {
     "lu_machinery.api.runtime_router": {

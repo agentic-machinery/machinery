@@ -79,38 +79,6 @@ def wt_layout(tmp_path) -> tuple[Path, Path]:
     return main_repo, worktree
 
 
-def test_bridge_config_state_paths_resolve_to_primary_in_worktree(wt_layout):
-    """Verify that _config.py run from a worktree layout resolves state paths to the primary root.
-
-    lu_machinery derives no state anchor (C-4843), so the primary is configured, as installed
-    machinery has it; the worktree stays the working directory.
-    """
-    main_repo, worktree = wt_layout
-
-    # Run subprocess to check DB_PATH and PID_DIR
-    script = "from lu_machinery.ai_agent_bridge._config import DB_PATH, PID_DIR; print(f'{DB_PATH};{PID_DIR}')"
-    env = os.environ.copy()
-    env.pop("AB_DB_PATH", None)  # Exercise the default path, not the suite's isolated override.
-    env.pop("LU_PRODUCT_ROOT", None)  # The child runs in the fixture's product layout.
-    env["LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"] = str(main_repo)
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(worktree),
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    db_path_str, pid_dir_str = proc.stdout.strip().split(";")
-
-    expected_db_path = main_repo / ".mcp" / "servers" / "message-broker" / "messages.db"
-    expected_pid_dir = main_repo / ".mcp" / "servers" / "message-broker" / "pids"
-
-    assert Path(db_path_str).resolve() == expected_db_path.resolve()
-    assert Path(pid_dir_str).resolve() == expected_pid_dir.resolve()
-
-
 def _write_venv_python(checkout: Path, name: str = "python") -> Path:
     interpreter = checkout / ".venv" / "bin" / name
     interpreter.parent.mkdir(parents=True, exist_ok=True)

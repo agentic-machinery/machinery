@@ -1,25 +1,11 @@
 """Closed-registry integration coverage for the native Kimi lane."""
 from __future__ import annotations
 
-
 import ast
 import re
 from dataclasses import dataclass, field
 
-import pytest
-
 from lu_machinery.common.repo_root import machinery_root
-
-
-
-
-def test_kimi_background_worker_refuses_before_any_processor(monkeypatch):
-    from lu_machinery.ai_agent_bridge import _ask_lifecycle, _messaging
-
-    monkeypatch.setattr(_messaging, "read_message", lambda *_a, **_k: None)
-    with pytest.raises(ValueError, match="Kimi is retired"):
-        _ask_lifecycle._process_target(12, "kimi", {"new_session": True, "no_timeout": True, "review": True})
-
 
 _SCRIPTS = machinery_root()
 _PACKAGES = ("fleet_comms", "ai_agent_bridge")
@@ -76,21 +62,7 @@ def _fc(name: str) -> str:
     return f"fleet_comms/{name}"
 
 
-def _br(name: str) -> str:
-    return f"ai_agent_bridge/{name}"
-
-
 _AUTH = _fc("authority.py")
-
-# Channel telemetry emitters and the inbox functions that call them, each with a claimed thread.
-_EMITTERS: dict[str, tuple[str, ...]] = {
-    "emit_delivery_delivered": ("run_inbox", "_mark_claimed_delivered"),
-    "emit_delivery_failed": ("run_inbox",),
-    "emit_reply_started": ("_invoke_thread",),
-    "emit_reply_complete": ("_mark_claimed_delivered",),
-    "emit_heartbeat": ("_invoke_thread._heartbeat_loop",),
-    "emit_model_cascade": (),
-}
 
 WRITERS: dict[str, Writer] = {
     # --- fleet_comms/authority.py: durable jobs and deliveries ---------------------------------------
@@ -178,44 +150,6 @@ WRITERS: dict[str, Writer] = {
     # claim_v4_runner_execution was removed in machinery #66.
     f"{_fc('message_plane.py')}::MessagePlane._bump_continuation": Writer(KEYED, "one request by id"),
     f"{_fc('artifacts.py')}::ArtifactStore._ensure_message_stub": Writer(NO_TARGET, "a note stub with no recipient"),
-    # --- ai_agent_bridge: legacy messages ---------------------------------------------------------------
-    f"{_br('_messaging.py')}::_insert_message": Writer(ADMITTED, "send_message's admitted target"),
-    f"{_br('_messaging.py')}::acknowledge": Writer(KEYED, "named ids; drains skip stored Kimi rows first"),
-    f"{_br('_messaging.py')}::acknowledge_all": Writer(SKIP, "a seat's unread messages"),
-    f"{_br('_ask_lifecycle.py')}::record_ask_reply": Writer(KEYED, "the ask being answered"),
-    f"{_br('_ask_lifecycle.py')}::mark_timeout_notices_shown": Writer(SKIP, "timed-out asks shown by the notice"),
-    f"{_br('_ask_lifecycle.py')}::_re_fire_ask": Writer(SKIP, "watchdog retry of a dead ask"),
-    f"{_br('_ask_lifecycle.py')}::_set_ask_status": Writer(KEYED, "one ask by id"),
-    f"{_br('_ask_lifecycle.py')}::_store_fleet_request_id": Writer(KEYED, "the ask just registered"),
-    # The legacy Grok retry processor was removed in machinery #234.
-    f"{_br('_broker.py')}::_cleanup_ancient_messages": Writer(SKIP, "force-acknowledge ancient messages"),
-    f"{_br('_broker.py')}::broker_retention_cleanup": Writer(SKIP, "retention deletes of old terminal rows"),
-    f"{_br('_db.py')}::get_db": Writer(SKIP, "one-time consumed_by_live_driver backfill"),
-    # --- ai_agent_bridge: channel deliveries --------------------------------------------------------------
-    f"{_br('_channels.py')}::_insert_delivery": Writer(ADMITTED, "post's admitted targets"),
-    f"{_br('_channels.py')}::post": Writer(ADMITTED, "recipients admitted before any insert"),
-    f"{_br('_channels.py')}::mark_delivery": Writer(KEYED, "one delivery by id"),
-    f"{_br('_channels.py')}::mark_delivery_delivered": Writer(KEYED, "the claimant's delivery and attempt"),
-    f"{_br('_channels.py')}::mark_delivery_failed": Writer(KEYED, "the claimant's delivery and attempt"),
-    f"{_br('_channels.py')}::claim_next_delivery": Writer(SKIP, "oldest pending delivery"),
-    f"{_br('_channels.py')}::release_expired_leases": Writer(SKIP, "expired processing leases"),
-    f"{_br('_channels.py')}::expire_stale_deliveries": Writer(SKIP, "deliveries past their channel TTL"),
-    f"{_br('_channels.py')}::bulk_expire_dead_lanes": Writer(SKIP, "pending deliveries of dead lanes"),
-    f"{_br('_reconcile.py')}::reconcile_deliveries": Writer(SKIP, "deliveries whose reply already exists"),
-    f"{_br('_inbox.py')}::_claim_next_thread": Writer(SKIP, "the inbox drain's thread claim"),
-    f"{_br('_inbox.py')}::_update_claimed_status": Writer(KEYED, "the ids the filtered claim returned"),
-    f"{_br('_channels_watch.py')}::append_channel_event": Writer(
-        HELPER,
-        "delivery telemetry",
-        {f"{_br('_channels_watch.py')}::{name}": HELPER for name in _EMITTERS},
-    ),
-    # Each emitter reports on a thread the filtered inbox claim (``_claim_next_thread``) returned.
-    **{
-        f"{_br('_channels_watch.py')}::{name}": Writer(
-            HELPER, "delivery telemetry", {f"{_br('_inbox.py')}::{caller}": KEYED for caller in callers}
-        )
-        for name, callers in _EMITTERS.items()
-    },
 }
 
 

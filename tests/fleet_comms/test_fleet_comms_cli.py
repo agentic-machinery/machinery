@@ -282,23 +282,14 @@ def test_supported_bridge_command_defaults_to_durable_acp(
     capsys,
     configured_roots,
 ) -> None:
-    from lu_machinery.ai_agent_bridge import _channels, _channels_cli, _config
+    from lu_machinery.ai_agent_bridge import _discuss
 
-    db_path = tmp_path / "bridge.db"
     # The private bridge checkout uses the explicit ACP test workspace hook.
     monkeypatch.setenv("AB_REPO_ROOT", str(configured_roots.primary))
     monkeypatch.setenv("LU_TEST_ACP_PRIMARY_ROOT", str(configured_roots.primary))
-    monkeypatch.setattr(_config, "DB_PATH", db_path)
     monkeypatch.setattr(
         "lu_machinery.fleet_comms.artifacts.default_plane_root",
         lambda **_kwargs: tmp_path / "authority-plane",
-    )
-    monkeypatch.setattr(_channels, "fetch_monitor_state", lambda: None)
-    monkeypatch.setattr(_channels, "context_sha256", lambda path: "")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda channel: {"body": "", "revs": {}, "missing": []},
     )
     monkeypatch.delenv("LU_AGENT_COMM_TRANSPORT", raising=False)
     monkeypatch.delenv("LU_RUNTIME_INITIATOR", raising=False)
@@ -314,7 +305,6 @@ def test_supported_bridge_command_defaults_to_durable_acp(
     ):
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-6159")
-    _channels.create_channel("architecture", exist_ok=False)
     observed: dict[str, object] = {}
 
     def fake_run_discussion(**kwargs):
@@ -340,7 +330,7 @@ def test_supported_bridge_command_defaults_to_durable_acp(
         models=None,
     )
 
-    assert _channels_cli._handle_discuss(args) == 0
+    assert _discuss.handle_discuss(args) == 0
     assert observed["participants"] == ("cursor", "pool")
     assert observed["initiator"] == "codex"
     assert "Compare the bounded options." in str(observed["prompt"])
@@ -443,15 +433,13 @@ def test_cli_collectors_emit_store_not_db_path(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-    missing_broker = tmp_path / "missing.db"
-    monkeypatch.setenv("AB_DB_PATH", str(missing_broker))
+    missing_plane = tmp_path / "missing-plane"
 
     for command in ("metrics", "backlog", "dead-letters"):
-        rc = main([command, "--legacy"])
+        rc = main([command, "--root", str(missing_plane)])
         assert rc == EXIT_OK
         payload = json.loads(capsys.readouterr().out)
         assert payload["response_schema_version"] == "comms.v2"
-        assert payload["store"]["kind"] == "legacy-broker"
+        assert payload["store"]["kind"] == "comms-plane"
         assert payload["store"]["reachable"] is False
         assert "db_path" not in payload

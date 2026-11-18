@@ -83,12 +83,9 @@ detached `process-*` or `ask-*` worker — reads and applies every message marke
 or `read-but-not-live-consumed`, then records that consumption:
 
 ```bash
-.venv/bin/python -m lu_machinery.ai_agent_bridge inbox --for "$SESSION_HANDOFF_AGENT"
-.venv/bin/python -m lu_machinery.ai_agent_bridge ack --consumed-by-live-driver <message-id> [<message-id> ...]
+.venv/bin/python -m lu_machinery.fleet_comms deliveries receive --recipient "$SESSION_HANDOFF_AGENT" --worker-id "$SESSION_HANDOFF_AGENT"
+.venv/bin/python -m lu_machinery.fleet_comms deliveries ack <delivery-id> --worker-id "$SESSION_HANDOFF_AGENT" --fence-token <n>
 ```
-
-Never use a plain `ack` for these: it also records one-shot or headless processing and is
-not delivery proof for the live driver.
 
 Record every order, in-flight task with its full run nonce, blocker, decision and
 next action as a lane tracker item throughout the cycle. Use `add`, `note`,
@@ -100,7 +97,7 @@ requires an operator reference. The item lifecycle is in
    stream's `next` list, and `.venv/bin/python -m lu_machinery.fleet_comms plane-status`. The launcher already holds your lease; never
    claim it. Read open lane work with `lu-driver-state render --lane <lane>` and
    `lu-driver-state check --lane <lane>`. The database is the lane's handoff;
-   `DRIVER-STATE.md` is only a pointer. Detail and the optional §0b inbox watcher:
+   `DRIVER-STATE.md` is only a pointer. Detail and the §0b inbox count:
    [orient](references/orient.md).
 2. **§0a Inbox drain — cycle start.** A CTO demand (an URGENT delivery order or a
    blocker-report request) outranks all other lane work. Answer within its deadline, by

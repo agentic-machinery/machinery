@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from lu_machinery.agent_runtime.adapters.claude import ClaudeAdapter
-from lu_machinery.ai_agent_bridge import _channels, _channels_cli
+from lu_machinery.ai_agent_bridge import _discuss
 from lu_machinery.ai_agent_bridge._acp_compat import _discussion_failure_metadata, _failure_metadata
 from lu_machinery.fleet_comms.authority import AuthorityService
 from tests.ai_agent_bridge.conftest import acp_runs_in_product, bridge_wake_dir  # noqa: F401
@@ -40,10 +40,6 @@ def test_discuss_round_four_prompt_preserves_root_and_all_thread_replies(
                 body=f"prior message {index}",
             )
 
-    def legacy_context_must_not_be_read(_channel):
-        raise AssertionError("discussion context must come from Fleet Comms")
-
-    monkeypatch.setattr(_channels, "load_channel_context", legacy_context_must_not_be_read)
     observed: dict[str, object] = {}
 
     def fake_discussion(**kwargs):
@@ -66,7 +62,7 @@ def test_discuss_round_four_prompt_preserves_root_and_all_thread_replies(
         review=False,
     )
 
-    assert _channels_cli._handle_discuss(args) == 0
+    assert _discuss.handle_discuss(args) == 0
     assert observed["rounds"] == 3
     assert observed["participants"] == ("codex", "claude")
     assert root_body in str(observed["prompt"])

@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from lu_machinery.ai_agent_bridge import _ask_lifecycle as lifecycle
-from lu_machinery.ai_agent_bridge import _db, _gemini
+
 from lu_machinery.fleet_comms.artifacts import ArtifactStore
 from lu_machinery.fleet_comms.formal_review_finalize import finalize_formal_review_verdict
 from lu_machinery.fleet_comms.formal_review_jobs import FormalReviewJobService
@@ -19,44 +17,6 @@ from lu_machinery.fleet_comms.request_executor import RequestExecutor
 
 _REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
 _HEAD_SHA = "a" * 40
-
-
-@pytest.fixture
-def dual_write_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
-    """Point the legacy bridge and opt-in plane at isolated durable stores."""
-    legacy_db = tmp_path / "legacy" / "messages.db"
-    plane_root = tmp_path / "batch_state" / "fleet-comms" / "v1"
-    monkeypatch.setenv("AB_DB_PATH", str(legacy_db))
-    monkeypatch.setattr(lifecycle, "_PLANE_ROOT_OVERRIDE", plane_root)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "dual_write")
-    with _db.init_db() as conn:
-        assert conn.execute("SELECT 1").fetchone() is not None
-    return legacy_db, plane_root
-
-
-def _legacy_message(legacy_db: Path, message_id: int) -> tuple[str, str, str]:
-    with sqlite3.connect(legacy_db) as conn:
-        row = conn.execute(
-            "SELECT from_llm, to_llm, status FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-    assert row is not None
-    return tuple(str(value) for value in row)
-
-
-def _request_for_legacy_message(plane_root: Path, message_id: int) -> tuple[str, str]:
-    with sqlite3.connect(plane_root / "comms.sqlite3") as conn:
-        row = conn.execute(
-            """
-            SELECT request_id, requested_recipient
-            FROM requests
-            JOIN comms_messages
-              ON comms_messages.message_id = requests.request_message_id
-            WHERE json_extract(comms_messages.metadata_json, '$.legacy_message_id') = ?
-            """,
-            (message_id,),
-        ).fetchone()
-    assert row is not None
-    return str(row[0]), str(row[1])
 
 
 @pytest.fixture
@@ -78,39 +38,6 @@ def approved_findings_path(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
-
-
-@pytest.mark.parametrize(
-    ("recipient", "send"),
-    [
-        (
-            "gemini",
-            lambda: _gemini.ask_gemini(
-                "acceptance ask",
-                task_id="rollout-gemini",
-                from_llm="test",
-                async_mode=True,
-                # Read-only Gemini is refused before any write (#100), so the dual write is
-                # pinned on the write path, the only one that records a message.
-                allow_write=True,
-            ),
-        ),
-    ],
-)
-def test_bridge_asks_dual_write_to_legacy_and_message_plane(
-    dual_write_bridge: tuple[Path, Path],
-    recipient: str,
-    send: Callable[[], int | None],
-) -> None:
-    """Each public ask writes its legacy row and synchronous plane request."""
-    legacy_db, plane_root = dual_write_bridge
-
-    message_id = send()
-    assert isinstance(message_id, int)
-    assert _legacy_message(legacy_db, message_id) == ("test", recipient, "sent")
-    request_id, request_recipient = _request_for_legacy_message(plane_root, message_id)
-    assert request_id.startswith("request_")
-    assert request_recipient == recipient
 
 
 def test_schema_v2_contains_rollout_contract_tables_and_columns(tmp_path: Path) -> None:

@@ -1310,7 +1310,6 @@ def test_periodic_refresh_keeps_idle_next_warm(monkeypatch, tmp_path, hung_first
     for name in (
         "preload_all",
         "install_signal_logging",
-        "ensure_broker_db_ready",
         "seed_manifest_inventory",
         "warm_projection_cache",
         "start_periodic_refresh",

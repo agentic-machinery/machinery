@@ -838,34 +838,16 @@ def test_preparation_deadline_refuses_first_launch(tmp_path, monkeypatch):
     assert result.parse.agy_telemetry.retry_disposition == "deadline_exhausted"
 
 
-@pytest.mark.parametrize("caller", ["wiki-writer", "gemini-ask"])
-def test_off_review_agy_caller_runs_bounded_or_refuses_before_launch(tmp_path, monkeypatch, capsys, caller):
-    """Defect class: an off-review AGY caller launched, or wrote broker state, before its refusal (#100).
+def test_off_review_agy_caller_runs_bounded_or_refuses_before_launch(tmp_path, monkeypatch):
+    """Defect class: an off-review AGY caller launched before its refusal (#100).
 
     AGY has a read-only boundary only on the review route, so a text-only caller is refused
-    before any workspace, broker message or provider launch exists.
+    before any workspace or provider launch exists.
     """
-    from lu_machinery.ai_agent_bridge import _db, _gemini
     from lu_machinery.ai_llm import fallback
 
     invoke = Mock(side_effect=AssertionError("provider invoked"))
     monkeypatch.setattr(runner, "invoke", invoke)
-    monkeypatch.setattr(_gemini, "runtime_invoke", invoke)
-    if caller == "gemini-ask":
-        monkeypatch.setenv("AB_DB_PATH", str(tmp_path / "messages.db"))
-        _db.init_db()
-        monkeypatch.setattr(_gemini, "require_core_or_exit", lambda *_: None)
-        refused = _gemini.ask_gemini("prompt", task_id="fixture-task", stdout_only=True, allow_write=False)
-        out = capsys.readouterr()
-        conn = _db.get_db()
-        try:
-            rows = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        finally:
-            conn.close()
-        assert (refused, rows, out.out) == (None, 0, "")
-        assert "ask-gemini refused" in out.err
-        invoke.assert_not_called()
-        return
 
     outcome = fallback._run_agy_via_runtime("prompt", task_name="wiki", timeout_s=60, cwd=tmp_path)
 

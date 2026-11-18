@@ -703,46 +703,6 @@
       "message": "Value of type variable \"_DataclassT\" of \"replace\" cannot be \"object\""
     },
     {
-      "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"float\", variable has type \"int\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"int\", variable has type \"Signals\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-      "code": "return",
-      "message": "Missing return statement"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
-      "code": "return-value",
-      "message": "Return value expected"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_channels.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_channels.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_channels.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_channels_cli.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"AuthorityJobLease | None\" has no attribute \"fence_token\""
-    },
-    {
       "path": "lu_machinery/ai_agent_bridge/_cli.py",
       "code": "arg-type",
       "message": "Argument 1 to \"float\" has incompatible type \"object\"; expected \"Buffer | SupportsFloat | SupportsIndex | str\""
@@ -766,11 +726,6 @@
       "path": "lu_machinery/ai_agent_bridge/_cli.py",
       "code": "call-overload",
       "message": "No overload variant of \"int\" matches argument type \"object\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_cli.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | str\""
     },
     {
       "path": "lu_machinery/ai_agent_bridge/_cli.py",
@@ -786,11 +741,6 @@
       "path": "lu_machinery/ai_agent_bridge/_dispatch_wrappers.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_inbox.py",
-      "code": "attr-defined",
-      "message": "\"object\" has no attribute \"__iter__\"; maybe \"__dir__\" or \"__str__\"? (not iterable)"
     },
     {
       "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
@@ -884,26 +834,6 @@
     },
     {
       "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"Any | CompletedProcess[bytes]\", variable has type \"dict[Any, Any]\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
-      "code": "attr-defined",
-      "message": "\"dict[Any, Any]\" has no attribute \"returncode\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"Connection\", expected \"SQLiteConnection\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_inbox_watch.py",
       "code": "union-attr",
       "message": "Item \"MonitorNotContacted\" of \"MonitorNotContacted | SupervisoryRequest\" has no attribute \"delivery_id\""
     },
@@ -913,11 +843,6 @@
       "message": "Item \"None\" of \"None | str\" has no attribute \"replace\""
     },
     {
-      "path": "lu_machinery/ai_agent_bridge/_messaging.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"kept\" (hint: \"kept: list[<type>] = ...\")"
-    },
-    {
       "path": "lu_machinery/ai_agent_bridge/_opencode.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
@@ -931,36 +856,6 @@
       "path": "lu_machinery/ai_agent_bridge/_opencode.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"_RolloutRecord\", variable has type \"None\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"str\", variable has type \"None\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"tuple[int, int, int, int]\", variable has type \"None\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "attr-defined",
-      "message": "\"None\" has no attribute \"feed\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"tuple[bool, None]\", expected \"tuple[bool, str]\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_ui_codex.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"seen\" (hint: \"seen: set[<type>] = ...\")"
     },
     {
       "path": "lu_machinery/ai_agent_bridge/monitor_client.py",
@@ -999,16 +894,6 @@
     },
     {
       "path": "lu_machinery/api/comms_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"float\", variable has type \"int\")"
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | SQLiteConnection\""
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[Any, Any]\""
     },
@@ -1026,11 +911,6 @@
       "path": "lu_machinery/api/comms_router.py",
       "code": "var-annotated",
       "message": "Need type annotation for \"completions\" (hint: \"completions: list[<type>] = ...\")"
-    },
-    {
-      "path": "lu_machinery/api/comms_router.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"task_groups\" (hint: \"task_groups: dict[<type>, <type>] = ...\")"
     },
     {
       "path": "lu_machinery/api/delegate_router.py",
@@ -1875,7 +1755,7 @@
     {
       "path": "lu_machinery/api/state_router.py",
       "code": "no-redef",
-      "message": "Name \"agents\" already defined on line 1306"
+      "message": "Name \"agents\" already defined"
     },
     {
       "path": "lu_machinery/api/state_router.py",
@@ -2223,16 +2103,6 @@
       "message": "Item \"None\" of \"Any | None | list[Any]\" has no attribute \"__iter__\" (not iterable)"
     },
     {
-      "path": "lu_machinery/api/telemetry/legacy_comms.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"Response\""
-    },
-    {
-      "path": "lu_machinery/api/telemetry/legacy_comms.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"Response\""
-    },
-    {
       "path": "lu_machinery/api/telemetry_router.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"SQLiteConnection\""
@@ -2260,7 +2130,7 @@
     {
       "path": "lu_machinery/api/work_router.py",
       "code": "no-redef",
-      "message": "Name \"body\" already defined on line 817"
+      "message": "Name \"body\" already defined"
     },
     {
       "path": "lu_machinery/api/work_router.py",
@@ -5065,7 +4935,7 @@
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
       "code": "no-redef",
-      "message": "Name \"body\" already defined on line 432"
+      "message": "Name \"body\" already defined"
     },
     {
       "path": "lu_machinery/fleet_comms/adapter_conformance.py",
@@ -5448,11 +5318,6 @@
       "message": "No overload variant of \"__getitem__\" of \"list\" matches argument type \"str\""
     },
     {
-      "path": "lu_machinery/fleet_comms/efficiency_metrics.py",
-      "code": "misc",
-      "message": "Incompatible types in \"yield\" (actual type \"Connection\", expected type \"SQLiteConnection\")"
-    },
-    {
       "path": "lu_machinery/fleet_comms/fleet_overview.py",
       "code": "misc",
       "message": "Cannot assign to a type"
@@ -5486,11 +5351,6 @@
       "path": "lu_machinery/fleet_comms/formal_review_jobs.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/fleet_comms/legacy_broker_report.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"Connection\", expected \"SQLiteConnection\")"
     },
     {
       "path": "lu_machinery/fleet_comms/message_plane.py",
@@ -7380,7 +7240,7 @@
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "no-redef",
-      "message": "Name \"_lock_timeout_exit\" already defined on line 7501"
+      "message": "Name \"_lock_timeout_exit\" already defined"
     },
     {
       "path": "lu_machinery/orchestration/worktree_artifacts.py",

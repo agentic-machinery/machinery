@@ -83,7 +83,7 @@ second discuss API):
 
 | Verb | How |
 | --- | --- |
-| **inbox** | `… -m lu_machinery.ai_agent_bridge inbox show\|ack …` (fleet-comms dual-write) |
+| **inbox** | `… -m lu_machinery.fleet_comms deliveries pending\|receive\|ack …` |
 | **dispatch** | `lu_machinery/dispatch.py dispatch --model <catalog-model> --agent <non-cursor> …` (Cursor driver holds concurrency 1 — do not self-dispatch) |
 | **discuss** | `ab discuss` via the venv bridge above → ACPX controller (`LU_ACPX_TRANSPORT=active`) on the same plane |
 | **receipts** | `batch_state/tasks/<task-id>.json` + channel/thread ids; Cursor receipts must carry `resolved_model` / `resolved_model_known` / `resolved_model_source` |

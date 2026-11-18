@@ -10,29 +10,6 @@
     ]
   },
   {
-    "path": "lu_machinery/ai_agent_bridge/_broker.py",
-    "reference_count": 4,
-    "kind": "writer",
-    "target_db": "legacy broker DB",
-    "reason": "persists broker messages and jobs",
-    "calls": [
-      "sqlite3.connect(str(_config.DB_PATH))",
-      "sqlite3.connect(str(_config.DB_PATH))"
-    ]
-  },
-  {
-    "path": "lu_machinery/ai_agent_bridge/_db.py",
-    "reference_count": 9,
-    "kind": "writer",
-    "target_db": "legacy broker DB",
-    "reason": "migrates and persists broker state",
-    "calls": [
-      "sqlite3.connect(_config.DB_PATH)",
-      "sqlite3.connect(_config.DB_PATH)",
-      "sqlite3.connect(f'{_config.DB_PATH.resolve().as_uri()}?mode=ro', uri=True)"
-    ]
-  },
-  {
     "path": "lu_machinery/api/resilience.py",
     "reference_count": 3,
     "kind": "writer",
@@ -96,16 +73,6 @@
     ]
   },
   {
-    "path": "lu_machinery/ai_agent_bridge/broker_indexes.py",
-    "reference_count": 4,
-    "kind": "writer",
-    "target_db": "legacy broker DB",
-    "reason": "adds broker indexes",
-    "calls": [
-      "sqlite3.connect(str(args.db))"
-    ]
-  },
-  {
     "path": "lu_machinery/ops/product_entry.py",
     "reference_count": 1,
     "kind": "configured_entry_point",
@@ -152,16 +119,6 @@
     "calls": [
       "sqlite3.connect(candidate.resolve().as_uri() + '?mode=rw', uri=True, isolation_level=None)",
       "sqlite3.connect(held.generation.resolve().as_uri() + '?mode=rw', uri=True, isolation_level=None)"
-    ]
-  },
-  {
-    "path": "lu_machinery/telemetry/legacy_bridge.py",
-    "reference_count": 7,
-    "kind": "writer",
-    "target_db": "legacy broker DB",
-    "reason": "writes legacy telemetry projection",
-    "calls": [
-      "sqlite3.connect(str(path), timeout=5.0)"
     ]
   },
   {

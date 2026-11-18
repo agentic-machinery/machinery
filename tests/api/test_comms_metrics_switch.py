@@ -30,19 +30,6 @@ def test_authority_mode_reads_plane_not_legacy_broker(
         assert payload["store"]["kind"] == "comms-plane", route
 
 
-def test_forced_off_mode_stays_on_legacy_broker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Explicit off mode pins the legacy broker path (the repo's CONFIGURED
-    default is authority, so the off/legacy path needs an explicit pin)."""
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-    client = _client(tmp_path)
-    for route in _ROUTES:
-        payload = client.get(route).json()
-        assert payload.get("source") != "authority", route
-        assert payload.get("db_missing") is True, route  # fixture: no broker db
-
-
 def test_exporter_refresh_never_blocks_scrape_or_exports_expired_counts(monkeypatch, tmp_path):
     """A slow/failed refresh must not pin a scrape or label old counts as healthy."""
     import threading
@@ -124,7 +111,7 @@ def test_exporter_refresh_never_blocks_scrape_or_exports_expired_counts(monkeypa
 
 
 def test_exporter_snapshot_isolates_contexts_and_plane_switch(monkeypatch, tmp_path):
-    """A cached authority reading must not bleed into another root or legacy mode."""
+    """A cached authority reading must not bleed into another root or plane."""
     from lu_machinery.api import comms_router as comms
     from lu_machinery.api import state_helpers as cache
 
@@ -139,10 +126,7 @@ def test_exporter_snapshot_isolates_contexts_and_plane_switch(monkeypatch, tmp_p
         monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "new-plane"))
         assert comms.cached_panel_metrics(first) is None
         monkeypatch.delenv("FLEET_COMMS_ROOT")
-        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-        assert comms.cached_panel_metrics(first) is None
         cache.cache_invalidate(key)
-        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
         assert comms.cached_panel_metrics(first) is None
     finally:
         cache.cache_invalidate(key)

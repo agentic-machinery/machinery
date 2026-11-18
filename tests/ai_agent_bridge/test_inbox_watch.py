@@ -1,192 +1,33 @@
-"""Unit coverage for the live-driver legacy-inbox wakeup watcher."""
+"""Unit coverage for the supervisory wake watcher (Fleet Comms authority)."""
 
 from __future__ import annotations
 
 import io
-import os
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 import yaml
 
-from lu_machinery.ai_agent_bridge import _channels, _db, _inbox_watch, _messaging
+from lu_machinery import agent_identity
+from lu_machinery.ai_agent_bridge import _inbox_watch
 from tests.ai_agent_bridge.conftest import bridge_wake_dir  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
 
-@pytest.fixture(autouse=True)
-def isolate_db(tmp_path: Path):
-    """Create an isolated broker database with the current messages schema."""
-    db_path = tmp_path / "messages.db"
-    with (
-        patch.dict(os.environ, {"AB_DB_PATH": str(db_path), "FLEET_COMMS_MESSAGE_PLANE": "shadow"}),
-    ):
-        _db.init_db().close()
-        yield db_path
-
-
-def _send(
-    content: str,
-    *,
-    task_id: str = "review-pr-5687",
-    to_llm: str = "grok",
-    consumed: bool = False,
-) -> int:
-    message_id = _messaging.send_message(
-        content,
-        task_id=task_id,
-        from_llm="claude",
-        to_llm=to_llm,
-        quiet=True,
-    )
-    if consumed:
-        _messaging.acknowledge(message_id, quiet=True, consumed_by_live_driver=True)
-    return message_id
-
-
-def test_cold_start_surfaces_existing_unconsumed_alias_rows(isolate_db: Path):
-    """A watcher begins at zero and includes permanent read aliases."""
-    canonical_id = _send("canonical pending", to_llm="grok")
-    alias_id = _send("historical pending", to_llm="grok-build")
-    _send("already consumed", to_llm="grok", consumed=True)
-
-    conn = _inbox_watch.open_readonly_db(isolate_db)
-    try:
-        events = _inbox_watch.poll_once(conn, "grok", last_seen=0)
-    finally:
-        conn.close()
-
-    assert [event.message_id for event in events] == [canonical_id, alias_id]
-    query = _inbox_watch.build_poll_query(("grok", "grok-build"))
-    assert "to_llm IN (?, ?)" in query
-    assert "consumed_by_live_driver = 0" in query
-    assert "ORDER BY id ASC" in query
-
-
-def test_cursor_advances_after_emission_and_does_not_reemit(isolate_db: Path):
-    """The in-memory cursor suppresses events only after their flush succeeds."""
-    message_id = _send("please drain")
-    output = io.StringIO()
-    conn = _inbox_watch.open_readonly_db(isolate_db)
-    try:
-        events = _inbox_watch.poll_once(conn, "grok", last_seen=0)
-        cursor = _inbox_watch.emit_notifications(events, last_seen=0, output=output)
-        repeated = _inbox_watch.poll_once(conn, "grok", last_seen=cursor)
-    finally:
-        conn.close()
-
-    assert cursor == message_id
-    assert repeated == []
-    assert f"id={message_id}" in output.getvalue()
-
-
-def test_notification_escapes_newlines_and_bounds_preview(isolate_db: Path):
-    """One message always creates one bounded Monitor event line."""
-    message_id = _send("first line\nsecond line\r\n" + ("x" * 400))
-    conn = _inbox_watch.open_readonly_db(isolate_db)
-    try:
-        event = _inbox_watch.poll_once(conn, "grok", last_seen=0)[0]
-    finally:
-        conn.close()
-
-    line = event.notification_line()
-    preview = line.split("preview=", maxsplit=1)[1]
-    assert f"id={message_id}" in line
-    assert "sender=claude" in line
-    assert "request_id=review-pr-5687" in line
-    assert "first line\\nsecond line\\r\\n" in line
-    assert "\n" not in line
-    assert len(preview) == _inbox_watch.MAX_PREVIEW_CHARS + len("...")
-
-
-def test_duplicate_watcher_lock_blocks_second_start(isolate_db: Path, tmp_path: Path):
+def test_duplicate_watcher_lock_blocks_second_start(tmp_path: Path):
     """A second process cannot own the same canonical agent-slot watcher lock."""
     lock_dir = tmp_path / "locks"
     first = _inbox_watch.acquire_watcher_lock("grok", lock_dir)
     try:
         with pytest.raises(_inbox_watch.WatcherAlreadyRunningError, match="already running"):
-            _inbox_watch.run_watcher(
-                "grok-build",
-                db_path=isolate_db,
-                lock_dir=lock_dir,
-                once=True,
-            )
+            _inbox_watch.acquire_watcher_lock("grok-build", lock_dir)
     finally:
         first.release()
 
-    assert (
-        _inbox_watch.run_watcher(
-            "grok-build",
-            db_path=isolate_db,
-            lock_dir=lock_dir,
-            once=True,
-        )
-        == 0
-    )
-
-
-def test_cursor_does_not_advance_when_stdout_flush_fails(isolate_db: Path):
-    """A failed event flush leaves the caller's cursor unchanged for replay."""
-    _send("retry this")
-    conn = _inbox_watch.open_readonly_db(isolate_db)
-    try:
-        events = _inbox_watch.poll_once(conn, "grok", last_seen=0)
-    finally:
-        conn.close()
-
-    class BrokenOutput:
-        def write(self, _line: str) -> int:
-            return 1
-
-        def flush(self) -> None:
-            raise OSError("stdout closed")
-
-    last_seen = 0
-    with pytest.raises(OSError, match="stdout closed"):
-        last_seen = _inbox_watch.emit_notifications(events, last_seen=last_seen, output=BrokenOutput())
-    assert last_seen == 0
-
-
-def test_inbox_watcher_tick_invokes_ask_watchdog(isolate_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """The persistent inbox watcher loop invokes run_ask_watchdog on each tick (#5893)."""
-    watchdog_mock = patch("lu_machinery.ai_agent_bridge._ask_lifecycle.run_ask_watchdog").start()
-    try:
-        _inbox_watch.run_watcher(
-            "grok",
-            db_path=isolate_db,
-            lock_dir=tmp_path / "locks",
-            output=io.StringIO(),
-            once=True,
-        )
-        watchdog_mock.assert_called_once()
-    finally:
-        patch.stopall()
-
-
-def test_inbox_watcher_watchdog_failure_warns_and_continues(
-    isolate_db: Path, tmp_path: Path, capsys: pytest.CaptureFixture
-):
-    """A raising ask watchdog emits a stderr warning and does not crash the watcher loop (#5893)."""
-    watchdog_mock = patch(
-        "lu_machinery.ai_agent_bridge._ask_lifecycle.run_ask_watchdog", side_effect=RuntimeError("watchdog exploded")
-    ).start()
-    try:
-        cursor = _inbox_watch.run_watcher(
-            "grok",
-            db_path=isolate_db,
-            lock_dir=tmp_path / "locks",
-            output=io.StringIO(),
-            once=True,
-        )
-        assert cursor == 0
-        watchdog_mock.assert_called_once()
-        stderr = capsys.readouterr().err
-        assert "⚠️  inbox watcher: ask watchdog failed: RuntimeError: watchdog exploded" in stderr
-    finally:
-        patch.stopall()
+    _inbox_watch.acquire_watcher_lock("grok-build", lock_dir).release()
 
 
 @pytest.fixture
@@ -196,11 +37,10 @@ def legacy_monitor_roster(tmp_path: Path, monkeypatch):
     Only Grok has dual-read aliases (grok-build), so the legacy monitor path is
     exercised on that provider with the monitor roster the #7597 sessions saw.
     """
-    assignments = yaml.safe_load(_channels.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
+    assignments = yaml.safe_load(agent_identity.ASSIGNMENTS_PATH.read_text(encoding="utf-8"))
     assignments["assignments"]["monitor"]["slots"] = ["muse-monitor"]
     roster = tmp_path / "area_assignments.yaml"
     roster.write_text(yaml.safe_dump(assignments), encoding="utf-8")
-    from lu_machinery import agent_identity
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
     return roster
 

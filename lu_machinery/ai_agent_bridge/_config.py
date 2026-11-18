@@ -4,8 +4,7 @@ import os
 import shutil
 from pathlib import Path
 
-from lu_machinery.common.bridge_paths import default_bridge_db_path
-from lu_machinery.common.repo_root import product_root, state_root
+from lu_machinery.common.repo_root import product_root
 
 from ._env import build_agent_env
 
@@ -21,10 +20,6 @@ BRIDGE_ENTRY = "lu_machinery.ai_agent_bridge"
 # ``_config.NAME`` where they are used; ``from ._config import NAME`` would resolve at import.
 # REPO_ROOT: the bridge's repository, ``AB_REPO_ROOT`` when set, else the product checkout.
 REPO_ROOT: Path
-# DB_PATH, PID_DIR: the broker database (same as the MCP server uses) and pid directory,
-# under the shared state root.
-DB_PATH: Path
-PID_DIR: Path
 # _PARENT_ENV: the narrow environment for detached children.
 _PARENT_ENV: dict[str, str]
 
@@ -40,8 +35,6 @@ _CLAUDE_BIN = shutil.which("claude") or (
 )
 CLAUDE_CMD = [_CLAUDE_BIN] if _CLAUDE_BIN else ["npx", "@anthropic-ai/claude-code@latest"]
 AGY_CLI = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
-GEMINI_CLI = shutil.which("gemini") or "gemini"
-CODEX_CLI = shutil.which("codex") or "codex"
 
 
 def default_gemini_model() -> str:
@@ -81,13 +74,6 @@ def __getattr__(name: str):
         return default_gemini_model()
     if name == "REPO_ROOT":
         return product_root(os.environ.get("AB_REPO_ROOT") or None)
-    # A set override wins without resolving the state root it replaces.
-    if name == "DB_PATH":
-        override = os.environ.get("AB_DB_PATH")
-        return Path(override) if override else default_bridge_db_path(state_root())
-    if name == "PID_DIR":
-        override = os.environ.get("AB_PID_DIR")
-        return Path(override) if override else state_root() / ".mcp" / "servers" / "message-broker" / "pids"
     if name == "_PARENT_ENV":
         # Environment for detached children. Use a narrow env so background bridge
         # processes do not inherit shell tokens that agents can print. Set
@@ -102,6 +88,3 @@ def __getattr__(name: str):
 # Avoids burning API quota on repeated checks within the same session.
 _MODEL_CACHE: dict[str, tuple[bool, float]] = {}
 _MODEL_CACHE_TTL = 3600  # 1 hour — re-check after this
-
-# GitHub comment/body limit is 65,536 chars. Use 64K with 1.5K safety margin for headers.
-GH_CHAR_LIMIT = 64000

@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from lu_machinery.ai_agent_bridge import _channels, _channels_cli
+from lu_machinery.ai_agent_bridge import _discuss
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir", "acp_runs_in_product")
@@ -28,11 +28,6 @@ def discuss_plane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("LU_RUNTIME_INITIATOR_SOURCE", raising=False)
     monkeypatch.delenv("SESSION_HANDOFF_AGENT", raising=False)
     monkeypatch.setenv("CODEX_THREAD_ID", "thread-7160")
-    monkeypatch.setattr(
-        _channels,
-        "load_channel_context",
-        lambda _channel: {"body": "", "revs": {}, "missing": []},
-    )
 
     def fake_discussion(**kwargs):
         return {
@@ -81,16 +76,16 @@ def _discussion_roots(fleet_root: Path) -> list[tuple[str, str]]:
 
 
 def test_same_brief_retry_on_fresh_channel_succeeds(discuss_plane: Path) -> None:
-    assert _channels_cli._handle_discuss(_args(channel="alpha", body="Retry me.")) == 0
-    assert _channels_cli._handle_discuss(_args(channel="beta", body="Retry me.")) == 0
+    assert _discuss.handle_discuss(_args(channel="alpha", body="Retry me.")) == 0
+    assert _discuss.handle_discuss(_args(channel="beta", body="Retry me.")) == 0
     roots = _discussion_roots(discuss_plane)
     assert sorted(channel for channel, _ in roots) == ["alpha", "beta"]
     assert roots[0][1] != roots[1][1]
 
 
 def test_same_channel_replay_dedupes_root(discuss_plane: Path) -> None:
-    assert _channels_cli._handle_discuss(_args(channel="alpha", body="Same brief.")) == 0
-    assert _channels_cli._handle_discuss(_args(channel="alpha", body="Same brief.")) == 0
+    assert _discuss.handle_discuss(_args(channel="alpha", body="Same brief.")) == 0
+    assert _discuss.handle_discuss(_args(channel="alpha", body="Same brief.")) == 0
     roots = _discussion_roots(discuss_plane)
     assert len(roots) == 1
     assert roots[0][0] == "alpha"
@@ -100,19 +95,19 @@ def test_explicit_idempotency_key_replays_and_mints_fresh_roots(
     discuss_plane: Path,
 ) -> None:
     assert (
-        _channels_cli._handle_discuss(
+        _discuss.handle_discuss(
             _args(channel="alpha", body="Same brief.", idempotency_key="attempt-1")
         )
         == 0
     )
     assert (
-        _channels_cli._handle_discuss(
+        _discuss.handle_discuss(
             _args(channel="alpha", body="Same brief.", idempotency_key="attempt-2")
         )
         == 0
     )
     assert (
-        _channels_cli._handle_discuss(
+        _discuss.handle_discuss(
             _args(channel="alpha", body="Same brief.", idempotency_key="attempt-2")
         )
         == 0
@@ -140,13 +135,13 @@ def test_failed_discussion_can_retry_same_channel_with_new_idempotency_key(
     monkeypatch.setattr("lu_machinery.agent_runtime.acpx_discuss.run_discussion", fail_once)
 
     assert (
-        _channels_cli._handle_discuss(
+        _discuss.handle_discuss(
             _args(channel="alpha", body="Retry safely.", idempotency_key="attempt-1")
         )
         == 1
     )
     assert (
-        _channels_cli._handle_discuss(
+        _discuss.handle_discuss(
             _args(channel="alpha", body="Retry safely.", idempotency_key="attempt-2")
         )
         == 0

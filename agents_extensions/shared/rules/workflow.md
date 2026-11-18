@@ -742,19 +742,13 @@ those.
 **Quick reference** (through the explicit project bridge; never run bare
 `ab`, which resolves to ApacheBench on the operator machine):
 ```bash
-  # List / inspect
-.venv/bin/python -m lu_machinery.ai_agent_bridge channel list
-.venv/bin/python -m lu_machinery.ai_agent_bridge channel info pipeline
-.venv/bin/python -m lu_machinery.ai_agent_bridge channel tail reviews -n 20
-.venv/bin/python -m lu_machinery.ai_agent_bridge channel tail reviews --thread THREAD_ID
+  # Inspect (read-only Monitor API)
+curl -s http://127.0.0.1:8765/api/fleet/acp/conversations
+curl -s http://127.0.0.1:8765/api/fleet/acp/conversations/CONVERSATION_ID
 
-  # Post (short form — single recipient)
-.venv/bin/python -m lu_machinery.ai_agent_bridge p reviews claude \
-  "quick question about module X"
-
-  # Post (long form — multi-recipient, threading, parent/corr ids)
-.venv/bin/python -m lu_machinery.ai_agent_bridge post reviews \
-  "Review of #NNN" --to claude,codex --parent MSG_ID
+  # Post (one recipient per --recipient; threading with --in-reply-to / --correlation-id)
+.venv/bin/python -m lu_machinery.fleet_comms channel publish reviews - \
+  --sender "$SESSION_HANDOFF_AGENT" --recipient claude --idempotency-key KEY < message.md
 
   # Multi-agent bounded discussion
 .venv/bin/python -m lu_machinery.ai_agent_bridge discuss architecture \
@@ -764,12 +758,9 @@ those.
 
 `ab discuss` runs rounds in parallel via ThreadPoolExecutor,
 short-circuits when all agents end their response with `[AGREE]`,
-and caps at 4 rounds. Default: 2 rounds, 1 agent. The transcript
-lands in `channel_messages` with proper `parent_id` threading so
-you can tail it later with `ab channel tail --thread`.
-
-**Web dashboard**: `http://localhost:8765/channels.html` (localhost
-only, read + post).
+and caps at 4 rounds. Default: 2 rounds, 1 agent. The discussion is a
+Fleet Comms job; read its transcript with
+`GET /api/fleet/acp/conversations/<conversation-id>`.
 
 **Full docs**: `docs/best-practices/agent-bridge.md`.
 

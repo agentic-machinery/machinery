@@ -289,12 +289,9 @@ Use the seat-facing facade from any repository checkout:
 .venv/bin/python -m lu_machinery.fleet_comms fleet metrics
 ```
 
-Before proposing deletion of a Broker Ops page or a legacy route, choose a
-window between 1 and 90 days and run:
-
-```bash
-.venv/bin/python -m lu_machinery.fleet_comms fleet broker-report --days 7
-```
+`fleet broker-report` and its telemetry stores were retired with the legacy
+broker in #515; the command now refuses with exit 2. The process below is kept
+as the record of how earlier legacy slices were retired.
 
 The report reads `data/telemetry/legacy_comms_routes.db` without creating or
 modifying it. A separate `data/telemetry/legacy_bridge` file is read when

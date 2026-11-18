@@ -393,30 +393,6 @@ def test_cli_cold_start_board(capsys, tmp_path, monkeypatch):
     assert "probes" in payload
 
 
-def test_probe_inbox_legacy_schema_ok(tmp_path: Path, monkeypatch) -> None:
-    """Legacy deliveries without channel/recipient columns must not degrade."""
-    # #6863: default_plane_root hard-fails on non-git roots; the fixture must
-    # present a real anchor (a `.git` dir is enough for the fs fallback).
-    (tmp_path / ".git").mkdir()
-    broker = tmp_path / "messages.db"
-    _seed_legacy_broker(broker)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-    monkeypatch.setenv("AB_DB_PATH", str(broker))
-
-    result = _probe_inbox(root=None, repo_root=tmp_path, agent="claude")
-    assert result.status == "ok"
-    assert result.error is None
-    assert result.data["source"] == "legacy"
-    assert result.data["inbox_pending_count"] == 2
-    assert result.data["matched_agent"] == "claude"
-    recent = result.data["recent_deliveries"]
-    assert len(recent) == 2
-    assert {r["delivery_id"] for r in recent} == {"d1", "d2"}
-    blob = json.dumps(result.data)
-    assert "SECRET_BODY" not in blob
-    assert "also-secret" not in blob
-
-
 def test_probe_inbox_authority_counts_agent(tmp_path: Path, monkeypatch) -> None:
     """Authority path counts queued/running rows for the exact recipient."""
     plane_root = tmp_path / "plane"
@@ -458,19 +434,6 @@ def test_probe_backlog_labels_authority_source(tmp_path: Path, monkeypatch) -> N
     assert data["backlog_total"] == 3
     assert data["dead_letters_total"] == 1
     assert "claude" in data["backlog_by_agent"]
-
-
-def test_probe_backlog_labels_legacy_source(tmp_path: Path, monkeypatch) -> None:
-    """Backlog probe falls back to broker DB and labels source=legacy when plane is off."""
-    broker = tmp_path / "messages.db"
-    _seed_legacy_broker(broker)
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "off")
-    monkeypatch.setenv("AB_DB_PATH", str(broker))
-
-    data = _probe_backlog_and_dead_letters(root=tmp_path / "missing-plane", repo_root=tmp_path)
-    assert data["source"] == "legacy"
-    assert data["backlog_total"] == 2
-    assert data["backlog_by_agent"].get("claude") == 2
 
 
 def test_board_oversized_probe_applies_final_fallback(

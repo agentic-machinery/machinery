@@ -1,4 +1,8 @@
-"""Dependency-light bridge database path resolution."""
+"""Legacy broker database path, kept only for the product-facing MonitorContext roots.
+
+Machinery no longer reads this store (#515). The product's project API still reads
+``ctx.stores.message_db`` until it drops its module comms view; then remove this module.
+"""
 
 import os
 from pathlib import Path

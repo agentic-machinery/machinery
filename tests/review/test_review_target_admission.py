@@ -8,10 +8,12 @@ reach their sinks unchanged.
 from __future__ import annotations
 
 import dataclasses
+
 import pytest
+
+from lu_machinery.agent_identity import STATIC_VALID_AGENTS
 from lu_machinery.agent_runtime import retired_seat_admission as kimi_admission
 from lu_machinery.agent_runtime import target_admission
-from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.agent_runtime.retired_seat_admission import ACP_MODE, BRIDGE_MODE, REVIEW_MODE, KimiAdmissionRefused
 from lu_machinery.agent_runtime.target_admission import (
     AdmittedTarget,
@@ -20,11 +22,11 @@ from lu_machinery.agent_runtime.target_admission import (
     require_admitted,
     resolve_and_admit,
 )
-from lu_machinery.ai_agent_bridge import _channels, _db
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import slot_routing
 from tests.claude_route_accounts import HOST_ACCOUNT
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 
@@ -52,50 +54,10 @@ def _holder(agent: str | None):
     return resolve
 
 
-@pytest.fixture
-def channel_db(tmp_path, monkeypatch):
-    db_file = tmp_path / "messages.db"
-    monkeypatch.setenv("AB_WAKE_DIR", str(tmp_path / "wake"))
-    monkeypatch.setenv("AB_DB_PATH", str(db_file))
-    _db.init_db()
-    _channels.create_channel("topic")
-    yield tmp_path
-
-
-# --- the reviewer's reproduction: a slot whose live holder is Kimi -------------------
-
-
-@pytest.mark.parametrize("holder", _KIMI_HOLDERS)
-def test_a_slot_held_by_kimi_is_refused_before_snapshots_broker_inserts_or_wakes(channel_db, monkeypatch, holder):
-    monkeypatch.setattr(slot_routing, "resolve_slot_holder", _holder(holder))
-    for effect in ("get_db", "fetch_monitor_state", "context_sha256", "_touch_wake_file", "_insert_delivery"):
-        monkeypatch.setattr(_channels, effect, _fail)
-
-    # The bridge loads the gate as ``agent_runtime``: its KimiAdmissionRefused is a ValueError of that copy.
-    with pytest.raises(ValueError, match=_TOKEN) as refused:
-        _channels.post("topic", "user", "Consult on this design.", to_agents=["claude-folk"])
-
-    assert holder in str(refused.value)
-    assert not (channel_db / "wake").exists()
-
-
-def test_a_slot_held_by_a_non_kimi_seat_is_delivered_to_and_woken_at_its_holder(channel_db, monkeypatch):
-    monkeypatch.setattr(slot_routing, "resolve_slot_holder", _holder("claude-infra"))
-
-    result = _channels.post(
-        "topic", "user", "hello", to_agents=["claude-folk"], to_model="claude-opus-5-5", auto_snapshot=False
-    )
-
-    [delivery] = _channels.deliveries_for_message(result["message_id"])
-    assert (delivery["to_agent"], delivery["to_model"]) == ("claude-infra", "claude-opus-5-5")
-    assert (channel_db / "wake" / "claude-infra").is_file()
-    assert result["warnings"] == []
-
-
-def test_an_explicit_kimi_slot_is_refused_before_the_slot_is_looked_up(channel_db, monkeypatch):
+def test_an_explicit_kimi_slot_is_refused_before_the_slot_is_looked_up(monkeypatch):
     monkeypatch.setattr(slot_routing, "resolve_slot_holder", _fail)
     with pytest.raises(KimiAdmissionRefused, match=_TOKEN):
-        resolve_and_admit(("kimi-infra",), mode=BRIDGE_MODE, slots=_channels.STATIC_VALID_AGENTS)
+        resolve_and_admit(("kimi-infra",), mode=BRIDGE_MODE, slots=STATIC_VALID_AGENTS)
 
 
 # --- every resolution step is inside the gate ----------------------------------------
@@ -103,26 +65,26 @@ def test_an_explicit_kimi_slot_is_refused_before_the_slot_is_looked_up(channel_d
 
 def test_slots_resolve_to_the_live_holder_or_keep_the_identity_with_a_warning(monkeypatch):
     monkeypatch.setattr(slot_routing, "resolve_slot_holder", _holder("claude-infra"))
-    (held,) = resolve_and_admit(("claude-folk",), mode=BRIDGE_MODE, slots=_channels.STATIC_VALID_AGENTS)
+    (held,) = resolve_and_admit(("claude-folk",), mode=BRIDGE_MODE, slots=STATIC_VALID_AGENTS)
     assert (held.recipient, held.reason) == ("claude-infra", "slot:claude-folk")
 
     monkeypatch.setattr(slot_routing, "resolve_slot_holder", _holder(None))
     warnings: list[str] = []
     (unheld,) = resolve_and_admit(
-        ("claude-folk",), mode=BRIDGE_MODE, slots=_channels.STATIC_VALID_AGENTS, warnings=warnings
+        ("claude-folk",), mode=BRIDGE_MODE, slots=STATIC_VALID_AGENTS, warnings=warnings
     )
     assert (unheld.recipient, unheld.reason) == ("claude-folk", "explicit")
     assert warnings and "recipient claude slot has no live holder (no-live-holder)" in warnings[0]
     # #9739: the caller's slot string never reaches the log text.
     assert "claude-folk" not in warnings[0]
 
-    (static,) = resolve_and_admit(("claude-infra",), mode=BRIDGE_MODE, slots=_channels.STATIC_VALID_AGENTS)
+    (static,) = resolve_and_admit(("claude-infra",), mode=BRIDGE_MODE, slots=STATIC_VALID_AGENTS)
     assert static.recipient == "claude-infra"
 
 
 def test_slot_log_label_comes_from_the_seat_list_and_taxonomy_area():
     # #9739: log text names a slot by its static seat prefix and taxonomy area.
-    seats = _channels.STATIC_VALID_AGENTS
+    seats = STATIC_VALID_AGENTS
     assert target_admission._slot_label("grok-infra", seats, "infra") == "grok slot in area 'infra'"
     assert target_admission._slot_label("claude-infra-x", seats) == "claude-infra slot"  # longest prefix
     assert target_admission._slot_label("nobody-infra", seats) == "slot with an unregistered seat prefix"
@@ -135,7 +97,7 @@ def test_slot_resolver_failure_warning_omits_the_caller_slot_string(monkeypatch,
     monkeypatch.setattr(slot_routing, "resolve_slot_holder", boom)
     warnings: list[str] = []
     (target,) = resolve_and_admit(
-        ("claude-folk",), mode=BRIDGE_MODE, slots=_channels.STATIC_VALID_AGENTS, warnings=warnings
+        ("claude-folk",), mode=BRIDGE_MODE, slots=STATIC_VALID_AGENTS, warnings=warnings
     )
     assert target.recipient == "claude-folk"
     expected = "slot resolver failed for the claude slot (RuntimeError: resolver down) — queued at its identity"
@@ -431,8 +393,6 @@ def test_sinks_refuse_raw_names():
     for raw in ("claude", "kimi", None):
         with pytest.raises(TypeError, match="AdmittedTarget"):
             require_admitted(raw)
-    with pytest.raises(TypeError, match="AdmittedTarget"):
-        _channels._touch_wake_file("kimi")
 
 
 def test_a_target_from_either_import_path_is_accepted_by_either_sink_check():

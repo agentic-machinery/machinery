@@ -64,7 +64,7 @@ from ._signal_log import install_signal_logging
 from .cluster_router import router as cluster_router
 from .codexbar_usage import scheduler_status, start_periodic_refresh, stop_periodic_refresh
 from .comms_prometheus import CommsCollector
-from .comms_router import ensure_broker_db_ready, refresh_panel_metrics_periodically, warm_panel_metrics
+from .comms_router import refresh_panel_metrics_periodically, warm_panel_metrics
 from .comms_router import router as comms_router
 from .coordination_router import router as coordination_router
 from .delegate_router import router as delegate_router
@@ -143,7 +143,6 @@ async def _lifespan(_app: FastAPI):
         assert_component_supported(StoreId.FLEET_COMMS, "authority_service")
         preload_all(product.preload, product.preload_optional)
         install_signal_logging()
-        ensure_broker_db_ready(ctx=ctx)
         warm_panel_metrics(ctx)
         warm_pull_requests(ctx)
         seed_manifest_inventory(
@@ -339,7 +338,6 @@ ORIENT_SECTION_TTLS: dict[str, float] = {
     "runtime": 60.0,
     "delegate": 30.0,
     "capacity": 15.0,
-    "bridge_pending": 15.0,
     # One rollover audit costs about 5 s of CPU, and rollovers change rarely.
     "rollovers": 120.0,
     "health": 15.0,
@@ -353,7 +351,6 @@ ORIENT_SECTION_SOURCES: dict[str, str] = {
     "runtime": "fs",
     "delegate": "fs",
     "capacity": "fs",
-    "bridge_pending": "sqlite",
     "rollovers": "fs",
     "health": "probe",
     "session_hints": "fs",
@@ -390,8 +387,8 @@ _REVIEW_HEAD_RE = re.compile(
 ORIENT_SECTION_KEYS: tuple[str, ...] = tuple(ORIENT_SECTION_TTLS.keys())
 
 # Lean cold-start preset (``?lean=true``): the small, lane-agnostic sections an agent needs to
-# orient BEFORE it has selected work — tree state (git), active dispatches (delegate), pending
-# bridge asks, blocking decisions (governance), health, and the handoff pointers / current goal
+# orient BEFORE it has selected work — tree state (git), active dispatches (delegate),
+# blocking decisions (governance), health, and the handoff pointers / current goal
 # (session_hints). Excludes the three heavy sections — ``pipeline`` (~2k module stats),
 # ``issues`` (full gh list), ``wiki`` (per-track coverage) — which are fetched on demand via
 # ``?sections=...``. ``capacity``, ``health``, ``delegate``, and ``rollovers`` stay in the
@@ -402,7 +399,6 @@ LEAN_ORIENT_SECTIONS: tuple[str, ...] = (
     "runtime",
     "delegate",
     "capacity",
-    "bridge_pending",
     "rollovers",
     "health",
     "session_hints",
@@ -1087,13 +1083,6 @@ def _collect_capacity_orient_data(ctx: MonitorContext | None = None) -> dict:
     }
 
 
-def _collect_bridge_pending_orient_data(ctx: MonitorContext | None = None) -> dict:
-    resolve_context(ctx)
-    from lu_machinery.ai_agent_bridge import _channels  # noqa: PLC0415 — optional broker bridge
-
-    return _channels.bridge_pending_summary()
-
-
 def _collect_rollovers_orient_data(ctx: MonitorContext | None = None) -> dict:
     resolved_ctx = resolve_context(ctx)
     return collect_rollover_orient_data(live_repo_root=resolved_ctx.roots.state_root)
@@ -1108,10 +1097,6 @@ def _port_open(host: str, port: int, timeout_s: float) -> bool:
             return True
     except OSError:
         return False
-
-
-def _readable_file(path: Path) -> bool:
-    return path.exists() and path.is_file() and os.access(path, os.R_OK)
 
 
 def _core_bare_canary(ctx: MonitorContext | None = None) -> bool:
@@ -1357,7 +1342,6 @@ def _collect_health_orient_data(
         fields.update(product_health(resolved_ctx))
     return {
         **fields,
-        "message_broker": _readable_file(resolved_ctx.roots.message_db_path),
         "git_core_bare_ok": core_bare_ok,
         "node_modules_symlinks_ok": self_symlink_ok,
         "primary_integrity_ok": primary_integrity_ok,
@@ -1614,7 +1598,6 @@ def _orient_section_specs(product: ProductContribution) -> dict[str, tuple[Calla
         "runtime": (_collect_runtime_orient_data, {}, False),
         "delegate": (_collect_delegate_orient_data, {"active_count": 0, "recent": []}, False),
         "capacity": (_collect_capacity_orient_data, {"lanes": {}}, False),
-        "bridge_pending": (_collect_bridge_pending_orient_data, {}, False),
         "rollovers": (
             _collect_rollovers_orient_data,
             {"counts": {}, "actionable": [], "errors": []},
@@ -1728,7 +1711,7 @@ async def orient(
     lean: bool = Query(
         False,
         description="Lean cold-start preset: return only the lightweight sections "
-        "(git, runtime, delegate, bridge_pending, rollovers, governance, health, session_hints), "
+        "(git, runtime, delegate, rollovers, governance, health, session_hints), "
         "skipping the heavy pipeline/issues/wiki and idle_prs. Ignored when 'sections' is given.",
     ),
     sections: str | None = Query(

@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import TextIO
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -47,6 +48,23 @@ def probe(recipient: str, *, limit: int = 5) -> dict:
         "truncated": result["truncated"], "stores": {"authority": result["count"]},
         "probe": "ok",
     }
+
+
+def authority_inbox_notice(recipient: str | None, *, file: TextIO | None = None) -> None:
+    """Print one line pointing a task-record inbox reader at its Fleet Comms deliveries.
+
+    Body-free: only the queued count is read. An unknown recipient or store
+    reports ``unknown``, never zero.
+    """
+    slot = (recipient or "").strip().lower()
+    result = probe(slot) if slot else {"probe": "unknown"}
+    count = result["count"] if result["probe"] == "ok" else "unknown"
+    target = slot or "<slot>"
+    print(
+        f"Fleet Comms deliveries for {target}: {count} queued; read them with "
+        f"`.venv/bin/python -m {_MACHINERY}.fleet_comms deliveries receive --recipient {target}`.",
+        file=file or sys.stdout,
+    )
 
 
 def _reject_constant(_value: str) -> None:
