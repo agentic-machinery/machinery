@@ -498,7 +498,7 @@ def test_scoped_preparation_never_imports_execution_inventory(boundary_tree, tmp
     (tree / "payload.bin").write_bytes(b"owned\r\n\x00")
     markers = install_full_markers(repo, tree, tmp_path, scope)
     admin = Path((tree / ".git").read_text().strip().removeprefix("gitdir: "))
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path) as context:
+    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=str(repo), local_remote=True) as context:
         context.source_git_dir = admin
         result = safe.prepare_scoped_commit(
             context,

@@ -14,10 +14,16 @@ import pytest
 
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import stalled_work as mod
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.review.record_cf_verdict import build_comment
 
 NOW = datetime(2026, 10, 20, 18, tzinfo=UTC)
 SLUG = "example/public"
+MACHINERY = "example/machinery"
+REPOS = {
+    "public": FleetRepo("public", SLUG, "public", "public-monorepo", True),
+    "machinery": FleetRepo("machinery", MACHINERY, "machinery", "public-machinery"),
+}
 BASE, LOCAL, REMOTE = "a" * 40, "b" * 40, "c" * 40
 
 
@@ -28,7 +34,6 @@ def host(tmp_path, monkeypatch):
     target = mod.stale.FetchTarget("fixture", "https://github.com/example/public.git")
     facts = mod.stale.RepoFacts(SLUG, tmp_path, target, {"main": BASE}, {})
     prs, comments, calls, closed = [], {}, [], []
-    unpublished = {LOCAL}
     merged = {BASE}
 
     def git(args, **kwargs):
@@ -40,9 +45,9 @@ def host(tmp_path, monkeypatch):
             output = "1"
         elif args[2] in merged:
             output = ""
-        elif any(arg.startswith("--glob=") for arg in args):
-            output = args[2] if args[2] in unpublished else ""
         else:
+            assert args[3] == "--stdin"
+            assert f"^{BASE}\n" in kwargs["stdin"]
             output = args[2]
         return subprocess.CompletedProcess(["git", *args], 0, output, "")
 
@@ -80,7 +85,8 @@ def host(tmp_path, monkeypatch):
 
     def scan():
         return mod.scan(
-            tasks, {SLUG: tmp_path}, now=NOW, adapter_factory=lambda path: mod.GitHubAdapter(path, runner=gh)
+            tasks, {SLUG: tmp_path}, repos=REPOS, now=NOW,
+            adapter_factory=lambda path: mod.GitHubAdapter(path, runner=gh),
         )
 
     return SimpleNamespace(**locals())
@@ -412,7 +418,27 @@ def test_malformed_record_is_visible(host):
 
 
 def test_empty_scan_sends_no_lane_request_or_cto_summary(host):
-    report = host.scan()
+    primary = host.tmp_path / "public"
+    machinery = host.tmp_path / "machinery"
+    for checkout in (primary, machinery):
+        (checkout / ".git").mkdir(parents=True)
+    host.monkeypatch.setattr(mod, "load_fleet_repos", lambda: REPOS)
+    host.monkeypatch.setattr(mod, "state_root", lambda: primary)
+    gh_repos = []
+    scan = mod.scan
+
+    def gh(args):
+        if isinstance(args, list) and args[:3] == ["gh", "pr", "list"]:
+            gh_repos.append(args[args.index("--repo") + 1])
+        return host.gh(args)
+
+    def scan_fleet(*args, **kwargs):
+        return scan(*args, **kwargs, adapter_factory=lambda path: mod.GitHubAdapter(path, runner=gh))
+
+    host.monkeypatch.setattr(mod, "scan", scan_fleet)
+    args = argparse.Namespace(tasks_dir=host.tasks, route=False)
+    report = mod.run(args, now=NOW)
+    assert gh_repos == [SLUG, MACHINERY]
     assert report["rows"] == []
     assert report["errors"] == []
 
@@ -421,6 +447,8 @@ def test_empty_scan_sends_no_lane_request_or_cto_summary(host):
 
     service = SimpleNamespace(enqueue_supervisory_request=enqueue)
     assert mod.route(report, cycle=1, service=service) == []
+    (machinery / ".git").rmdir()
+    assert mod.run(args, now=NOW)["errors"] == [f"{MACHINERY}: missing_fleet_checkout"]
     assert mod.route(report, cycle=2, service=service) == []
 
 

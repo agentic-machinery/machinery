@@ -99,7 +99,11 @@ def test_closed_pr_clears_alert_and_drops_handoff():
 
 # --- the owner check with handoffs and unknown liveness ----------------------------
 
-FLEET = {"public": FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True)}
+MACHINERY = "learn-ukrainian/machinery"
+FLEET = {
+    "public": FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True),
+    "machinery": FleetRepo("machinery", MACHINERY, "machinery", "public-machinery"),
+}
 
 
 def find(prs, records, handoffs=None, live=is_live):
@@ -108,7 +112,8 @@ def find(prs, records, handoffs=None, live=is_live):
 
 def test_accepted_successor_owns_from_another_branch_while_live():
     prs = [{"number": 42, "headRefName": "codex/x", "isCrossRepository": False}]
-    records = [task("old", status="timeout"), task("succ", "claude/queue")]
+    successor = {**task("succ", "claude/queue"), "repository": MACHINERY, "repository_id": MACHINERY, "repo": "machinery"}
+    records = [task("old", status="timeout"), successor]
     (row,) = find(prs, records)
     assert not row.unknown and row.last_task == "old"
     assert find(prs, records, {(REPO.casefold(), 42): "succ"}) == []
@@ -136,7 +141,10 @@ def test_running_task_on_another_branch_is_not_ownerless_when_the_head_names_it(
             "messageBody": "X-Agent: codex/worker-1",
         }],
     }]
-    assert find(prs, [task("worker-1", "codex/worker-1")]) == []
+    worker = task("worker-1", "codex/worker-1")
+    assert find(prs, [worker]) == []
+    (row,) = find(prs, [{**worker, "repo": "machinery"}])
+    assert row.unknown and row.reason == "task_repository_conflict"
 
 
 def fake_proc(monkeypatch, files):
@@ -164,6 +172,8 @@ def test_unobservable_owner_is_unknown_and_gone_owner_is_ownerless(monkeypatch):
     for extra in ({}, {"pid": 7}, {"pid": 7, "process_start": None}):
         (row,) = find(prs, [{**task("t"), **extra}], live=own.liveness)
         assert row.unknown and "cannot be observed" in row.reason
+    (row,) = find(prs, [{**task("t"), "repository": None}], live=own.liveness)
+    assert row.unknown and row.reason == "task_repository_missing"
     (row,) = find(prs, [owner], live=own.liveness)
     assert not row.unknown and "not verifiably alive" in row.reason
     boot = {"/proc/sys/kernel/random/boot_id": "boot\n"}

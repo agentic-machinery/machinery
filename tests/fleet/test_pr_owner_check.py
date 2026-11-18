@@ -12,9 +12,11 @@ from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 PUBLIC = "learn-ukrainian/learn-ukrainian.github.io"
 PRIVATE = "learn-ukrainian/learn-ukrainian-infra-private"
+MACHINERY = "learn-ukrainian/machinery"
 REPOS = {
     "public": FleetRepo("public", PUBLIC, "learn-ukrainian", "public-monorepo", True),
     "infra-private": FleetRepo("infra-private", PRIVATE, "learn-ukrainian-infra-private", "private-infra"),
+    "machinery": FleetRepo("machinery", MACHINERY, "machinery", "public-machinery"),
 }
 
 
@@ -84,10 +86,17 @@ def test_fork_pr_is_never_owned_by_a_same_named_branch():
     assert "fork" in finding.reason
 
 
-def test_legacy_record_without_repository_belongs_to_default_repo():
+def test_legacy_record_needs_an_explicit_repository_binding():
     legacy = {"task_id": "old", "worktree_branch": "x", "status": "running", "started_at": "2026-10-01"}
-    assert run({PUBLIC: [pr(1, "x")]}, [legacy]) == []
-    assert len(run({PRIVATE: [pr(1, "x")]}, [legacy])) == 1
+    prs = {PUBLIC: [pr(1, "x")], MACHINERY: [pr(1, "x")]}
+    assert [(row.repo, row.unknown, row.reason) for row in run(prs, [legacy])] == [
+        (PUBLIC, True, "task_repository_missing"),
+        (MACHINERY, True, "task_repository_missing"),
+    ]
+    for binding in ({"repo": "machinery"}, {"repository_id": MACHINERY}):
+        assert [row.repo for row in run(prs, [{**legacy, **binding}])] == [PUBLIC]
+    conflicting = {**legacy, "repository": PUBLIC, "repo": "machinery"}
+    assert {row.reason for row in run(prs, [conflicting])} == {"task_repository_conflict"}
 
 
 @pytest.mark.parametrize(
@@ -127,18 +136,20 @@ def patch_world(monkeypatch, prs, records, repos=REPOS):
 
     monkeypatch.setattr(worker, "_identity", lambda pid: "boot:1")
     monkeypatch.setattr(check, "load_fleet_repos", lambda: repos)
-    monkeypatch.setattr(check, "fetch_open_prs", lambda slug: prs[slug])
+    monkeypatch.setattr(check, "fetch_open_prs", lambda slug: prs.get(slug, []))
     from lu_machinery.dispatcher import store
 
     monkeypatch.setattr(store, "list_tasks", lambda *a, **k: records)
 
 
 def test_main_exit_codes_and_output(monkeypatch, capsys):
-    prs = {PUBLIC: [pr(1, "a")], PRIVATE: [pr(2, "b")]}
-    patch_world(monkeypatch, prs, [live("a", "a")])
+    prs = {PUBLIC: [pr(1, "a")], PRIVATE: [pr(2, "b")], MACHINERY: [pr(2, "b")]}
+    owners = [live("a", "a"), live("b", "b", PRIVATE)]
+    patch_world(monkeypatch, prs, owners)
     assert check.main(["--json"]) == 1
-    assert [row["number"] for row in json.loads(capsys.readouterr().out)] == [2]
-    patch_world(monkeypatch, prs, [live("a", "a"), live("b", "b", PRIVATE)])
+    assert [(row["repo"], row["number"]) for row in json.loads(capsys.readouterr().out)] == [(MACHINERY, 2)]
+    assert check.main(["--repo", "infra-private"]) == 0
+    patch_world(monkeypatch, prs, [*owners, live("m", "b", MACHINERY)])
     assert check.main([]) == 0
     assert capsys.readouterr().out == ""
 
