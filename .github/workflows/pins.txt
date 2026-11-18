@@ -88,16 +88,13 @@ CI_GATE_RUNNER=ubuntu-24.04
 CI_GATE_PYTHON=.python-version
 #   Every job runs the uv-managed CPython named in the repository's
 #   .python-version (3.14.8 on 2026-11-17), the build the host's uv installs.
-#   installed-wheel also runs on the requires-python floor of pyproject.toml
-#   (3.12). .github/actions/uv-python checks the
-#   interpreter it puts on PATH. UV_PYTHON_PREFERENCE=only-managed keeps uv
-#   off the runner's own Pythons.
+#   .github/actions/uv-python checks the interpreter it puts on PATH.
+#   UV_PYTHON_PREFERENCE=only-managed keeps uv off the runner's own Pythons.
 UV_VERSION=0.13.1
 #   https://github.com/astral-sh/uv/releases/tag/0.13.1 (published
 #   2026-10-14), the host's uv. pyproject.toml [tool.uv] required-version pins
-#   the same release, so uv.lock is written and read by one uv. uv 0.12.9 (the
-#   product's CI pin below) cannot download CPython 3.14.8: its newest 3.14 is
-#   3.14.7 (`uv python list --only-downloads --all-versions`, 2026-11-17).
+#   the same release, so one uv writes and reads uv.lock. It also matches
+#   the required-version at the product commit in product-consumer.pin.
 UV_LINUX_X86_64_SHA256=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
 #   uv-x86_64-unknown-linux-gnu.tar.gz of that release; equals its GitHub
 #   release asset digest. ci-gate.yml and tests.yml carry both values.
@@ -170,19 +167,6 @@ PIP_AUDIT_VERSION=2.10.1
 #   runtime closure exported from uv.lock; its default vulnerability service is the
 #   PyPI JSON API (OSV data). npm audit uses the hosted runner's npm and the npm
 #   registry's advisory database.
-
-# Product consumer check (installed-wheel job of ci-gate.yml). The product
-# commit it tests is product-consumer.pin beside this file, not a tool pin.
-# Upstream checks below were made on 2026-11-16.
-PRODUCT_UV_VERSION=0.12.9
-#   https://pypi.org/project/uv/0.12.9/ (uploaded 2026-09-01), the version the
-#   product's .github/actions/python-ci-env pins, so the product environment is
-#   installed the way product CI installs it. It follows the product's pin,
-#   not UV_VERSION above.
-PRODUCT_UV_WHEEL_MANYLINUX_2_17_X86_64_SHA256=5badfd805fd88bf99b4b4f044f6e8f762f1892cab27477f4427bb473e93dd049
-#   uv-0.12.9-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl; the
-#   wheel has no dependencies. It installs the product's requirements-lock.txt,
-#   which carries no hashes; the product commit pins which lock is read.
 
 # Pre-publication gate (prepublication-gate.sh beside this file)
 #   Run once on the rewritten clone before the first content push, with the
