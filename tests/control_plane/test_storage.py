@@ -49,6 +49,8 @@ def test_default_authority_is_sqlite(
 
 def test_sqlite_path_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("LEARN_UKRAINIAN_OWNERSHIP_LEDGER", raising=False)
+    # This case checks defaults under its private primary, without the session override.
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
     fleet_path = sqlite_path(StoreId.FLEET_COMMS)
     assert fleet_path.name == "comms.sqlite3"
     assert fleet_path.parent.name == "v1"
