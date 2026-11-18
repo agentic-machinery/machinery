@@ -9,10 +9,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lu_machinery.api import subscriptions
 from lu_machinery.api.main import _route_template, create_app
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import ProductContribution
@@ -42,9 +45,12 @@ def _sample(body: str, name: str, route: str) -> str:
     return f'{name}{{method="GET",route="{route}",status='
 
 
-def test_route_label_is_full_template(tmp_path: Path) -> None:
+def test_route_label_is_full_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Defect class: two routes with the same suffix share a label, or a path parameter leaks into the label."""
+    read_subscriptions = Mock(return_value={})
+    monkeypatch.setattr(subscriptions, "subscriptions_snapshot", read_subscriptions)
     app = create_app(fixture_context(tmp_path), lifespan=_no_lifespan, product=ProductContribution())
+    app.state.metrics_snapshot.interval = float("inf")  # publish after the test traffic below
     with TestClient(app) as client:
         for path, _template in _REQUESTS:
             client.get(path)
@@ -52,7 +58,18 @@ def test_route_label_is_full_template(tmp_path: Path) -> None:
         raw_path = "/opsec-raw-path-should-not-be-labelled"
         missing = client.get(raw_path)
         assert missing.status_code == 404
-        body = client.get("/metrics").text
+        app.state.metrics_snapshot.refresh()
+        reads = read_subscriptions.call_count
+        assert reads > 0
+        response = client.get("/metrics", headers={"Accept": "application/openmetrics-text"})
+        filtered = client.get("/metrics", params={"name[]": "monitor_http_request_duration_seconds_count"})
+        assert response.status_code == filtered.status_code == 200
+        assert response.headers["Content-Type"] == filtered.headers["Content-Type"] == "text/plain; version=0.0.4; charset=utf-8"
+        assert [line for line in filtered.text.splitlines() if not line.startswith("#")] == [
+            line for line in response.text.splitlines() if line.startswith("monitor_http_request_duration_seconds_count{")
+        ]
+        assert read_subscriptions.call_count == reads
+        body = response.text
 
     assert _LEAK not in body
     assert raw_path not in body
