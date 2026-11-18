@@ -55,9 +55,7 @@ _RECEIPT_SOURCE_FIELDS = frozenset(
     }
 )
 
-# Published 18-code STOP vocabulary. The historic "16" count describes trigger
-# classes only; it is not the executable vocabulary. validate_trailspec imports
-# this immutable source so direct invocation never depends on package layout.
+# Stop codes accepted by the known-failures registry.
 VALID_STOP_CODES: frozenset[str] = frozenset({
     "STOP-timeout",
     "STOP-verdict-timeout",

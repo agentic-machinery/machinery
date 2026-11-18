@@ -89,12 +89,12 @@ writes and reads it (`UV_VERSION` in `.github/workflows/pins.txt`), and
 `requires-python` stays the supported floor. Change a dependency in
 `pyproject.toml`, then run `uv lock` (or `uv lock --upgrade-package NAME`);
 CI's `uv sync --locked` fails when the lock no longer matches, and refuses
-any wheel whose hash differs from the lock. The `semgrep` group runs in an
-isolated environment because Semgrep and the `mcp` extra require different
-MCP versions. The release build tools and the product consumer's uv use
-hash-pinned installs.
+any wheel whose hash differs from the lock. Semgrep runs in its own
+environment. The opt-in permission test gets MCP from the `test`
+dependency group. The release build tools and the product consumer's uv
+use hash-pinned installs.
 
-The release wheelhouse includes core and the `api`, `mcp`, `postgres`, and
+The release wheelhouse includes core and the `api`, `postgres`, and
 `pytest` extras. This export excludes the project, development groups, and
 the `test` extra:
 

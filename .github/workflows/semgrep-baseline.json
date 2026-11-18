@@ -1765,16 +1765,6 @@
    "sha256": "1e320f418d669db00cfead8fa8646c56344ff10f9de8bdedd59ac464c072e3a4"
   },
   {
-   "path": "lu_machinery/orchestration/trails/executor.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "420677bcd1cfdb809eaf305d4e2d64dcaa0e12478fea9370e472c4d93ce92800"
-  },
-  {
-   "path": "lu_machinery/orchestration/trails/trail_mcp.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "43af0194cf105e2afb62ea1a2747b0141fa45440265c41272fa04a2c3358c473"
-  },
-  {
    "path": "lu_machinery/orchestration/worktree_git.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "9c701f4c3de6bef02a80dd782fe8428afb529090e1ebd602331fc7266c3e5e78"

@@ -162,11 +162,6 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "157c5504e246d91fc39c7a97000388fbb49ded2a1e940ab30d4a92310a851018:1 27e2a870d20bcd60a938424c008e9548500d4fdf66554af3ef7e89d14db9e54e:1 5626cf9c36f6c39aa27b49c3c3a28c37bd827034ba92e47f0e39bb9f8b0cf4d9:1 62727a005096ecac61c899e122a56d6728b1ea730538ef7070f6a36f78924ed1:1 a09bdb0bbd6dd2c2efc822b650fd74694f00d2234214ff99883dce2c68b26383:1",
     ),
     (
-        _mp("agent_runtime/trail_isolation.py"),
-        "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
-        "01703b3d21d72b6e41b5099d9488db2b7694f1c74d5014049431c6ef16bd837b:1",
-    ),
-    (
         _mp("ai_agent_bridge/_acp_execution.py"),
         "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
         "bea382265465ea02401846d25d95ec489f7027dea9f66e84c2b577b74cc0fcee:1",

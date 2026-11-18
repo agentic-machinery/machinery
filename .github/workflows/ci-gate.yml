@@ -1394,7 +1394,6 @@ jobs:
           # because the SQLite path can use them without a Postgres driver.
           extra_modules = {
               "api": ("lu_machinery.api",),
-              "mcp": ("lu_machinery.orchestration.trails.trail_mcp",),
               "postgres": (),
               "pytest": (
                   "lu_machinery.ci.coverage_diff",
@@ -1409,7 +1408,6 @@ jobs:
           }
           extra_probes = {
               "api": ("uvicorn",),
-              "mcp": (),
               "postgres": (
                   "psycopg.pq",
                   "lu_machinery.control_plane.storage",

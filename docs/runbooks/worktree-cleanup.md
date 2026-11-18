@@ -122,7 +122,7 @@ If either command refuses, resolve its stated condition without forcing removal.
 | `data_tier.remove_test_worktree`: stale and final cleanup | Shared locked remover. |
 | `sibling_git.worktree_remove` | Shared locked remover; preservation uses the public control plane. |
 | `task_family.git_safety.remove_unclaimed_worktree`: executor cleanup | Shared locked remover. |
-| `worktree_claims remove`, `wt.sh`, RB2 failed-dispatch cleanup | Guarded CLI, then shared locked remover. |
+| `worktree_claims remove`, `wt.sh` | Guarded CLI, then shared locked remover. |
 | `tmp_leak_sweep._remove_path`: `shutil.rmtree` | Refuses linked worktree markers, including nested checkouts and unreadable scans. |
 | `review.isolation._remove_review_temp_tree`: `shutil.rmtree` | Repairs review permissions without following symlinks, then refuses linked worktree markers, nested checkouts and unreadable scans before deletion. Root symlinks are refused; the orphan sweep reports refusals as errors. Plain temporary trees and disposable clones remain eligible. |
 
@@ -580,7 +580,7 @@ an audit record proves the calling session created
 Every worktree removal goes through one guarded chokepoint (#8610): Python
 callers use `worktree_claims.remove_unclaimed_worktree`, and shell and YAML
 callers use `python -m lu_machinery.orchestration.worktree_claims remove PATH`
-(`lu_machinery/wt.sh clean`, the RB2 trail's `cleanup_failed_worktree`). Holding
+(`lu_machinery/wt.sh clean`). Holding
 the per-worktree lock dispatch holds from attach until its task record is
 published, it runs the caller's ownership proof, proves a forced target clean,
 refuses while another task's unfinished record names the checkout, and only
@@ -776,12 +776,6 @@ a matched worktree is still registered, or if the remote or local branch is stil
 present after `--apply` ran (residual branches are reported, never force-deleted
 past an exact-head-match proof). A kept worktree is a blocker for its owner to
 resolve, not permission to remove it with `--force`.
-
-The canonical PR lifecycle trail (`lu_machinery/config/trails/rb3-pr-lifecycle.trail.yaml`)
-runs its own post-merge step: it deletes the merged remote branch when no open PR
-uses it, prunes origin, and removes no worktree; a worktree still on disk stops the
-trail at `STOP-hygiene-failed`. Other merge owners must invoke the exact command
-above before declaring closeout complete.
 
 Git closeout for **every** merge is exactly three things: worktree gone,
 remote branch gone, local branch gone. If GitHub did not delete the remote

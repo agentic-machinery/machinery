@@ -19,8 +19,7 @@ from lu_machinery.review.model_catalog import retired_model_refusal
 from ..errors import AgentRuntimeError
 from ..failure_codes import opencode_provider_error, provider_failure_code, provider_stderr_error
 from ..result import ParseResult
-from ..trail_isolation import TrailIsolationError, trail_isolation_requested
-from .base import InvocationPlan
+from .base import InvocationPlan, refuse_retired_isolation
 
 _logger = logging.getLogger(__name__)
 
@@ -103,8 +102,7 @@ class GlmAdapter:
         tool_config: dict | None = None,
         effort: str | None = None,
     ) -> InvocationPlan:
-        if trail_isolation_requested(tool_config):
-            raise TrailIsolationError("trail isolation refused for GLM: opencode does not enforce tool restrictions")
+        refuse_retired_isolation(tool_config)
         assert_glm_egress_allowed("GlmAdapter")
 
         if mode not in self.supported_modes:

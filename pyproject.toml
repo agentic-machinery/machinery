@@ -16,6 +16,7 @@ dependencies = [
     "jsonschema>=4.20",
     "markdown-it-py>=4.2.0",
     "packaging>=26.3",
+    "pre-commit>=4.6.0",
     "prometheus-client>=0.26.0",
     "psutil>=7.2",
     "pydantic>=2.13.5",
@@ -30,7 +31,6 @@ api = [
     "psycopg[binary]==3.3.6",  # Postgres-backed API routes need the binary driver.
     "uvicorn>=0.48.0",
 ]
-mcp = ["mcp>=2.2,<3"]
 postgres = ["psycopg[binary]==3.3.6"]
 pytest = ["coverage>=7.17.0", "pytest>=9.1.1", "pytest-xdist>=3.6"]
 test = ["hypothesis==6.170.15"]
@@ -43,6 +43,8 @@ test = ["hypothesis==6.170.15"]
 # environment has no pip of its own.
 test = [
     "pip==26.3",
+    "httpx2==2.16.0",  # ASGI transport used by the API and Work tests.
+    "mcp==1.29.0",  # FastMCP used by the opt-in permission test.
     "PyMuPDF==2.1",
     "pymupdf4llm==2.1",
     "pytest-cov==7.1.0",
@@ -58,9 +60,6 @@ semgrep = ["semgrep==1.183.0"]
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).
 required-version = "==0.13.1"
-# CI installs only the Semgrep group in its venv. Its MCP 1.x pin and the
-# runtime MCP 2.x extra cannot share one environment.
-conflicts = [[{ group = "semgrep" }, { extra = "mcp" }]]
 
 [tool.setuptools]
 include-package-data = true
