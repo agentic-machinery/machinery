@@ -195,6 +195,22 @@ def test_rollover_bundle_v5_receipt_upgrades_to_status_binding_schema(tmp_path: 
     finally:
         connection.close()
 
+    # Historical archive bytes must remain readable after the writer retires.
+    store = SessionStreamStore(SessionStreamDatabase(path))
+    expected = {
+        "manifest": {"schema": "rollover-bundle.v1", "status": "pending_start", "prepared_at": timestamp,
+                     "upload_seq": 1},
+        "upload_seq": 1,
+        "bundle_sha256": "a" * 64,
+        "bytes": 9,
+        "uploaded_at": timestamp,
+        "uploaded_by_lease_id": "lease-v5",
+    }
+    assert store.list_rollover_bundles("epic:7260", agent="codex", lineage_id="lineage-v5") == [expected]
+    expected_blob = {**expected, "blob": b"v5-bundle"}
+    assert store.latest_rollover_bundle("epic:7260", agent="codex", lineage_id="lineage-v5") == expected_blob
+    assert store.rollover_bundle_by_upload_seq("epic:7260", 1) == expected_blob
+
 
 def test_app_holder_migration_preserves_legacy_process_projection_and_indexes(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"

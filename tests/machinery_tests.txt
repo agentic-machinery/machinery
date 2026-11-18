@@ -164,7 +164,6 @@ tests/agents_extensions/test_operator_contract_wiring.py
 tests/agents_extensions/test_post_compact_stream.py
 tests/agents_extensions/test_remote_epic_lifecycle.py
 tests/agents_extensions/test_remote_supervisor.py
-tests/agents_extensions/test_rollover_bundles.py
 tests/agents_extensions/test_rules_core_structural_coverage.py
 tests/agents_extensions/test_session_stream_handoff.py
 tests/agents_extensions/test_session_streams.py

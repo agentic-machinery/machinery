@@ -17,24 +17,11 @@ For a known packet, inspect health without changing it.
 ```
 
 When more than one unrelated packet is pending, generic detection stays
-read-only and returns actionable candidates. Select the intended packet by
-exact ID; selectors are ANDed and titles never select a packet.
+read-only and returns the exact candidate IDs. Inspect the selected lineage
+with `check --agent <agent> --lineage-id <lineage-id>` and match its rollover
+ID to the intended candidate before using the exact replacement commands in
+[resume and confirm](resume.md). Never select by title or listing order.
 
-```bash
-.venv/bin/python -m lu_machinery.orchestration.rollover_registry_cli detect \
-  --agent codex --lineage-id <lineage-id> --rollover-id <rollover-id>
-.venv/bin/python -m lu_machinery.orchestration.rollover_registry_cli detect \
-  --agent codex --source-thread-id <predecessor-task-id>
-```
-
-Audit all agents without mutation:
-
-```bash
-.venv/bin/python -m lu_machinery.orchestration.rollover_registry_cli audit
-```
-
-Use `reconcile-exact --snapshot <authoritative-json>` before acting on an
-unrecorded native successor or confusing cleanup state. Reconciliation requires
-exact native IDs, title/readback receipts, confirmation proof, and automation
-facts; a title or missing local process is never proof of creation or cleanup.
-It is read-only unless `--apply` is explicit.
+Use `reconcile-native` with authoritative native evidence for interrupted
+successor creation. Exact native IDs, title readback and binding still govern
+resume and confirmation; a missing local process never authorizes cleanup.

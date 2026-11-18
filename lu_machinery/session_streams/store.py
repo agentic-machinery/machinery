@@ -7,17 +7,14 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 import unicodedata
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
 from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
-
-from lu_machinery.common.repo_root import machinery_path, primary_root
 
 from .app_lifecycle import VerifiedAppLifecycleProof
 from .db import SessionStreamDatabase
@@ -44,45 +41,6 @@ from .model import (
 
 MAX_ENTRY_BYTES = 65_536
 MAX_TTL_SECONDS = 86_400
-MAX_ROLLOVER_BUNDLE_BYTES = 4 * 1024 * 1024
-ROLLOVER_BUNDLE_SCHEMA = "rollover-bundle.v1"
-ROLLOVER_BUNDLE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-ROLLOVER_BUNDLE_LINEAGE_ROOT = ".agent/thread-rollovers"
-_HANDOFF_IDENTITY_SH = machinery_path("lib/handoff_identity.sh")
-# Lease holders carry the provider id; each provider mints its handoff slot
-# through its own launcher helper in scripts/lib/handoff_identity.sh.
-_HANDOFF_SLOT_HELPERS = {
-    "claude": "handoff_identity_for_epic",
-    "codex": "handoff_identity_for_codex_epic",
-    "cursor": "handoff_identity_for_cursor_epic",
-    "gemini": "handoff_identity_for_gemini_epic",
-    "grok": "handoff_identity_for_grok_epic",
-}
-# Print the slot for every launcher selector (registry keys, their infra.<key>
-# form, and the compatibility aliases passed as arguments) that resolves to the
-# requested stream. Resolution stays in the shell helpers the launchers use.
-_HANDOFF_SLOT_SCRIPT = r"""
-source "$1" || exit 2
-helper="$2"
-stream="$3"
-shift 3
-keys="$(_launcher_registry_stream_keys)" || exit 2
-emit() {
-  local resolved='' slot=''
-  resolved="$(launcher_selector_stream "$1" 2>/dev/null)" || return 0
-  [ "$resolved" = "$stream" ] || return 0
-  slot="$("$helper" "$1" 2>/dev/null)" || return 0
-  [ -z "$slot" ] || printf '%s\n' "$slot"
-}
-while IFS= read -r key; do
-  [ -n "$key" ] || continue
-  emit "$key"
-  emit "infra.$key"
-done <<< "$keys"
-for selector in "$@"; do
-  emit "$selector"
-done
-"""
 SECRET_PATTERNS = (
     ("private-key", re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |PGP )?PRIVATE KEY-----")),
     ("credential-token", re.compile(r"(?:sk-|gh[pousr]_|AIza)[A-Za-z0-9_-]{16,}")),
@@ -419,99 +377,9 @@ def validate_entry_body(body: str) -> None:
             raise ContentRejectedError(f"entry body rejected by {rule} rule")
 
 
-def rollover_bundle_handoff_candidates(lane_candidates: Iterable[str], agent: str) -> tuple[str, ...]:
-    """Inventory handoff paths for the stream, then the canonical Claude slot template, deduped."""
-    candidates = list(lane_candidates)
-    if agent.startswith("claude-"):
-        candidates.append(f".claude/{agent.removeprefix('claude-')}-epic/CLAUDE-DRIVER-HANDOFF.md")
-    return tuple(dict.fromkeys(candidates))
-
-
 def rollover_bundle_identity_is_safe(value: str) -> bool:
     """The check an uploaded bundle's agent, lineage_id and rollover_id must pass to be stored."""
     return bool(value) and len(value) <= 256 and all(char.isalnum() or char in "._:/-" for char in value)
-
-
-def _rollover_bundle_member_name(value: object) -> str:
-    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
-        raise ValueError("rollover bundle member path is malformed")
-    path = PurePosixPath(value)
-    if not path.parts or path.is_absolute() or ".." in path.parts:
-        raise ValueError("rollover bundle member path is unsafe")
-    return path.as_posix()
-
-
-def validate_rollover_bundle_members(
-    names: Iterable[object],
-    *,
-    agent: str,
-    lineage_id: str,
-    handoff_candidates: Iterable[str],
-) -> tuple[str, ...]:
-    """Refuse the whole bundle unless every member is its own lineage file or one of its handoff paths.
-
-    The importer and the bundle store share this one predicate. Anything not
-    explicitly allowed is refused, and the caller refuses before any write.
-    """
-    for label, value in (("agent", agent), ("lineage_id", lineage_id)):
-        if not isinstance(value, str) or not value or value in {".", ".."} or "/" in value or "\\" in value:
-            raise ValueError(f"rollover bundle {label} is not a single path component")
-    lineage_prefix = f"{ROLLOVER_BUNDLE_LINEAGE_ROOT}/{agent}/{lineage_id}/"
-    handoffs = {_rollover_bundle_member_name(candidate) for candidate in handoff_candidates}
-    members: list[str] = []
-    for member in names:
-        name = _rollover_bundle_member_name(member)
-        if name.startswith(lineage_prefix):
-            parts = name[len(lineage_prefix):].casefold().split("/")
-            if parts[-1] == ".native-intent.lock" or parts[-1].endswith(".bundle.tgz") or "_bundle-reconcile" in parts:
-                raise ValueError("rollover bundle member is excluded from export")
-        if not (name.startswith(lineage_prefix) and len(name) > len(lineage_prefix)) and name not in handoffs:
-            raise ValueError("rollover bundle member is outside its lineage and handoff paths")
-        members.append(name)
-    return tuple(members)
-
-
-def rollover_bundle_handoff_slots(provider: str, stream_id: str) -> frozenset[str]:
-    """Handoff slots a launcher can mint for ``provider`` on ``stream_id``.
-
-    Each launcher selector that resolves to the stream goes through the
-    provider's ``handoff_identity_for_*_epic`` helper; only slots registered in
-    the fleet roster are kept, as the launcher itself refuses the others.
-    Anything that cannot be resolved raises ``ValueError``.
-    """
-    helper = _HANDOFF_SLOT_HELPERS.get(provider)
-    if helper is None:
-        raise ValueError("rollover bundle lease holder has no handoff slot helper")
-    stream_id = validate_stream_id(stream_id)
-    try:
-        from lu_machinery.orchestration.handoff_slot_registry import is_registered_slot, registry_readable
-        from lu_machinery.orchestration.launcher_aliases import load_launcher_aliases
-
-        alias_selectors = sorted(load_launcher_aliases())
-        result = subprocess.run(
-            [
-                "bash",
-                "-c",
-                _HANDOFF_SLOT_SCRIPT,
-                "handoff-slots",
-                str(_HANDOFF_IDENTITY_SH),
-                helper,
-                stream_id,
-                *alias_selectors,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (ImportError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        raise ValueError("rollover bundle handoff slot could not be resolved") from exc
-    if result.returncode != 0 or not registry_readable():
-        raise ValueError("rollover bundle handoff slot could not be resolved")
-    slots = frozenset(slot for slot in result.stdout.split() if is_registered_slot(slot))
-    if not slots:
-        raise ValueError(f"no registered {provider} handoff slot resolves to {stream_id}")
-    return slots
 
 
 def _validate_remote_epic_stream(stream_id: str) -> str:
@@ -1960,190 +1828,6 @@ class SessionStreamStore:
                 raise SessionStreamError("entry insert did not produce a readable row")
             return AppendResult(entry=self._entry_from_row(connection, row), is_replay=False)
 
-    def upload_rollover_bundle(
-        self,
-        lease: Lease,
-        *,
-        manifest: Mapping[str, Any],
-        blob: bytes,
-        now: datetime | None = None,
-        app_proof: VerifiedAppLifecycleProof | None = None,
-    ) -> dict[str, Any]:
-        """Store one verified rollover bundle under the exact fenced lease.
-
-        This deliberately mirrors ``append_entry``'s lease and app-proof
-        contract.  Process holders use the ordinary fenced lease path;
-        app-thread holders must carry the same verified lifecycle receipt used
-        by other immutable mutations.
-        """
-        try:
-            from lu_machinery.orchestration.thread_handoff import (
-                _bundle_conversion,
-                _bundle_require_json_value,
-                _bundle_secret_hits,
-                verify_rollover_bundle,
-            )
-        except ImportError as exc:
-            raise ValueError("rollover bundle validator is unavailable") from exc
-        _bundle_require_json_value(manifest)
-        if not isinstance(manifest, Mapping):
-            raise ValueError("rollover bundle manifest must be an object")
-        if not isinstance(blob, bytes) or not blob:
-            raise ContentRejectedError("rollover bundle blob must be non-empty bytes")
-        if len(blob) > MAX_ROLLOVER_BUNDLE_BYTES:
-            raise ContentRejectedError("rollover bundle exceeds the 4 MiB cap")
-        manifest_value = dict(manifest)
-        if manifest_value.get("schema") != ROLLOVER_BUNDLE_SCHEMA:
-            raise ValueError("rollover bundle manifest schema is invalid")
-        stream_id = validate_stream_id(lease.stream_id)
-        if manifest_value.get("stream_id") != stream_id:
-            raise ValueError("rollover bundle stream_id does not match the lease")
-        for field in ("agent", "lineage_id", "rollover_id"):
-            value = manifest_value.get(field)
-            if not isinstance(value, str) or not value or not self._identity_is_safe(value):
-                raise ValueError(f"rollover bundle {field} is malformed")
-        with _bundle_conversion():
-            generation_value = manifest_value.get("generation")
-            if generation_value is None:
-                raise ValueError("rollover bundle generation is missing")
-            generation = int(generation_value)
-        if generation < 1:
-            raise ValueError("rollover bundle generation must be positive")
-        with _bundle_conversion():
-            valid_status = manifest_value.get("status") in {"pending_start", "resumed", "started", "confirmed", "superseded"}
-        if not valid_status:
-            raise ValueError("rollover bundle status is invalid")
-        prepared_at = manifest_value.get("prepared_at")
-        if not isinstance(prepared_at, str):
-            raise ValueError("rollover bundle prepared_at is malformed")
-        with _bundle_conversion():
-            parse_timestamp(prepared_at)
-        bundle_sha256 = manifest_value.get("bundle_sha256")
-        if not isinstance(bundle_sha256, str) or not ROLLOVER_BUNDLE_SHA256_RE.fullmatch(bundle_sha256):
-            raise ValueError("rollover bundle fingerprint is malformed")
-        files = manifest_value.get("files")
-        if not isinstance(files, list) or not files:
-            raise ValueError("rollover bundle manifest has no files")
-        # The importer runs this same validation; the archive's embedded
-        # manifest, bound to the supplied identity, is what gets stored.
-        embedded, members = verify_rollover_bundle(blob, repo_root=primary_root(), manifest_override=manifest_value)
-        if files != embedded["files"]:
-            raise ValueError("rollover bundle manifest files do not match its archive")
-        secret_hits = _bundle_secret_hits(members)
-        if secret_hits:
-            _member, rule = secret_hits[0]
-            raise ContentRejectedError(f"bundle content matched {rule} rule")
-        manifest_value = embedded
-        agent = manifest_value["agent"]
-        if agent not in rollover_bundle_handoff_slots(lease.holder.agent, stream_id):
-            raise ValueError("rollover bundle agent is not the lease holder's handoff slot for this stream")
-        current_time = now or utc_now()
-        self._require_app_proof(
-            app_proof,
-            operation="append",
-            holder=lease.holder,
-            stream_id=stream_id,
-            session_id=lease.session_id,
-            lease_id=lease.lease_id,
-            generation=lease.generation,
-            fencing_token=lease.fencing_token,
-            now=current_time,
-        )
-        uploaded_at = isoformat_z(current_time)
-        manifest_json = canonical_json(manifest_value)
-        try:
-            with self._transaction(now=current_time) as connection:
-                lease_row = self._require_current_lease(connection, lease, require_valid_at=current_time)
-                existing_by_sha = connection.execute(
-                    "SELECT * FROM rollover_bundles WHERE bundle_sha256 = ?",
-                    (bundle_sha256,),
-                ).fetchone()
-                if existing_by_sha is not None:
-                    if (
-                        existing_by_sha["stream_id"] != stream_id
-                        or existing_by_sha["agent"] != manifest_value["agent"]
-                        or existing_by_sha["lineage_id"] != manifest_value["lineage_id"]
-                        or existing_by_sha["rollover_id"] != manifest_value["rollover_id"]
-                        or int(existing_by_sha["generation"]) != generation
-                        or existing_by_sha["status"] != manifest_value["status"]
-                        or existing_by_sha["prepared_at"] != prepared_at
-                    ):
-                        raise LeaseConflictError("bundle fingerprint is already bound to another lineage")
-                    return self._rollover_bundle_payload(existing_by_sha, include_blob=True)
-                existing_by_rollover = connection.execute(
-                    "SELECT bundle_sha256 FROM rollover_bundles "
-                    "WHERE stream_id = ? AND agent = ? AND lineage_id = ? AND rollover_id = ? "
-                    "AND status = ? AND prepared_at = ?",
-                    (
-                        stream_id,
-                        manifest_value["agent"],
-                        manifest_value["lineage_id"],
-                        manifest_value["rollover_id"],
-                        manifest_value["status"],
-                        prepared_at,
-                    ),
-                ).fetchone()
-                if existing_by_rollover is not None:
-                    raise LeaseConflictError("rollover tuple already binds different immutable bundle content")
-                cursor = connection.execute(
-                    "INSERT INTO rollover_bundles("
-                    "stream_id, agent, lineage_id, generation, rollover_id, status, prepared_at, "
-                    "bundle_sha256, manifest_json, blob, uploaded_at, uploaded_by_lease_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        stream_id,
-                        manifest_value["agent"],
-                        manifest_value["lineage_id"],
-                        generation,
-                        manifest_value["rollover_id"],
-                        manifest_value["status"],
-                        prepared_at,
-                        bundle_sha256,
-                        manifest_json,
-                        blob,
-                        uploaded_at,
-                        lease.lease_id,
-                    ),
-                )
-                assert cursor.lastrowid is not None  # Successful INSERT into an INTEGER PRIMARY KEY table.
-                bundle_id = cursor.lastrowid
-                if app_proof is not None:
-                    event_id = self._insert_lease_event_from_row(
-                        connection,
-                        row=lease_row,
-                        event_type="appended",
-                        timestamp=uploaded_at,
-                        proof={
-                            "kind": "session_stream_rollover_bundle_upload.v1",
-                            "bundle_sha256": bundle_sha256,
-                            **self._proof_payload(app_proof),
-                        },
-                        reason="verified GUI-native rollover bundle upload",
-                    )
-                    connection.execute(
-                        "UPDATE stream_leases SET version = version + 1, last_event_id = ? WHERE stream_id = ?",
-                        (event_id, stream_id),
-                    )
-                old_rows = connection.execute(
-                    "SELECT bundle_id FROM rollover_bundles "
-                    "WHERE stream_id = ? AND agent = ? AND lineage_id = ? "
-                    "ORDER BY bundle_id DESC LIMIT -1 OFFSET 5",
-                    (stream_id, manifest_value["agent"], manifest_value["lineage_id"]),
-                ).fetchall()
-                if old_rows:
-                    connection.executemany(
-                        "DELETE FROM rollover_bundles WHERE bundle_id = ?",
-                        ((int(row["bundle_id"]),) for row in old_rows),
-                    )
-                row = connection.execute(
-                    "SELECT * FROM rollover_bundles WHERE bundle_id = ?",
-                    (bundle_id,),
-                ).fetchone()
-                if row is None:
-                    raise SessionStreamError("rollover bundle insert did not produce a readable row")
-                return self._rollover_bundle_payload(row, include_blob=True)
-        except sqlite3.IntegrityError as exc:
-            raise LeaseConflictError("rollover bundle conflicts with an existing immutable row") from exc
 
     def list_rollover_bundles(
         self,
@@ -2178,23 +1862,6 @@ class SessionStreamStore:
             ).fetchall()
             return [self._rollover_bundle_payload(row, include_blob=False) for row in rows]
 
-    def upload_bundle(
-        self,
-        lease: Lease,
-        *,
-        manifest: Mapping[str, Any],
-        blob: bytes,
-        now: datetime | None = None,
-        app_proof: VerifiedAppLifecycleProof | None = None,
-    ) -> dict[str, Any]:
-        """Compatibility name for callers that treat bundles as uploads."""
-        return self.upload_rollover_bundle(
-            lease,
-            manifest=manifest,
-            blob=blob,
-            now=now,
-            app_proof=app_proof,
-        )
 
     def latest_rollover_bundle(
         self,

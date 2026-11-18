@@ -31,10 +31,7 @@ import io
 import json
 import os
 import platform
-import signal
 import sys
-import threading
-import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -450,111 +447,6 @@ def phase_rollover_detect(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _installed_stage_cleanup_warnings(payload: dict[str, Any]) -> list[str]:
-    """SessionStart lines for an install that committed and kept its stage."""
-    items = payload.get("bundles", [payload])
-    if not isinstance(items, list):
-        return []
-    warnings: list[str] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("status") != "installed":
-            continue
-        warning = item.get("cleanup_warning")
-        if not isinstance(warning, dict):
-            continue
-        stage = warning.get("stage")
-        code = warning.get("code")
-        if not isinstance(stage, str) or not stage or not isinstance(code, str) or not code:
-            continue
-        message = f"WARNING: rollover bundle installed; {code}; retained stage: {stage}"
-        leftovers = warning.get("leftovers")
-        if isinstance(leftovers, list):
-            names = [item for item in leftovers if isinstance(item, str) and item]
-            if names:
-                message += "; leftovers: " + ", ".join(names)
-        warnings.append(message)
-    return warnings
-
-
-def phase_rollover_import(args: argparse.Namespace) -> dict[str, Any]:
-    """Fetch the newest remote packet before detect, without blocking startup."""
-    if not getattr(args, "import_bundle", False):
-        return {"status": "skipped", "reason": "bundle backstop not requested"}
-    if not getattr(args, "stream", ""):
-        return {"status": "skipped", "reason": "no launcher-derived stream"}
-    started = time.monotonic()
-    import_timeout = 2.8
-    previous_handler: Any = None
-    previous_timer: tuple[float, float] | None = None
-    alarm_enabled = threading.current_thread() is threading.main_thread()
-    try:
-        thread_handoff = _import_thread_handoff()
-        if alarm_enabled:
-            previous_handler = signal.getsignal(signal.SIGALRM)
-            previous_timer = signal.setitimer(signal.ITIMER_REAL, import_timeout)
-
-            def _alarm_timeout(_signum: int, _frame: Any) -> None:
-                raise TimeoutError("rollover bundle import exceeded its 3-second sub-budget")
-
-            signal.signal(signal.SIGALRM, _alarm_timeout)
-        rc, out, err = _run_cli_inprocess(
-            thread_handoff.main,
-            [
-                "--repo-root",
-                args.repo_root,
-                "import-bundle",
-                "--agent",
-                args.agent,
-                "--from-api",
-                args.stream,
-                "--stream",
-                args.stream,
-            ],
-        )
-    except TimeoutError as exc:
-        return {
-            "status": "issue",
-            "warning": f"WARNING: rollover bundle import skipped (fail-open): {exc}; detect continues.",
-        }
-    except Exception as exc:
-        return _crash(exc)
-    finally:
-        if alarm_enabled:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            if previous_timer is not None:
-                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
-            if previous_handler is not None:
-                signal.signal(signal.SIGALRM, previous_handler)
-    elapsed = time.monotonic() - started
-    payload = _parse_protocol_payload(out, err)
-    if elapsed > 3.0:
-        return {
-            "status": "issue",
-            "warning": f"WARNING: rollover bundle import exceeded its 3-second sub-budget ({elapsed:.2f}s); detect continues.",
-        }
-    if rc == 0 and isinstance(payload, dict):
-        copies = [
-            item["preserved_copy"]
-            for item in payload.get("bundles", [payload])
-            if isinstance(item, dict) and item.get("status") == "warning" and item.get("preserved_copy")
-        ]
-        notices = []
-        if copies:
-            notices.append(
-                f"WARNING: rollover bundle differs at equal order; kept local; remote preserved at {', '.join(copies)}"
-            )
-        notices.extend(_installed_stage_cleanup_warnings(payload))
-        if notices:
-            return {"status": "issue", "warning": " ".join(notices)}
-    if rc == 0 and isinstance(payload, dict) and payload.get("status") not in {"warning", "refused"}:
-        return {"status": "ok", "elapsed_seconds": round(elapsed, 3)}
-    detail = " ".join((out or err).split()) or "no structured output"
-    return {
-        "status": "issue",
-        "warning": f"WARNING: rollover bundle import skipped (fail-open): {detail}",
-    }
-
-
 def phase_stack_drift(args: argparse.Namespace) -> dict[str, Any]:
     """Write the private drift report. The session payload stays status-only.
 
@@ -599,7 +491,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-family", default="")
     parser.add_argument("--claim-lease", action="store_true")
     parser.add_argument("--detect", action="store_true")
-    parser.add_argument("--import-bundle", action="store_true")
     parser.add_argument("--stream", default="")
     args = parser.parse_args(argv)
 
@@ -613,10 +504,8 @@ def main(argv: list[str] | None = None) -> int:
     # and detect must not run (never replace a lease verdict with detect output).
     lease_status = result["thread_lease"]["status"]
     if lease_status in {"stop", "crashed"}:
-        result["rollover_import"] = {"status": "skipped", "reason": "lease verdict is authoritative"}
         result["rollover_detect"] = {"status": "skipped", "reason": "lease verdict is authoritative"}
     else:
-        result["rollover_import"] = phase_rollover_import(args)
         result["rollover_detect"] = phase_rollover_detect(args)
 
     result["stack_drift"] = phase_stack_drift(args)

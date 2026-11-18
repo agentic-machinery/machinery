@@ -137,10 +137,17 @@ def test_session_start_drift_check_matches_the_installed_deployer(tmp_path: Path
     tell. A clean deployment with runtime state beside it, reached through a symlinked root, and an undeployed
     linked worktree report nothing; one edited deployed file is drift.
     """
-    from lu_machinery.agent_deploy.plan import release_inputs
-
+    # The child deployer and drift checker use the installed release. Its
+    # mandatory-hook inventory must also own the fixture, even when this
+    # checkout is newer or older than that installed release.
+    inventory_probe = subprocess.run(
+        [sys.executable, "-I", "-c",
+         "import json; from lu_machinery.agent_deploy.plan import release_inputs; "
+         "print(json.dumps(release_inputs()[1]))"],
+        capture_output=True, text=True, check=True,
+    )
+    inventory = json.loads(inventory_probe.stdout)
     project = _scratch_project(tmp_path)
-    _files, inventory, _identity = release_inputs()
     # No preserve entry: the session state and lease this hook writes, and a driver's state directory, are
     # runtime siblings the deployer leaves out of its check.
     descriptor = {"providers": ["claude", "codex", "agy"], "sources": {}, "preserve": []}
@@ -291,7 +298,6 @@ _LIB_SITES = {
         f"{_LAUNCHER}LC_MODE=driver LC_DRY_RUN=0 LC_EPIC=infra LU_DRIVER_STATE_PYTHON={_PY} "
         'LU_DRIVER_STATE_FILE="$1/.claude/infra-epic/DRIVER-STATE.md" && launcher_seed_driver_state'
     ),
-    "launcher_rollover_bundle": f"{_LAUNCHER}LC_EPIC=infra && launcher_import_rollover_bundle",
     "launcher_close_lease": f"{_LAUNCHER}LC_DRIVER_CLOSE_RETRY_SECONDS=0 && launcher_close_driver_lease",
     "launcher_driver_agent": f"{_LAUNCHER}LC_PROVIDER=claude LC_EPIC=infra && launcher_inject_driver_agent",
 }

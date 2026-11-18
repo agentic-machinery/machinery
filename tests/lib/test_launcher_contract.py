@@ -336,16 +336,7 @@ def test_codex_launchers_pin_roles_and_preserve_explicit_effort(launcher, args, 
         )
 
 
-# The fail-open pre-lease rollover import is not under test in the sandboxed
-# driver fixtures: their closure lacks its imports, so the real call only cost a
-# failed interpreter start. The launcher call site is covered by
-# tests/test_start_codex_profiles.py and tests/test_launcher_helper_root.py; the
-# import itself by tests/test_rollover_bundles.py.
-_ROLLOVER_IMPORT_STUB = """\
-if [[ ( "${1:-}" == */lu_machinery/orchestration/thread_handoff.py || "${1:-}:${2:-}" == -m:lu_machinery.orchestration.thread_handoff ) && "$*" == *" import-bundle "* ]]; then
-  exit 0
-fi
-"""
+
 
 
 def _core_canary_failure_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -382,7 +373,7 @@ if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "lu_machinery.session_supervisor" && "
   touch {os.fspath(close_marker)!r}
   exit 0
 fi
-{_ROLLOVER_IMPORT_STUB}exec {sys.executable!r} "$@"
+exec {sys.executable!r} "$@"
 """,
         encoding="utf-8",
     )
@@ -544,7 +535,7 @@ if [[ "${{1:-}}" == "-m" && "${{2:-}}" == "lu_machinery.session_supervisor" && "
   touch {os.fspath(close_marker)!r}
   exit 0
 fi
-{_ROLLOVER_IMPORT_STUB}exec {sys.executable!r} "$@"
+exec {sys.executable!r} "$@"
 """,
         encoding="utf-8",
     )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.orchestration import rollover_registry_cli, task_identity
+from lu_machinery.orchestration import task_identity
 from lu_machinery.orchestration.task_family import rollover
 from lu_machinery.orchestration.task_family import rollover_registry as registry
 
@@ -319,46 +319,6 @@ def test_supported_agents_share_one_registry_contract(tmp_path: Path, agent: str
     }
 
 
-def test_generic_cli_is_fail_closed_with_actionable_candidates(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    for index in range(1, 5):
-        _sync(
-            tmp_path,
-            _lease(lineage=f"lineage-c{index}", rollover_id=f"rollover-c{index}", source=f"source-c{index}"),
-        )
-
-    returncode = rollover_registry_cli.main(["--repo-root", str(tmp_path), "detect", "--agent", "codex"])
-    payload = json.loads(capsys.readouterr().out)
-
-    assert returncode == 2
-    assert payload["error"] == "multiple_live_pending_rollovers"
-    assert payload["mutation_allowed"] is False
-    assert len(payload["candidates"]) == 4
-    assert all(
-        {"title", "issue", "epic", "lineage_id", "rollover_id", "state", "age_seconds", "next_safe_action"}
-        <= candidate.keys()
-        for candidate in payload["candidates"]
-    )
-
-
-def test_generic_cli_refuses_single_candidate_when_another_source_is_corrupt(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _sync(tmp_path, _lease(lineage="lineage-only-visible", rollover_id="rollover-only-visible"))
-    corrupt = registry.registry_root(tmp_path) / "codex" / "lineage-hidden" / "rollover-hidden" / "record.json"
-    _write_json(corrupt, {"schema_version": 999})
-
-    returncode = rollover_registry_cli.main(["--repo-root", str(tmp_path), "detect", "--agent", "codex"])
-    payload = json.loads(capsys.readouterr().out)
-
-    assert returncode == 2
-    assert payload["error"] == "inconsistent_or_corrupt_rollover_sources"
-    assert payload["mutation_allowed"] is False
-    assert len(payload["candidates"]) == 1
-    assert payload["registry_errors"][0]["path"].endswith("record.json")
-
-
 def test_wrong_lineage_rollover_pairing_finds_no_record(tmp_path: Path) -> None:
     _sync(tmp_path, _lease(lineage="lineage-a1", rollover_id="rollover-r1", source="source-1"))
     _sync(tmp_path, _lease(lineage="lineage-a2", rollover_id="rollover-r2", source="source-2"))
@@ -384,62 +344,6 @@ def test_confirmed_rollover_is_not_live_and_requires_cleanup(tmp_path: Path) -> 
     assert not registry.is_live_pending(record)
     audit = registry.audit_fleet(tmp_path, now=datetime(2026, 7, 16, 10, tzinfo=UTC))
     assert audit["entries"][0]["classification"] == "confirmed but incompletely cleaned"
-
-
-def test_incident_shape_allows_exact_aef219_and_leaves_unrelated_packets_untouched(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    confirmed = _sync(
-        tmp_path,
-        _lease(
-            lineage="lineage-f039",
-            rollover_id="rollover-f039",
-            source="source-f039",
-            replacement="replacement-f039",
-            status="started",
-        ),
-    )
-    target = _sync(
-        tmp_path,
-        _lease(
-            lineage="lineage-4ad435086af0f3a1111550d8",
-            rollover_id="rollover-aef219c119ed4141919c2e7fd90860a8",
-            source="source-aef219",
-        ),
-    )
-    unrelated = [
-        _sync(
-            tmp_path,
-            _lease(
-                lineage=f"lineage-unrelated-{index}",
-                rollover_id=f"rollover-unrelated-{index}",
-                source=f"source-unrelated-{index}",
-            ),
-        )
-        for index in range(1, 4)
-    ]
-
-    rc = rollover_registry_cli.main(
-        [
-            "--repo-root",
-            str(tmp_path),
-            "detect",
-            "--agent",
-            "codex",
-            "--source-thread-id",
-            "source-aef219",
-        ]
-    )
-    payload = json.loads(capsys.readouterr().out)
-    audit = registry.audit_fleet(tmp_path)
-
-    assert rc == 0
-    assert payload["candidate"]["rollover_id"] == target["key"]["rollover_id"]
-    assert audit["counts"]["live_pending"] == 4
-    assert not registry.is_live_pending(confirmed)
-    for packet in unrelated:
-        current = registry.load_record(tmp_path, **packet["key"])
-        assert current["state"] == registry.RolloverState.AWAITING_NATIVE_CREATE.value
 
 
 def _retire_native_plan(lease: dict) -> dict:
@@ -485,6 +389,9 @@ def test_retired_non_native_lease_with_bound_fallback_projects_replacement_creat
 
     assert lease["replacement"]["title_transition"]["state"] == "fallback_recorded"
     assert record["state"] == registry.RolloverState.REPLACEMENT_CREATED.value
+    assert registry.next_safe_action(record) == (
+        "run bootstrap-replacement with the exact lineage, rollover and authoritative replacement thread ID"
+    )
 
 
 def test_stale_age_is_read_only_and_never_deletes_packet(tmp_path: Path) -> None:
@@ -737,57 +644,6 @@ def test_maintenance_apply_revalidates_action_target_semantics(tmp_path: Path) -
     assert registry.load_record(tmp_path, **record["key"])["state"] == record["state"]
 
 
-def test_blocked_packet_is_visible_but_not_mutation_authorized(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    record = _sync(
-        tmp_path,
-        _lease(
-            lineage="lineage-blocked-resume",
-            rollover_id="rollover-blocked-resume",
-            replacement="replacement-blocked-resume",
-            status="resumed",
-        ),
-    )
-    registry.transition(
-        tmp_path,
-        **record["key"],
-        state=registry.RolloverState.BLOCKED,
-        reason="exact title proof missing",
-    )
-
-    detect_rc = rollover_registry_cli.main(
-        [
-            "--repo-root",
-            str(tmp_path),
-            "detect",
-            "--lineage-id",
-            record["key"]["lineage_id"],
-            "--rollover-id",
-            record["key"]["rollover_id"],
-        ]
-    )
-    detected = json.loads(capsys.readouterr().out)
-    resume_rc = rollover_registry_cli.main(
-        [
-            "--repo-root",
-            str(tmp_path),
-            "resume-exact",
-            "--lineage-id",
-            record["key"]["lineage_id"],
-            "--rollover-id",
-            record["key"]["rollover_id"],
-            "--replacement-thread-id",
-            "replacement-blocked-resume",
-        ]
-    )
-
-    assert detect_rc == 0
-    assert detected["mutation_allowed"] is False
-    assert resume_rc == 2
-    assert "requires reconciliation or maintenance" in capsys.readouterr().out
-
-
 def test_failed_native_boundary_projects_as_blocked(tmp_path: Path) -> None:
     lease = _lease(lineage="lineage-native-failed", rollover_id="rollover-native-failed")
     lease["replacement"]["native_lifecycle"]["status"] = "title_readback_failed"
@@ -824,37 +680,6 @@ def test_blocked_packet_cannot_be_cleared_at_the_same_boundary(tmp_path: Path) -
             state=registry.RolloverState.RESUMED,
             reason="unproved unblock",
         )
-
-
-def test_cli_rejects_wrong_exact_plan_before_mutation(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    selected = _sync(tmp_path, _lease(lineage="lineage-selected", rollover_id="rollover-selected"))
-    other = _sync(tmp_path, _lease(lineage="lineage-other", rollover_id="rollover-other"))
-    plan = registry.create_maintenance_plan(
-        tmp_path,
-        record=other,
-        action=registry.MaintenanceAction.SUPERSEDE,
-        proof=_persist_proof_evidence(tmp_path, _disposition_proof(other)),
-    )
-
-    rc = rollover_registry_cli.main(
-        [
-            "--repo-root",
-            str(tmp_path),
-            "supersede-exact",
-            "--lineage-id",
-            selected["key"]["lineage_id"],
-            "--rollover-id",
-            selected["key"]["rollover_id"],
-            "--apply",
-            "--plan-file",
-            plan["plan_path"],
-        ]
-    )
-
-    assert rc == 2
-    assert "exact IDs do not match the selected registry record" in capsys.readouterr().out
-    current = registry.load_record(tmp_path, **other["key"])
-    assert current["state"] == registry.RolloverState.AWAITING_NATIVE_CREATE.value
 
 
 def test_abandonment_refuses_confirmed_active_rollover(tmp_path: Path) -> None:
@@ -1021,26 +846,6 @@ def test_audit_classifies_packet_with_corrupt_referenced_lease_once(tmp_path: Pa
     assert audit["counts"] == {"total": 1, "live_pending": 0, "corrupt": 1}
     assert audit["entries"][0]["classification"] == registry.AuditClassification.INCONSISTENT_CORRUPT.value
     assert audit["entries"][0]["source_errors"][0]["path"] == record["lease_path"]
-
-
-def test_exact_selector_refuses_corrupt_authoritative_record(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    record = _sync(tmp_path, _lease(lineage="lineage-corrupt-exact", rollover_id="rollover-corrupt-exact"))
-    _write_json(registry.record_path(tmp_path, **record["key"]), {"schema_version": 999})
-
-    rc = rollover_registry_cli.main(
-        [
-            "--repo-root",
-            str(tmp_path),
-            "detect",
-            "--source-thread-id",
-            record["task_identity"]["predecessor_task_id"],
-        ]
-    )
-
-    assert rc == 2
-    assert "corrupt durable source" in capsys.readouterr().out
 
 
 def test_transition_cannot_skip_required_boundaries(tmp_path: Path) -> None:
@@ -1227,3 +1032,7 @@ def test_every_success_boundary_is_idempotent_after_crash_retry(tmp_path: Path) 
 
         assert first == second
         assert sum(event.get("operation_id") == operation_id for event in second["history"]) == 1
+        if boundary is registry.RolloverState.PREDECESSOR_ARCHIVED:
+            assert registry.next_safe_action(second) == (
+                "request FINISH_CLEANUP library maintenance with exact heartbeat retirement proof and authorization"
+            )

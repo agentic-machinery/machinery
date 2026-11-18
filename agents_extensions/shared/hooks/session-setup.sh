@@ -776,9 +776,6 @@ ROLLOVER_STREAM_ARGS=()
 if [ -n "$ROLLOVER_BUNDLE_STREAM" ]; then
   ROLLOVER_STREAM_ARGS=(--stream "$ROLLOVER_BUNDLE_STREAM")
   GATE_ARGS+=("${ROLLOVER_STREAM_ARGS[@]}")
-  case "$ROLLOVER_BUNDLE_STREAM" in
-    epic:*) GATE_ARGS+=(--import-bundle) ;;
-  esac
 fi
 
 GATE_RC=0
@@ -797,8 +794,7 @@ if [ "$GATE_RC" -eq 0 ] && [ -n "$GATE_JSON" ]; then
       (.thread_lease.status // ""), (.thread_lease.context // ""),
       (.thread_lease.generation // ""), (.thread_lease.takeover_banner // ""),
       (.rollover_detect.status // ""), (.rollover_detect.context // ""),
-      (.rollover_detect.detect_status // ""),
-      (.rollover_import.warning // .rollover_import.error // "")
+      (.rollover_detect.detect_status // "")
     ] | .[] | tostring, ([0] | implode)' 2>/dev/null)
   unset _gate_field
 fi
@@ -861,9 +857,6 @@ else
       fi
       ;;
   esac
-  if [ ${#GATE_FIELDS[@]} -ge 14 ]; then
-    [ -n "${GATE_FIELDS[13]}" ] && ISSUES+=("${GATE_FIELDS[13]}")
-  fi
 fi
 unset GATE_JSON GATE_FIELDS
 
