@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -1110,10 +1111,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"  python -m {_MODULE} status\n"
             f"  python -m {_MODULE} accept --pr 42\n"
             f"  python -m {_MODULE} accept --pr 42 --custody --from TASK\n"
-            f"  python -m {_MODULE} accept --pr 42 --reason REASON --decision-owner OWNER\n"
-            f"  python -m {_MODULE} accept --pr 42 --release\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --reason REASON --decision-owner OWNER\n"
+            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --release\n"
             f"  python -m {_MODULE} queue-exit --pr 42\n\n"
-            "accept --reason and --decision-owner records coordinator custody with no dispatch task.\n"
+            "accept --reason and --decision-owner records coordinator custody with no dispatch task; it and\n"
+            "--release need --repo, since the coordinator's checkout is not the alert's repository.\n"
             "--release drops that custody. The PR is not alerted again while it stays open.\n"
             "Other accept and queue-exit act as the dispatch task named by LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
             "Outputs: JSON on stdout (check: one line per PR without a live owner);\n"
@@ -1134,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subs.add_parser(name, help=text)
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
         sub.add_argument("--repo", default=None,
-                         help="owner/name (default: the default fleet repository)")
+                         help="owner/name (default: this checkout's origin; refused when unresolvable)")
         if name == "accept":
             sub.add_argument("--custody", action="store_true",
                              help="Accept queue custody: ejection, stale approval, merge confirmation, closeout")
@@ -1147,6 +1149,45 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--release", action="store_true",
                              help="Release recorded custody so an ownerless PR can alert again")
     return parser
+
+
+def _checkout_slug(cwd: Path) -> str | None:
+    """The ``owner/name`` of the checkout's own origin, else None.
+
+    One read of every origin URL (fetch and push), with Git's repository redirects (``GIT_*``) cleared.
+    Each value must come from the checkout's repository or worktree configuration (includes followed), and
+    all must name the same GitHub repository: a user-level, system-level or command-line value applies to
+    any directory, and distinct values leave the checkout's repository ambiguous.
+    """
+    from lu_machinery.fleet.pr_identity import _GITHUB_REMOTE_PATTERNS
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        done = subprocess.run(
+            ["git", "config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    slugs: set[str | None] = set()
+    for line in done.stdout.splitlines():
+        scope, _, entry = line.partition("\t")
+        url = entry.partition(" ")[2].strip()
+        match = next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None)
+        slugs.add(f"{match.group(1)}/{match.group(2)}" if match and scope in {"local", "worktree"} else None)
+    return slugs.pop() if done.returncode == 0 and len(slugs) == 1 else None
+
+
+def _repo_or_checkout(repo: str | None) -> str:
+    """The ``--repo`` value (``owner/name`` only), else the checkout's origin; never another repository by default."""
+    if repo is not None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise OwnershipError(f"invalid --repo {repo!r}: expected owner/name")
+        return repo
+    slug = _checkout_slug(Path.cwd())
+    if slug is None:
+        raise OwnershipError("repository unresolved: run inside a checkout with a GitHub origin, or pass --repo owner/name")
+    return slug
 
 
 def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
@@ -1163,8 +1204,12 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     from lu_machinery.dispatcher import store
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
+    if args.repo is None:
+        # Custody is recorded from the coordinator seat, whose checkout is not the alert's repository.
+        print(json.dumps({"accepted": False, "reason": "recorded custody needs --repo owner/name"}))
+        return 1
     repos = load_fleet_repos()
-    repo = args.repo or next(item.github for item in repos.values() if item.default)
+    repo = _repo_or_checkout(args.repo)
     pr = _gh_pr(repo, args.pr)
     now = datetime.now(UTC)
     records = [] if args.release else store.list_tasks(strict=True)
@@ -1213,7 +1258,7 @@ def main(argv: list[str] | None = None) -> int:
         from lu_machinery.dispatcher import store
         from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-        repo = args.repo or next(r.github for r in load_fleet_repos().values() if r.default)
+        repo = _repo_or_checkout(args.repo)
         records = store.list_tasks(strict=True)
         pr = _gh_pr(repo, args.pr)
         now = datetime.now(UTC)

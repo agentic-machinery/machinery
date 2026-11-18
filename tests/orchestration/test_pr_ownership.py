@@ -473,6 +473,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
     repo = fleet_repos.FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True)
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {"public": repo})
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: REPO)
     return path
 
 
@@ -491,6 +492,96 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
     assert own.main(["queue-exit", "--pr", "42"]) == 0
     assert json.loads(capsys.readouterr().out) == {"may_exit": True, "reasons": []}
     assert own.main(["status"]) == 0
+
+
+def test_cli_without_repo_targets_the_checkout_not_the_default_fleet_repository(world, monkeypatch, capsys):
+    """Wrong-repository class: an omitted --repo once meant the default fleet repository, whatever the checkout."""
+    seen = []
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: seen.append(repo) or {"state": "OPEN", "headRefOid": HEAD})
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: "learn-ukrainian/machinery")
+    monkeypatch.setenv(own.TASK_ENV, "integration")
+    own.main(["accept", "--pr", "42"])
+    own.main(["accept", "--pr", "42", "--repo", "other/explicit"])
+    assert seen == ["learn-ukrainian/machinery", "other/explicit"]
+    # A checkout whose repository cannot be determined is refused before any GitHub read.
+    seen.clear()
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: None)
+    capsys.readouterr()
+    assert own.main(["accept", "--pr", "42"]) == 2
+    assert own.main(["queue-exit", "--pr", "42"]) == 2
+    assert "repository unresolved" in capsys.readouterr().err and seen == []
+    # An explicit --repo is never replaced by the checkout, and only an owner/name spelling is a repository.
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: "learn-ukrainian/machinery")
+    for bad in ("", "github.com/learn-ukrainian/machinery", "https://github.com/learn-ukrainian/machinery"):
+        assert own.main(["accept", "--pr", "42", "--repo", bad]) == 2
+    assert "invalid --repo" in capsys.readouterr().err and seen == []
+
+
+def test_coordinator_custody_never_takes_the_repository_from_the_checkout(world, monkeypatch, capsys):
+    """Wrong-repository class: custody recorded from a seat whose checkout is not the alert's repository."""
+    seen = []
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: seen.append(repo) or {"state": "OPEN", "headRefOid": HEAD})
+    monkeypatch.delenv(own.TASK_ENV, raising=False)
+    argv = ["accept", "--pr", "42", "--reason", "waiting on a decision", "--decision-owner", "operator"]
+    assert own.main(argv) == 1
+    assert own.main(["accept", "--pr", "42", "--release"]) == 1
+    assert "needs --repo" in capsys.readouterr().out and seen == []
+
+
+def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch):
+    """Class: an origin from user config, command-line config or a redirected GIT_DIR named a repository
+    for a directory that is not the checkout's; an origin from a local config include was refused."""
+    import subprocess
+
+    def git(cwd, *args):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, timeout=30)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text('[remote "origin"]\n\turl = https://github.com/someone/global-only.git\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    checkout, outside, other = tmp_path / "checkout", tmp_path / "outside", tmp_path / "other"
+    for directory in (checkout, outside, other):
+        directory.mkdir()
+    git(checkout, "init", "-q")
+    git(other, "init", "-q")
+    git(other, "remote", "add", "origin", "https://github.com/someone/redirected.git")
+    assert own._checkout_slug(outside) is None
+    assert own._checkout_slug(checkout) is None
+    # Ambient redirects and command-line configuration never name the checkout.
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "https://github.com/someone/command-line.git")
+    assert own._checkout_slug(checkout) is None
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_CONFIG_COUNT")
+    url = "https://github.com/learn-ukrainian/machinery.git"
+    git(checkout, "remote", "add", "origin", url)
+    # Git fetches from the first of several origin URLs, the user-level one: the checkout's own is not the answer.
+    assert own._checkout_slug(checkout) is None
+    (home / ".gitconfig").unlink()
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    # An origin defined by a file the local configuration includes is still the checkout's own.
+    included = tmp_path / "included"
+    included.mkdir()
+    git(included, "init", "-q")
+    (included / "origin.inc").write_text(f'[remote "origin"]\n\turl = {url}\n')
+    git(included, "config", "include.path", str(included / "origin.inc"))
+    assert own._checkout_slug(included) == "learn-ukrainian/machinery"
+    git(checkout, "remote", "set-url", "origin", "https://example.com/not/github.git")
+    assert own._checkout_slug(checkout) is None
+    # Distinct origin URLs, in an include or as a push URL, leave the repository ambiguous.
+    (included / "second.inc").write_text('[remote "origin"]\n\turl = https://github.com/sample/second.git\n')
+    git(included, "config", "--add", "include.path", str(included / "second.inc"))
+    assert own._checkout_slug(included) is None
+    git(checkout, "remote", "set-url", "origin", url)
+    git(checkout, "config", "remote.origin.pushurl", "git@github.com:learn-ukrainian/machinery.git")
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    git(checkout, "config", "remote.origin.pushurl", "https://github.com/sample/elsewhere.git")
+    assert own._checkout_slug(checkout) is None
 
 
 def test_documented_module_invocation_shows_help():
