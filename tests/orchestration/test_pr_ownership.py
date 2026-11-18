@@ -478,9 +478,9 @@ def world(tmp_path, monkeypatch):
 
 def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
     monkeypatch.delenv(own.TASK_ENV, raising=False)
-    assert own.main(["accept", "--pr", "42"]) == 2
+    assert own.main(["accept", "--pr", "42", "--repo", REPO]) == 2
     monkeypatch.setenv(own.TASK_ENV, "integration")
-    assert own.main(["accept", "--pr", "42", "--custody", "--from", "waiter"]) == 0
+    assert own.main(["accept", "--pr", "42", "--repo", REPO, "--custody", "--from", "waiter"]) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["accepted"] is True
     assert own.accepted_handoffs(world) == {(REPO.casefold(), 42): "integration"}
     monkeypatch.setattr(own, "_queued_at", lambda repo, n, head, base: head == HEAD)
@@ -488,8 +488,19 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
     with own.locked(world) as data:
         data["last_tick"] = {"at": datetime.now(UTC).isoformat(), "ok": True}
     capsys.readouterr()
-    assert own.main(["queue-exit", "--pr", "42"]) == 0
+    assert own.main(["queue-exit", "--pr", "42", "--repo", REPO]) == 0
     assert json.loads(capsys.readouterr().out) == {"may_exit": True, "reasons": []}
+    # Class: a verb acting on a repository the caller never named. Omitted --repo is refused before any lookup.
+    for verb in ("accept", "queue-exit"):
+        with pytest.raises(SystemExit) as refused:
+            own.main([verb, "--pr", "42"])
+        assert refused.value.code == 2
+        assert "--repo" in capsys.readouterr().err
+        # An empty repository lets native gh pick GH_REPO or its checkout; host, URL and .git spellings key dead handoffs.
+        for spelled in ("", "github.com/o/r", "https://github.com/o/r", "o/r.git", "machinery"):
+            with pytest.raises(SystemExit):
+                own.main([verb, "--pr", "42", "--repo", spelled])
+            assert "owner/name" in capsys.readouterr().err
     assert own.main(["status"]) == 0
 
 

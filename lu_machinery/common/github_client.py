@@ -150,6 +150,8 @@ class Result:
     reset_at: int | None = None
     headers: dict[str, str] = field(default_factory=dict)
     reason: str | None = None
+    # The response carried no body. ``value`` cannot say so: a missing document and JSON null both read as None.
+    empty_body: bool = False
 
     def require_fresh(self):
         if self.error == "github_rate_limited" or self.stale:
@@ -2606,10 +2608,19 @@ def _format_value(value, options, *, api=False):
     expression = _opt(options, "--jq", "-q")
     if expression:
         # jq stays local: gh must not fetch again to format a cached response.
-        p = subprocess.run(
-            ["jq", "-r", expression], input=json.dumps(value), text=True, capture_output=True, check=True, timeout=5
-        )
-        return p.stdout.encode()
+        # A raw body (bytes) is jq's own input, as for gh: an empty body prints nothing.
+        source = value if isinstance(value, bytes) else json.dumps(value).encode()
+        # A body or program jq rejects, a jq that outlives its timeout or cannot start is a typed refusal through
+        # ``run``, never a traceback.
+        try:
+            done = subprocess.run(["jq", "-r", expression], input=source, capture_output=True, check=False, timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise ValueError("jq timed out on the response") from exc
+        except OSError as exc:
+            raise ValueError("jq could not run") from exc
+        if done.returncode:
+            raise ValueError(f"jq exited {done.returncode} on the response")
+        return done.stdout
     if isinstance(value, bytes):
         return value
     if isinstance(value, str):
@@ -4101,7 +4112,7 @@ def _response_result(response, headers, *, graphql, raw_response, reset_at, now)
     """Classify a response independently of budget/cache persistence."""
     success = 200 <= response.status < 300
     if raw_response and success and not graphql:
-        return Result(response.body, status=response.status, headers=headers)
+        return Result(response.body, status=response.status, headers=headers, empty_body=not response.body)
     try:
         value = json_depth.loads(response.body, max_depth=_JSON_MAX_DEPTH) if response.body else None
     except ValueError:
@@ -4117,7 +4128,10 @@ def _response_result(response, headers, *, graphql, raw_response, reset_at, now)
             return Result(value, status=response.status, error="github_graphql_error", headers=headers)
     if not success:
         return Result(value, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers)
-    return Result(response.body if raw_response else value, status=response.status, headers=headers)
+    return Result(
+        response.body if raw_response else value, status=response.status, headers=headers,
+        empty_body=not response.body,
+    )
 
 
 def _graphql_error_detail(value):
@@ -4155,7 +4169,9 @@ def _result_process(args, result, options, kwargs, *, api=True):
         error = output
         code = 75 if result.error == "github_rate_limited" else 1
     else:
-        output = _format_value(result.value, options, api=api)
+        # As for gh, a response with no body has nothing for jq to read: it prints nothing.
+        empty = result.empty_body and _opt(options, "--jq", "-q")
+        output = b"" if empty else _format_value(result.value, options, api=api)
         error = (
             json.dumps({"stale": True, "age_seconds": result.age_seconds, "reset_at": result.reset_at}).encode()
             if result.stale
