@@ -38,6 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import lu_machinery.github_rest_cache as github_rest
 from lu_machinery.agent_runtime.usage import has_headroom
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.jsonl import physical_lines
 from lu_machinery.common.release_layout import is_release_root
 from lu_machinery.common.repo_root import ProductRootError, machinery_path
@@ -488,9 +489,9 @@ def _run_command(
         return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr=str(exc))
 
 
-# The git section is seven independent reads of one checkout, each a subprocess
-# that spends its time waiting, not computing. Run together they cost the slowest
-# one (a ``git status`` scan) instead of the sum; serially they were ~0.9 s of every
+# The git section is independent reads of one checkout, each a subprocess that
+# spends its time waiting, not computing. Run together they cost the slowest one
+# (a ``git status`` scan) instead of the sum; serially they were ~0.9 s of every
 # cold or expired request, and longer while detached collectors held the GIL.
 _GIT_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="orient-git")
 
@@ -508,6 +509,19 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
             ("log", "--oneline", "-5"),
         )
     ]
+    # Does the checkout the authority read scans have a work tree? Asked the way
+    # that read asks (same root, Git redirect variables removed). Only an exact
+    # ``false`` proves it; ``true``, any other answer or a failed probe does not.
+    work_tree_probe = _GIT_PROBE_EXECUTOR.submit(
+        subprocess.run,
+        [*git, "rev-parse", "--is-bare-repository"],
+        cwd=resolved_ctx.roots.live_repo_root,
+        env=sanitized_git_env(),
+        capture_output=True,
+        text=True,
+        timeout=2.0,
+        check=False,
+    )
     branch_proc, head_proc, full_head_proc, ahead_proc, log_proc = (probe.result() for probe in probes)
 
     if branch_proc.returncode != 0:
@@ -517,24 +531,22 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
     if log_proc.returncode != 0:
         raise RuntimeError(log_proc.stderr.strip() or "git log failed")
 
-    # Only now, as before: a failed request must not write Git configuration.
-    # A bare-drifted primary is healed before the authority read starts, which
-    # needs a work tree. When that heal cannot confirm a ready checkout (it
-    # failed, for instance on a held config lock), the status read repeats it and
-    # finishes first, and the authority read follows it as it did when the reads
-    # were serial. Otherwise the two slow reads (a ``git status`` scan each) run
-    # together; an error in the status read keeps its fallback below.
     try:
-        worktree_containment.heal_primary_bare_if_needed(
-            worktree_containment.resolve_main_root(resolved_ctx.roots.live_repo_root)
-        )
-        checkout_ready = True
+        work_tree_proc = work_tree_probe.result()
+        has_work_tree = work_tree_proc.returncode == 0 and work_tree_proc.stdout.strip() == "false"
     except Exception:
-        checkout_ready = False
+        has_work_tree = False
+    # Only now, as before: a failed request starts neither slow read, so it never
+    # heals (writes) Git configuration. The status read heals a bare-drifted
+    # primary; the authority read runs ``git status`` and needs a work tree. When
+    # the authority's checkout has one, healing cannot change that read and the
+    # two slow reads run together. Otherwise (bare, or not proven) the status read
+    # finishes first and the authority read follows, as when the reads were serial.
+    # An error in the status read keeps its fallback below.
     status_probe = _GIT_PROBE_EXECUTOR.submit(
         worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
     )
-    if not checkout_ready:
+    if not has_work_tree:
         wait_for_futures([status_probe])
     authority_probe = _GIT_PROBE_EXECUTOR.submit(
         build_repository_authority,

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import threading
 from contextlib import suppress
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import lu_machinery.api.main as api_main
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import OrientSection, ProductContribution
+from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.guardrails import worktree_containment
 
 
 def _product(collector, *, ttl=0.0):
@@ -272,3 +276,112 @@ def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path
                 await task
 
     asyncio.run(scenario())
+
+
+def _git_checkout(tmp_path: Path, *, bare: bool) -> Path:
+    """A throwaway checkout with an owner/name origin; ``bare`` drifts its ``core.bare`` to true."""
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, env=sanitized_git_env())
+
+    git("init", "-q", "-b", "main")
+    git("-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+        "commit", "-q", "--allow-empty", "-m", "init")
+    git("remote", "add", "origin", "https://github.com/example/checkout.git")
+    if bare:
+        git("config", "core.bare", "true")
+    return repo
+
+
+def _record_slow_git_reads(monkeypatch, events: list[str], *, status_waits_for: threading.Event | None = None):
+    real_status = worktree_containment.primary_checkout_dirty_status
+    real_authority = api_main.build_repository_authority
+
+    def status(root):
+        events.append("status-start")
+        try:
+            if status_waits_for is not None and status_waits_for.wait(timeout=10):
+                events.append("status-saw-authority")
+            return real_status(root)
+        finally:
+            events.append("status-end")
+
+    def authority(**kwargs):
+        events.append("authority-start")
+        if status_waits_for is not None:
+            status_waits_for.set()
+        return real_authority(**kwargs)
+
+    monkeypatch.setattr(worktree_containment, "primary_checkout_dirty_status", status)
+    monkeypatch.setattr(api_main, "build_repository_authority", authority)
+
+
+def _core_bare(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "core.bare"],
+        capture_output=True, text=True, check=False, env=sanitized_git_env(),
+    ).stdout.strip()
+
+
+def test_orient_git_runs_the_slow_reads_together_on_a_checkout_with_a_work_tree(monkeypatch, tmp_path):
+    """Defect class: the two ``git status`` scans run one after the other on a healthy checkout.
+
+    The status read holds until the authority read has started; serial reads
+    would leave it waiting out its 10 s bound instead.
+    """
+    repo = _git_checkout(tmp_path, bare=False)
+    events: list[str] = []
+    _record_slow_git_reads(monkeypatch, events, status_waits_for=threading.Event())
+
+    data = api_main._collect_git_orient_data(fixture_context(repo))
+
+    assert "status-saw-authority" in events
+    assert data["branch"] == "main"
+    assert data["authority"]["repository"] == "example/checkout"
+    assert data["primary_checkout"]["dirty_count"] == data["authority"]["primary_checkout"]["dirty_count"] == 0
+
+
+def test_orient_git_heals_a_bare_primary_before_the_authority_read(monkeypatch, tmp_path):
+    """Defect class: the authority read scans a bare-drifted primary before the status read heals it.
+
+    ``git status`` needs a work tree, so an authority read that overtakes the
+    heal fails the whole git section where the serial reads succeeded.
+    """
+    repo = _git_checkout(tmp_path, bare=True)
+    events: list[str] = []
+    _record_slow_git_reads(monkeypatch, events)
+
+    data = api_main._collect_git_orient_data(fixture_context(repo))
+
+    assert events.index("status-end") < events.index("authority-start"), events
+    assert _core_bare(repo) == "false"
+    assert data["authority"]["repository"] == "example/checkout"
+    assert data["authority"]["primary_checkout"]["dirty_count"] == 0
+
+
+@pytest.mark.parametrize("probe", ["git_missing", "git_fails"])
+def test_orient_git_keeps_serial_order_when_the_work_tree_probe_fails(monkeypatch, tmp_path, probe):
+    """Defect class: a failed bare-detection probe is read as "has a work tree" and lets the authority read overtake the heal.
+
+    The checkout is really bare. The probe either cannot start (no ``git`` on its
+    PATH) or exits non-zero while printing ``false``; neither proves a work tree.
+    """
+    repo = _git_checkout(tmp_path, bare=True)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    if probe == "git_fails":
+        fake_git = fake_bin / "git"
+        fake_git.write_text("#!/bin/sh\necho false\nexit 1\n", encoding="utf-8")
+        fake_git.chmod(0o755)
+    probe_env = {**sanitized_git_env(), "PATH": str(fake_bin)}
+    monkeypatch.setattr(api_main, "sanitized_git_env", lambda: dict(probe_env))
+    events: list[str] = []
+    _record_slow_git_reads(monkeypatch, events)
+
+    data = api_main._collect_git_orient_data(fixture_context(repo))
+
+    assert events.index("status-end") < events.index("authority-start"), events
+    assert _core_bare(repo) == "false"
+    assert data["authority"]["primary_checkout"]["dirty_count"] == 0
