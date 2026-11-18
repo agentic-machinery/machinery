@@ -21,16 +21,18 @@ needing ``data/sources.db`` to exist on the test machine.
 
 
 
-from pathlib import Path
-import pytest
-from lu_machinery.ai_agent_bridge import _citation_check as cc
-from tests.helpers.product_tree import configured_roots as configured_roots
 import json
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
+
+from lu_machinery.ai_agent_bridge import _citation_check as cc
 from tests.agent_runtime.agy_hook_helpers import register_agy_hooks as register_agy_hooks
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 # ─────────────────────────────────────────────────────────────────────
 # Detection
@@ -461,9 +463,7 @@ class TestConfig:
 
     @pytest.mark.usefixtures('configured_roots', '_synthetic_publishing_rules')
     def test_cli_paths_are_correct_types(self):
-        from lu_machinery.ai_agent_bridge._config import AGY_CLI
-        from lu_machinery.ai_agent_bridge._config import CLAUDE_CMD
-        from lu_machinery.ai_agent_bridge._config import GEMINI_CLI
+        from lu_machinery.ai_agent_bridge._config import AGY_CLI, CLAUDE_CMD, GEMINI_CLI
         assert isinstance(CLAUDE_CMD, list)
         # #4875: prefers a native `claude` binary on PATH (single-element
         # command) and only falls back to the npx shim when none is found —
@@ -531,9 +531,7 @@ class TestDb:
 
     @pytest.mark.usefixtures('configured_roots', '_synthetic_publishing_rules')
     def test_set_session_and_get_session_claude(self, tmp_db):
-        from lu_machinery.ai_agent_bridge._db import get_session
-        from lu_machinery.ai_agent_bridge._db import init_db
-        from lu_machinery.ai_agent_bridge._db import set_session
+        from lu_machinery.ai_agent_bridge._db import get_session, init_db, set_session
         init_db()
         set_session("task-1", "claude", "sess-abc123")
         result = get_session("task-1")
@@ -542,9 +540,7 @@ class TestDb:
 
     @pytest.mark.usefixtures('configured_roots', '_synthetic_publishing_rules')
     def test_set_session_update_existing(self, tmp_db):
-        from lu_machinery.ai_agent_bridge._db import get_session
-        from lu_machinery.ai_agent_bridge._db import init_db
-        from lu_machinery.ai_agent_bridge._db import set_session
+        from lu_machinery.ai_agent_bridge._db import get_session, init_db, set_session
         init_db()
         set_session("task-1", "claude", "old-session")
         set_session("task-1", "claude", "new-session")
@@ -567,8 +563,8 @@ class TestBroker:
 
     @pytest.mark.usefixtures('configured_roots', '_synthetic_publishing_rules')
     def test_validate_file_writes_allowed_path(self):
-        from lu_machinery.ai_agent_bridge._config import REPO_ROOT
         from lu_machinery.ai_agent_bridge._broker import _validate_file_writes
+        from lu_machinery.ai_agent_bridge._config import REPO_ROOT
         pre = set()
         allowed = "scripts/test.py"
         post = {f" M {allowed}"}
@@ -789,7 +785,8 @@ class TestMessaging:
     """Tests for scripts/ai_agent_bridge/_messaging.py."""
 
     @pytest.fixture
-    def msg_db(self, tmp_path):
+    def msg_db(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
         db_path = tmp_path / "msg.db"
         # Create the DB file and schema
         conn = sqlite3.connect(str(db_path))
@@ -875,8 +872,7 @@ class TestModel:
         monkeypatch.setattr("lu_machinery.agent_runtime.adapters.agy._agy_version", lambda _binary: (1, 2, 9))
         import subprocess
 
-        from lu_machinery.common.repo_root import _HOOK_ROOTS_SCRIPT
-        from lu_machinery.common.repo_root import machinery_path
+        from lu_machinery.common.repo_root import _HOOK_ROOTS_SCRIPT, machinery_path
 
         self._real_run = subprocess.run
         self._root_command = ["/bin/bash", "-c", _HOOK_ROOTS_SCRIPT, "lu-hook-roots",
@@ -909,7 +905,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         import subprocess
 
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
@@ -932,7 +928,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
         from lu_machinery.ai_agent_bridge._model import check_model
         _MODEL_CACHE.pop("gemini-3.8-flash-high", None)
@@ -963,7 +959,7 @@ class TestModel:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(home))
         register_agy_hooks(tmp_path, home=home)
-        monkeypatch.setattr("lu_machinery.ai_agent_bridge._config.REPO_ROOT", tmp_path)
+        monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
         from lu_machinery.ai_agent_bridge._config import _MODEL_CACHE
         from lu_machinery.ai_agent_bridge._model import check_model
         _MODEL_CACHE.pop("gemini-3.8-flash-high", None)

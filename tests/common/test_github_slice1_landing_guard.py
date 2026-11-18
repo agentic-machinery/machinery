@@ -1218,23 +1218,24 @@ def test_rest_read_never_takes_an_unrelated_failure_for_a_refusal():
     assert gh.refusal_of(subprocess.CompletedProcess([], 75, _serialized_refusal(), "")) is None
 
 
-def test_rest_cache_adapter_keeps_reason_and_reset(tmp_path, monkeypatch):
+def test_rest_cache_adapter_keeps_reason_and_reset(tmp_path):
     from lu_machinery import github_rest_cache as rest
 
     wire = Wire()
-    client = store(tmp_path, wire, [("core", 0, OPEN)])
-    monkeypatch.setattr(gh, "GitHubClient", lambda **kwargs: client)
+    client = store(tmp_path, wire, [("core", 0, OPEN)], env={"GH_CONFIG_DIR": str(tmp_path)})
+    cache = rest.GitHubRestCache(client)
     with pytest.raises(rest.GitHubRestError) as raised:
-        rest._gh_api_transport("repos/o/r/pulls?state=open", {}, 5)
+        cache.get_json("repos/o/r/pulls?state=open", timeout=5)
     error = raised.value
     assert isinstance(error, rest.GitHubRestRateLimited) and error.status == 429
     assert (error.code, error.reason, error.reset_at) == ("github_rate_limited", "core_below_landing_reserve", OPEN)
     assert "reason=core_below_landing_reserve" in str(error)
     # Through the cache, the typed refusal is what the caller sees and nothing is cached.
-    cache = rest.GitHubRestCache(identity="unit")
     with pytest.raises(rest.GitHubRestRateLimited) as through:
         cache.get_json("repos/o/r/issues/1", timeout=5)
-    assert through.value.reason == "core_below_landing_reserve" and not cache._entries
+    assert through.value.reason == "core_below_landing_reserve"
+    with client._db() as db:
+        assert db.execute("SELECT count(*) FROM cache").fetchone()[0] == 0
     assert wire.sent == []
 
 

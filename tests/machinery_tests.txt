@@ -184,8 +184,6 @@ tests/ai_agent_bridge/test_acp_execution.py
 tests/ai_agent_bridge/test_acp_quota_substitution.py
 tests/ai_agent_bridge/test_agent_env.py
 tests/ai_agent_bridge/test_agy_integration.py
-tests/ai_agent_bridge/test_agy_model_selection.py
-tests/ai_agent_bridge/test_agy_sealed_review_refuse.py
 tests/ai_agent_bridge/test_ask_contract.py
 tests/ai_agent_bridge/test_ask_gemma.py
 tests/ai_agent_bridge/test_ask_lifecycle.py
@@ -212,9 +210,6 @@ tests/ai_agent_bridge/test_live_driver_message_consumption.py
 tests/ai_agent_bridge/test_module_identity.py
 tests/ai_agent_bridge/test_monitor_cache.py
 tests/ai_agent_bridge/test_monitor_client_sdk.py
-tests/ai_agent_bridge/test_openai_proxy.py
-tests/ai_agent_bridge/test_openai_proxy_arg_max.py
-tests/ai_agent_bridge/test_openai_proxy_healthz.py
 tests/ai_agent_bridge/test_opencode_abort.py
 tests/ai_agent_bridge/test_opencode_stdin_transport.py
 tests/ai_agent_bridge/test_opencode_stream_parse.py
@@ -227,7 +222,6 @@ tests/ai_agent_bridge/test_review_pr_required.py
 tests/ai_agent_bridge/test_review_safety_timeouts.py
 tests/ai_agent_bridge/test_routing_guard.py
 tests/ai_agent_bridge/test_secret_redactor.py
-tests/ai_agent_bridge/test_serve_security.py
 tests/ai_agent_bridge/test_ui_agy.py
 tests/ai_agent_bridge/test_ui_codex.py
 tests/ai_agent_bridge/test_wake_overlap_detection.py
@@ -834,6 +828,10 @@ tests/fixtures/product_tree/start-gemini.sh
 tests/fixtures/product_tree/start-muse-driver.sh
 tests/fixtures/routing_baseline/baseline.json.gz
 tests/fixtures/routing_baseline/inputs.json
+tests/fixtures/routing_baseline/no-cli/SHA256SUMS
+tests/fixtures/routing_baseline/no-cli/baseline.json.gz
+tests/fixtures/routing_baseline/no-cli/inputs.json
+tests/fixtures/routing_baseline/no-cli/occurrences.json.gz
 tests/fixtures/routing_baseline/routing-10263.json.gz
 tests/fixtures/routing_baseline/v2-baseline.json.gz
 tests/flake_quarantine.yaml

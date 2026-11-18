@@ -207,26 +207,19 @@ class GhGitHubAdapter:
                 f"GitHub command returned invalid JSON: {args.verb if isinstance(args, Request) else ' '.join(args[:4])}"
             ) from exc
 
-    def registered_stream_epics(self, repository: str | None = None) -> list[int]:
-        """Return membership roots for this checkout's repository.
-
-        Init and every mutation observation pass the task identity here, so
-        both native ancestry and body fallback consume a bound registry.
-        Read-only registry inspection may omit the identity. Closed epics
-        remain registered for launcher and session consumers and are excluded
-        here, matching the issue-quality checker.
-        """
-        if repository is not None:
-            document = self._json(["gh", "repo", "view", "--json", "nameWithOwner"])
-            failure = task_lifecycle.repository_evidence_refusal(
-                repository, document.get("nameWithOwner") if isinstance(document, dict) else None,
-                source="issue-stream registry",
-            )
-            if failure is not None:
-                raise task_lifecycle.LifecycleError(failure)
+    def registered_stream_epics(self, repository: str) -> tuple[str, list[int]]:
+        """Return the fleet registry's repository and its active epic numbers."""
+        document = self._json(["gh", "repo", "view", "--json", "nameWithOwner"])
+        failure = task_lifecycle.repository_evidence_refusal(
+            repository, document.get("nameWithOwner") if isinstance(document, dict) else None,
+            source="issue-stream registry",
+        )
+        if failure is not None:
+            raise task_lifecycle.LifecycleError(failure)
         try:
             from lu_machinery.orchestration import issue_stream_audit
 
+            epic_repository = task_lifecycle.stream_registry_repository(repository)
             # Closed epics stay in the file for launcher and Work API consumers.
             # Membership roots are the audit registry only (#12176).
             registry = issue_stream_audit.load_registry(
@@ -237,7 +230,7 @@ class GhGitHubAdapter:
             raise task_lifecycle.LifecycleError(
                 f"cannot load the issue-stream registry: {exc}"
             ) from exc
-        return sorted({epic for epics in registry.values() for epic in epics})
+        return epic_repository, sorted({epic for epics in registry.values() for epic in epics})
 
     def membership_audit_report(self) -> dict[str, Any]:
         """One fresh, live issue-stream membership audit snapshot.
@@ -448,12 +441,13 @@ class GhGitHubAdapter:
         # (native-chain path, #9783) — on the lifecycle issue itself or on the
         # transferred-scope follow-up read above — can only be decided by the
         # live membership snapshot, so only those cases fetch it.
-        registered_epics = self.registered_stream_epics(repository)
-        needs_membership_audit = task_lifecycle.membership_needs_audit(
-            issue.get("parent_epic"), registered_epics
-        ) or (
-            follow_up is not None
-            and task_lifecycle.membership_needs_audit(follow_up.get("parent_epic"), registered_epics)
+        epic_repository, registered_epics = self.registered_stream_epics(repository)
+        needs_membership_audit = any(
+            task_lifecycle.membership_needs_audit(
+                target.get("parent_epic"), registered_epics, repository=repository,
+                epic_repository=epic_repository, native_parent_repository=target.get("parent_repository"),
+            )
+            for target in (issue, follow_up) if target is not None
         )
         membership_audit = self.membership_audit_report() if needs_membership_audit else None
         pr_number = ledger["pr"]["number"]
@@ -490,6 +484,7 @@ class GhGitHubAdapter:
             "repository": repository,
             "authenticated_login": authenticated_login,
             "registered_stream_epics": registered_epics,
+            "stream_epic_repository": epic_repository,
             "membership_audit": membership_audit,
             "issue": issue,
             "pr": pr,
@@ -795,10 +790,17 @@ def _assert_live_memberships(
     ledger: Mapping[str, Any],
     *,
     registered_epics: list[int] | None,
+    epic_repository: str | None,
     membership_report: Mapping[str, Any] | None,
 ) -> None:
     """Revalidate all targets using this invocation's registry and live audit."""
     identity = ledger["identity"]
+    if epic_repository is None:
+        epic_repository = identity["repository"]
+    if task_lifecycle.repository_identity_valid(epic_repository) and not task_lifecycle.stream_epic_url_matches(
+        identity, epic_repository
+    ):
+        raise task_lifecycle.LifecycleError("identity stream epic URL does not match the registered repository and number")
     targets = [(identity["github_issue_number"], identity["stream_epic"])]
     remaining = ledger["remaining_scope"]
     if remaining["status"] == "transferred":
@@ -807,6 +809,7 @@ def _assert_live_memberships(
         membership = task_lifecycle.resolve_live_ancestry(
             repository=identity["repository"], issue_number=issue_number,
             stream_epic=epic, registered_epics=registered_epics,
+            epic_repository=epic_repository,
             read_parent=adapter.read_issue_parent,
             membership_report=membership_report,
         )
@@ -836,6 +839,7 @@ def perform_mutation(
             _assert_live_memberships(
                 adapter, ledger,
                 registered_epics=before["github"].get("registered_stream_epics"),
+                epic_repository=before["github"].get("stream_epic_repository"),
                 membership_report=before["github"].get("membership_audit"),
             )
             if action == "sync-acs" and str(before["github"]["pr"].get("state") or "").upper() == "MERGED":
@@ -1043,19 +1047,28 @@ def _identity_from_args(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _issue_snapshot(
-    args: argparse.Namespace, identity: Mapping[str, Any], now: str,
-) -> tuple[GhGitHubAdapter, dict[str, Any], list[int] | None, Mapping[str, Any] | None]:
-    """Resolve exact stream membership and snapshot the authoritative issue ACs."""
+    args: argparse.Namespace, identity: dict[str, Any], now: str,
+) -> tuple[GhGitHubAdapter, dict[str, Any], str, list[int], Mapping[str, Any] | None]:
+    """Bind the task's epic URL and snapshot its authoritative issue ACs."""
     adapter = GhGitHubAdapter(Path(args.repo_root))
     issue = adapter.read_issue(identity["repository"], identity["github_issue_number"])
-    registered_epics = adapter.registered_stream_epics(identity["repository"])
+    epic_repository, registered_epics = adapter.registered_stream_epics(identity["repository"])
+    epic_url = task_lifecycle.stream_epic_url(epic_repository, identity["stream_epic"])
+    if identity["stream_epic_url"] is not None and not (
+        task_lifecycle.stream_epic_url_matches(identity, identity["repository"])
+        or task_lifecycle.stream_epic_url_matches(identity, epic_repository)
+    ):
+        raise task_lifecycle.LifecycleError("identity stream epic URL does not match the registered repository and number")
     # A native parent that is a registered stream epic decides alone in
     # resolve_membership. Only fetch the live audit snapshot when native
     # parentage is absent (body path) or the native parent is an unregistered
     # sub-epic (native-chain path, #9783).
     membership_report = (
         adapter.membership_audit_report()
-        if task_lifecycle.membership_needs_audit(issue["parent_epic"], registered_epics)
+        if task_lifecycle.membership_needs_audit(
+            issue["parent_epic"], registered_epics, repository=identity["repository"],
+            epic_repository=epic_repository, native_parent_repository=issue.get("parent_repository"),
+        )
         else None
     )
     membership = task_lifecycle.resolve_membership(
@@ -1065,6 +1078,7 @@ def _issue_snapshot(
         repository=identity["repository"],
         native_parent_repository=issue.get("parent_repository"),
         registered_epics=registered_epics,
+        epic_repository=epic_repository,
         membership_report=membership_report,
     )
     if not membership["valid"]:
@@ -1072,16 +1086,18 @@ def _issue_snapshot(
             "issue membership does not resolve to the identity's exact registered "
             f"stream epic: {membership['reason']}"
         )
+    if identity["repository"].casefold() != epic_repository.casefold():
+        identity["stream_epic_url"] = epic_url
     snapshot = task_lifecycle.build_ac_snapshot(
         issue["body"], _load_policy(Path(args.ac_policy)), finalized_at=now
     )
-    return adapter, snapshot, registered_epics, membership_report
+    return adapter, snapshot, epic_repository, registered_epics, membership_report
 
 
 def cmd_init(args: argparse.Namespace) -> int:
     identity = _identity_from_args(args)
     now = args.now or utc_now()
-    adapter, snapshot, registered_epics, membership_report = _issue_snapshot(args, identity, now)
+    adapter, snapshot, epic_repository, registered_epics, membership_report = _issue_snapshot(args, identity, now)
     ledger = task_lifecycle.build_lifecycle(
         identity,
         author_family=args.author_family,
@@ -1109,6 +1125,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             ledger = existing
         _assert_live_memberships(
             adapter, ledger, registered_epics=registered_epics,
+            epic_repository=epic_repository,
             membership_report=membership_report,
         )
         return _write_and_print(path, ledger)
@@ -1118,7 +1135,7 @@ def cmd_bind_successor(args: argparse.Namespace) -> int:
     """Archive the issue's predecessor ledger byte for byte and bind a successor identity."""
     identity = _identity_from_args(args)
     now = args.now or utc_now()
-    adapter, snapshot, registered_epics, membership_report = _issue_snapshot(args, identity, now)
+    adapter, snapshot, epic_repository, registered_epics, membership_report = _issue_snapshot(args, identity, now)
     path = _state_file(args, identity)
     with task_lifecycle.lifecycle_lock(path, blocking=False):
         try:
@@ -1147,6 +1164,7 @@ def cmd_bind_successor(args: argparse.Namespace) -> int:
         )
         _assert_live_memberships(
             adapter, ledger, registered_epics=registered_epics,
+            epic_repository=epic_repository,
             membership_report=membership_report,
         )
         task_lifecycle.archive_predecessor(raw, archive_path, archive_sha256)

@@ -7,12 +7,10 @@ from unittest.mock import Mock
 
 import pytest
 
-
 from lu_machinery.ai_agent_bridge import _ask_lifecycle as lifecycle
-from lu_machinery.ai_agent_bridge._agy import ask_agy
 from lu_machinery.ai_agent_bridge._db import get_db, init_db
 from lu_machinery.ai_agent_bridge._messaging import send_message
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
@@ -21,6 +19,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 def bridge_db(tmp_path, monkeypatch):
     db_path = tmp_path / "messages.db"
     monkeypatch.setenv("AB_DB_PATH", str(db_path))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     monkeypatch.setenv("AB_PID_DIR", str(tmp_path / "pids"))
     conn = init_db()
     conn.close()
@@ -48,51 +47,6 @@ def _status(message_id: int) -> str:
         return str(row[0])
     finally:
         conn.close()
-
-
-def test_background_ask_sends_immediately_and_mocks_detached_spawn(bridge_db, monkeypatch):
-    spawn = Mock(return_value=4321)
-    monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.launch_background_ask", spawn)
-
-    message_id = ask_agy("Read one file", task_id="task-4837", background=True)
-
-    assert _status(message_id) == "sent"
-    spawn.assert_called_once_with(
-        message_id,
-        "agy",
-        {
-            "new_session": False,
-            "no_timeout": False,
-            "review": False,
-            "timeout_seconds": 1800,
-        },
-    )
-
-
-def test_background_branch_review_agy_refuses_sealed_cf(bridge_db, monkeypatch):
-    """AGY sealed formal review is fail-closed before send (#5553 / #5555)."""
-    spawn = Mock(return_value=4321)
-    monkeypatch.setattr("lu_machinery.ai_agent_bridge._agy.launch_background_ask", spawn)
-
-    with pytest.raises(ValueError, match="agy_isolated_review_unsupported"):
-        ask_agy(
-            "Review the branch.",
-            task_id="review-5150",
-            review=True,
-            review_branch="feature/review",
-            background=True,
-        )
-
-    spawn.assert_not_called()
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT id FROM messages WHERE task_id = ?",
-            ("review-5150",),
-        ).fetchone()
-    finally:
-        conn.close()
-    assert row is None
 
 
 def test_launch_background_ask_writes_state_and_uses_detached_popen(bridge_db, monkeypatch, tmp_path, configured_roots):
@@ -160,6 +114,7 @@ def test_background_signal_handler_writes_terminal_record(bridge_db, monkeypatch
 
 def test_asks_marks_dead_launched_worker_without_terminal_as_died_silent(bridge_db, monkeypatch, capsys, tmp_path, configured_roots):
     """A vanished worker cannot remain indefinitely indistinguishable from pending."""
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     message_id = _send_ask()
     monkeypatch.setenv("AB_REPO_ROOT", str(tmp_path))
     state_dir = configured_roots.primary / "batch_state" / "asks" / "task-4837"

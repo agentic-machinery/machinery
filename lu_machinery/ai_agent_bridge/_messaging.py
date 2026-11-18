@@ -160,6 +160,14 @@ def send_message(content: str, task_id: str | None = None, msg_type: str = "resp
     )
 
 
+def require_legacy_message_writes() -> None:
+    """Refuse retired work before reading a legacy request or invoking its provider."""
+    from lu_machinery.fleet_comms.message_plane import resolve_plane_mode
+
+    if resolve_plane_mode() == "authority":
+        raise ValueError("legacy_message_writes_retired_use_fleet_comms")
+
+
 def _insert_message(
     target: "AdmittedTarget",
     *,
@@ -176,7 +184,7 @@ def _insert_message(
     """Store one bridge message for the admitted ``target`` (sidecar, row, notification)."""
     from lu_machinery.agent_runtime.retired_seat_admission import attachment_metadata
     from lu_machinery.agent_runtime.target_admission import require_admitted
-
+    require_legacy_message_writes()
     target = require_admitted(target)
     to_llm, to_model = target.recipient, target.model
     content = redact_text(content) or ""

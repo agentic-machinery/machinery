@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import subprocess
 import time
-from pathlib import Path
 
 from tests.helpers.product_tree import configured_roots as configured_roots
 from lu_machinery.common.repo_root import machinery_path
@@ -28,7 +27,6 @@ import pytest
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
-ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = machinery_path('config/issue_streams.yaml')
 STREAM = "infra-harness"
 LIVE = 10453
@@ -110,8 +108,12 @@ def test_membership_and_issue_resolvers_accept_program_child_only_under_its_epic
     assert make_issue_resolver(report)(str(CHILD)) is True
 
 
-def test_lifecycle_resolves_program_child_to_registered_epic_natively():
-    registered = GhGitHubAdapter(ROOT).registered_stream_epics()
+def test_lifecycle_resolves_program_child_to_registered_epic_natively(tmp_path, monkeypatch):
+    adapter = GhGitHubAdapter(tmp_path)
+    monkeypatch.setattr(adapter, "_json", lambda command: {"nameWithOwner": "org/repo"})
+    monkeypatch.setattr(task_lifecycle, "stream_registry_repository", lambda repo: repo)
+    epic_repository, registered = adapter.registered_stream_epics("org/repo")
+    assert epic_repository == "org/repo"
     assert LIVE in registered
     assert PARENT not in registered and PROGRAM not in registered
     report = _audit_report({LIVE: [PARENT], PARENT: [CHILD]}, [PARENT, CHILD])
@@ -150,7 +152,7 @@ def test_lifecycle_resolves_program_child_through_audit_body_evidence():
         "via": "body",
         "unique_stream": True,
     }
-    registered = GhGitHubAdapter(ROOT).registered_stream_epics()
+    registered = _registered(audit_only=True)
     other_epic = next(epic for epic in registered if epic != LIVE)
 
     ok = task_lifecycle.resolve_membership(
@@ -179,8 +181,8 @@ def test_lifecycle_resolves_program_child_through_audit_body_evidence():
 SUB_EPIC, GRANDCHILD = 8647, 9757  # unregistered sub-epic of #6943 and its child (#9783)
 
 
-def _registered() -> list[int]:
-    return sorted({e for epics in load_registry(REGISTRY_PATH).values() for e in epics})
+def _registered(*, audit_only: bool = False) -> list[int]:
+    return sorted({e for epics in load_registry(REGISTRY_PATH, audit_only=audit_only).values() for e in epics})
 
 
 def test_lifecycle_accepts_native_grandchild_through_unregistered_sub_epic():

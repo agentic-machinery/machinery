@@ -12,19 +12,19 @@
 #
 # - Jobs: Ruff over lu_machinery/ with the source repository's Ruff version and
 #   lint settings (the extracted tree has no Ruff configuration yet); compileall
-#   of lu_machinery on Python 3.12; the mypy ratchet (lu_machinery.lint.mypy_ratchet:
+#   of lu_machinery on the pinned Python (.python-version); the mypy ratchet (lu_machinery.lint.mypy_ratchet:
 #   new errors fail, the baseline only shrinks); the test-wait lint L4
 #   (lu_machinery.lint.lint_test_waits: a new sleep, timer poll, flaky or rerun
 #   mark, rerun option, or non-strict xfail fails, and the baseline only shrinks);
 #   actionlint (with a pinned ShellCheck) and zizmor (offline) over
 #   .github/workflows/; the TruffleHog secret scan and the Semgrep SAST scan;
-#   dependency-audit (pip-audit of requirements-machinery.lock, npm audit of
+#   dependency-audit (pip-audit of the uv.lock runtime closure, npm audit of
 #   package-lock.json). The secret-scan and sast jobs below are the only
 #   definition of each scan for the machinery repository; CodeQL code scanning
 #   is codeql.yml beside this file, outside the gate. installed-wheel builds the release wheel
-#   from the tracked tree, installs it offline with requirements-machinery.lock
+#   from the tracked tree, installs it offline with the uv.lock runtime export
 #   (pip --require-hashes) into a clean venv and imports every lu_machinery
-#   module from it. It then checks that wheel against the product commit
+#   module from it, on the pinned Python and on the requires-python floor. It then checks that wheel against the product commit
 #   pinned in product-consumer.pin beside this file: the release cut's
 #   consumer test collection (release_cut consumer-collection) and the pin's
 #   key consumer tests, on PRs and merge groups alike. pytest calls tests.yml for the full six-shard suite on
@@ -51,11 +51,14 @@
 #   `needs` and the gate's expected list; nothing else catches a job left out of both.
 # - Hosted runners only (ubuntu-24.04). Every tool is downloaded at a pinned
 #   version and checked against a pinned SHA-256 before it runs: release
-#   tarballs for actionlint and ShellCheck, hash-pinned PyPI wheels
-#   (pip --require-hashes --only-binary=:all:) for Ruff, mypy, zizmor, Semgrep
-#   and pip-audit; npm audit uses the hosted runner's npm.
-#   Install steps run from the job temp directory with isolated interpreters
-#   (python -I), so no Python module in the checkout is imported while installing.
+#   tarballs for actionlint, ShellCheck and uv; uv-managed CPython (uv checks
+#   each download against the hash it ships); `uv sync --locked` from uv.lock,
+#   which checks the SHA-256 of every wheel, for Ruff, mypy, zizmor and
+#   pip-audit; hash-pinned PyPI wheels (pip --require-hashes
+#   --only-binary=:all:) for Semgrep and the build tools; npm audit uses the
+#   hosted runner's npm. Every venv lives in the job temp directory. Installers
+#   that run Python use isolated interpreters (python -I), so no Python module
+#   in the checkout is imported while installing.
 # - Read-only contents permission, no kept checkout token,
 #   no secrets. Scanners and zizmor run under `env -i`, so no runner credential
 #   reaches them. zizmor runs offline: its online audits (impostor commits,
@@ -85,13 +88,23 @@ concurrency:
   group: ci-gate-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
-# setup-python prefers the runner tool cache with check-latest disabled. The
-# previous patch pins mirrored a source environment, not a patch-specific check.
-# CPython 3.12 wheels and compileall work across 3.12 patch releases.
+# Python: every job runs the uv-managed CPython named in .python-version (the
+# host's build), installed by .github/actions/uv-python with the uv release
+# pinned below. Python dependencies come from uv.lock (`uv sync --locked`,
+# which checks every SHA-256 in the lock). Named exceptions, hash-pinned
+# heredocs: Semgrep (its closure pins mcp==1.29.0, which the project's mcp
+# range excludes; it stays on CPython ${SEMGREP_PYTHON}), the build tools that
+# release_cut reads from this file, and the product's uv for the consumer check.
+# installed-wheel also runs on the requires-python floor, so the floor stays
+# proven while the pin is newer.
 # Cache only verified release archives, never venvs or repository build outputs.
 # Fork PRs restore only. No prefix restore keys.
 env:
-  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.13.1"
+  UV_LINUX_X86_64_SHA256: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+  # uv-managed CPython only, the build the host runs; never the runner's own.
+  UV_PYTHON_PREFERENCE: only-managed
+  SEMGREP_PYTHON: "3.12"
   RUFF_VERSION: "0.15.21"
   MYPY_VERSION: "2.1.0"
   ZIZMOR_VERSION: "1.31.1"
@@ -271,25 +284,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
-      - name: Install Ruff (hash-pinned wheel)
+      - name: Install Ruff (uv.lock lint group)
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           venv="$RUNNER_TEMP/ruff-venv"
           rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/ruff-requirements.txt"
-          cat > "$requirements" <<'REQUIREMENTS'
-          ruff==0.15.21 \
-              --hash=sha256:bab0905d2f29e0d9fbc3c373ed23db0095edaa3f71f1f4f519ec15134d9e85c8
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group lint
           reported="$("$venv/bin/ruff" --version)"
           if [ "$reported" != "ruff ${RUFF_VERSION}" ]; then
             echo "::error::Expected ruff ${RUFF_VERSION}, got: ${reported}"
@@ -342,7 +348,7 @@ jobs:
   compileall:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: Compile (Python 3.12)
+    name: Compile (pinned Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -350,18 +356,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Compile lu_machinery
+        env:
+          # uv-python checked this against .python-version.
+          EXPECTED: ${{ steps.python.outputs.version }}
         run: |
           set -euo pipefail
           reported="$(python -I -c 'import platform; print(platform.python_version())')"
-          minor="$(python -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-          if [ "$minor" != "$PYTHON_VERSION" ]; then
-            echo "::error::Expected Python ${PYTHON_VERSION}, got: ${reported}"
+          if [ -z "$EXPECTED" ] || [ "$reported" != "$EXPECTED" ]; then
+            echo "::error::Expected Python ${EXPECTED}, got: ${reported}"
             exit 1
           fi
           if [ ! -d lu_machinery ]; then
@@ -411,10 +420,11 @@ jobs:
           # HEAD and origin/main, and silently skips a ref it cannot read.
           fetch-depth: 2
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Fetch origin/main for the shrink check
         run: |
@@ -436,150 +446,17 @@ jobs:
             exit 1
           fi
 
-      - name: Install mypy and the lu_machinery import closure (hash-pinned wheels)
+      - name: Install mypy and the lu_machinery import closure (uv.lock)
+        env:
+          EXPECTED: ${{ steps.python.outputs.version }}
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           venv="$RUNNER_TEMP/mypy-venv"
           rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/mypy-requirements.txt"
-          # mypy and the [project] dependency closure at the source repository's
-          # requirements-lock.txt versions. Typed packages change the error census,
-          # so mypy alone does not reproduce the baseline. See pins.txt.
-          cat > "$requirements" <<'REQUIREMENTS'
-          annotated-doc==0.0.5 \
-              --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101
-          annotated-types==0.8.0 \
-              --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
-          anyio==4.15.1 \
-              --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101
-          ast-serialize==0.12.1 \
-              --hash=sha256:50a9eaedf1db4857dad7cc47dd757ed70bfcc40b89d44d516c4a2f0d5033bd76
-          attrs==26.1.0 \
-              --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
-          blinker==1.9.0 \
-              --hash=sha256:ba0efaa9080b619ff2f3459d1d500c57bddea4a6b424b60a91141db6fd2f08bc
-          cffi==2.1.1 \
-              --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf \
-              --hash=sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96
-          click==8.4.2 \
-              --hash=sha256:e6f9f66136c816745b9d65817da91d61d957fb16e02e4dcd0552553c5a197b76
-          coverage==7.17.0 \
-              --hash=sha256:85932227e9dd38e62cd29c17fefdfecfb919eead6af1e3259522d03cf85de983 \
-              --hash=sha256:acdb5f3c96046efff9dc6c572a6acb2b8d0da09372d7b9a9ed7249cf7d17434f
-          cryptography==50.0.2 \
-              --hash=sha256:9dab55f57c74c3cad24c323bacbbd04be4705ba6eb0d92e920b1fc4837ed5079
-          execnet==2.1.2 \
-              --hash=sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec
-          fastapi==0.139.0 \
-              --hash=sha256:cf15e1e9e667ddb0ad63811e60bd11390d1aac838ca4a7a23f421807b2308189
-          filelock==4.2.1 \
-              --hash=sha256:7be2662e9e826b9bba28afc0f843a123280d799a2ea44bb5d35ccec67905ae44
-          flask==3.1.3 \
-              --hash=sha256:f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c
-          graphql-core==3.3.1 \
-              --hash=sha256:43ebcd0d9a0662a71b1a2f6562ba863d253057ec11cbc45835b2e2683a0a3770
-          h11==0.16.0 \
-              --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
-          httpcore2==2.12.0 \
-              --hash=sha256:7e04258ce01013d7d615e5b910a3b27fac937d7a95038227e79652b4ba3b4ceb
-          httpx2==2.12.0 \
-              --hash=sha256:cc8b6eecb8661c146b8f89a60e97456ee086e91a784ed31ac450c3a9e613dd36
-          idna==3.20 \
-              --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
-          ijson==3.6.0 \
-              --hash=sha256:c14d568d31a322e8ed7e9735f6e355608a23cc6ff4b5da843515089dae4cbf5f \
-              --hash=sha256:09ab289fc2faf66575c4a1c626cddd413843f5508829fb4c2370fe584624d396
-          iniconfig==2.3.0 \
-              --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
-          itsdangerous==2.2.0 \
-              --hash=sha256:c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef
-          jinja2==3.1.6 \
-              --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
-          jsonschema==4.26.0 \
-              --hash=sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce
-          jsonschema-specifications==2025.9.1 \
-              --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe
-          librt==0.16.0 \
-              --hash=sha256:36e53948e99bbe3ffea257124cfcae1cfb01831555c9a9c903c9f9a72db7fd07 \
-              --hash=sha256:ca8052401c55d7511dda6760719fda7618067e83535d7d0010096d216c34b667
-          markdown-it-py==4.2.0 \
-              --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
-          markupsafe==3.0.4 \
-              --hash=sha256:8e124f974786f831d6043728e38296969d3579db8896fe004682f5758e613581 \
-              --hash=sha256:a8e9f292fcda89b324f2f5c91d13f1424a153e40fc2756f38ee23b15835ff300
-          mcp==2.2.0 \
-              --hash=sha256:bde982589473a060ae145e3406e9a5333fe538c97229ba841f5a7f92be004f81
-          mcp-types==2.2.0 \
-              --hash=sha256:ea476b73ee86709ab5abc9452385ed36cc05907e582355622e294595c9a04f13
-          mdurl==0.1.2 \
-              --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
-          mypy==2.1.0 \
-              --hash=sha256:bf03e12003084a67395184d3eb8cbd6a489dc3655b5664b28c210a9e2403ab0b \
-              --hash=sha256:c90345fc182dc363b891350457ec69c35140858538f38b4540845afcc32b1aef
-          mypy-extensions==1.1.0 \
-              --hash=sha256:1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505
-          opentelemetry-api==1.45.2 \
-              --hash=sha256:2cbd737377e710ee740d261c94e93fa0f08e6d037c18f17513cc0a2d94479a34
-          packaging==26.3 \
-              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-          pathspec==1.1.1 \
-              --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
-          pluggy==1.6.0 \
-              --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
-          prometheus-client==0.26.0 \
-              --hash=sha256:fa93d06737aa02bacd05794768508bb97d2fbee28cb3bca04eaae92f0ca953d6
-          psutil==7.2.2 \
-              --hash=sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9
-          psycopg==3.3.6 \
-              --hash=sha256:a1db9f7148b06a28606767efaca51fa6f9398c5c0a3810519be69d7000bdb631
-          psycopg-binary==3.3.6 \
-              --hash=sha256:1679a1cb93fbe5a6d1fd58d82cbddcc6fcb8c61446ba7cae6eb2a7b19bc585de \
-              --hash=sha256:31cd942c23f613276b81a6e6598cefa12960058b0f46e1e874b540c793f6aca5
-          pycparser==3.0 \
-              --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
-          pydantic==2.13.5 \
-              --hash=sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73
-          pydantic-core==2.46.5 \
-              --hash=sha256:0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2 \
-              --hash=sha256:54d510bac3ee52247af28ed4bb18a1e799f040ac60fd2bf5ccd4c92f1fbe786f
-          pygments==2.21.0 \
-              --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
-          pyjwt==2.15.0 \
-              --hash=sha256:7a3742debf6b879e912dbb9819ceec1594be812452b78c5f2e2dfc56564954f8
-          pytest==9.1.1 \
-              --hash=sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c
-          pytest-xdist==3.8.0 \
-              --hash=sha256:202ca578cfeb7370784a8c33d6d05bc6e13b4f25b5053c30a152269fd10f0b88
-          python-multipart==0.0.32 \
-              --hash=sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23
-          pyyaml==6.0.3 \
-              --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
-              --hash=sha256:c458b6d084f9b935061bc36216e8a69a7e293a2f1e68bf956dcd9e6cbcd143f5
-          referencing==0.37.0 \
-              --hash=sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231
-          rpds-py==0.30.0 \
-              --hash=sha256:47f236970bccb2233267d89173d3ad2703cd36a0e2a6e92d0560d333871a3d23 \
-              --hash=sha256:47e77dc9822d3ad616c3d5759ea5631a75e5809d5a28707744ef79d7a1bcfcad
-          sse-starlette==3.5.0 \
-              --hash=sha256:3e6e1070df3f0f5d9cea81496de92dbb72f6721871d99748ece67441dd8b7997
-          starlette==1.3.1 \
-              --hash=sha256:c7372aae11c3c3f26a42df7bd626cec2f47d03483d261d369516a615a53714c6
-          truststore==0.10.4 \
-              --hash=sha256:adaeaecf1cbb5f4de3b1959b42d41f6fab57b2b1666adb59e89cb0b53361d981
-          typing-extensions==4.16.0 \
-              --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
-          typing-inspection==0.4.4 \
-              --hash=sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147
-          uvicorn==0.48.0 \
-              --hash=sha256:48097851328b87ec36117d3d575234519eb58c2b22d79666e9bbc6c49a761dad
-          werkzeug==3.1.9 \
-              --hash=sha256:6392e50c78460ba618e5b21f08a71f59c99ce99cdc6cf6e3dd7e6ccca8754fab
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
-          "$venv/bin/python" -I -m pip check --disable-pip-version-check
+          # mypy and the whole [project] dependency closure, without the project
+          # itself (the ratchet imports the checkout). Typed packages change the
+          # error census, so mypy alone does not reproduce the baseline. See pins.txt.
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --no-install-project --group typecheck
           reported="$("$venv/bin/python" -I -m mypy --version)"
           case "$reported" in
             "mypy ${MYPY_VERSION} "*) ;;
@@ -588,9 +465,9 @@ jobs:
               exit 1
               ;;
           esac
-          minor="$("$venv/bin/python" -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-          if [ "$minor" != "$PYTHON_VERSION" ]; then
-            echo "::error::Expected Python ${PYTHON_VERSION}, got: ${minor}"
+          version="$("$venv/bin/python" -I -c 'import platform; print(platform.python_version())')"
+          if [ -z "$EXPECTED" ] || [ "$version" != "$EXPECTED" ]; then
+            echo "::error::Expected Python ${EXPECTED}, got: ${version}"
             exit 1
           fi
 
@@ -630,10 +507,10 @@ jobs:
           # origin/main, and skips a ref it cannot read.
           fetch-depth: 2
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Fetch origin/main for the shrink check
         run: |
@@ -771,25 +648,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
-      - name: Install zizmor (hash-pinned wheel)
+      - name: Install zizmor (uv.lock lint group)
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           venv="$RUNNER_TEMP/zizmor-venv"
           rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/zizmor-requirements.txt"
-          cat > "$requirements" <<'REQUIREMENTS'
-          zizmor==1.31.1 \
-              --hash=sha256:58e878eb2dbd2c6183c105e1ac28c14f7dd1eca44a783f1fe2a69647d012c410
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group lint
           reported="$("$venv/bin/zizmor" --version)"
           if [ "$reported" != "zizmor ${ZIZMOR_VERSION}" ]; then
             echo "::error::Expected zizmor ${ZIZMOR_VERSION}, got: ${reported}"
@@ -821,7 +691,7 @@ jobs:
 
       - name: Remove tools
         if: always()
-        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-venv" "$RUNNER_TEMP/zizmor-requirements.txt"
+        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-venv"
 
   # Blocking secret scan with the pinned TruffleHog CLI (pins.txt).
   # - pull_request, merge_group and main pushes scan the commits between base and head;
@@ -847,10 +717,11 @@ jobs:
           persist-credentials: false
 
       # For the exclusion coverage check only; the scanner is a Go binary.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Restore verified TruffleHog
         uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
@@ -1108,10 +979,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          python: ${{ env.SEMGREP_PYTHON }}
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Install Semgrep (hash-pinned wheels)
         run: |
@@ -1402,17 +1275,20 @@ jobs:
   # Blocking vulnerability audit of the release inputs, as the source
   # repository's dependency-audit job does it (pip-audit, then npm audit at
   # high and above), on every event.
-  # - Python: pip-audit reads requirements-machinery.lock as written
+  # - Python: pip-audit reads the runtime closure of uv.lock (`uv export
+  #   --locked`, the input of the release wheelhouse) with its markers removed
   #   (--disable-pip --require-hashes: no resolver, no install) and fails on any
   #   known vulnerability; --strict also fails a pin it cannot look up. pip-audit
   #   silently drops a requirement whose environment marker is false on this
-  #   runner, so its report must list exactly as many audited packages as the
-  #   requirements parser it uses (pip-requirements-parser) finds in the lock;
-  #   an invalid line or an option line (-r, -c, an index) fails the job.
+  #   runner, so markers are removed and its report must list exactly as many
+  #   audited packages as the requirements parser it uses
+  #   (pip-requirements-parser) finds in the export; an invalid line, an option
+  #   line (-r, -c, an index) or a requirement that is not one hashed == pin
+  #   fails the job.
   # - Node: npm audit reads package-lock.json only (--package-lock-only), every
   #   locked package with no --omit (a lock's dev flag cannot hide one), and
   #   fails on a high or critical advisory, or on any audit error.
-  # - pip-audit and its dependency closure are hash-pinned wheels (pins.txt);
+  # - pip-audit and its dependency closure come from uv.lock (audit group);
   #   npm is the hosted runner's. Both run under `env -i`.
   # - A suppression is an `--ignore-vuln ID` argument below with its reason,
   #   reviewed in the diff like every other suppression.
@@ -1427,120 +1303,76 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
-      - name: Install pip-audit (hash-pinned wheels)
+      - name: Install pip-audit (uv.lock audit group)
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           venv="$RUNNER_TEMP/pip-audit-venv"
           rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/pip-audit-requirements.txt"
-          cat > "$requirements" <<'REQUIREMENTS'
-          boolean-py==5.0 \
-              --hash=sha256:ef28a70bd43115208441b53a045d1549e2f0ec6e3d08a9d142cbc41c1938e8d9
-          cachecontrol==0.14.4 \
-              --hash=sha256:b7ac014ff72ee199b5f8af1de29d60239954f223e948196fa3d84adaffc71d2b
-          certifi==2026.10.23 \
-              --hash=sha256:e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1
-          charset-normalizer==3.5.2 \
-              --hash=sha256:3d31298449090ab8d47b7b1b2a555ff73cac7ed438a08b7ac160980c7ebed649
-          cyclonedx-python-lib==11.12.0 \
-              --hash=sha256:0e807521a921a5c3cb8ce1153f8a61d29eedfe76a46aac2796b7c6b573391a54
-          defusedxml==0.7.1 \
-              --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
-          filelock==4.2.10 \
-              --hash=sha256:9479aaeb4db20b5a53e3da28493edd24720b66b8a0b84030aa56ccdf243d6857
-          idna==3.20 \
-              --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
-          license-expression==30.4.4 \
-              --hash=sha256:421788fdcadb41f049d2dc934ce666626265aeccefddd25e162a26f23bcbf8a4
-          markdown-it-py==4.3.0 \
-              --hash=sha256:7aa1511a46c39138de78d9eba92ce47e63124d8003fc98b3a351909e04239efa
-          mdurl==0.1.2 \
-              --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
-          msgpack==1.2.4 \
-              --hash=sha256:c4d5bbdbea8f5669b3a734d6c226772804fb120848f99cbe63a0ddee63b049c9
-          packageurl-python==0.17.6 \
-              --hash=sha256:31a85c2717bc41dd818f3c62908685ff9eebcb68588213745b14a6ee9e7df7c9
-          packaging==26.3 \
-              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-          pip==26.3 \
-              --hash=sha256:f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13
-          pip-api==0.0.35 \
-              --hash=sha256:66990d0da25378555cbb538db79384bab92d4617c6350dfd7a2126ba2a3a9894
-          pip-audit==2.10.1 \
-              --hash=sha256:99ef3f600a317c1945f1e89e227ef26e1c2d618429b8bd3fa6f4f7c440c4611a
-          pip-requirements-parser==32.0.1 \
-              --hash=sha256:4659bc2a667783e7a15d190f6fccf8b2486685b6dba4c19c3876314769c57526
-          platformdirs==4.14.5 \
-              --hash=sha256:8e778c6fa421516f4d3369449f8df3b0e1b72c0e0005fe88e3ec772d0a14e750
-          py-serializable==2.2.0 \
-              --hash=sha256:2cce775abc5aac12115f9ff572a145c7276d04a770090334bd4e51ed9c782415
-          pygments==2.21.0 \
-              --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
-          pyparsing==3.3.3 \
-              --hash=sha256:ece8c00a69cf01b45d0b1dedabb469c90d8caf996d4fda40f147627a122849a4
-          requests==2.34.2 \
-              --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
-          rich==15.0.0 \
-              --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
-          sortedcontainers==2.4.0 \
-              --hash=sha256:a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0
-          tomli==2.5.0 \
-              --hash=sha256:6cf74416bdc94ae458b14e37286c1073081850ac8459a00d0c5efef5d44294c6
-          tomli-w==1.2.0 \
-              --hash=sha256:188306098d013b691fcadc011abd66727d3c414c571bb01b1a174ba8c983cf90
-          typing-extensions==4.16.0 \
-              --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
-          urllib3==2.8.0 \
-              --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group audit
           reported="$("$venv/bin/pip-audit" --version)"
           if [ "$reported" != "pip-audit ${PIP_AUDIT_VERSION}" ]; then
             echo "::error::Expected pip-audit ${PIP_AUDIT_VERSION}, got: ${reported}"
             exit 1
           fi
 
-      - name: Audit requirements-machinery.lock (pip-audit)
+      - name: Audit the runtime closure of uv.lock (pip-audit)
         run: |
           set -euo pipefail
-          lock="$PWD/requirements-machinery.lock"
-          if [ ! -f "$lock" ]; then
-            echo "::error::requirements-machinery.lock is missing; nothing would be audited"
-            exit 1
-          fi
-          # The denominator comes from pip-audit's own requirements parser,
-          # before any environment marker is evaluated.
-          pins="$(env -i PATH=/usr/bin:/bin "$RUNNER_TEMP/pip-audit-venv/bin/python" -I - "$lock" <<'PY'
-          import sys
-
-          from pip_requirements_parser import RequirementsFile
-
-          parsed = RequirementsFile.from_file(sys.argv[1])
-          for line in parsed.invalid_lines:
-              print(f"::error::invalid lock line {line.line_number}: {line.error_message}", file=sys.stderr)
-          for option in parsed.options:
-              print(f"::error::option line {option.line_number} is not allowed in the lock: {option.dumps()}", file=sys.stderr)
-          if parsed.invalid_lines or parsed.options:
-              sys.exit(1)
-          print(len(parsed.requirements))
-          PY
-          )"
-          echo "pip-audit checks ${pins} pinned package(s) in requirements-machinery.lock."
-          if [ "$pins" -eq 0 ]; then
-            echo "::error::requirements-machinery.lock pins no package"
+          if [ ! -f uv.lock ]; then
+            echo "::error::uv.lock is missing; nothing would be audited"
             exit 1
           fi
           work="$RUNNER_TEMP/pip-audit"
           rm -rf "$work"
           mkdir -p "$work/home"
+          # The release's runtime closure: uv.lock less the project and every
+          # dependency group, with hashes. release_cut builds the release
+          # wheelhouse from the same export.
+          uv export --locked --quiet --format requirements.txt --no-emit-project --no-default-groups \
+            > "$work/runtime.txt"
+          lock="$work/audit.txt"
+          # The export keeps environment markers, and pip-audit drops a marker
+          # that is false on this runner (the Windows-only packages, for
+          # example). Every exported pin is audited instead: the audit input is
+          # the export without markers, one hashed == pin per line, written by
+          # pip-audit's own requirements parser, and the denominator is its count.
+          pins="$(env -i PATH=/usr/bin:/bin "$RUNNER_TEMP/pip-audit-venv/bin/python" -I - "$work/runtime.txt" "$lock" <<'PY'
+          import sys
+
+          from pip_requirements_parser import RequirementsFile
+
+          source, target = sys.argv[1:]
+          parsed = RequirementsFile.from_file(source)
+          problems = [f"invalid line {line.line_number}: {line.error_message}" for line in parsed.invalid_lines]
+          problems += [f"option line {option.line_number} is not allowed: {option.dumps()}" for option in parsed.options]
+          lines = []
+          for req in parsed.requirements:
+              specs = list(req.specifier) if req.specifier else []
+              if req.link or len(specs) != 1 or specs[0].operator != "==" or not req.hash_options:
+                  problems.append(f"line {req.line_number}: {req.dumps()!r} is not one hashed == pin")
+                  continue
+              hashes = " ".join(f"--hash={value}" for value in req.hash_options)
+              lines.append(f"{req.name}=={specs[0].version} {hashes}\n")
+          for problem in problems:
+              print(f"::error::uv export {problem}", file=sys.stderr)
+          if problems:
+              sys.exit(1)
+          with open(target, "w", encoding="utf-8") as handle:
+              handle.writelines(lines)
+          print(len(lines))
+          PY
+          )"
+          echo "pip-audit checks ${pins} pinned package(s) of the uv.lock runtime closure."
+          if [ "$pins" -eq 0 ]; then
+            echo "::error::the uv.lock runtime export pins no package"
+            exit 1
+          fi
           report="$work/report.json"
           # Any known vulnerability, unknown package or tool error fails the job.
           status=0
@@ -1594,27 +1426,38 @@ jobs:
         if: always()
         run: >-
           rm -rf "$RUNNER_TEMP/pip-audit" "$RUNNER_TEMP/npm-audit"
-          "$RUNNER_TEMP/pip-audit-venv" "$RUNNER_TEMP/pip-audit-requirements.txt"
+          "$RUNNER_TEMP/pip-audit-venv"
 
   # The release path of docs/release.md on a hosted runner: build sdist and
   # wheel from the tracked tree with pinned tools, fill a temporary wheelhouse
-  # with the wheel and every locked dependency, install offline with hashes
-  # required, then import every module from the installed wheel only.
+  # with the wheel and the runtime closure exported from uv.lock, install
+  # offline with hashes required, then import every module from the installed
+  # wheel only. It runs twice: on the pinned Python (.python-version) and on
+  # the requires-python floor, so the floor stays proven while CI and the host
+  # run a newer pin. The product consumer check runs in the entry whose minor
+  # version is the product pin's .python-version, and an entry fails when
+  # neither entry matches it.
   installed-wheel:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: Installed wheel
+    name: Installed wheel (${{ matrix.python }} Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [pinned, floor]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        id: python
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          python: ${{ matrix.python }}
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Build sdist and wheel with pinned tools
         run: |
@@ -1650,13 +1493,17 @@ jobs:
       - name: Install offline from a hash-locked wheelhouse
         run: |
           set -euo pipefail
-          lock="$PWD/requirements-machinery.lock"
           work="$RUNNER_TEMP/installed-wheel"
+          lock="$work/runtime.txt"
+          # The runtime closure of uv.lock, as release_cut exports it.
+          uv export --locked --quiet --format requirements.txt --no-emit-project --no-default-groups > "$lock"
           cd "$work"
           wheel="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl')"
           version="$(python -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' src/pyproject.toml)"
           mkdir wheelhouse
-          python -I -m pip download --no-cache-dir --disable-pip-version-check --no-input \
+          # The build venv's pip (a stdlib venv of the same interpreter): the
+          # activated uv venv has no pip.
+          build-venv/bin/python -I -m pip download --no-cache-dir --disable-pip-version-check --no-input \
             --require-hashes --only-binary=:all: --no-deps --dest wheelhouse --requirement "$lock"
           cp "$wheel" wheelhouse/
           # The consumer lock: the release line, then the dependency lock.
@@ -1782,7 +1629,33 @@ jobs:
           path: product
           persist-credentials: false
 
+      # The product environment needs the product's own Python minor version.
+      - name: Match the product pin's Python
+        id: consumer
+        env:
+          PYTHON: ${{ steps.python.outputs.version }}
+          ENTRY: ${{ matrix.python }}
+        run: |
+          set -euo pipefail
+          minor() { sed -nE 's/^(3\.[0-9]+)(\.[0-9]+)?$/\1/p'; }
+          product="$(tr -d '[:space:]' < product/.python-version | minor)"
+          pinned="$(tr -d '[:space:]' < .python-version | minor)"
+          floor="$(sed -nE 's/^requires-python = ">=(3\.[0-9]+)"$/\1/p' pyproject.toml)"
+          here="$(printf '%s\n' "$PYTHON" | minor)"
+          echo "product pin Python ${product:-unreadable}; pinned ${pinned}; floor ${floor}; this entry (${ENTRY}) ${here}"
+          if [ -z "$product" ] || { [ "$product" != "$pinned" ] && [ "$product" != "$floor" ]; }; then
+            echo "::error::The product pin's Python ${product:-unreadable} is neither the pinned nor the floor minor; no entry would run the consumer check"
+            exit 1
+          fi
+          if [ "$product" = "$here" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "The ${ENTRY} entry skips the product consumer check; the entry on Python ${product} runs it." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Build the product environment at the pin
+        if: steps.consumer.outputs.run == 'true'
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/installed-wheel"
@@ -1801,12 +1674,15 @@ jobs:
           python -I -m venv --without-pip product-venv
           grep -viE -e '^(torch|torchvision|open_clip_torch|stanza)==' -e '^\./packages/v4-runtime$' \
             "$product/requirements-lock.txt" > product-requirements.txt
-          "$uv" pip install --python product-venv/bin/python --no-deps -r product-requirements.txt
+          # --no-config: the product checkout sits inside this repository, whose
+          # pyproject.toml [tool.uv] pins this workflow's uv, not the product's.
+          "$uv" pip install --no-config --python product-venv/bin/python --no-deps -r product-requirements.txt
           cd "$product"
-          "$uv" pip install --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
+          "$uv" pip install --no-config --python "$work/product-venv/bin/python" --no-deps --no-build-isolation ./packages/v4-runtime
           "$work/product-venv/bin/python" packages/v4-runtime/build_assets.py
 
       - name: Collect the product's tests with the candidate first
+        if: steps.consumer.outputs.run == 'true'
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/installed-wheel"
@@ -1829,6 +1705,7 @@ jobs:
           fi
 
       - name: Run the key consumer tests with the candidate first
+        if: steps.consumer.outputs.run == 'true'
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/installed-wheel"
@@ -1860,27 +1737,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          check-latest: false
+          uv-version: ${{ env.UV_VERSION }}
+          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
-      - name: Install the declaration parser (hash-pinned wheels)
+      - name: Install the declaration parser (uv.lock)
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
-          venv="$RUNNER_TEMP/verified-trailer-venv"
-          rm -rf "$venv"
-          python -I -m venv "$venv"
-          requirements="$RUNNER_TEMP/verified-trailer-requirements.txt"
-          cat > "$requirements" <<'REQUIREMENTS'
-          markdown-it-py==4.2.0 \
-              --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
-          mdurl==0.1.2 \
-              --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
-          REQUIREMENTS
-          "$venv/bin/python" -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement "$requirements"
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/python" uv sync --locked --no-build --only-group attribution
 
       - name: Check the verification line
         env:
@@ -1891,7 +1756,7 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          py="$RUNNER_TEMP/verified-trailer-venv/bin/python"
+          py="$RUNNER_TEMP/python/bin/python"
           "$py" -c 'import lu_machinery.ci.check_agent_attribution as checker; raise SystemExit(0 if checker.DEFAULT_VERIFIED_MODE == "observe" else 1)'
           case "$EVENT_NAME" in
             pull_request)

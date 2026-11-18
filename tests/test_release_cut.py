@@ -297,8 +297,8 @@ def test_release_shallow_clone_cannot_truncate_callers_linked_worktree_history(t
     assert (clone / ".git/shallow").read_text().strip() == head
 
 
-def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
-    """Defect class: the adopt and post-release commits omit an X-Agent trailer, so review cannot resolve an author family."""
+def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypatch):
+    """Defect classes: missing commit attribution and a version bump with a stale lock."""
     machinery_seed = tmp_path / "machinery-seed"
     _init_repo(machinery_seed)
     (machinery_seed / "CHANGELOG.md").write_text(
@@ -307,6 +307,8 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         encoding="utf-8",
     )
     (machinery_seed / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.22"\n', encoding="utf-8")
+    uv_lock = 'version = 1\n\n[[package]]\nname = "lu-machinery"\nversion = "0.1.22"\n'
+    (machinery_seed / "uv.lock").write_text(uv_lock, encoding="utf-8")
     (machinery_seed / "package.json").write_text(
         json.dumps({"name": "lu-machinery-acp", "version": "0.1.22"}, indent=2) + "\n", encoding="utf-8",
     )
@@ -314,7 +316,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         json.dumps({"name": "lu-machinery-acp", "version": "0.1.22", "packages": {"": {"version": "0.1.22"}}}, indent=2) + "\n",
         encoding="utf-8",
     )
-    _git(machinery_seed, "add", "CHANGELOG.md", "pyproject.toml", "package.json", "package-lock.json")
+    _git(machinery_seed, "add", "CHANGELOG.md", "pyproject.toml", "package.json", "package-lock.json", "uv.lock")
     _git(machinery_seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "version files")
 
     product_seed = tmp_path / "product-seed"
@@ -325,6 +327,20 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
     product = work / "product"
     _bare_checkout(machinery_seed, tmp_path / "machinery.git", machinery)
     _bare_checkout(product_seed, tmp_path / "product.git", product)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        '[ "$*" = "lock --offline --no-python-downloads" ]\n'
+        "grep -Fqx 'version = \"0.1.23\"' pyproject.toml\n"
+        "sed 's/^version = \"0.1.22\"$/version = \"0.1.23\"/' uv.lock > next.lock\n"
+        "mv next.lock uv.lock\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     cut = Cut(
         work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
         product_remote=str(tmp_path / "product.git"), machinery_repo="learn-ukrainian/machinery",
@@ -347,6 +363,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path):
         ["git", "-C", str(machinery), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
     assert post.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+    assert cut.git(machinery, "show", "HEAD:uv.lock") == uv_lock.replace("0.1.22", "0.1.23").strip()
 
     lock = tmp_path / "consumer.lock"
     lock.write_text("lu-machinery==0.1.22\n", encoding="utf-8")

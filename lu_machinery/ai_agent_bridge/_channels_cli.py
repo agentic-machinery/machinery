@@ -48,7 +48,6 @@ import shlex
 import subprocess
 import sys
 import time
-import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1291,7 +1290,7 @@ def _gemini_review_request_error(
     --with agy`` is always checked: a missing profile names the flag, ``code``
     cites the operator rule, and ``ukrainian`` is allowed.
     """
-    from ._agy import GEMINI_REVIEW_AGENTS, gemini_review_profile_error
+    from ._gemini_review import GEMINI_REVIEW_AGENTS, gemini_review_profile_error
 
     if not GEMINI_REVIEW_AGENTS.intersection({agent.strip().lower() for agent in agents}):
         return None
@@ -1640,44 +1639,49 @@ def _handle_sync(args) -> int:
     return worst_exit_code
 
 
+def _discussion_context_revisions(authority, channel: str, *, _seen: set[str] | None = None) -> dict[str, str]:
+    """Pin Fleet include revisions; unimported authoring files are a visible refusal."""
+    from lu_machinery.fleet_comms.authority import AuthorityServiceError
+
+    seen = _seen if _seen is not None else set()
+    if channel in seen:
+        return {}
+    seen.add(channel)
+    record = authority.get_channel(channel)
+    includes = record.metadata.get("include", [])
+    if isinstance(includes, str):
+        includes = _parse_csv(includes)
+    if not isinstance(includes, list) or any(not isinstance(name, str) for name in includes):
+        raise AuthorityServiceError("channel_context_includes_invalid")
+    revisions: dict[str, str] = {}
+    for name in includes:
+        revisions.update(_discussion_context_revisions(authority, name, _seen=seen))
+    if record.current_context_revision_id:
+        revisions[f"include:{channel}"] = record.current_context_revision_id
+    elif _channels.channel_context_path(channel).exists():
+        raise AuthorityServiceError("channel_context_import_required")
+    return revisions
+
+
+def _read_discussion_context(authority, channel: str, revisions: dict[str, str]) -> str:
+    includes = [(name.split(":", 2)[2], revision) for name, revision in sorted(revisions.items())
+                if name.startswith("include:")]
+    parts = [authority.read_channel_context(name, revision_id=revision) for name, revision in includes]
+    if "channel" in revisions and not any(name == channel for name, _ in includes):
+        parts.append(authority.read_channel_context(channel, revision_id=revisions["channel"]))
+    return "\n".join(part.strip() for part in parts if part.strip())
+
+
 def _handle_discuss(args) -> int:
-    """Multi-agent fan-out discussion with bounded rounds.
+    """Run bounded ACP discussion with a Fleet root and its pinned context.
 
-    Workflow:
-      1. Post the user's question to the channel as a normal message
-         with ``to_agents=with_list``. This creates the root message
-         that everything else threads off of.
-      2. For each round, build a per-agent prompt via
-         ``_channels.build_agent_prompt`` — the pinned context + the
-         channel history + a "please respond" instruction — and hand
-         it off to every agent in parallel through
-         ``agent_runtime.runner.invoke``. Each response lands back in
-         the channel as a reply with ``parent_id`` set to the root.
-      3. If all agents end their response with ``[AGREE]``, treat the
-         round as converged and stop early. Otherwise continue until
-         ``max_rounds`` is hit (capped at 4 regardless of caller).
-      4. Print a one-line transcript summary at the end so the user
-         can tail the thread for the full conversation.
-
-    The implementation is deliberately lightweight — no new schema,
-    no new tables, no new middleware. Everything routes through the
-    existing channel primitives so the transcript is visible in the
-    dashboard + CLI + API the moment a round resolves.
+    Fleet owns the discussion job and terminal receipt. ACP transports the
+    participants' text; it never falls back to legacy channel execution.
     """
     # Lazy import: agent_runtime pulls in the adapter stack and we
     # don't want that on every ``ab --help``.
     try:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         from lu_machinery.agent_runtime.attribution import resolve_invocation_attribution
-        from lu_machinery.agent_runtime.errors import (
-            AgentStalledError,
-            AgentTimeoutError,
-            AgentUnavailableError,
-            RateLimitedError,
-        )
-        from lu_machinery.agent_runtime.registry import get_agent_entry
-        from lu_machinery.agent_runtime.runner import invoke as runtime_invoke
     except ImportError as e:
         print(f"❌ agent_runtime unavailable: {e}", file=sys.stderr)
         print(
@@ -1707,13 +1711,10 @@ def _handle_discuss(args) -> int:
             file=sys.stderr,
         )
         return 1
-    acp_routine = True
     from lu_machinery.agent_runtime.acpx_discuss import MAX_PARTICIPANTS, MIN_PARTICIPANTS
     from lu_machinery.agent_runtime.adapters.acpx import ACPX_SUPPORTED_PARTICIPANTS
 
-    acp_participant_routes: dict[str, dict[str, str | None]] = (
-        ACPX_SUPPORTED_PARTICIPANTS if acp_routine else {}
-    )
+    acp_participant_routes = ACPX_SUPPORTED_PARTICIPANTS
     with_agents = _parse_csv(args.with_agents)
     agent_models: dict[str, str] = {}
     if getattr(args, "models", None):
@@ -1762,30 +1763,6 @@ def _handle_discuss(args) -> int:
             file=sys.stderr,
         )
         return 1
-    valid_agents = set(_channels.get_valid_agents()) | set(acp_participant_routes)
-    unknown = [a for a in with_agents if a not in valid_agents]
-    if unknown:
-        print(
-            f"❌ unknown agent(s): {', '.join(unknown)} "
-            f"(valid: {', '.join(sorted(valid_agents))})",
-            file=sys.stderr,
-        )
-        return 1
-    non_cli_agents = [
-        agent
-        for agent in with_agents
-        if agent not in acp_participant_routes and not _cli_available_agent(agent)
-    ]
-    if non_cli_agents:
-        print(
-            "❌ ab discuss cannot spawn non-CLI participant(s): "
-            f"{', '.join(non_cli_agents)}. "
-            "Use channel posts/inbox show for Desktop participation until "
-            "the Multi-UI ADR lands.",
-            file=sys.stderr,
-        )
-        return 1
-
     if agent_models:
         unknown_models = [a for a in agent_models if a not in with_agents]
         if unknown_models:
@@ -1839,22 +1816,26 @@ def _handle_discuss(args) -> int:
     )
     discussion_source = runtime_initiator or "operator"
 
-    # ── post the root question ────────────────────────────────────
-    # NOTE: do NOT pass to_agents here — discuss handles fanout itself
-    # via runtime_invoke. The root names no recipient (an empty tuple, not
-    # None, so channel subscribers get no fan-out either): a participant is a
-    # provider seat no drain reads, so a delivery to it is never read (#594).
+    # The job owns participant execution, so the root creates no deliveries.
     from lu_machinery.fleet_comms.authority import AuthorityService
 
     authority = AuthorityService()
     try:
         authority.create_channel(args.channel)
+        snapshot = _discussion_context_revisions(authority, args.channel)
+        context_revisions = {
+            f"include:{index:06d}:{name.removeprefix('include:')}": revision
+            for index, (name, revision) in enumerate(snapshot.items())
+        }
+        if f"include:{args.channel}" in snapshot:
+            context_revisions["channel"] = snapshot[f"include:{args.channel}"]
         root = authority.publish_message(
             sender=discussion_source,
             body=body,
             channel=args.channel,
             recipients=(),
             kind="discussion-root",
+            context_revisions=context_revisions,
             provenance={
                 "Source": discussion_source,
                 "Agent": "ab-discuss",
@@ -1864,23 +1845,19 @@ def _handle_discuss(args) -> int:
         )
         root_id = root.message_id
         correlation_id = root.thread_id
+        channel_context = _read_discussion_context(authority, args.channel, root.context_revisions)
         deadline_at = (datetime.now(UTC) + timedelta(seconds=1800)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
         task_channel = re.sub(r"[^A-Za-z0-9._:-]+", "-", args.channel).strip("-._:")
         task_digest = hashlib.sha256(correlation_id.encode("utf-8")).hexdigest()[:10]
         acp_task_id = f"discuss-{task_channel[:48] or 'channel'}-{task_digest}"
-        discussion_budget: dict[str, int] = {}
-        if acp_routine:
-            from lu_machinery.agent_runtime.acpx_discuss import (
-                CONTENT_BUDGET_BYTES,
-                TOKEN_BUDGET,
-            )
+        from lu_machinery.agent_runtime.acpx_discuss import CONTENT_BUDGET_BYTES, TOKEN_BUDGET
 
-            discussion_budget = {
-                "token_budget": TOKEN_BUDGET,
-                "content_budget_bytes": CONTENT_BUDGET_BYTES,
-            }
+        discussion_budget = {
+            "token_budget": TOKEN_BUDGET,
+            "content_budget_bytes": CONTENT_BUDGET_BYTES,
+        }
         authority_job = authority.enqueue_discussion(
             channel=args.channel,
             prompt=body,
@@ -1924,467 +1901,99 @@ def _handle_discuss(args) -> int:
     # seat list cannot create a conversation that the read-only status surface
     # would later need to normalize. A refusal, partial result, timeout, or
     # cancellation never replays the provider call over the retired bridge path.
-    if acp_routine:
-        from lu_machinery.agent_runtime.acpx_discuss import run_discussion
+    from lu_machinery.agent_runtime.acpx_discuss import run_discussion
 
-        from ._acp_compat import _discussion_failure_metadata, _failure_metadata
-        from ._acp_execution import acp_execution_cwd
+    from ._acp_compat import _discussion_failure_metadata, _failure_metadata
+    from ._acp_execution import acp_execution_cwd
 
-        acp_rounds = max_rounds
-        try:
-            if lease is None:
-                raise StopIteration
-            # ACP already persists and exchanges the current conversation.
-            # Keep a bounded slice of stable channel context plus the exact root.
-            channel_context = _channels.load_channel_context(args.channel)["body"].strip()
-            if len(channel_context) > 24_000:
-                channel_context = channel_context[:24_000] + "\n[context truncated]"
-            acp_prompt = (
-                (f"--- pinned channel context ---\n{channel_context}\n\n" if channel_context else "")
-                + f"--- discussion task ---\n{body}\n\n"
-                + "Produce an independent first take from the supplied text only. "
-                + "No tools, files, terminal, or external lookup are available."
-            )
-            previous_transport = os.environ.get("LU_ACPX_TRANSPORT")
-            os.environ["LU_ACPX_TRANSPORT"] = "active"
-            try:
-                with acp_execution_cwd(_config.REPO_ROOT, task_id=acp_task_id) as execution_cwd:
-                    payload = run_discussion(
-                        prompt=acp_prompt,
-                        cwd=execution_cwd,
-                        task_id=acp_task_id,
-                        correlation_id=correlation_id,
-                        idempotency_key=f"ab-discuss:{correlation_id}",
-                        rounds=acp_rounds,
-                        participants=tuple(with_agents),
-                        models=agent_models or None,
-                        efforts=agent_efforts or None,
-                        source=discussion_source,
-                        initiator=discussion_source,
-                        reserved_conversation_id=authority_job.subject_id,
-                    )
-            finally:
-                if previous_transport is None:
-                    os.environ.pop("LU_ACPX_TRANSPORT", None)
-                else:
-                    os.environ["LU_ACPX_TRANSPORT"] = previous_transport
-        except StopIteration:
-            pass
-        except Exception as exc:
-            with AuthorityService() as failed_authority:
-                failed_authority.finish_job(
-                    authority_job.job_id,
-                    worker_id=f"ab-discuss:{os.getpid()}",
-                    fence_token=lease.fence_token,
-                    state="failed",
-                    result=json.dumps(
-                        {"error": type(exc).__name__, "transport": "acp"},
-                        sort_keys=True,
-                    ).encode("utf-8"),
-                    failure=_failure_metadata(error=exc),
-                )
-            print(f"❌ ACP discussion failed without bridge retry: {exc}", file=sys.stderr)
-            return 1
-
-        conversation_id = str(payload["conversation_id"])
-        state = str(payload["state"])
-        synthesis = str(payload.get("synthesis") or "[no synthesis available]")
-        if lease is not None:
-            with AuthorityService() as completed_authority:
-                completed_authority.finish_job(
-                    authority_job.job_id,
-                    worker_id=f"ab-discuss:{os.getpid()}",
-                    fence_token=lease.fence_token,
-                    state="complete" if state == "COMPLETE" else "failed",
-                    result=json.dumps(payload, sort_keys=True).encode("utf-8"),
-                    failure=(
-                        None
-                        if state == "COMPLETE"
-                        else _discussion_failure_metadata(payload)
-                    ),
-                )
-                completed_authority.publish_message(
-                    sender="acp-controller",
-                    body=f"[ACP {state}] conversation={conversation_id}\n\n{synthesis}",
-                    channel=args.channel,
-                    kind="discussion-result",
-                    conversation_id=root.conversation_id,
-                    in_reply_to=root_id,
-                    correlation_id=correlation_id,
-                    provenance={
-                        "Source": "acp",
-                        "Agent": "controller",
-                        "Via": "fleet-comms",
-                    },
-                    idempotency_key=f"discussion-result:{authority_job.job_id}",
-                )
-        print(f"   transport: ACP ({', '.join(with_agents)})")
-        print(f"   conversation: {conversation_id}")
-        print(f"   state: {state}; rounds completed: {payload.get('rounds_completed', 0)}")
-        return 0 if state == "COMPLETE" else 1
-
-    discussion_session_ids: dict[str, str] = {}
-
-    def _invoke_one(
-        agent_name: str, prompt_text: str, round_idx: int
-    ) -> tuple[str, str, bool]:
-        """Run one agent for a specific round. Returns (agent, text, ok).
-
-        ``round_idx`` is woven into the task_id so the agent_runtime
-        usage log shows one row per (agent, round) — otherwise every
-        row in a 4-round discussion would collide on the same task_id
-        and the dashboard couldn't tell them apart.
-        """
-        try:
-            resume_policy = get_agent_entry(agent_name).get("resume_policy", "never")
-        except KeyError:
-            resume_policy = "never"
-
-        session_id_to_pass: str | None = None
-        is_new_session = False
-        if resume_policy == "bridge_only":
-            if agent_name == "codex":
-                session_id_to_pass = discussion_session_ids.get(agent_name)
-            elif agent_name not in discussion_session_ids:
-                discussion_session_ids[agent_name] = str(uuid.uuid4())
-                is_new_session = True
-                session_id_to_pass = discussion_session_ids[agent_name]
-            else:
-                session_id_to_pass = discussion_session_ids[agent_name]
-
-        tool_config = dict(_DISCUSSION_READONLY_TOOL_CONFIG)
-        if is_new_session:
-            tool_config["is_new_session"] = True
-
-        try:
-            result = runtime_invoke(
-                agent_name,
-                prompt_text,
-                mode="read-only",
-                cwd=_config.REPO_ROOT,
-                model=agent_models.get(agent_name),
-                task_id=f"discuss-{correlation_id[:8]}-r{round_idx}-{agent_name}",
-                initiator=runtime_initiator,
-                # TODO(#1701): keep this flag in the sanitized child-env
-                # allowlist when the runner switches to build_agent_env().
-                tool_config=tool_config,
-                entrypoint="bridge",
-                session_id=session_id_to_pass,
-                hard_timeout=900,
-            )
-        except RateLimitedError as exc:
-            return (agent_name, f"[rate-limited: {exc}]", False)
-        except (AgentStalledError, AgentTimeoutError) as exc:
-            return (agent_name, f"[timeout: {exc}]", False)
-        except AgentUnavailableError as exc:
-            return (agent_name, f"[unavailable: {exc}]", False)
-        except Exception as exc:  # defensive — never let one agent's
-            # crash take down the whole discussion. KeyboardInterrupt
-            # is BaseException, not Exception, so Ctrl+C still bubbles
-            # up to the pool-shutdown branch in the main loop.
-            return (agent_name, f"[error: {type(exc).__name__}: {exc}]", False)
-
-        if not result.ok:
-            if agent_name == "cursor":
-                recovered = _recover_cursor_discuss_response_from_session_log(
-                    result,
-                    _config.REPO_ROOT,
-                )
-                if recovered:
-                    return (agent_name, recovered, True)
-            return (
-                agent_name,
-                f"[failed: {result.stderr_excerpt or 'no response'}]",
-                False,
-            )
-        if (
-            resume_policy == "bridge_only"
-            and agent_name == "codex"
-            and agent_name not in discussion_session_ids
-            and result.session_id
-        ):
-            discussion_session_ids[agent_name] = result.session_id
-        return (agent_name, result.response.strip(), True)
-
-    completed_rounds = 0
-    for round_idx in range(1, max_rounds + 1):
-        completed_rounds = round_idx
-        print(f"── round {round_idx}/{max_rounds} ──────────────────────")
-
-        # Every agent sees the full channel history (pinned context +
-        # monitor state + recent posts including the root). The per-
-        # round directive tells them what to produce.
-        #
-        # Round-1 vs round-2+ semantics differ structurally:
-        #
-        # - Round 1 is parallel fan-out — every agent answers the root
-        #   question independently, NONE of them have seen any other
-        #   agent's reply yet. So `[AGREE]` in round 1 cannot mean
-        #   "I agree with the other agents" (no replies to agree with).
-        #   It can only mean "I'm satisfied with my own first take."
-        #   The convergence check below explicitly disallows round-1
-        #   short-circuit because of this — see comment there.
-        #
-        # - Round 2+ is where agents see each other's round-1 (and
-        #   later) replies via the channel history, and `[AGREE]` /
-        #   `[DISAGREE]` becomes meaningful as cross-agent assent or
-        #   pushback.
-        #
-        # This was originally a single uniform directive; that produced
-        # false convergence in the собака-gender deliberation 2026-05-05
-        # (3 agents disagreed substantively but all signed [AGREE] in
-        # round 1, short-circuiting before any agent saw the disagreements).
-        if round_idx == 1:
-            directive = (
-                f"You are participating in a bounded multi-agent discussion "
-                f"on #{args.channel}. This is round 1 of at most "
-                f"{max_rounds}. The other participants are answering this "
-                f"same root question in parallel right now — you have NOT "
-                f"seen their replies. Produce your independent first take.\n\n"
-                f"- Be concise but substantive. Cite file:line when relevant.\n"
-                f"- Deliberation is read-only: do not create, modify, delete, "
-                f"stage, commit, or push files.\n"
-                f"- Quote authoritative sources (VESUM, Правопис 2019, etc.) "
-                f"with specific entries; do not paraphrase from memory.\n"
-                f"- End your response with one of:\n"
-                f"    [DISAGREE]  — your default in round 1; you have a "
-                f"substantive position and want round 2 to compare it "
-                f"against the other agents' first takes.\n"
-                f"    [AGREE]     — only if your reading of the channel "
-                f"context (pinned rules) makes the question trivially "
-                f"resolved before any cross-agent comparison is needed. "
-                f"Rare; default is [DISAGREE] in round 1.\n"
-                f"- Even if every participant signs [AGREE] in round 1, the "
-                f"protocol will NOT short-circuit until round 2+ — round 2 "
-                f"is where you read each other and either confirm or push back."
-            )
-        else:
-            directive = (
-                f"You are participating in a bounded multi-agent discussion "
-                f"on #{args.channel}. This is round {round_idx} of at most "
-                f"{max_rounds}. Read the prior-round replies in the history "
-                f"above (they are posted as replies to the root). Compare "
-                f"them to your own prior position and decide.\n\n"
-                f"- Be concise but substantive. Cite file:line when relevant.\n"
-                f"- Deliberation is read-only: do not create, modify, delete, "
-                f"stage, commit, or push files.\n"
-                f"- Push back on any other agent's claim you disagree with — "
-                f"name the agent, quote the claim, give the counter-evidence.\n"
-                f"- End your response with one of:\n"
-                f"    [AGREE]     — you have read the other agents' prior "
-                f"replies and you accept the converging position (or yours "
-                f"is unchanged and the others now match it).\n"
-                f"    [DISAGREE]  — you still have open substantive objections "
-                f"after reading the others.\n"
-                f"- If every agent ends with [AGREE], the discussion "
-                f"short-circuits and stops before round {max_rounds}."
-            )
-
-        # `thread_id` (set below) makes `build_agent_prompt` fetch
-        # ALL messages in this discussion's thread instead of pulling
-        # the channel-wide tail. Without that, peer round-1 replies
-        # were silently dropped in round 2+ because non-thread channel
-        # messages filled the history budget and squeezed them out
-        # (#1808 root cause; observed 2026-05-08 in the writer-prompt
-        # theatre discussion where Claude flagged "context still
-        # missing" for two consecutive rounds).
-        #
-        # `history_tail` is now only a fallback bound for non-thread
-        # callers; the thread-mode read fetches the full thread
-        # regardless. Keep the +10 so legacy callers with no thread_id
-        # still get a sensible window.
-        needed_history = 1 + len(with_agents) * max_rounds + 10
-        try:
-            prompt_obj = _channels.build_agent_prompt(
-                args.channel,
-                _build_discuss_round_body(body, directive),
-                history_tail=needed_history,
-                review=args.review,
-                thread_id=correlation_id,
-            )
-        except ValueError as e:
-            print(f"❌ prompt build failed: {e}", file=sys.stderr)
-            return 1
-        prompt_text = prompt_obj["prompt"]
-        print(
-            f"   prompt {len(prompt_text)} chars "
-            f"(history_tail={needed_history}, "
-            f"dropped {prompt_obj.get('history_dropped', 0)})"
+    acp_rounds = max_rounds
+    try:
+        if lease is None:
+            raise StopIteration
+        # ACP already persists and exchanges the current conversation.
+        # Keep a bounded slice of stable channel context plus the exact root.
+        if len(channel_context) > 24_000:
+            channel_context = channel_context[:24_000] + "\n[context truncated]"
+        acp_prompt = (
+            (f"--- pinned channel context ---\n{channel_context}\n\n" if channel_context else "")
+            + f"--- discussion task ---\n{body}\n\n"
+            + "Produce an independent first take from the supplied text only. "
+            + "No tools, files, terminal, or external lookup are available."
         )
-
-        # ── parallel fan-out ──────────────────────────────────────
-        # The `with` block calls pool.shutdown(wait=True) on exit. If
-        # the user hits Ctrl+C mid-round we catch KeyboardInterrupt,
-        # cancel all queued futures, and re-raise so the process
-        # exits promptly instead of blocking on in-flight invocations
-        # (which could be hold for up to hard_timeout=900 seconds).
-        responses: dict[str, tuple[str, bool]] = {}
-        pre_round_worktree = _discussion_worktree_snapshot()
-        pool = ThreadPoolExecutor(max_workers=len(with_agents))
+        previous_transport = os.environ.get("LU_ACPX_TRANSPORT")
+        os.environ["LU_ACPX_TRANSPORT"] = "active"
         try:
-            futures = {
-                pool.submit(_invoke_one, agent, prompt_text, round_idx): agent
-                for agent in with_agents
-            }
-            try:
-                for fut in as_completed(futures):
-                    agent, text, ok = fut.result()
-                    responses[agent] = (text, ok)
-                    status = "✅" if ok else "⚠️ "
-                    preview = text.replace("\n", " ")[:80]
-                    print(f"   {status} {agent}: {preview}")
-            except KeyboardInterrupt:
-                print(
-                    "\n⚠️  interrupted — cancelling pending agent invocations",
-                    file=sys.stderr,
+            with acp_execution_cwd(_config.REPO_ROOT, task_id=acp_task_id) as execution_cwd:
+                payload = run_discussion(
+                    prompt=acp_prompt,
+                    cwd=execution_cwd,
+                    task_id=acp_task_id,
+                    correlation_id=correlation_id,
+                    idempotency_key=f"ab-discuss:{correlation_id}",
+                    rounds=acp_rounds,
+                    participants=tuple(with_agents),
+                    models=agent_models or None,
+                    efforts=agent_efforts or None,
+                    source=discussion_source,
+                    initiator=discussion_source,
+                    reserved_conversation_id=authority_job.subject_id,
                 )
-                for pending in futures:
-                    pending.cancel()
-                raise
         finally:
-            # cancel_futures is Py3.9+. Tasks already running cannot
-            # be cancelled mid-flight, but queued ones will be.
-            pool.shutdown(wait=False, cancel_futures=True)
+            if previous_transport is None:
+                os.environ.pop("LU_ACPX_TRANSPORT", None)
+            else:
+                os.environ["LU_ACPX_TRANSPORT"] = previous_transport
+    except StopIteration:
+        pass
+    except Exception as exc:
+        with AuthorityService() as failed_authority:
+            failed_authority.finish_job(
+                authority_job.job_id,
+                worker_id=f"ab-discuss:{os.getpid()}",
+                fence_token=lease.fence_token,
+                state="failed",
+                result=json.dumps(
+                    {"error": type(exc).__name__, "transport": "acp"},
+                    sort_keys=True,
+                ).encode("utf-8"),
+                failure=_failure_metadata(error=exc),
+            )
+        print(f"❌ ACP discussion failed without bridge retry: {exc}", file=sys.stderr)
+        return 1
 
-        changed, status_text = _discussion_worktree_changed(pre_round_worktree)
-        if changed:
-            violation_agents = _discussion_violation_agents(with_agents)
-            violation_marker = (
-                "READ_ONLY_VIOLATION: " + ", ".join(violation_agents)
+    conversation_id = str(payload["conversation_id"])
+    state = str(payload["state"])
+    synthesis = str(payload.get("synthesis") or "[no synthesis available]")
+    if lease is not None:
+        with AuthorityService() as completed_authority:
+            completed_authority.finish_job(
+                authority_job.job_id,
+                worker_id=f"ab-discuss:{os.getpid()}",
+                fence_token=lease.fence_token,
+                state="complete" if state == "COMPLETE" else "failed",
+                result=json.dumps(payload, sort_keys=True).encode("utf-8"),
+                failure=(
+                    None
+                    if state == "COMPLETE"
+                    else _discussion_failure_metadata(payload)
+                ),
             )
-            warning = (
-                "⚠️ READ-ONLY DISCUSSION VIOLATION\n\n"
-                f"{violation_marker}\n\n"
-                f"`ab discuss` round {round_idx} changed the git working tree. "
-                "Discussion rounds are analysis-only; filesystem writes must go "
-                f"through an explicit execution path such as `{DISPATCH_ENTRY} dispatch`.\n\n"
-                "Current `git status --short`:\n\n"
-                "```text\n"
-                f"{status_text}\n"
-                "```\n\n"
-                "The round is failed and agent replies from this round were not "
-                "accepted."
+            completed_authority.publish_message(
+                sender="acp-controller",
+                body=f"[ACP {state}] conversation={conversation_id}\n\n{synthesis}",
+                channel=args.channel,
+                kind="discussion-result",
+                conversation_id=root.conversation_id,
+                in_reply_to=root_id,
+                correlation_id=correlation_id,
+                provenance={
+                    "Source": "acp",
+                    "Agent": "controller",
+                    "Via": "fleet-comms",
+                },
+                idempotency_key=f"discussion-result:{authority_job.job_id}",
             )
-            try:
-                _channels.post(
-                    args.channel,
-                    "user",
-                    warning,
-                    to_agents=None,
-                    parent_id=root_id,
-                    correlation_id=correlation_id,
-                    kind="system",
-                    auto_snapshot=False,
-                )
-            except ValueError as e:
-                print(
-                    f"⚠️  failed to store read-only violation warning: {e}",
-                    file=sys.stderr,
-                )
-            print(warning, file=sys.stderr)
-            print()
-            print(
-                f"📊 discuss failed after {round_idx} round(s). "
-                f"{violation_marker}. "
-                f"Full thread: ab channel tail {args.channel} --thread {root_id}"
-            )
-            return 1
-
-        # ── post each response as a reply to root ─────────────────
-        # auto_snapshot=False here — the root message captured the
-        # state of the world for the discussion; re-snapshotting on
-        # every reply would mean N*max_rounds redundant Monitor API
-        # fetches + context file reads + extra storage. The reply's
-        # context is implicit from its parent_id anyway.
-        for agent in with_agents:
-            text, _ok = responses[agent]
-            try:
-                reply = _channels.post(
-                    args.channel,
-                    agent,
-                    text,
-                    to_agents=with_agents,
-                    parent_id=root_id,
-                    correlation_id=correlation_id,
-                    kind="reply",
-                    auto_snapshot=False,
-                )
-            except ValueError as e:
-                print(
-                    f"⚠️  failed to store {agent} response: {e}",
-                    file=sys.stderr,
-                )
-                continue
-            for delivery_id in reply["delivery_ids"]:
-                _channels.mark_delivery(
-                    delivery_id,
-                    "delivered",
-                    error=(
-                        "acked by ab discuss orchestrator "
-                        f"(thread={correlation_id[:8]}, round={round_idx})"
-                    ),
-                )
-
-        # ── convergence check ─────────────────────────────────────
-        # All agents must (1) have succeeded, and (2) end their
-        # response with the literal `[AGREE]` token at the tail.
-        # Strict endswith() — substring match would false-positive on
-        # "I don't [AGREE] with that. [DISAGREE]".
-        #
-        # CRITICAL: round 1 cannot short-circuit, even if every agent
-        # signs [AGREE]. Round 1 is parallel fan-out — no agent has
-        # seen any other agent's reply yet, so [AGREE] in round 1 is
-        # an "I'm done with my own answer" signal, not cross-agent
-        # assent. Forcing round 2 ensures at least one pass where
-        # agents read each other's first takes and can surface
-        # disagreement. Discovered 2026-05-05 in the собака-gender
-        # deliberation: Gemini hallucinated "Антоненко-Давидович flags
-        # feminine собака as a Russianism" (it doesn't — Антоненко-
-        # Давидович has no entry on собака at all per VESUM and
-        # search_style_guide), Claude and Codex both contradicted that
-        # claim, but all three signed [AGREE] in round 1 and the
-        # protocol short-circuited without any cross-agent comparison.
-        # Hallucination would have shipped to curriculum if the
-        # transcript were taken at face value.
-        all_ok = all(ok for (_, ok) in responses.values())
-        all_agreed = all_ok and all(
-            text.strip().endswith("[AGREE]") for (text, _) in responses.values()
-        )
-        if all_agreed and round_idx >= 2:
-            print()
-            print(f"✅ converged at round {round_idx} — all agents signed off [AGREE]")
-            break
-        elif all_agreed and round_idx == 1:
-            print()
-            print(
-                "ℹ️  all agents signed [AGREE] in round 1, but round 1 cannot "
-                "short-circuit (parallel fan-out — agents have not seen each "
-                "other's replies). Forcing round 2 for cross-agent comparison."
-            )
-
-        if round_idx == max_rounds:
-            # Tell the caller WHY we stopped so escalation is obvious.
-            # Same strict endswith check as convergence — substring
-            # match would false-positive on "I don't [AGREE] with
-            # that. [DISAGREE]" and report no disagreements.
-            disagreeing = [
-                a
-                for a, (t, _) in responses.items()
-                if not t.strip().endswith("[AGREE]")
-            ]
-            print()
-            print(
-                f"⚠️  hit max_rounds={max_rounds} without convergence. "
-                f"Still disagreeing: {', '.join(disagreeing) or '(none? see errors)'}"
-            )
-            print(
-                "   Escalate to a human or re-open the discussion with a "
-                "tighter brief."
-            )
-
-    print()
-    print(
-        f"📊 discuss done after {completed_rounds} round(s). "
-        f"Full thread: ab channel tail {args.channel} --thread {root_id}"
-    )
-    return 0
+    print(f"   transport: ACP ({', '.join(with_agents)})")
+    print(f"   conversation: {conversation_id}")
+    print(f"   state: {state}; rounds completed: {payload.get('rounds_completed', 0)}")
+    return 0 if state == "COMPLETE" else 1

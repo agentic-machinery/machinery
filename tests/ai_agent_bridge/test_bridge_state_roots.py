@@ -62,7 +62,7 @@ def test_reply_and_ask_files_are_written_only_to_state(roots, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["ask", "gemini"])
-def test_background_logs_use_state_but_child_cwd_stays_product(roots, monkeypatch, kind):
+def test_background_logs_use_state_and_ask_child_uses_primary(roots, monkeypatch, kind):
     product, state = roots
     captured = []
 
@@ -79,6 +79,7 @@ def test_background_logs_use_state_but_child_cwd_stays_product(roots, monkeypatc
     monkeypatch.setattr(_ask_lifecycle, "_load_ask_row", lambda message_id: None)
     monkeypatch.setattr(_ask_lifecycle, "_confirm_worker_started", lambda *args: True)
     if kind == "ask":
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
         _ask_lifecycle.launch_background_ask(42, "claude", {})
         log_name = "ask-42.log"
     else:
@@ -86,7 +87,7 @@ def test_background_logs_use_state_but_child_cwd_stays_product(roots, monkeypatc
         log_name = "gemini-root-proof.log"
     assert len(captured) == 1
     assert captured[0][0][1:5] == ["-I", "-u", "-m", "lu_machinery.ai_agent_bridge"]
-    assert captured[0][1]["cwd"] == str(product)
+    assert captured[0][1]["cwd"] == str(state if kind == "ask" else product)
     log = state / ".mcp/servers/message-broker/logs" / log_name
     assert log.read_text() == "child log\n"
     assert list(product.rglob("*")) == []

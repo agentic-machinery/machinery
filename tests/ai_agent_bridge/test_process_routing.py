@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-
 from lu_machinery.agent_runtime.runner import InterAgentTransportError, resolve_inter_agent_route
 from lu_machinery.ai_agent_bridge import _process
 from lu_machinery.ai_agent_bridge._acp_compat import (
@@ -35,6 +34,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 def bridge_db(tmp_path, monkeypatch):
     db_path = tmp_path / "messages.db"
     monkeypatch.setenv("AB_DB_PATH", str(db_path))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     conn = init_db()
     conn.close()
     return db_path
@@ -432,53 +432,42 @@ def test_legacy_gemini_error_handler_never_acks(bridge_db):
     assert _replies(message_id)[0][2] == "error"
 
 
-def test_agy_error_handler_never_acks(bridge_db):
-    """Mutation check: removing the no-ack guard turns this red."""
-    from lu_machinery.ai_agent_bridge import _agy
+def test_opencode_incomplete_turn_never_acks(bridge_db, tmp_path, monkeypatch):
+    """Long attachment paths survive redaction and timeout without consuming legacy mail."""
+    import json
+    import string
 
-    message_id = _send("agy")
-    msg = {
-        "id": message_id,
-        "task_id": "task-6915",
-        "from": "qa-engineer",
-        "to": "agy",
-        "type": "advisory",
-        "content": "x",
-        "data": None,
-    }
-    _agy._handle_agy_error(msg, message_id, "boom")
-
-    acked, status = _row(message_id)
-    assert acked == 0, "agy error handler consumed a failed message"
-    assert status.startswith("failed:")
-    assert _replies(message_id)[0][2] == "error"
-
-
-def test_opencode_incomplete_turn_never_acks(bridge_db):
     from lu_machinery.ai_agent_bridge import _opencode
+    from lu_machinery.fleet_comms.authority import AuthorityService
 
-    message_id = _send("glm")
-    msg = {
-        "id": message_id,
-        "task_id": "task-6915",
-        "from": "qa-engineer",
-        "to": "glm",
-        "type": "advisory",
-        "content": "x",
-        "data": None,
-    }
-    _opencode._handle_opencode_incomplete_turn(
-        msg,
-        message_id,
-        "glm",
-        "",
-        SimpleNamespace(outcome="timeout", cancellation_category=None, reason="hard timeout"),
-        actual_model="glm-5.3",
-        effort="high",
-    )
-    acked, status = _row(message_id)
-    assert acked == 0
-    assert status.startswith("failed:")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
+    attachment = tmp_path / (string.ascii_letters + string.digits) / "attachment.txt"
+    attachment.parent.mkdir(parents=True)
+    attachment.write_text("frozen attachment")
+    monkeypatch.chdir(tmp_path)
+    status = _opencode.OpencodeTurnStatus(outcome="timeout", cancellation_category=None, reason="hard timeout")
+    def incomplete(*args, **kwargs):
+        assert kwargs["data"] == str(attachment.resolve())
+        raise _opencode.OpencodeTurnError(status, "partial narration")
+    monkeypatch.setattr(_opencode, "_invoke_opencode", incomplete)
+    with pytest.raises(SystemExit, match="opencode turn aborted"):
+        _opencode.ask_opencode("Question", "task-6915", model="deepseek/deepseek-v4.1-flash", data=str(attachment.relative_to(tmp_path)))
+    with AuthorityService() as service:
+        row = service.store.connection.execute("SELECT job_id, state FROM authority_jobs").fetchone()
+        assert row["state"] == "failed"
+        job = service.get_job(row["job_id"])
+        metadata = json.loads(service.store.read_bytes(job.payload_artifact_id))["metadata"]
+        assert metadata["data"] == str(attachment.resolve())
+        assert metadata["attachment_sha256"] == "04fee3a35512bde4d325e49fc704a6291b7ecf98b88e8db75c3157f83455858a"
+        receipt = json.loads(service.read_job_result(row["job_id"]))
+        assert receipt["turn_outcome"] == "timeout"
+        assert receipt["partial_response"] == "partial narration"
+        assert "response" not in receipt
+    conn = get_db()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def test_process_all_gemini_counts_failures_without_consuming(bridge_db, monkeypatch, capsys):
@@ -503,14 +492,10 @@ def test_process_all_gemini_counts_failures_without_consuming(bridge_db, monkeyp
 def forbid_legacy_processors(monkeypatch):
     from unittest.mock import Mock
 
-    for module, name in [
-        ("_agy", "process_for_agy"),
-        ("_opencode", "process_for_opencode"),
-    ]:
-        monkeypatch.setattr(
-            f"lu_machinery.ai_agent_bridge.{module}.{name}",
-            Mock(side_effect=AssertionError("ordinary ask reached legacy provider processor")),
-        )
+    monkeypatch.setattr(
+        "lu_machinery.ai_agent_bridge._opencode.process_for_opencode",
+        Mock(side_effect=AssertionError("ordinary ask reached the OpenCode worker")),
+    )
 
 
 @pytest.mark.parametrize(
@@ -608,7 +593,7 @@ def test_detached_ordinary_worker_uses_acp_without_provider_fallback(
     assert _replies(message_id)[0][2] == "error"
 
 
-@pytest.mark.parametrize("target", ["claude", "codex", "grok", "grok-build", "cursor"])
+@pytest.mark.parametrize("target", ["claude", "codex", "agy", "grok", "grok-build", "cursor"])
 @pytest.mark.parametrize("review_intent", ["flag", "type", "target"])
 def test_removed_seat_review_is_unsupported_and_stays_out_of_acp(bridge_db, monkeypatch, target, review_intent):
     from unittest.mock import Mock
@@ -666,7 +651,10 @@ def test_batch_ordinary_drains_use_acp_and_report_failures(
     batch()
     acp.assert_called_once()
     assert _row(message_id)[0] == 0
-    assert "0 succeeded, 1 failed" in capsys.readouterr().out
+    label = {"claude": "Claude (headless)", "codex": "Codex"}[target]
+    output = capsys.readouterr().out
+    assert f"Processing 1 unread message(s) for {label}..." in output
+    assert "0 succeeded, 1 failed" in output
 
 
 def test_ordinary_process_failure_is_nonzero(bridge_db, monkeypatch):

@@ -1,0 +1,101 @@
+name: uv and the pinned CPython
+description: >-
+  Install the pinned uv release (checksum-verified) and activate a venv of a
+  uv-managed CPython: the exact version in .python-version, the requires-python
+  floor of pyproject.toml, or a named minor version. The calling workflow sets
+  UV_PYTHON_PREFERENCE=only-managed, so the runner's own Pythons are never used.
+inputs:
+  python:
+    description: >-
+      pinned (.python-version, exact), floor (the >=X.Y bound of requires-python)
+      or an X.Y minor version for a tool pinned to one ABI.
+    default: pinned
+  uv-version:
+    description: uv release (pins.txt UV_VERSION; pyproject.toml [tool.uv] required-version)
+    required: true
+  uv-sha256:
+    description: SHA-256 of uv-x86_64-unknown-linux-gnu.tar.gz for that release (pins.txt)
+    required: true
+outputs:
+  version:
+    description: The full version of the interpreter the venv runs
+    value: ${{ steps.python.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Read the requested Python version
+      id: want
+      shell: bash
+      env:
+        WHICH: ${{ inputs.python }}
+      run: |
+        set -euo pipefail
+        case "$WHICH" in
+          pinned)
+            want="$(tr -d '[:space:]' < .python-version)"
+            pattern='^3\.[0-9]+\.[0-9]+$'
+            ;;
+          floor)
+            # Exactly one `requires-python = ">=3.N"` line; anything else fails.
+            want="$(sed -nE 's/^requires-python = ">=(3\.[0-9]+)"$/\1/p' pyproject.toml)"
+            pattern='^3\.[0-9]+$'
+            ;;
+          *)
+            want="$WHICH"
+            pattern='^3\.[0-9]+$'
+            ;;
+        esac
+        if ! [[ "$want" =~ $pattern ]]; then
+          echo "::error::Cannot read the ${WHICH} Python version (got '${want}')"
+          exit 1
+        fi
+        echo "version=${want}" >> "$GITHUB_OUTPUT"
+    # Downloads uv from GitHub Releases and checks the archive against the
+    # pinned SHA-256 before use. No Actions cache: every job starts from the pins.
+    # The venv lives in the job temp directory, never in the checkout.
+    - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        version: ${{ inputs.uv-version }}
+        checksum: ${{ inputs.uv-sha256 }}
+        download-from-astral-mirror: 'false'
+        enable-cache: 'false'
+        python-version: ${{ steps.want.outputs.version }}
+        activate-environment: 'true'
+        venv-path: ${{ runner.temp }}/python
+        no-project: 'true'
+    - name: Check uv and the interpreter on PATH
+      id: python
+      shell: bash
+      env:
+        WANT: ${{ steps.want.outputs.version }}
+        WHICH: ${{ inputs.python }}
+        UV_VERSION: ${{ inputs.uv-version }}
+        PREFERENCE: ${{ env.UV_PYTHON_PREFERENCE }}
+      run: |
+        set -euo pipefail
+        if [ "$PREFERENCE" != only-managed ]; then
+          echo "::error::The workflow must set UV_PYTHON_PREFERENCE=only-managed (got '${PREFERENCE}')"
+          exit 1
+        fi
+        reported_uv="$(uv --version)"
+        case "$reported_uv" in
+          "uv ${UV_VERSION}"|"uv ${UV_VERSION} "*) ;;
+          *) echo "::error::Expected uv ${UV_VERSION}, got: ${reported_uv}"; exit 1 ;;
+        esac
+        venv="$RUNNER_TEMP/python"
+        found="$(command -v python)"
+        if [ "$found" != "$venv/bin/python" ]; then
+          echo "::error::python on PATH is ${found}, not the activated venv ${venv}"
+          exit 1
+        fi
+        reported="$(python -I -c 'import platform; print(platform.python_version())')"
+        case "$reported" in
+          "$WANT"|"$WANT".*) ;;
+          *) echo "::error::Expected Python ${WANT}, got: ${reported}"; exit 1 ;;
+        esac
+        if [ "$WHICH" = pinned ] && [ "$reported" != "$WANT" ]; then
+          echo "::error::Expected Python ${WANT} exactly, got: ${reported}"
+          exit 1
+        fi
+        echo "version=${reported}" >> "$GITHUB_OUTPUT"
+        echo "${reported_uv}; Python ${reported} (${WHICH}) at ${venv}/bin/python"

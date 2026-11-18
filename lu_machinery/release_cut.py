@@ -544,8 +544,20 @@ class Cut:
         self.step = "wheelhouse"
         house = self.work / "wheelhouse"
         house.mkdir()
-        lock = self.work / "src/requirements-machinery.lock"
-        self.run([self.host_python, "-I", "-m", "pip", "download", "--no-cache-dir", "--disable-pip-version-check",
+        # The runtime closure of uv.lock at the tagged commit: no project line and no dependency
+        # group, with every hash (ci-gate.yml's dependency-audit and installed-wheel jobs export the
+        # same). --locked refuses a lock that no longer matches pyproject.toml, and its [tool.uv]
+        # required-version refuses any other uv release.
+        uv = shutil.which("uv")
+        if uv is None:
+            raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
+        lock = self.work / "runtime-requirements.txt"
+        exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
+                             "--no-emit-project", "--no-default-groups"], cwd=self.work / "src").stdout
+        lock.write_text(exported, encoding="utf-8")
+        # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
+        self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
+                  "--disable-pip-version-check",
                   "--no-input", "--require-hashes", "--only-binary=:all:", "--no-deps", "--dest", house,
                   "--requirement", lock])
         shutil.copy2(files["wheel"], house)
@@ -941,16 +953,23 @@ class Cut:
             path = clone / name
             path.write_text(bump_version_file(name, path.read_text(encoding="utf-8"), self.version, upcoming),
                             encoding="utf-8")
+        version_files = list(VERSION_FILES)
+        if (clone / "uv.lock").is_file():
+            uv = shutil.which("uv")
+            if uv is None:
+                raise CutError("uv is not on PATH; cannot refresh uv.lock for the next version")
+            self.run([uv, "lock", "--offline", "--no-python-downloads"], cwd=clone)
+            version_files.append("uv.lock")
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
-        self.git(clone, "add", "CHANGELOG.md", *VERSION_FILES)
+        self.git(clone, "add", "CHANGELOG.md", *version_files)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"{title}\n\nX-Agent: {self.x_agent}")
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
         body.write_text(
             f"Records the {self.version} section of `CHANGELOG.md`, generated from the merged PR titles in "
-            f"`v{self.baseline}..v{self.version}`, and moves `pyproject.toml`, `package.json` and "
-            f"`package-lock.json` to {upcoming}, the version the next release cut tags.\n\n"
+            f"`v{self.baseline}..v{self.version}`, and updates the version files to {upcoming}, "
+            "the version the next release cut tags.\n\n"
             "Opened by the release cut (`docs/release.md`). It needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
         )

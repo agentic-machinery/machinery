@@ -708,16 +708,6 @@
       "message": "Value of type variable \"_DataclassT\" of \"replace\" cannot be \"object\""
     },
     {
-      "path": "lu_machinery/ai_agent_bridge/_agy.py",
-      "code": "arg-type",
-      "message": "Argument \"run_nonce\" to \"agy_model_state\" has incompatible type \"object\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_agy.py",
-      "code": "return-value",
-      "message": "Return value expected"
-    },
-    {
       "path": "lu_machinery/ai_agent_bridge/_ask_lifecycle.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"float\", variable has type \"int\")"
@@ -931,116 +921,6 @@
       "path": "lu_machinery/ai_agent_bridge/_messaging.py",
       "code": "var-annotated",
       "message": "Need type annotation for \"kept\" (hint: \"kept: list[<type>] = ...\")"
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 4 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | Path\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 4 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 4 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 4 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 4 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | Path\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | Path\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 6 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 7 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | Path\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 7 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "arg-type",
-      "message": "Argument 7 to \"_invoke_opencode\" has incompatible type \"**dict[str, object]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
-    },
-    {
-      "path": "lu_machinery/ai_agent_bridge/_opencode.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"int\""
     },
     {
       "path": "lu_machinery/ai_agent_bridge/_opencode.py",
@@ -6444,11 +6324,6 @@
     },
     {
       "path": "lu_machinery/inbox_pending.py",
-      "code": "attr-defined",
-      "message": "Module \"lu_machinery.agent_runtime.agent_identity\" has no attribute \"seat_read_aliases\""
-    },
-    {
-      "path": "lu_machinery/inbox_pending.py",
       "code": "override",
       "message": "Return type \"None\" of \"error\" incompatible with return type \"Never\" in supertype \"argparse.ArgumentParser\""
     },
@@ -7138,11 +7013,6 @@
       "message": "Returning Any from function declared to return \"str\""
     },
     {
-      "path": "lu_machinery/orchestration/task_closeout.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None\" has no attribute \"casefold\""
-    },
-    {
       "path": "lu_machinery/orchestration/task_family/cli.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None\" has no attribute \"__iter__\" (not iterable)"
@@ -7499,11 +7369,6 @@
     },
     {
       "path": "lu_machinery/orchestration/task_lifecycle.py",
-      "code": "attr-defined",
-      "message": "\"object\" has no attribute \"casefold\""
-    },
-    {
-      "path": "lu_machinery/orchestration/task_lifecycle.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
@@ -7511,11 +7376,6 @@
       "path": "lu_machinery/orchestration/task_lifecycle.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/task_lifecycle.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"None | str\" has no attribute \"casefold\""
     },
     {
       "path": "lu_machinery/orchestration/thread_handoff.py",
