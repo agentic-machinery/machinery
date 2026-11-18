@@ -161,19 +161,28 @@ def test_jq_on_a_non_json_200_body_is_a_typed_refusal_not_a_traceback(tmp_path):
     assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
 
 
-def test_jq_timeout_is_a_typed_refusal(tmp_path, monkeypatch):
-    """Class: a jq that outlives its timeout raised TimeoutExpired out of ``run`` instead of a typed result."""
+@pytest.mark.parametrize(
+    "failure",
+    [lambda command, kw: subprocess.TimeoutExpired(command, kw["timeout"]), lambda command, kw: FileNotFoundError("jq")],
+    ids=["timeout", "not-installed"],
+)
+def test_jq_that_times_out_or_cannot_start_is_a_typed_refusal(tmp_path, monkeypatch, failure):
+    """Class: a jq that outlived its timeout or was not installed raised out of ``run`` instead of a typed result."""
 
     def transport(method, endpoint, headers, body, timeout):
         return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"{}")
 
-    def hang(command, **kwargs):
-        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+    def broken(command, **kwargs):
+        raise failure(command, kwargs)
 
     store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
-    monkeypatch.setattr(gh.subprocess, "run", hang)
-    result = gh.run(["gh", "api", "repos/o/r/x", "--jq", ".x"], client=store, capture_output=True, check=False)
+    monkeypatch.setattr(gh.subprocess, "run", broken)
+    args = ["gh", "api", "repos/o/r/x", "--jq", ".x"]
+    result = gh.run(args, client=store, capture_output=True, check=False)
     assert result.returncode == 1 and result.github_result.error == "github_invalid_command"
+    with pytest.raises(subprocess.CalledProcessError) as raised:
+        gh.run(args, client=store, capture_output=True, check=True)
+    assert raised.value.github_result.error == "github_invalid_command"
 
 
 def test_jq_reads_a_raw_json_body_as_input(tmp_path):

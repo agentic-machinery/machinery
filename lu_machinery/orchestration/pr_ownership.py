@@ -34,6 +34,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -1149,13 +1150,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _checkout_slug(cwd: Path) -> str | None:
+    """The ``owner/name`` of the checkout's own origin, else None.
+
+    Only repository-scoped configuration names a checkout: a user- or system-level ``remote.origin.url``
+    applies to every directory, including one that is no checkout at all.
+    """
+    from lu_machinery.fleet.pr_identity import resolve_repo_slug
+
+    try:
+        local = subprocess.run(
+            ["git", "config", "--local", "--get", "remote.origin.url"],
+            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return resolve_repo_slug(cwd) if local.returncode == 0 and local.stdout.strip() else None
+
+
 def _repo_or_checkout(repo: str | None) -> str:
     """The ``--repo`` value, else the checkout's origin; never another repository by default."""
     if repo:
         return repo
-    from lu_machinery.fleet.pr_identity import resolve_repo_slug
-
-    slug = resolve_repo_slug(Path.cwd())
+    slug = _checkout_slug(Path.cwd())
     if slug is None:
         raise OwnershipError("repository unresolved: run inside a checkout with a GitHub origin, or pass --repo owner/name")
     return slug
@@ -1175,8 +1192,12 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     from lu_machinery.dispatcher import store
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
+    if not args.repo:
+        # Custody is recorded from the coordinator seat, whose checkout is not the alert's repository.
+        print(json.dumps({"accepted": False, "reason": "recorded custody needs --repo owner/name"}))
+        return 1
     repos = load_fleet_repos()
-    repo = _repo_or_checkout(args.repo)
+    repo = args.repo
     pr = _gh_pr(repo, args.pr)
     now = datetime.now(UTC)
     records = [] if args.release else store.list_tasks(strict=True)

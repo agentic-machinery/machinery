@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.fleet import pr_identity
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.orchestration import pr_ownership as own
@@ -474,7 +473,7 @@ def world(tmp_path, monkeypatch):
     monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
     repo = fleet_repos.FleetRepo("public", REPO, "learn-ukrainian", "public-monorepo", True)
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {"public": repo})
-    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: REPO)
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: REPO)
     return path
 
 
@@ -499,18 +498,48 @@ def test_cli_without_repo_targets_the_checkout_not_the_default_fleet_repository(
     """Wrong-repository class: an omitted --repo once meant the default fleet repository, whatever the checkout."""
     seen = []
     monkeypatch.setattr(own, "_gh_pr", lambda repo, n: seen.append(repo) or {"state": "OPEN", "headRefOid": HEAD})
-    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: "learn-ukrainian/machinery")
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: "learn-ukrainian/machinery")
     monkeypatch.setenv(own.TASK_ENV, "integration")
     own.main(["accept", "--pr", "42"])
     own.main(["accept", "--pr", "42", "--repo", "other/explicit"])
     assert seen == ["learn-ukrainian/machinery", "other/explicit"]
     # A checkout whose repository cannot be determined is refused before any GitHub read.
     seen.clear()
-    monkeypatch.setattr(pr_identity, "resolve_repo_slug", lambda root: None)
+    monkeypatch.setattr(own, "_checkout_slug", lambda cwd: None)
     capsys.readouterr()
     assert own.main(["accept", "--pr", "42"]) == 2
     assert own.main(["queue-exit", "--pr", "42"]) == 2
     assert "repository unresolved" in capsys.readouterr().err and seen == []
+
+
+def test_coordinator_custody_never_takes_the_repository_from_the_checkout(world, monkeypatch, capsys):
+    """Wrong-repository class: custody recorded from a seat whose checkout is not the alert's repository."""
+    seen = []
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: seen.append(repo) or {"state": "OPEN", "headRefOid": HEAD})
+    monkeypatch.delenv(own.TASK_ENV, raising=False)
+    argv = ["accept", "--pr", "42", "--reason", "waiting on a decision", "--decision-owner", "operator"]
+    assert own.main(argv) == 1
+    assert own.main(["accept", "--pr", "42", "--release"]) == 1
+    assert "needs --repo" in capsys.readouterr().out and seen == []
+
+
+def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch):
+    """Class: a user-level remote.origin.url named a repository for any directory, checkout or not."""
+    import subprocess
+
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text('[remote "origin"]\n\turl = https://github.com/someone/global-only.git\n')
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    checkout, outside = tmp_path / "checkout", tmp_path / "outside"
+    checkout.mkdir()
+    outside.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True, capture_output=True)
+    assert own._checkout_slug(outside) is None
+    assert own._checkout_slug(checkout) is None
+    url = "https://github.com/learn-ukrainian/machinery.git"
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=checkout, check=True, capture_output=True)
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
 
 
 def test_documented_module_invocation_shows_help():
