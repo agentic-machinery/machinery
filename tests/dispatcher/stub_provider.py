@@ -62,6 +62,9 @@ while not Path(sys.argv[2]).exists():
 """
 
 
+LEFTOVER_NAMES = ("notes.txt", "lf\nname", "cr\rname", "crlf\r\nname")
+
+
 def main():
     # Retain the binding line that the watchdog tests instrument with heartbeat output.
     del sys.argv[4:]
@@ -104,7 +107,8 @@ def main():
             delivered.write_text("uncommitted delivery\n")
         if model == "pushed-scratch":  # generated output left untracked beside the delivery
             Path("leftover").mkdir()
-            Path("leftover/notes.txt").write_text("leftover notes\n")
+            for name in LEFTOVER_NAMES:  # distinct names a text read of Git's output would fold into one
+                Path("leftover", name).write_text(f"leftover {name!r}\n")
         if model == "pushed-dirty-outside":  # an uncommitted edit to a tracked file outside the delivery
             with Path("lu_machinery/__init__.py").open("a") as handle:
                 handle.write("# uncommitted edit\n")

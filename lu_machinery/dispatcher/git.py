@@ -916,7 +916,9 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     would fail the ownership rule and settlement's removal preserves them, so they are not undelivered task
     work. Every tracked change is task work, inside the scope or not (an edit outside it may be work the
     worker could not commit), and so is any untracked file of an unscoped task or one whose scope is
-    unreadable, and an untracked directory (a nested repository, whose files Git does not list).
+    unreadable, and any nested repository: a checkout, whose files Git does not list, or a bare repository,
+    whose commits may hold work the published branch does not. The tree is read as removal reads it
+    (_tree_changes).
     """
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
@@ -930,25 +932,22 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             head_sha=local(["rev-parse", "HEAD"]).stdout.strip(),
             commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
         )
-        # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
-        # edit or new submodule commit is reported whatever the tree configures. -z keeps names unquoted and
-        # --untracked-files=all lists each untracked file, so each can be matched against the owned paths.
-        status = [os.fsdecode(entry) for entry in execution_safe_git(
-            ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
-            cwd=spec.worktree, capture_output=True, check=True, timeout=30).stdout.split(b"\0") if entry]
-        untracked = [entry[3:] for entry in status if entry.startswith("?? ")]
-        tracked = len(untracked) < len(status) or _hidden_tracked_changes(spec.worktree)
+        changed, untracked = _tree_changes(spec.worktree)
         try:
             owned = ownership.effective_scope(record)
         except (TypeError, ValueError):
             owned = []  # an unreadable scope owns everything
         outside = set(ownership.outside_owned(untracked, owned)) if owned else set()
+        repositories: dict[Path, bool] = {}
+
+        def unrelated(name: str) -> bool:
+            return name in outside and not name.endswith("/") and not _in_git_directory(spec.worktree, name, repositories)
+
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
-        delivery.update(worktree_dirty_on_exit=tracked or bool(untracked),
-                        worktree_untracked_only_on_exit=bool(untracked) and not tracked,
-                        worktree_unrelated_only_on_exit=bool(untracked) and not tracked and all(
-                            name in outside and not name.endswith("/") for name in untracked))
+        delivery.update(worktree_dirty_on_exit=bool(changed or untracked),
+                        worktree_untracked_only_on_exit=bool(untracked) and not changed,
+                        worktree_unrelated_only_on_exit=bool(untracked) and not changed and all(map(unrelated, untracked)))
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -1231,15 +1230,46 @@ def merged_delivery(record: dict) -> dict | None:
 def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     """Return the tree's uncommitted tracked changes and its untracked files; ignored files are neither.
 
-    Use the exit snapshot's hidden-change check so index flags and submodule ignore settings cannot
-    hide tracked work from removal either.
+    The exit snapshot and removal both read the tree here. Status runs with integrity, which forces
+    core.trustctime and core.checkStat to their defaults, so a worker's stat settings cannot hide an edit,
+    and the hidden-change check covers the index flags and submodule ignore settings status trusts.
+    --ignore-submodules=none overrides the tree's submodule ignore settings. Names are read as bytes: a
+    text read folds CR and CRLF into LF, so distinct files would collapse into one. In porcelain v1 -z, a
+    rename or copy is followed by its source path as a separate field, which belongs to that entry.
     """
-    entries = [entry for entry in _git(tree, "status", "--porcelain", "--ignore-submodules=none", "-z", "--untracked-files=all",
-                                       isolate=True, strip=False).split("\0") if entry]
-    changed = [entry for entry in entries if not entry.startswith("?? ")]
+    fields = iter(execution_safe_git(
+        ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        cwd=tree, integrity=True, capture_output=True, check=True, timeout=30).stdout.split(b"\0"))
+    changed, untracked = [], []
+    for field in fields:
+        if not field:
+            continue
+        if field.startswith(b"?? "):
+            untracked.append(os.fsdecode(field[3:]))
+            continue
+        changed.append(os.fsdecode(field))
+        if b"R" in field[:2] or b"C" in field[:2]:
+            next(fields, None)
     if _hidden_tracked_changes(tree):
         changed.append("hidden tracked changes")
-    return changed, [entry[3:] for entry in entries if entry.startswith("?? ")]
+    return changed, untracked
+
+
+def _in_git_directory(tree: Path, name: str, seen: dict[Path, bool]) -> bool:
+    """Whether an untracked file lies in a nested Git directory, such as a bare repository, which status lists file by file.
+
+    A directory is one when Git would open it as a repository: a HEAD file beside an objects directory, or a
+    commondir file. ``seen`` caches the answer per directory.
+    """
+    directory = tree
+    for part in PurePosixPath(name).parts[:-1]:
+        directory = directory / part
+        if directory not in seen:
+            seen[directory] = (directory / "HEAD").is_file() and (
+                (directory / "objects").is_dir() or (directory / "commondir").is_file())
+        if seen[directory]:
+            return True
+    return False
 
 
 def _canonical_publication(record: dict, ref: str, head: str) -> tuple[str | None, bool]:

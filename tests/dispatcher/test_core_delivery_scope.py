@@ -1,6 +1,7 @@
 """Delivery observation and write-settle scope checks."""
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +10,7 @@ from lu_machinery.dispatcher import git, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.dispatcher.conftest import run_git
 from tests.dispatcher.conftest import MERGED
+from tests.dispatcher.stub_provider import LEFTOVER_NAMES
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 
@@ -119,8 +121,10 @@ def test_settle_rejects_out_of_scope_or_unpublished_write_delivery(sandbox, mode
         assert record["worktree_disposition"] == "removed"
         archive = record["branch_holder_archive"]
         assert archive["retention_disposition"] == "retrieved"
-        assert (sandbox.repo / archive["location"] / "leftover/notes.txt").read_text() == "leftover notes\n"
-        assert [entry["path"] for entry in archive["paths"]] == ["leftover/notes.txt"]
+        names = [f"leftover/{name}" for name in LEFTOVER_NAMES]
+        assert sorted(entry["path"] for entry in archive["paths"]) == sorted(names)
+        for name in LEFTOVER_NAMES:
+            assert (sandbox.repo / archive["location"] / "leftover" / name).read_text() == f"leftover {name!r}\n"
 
 
 def test_v2_record_without_owned_paths_remains_readable(sandbox):
@@ -143,18 +147,25 @@ def test_write_settle_without_ownership(delivery_settle, owned, model, cause):
     assert ("owned_paths" in result) is (owned is not None)
 
 
-@pytest.mark.parametrize(("leftover", "grants", "unrelated"), [
-    ("scratch/notes.txt", None, True),
-    ("ignored.log", None, False),  # ignored output is not uncommitted state at all
-    ("scratch/notes.txt", ["scratch"], False),  # a grant bound to this run widens the scope
-    ("scratch/notes.txt", "unbound", False),  # an unreadable scope owns every untracked file
-    ("nested/", None, False),  # a nested repository's files are not listed, so it may hold task work
+LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nname"]
+
+
+@pytest.mark.parametrize(("case", "grants", "unrelated"), [
+    ("outside", None, True),
+    ("line-breaks", None, True),  # distinct names a text read would fold into one
+    ("ignored", None, False),  # ignored output is not uncommitted state at all
+    ("outside", ["scratch"], False),  # a grant bound to this run widens the scope
+    ("outside", "unbound", False),  # an unreadable scope owns every untracked file
+    ("nested", None, False),  # a nested checkout's files are not listed, so it may hold task work
+    ("bare", None, False),  # a nested bare repository's commits may hold work the delivery does not
+    ("stat-hidden", None, False),  # a tracked edit the worker's stat settings would hide from status
 ])
-def test_snapshot_separates_unrelated_untracked_state(tmp_path, leftover, grants, unrelated):
+def test_snapshot_separates_unrelated_untracked_state(tmp_path, case, grants, unrelated):
     """Defect class: settlement failed a pushed delivery for scratch the task does not own (#524).
 
     Untracked files outside the effective owned paths are generated or unrelated state; anything the
-    scope covers, or cannot be shown not to cover, stays uncommitted task work.
+    scope covers, or cannot be shown not to cover, stays uncommitted task work. The snapshot reads the
+    tree as removal does, byte for byte and without trusting the worker's stat settings.
     """
     work = tmp_path / "work"
     run_git(tmp_path, "init", "-q", "-b", "main", str(work))
@@ -162,23 +173,41 @@ def test_snapshot_separates_unrelated_untracked_state(tmp_path, leftover, grants
         run_git(work, "config", key, value)
     (work / ".gitignore").write_text("*.log\n")
     (work / "delivered.txt").write_text("delivery\n")
+    os.utime(work / "delivered.txt", (1_000_000_000, 1_000_000_000))  # older than the index: not racily clean
     run_git(work, "add", ".")
     run_git(work, "commit", "-q", "-m", "delivery")
-    if leftover == "nested/":
-        run_git(work, "init", "-q", "nested")
-        (work / "nested" / "scratch.txt").write_text("nested\n")
-    else:
-        (work / leftover).parent.mkdir(exist_ok=True)
-        (work / leftover).write_text("left over\n")
+    leftovers ={"line-breaks": LINE_BREAK_NAMES, "ignored": ["scratch/out.log"]}.get(case, ["scratch/notes.txt"])
+    (work / "scratch").mkdir()
+    for name in leftovers:
+        (work / name).write_text(f"left over {name!r}\n")
+    if case == "nested":
+        run_git(work, "init", "-q", "scratch/nested")
+        (work / "scratch/nested/inner.txt").write_text("nested\n")
+    elif case == "bare":
+        run_git(work, "init", "-q", "--bare", "scratch/nested.git")
+    elif case == "stat-hidden":
+        # Same size and timestamps on a new inode: only the stat checks the worker switches off can see it.
+        before, rewrite = (work / "delivered.txt").stat(), work / "rewrite.tmp"
+        rewrite.write_text("DELIVERY\n")
+        os.utime(rewrite, ns=(before.st_atime_ns, before.st_mtime_ns))
+        rewrite.replace(work / "delivered.txt")
+        run_git(work, "config", "core.trustctime", "false")
+        run_git(work, "config", "core.checkStat", "minimal")
+        # Hidden from a plain status; --no-optional-locks keeps that probe from refreshing the index.
+        assert "delivered.txt" not in run_git(work, "--no-optional-locks", "status", "--porcelain")
     record = {"task_id": "probe", "run_nonce": "nonce", "owned_paths": ["delivered.txt"],
               "worktree_base_sha": run_git(work, "rev-parse", "HEAD")}
     if grants is not None:
         record["owned_path_grants"] = [{"task_id": "probe", "run_nonce": "other" if grants == "unbound" else "nonce",
                                         "grant_id": "g1", "owned_paths": ["scratch"]}]
     observed = git.snapshot_delivery(SimpleNamespace(worktree=work, mode="read-only"), record)
-    assert observed["worktree_dirty_on_exit"] is (leftover != "ignored.log")
-    assert observed["worktree_untracked_only_on_exit"] is (leftover != "ignored.log")
+    assert observed["worktree_dirty_on_exit"] is (case != "ignored")
+    assert observed["worktree_untracked_only_on_exit"] is (case not in {"ignored", "stat-hidden"})
     assert observed["worktree_unrelated_only_on_exit"] is unrelated
+    changed, untracked = git._tree_changes(work)  # removal's inventory: the same exact names
+    assert bool(changed) is (case == "stat-hidden")
+    if case in {"outside", "line-breaks"}:
+        assert sorted(untracked) == sorted(leftovers)
 
 
 @pytest.mark.parametrize("model,status,error", [
