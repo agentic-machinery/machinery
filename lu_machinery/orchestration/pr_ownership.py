@@ -1157,25 +1157,41 @@ def _checkout_slug(cwd: Path) -> str | None:
     One read of every origin URL (fetch and push), with Git's repository redirects (``GIT_*``) cleared.
     Each value must come from the checkout's repository or worktree configuration (includes followed), and
     all must name the same GitHub repository: a user-level, system-level or command-line value applies to
-    any directory, and distinct values leave the checkout's repository ambiguous.
+    any directory, and distinct values, or an insteadOf rule that rewrites one, leave the checkout's
+    repository ambiguous.
     """
     from lu_machinery.fleet.pr_identity import _GITHUB_REMOTE_PATTERNS
 
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     try:
         done = subprocess.run(
-            ["git", "config", "--show-scope", "--includes", "--get-regexp", r"^remote\.origin\.(push)?url$"],
+            ["git", "config", "--show-scope", "--includes", "--get-regexp",
+             r"^(remote\.origin\.(push)?url|url\..*\.(push)?insteadof)$"],
             cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    slugs: set[str | None] = set()
+    rows: list[tuple[str, str | None]] = []
+    urls: list[str] = []
+    rewrites: list[str] = []
     for line in done.stdout.splitlines():
         scope, _, entry = line.partition("\t")
-        url = entry.partition(" ")[2].strip()
+        key, _, url = entry.partition(" ")
+        url = url.strip()
+        if not key.startswith("remote.origin."):
+            rewrites.append(url)
+            continue
         match = next((m for m in (pattern.match(url) for pattern in _GITHUB_REMOTE_PATTERNS) if m), None)
-        slugs.add(f"{match.group(1)}/{match.group(2)}" if match and scope in {"local", "worktree"} else None)
-    return slugs.pop() if done.returncode == 0 and len(slugs) == 1 else None
+        rows.append((key, f"{match.group(1)}/{match.group(2)}" if match and scope in {"local", "worktree"} else None))
+        urls.append(url)
+    slugs = [slug for _, slug in rows]
+    # GitHub names are case-insensitive. A repository needs a fetch URL; a push URL only has to agree with it.
+    # A URL that an insteadOf rule rewrites is not the repository Git uses.
+    if done.returncode or None in slugs or len({str(slug).casefold() for slug in slugs}) != 1:
+        return None
+    if any(url.startswith(prefix) for url in urls for prefix in rewrites if prefix):
+        return None
+    return next((slug for key, slug in rows if key == "remote.origin.url"), None)
 
 
 def _repo_or_checkout(repo: str | None) -> str:

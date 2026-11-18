@@ -580,7 +580,21 @@ def test_checkout_slug_reads_only_the_checkouts_own_origin(tmp_path, monkeypatch
     git(checkout, "remote", "set-url", "origin", url)
     git(checkout, "config", "remote.origin.pushurl", "git@github.com:learn-ukrainian/machinery.git")
     assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    git(checkout, "config", "remote.origin.pushurl", "git@github.com:Learn-Ukrainian/Machinery.git")
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"  # names differ only in case
     git(checkout, "config", "remote.origin.pushurl", "https://github.com/sample/elsewhere.git")
+    assert own._checkout_slug(checkout) is None
+    # An insteadOf rule that rewrites the origin means Git uses another repository; one that does not match is inert.
+    git(checkout, "config", "remote.origin.pushurl", url)
+    git(checkout, "config", "url.https://github.com/sample/.insteadOf", "https://github.com/learn-ukrainian/")
+    assert own._checkout_slug(checkout) is None
+    git(checkout, "config", "--unset", "url.https://github.com/sample/.insteadOf")
+    git(checkout, "config", "url.https://github.com/sample/.insteadOf", "https://example.org/")
+    assert own._checkout_slug(checkout) == "learn-ukrainian/machinery"
+    git(checkout, "config", "--unset", "url.https://github.com/sample/.insteadOf")
+    # A push URL alone is not a repository: Git has no fetch origin there.
+    git(checkout, "config", "--unset-all", "remote.origin.url")
+    git(checkout, "config", "remote.origin.pushurl", url)
     assert own._checkout_slug(checkout) is None
 
 
