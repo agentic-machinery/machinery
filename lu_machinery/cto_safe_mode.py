@@ -21,12 +21,14 @@ CTO seat explicitly with ``--initiator claude-cto`` (or a session id ``claude-ct
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
 
 from lu_machinery import config
 from lu_machinery.common import json_depth
+from lu_machinery.common.safe_open import safe_open_below
 
 CTO_SEAT = "claude-cto"
 _WORKER_MARKERS = ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER")
@@ -54,18 +56,33 @@ def is_cto_caller(environment: Mapping[str, str], initiator: str | None = None) 
     return environment.get("SESSION_SEAT") == "cto" or environment.get("SESSION_EPIC") == "epics"
 
 
+def _read_bounded(path: Path) -> bytes:
+    """At most ``_MAX_BYTES + 1`` bytes of a regular file we own, opened without following or blocking.
+
+    Only a missing parent directory or a missing entry raises ``FileNotFoundError``.
+    """
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        fd = safe_open_below(directory, path.name, os.O_RDONLY)
+    finally:
+        os.close(directory)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read(_MAX_BYTES + 1)
+
+
 def read_state(path: Path | None = None) -> dict | None:
     """``None`` when the file is absent; the validated record when present; ``SafeModeError`` otherwise."""
     path = path or safe_mode_file()
     try:
-        raw = path.read_bytes()
+        raw = _read_bounded(path)
     except FileNotFoundError:
         return None
     except OSError as exc:
+        # A symlink (dangling or not), FIFO, directory or foreign-owned entry is present but no state record.
         raise SafeModeError(f"cannot be read ({type(exc).__name__})") from None
+    if len(raw) > _MAX_BYTES:
+        raise SafeModeError(f"is larger than {_MAX_BYTES} bytes")
     try:
-        if len(raw) > _MAX_BYTES:
-            raise ValueError("too large")
         data = json_depth.loads(raw.decode("utf-8"), max_depth=8)
     except (UnicodeError, ValueError, RecursionError):
         raise SafeModeError("is not a JSON object") from None

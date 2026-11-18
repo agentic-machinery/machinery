@@ -1045,7 +1045,10 @@ def _cto_seat(monkeypatch, tmp_path, body, *, seat=True):
         monkeypatch.setenv("SESSION_SEAT", "cto")
     if body is not None:
         path.parent.mkdir()
-        path.write_text(body if isinstance(body, str) else json.dumps(body))
+        if callable(body):
+            body(path)
+        else:
+            path.write_text(body if isinstance(body, str) else json.dumps(body))
     return path
 
 
@@ -1068,8 +1071,13 @@ def test_cto_write_dispatch_runs_without_a_safe_mode_file(admission_dispatch, tm
     assert [record["task_id"] for record in admission_dispatch.spawned] == ["adm-worker"]
 
 
-@pytest.mark.parametrize("body", ["{not json", json.dumps({**_SAFE_MODE, "generation": "3"}), "[]"],
-                         ids=["syntax", "field-type", "not-object"])
+@pytest.mark.parametrize("body", [
+    "{not json", json.dumps({**_SAFE_MODE, "generation": "3"}), "[]",
+    json.dumps({**_SAFE_MODE, "reason": "x" * 70_000}),
+    lambda path: path.symlink_to(path.with_name("missing-target")),
+    lambda path: os.mkfifo(path),
+    lambda path: path.mkdir(),
+], ids=["syntax", "field-type", "not-object", "oversized", "dangling-symlink", "fifo-without-writer", "directory"])
 def test_malformed_cto_safe_mode_file_refuses_fail_closed(admission_dispatch, tmp_path, monkeypatch, capsys, body):
     """Defect class: an unreadable safe-mode file is treated as no safe mode (fail open)."""
     _cto_seat(monkeypatch, tmp_path, body)
@@ -1078,11 +1086,15 @@ def test_malformed_cto_safe_mode_file_refuses_fail_closed(admission_dispatch, tm
     assert not admission_dispatch.spawned
 
 
-def test_cto_safe_mode_keeps_read_only_dispatch(admission_dispatch, tmp_path, monkeypatch, capsys):
-    """Defect class: safe mode blocks the read-only diagnosis the CTO needs."""
+@pytest.mark.parametrize("mode,flags", [("read-only", ()), ("workspace-write", ("--print-advisory-binding",))],
+                         ids=["read-only", "advisory-binding"])
+def test_cto_safe_mode_keeps_read_only_dispatch(admission_dispatch, tmp_path, monkeypatch, capsys, mode, flags):
+    """Defect class: safe mode blocks the read-only diagnosis the CTO needs, or the advisory binding it computes."""
     _cto_seat(monkeypatch, tmp_path, _SAFE_MODE)
-    assert admission_dispatch.dispatch(mode="read-only") == 0
-    assert "CTO_SAFE_MODE" not in capsys.readouterr().err
+    assert admission_dispatch.dispatch(*flags, mode=mode) == 0
+    captured = capsys.readouterr()
+    assert "CTO_SAFE_MODE" not in captured.err
+    assert bool(flags) is (len(captured.out.strip()) == 64)
 
 
 def test_cto_safe_mode_leaves_a_dispatched_worker_alone(admission_dispatch, tmp_path, monkeypatch, capsys):

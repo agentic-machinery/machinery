@@ -378,8 +378,9 @@ def _dispatch(args) -> int:
         rules_core.require_core()
     except rules_core.RulesCoreMissing as exc:
         raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
-    # A CTO seat in safe mode starts no new write work; read-only diagnosis still runs (cto_safe_mode).
-    if args.mode != "read-only" and (
+    # A CTO seat in safe mode starts no new write work; read-only diagnosis, including the advisory binding
+    # digest it computes from a proposed write dispatch's arguments, still runs (cto_safe_mode).
+    if args.mode != "read-only" and not args.print_advisory_binding and (
         refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
     ):
         raise host_admission.Refused(f"❌ {refusal}", 2)
