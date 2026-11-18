@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import runpy
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -19,6 +20,8 @@ from typing import Any, cast
 
 import yaml
 
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 
 def _product_hooks() -> Any:
     """Load the product hook named by the product checkout's bakeoff configuration.
@@ -30,7 +33,7 @@ def _product_hooks() -> Any:
     from lu_machinery.ops.product_entry import load_configured_module
 
     root = product_root()
-    payload = json.loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"))
+    payload = _json_loads((root / "scripts/build/bakeoff_hooks.v1.json").read_text(encoding="utf-8"), max_depth=512)
     return load_configured_module(payload["module"], product_root=root)
 
 
@@ -142,7 +145,7 @@ def _hard_failed(checks: Sequence[Mapping[str, Any]]) -> bool:
 
 
 def _read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return _json_loads(path.read_text(encoding="utf-8"), max_depth=512)
 
 
 def _artifact_name_from_info(info: str, hooks: Any) -> str | None:
@@ -170,7 +173,7 @@ def _best_effort_artifacts(raw_output: str, hooks: Any) -> dict[str, str]:
             artifacts[name] = body + "\n"
             continue
         try:
-            parsed = json.loads(body)
+            parsed = _json_loads(body, max_depth=512)
         except json.JSONDecodeError:
             artifacts[name] = body + "\n"
         else:

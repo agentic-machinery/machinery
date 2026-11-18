@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import providers
@@ -100,7 +101,7 @@ def build(
         from lu_machinery.dispatcher.providers.agy import continuation
 
         invocation = continuation(invocation, conversation)
-        launch_prompt = json.loads(invocation.stdin or b"")["message"]["content"][0]["text"].encode("utf-8")
+        launch_prompt = json_depth.loads(invocation.stdin or b"", max_depth=512)["message"]["content"][0]["text"].encode("utf-8")
     body = spec.prompt_file.read_bytes() if launch_prompt is None else launch_prompt
     if spec.agent in {"claude", "codex", "cursor", "agy"}:
         body = prompt(spec, body)
@@ -118,7 +119,7 @@ def build(
         body = core.encode("utf-8") + b"\n\n" + body
     stdin: bytes | None = body
     if spec.agent == "agy":
-        message = json.loads(invocation.stdin or b"")
+        message = json_depth.loads(invocation.stdin or b"", max_depth=512)
         message["message"]["content"][0]["text"] = body.decode("utf-8")
         stdin = (json.dumps(message) + "\n").encode("utf-8")
     elif spec.agent == "opencode":

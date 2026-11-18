@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+from lu_machinery.common import json_depth
+
 
 def _strip_leading_fence(text: str) -> str:
     """Strip one leading markdown code fence header when present."""
@@ -73,7 +75,7 @@ def extract_json_object(response: str) -> dict:
 
         candidate = text[start : end + 1]
         try:
-            payload = json.loads(candidate)
+            payload = json_depth.loads(candidate, max_depth=512)
         except json.JSONDecodeError:
             search_from = start + 1
             continue

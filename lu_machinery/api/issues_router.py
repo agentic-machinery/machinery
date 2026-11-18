@@ -29,7 +29,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.orchestration import issue_stream_audit as audit
 
 from .monitor_context import MonitorContext, get_ctx, resolve_context
@@ -157,7 +157,7 @@ def _fetch_issues(limit: int, ctx: MonitorContext | None = None) -> dict[str, An
         }
 
     try:
-        payload = json.loads(stdout or "[]")
+        payload = json_depth.loads(stdout or "[]", max_depth=512)
     except json.JSONDecodeError:
         logger.warning("gh issue list returned invalid JSON", exc_info=True)
         return {"categories": {}, "count": 0, "error": "invalid gh json"}

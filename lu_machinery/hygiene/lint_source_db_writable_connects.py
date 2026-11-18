@@ -39,6 +39,7 @@ from functools import cached_property, lru_cache, wraps
 from pathlib import Path
 from threading import RLock
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, in_tree_source, product_root
 from lu_machinery.lib.readonly_sqlite import (
     PRODUCT_WRITER_DECLARATION,
@@ -124,7 +125,7 @@ CONFIGURED_LOADER = "load_configured_module"
 def load_allowlist(manifest: Path | None = None, *, rows: list | None = None) -> tuple[AllowedReference, ...]:
     """Validated ``rows``, else the rows of ``manifest``; machinery's own packaged manifest by default."""
     if rows is None:
-        rows = json.loads((REFERENCE_MANIFEST if manifest is None else manifest).read_text())
+        rows = json_depth.loads((REFERENCE_MANIFEST if manifest is None else manifest).read_text(), max_depth=512)
     try:
         entries = tuple(
             AllowedReference(**{**row, "calls": tuple(row.get("calls", ())), "functions": tuple(row.get("functions", ()))})
@@ -684,7 +685,7 @@ def load_scan_allowlist(root: Path) -> tuple[AllowedReference, ...]:
         raise ValueError(f"unusable product SQLite declaration {PRODUCT_WRITER_DECLARATION}: {exc.reason}") from None
     if not in_tree_source() and any(row["path"].startswith(_mp("")) for row in rows):
         raise ValueError("product SQLite declaration cannot authorize machinery package files")
-    return load_allowlist(rows=[*rows, *_hosted_package_rows(root, json.loads(REFERENCE_MANIFEST.read_text()))])
+    return load_allowlist(rows=[*rows, *_hosted_package_rows(root, json_depth.loads(REFERENCE_MANIFEST.read_text(), max_depth=512))])
 
 
 STORE_CLASSES = ("store_path", "raw_store_constructor", "test_import_access")
@@ -1093,7 +1094,7 @@ def source_blob_id(source: str, algorithm: str = "sha1") -> str:
 
 def baseline_entries(baseline: Path | None = None) -> set[StoreFinding]:
     """Rows of ``baseline``; machinery's own packaged baseline by default."""
-    return {StoreFinding(**entry) for entry in json.loads((BASELINE if baseline is None else baseline).read_text())["entries"]}
+    return {StoreFinding(**entry) for entry in json_depth.loads((BASELINE if baseline is None else baseline).read_text(), max_depth=512)["entries"]}
 
 
 
@@ -1109,7 +1110,7 @@ def baseline_policy_violations(root: Path) -> list[str]:
     # The policy pins the product's committed baseline (PRODUCT_BASELINE) as before.
     if not (root / ".git").exists() or baseline != root / PRODUCT_BASELINE:
         return []
-    current = json.loads(baseline.read_text())
+    current = json_depth.loads(baseline.read_text(), max_depth=512)
     current_entries = {StoreFinding(**row) for row in current["entries"]}
     rel = PRODUCT_BASELINE
     initial_correction = None
@@ -1118,7 +1119,7 @@ def baseline_policy_violations(root: Path) -> list[str]:
                                 capture_output=True, text=True, timeout=30)
         if result.returncode:
             continue
-        previous = json.loads(result.stdout)
+        previous = json_depth.loads(result.stdout, max_depth=512)
         prior_entries = {StoreFinding(**row) for row in previous["entries"]}
         if (previous["base_commit"] != current["base_commit"] or not current_entries <= prior_entries
                 or previous.get("file_counts", {}) != current.get("file_counts", {})):
@@ -1248,8 +1249,8 @@ def find_violations(
     seen = set()
     baseline = baseline_entries(baseline_file) if apply_baseline else set()
     if apply_baseline and baseline_file != BASELINE:
-        baseline |= {StoreFinding(**row) for row in _hosted_package_rows(root, json.loads(BASELINE.read_text())["entries"])}
-    payload = json.loads(baseline_file.read_text()) if apply_baseline else {}
+        baseline |= {StoreFinding(**row) for row in _hosted_package_rows(root, json_depth.loads(BASELINE.read_text(), max_depth=512)["entries"])}
+    payload = json_depth.loads(baseline_file.read_text(), max_depth=512) if apply_baseline else {}
     base_blobs = base_blob_ids(root, payload["base_commit"]) if "base_commit" in payload else {}
     by_path = {}
     for finding in baseline:

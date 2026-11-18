@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - direct file invocation
         sys.path.insert(0, str(_install_root))
     from lu_machinery.common.repo_root import MachineryConfigError, state_root  # type: ignore[no-redef]
     from lu_machinery.path_safety import assert_delete_target  # type: ignore[no-redef]
+from lu_machinery.common import json_depth
 
 SCHEMA = "codex.rollout-reconcile.v1"
 STATE_PATTERN = re.compile(r"state_[A-Za-z0-9][A-Za-z0-9._-]*\.sqlite\Z")
@@ -171,7 +172,7 @@ def _load_pins(home: Path) -> tuple[set[str], list[str]]:
     if not path.exists():
         return set(), []
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         return set(), [f"cannot read pinned-thread state: {exc.__class__.__name__}"]
     values = payload.get("pinned-thread-ids", payload.get("pinned_thread_ids")) if isinstance(payload, dict) else None

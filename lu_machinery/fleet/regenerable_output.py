@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
-import json
 import os
 import re
 import stat
@@ -19,6 +18,7 @@ from urllib.parse import quote
 
 from packaging.requirements import Requirement
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.nofollow_walk import ComponentOpenError
 from lu_machinery.orchestration.worktree_artifacts import REGENERABLE_CACHE_DIRECTORIES
 
@@ -92,7 +92,7 @@ def _release_is_recoverable(worktree: Path, stem: str, pointer: dict[str, Any]) 
         timeout=10,
         fresh=True,
     )
-    listing = json.loads(result.stdout)
+    listing = json_depth.loads(result.stdout, max_depth=512)
     assets = listing.get("assets") if isinstance(listing, dict) else None
     if not isinstance(assets, list):
         return False
@@ -150,7 +150,7 @@ def committed_release_pins(worktree: Path, tracked: set[str]) -> dict[str, tuple
             command_file = artifacts._read_preserved_bytes(worktree / generator, root=worktree)
             if command_file.file_type != "regular" or command_file.payload != command_bytes:
                 continue
-            pointer_data = json.loads(committed)
+            pointer_data = json_depth.loads(committed, max_depth=512)
             if not isinstance(pointer_data, dict):
                 continue
             if not str(pointer_data.get("asset_url", "")).startswith(
@@ -305,7 +305,7 @@ class CopyProofRun:
 
         for path, (original, receipts) in self.used_archives.items():
             with artifacts.task_state_lock(path):
-                current = json.loads(path.read_text())
+                current = json_depth.loads(path.read_text(), max_depth=512)
                 if (current.get("task_id"), current.get("run_nonce")) != (
                     original.get("task_id"), original.get("run_nonce")
                 ):
@@ -489,7 +489,7 @@ def _parse_dependency_input(filename: str, payload: bytes) -> None:
     """Parse dependency inputs using their format's parser; invalid input raises ValueError."""
     text = payload.decode("utf-8")
     if filename == "package-lock.json":
-        if not isinstance(json.loads(text), dict):
+        if not isinstance(json_depth.loads(text, max_depth=512), dict):
             raise ValueError("package lock must be a JSON object")
     elif filename in {"uv.lock", "poetry.lock"}:
         tomllib.loads(text)

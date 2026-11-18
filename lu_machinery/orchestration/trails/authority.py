@@ -16,6 +16,7 @@ from typing import Any, Protocol
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 
 from .models import TrailRun, TrailRunnerError
@@ -85,7 +86,7 @@ def _validator() -> Draft202012Validator:
     if _AUTHORITY_RECEIPT_VALIDATOR is not None:
         return _AUTHORITY_RECEIPT_VALIDATOR
     try:
-        schema = json.loads(AUTHORITY_RECEIPT_SCHEMA_PATH.read_text(encoding="utf-8"))
+        schema = json_depth.loads(AUTHORITY_RECEIPT_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise AuthorityReceiptError(f"cannot load authority receipt schema: {exc}") from exc
     if not isinstance(schema, dict):

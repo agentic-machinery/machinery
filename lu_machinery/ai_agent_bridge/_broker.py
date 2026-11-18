@@ -7,6 +7,7 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 
 from . import _config
@@ -87,7 +88,7 @@ def _is_task_locked(agent: str, task_id: str) -> bool:
         return False
 
     try:
-        data = json.loads(pid_file.read_text())
+        data = json_depth.loads(pid_file.read_text(), max_depth=512)
         pid = data.get("pid", 0)
         if pid == os.getpid():
             return False  # It's us — not locked
@@ -333,7 +334,7 @@ def _cleanup_stale_pids(action: str, max_age_hours: int, dry_run: bool) -> int:
 
     for pid_file in _config.PID_DIR.glob("*.json"):
         try:
-            data = json.loads(pid_file.read_text())
+            data = json_depth.loads(pid_file.read_text(), max_depth=512)
             pid = data.get("pid", 0)
             try:
                 os.kill(pid, 0)
@@ -429,7 +430,7 @@ def _categorize_pid_files(pid_files: list[Path]) -> tuple[list, list]:
     stale = []
     for pf in sorted(pid_files):
         try:
-            data = json.loads(pf.read_text())
+            data = json_depth.loads(pf.read_text(), max_depth=512)
             pid = data.get("pid", 0)
             try:
                 os.kill(pid, 0)

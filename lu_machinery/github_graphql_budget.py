@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.publish.github import read
 
 TIMEOUT_SECONDS = 10.0
@@ -141,7 +142,7 @@ def probe_graphql_budget(
         return _payload(checked_at=checked_at, exhausted=None, error=local_error)
 
     try:
-        decoded = json.loads(stdout)
+        decoded = json_depth.loads(stdout, max_depth=512)
     except (TypeError, json.JSONDecodeError):
         return _payload(
             checked_at=checked_at,

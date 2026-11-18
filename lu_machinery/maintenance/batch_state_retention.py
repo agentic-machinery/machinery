@@ -32,7 +32,7 @@ _PACKAGE_DIR = Path(os.path.abspath(__file__)).parents[1]
 for _path in (_PACKAGE_DIR.parent, _PACKAGE_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
@@ -407,7 +407,7 @@ def _phase_snapshots(snap_fd: int) -> tuple[dict[str, str], dict[str, str]] | No
         if raw is None:
             return None
         try:
-            payload = json.loads(raw)
+            payload = json_depth.loads(raw, max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(payload, dict):
@@ -451,7 +451,7 @@ def _read_record_at(parent_fd: int, record_name: str) -> dict[str, Any] | None:
     if raw is None:
         return None
     try:
-        loaded = json.loads(raw)
+        loaded = json_depth.loads(raw, max_depth=512)
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return loaded if isinstance(loaded, dict) else None

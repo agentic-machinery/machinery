@@ -105,7 +105,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import os
 import re
 import subprocess
@@ -117,7 +116,7 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.review.app_bot_authorship import verified_app_bot_login
 
 ENFORCE_ENV = "ATTRIBUTION_ENFORCE"
@@ -791,7 +790,7 @@ def _github_get_from_env() -> GitHubGet | None:
         if completed.returncode != 0:
             raise RuntimeError(f"GET {path} failed: gh exit {completed.returncode}")
         try:
-            return json.loads(completed.stdout)
+            return json_depth.loads(completed.stdout, max_depth=512)
         except ValueError as exc:
             raise RuntimeError(f"GET {path} failed: undecodable response") from exc
 

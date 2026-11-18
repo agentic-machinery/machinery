@@ -44,6 +44,7 @@ from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.guardrails import worktree_containment as wc
 
@@ -355,7 +356,7 @@ def collect_stale_snapshots(state: Path, now: float | None = None) -> int:
 
 def _load_snapshot(path: Path, session_id: str, tool_use_id: str) -> dict | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
     if (
@@ -483,7 +484,7 @@ def finish_call(
 
 def load_record(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) and data.get("schema") == SCHEMA else None

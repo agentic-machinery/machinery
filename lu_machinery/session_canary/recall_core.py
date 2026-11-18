@@ -30,6 +30,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.epic_selector import validate_epic
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.session_canary import handoff_select
@@ -292,7 +293,7 @@ def cmd_questions(args: argparse.Namespace) -> int:
     if not probe_path.is_file():
         print(f"error: missing probe {probe_path}; run mint first", file=sys.stderr)
         return 1
-    probe = json.loads(probe_path.read_text(encoding="utf-8"))
+    probe = json_depth.loads(probe_path.read_text(encoding="utf-8"), max_depth=512)
     anchors = probe.get("anchors") or []
     questions = {a["id"]: a["q"] for a in anchors if a.get("id") and a.get("q")}
     out = Path(args.out) if args.out else out_dir / "questions.json"
@@ -398,7 +399,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             current = handoff_select.read_consumed_handoff(handoff_path, meta_path=recorded_meta)
             recorded_sha = None
             if recorded_meta.is_file():
-                recorded_sha = json.loads(recorded_meta.read_text(encoding="utf-8")).get("handoff_sha256")
+                recorded_sha = json_depth.loads(recorded_meta.read_text(encoding="utf-8"), max_depth=512).get("handoff_sha256")
             changed = handoff_select.handoff_changed_since_mint(recorded_sha, current)
             payload["handoff_changed_since_mint"] = changed
             verdict_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -416,7 +417,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             import contextlib
 
             with contextlib.suppress(json.JSONDecodeError, OSError):
-                stream_id = json.loads(meta_path.read_text(encoding="utf-8")).get("stream_id") or stream_id
+                stream_id = json_depth.loads(meta_path.read_text(encoding="utf-8"), max_depth=512).get("stream_id") or stream_id
 
         stream_id = handoff_select.resolve_stream_id(epic, getattr(args, "stream", None) or stream_id)
 

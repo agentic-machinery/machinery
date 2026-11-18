@@ -21,7 +21,6 @@ Missing or invalid coverage and git failures exit non-zero.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -30,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from lu_machinery.ci.check_large_files import prefetch_missing_blobs
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 _SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 _ZERO_SHA = "0" * 40
@@ -233,7 +232,7 @@ def _github_json(endpoint: str) -> dict:
         result = github_client.run(
             ["gh", "api", endpoint], fresh=True, allow_stale=False, capture_output=True, text=True, check=True, timeout=30
         )
-        payload = json.loads(result.stdout)
+        payload = json_depth.loads(result.stdout, max_depth=512)
         if not isinstance(payload, dict):
             raise ValueError("invalid response")
         return payload

@@ -20,6 +20,8 @@
 #   Each needs the product checkout, which this repository does not hold.
 
 # [run]
+tests/common/test_json_depth.py
+tests/lint/test_json_readers.py
 tests/property/test_path_safety_props.py
 tests/property/test_attribution_roundtrip_props.py
 tests/property/test_publish_github_guards_props.py

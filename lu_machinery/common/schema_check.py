@@ -9,10 +9,12 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from lu_machinery.common import json_depth
+
 
 @lru_cache(maxsize=256)
 def _check_canonical(canonical: str) -> None:
-    Draft202012Validator.check_schema(json.loads(canonical))
+    Draft202012Validator.check_schema(json_depth.loads(canonical, max_depth=512))
 
 
 def check_schema(schema: Mapping[str, Any]) -> None:
@@ -26,7 +28,7 @@ def check_schema(schema: Mapping[str, Any]) -> None:
     """
     try:
         canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
-        round_trips = json.loads(canonical) == schema
+        round_trips = json_depth.loads(canonical, max_depth=512) == schema
     except (TypeError, ValueError):
         round_trips = False
     if not round_trips:

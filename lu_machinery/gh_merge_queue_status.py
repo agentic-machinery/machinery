@@ -25,7 +25,7 @@ from lu_machinery.ci.ci_timings import (
     extract_pr_number,
     resolve_repository,
 )
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.publish.github import read
 
 
@@ -371,7 +371,7 @@ def fetch_live_status(
         raise RuntimeError(f"GraphQL request timed out after {timeout}s.") from exc
 
     try:
-        data = json.loads(proc.stdout)
+        data = json_depth.loads(proc.stdout, max_depth=512)
     except json.JSONDecodeError as exc:
         err_msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"Failed to parse GraphQL response (exit {proc.returncode}): {err_msg}") from exc
@@ -406,7 +406,7 @@ def fetch_live_status(
             check=False,
         )
         if runs_proc.returncode == 0 and runs_proc.stdout.strip():
-            runs_data = json.loads(runs_proc.stdout)
+            runs_data = json_depth.loads(runs_proc.stdout, max_depth=512)
             if isinstance(runs_data, dict):
                 actions_runs = runs_data.get("workflow_runs", [])
     except Exception:
@@ -436,7 +436,7 @@ def fetch_live_status(
                 check=False,
             )
             if rl_proc.returncode == 0 and rl_proc.stdout.strip():
-                rl_data = json.loads(rl_proc.stdout)
+                rl_data = json_depth.loads(rl_proc.stdout, max_depth=512)
                 if isinstance(rl_data, list):
                     actions_runs = rl_data
         except Exception:
@@ -486,7 +486,7 @@ def check_and_report_pr_status(
     if fixture_file:
         try:
             with open(fixture_file, encoding="utf-8") as f:
-                fix_data = json.load(f)
+                fix_data = json_depth.load(f, max_depth=512)
         except Exception as exc:
             if json_only:
                 print(
@@ -500,7 +500,7 @@ def check_and_report_pr_status(
         if actions_fixture_file:
             try:
                 with open(actions_fixture_file, encoding="utf-8") as f:
-                    act_data = json.load(f)
+                    act_data = json_depth.load(f, max_depth=512)
                     if isinstance(act_data, dict):
                         actions_runs = act_data.get("workflow_runs") or act_data.get("runs") or []
                     elif isinstance(act_data, list):

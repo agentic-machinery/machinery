@@ -26,9 +26,9 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.review import findings_db
 from lu_machinery.review.reviewer_resolver import UNRESOLVED_AUTHOR_FAMILIES, resolve_author_family
@@ -195,7 +195,7 @@ def _findings_of(conn: SQLiteConnection, attempt: sqlite3.Row) -> list[dict[str,
         "SELECT finding_json FROM findings WHERE review_id = ? AND attempt_id = ? ORDER BY rowid",
         (attempt["review_id"], attempt["attempt_id"]),
     ).fetchall()
-    return [json.loads(row["finding_json"]) for row in rows]
+    return [json_depth.loads(row["finding_json"], max_depth=512) for row in rows]
 
 
 def record_agreement(

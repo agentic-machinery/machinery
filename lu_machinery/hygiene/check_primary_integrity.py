@@ -56,6 +56,7 @@ except ModuleNotFoundError:  # direct file-path invocation
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from lu_machinery.common.repo_root import product_root
     from lu_machinery.common.safe_unit_install import InstallError, install_unit, open_state_log
+from lu_machinery.common import json_depth
 
 
 def _machinery_top() -> str:
@@ -271,7 +272,7 @@ def _load_state(state_dir: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        state: dict[str, Any] = json.loads(path.read_text())
+        state: dict[str, Any] = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError):
         return {}
     return state

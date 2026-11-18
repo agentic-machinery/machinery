@@ -31,6 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, state_root
 from lu_machinery.github_check_rollup import collapse_status_rollup
 from lu_machinery.opsec.prepublish import publication_boundary, publication_cli
@@ -56,7 +57,7 @@ def repo_root_from_file() -> Path:
 
 def _json_file(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise task_lifecycle.LifecycleError(f"cannot read JSON file {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -200,7 +201,7 @@ class GhGitHubAdapter:
     def _json(self, args: list[str], stdin: str | None = None) -> Any:
         raw = self._run(args, stdin)
         try:
-            return json.loads(raw or "null")
+            return json_depth.loads(raw or "null", max_depth=512)
         except json.JSONDecodeError as exc:
             raise task_lifecycle.LifecycleError(
                 f"GitHub command returned invalid JSON: {args.verb if isinstance(args, Request) else ' '.join(args[:4])}"
@@ -1127,7 +1128,7 @@ def cmd_bind_successor(args: argparse.Namespace) -> int:
                 "PREDECESSOR_LEDGER_MISSING", f"no predecessor lifecycle ledger at {path}; use init"
             ) from exc
         try:
-            predecessor = json.loads(raw.decode("utf-8"))
+            predecessor = json_depth.loads(raw.decode("utf-8"), max_depth=512)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise task_lifecycle.LifecycleError(f"cannot read lifecycle ledger {path}: {exc}") from exc
         if not isinstance(predecessor, dict):
@@ -1170,7 +1171,7 @@ def cmd_bind_pr(args: argparse.Namespace) -> int:
 
 def cmd_evidence(args: argparse.Namespace) -> int:
     path = _state_file(args)
-    details = json.loads(args.details) if args.details else {}
+    details = json_depth.loads(args.details, max_depth=512) if args.details else {}
     if not isinstance(details, dict):
         raise task_lifecycle.LifecycleError("--details must be a JSON object")
     with task_lifecycle.lifecycle_lock(path):

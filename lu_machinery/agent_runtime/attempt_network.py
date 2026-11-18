@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import ctypes
 import ipaddress
-import json
 import os
 import re
 import socket
@@ -19,6 +18,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import project_interpreter
 from lu_machinery.review.isolation import ReviewIsolationError
 
@@ -213,7 +213,7 @@ class AttemptEgress:
                     await proc.wait()
                 if proc.returncode != 0:
                     raise ValueError("DNS unavailable")
-                return json.loads(output)
+                return json_depth.loads(output, max_depth=512)
             finally:
                 if proc.returncode is None:
                     with contextlib.suppress(ProcessLookupError):

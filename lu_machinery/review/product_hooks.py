@@ -18,14 +18,13 @@ missing or unknown field, or names a module outside ``scripts``.
 from __future__ import annotations
 
 import functools
-import json
 import re
 import stat
 import sys
 from pathlib import Path
 from types import ModuleType
 
-from lu_machinery.common import repo_root
+from lu_machinery.common import json_depth, repo_root
 from lu_machinery.ops.product_entry import load_configured_module
 
 SCHEMA = "learn-ukrainian.review-hooks"
@@ -63,7 +62,7 @@ def _module_name(path: Path) -> str:
     if info.st_size > MAX_HOOKS_BYTES:
         raise ProductHooksError("hooks_too_large", f"{HOOKS_REL} is over {MAX_HOOKS_BYTES} bytes")
     try:
-        payload = json.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=_no_duplicates)
+        payload = json_depth.loads(path.read_bytes().decode("utf-8"), object_pairs_hook=_no_duplicates, max_depth=512)
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         raise ProductHooksError("hooks_not_json", f"{HOOKS_REL}: {exc}") from None
     if not isinstance(payload, dict) or set(payload) != _FIELDS:

@@ -19,7 +19,7 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 
 
 def _machinery_top() -> str:
@@ -115,7 +115,7 @@ class GitHub:
             with github_client.http_open(request, opener=self.opener.open, timeout=30) as response:
                 if response.status != 200:
                     raise Unknown("API status unknown")
-                return json.load(response), response.headers.get("link", "")
+                return json_depth.load(response, max_depth=512), response.headers.get("link", "")
         except (URLError, OSError, ValueError, HTTPException, github_client.GitHubRateLimited) as exc:
             raise Unknown("API unavailable or malformed") from exc
 

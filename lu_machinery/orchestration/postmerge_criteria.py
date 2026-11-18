@@ -14,8 +14,7 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.orchestration import task_lifecycle
 from lu_machinery.publish.github import publish, read
@@ -109,10 +108,10 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
 
 def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
     """Inspect only this merged PR's issues; dry-run never writes or escalates."""
-    pr = json.loads(github_client.check_output(
+    pr = json_depth.loads(github_client.check_output(
         ["gh", "pr", "view", str(pr_number), "--json", "state,body,url,closingIssuesReferences"],
         text=True, timeout=60,
-    ))
+    ), max_depth=512)
     if pr["state"] != "MERGED":
         raise ValueError("PR must be MERGED before checking post-merge criteria")
     match = re.fullmatch(r"https://github.com/([^/]+/[^/]+)/pull/\d+", pr["url"])
@@ -120,9 +119,9 @@ def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
         raise ValueError("invalid PR URL")
     reports = []
     for repository, number in closing_issues(pr, match[1]):
-        issue = json.loads(read(
+        issue = json_depth.loads(read(
             "issue", repo=repository, number=number, capture_output=True, text=True, check=True, timeout=60,
-        ).stdout)
+        ).stdout, max_depth=512)
         if issue["state"] not in {"open", "closed"}:
             raise ValueError("issue state unavailable")
         outstanding = [item for item in acceptance_items(issue.get("body") or "") if not item["checked"]]
@@ -155,10 +154,10 @@ def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
                     idempotency_key=f"postmerge-criteria:{key}",
                 )
         marker = f"<!-- postmerge-criteria:{_item_set_key(repository, number, outstanding)} -->"
-        pages = json.loads(read(
+        pages = json_depth.loads(read(
             "comments", repo=repository, number=number, paginate=True, slurp=True,
             capture_output=True, text=True, check=True, timeout=60,
-        ).stdout)
+        ).stdout, max_depth=512)
         if not any(marker in (comment.get("body") or "") for page in pages for comment in page):
             publish(
                 "issue-comment", repo=repository, number=number, body=f"{marker}\n{content}",

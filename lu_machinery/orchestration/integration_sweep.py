@@ -56,6 +56,7 @@ from typing import Any
 
 from lu_machinery.ci.advisory_checks import is_advisory, load_advisory_checks
 from lu_machinery.ci.deploy_paths import DeployPathsError, load_deploy_paths
+from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited, timer
 from lu_machinery.common.repo_root import MachineryConfigError, ProductRootError, product_root
 from lu_machinery.github_check_rollup import group_collapsed_by_name
@@ -664,7 +665,7 @@ def _repair_receipt_blocks(body: str, sha: str) -> bool:
     attested = re.findall(r"(?m)^\s*REPAIR_VERIFIED:\s*([0-9a-f]{64})\s*$", body)
     for path in root.glob("*.json"):
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, UnicodeDecodeError, ValueError):
             return True
         if not isinstance(data, dict) or data.get("candidate_head") != sha:
@@ -1245,7 +1246,7 @@ class GitHubAdapter:
 
     def _json(self, args: list[str]) -> Any:
         try:
-            return json.loads(self._runner(args))
+            return json_depth.loads(self._runner(args), max_depth=512)
         except (ValueError, TypeError) as exc:
             raise SweepError("GitHub returned invalid JSON") from exc
 

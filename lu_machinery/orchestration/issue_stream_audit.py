@@ -47,6 +47,7 @@ from pathlib import Path
 
 import yaml
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import github_slug, machinery_path, product_root, state_root
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.publish.github import Request, request_run
@@ -234,7 +235,7 @@ def _read_refresh_state_raw() -> object | None:
     """Read the raw sidecar JSON (fail-safe to ``None``)."""
     path, _ = refresh_sidecar_paths()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
 
@@ -814,7 +815,7 @@ def _gh_json(args: list[str], timeout_s: float = 30.0, *, cwd: Path | None = Non
         # JSON was emitted in stdout.
         if isinstance(args, Request) and args.verb.startswith("read-subissue") and proc.stdout:
             try:
-                data = json.loads(proc.stdout)
+                data = json_depth.loads(proc.stdout, max_depth=512)
                 if isinstance(data, dict) and "data" in data:
                     return data
             except ValueError:
@@ -822,7 +823,7 @@ def _gh_json(args: list[str], timeout_s: float = 30.0, *, cwd: Path | None = Non
         raise RuntimeError(
             f"gh {args.verb if isinstance(args, Request) else ' '.join(args[:3])}… failed: {proc.stderr.strip()[:200]}"
         )
-    return json.loads(proc.stdout)
+    return json_depth.loads(proc.stdout, max_depth=512)
 
 
 def fetch_open_issues(repo_root: Path | None = None) -> list[dict]:
@@ -1477,7 +1478,7 @@ def run_audit(
 def read_cache(max_age_s: int) -> dict | None:
     path = state_root() / "batch_state/issue_stream_audit.json"
     try:
-        report = json.loads(path.read_text(encoding="utf-8"))
+        report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
     if time.time() - report.get("generated_at", 0) > max_age_s:
@@ -1677,7 +1678,7 @@ def read_membership_index(max_age_s: int, *, cache_path: Path | None = None) -> 
     """
     path = cache_path if cache_path is not None else state_root() / "batch_state/issue_stream_audit.json"
     try:
-        report = json.loads(path.read_text(encoding="utf-8"))
+        report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
     return validate_membership_report(report, max_age_s)

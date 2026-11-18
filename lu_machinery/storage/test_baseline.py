@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -22,7 +23,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-
+# File-path and isolated callers use this release's helper, never an installed copy.
+_json_loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
 def _machinery_top() -> str:
     # Unresolved package directory (design-v1 amendment 1). Never __package__.
     return Path(os.path.abspath(__file__)).parents[1].name
@@ -125,7 +127,7 @@ def capture_junit(
 
 def _load_baseline(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = _json_loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         raise BaselineError(f"cannot read baseline {path}: {exc}") from exc
     if not isinstance(value, dict) or not isinstance(value.get("jobs"), dict):
@@ -410,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         old, new = _load_baseline(args.old), _load_baseline(args.new)
         try:
-            dispositions = json.loads(args.dispositions.read_text(encoding="utf-8"))
+            dispositions = _json_loads(args.dispositions.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError) as exc:
             raise BaselineError(f"cannot read dispositions {args.dispositions}: {exc}") from exc
         if not isinstance(dispositions, dict):

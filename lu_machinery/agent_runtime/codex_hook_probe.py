@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.jsonl import jsonl_lines
+from lu_machinery.common import json_depth
 from lu_machinery.review.model_catalog import (
     ModelCatalogError,
     codex_dispatch_models,
@@ -36,14 +37,18 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
+_json_loads = runpy.run_path(str(Path(__file__).with_name("json_depth.py")))["loads"]
+
+
 def _payload() -> dict:
     try:
-        return json.loads(sys.stdin.read() or "{}")
+        return _json_loads(sys.stdin.read() or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         return {"_decode_error": str(exc)}
 
@@ -191,6 +196,7 @@ def _prepare_probe_repo(parent: Path) -> Path:
     hook_dir = repo / ".codex" / "hooks"
     hook_dir.mkdir(parents=True)
     hook_script = hook_dir / "probe-hook.py"
+    hook_script.with_name("json_depth.py").write_bytes(Path(json_depth.__file__).read_bytes())
     hook_script.write_text(HOOK_SCRIPT, encoding="utf-8")
     hook_script.chmod(0o755)
     (repo / ".codex" / "hooks.json").write_text(
@@ -222,7 +228,7 @@ def _prepare_probe_repo(parent: Path) -> Path:
 def _load_events(log_path: Path) -> list[dict[str, Any]]:
     if not log_path.exists():
         return []
-    return [json.loads(line) for line in jsonl_lines(log_path.read_text(encoding="utf-8")) if line.strip()]
+    return [json_depth.loads(line, max_depth=512) for line in jsonl_lines(log_path.read_text(encoding="utf-8")) if line.strip()]
 
 
 def _tool_names(events: list[dict[str, Any]]) -> list[str]:
@@ -296,7 +302,7 @@ def _summarize(repo: Path, results: list[dict[str, Any]]) -> dict[str, Any]:
 def _self_test() -> int:
     with tempfile.TemporaryDirectory(prefix="codex-hook-probe-selftest-", dir=TEMP_PARENT) as tmp:
         repo = _prepare_probe_repo(Path(tmp))
-        hooks = json.loads((repo / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        hooks = json_depth.loads((repo / ".codex" / "hooks.json").read_text(encoding="utf-8"), max_depth=512)
         command = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         assert ".venv/bin/python" in command
         assert "probe-hook.py" in command

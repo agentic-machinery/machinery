@@ -22,10 +22,10 @@ from urllib.parse import urlparse
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.api.occupancy_local import resolve_launcher_host_id
 from lu_machinery.api.occupancy_sanitize import CLOUD_OBSERVER_HOST_ID, opaque_host_id, safe_field
 from lu_machinery.api.telemetry.transcript_tokens import read_session_record, session_context_telemetry
+from lu_machinery.common import json_depth
 from lu_machinery.orchestration.session_markers import iter_session_markers
 
 DEFAULT_MONITOR = "http://127.0.0.1:8765"
@@ -122,7 +122,7 @@ def post_observer_presence(
     try:
         with urlopen(request, timeout=5) as resp:
             raw_body = resp.read().decode("utf-8")
-        data = json.loads(raw_body)
+        data = json_depth.loads(raw_body, max_depth=512)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise urllib.error.URLError("unreachable") from exc
     except json.JSONDecodeError:

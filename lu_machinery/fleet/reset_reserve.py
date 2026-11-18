@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.api.subscription_usage import get_provider_usage_data, pace_is_deficit
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import main_checkout_root
 from lu_machinery.fleet.credit_lane import CAPACITY_VERIFIED
 
@@ -220,7 +221,7 @@ def load_reset_reserve(
         return unavailable_reserve()
     path = main_checkout_root(Path(repo_root).resolve()) / RESERVE_RELATIVE_PATH
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return unavailable_reserve()
     if not isinstance(payload, dict):

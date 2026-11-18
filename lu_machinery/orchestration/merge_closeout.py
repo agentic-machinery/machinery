@@ -32,8 +32,7 @@ from typing import Any
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
-
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.orchestration import lifecycle_observation
 from lu_machinery.orchestration import scheduled_worktree_cleanup as swc
@@ -146,7 +145,7 @@ def _fetch_pr_info_rest(
         detail = (proc.stderr or proc.stdout or "").strip()
         return None, f"REST PR lookup failed: {detail or f'exit {proc.returncode}'}"
     try:
-        payload = json.loads(proc.stdout or "null")
+        payload = json_depth.loads(proc.stdout or "null", max_depth=512)
     except json.JSONDecodeError as exc:
         return None, f"REST PR lookup returned invalid JSON: {exc}"
 
@@ -210,7 +209,7 @@ def _fetch_pr_info_graphql(
         detail = (proc.stderr or proc.stdout or "").strip()
         return None, f"gh pr view {pr_number} failed: {detail or f'exit {proc.returncode}'}"
     try:
-        payload = json.loads(proc.stdout or "{}")
+        payload = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         return None, f"gh pr view {pr_number} returned invalid JSON: {exc}"
     if not isinstance(payload, dict):
@@ -491,7 +490,7 @@ def _closeout_api(repo_root: Path, request: Request) -> Any:
             request, runner=partial(github_client.run, fresh=True),
             cwd=repo_root, capture_output=True, text=True, check=False, timeout=DEFAULT_TIMEOUT,
         )
-        value = json.loads(proc.stdout) if proc.returncode == 0 else None
+        value = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         raise MergeCloseoutError("CLOSEOUT_EXECUTION_UNREADABLE") from exc
     expected = list if request.fields.get("slurp") else dict

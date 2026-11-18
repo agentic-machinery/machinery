@@ -10,7 +10,6 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import subprocess
 import time
@@ -23,7 +22,7 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.orchestration.task_record_store import (
@@ -753,7 +752,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     if proc.returncode != 0:
         return _unknown_pull_requests("github_unavailable", observed_at)
     try:
-        data = json.loads(proc.stdout or "")["data"]
+        data = json_depth.loads(proc.stdout or "", max_depth=512)["data"]
     except (ValueError, KeyError, TypeError):
         return _unknown_pull_requests("github_invalid_response", observed_at)
     if not isinstance(data, dict):

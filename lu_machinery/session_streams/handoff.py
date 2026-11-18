@@ -7,12 +7,13 @@ it composes ``force_close_expired_session`` + ``open_session`` + typed pins.
 
 from __future__ import annotations
 
-import json
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from lu_machinery.common import json_depth
 
 from .model import EntryType, Lease, LeaseHolder, isoformat_z, parse_timestamp, utc_now
 from .store import SessionStreamStore
@@ -144,7 +145,7 @@ def diagnose_handoff(
     pid = int(lease.get("holder_process_id") or 0)
     remote_ttl = any(
         event.get("session_id") == session_id
-        and json.loads(event.get("proof_json") or "{}").get("kind") == "remote_epic_claim.v1"
+        and json_depth.loads(event.get("proof_json") or "{}", max_depth=512).get("kind") == "remote_epic_claim.v1"
         for event in dump.get("session_events", ())
     )
     probe = getattr(store, "_process_probe", None)

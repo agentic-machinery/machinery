@@ -47,6 +47,7 @@ from types import ModuleType
 from typing import Any
 
 from lu_machinery.agent_identity import RETIRED_AGENT_ALIASES
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.secret_redactor import redact_text, redact_value
 
@@ -472,7 +473,7 @@ def _iter_usage_records(file_path: Path, unreadable: dict[str, int]) -> Iterator
                 if not text:
                     continue
                 try:
-                    parsed = json.loads(text)
+                    parsed = json_depth.loads(text, max_depth=512)
                 except ValueError:
                     unreadable["lines"] += 1
                     continue

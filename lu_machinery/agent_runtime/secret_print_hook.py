@@ -165,7 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("native event too large")
         else:
             raw = sys.stdin.read()
-        command = extract_command(harness, json.loads(raw))
+        from lu_machinery.common import json_depth
+
+        command = extract_command(harness, json_depth.loads(raw, max_depth=512))
         if command is not None:
             from lu_machinery.common.repo_root import configure_native_hook_roots
 

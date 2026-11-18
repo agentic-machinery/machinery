@@ -20,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from lu_machinery.api.opsec_scan import scan_text
+from lu_machinery.common import json_depth
 
 REDACTED_ABSOLUTE_PATH = "[redacted-path]"
 _UNCHANGED = object()
@@ -131,7 +132,7 @@ def sanitize_json_bytes(raw: bytes) -> tuple[Any, bytes]:
     if not raw:
         return _UNCHANGED, raw
     try:
-        payload = json.loads(raw)
+        payload = json_depth.loads(raw, max_depth=512)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
         return _UNCHANGED, raw
     sanitized = sanitize_document(payload)

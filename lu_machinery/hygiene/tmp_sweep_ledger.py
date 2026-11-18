@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 
 SCHEMA = "tmp-sweep-ledger.v1"
@@ -270,7 +271,7 @@ class Ledger:
             if not line:
                 continue
             try:
-                record = json.loads(line)
+                record = json_depth.loads(line, max_depth=512)
             except ValueError:
                 malformed += 1
                 continue

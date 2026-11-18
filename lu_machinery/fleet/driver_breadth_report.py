@@ -18,7 +18,7 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.fleet import idle_settle as idle_settle
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
@@ -261,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         report["idle_settle"] = None
     admission_state: idle_settle.AdmissionState | None = None
     if args.idle_snapshot_json is not None:
-        snap_payload = json.loads(args.idle_snapshot_json.read_text(encoding="utf-8"))
+        snap_payload = json_depth.loads(args.idle_snapshot_json.read_text(encoding="utf-8"), max_depth=512)
         if not isinstance(snap_payload, dict):
             print(
                 f"error: idle snapshot must be a JSON object: {args.idle_snapshot_json}",

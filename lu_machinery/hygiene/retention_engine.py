@@ -34,7 +34,7 @@ GATE5_TARGET_DAYS = 7
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
-
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 from lu_machinery.hygiene.lane_disk_retention import (
     scan_dispatch_worktrees,
@@ -276,7 +276,7 @@ def record_gate5_observation(
         log: dict[str, Any]
         if log_path.is_file():
             try:
-                raw = json.loads(log_path.read_text(encoding="utf-8"))
+                raw = json_depth.loads(log_path.read_text(encoding="utf-8"), max_depth=512)
                 log = raw if isinstance(raw, dict) else {}
             except (OSError, json.JSONDecodeError, UnicodeError):
                 log = {}

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import logging
 import os
 import tempfile
@@ -12,6 +11,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+from lu_machinery.common import json_depth
 
 from .model import LifecycleEvent, LifecycleState, OperationReceipt, TaskFamilyManifest
 from .planner import TaskFamilyPlan, canonical_json, sha256_digest
@@ -281,12 +282,12 @@ class TaskFamilyStorage:
         if not self.events_path.exists():
             return ()
         with self.events_path.open(encoding="utf-8") as handle:
-            return tuple(LifecycleEvent.from_dict(json.loads(line)) for line in handle if line.strip())
+            return tuple(LifecycleEvent.from_dict(json_depth.loads(line, max_depth=512)) for line in handle if line.strip())
 
     @staticmethod
     def read_json(path: Path) -> dict[str, Any]:
         with path.open(encoding="utf-8") as handle:
-            payload = json.load(handle)
+            payload = json_depth.load(handle, max_depth=512)
         if not isinstance(payload, dict):
             raise ValueError(f"expected object JSON at {path}")
         return payload

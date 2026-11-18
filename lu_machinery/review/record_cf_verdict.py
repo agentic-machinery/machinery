@@ -433,7 +433,7 @@ def _run_json(args: list[str], *, input_text: str | None = None) -> Any:
     if process.returncode:
         raise RecordError((process.stderr or process.stdout or "GitHub command failed")[:500])
     try:
-        return json.loads(process.stdout)
+        return json_depth.loads(process.stdout, max_depth=_JSON_MAX_DEPTH)
     except ValueError as exc:
         raise RecordError("GitHub returned invalid JSON") from exc
 
@@ -731,7 +731,7 @@ def _attribute_trailer(commit_sha: str | None, trailer: str, *, repository: str,
     if task_file is not None and task_file.exists():
         # Resolve the recorded model only after validating the task provenance.
         try:
-            author_task = json.loads(task_file.read_text(encoding="utf-8"))
+            author_task = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         except (OSError, ValueError) as exc:
             raise RecordError("author task provenance unavailable") from exc
         if (
@@ -2088,7 +2088,7 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
     # An archived review keeps its reply beside its record.
     result_path = task_path.with_suffix(".result")
     try:
-        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         raw_reply = result_path.read_bytes()
     except (OSError, ValueError) as exc:
         raise RecordError("review task record or reply unavailable") from exc

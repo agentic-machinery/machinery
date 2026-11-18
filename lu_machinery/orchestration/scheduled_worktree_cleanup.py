@@ -41,8 +41,7 @@ from typing import Any
 _IMPORT_ROOT = str(Path(__file__).resolve().parents[2])
 if _IMPORT_ROOT not in sys.path:
     sys.path.insert(0, _IMPORT_ROOT)
-
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.common.task_scratch import recover_orphans as recover_task_scratch
 from lu_machinery.dispatcher.store import retention_hold_disposition
@@ -1047,7 +1046,7 @@ def _query_pr_by_number(
     if proc.returncode != 0:
         return [], f"{rest_error}; gh pr view failed: {worktree_git._format_failure(proc)}"
     try:
-        item = json.loads(proc.stdout or "{}")
+        item = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         return [], f"gh pr view returned invalid JSON: {exc}"
     if not isinstance(item, dict):

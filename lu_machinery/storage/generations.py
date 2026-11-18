@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from lu_machinery.common import json_depth
 from lu_machinery.lib.readonly_sqlite import (
     ENV_STORE_WRITER_FD,
     ENV_STORE_WRITER_SELECTOR,
@@ -423,7 +424,7 @@ def receipt_path(generation: Path) -> Path:
 
 def read_receipt(generation: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(receipt_path(generation).read_text(encoding="utf-8"))
+        return json_depth.loads(receipt_path(generation).read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return None
 

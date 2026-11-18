@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.repo_root import state_root as shared_state_root
 from lu_machinery.lib.context_profiles import resolve_profile
@@ -194,7 +195,7 @@ def read_record(
             ) from exc
         try:
             with os.fdopen(fd, encoding="utf-8") as handle:
-                raw = json.loads(handle.read())
+                raw = json_depth.loads(handle.read(), max_depth=512)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SessionRecordError(f"cannot read session record {path}: {exc}") from exc
     finally:

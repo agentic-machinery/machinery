@@ -27,6 +27,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import issue_stream_audit, task_identity
@@ -95,7 +96,7 @@ FORBIDDEN_RECEIPT_PATH_MARKERS = (
 )
 
 _SCHEMA_PATH = machinery_path("schemas/task-lifecycle.v1.schema.json")
-_SCHEMA = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+_SCHEMA = json_depth.loads(_SCHEMA_PATH.read_text(encoding="utf-8"), max_depth=512)
 _VALIDATOR = Draft202012Validator(_SCHEMA, format_checker=FormatChecker())
 # Preserve the legacy bold-ID grammar, adding observed numeric suffix IDs.
 _AC_RE = re.compile(
@@ -1112,7 +1113,7 @@ def lifecycle_path(repo_root: Path, identity: Mapping[str, Any]) -> Path:
 
 def load_lifecycle(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError as exc:
         raise LifecycleError(f"lifecycle ledger not found: {path}") from exc
     except (OSError, json.JSONDecodeError) as exc:
@@ -1653,7 +1654,7 @@ def _behavior_proof_reference_error(
     path = Path(reference["receipt_path"]).expanduser()
     try:
         receipt_bytes = path.read_bytes()
-        receipt = json.loads(receipt_bytes)
+        receipt = json_depth.loads(receipt_bytes, max_depth=512)
     except (OSError, json.JSONDecodeError) as exc:
         return f"behavior-proof receipt is unreadable: {exc}"
     actual_digest = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()

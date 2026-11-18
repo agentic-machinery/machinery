@@ -57,6 +57,7 @@ except ModuleNotFoundError as exc:
     if str(_install_root) not in sys.path:
         sys.path.insert(0, str(_install_root))
     from lu_machinery.lib.readonly_sqlite import SQLiteConnection  # type: ignore[no-redef]
+from lu_machinery.common import json_depth
 
 # Anchor ledger + task-state to the PRIMARY checkout (not a worktree copy),
 # matching the task-store path encoding.
@@ -704,7 +705,7 @@ def _task_still_active(
     worktree_path: str | Path | None = None
     if state_path.is_file():
         try:
-            data = json.loads(state_path.read_text(encoding="utf-8"))
+            data = json_depth.loads(state_path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError):
             data = {}
         if isinstance(data, dict):
@@ -885,7 +886,7 @@ class OwnershipLedger:
         scoped = []
         for row in rows:
             try:
-                payload = json.loads(row["claim_json"])
+                payload = json_depth.loads(row["claim_json"], max_depth=512)
             except (ValueError, TypeError):
                 payload = None
             if self._belongs_to_repository(payload):
@@ -959,7 +960,7 @@ class OwnershipLedger:
         ahead: list[tuple[str, PathClaim, int]] = []
         for row in rows:
             try:
-                payload = json.loads(row["claims_json"])
+                payload = json_depth.loads(row["claims_json"], max_depth=512)
             except (ValueError, TypeError):
                 payload = []
             if isinstance(payload, list) and payload and not any(self._belongs_to_repository(c) for c in payload):
@@ -1005,7 +1006,7 @@ class OwnershipLedger:
             conn.execute("BEGIN IMMEDIATE")
             state_path = self.task_state_dir / f"{_safe_task_state_name(task_id)}.json"
             try:
-                record = json.loads(state_path.read_text(encoding="utf-8"))
+                record = json_depth.loads(state_path.read_text(encoding="utf-8"), max_depth=512)
             except (OSError, ValueError):
                 record = {}
             for row in self._claim_rows(conn):
@@ -1046,7 +1047,7 @@ class OwnershipLedger:
         for task_id, pid in {(str(b["other_task_id"]), b["other_pid"]) for b in blockers}:
             path = self.task_state_dir / f"{_safe_task_state_name(task_id)}.json"
             try:
-                record = json.loads(path.read_text(encoding="utf-8"))
+                record = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
                 raw = record.get("hard_timeout") if record.get("pid") in (pid, str(pid)) else None
                 value = float(raw) if not isinstance(raw, bool) else 0.0
                 budgets.append(value if math.isfinite(value) and value > 0 else fallback)
@@ -1269,7 +1270,7 @@ class OwnershipLedger:
             if pid is not None and other_pid == pid:
                 state_path = self.task_state_dir / f"{_safe_task_state_name(task_id)}.json"
                 try:
-                    record = json.loads(state_path.read_text(encoding="utf-8"))
+                    record = json_depth.loads(state_path.read_text(encoding="utf-8"), max_depth=512)
                 except (OSError, ValueError):
                     record = {}
                 candidate = record if isinstance(record, dict) and record.get("pid") in (pid, str(pid)) else {"pid": pid}
@@ -1322,7 +1323,7 @@ class OwnershipLedger:
         active: list[tuple[str, PathClaim, int | None]] = []
         for row in active_rows:
             try:
-                payload = json.loads(row["claim_json"])
+                payload = json_depth.loads(row["claim_json"], max_depth=512)
                 claim = PathClaim(
                     raw=str(payload.get("raw", "")),
                     kind=ClaimKind(str(payload.get("kind"))),

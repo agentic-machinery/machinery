@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 
 from lu_machinery.ci._location import module_name
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 from lu_machinery.orchestration import fleet_repos, postmerge_criteria
 from lu_machinery.orchestration import issue_stream_audit as audit
@@ -206,7 +206,7 @@ def read_parent(repository: str, number: int) -> dict | None:
     proc = read("issue-parent", repo=repository, number=number, capture_output=True, text=True, timeout=30)
     if proc.returncode:
         raise RuntimeError("parent read failed")
-    doc = json.loads(proc.stdout)
+    doc = json_depth.loads(proc.stdout, max_depth=512)
     repo = (doc.get("data") or {}).get("repository")
     if (
         doc.get("errors")
@@ -375,7 +375,7 @@ def cached_membership(issue: dict, repository: str, number: int, registry: dict,
     """Read shared audit evidence, then apply the canonical validator and resolver."""
     path = state_root() / "batch_state" / "issue_stream_audit.json"
     try:
-        report = json.loads(path.read_text(encoding="utf-8"))
+        report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except FileNotFoundError:
         return membership_error("membership_audit_cache_missing")
     except (OSError, ValueError):
@@ -704,7 +704,7 @@ def fetch_issue(repo: str, number: int) -> dict:
         text=True,
         timeout=60,
     )
-    data = json.loads(raw)
+    data = json_depth.loads(raw, max_depth=512)
     if not isinstance(data, dict) or not isinstance(data.get("body", ""), (str, type(None))):
         raise ValueError("issue unread")
     return data

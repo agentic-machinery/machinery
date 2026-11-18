@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -26,10 +25,10 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 
 
@@ -466,7 +465,7 @@ def resolve_cve_to_ghsa(cve_id: str, custom_aliases: dict[str, str] | None = Non
         url = f"https://api.osv.dev/v1/vulns/{clean}"
         req = urllib.request.Request(url, headers={"User-Agent": "learn-ukrainian-ci"})
         with urllib.request.urlopen(req, timeout=1.5) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            data = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
             primary_id = str(data.get("id", ""))
             if primary_id.upper().startswith("GHSA-"):
                 return primary_id.upper()
@@ -475,7 +474,7 @@ def resolve_cve_to_ghsa(cve_id: str, custom_aliases: dict[str, str] | None = Non
                     return str(alias).upper()
     except urllib.error.HTTPError as e:
         try:
-            body = json.loads(e.read().decode("utf-8"))
+            body = json_depth.loads(e.read().decode("utf-8"), max_depth=512)
             msg = str(body.get("message", ""))
             ghsa_match = re.search(r"GHSA-[a-z0-9-]+", msg, re.IGNORECASE)
             if ghsa_match:
@@ -678,7 +677,7 @@ def audit_node(repo_root: Path, ignore_file: Path | None = None) -> int:
             continue
 
         try:
-            audit_data = json.loads(res.stdout)
+            audit_data = json_depth.loads(res.stdout, max_depth=512)
         except (ValueError, TypeError):
             print(f"[audit_dependencies] ERROR: Failed to parse npm audit JSON output in {label}:", file=sys.stderr)
             if res.stderr:

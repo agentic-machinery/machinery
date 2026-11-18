@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import product_root
 from lu_machinery.review.model_catalog import (
     CURSOR_AUTO_OUTSIDE_CODING_TASK_CODE,
@@ -359,7 +360,7 @@ class CursorAdapter:
 
     def _read_mcp_file(self, path: Path) -> dict:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
         except (OSError, json.JSONDecodeError):
             return {}
         return data if isinstance(data, dict) else {}
@@ -778,7 +779,7 @@ def probe_cursor_login(*, timeout_s: float = 5.0) -> dict[str, Any]:
         return _cursor_login_probe_failure(exc, fetched_at)
 
     try:
-        parsed = json.loads(res.stdout or "{}")
+        parsed = json_depth.loads(res.stdout or "{}", max_depth=512)
     except json.JSONDecodeError:
         parsed = {}
     payload = parsed if isinstance(parsed, dict) else {}
@@ -802,7 +803,7 @@ def probe_cursor_login(*, timeout_s: float = 5.0) -> dict[str, Any]:
 
 def _load_cursor_access_token() -> str | None:
     try:
-        data = json.loads(_CURSOR_AUTH_PATH.read_text(encoding="utf-8"))
+        data = json_depth.loads(_CURSOR_AUTH_PATH.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     token = data.get("accessToken")
@@ -903,7 +904,7 @@ def _probe_cursor_grok_bot_window(*, token: str, timeout_s: float) -> dict[str, 
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except (
         urllib.error.URLError,
         TimeoutError,
@@ -989,7 +990,7 @@ def probe_cursor_provider_windows(*, timeout_s: float = 8.0) -> dict[str, Any]:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
         return {
             "lane": "cursor",

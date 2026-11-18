@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import github_client
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.guardrails.worktree_containment import (
     PROTECTED_BRANCHES,
@@ -370,7 +370,7 @@ def _repo_owner_and_name(repo_root: Path) -> tuple[str, str]:
     if proc.returncode != 0:
         raise GitHubQueryError("gh repo view failed")
     try:
-        payload = json.loads(proc.stdout or "{}")
+        payload = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         raise GitHubQueryError("invalid JSON from gh repo view") from exc
     if not isinstance(payload, dict):
@@ -391,7 +391,7 @@ def _github_repo_default_branch(repo_root: Path) -> str:
     if proc.returncode != 0:
         raise GitHubQueryError("github repo query failed")
     try:
-        payload = json.loads(proc.stdout or "{}")
+        payload = json_depth.loads(proc.stdout or "{}", max_depth=512)
     except json.JSONDecodeError as exc:
         raise GitHubQueryError("invalid JSON from github repo query") from exc
     if not isinstance(payload, dict):
@@ -413,7 +413,7 @@ def remote_protected_branches(repo_root: Path, *, timeout: float = 30.0) -> set[
     if proc.returncode != 0:
         raise GitHubQueryError("github protected-branch query failed")
     try:
-        payload = json.loads(proc.stdout or "[]")
+        payload = json_depth.loads(proc.stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         raise GitHubQueryError("invalid JSON from protected-branch query") from exc
     if not isinstance(payload, list):
@@ -550,7 +550,7 @@ def query_pr_by_head(
         if proc.returncode != 0:
             raise GitHubQueryError(f"gh pr view failed for #{pr_number}")
         try:
-            payload = json.loads(proc.stdout or "{}")
+            payload = json_depth.loads(proc.stdout or "{}", max_depth=512)
         except json.JSONDecodeError as exc:
             raise GitHubQueryError("invalid JSON from gh pr view") from exc
         rows, error = _scope_pr_rows([payload], repository, number=pr_number)
@@ -579,7 +579,7 @@ def query_pr_by_head(
     if proc.returncode != 0:
         raise GitHubQueryError(f"gh pr list failed for {branch!r}: {proc.stderr.strip() or proc.stdout.strip()}")
     try:
-        items = json.loads(proc.stdout or "[]")
+        items = json_depth.loads(proc.stdout or "[]", max_depth=512)
     except json.JSONDecodeError as exc:
         raise GitHubQueryError("invalid JSON from gh pr list") from exc
     if not isinstance(items, list):

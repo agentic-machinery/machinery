@@ -22,7 +22,6 @@ from typing import Any
 
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 from lu_machinery.agent_runtime.errors import (
     AgentRuntimeError,
     AgentStalledError,
@@ -31,6 +30,7 @@ from lu_machinery.agent_runtime.errors import (
     RateLimitedError,
 )
 from lu_machinery.agent_runtime.result import Result
+from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 
 SCHEMA_VERSION = "codex-transport-health.v2"
@@ -111,7 +111,7 @@ def load_receipt(receipt_path: Path | None = None) -> dict[str, Any] | None:
     if receipt_path is None:
         receipt_path = state_root() / "batch_state" / "runtime" / "codex-transport-health.json"
     try:
-        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        payload = json_depth.loads(receipt_path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
