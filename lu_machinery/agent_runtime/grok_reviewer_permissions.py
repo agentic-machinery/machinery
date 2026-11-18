@@ -9,6 +9,7 @@ commands, and no shell tool is exposed to the reviewer.
 from __future__ import annotations
 
 import argparse
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -108,9 +109,9 @@ def main() -> int:
             if exc.code == 0:  # argparse --help is a successful non-hook invocation.
                 return 0
             raise
-        from lu_machinery.common import json_depth
-
-        allowed = reviewer_tool_allowed(json_depth.load(sys.stdin, max_depth=512), args.review_root)
+        # This file also runs under -I without the package on sys.path.
+        loads = runpy.run_path(str(Path(__file__).resolve().parents[1] / "common" / "json_depth.py"))["loads"]
+        allowed = reviewer_tool_allowed(loads(sys.stdin.read(), max_depth=512), args.review_root)
     except BaseException:
         allowed = False
     try:
