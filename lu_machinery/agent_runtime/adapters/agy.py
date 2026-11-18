@@ -766,6 +766,12 @@ _AGY_CARBON_SLUGS: tuple[str, ...] = (
     "gemini-4-carbon-medium",
     "gemini-4-carbon-low",
 )
+_AGY_NEON_SLUGS: tuple[str, ...] = (
+    "gemini-4-neon-xhigh",
+    "gemini-4-neon-high",
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
+)
 _AGY_HYDROGEN_SLUGS: tuple[str, ...] = (
     "gemini-4-hydrogen-xhigh",
     "gemini-4-hydrogen-high",
@@ -773,6 +779,8 @@ _AGY_HYDROGEN_SLUGS: tuple[str, ...] = (
     "gemini-4-hydrogen-low",
 )
 _AGY_GEMINI4_SLUGS: tuple[str, ...] = (
+    *_AGY_NEON_SLUGS,
+    # The catalog rejects new Carbon invocations. Keep its runtime identities.
     *_AGY_CARBON_SLUGS,
     *_AGY_HYDROGEN_SLUGS,
     *_AGY_ARGON_SLUGS,

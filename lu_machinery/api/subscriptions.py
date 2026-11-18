@@ -92,7 +92,7 @@ _CACHE_GROUPS = {"AGY Gemini": "Gemini", "AGY Claude/GPT": "Claude/GPT"}
 # Providers without a real 5-hour window (CodexBar 0.69's "Session" mirrored the weekly percent).
 _NO_SESSION_PROVIDERS = frozenset({"claude", "codex"})
 _ACCOUNT_NOTES = {
-    "AGY Gemini": "Carbon draws on the AGY pools.",
+    "AGY Gemini": "Neon draws on the AGY pools.",
     "Codex a": "The Codex API credits belong to this account and renew with its monthly turnover.",
 }
 # Pools whose credits renew with the plan's monthly turnover.

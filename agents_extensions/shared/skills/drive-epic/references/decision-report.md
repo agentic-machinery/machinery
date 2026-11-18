@@ -69,7 +69,9 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   ([review-merge-cleanup](review-merge-cleanup.md)) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
 - **Members:** live eligible routes only: Opus 5.5 via Claude, Sol 6.2 via Codex, Grok 4.7
-  via Cursor (`model-assignment.md`). On Ukrainian language, culture and heritage questions,
+  via Cursor and Gemini 4 Neon for non-Ukrainian questions. Seat Neon in the independent
+  read-only dispatch round using [Gemini 4 Neon advisory routing](../../../rules/model-assignment.md#gemini-4-neon-advisory-routing).
+  Record its exact model ID with its findings and score. On Ukrainian language, culture and heritage questions,
   Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment); its
   Ukrainian council answers are input in the council and the discussion only, never review
   of record or designated approval. An unavailable member is reported, never substituted, and the panel is then not called

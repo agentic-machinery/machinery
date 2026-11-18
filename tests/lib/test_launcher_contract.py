@@ -1449,9 +1449,9 @@ fi
         ("start-gemini.sh", ["--effort", "high"], {}, "gemini-4-hydrogen-high", 0),
         ("start-gemini.sh", [], {"LAUNCHER_EFFORT": "low"}, "gemini-4-hydrogen-low", 0),
         # An effort never replaces a chosen model or names a variant AGY lacks.
-        ("start-gemini.sh", ["--model", "gemini-4-carbon-high", "--effort", "high"], {}, "gemini-4-carbon-high", 0),
-        ("start-gemini.sh", ["--model", "gemini-4-carbon-high"], {"LAUNCHER_EFFORT": "low"}, "", 2),
-        ("start-gemini.sh", ["--effort", "low", "--model", "gemini-4-carbon-high"], {}, "", 2),
+        ("start-gemini.sh", ["--model", "gemini-4-neon-high", "--effort", "high"], {}, "gemini-4-neon-high", 0),
+        ("start-gemini.sh", ["--model", "gemini-4-neon-high"], {"LAUNCHER_EFFORT": "low"}, "", 2),
+        ("start-gemini.sh", ["--effort", "low", "--model", "gemini-4-neon-high"], {}, "", 2),
         ("start-gemini.sh", [], {"LAUNCHER_MODEL": "gemini-3.8-flash-high", "LAUNCHER_EFFORT": "medium"}, "", 2),
         ("start-gemini.sh", ["--effort", "xhigh"], {}, "", 2),
         ("start-gemini.sh", ["--effort", "max"], {}, "", 2),
@@ -1461,8 +1461,8 @@ fi
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "--effort=low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-effort", "low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-effort=low"], {}, "", 4),
-        ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model", "gemini-4-carbon-high"], {}, "", 4),
-        ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model=gemini-4-carbon-high"], {}, "", 4),
+        ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model", "gemini-4-neon-high"], {}, "", 4),
+        ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model=gemini-4-neon-high"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--effort", "high"], {}, "gemini-3.8-flash-high", 0),
     ],
 )

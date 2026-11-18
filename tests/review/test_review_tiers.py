@@ -106,11 +106,11 @@ def _record_of_record(comments):
     })
 
 
-def test_carbon_is_refused_as_the_reviewer_of_record(low_review, tmp_path):
-    """Defect class: Carbon is recorded as the reviewer of record and so replaces it."""
+def test_neon_is_refused_as_the_reviewer_of_record(low_review, tmp_path):
+    """Defect class: an advisory Neon result is recorded as the formal verdict."""
     tasks, comments, statuses, files, _admit = low_review
     files[:] = [{"filename": SECURITY_FILES[0], "status": "modified"}]
-    name = _carbon_task(tasks)
+    name = _carbon_task(tasks, "review-neon", model="gemini-4-neon-high")
     with pytest.raises(recorder.RecordError, match="holds no review"):
         recorder.record(name, pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
     assert comments == [] and statuses == []

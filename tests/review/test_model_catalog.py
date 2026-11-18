@@ -1134,6 +1134,13 @@ def assert_frozen_surfaces(actual, *, surfaces):
             # route, ladder or ranking, and its row is pinned.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
             assert hashlib.sha256(encode(hydrogen)).hexdigest() == "1ac63a61c73fbe0e7503d8a6ed0428c5633e4a4acb458690927f578a95d892bc"
+            # Neon replaces Carbon's advisory route. Both rows are pinned while the remaining
+            # catalog and formal routing surfaces still compare against the frozen receipts.
+            carbon = value["models"].pop("gemini-4-carbon")
+            assert hashlib.sha256(encode(carbon)).hexdigest() == "9cf762a607d9112c013dd70fc6402a536022c28f418207f2ddb610cac106acb8"
+            neon = value["models"].pop("gemini-4-neon")
+            assert hashlib.sha256(encode(neon)).hexdigest() == "85226fcdf9424a3c5a2ade95790677438d942c9f646fa52bfa44a232c19c47a8"
+            expected["models"].pop("gemini-4-carbon")
         assert value == expected, f"current surface differs: {surface}"
 
 
