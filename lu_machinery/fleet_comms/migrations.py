@@ -5,7 +5,9 @@ import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
+from lu_machinery.fleet_comms.paths import assert_store_write_allowed
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection
 
 
@@ -754,6 +756,11 @@ def apply_migrations(conn: SQLiteConnection) -> int:
             "control-plane store 'fleet_comms': component 'migrations' only "
             "supports sqlite connections in this slice (#7482 interlock)"
         )
+    # Services and recovery callers may invoke migrations without ArtifactStore.
+    # Check the actual main database before even creating the migration ledger.
+    for _, name, filename in conn.execute("PRAGMA database_list").fetchall():
+        if name == "main" and filename:
+            assert_store_write_allowed(Path(filename), package_file=__file__)
     _ensure_migration_table(conn)
     conn.commit()
     known = {migration.version: migration for migration in MIGRATIONS}

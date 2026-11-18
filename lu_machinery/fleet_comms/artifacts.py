@@ -55,7 +55,11 @@ from lu_machinery.control_plane.storage import (
 from lu_machinery.control_plane.storage import connect as cp_connect
 from lu_machinery.fleet_comms.contracts import new_id
 from lu_machinery.fleet_comms.migrations import apply_migrations
-from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL, default_plane_root
+from lu_machinery.fleet_comms.paths import (
+    DEFAULT_ROOT_REL,
+    assert_store_write_allowed,
+    default_plane_root,
+)
 from lu_machinery.fleet_comms.paths import validate_plane_root as validate_plane_root
 from lu_machinery.fleet_comms.pg_schema import (
     PG_BLOB_TABLE,
@@ -898,6 +902,7 @@ class ArtifactStore:
             )
             self._conn.row_factory = sqlite3.Row
             return
+        assert_store_write_allowed(self.db_path, package_file=__file__)
         self._prepare_private_dir(self.root)
         self._prepare_private_dir(self.root / "blobs")
         self._prepare_private_dir(self.blob_root)

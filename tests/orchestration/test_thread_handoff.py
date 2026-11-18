@@ -3071,7 +3071,9 @@ def test_default_runtime_root_is_shared_by_real_linked_worktree(tmp_path: Path, 
     assert not (linked / ".agent").exists()
 
 
-def test_canonical_discovery_failure_refuses_fallback_and_explicit_root_is_isolated(monkeypatch, tmp_path: Path):
+def test_canonical_discovery_failure_refuses_fallback_and_explicit_root_is_isolated(
+    monkeypatch, tmp_path: Path, unconfigured_primary
+):
     monkeypatch.setattr(
         th,
         "run_command",
