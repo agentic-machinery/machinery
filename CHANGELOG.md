@@ -9,6 +9,30 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.34"></a>
+## [0.1.34] - 2026-11-18
+
+### Changed
+
+- Synchronize the scheduled crash recovery test ([#810](https://github.com/learn-ukrainian/machinery/pull/810))
+- Ignore dispatch worktrees and batch state ([#811](https://github.com/learn-ukrainian/machinery/pull/811))
+
+### Fixed
+
+- Require --repo for pr_ownership accept/queue-exit; dry-run residual; empty jq body ([#804](https://github.com/learn-ukrainian/machinery/pull/804))
+- Read the repository's required workflow for merged-run evidence ([#816](https://github.com/learn-ukrainian/machinery/pull/816))
+- Settlement reads reveal at least what main's did; byte-exact removal names (#524) ([#812](https://github.com/learn-ukrainian/machinery/pull/812))
+- Lock patched Semgrep dependencies ([#815](https://github.com/learn-ukrainian/machinery/pull/815))
+- Reject X-Agent trailers review cannot attribute ([#814](https://github.com/learn-ukrainian/machinery/pull/814))
+- Scan every registered repository ([#813](https://github.com/learn-ukrainian/machinery/pull/813))
+- Stop realpathing every file during artifact collection ([#818](https://github.com/learn-ukrainian/machinery/pull/818))
+- Write workers' TMPDIR is their task scratch, removed at settlement ([#817](https://github.com/learn-ukrainian/machinery/pull/817))
+- Tag the cut with the checkout identity ([#822](https://github.com/learn-ukrainian/machinery/pull/822))
+
+### Removed
+
+- Retire the TrailSpec executor ([#809](https://github.com/learn-ukrainian/machinery/pull/809))
+
 <a id="v0.1.33"></a>
 ## [0.1.33] - 2026-11-18
 
@@ -913,7 +937,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...HEAD
+[0.1.34]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...v0.1.34
 [0.1.33]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...v0.1.33
 [0.1.32]: https://github.com/learn-ukrainian/machinery/compare/v0.1.31...v0.1.32
 [0.1.31]: https://github.com/learn-ukrainian/machinery/compare/v0.1.28...v0.1.31
