@@ -33,6 +33,8 @@ RETIRED_CALLS = (
     ("read", "-1.5"),
     ("process-ask", "-", "opencode"),
     ("process-ask", "-1.5", "opencode"),
+    ("--", "read", "12", "--json"),
+    ("--", "process-ask", "12"),
     ("send", "hello", "--to", "claude"),
     ("ack", "--consumed-by-live-driver", "12"),
     ("ack-all", "claude"),
@@ -78,7 +80,8 @@ def test_retired_bridge_verbs_refuse_with_fleet_replacement(argv, tmp_path, monk
     out = capsys.readouterr()
     assert exited.value.code == 2
     assert out.out == ""
-    assert f"ab {argv[0]}" in out.err and "is retired" in out.err
+    verb = argv[1] if argv[0] == "--" else argv[0]
+    assert f"ab {verb}" in out.err and "is retired" in out.err
     assert any(name in out.err for name in ("fleet_comms", "/api/fleet/", "/api/runtime/", "ask-"))
     assert not broker.exists()
     assert not pids.exists()

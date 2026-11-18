@@ -1601,16 +1601,19 @@ def main():
     """CLI entry point."""
     argv = sys.argv[1:]
     # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
-    # Options (``-h``) go to argparse; ``--`` only ends options before the id. A
-    # signed integer (``-12``) is a legacy id, as argparse itself parses it.
-    if argv and argv[0] in _JOB_ID_VERBS:
-        rest = argv[1:]
+    # A ``--`` may end options before the verb or before the id. Help (``-h``,
+    # ``--help``), the verbs' only option, goes to argparse; any other token in the
+    # id position (``12``, ``-12``, ``-``, ``-1.5``) is an id. _dispatch_command
+    # checks the parsed id again.
+    words = argv[1:] if argv[:1] == ["--"] else argv
+    if words and words[0] in _JOB_ID_VERBS:
+        rest = words[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
-        elif rest[:1] and rest[0].startswith("-") and not rest[0][1:].isdigit():
+        elif rest[:1] and rest[0] in ("-h", "--help"):
             rest = []
         if rest and not rest[0].startswith("authority-job_"):
-            refuse_retired_verb(f"{argv[0]} <message-id>", _JOB_ID_VERBS[argv[0]])
+            refuse_retired_verb(f"{words[0]} <message-id>", _JOB_ID_VERBS[words[0]])
     parser = _build_parser()
     args = parser.parse_args(argv)
     # A Kimi request stops here, before telemetry or any provider call.
