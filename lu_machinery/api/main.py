@@ -93,7 +93,7 @@ from .product_contribution import (
     product_file,
 )
 from .project_state_router import router as project_state_router
-from .repository_authority import RepositoryAuthorityError, build_repository_authority, cwd_role
+from .repository_authority import build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
 from .rules_router import router as rules_router
@@ -433,6 +433,10 @@ _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
 _detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
 _detached_orient_last_error: dict[str, str] = {}
+# Section cache keys whose refresh worker has not yet published. The worker
+# publishes its value and leaves this set in one critical section, so a reader's
+# snapshot never pairs a new value with "still refreshing" or an old one with "done".
+_detached_orient_pending: set[str] = set()
 # Recent orient reads by section cache key. The warmer refreshes only those
 # sections; one agent's orient no longer keeps every section warm forever.
 _orient_demand: dict[str, Demand] = {}
@@ -512,9 +516,15 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
     if log_proc.returncode != 0:
         raise RuntimeError(log_proc.stderr.strip() or "git log failed")
 
-    # Only now, as before: the status read heals a bare-drifted primary, and a
-    # failed request must not write Git configuration. The status and authority
-    # reads are the two slow ones (a ``git status`` scan each); they run together.
+    # Only now, as before: a failed request must not write Git configuration.
+    # A bare-drifted primary is healed before either slow read starts (the status
+    # read repeats the heal as a read-only no-op); an error here is the status
+    # read's to report, with its fallback below. The status and authority reads
+    # are the two slow ones (a ``git status`` scan each); they run together.
+    with suppress(Exception):
+        worktree_containment.heal_primary_bare_if_needed(
+            worktree_containment.resolve_main_root(resolved_ctx.roots.live_repo_root)
+        )
     status_probe = _GIT_PROBE_EXECUTOR.submit(
         worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
     )
@@ -553,19 +563,7 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         }
 
     branch = branch_proc.stdout.strip()
-    try:
-        authority = authority_probe.result()
-    except RepositoryAuthorityError:
-        # Only a heal explains a failure here that a serial read would not have
-        # had: the status read heals a bare-drifted primary before it counts
-        # entries, and the concurrent authority read can lose that race. Read it
-        # again then; every other failure, and a second one, propagates.
-        if primary_status.get("bare_healed") is not True:
-            raise
-        authority = build_repository_authority(
-            project_root=resolved_ctx.roots.project_root,
-            live_repo_root=resolved_ctx.roots.live_repo_root,
-        )
+    authority = authority_probe.result()
     return {
         "branch": branch,
         "head": head_proc.stdout.strip(),
@@ -852,6 +850,7 @@ def reset_detached_orient_state_for_tests() -> None:
         _detached_orient_threads.clear()
     _detached_orient_last_good.clear()
     _detached_orient_last_error.clear()
+    _detached_orient_pending.clear()
     _orient_demand.clear()
     _integrity_verdicts.clear()
 
@@ -872,6 +871,7 @@ def _schedule_detached_orient_refresh(
             name=f"orient-{key}-refresh",
         )
         _detached_orient_threads[state_key] = worker
+        _detached_orient_pending.add(state_key)
         worker.start()
         return True
 
@@ -884,12 +884,19 @@ def _run_detached_orient_refresh(
         with _DETACHED_ORIENT_COLLECT_SLOTS:
             value = collector()
         generated_at = _isoformat_z(datetime.now(UTC))
-        if ttl > 0:
-            cache_set(cache_key, (value, generated_at))
-        _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
-        _detached_orient_last_error.pop(cache_key, None)
+        with _detached_orient_lock:
+            if ttl > 0:
+                cache_set(cache_key, (value, generated_at))
+            _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
+            _detached_orient_last_error.pop(cache_key, None)
+            _detached_orient_pending.discard(cache_key)
     except Exception as exc:
-        _detached_orient_last_error[cache_key] = str(exc)
+        with _detached_orient_lock:
+            _detached_orient_last_error[cache_key] = str(exc)
+            _detached_orient_pending.discard(cache_key)
+    finally:
+        with _detached_orient_lock:
+            _detached_orient_pending.discard(cache_key)
 
 
 _THREAD_WAIT_POLL_S = 0.005
@@ -967,45 +974,41 @@ async def _cached_detached_orient_section(
     if thread is not None and thread.is_alive() and (fresh or (started and not _due_for_stale_serve(cache_key, ttl))):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
 
-    # Sampled before any value is read: a value older than the worker's result
-    # can only be returned while the worker was still alive at this point, so
-    # the labels below never call an expired value current.
-    refreshing = thread is not None and thread.is_alive()
-    if ttl > 0:
-        cached = cache_get(cache_key, ttl=ttl)
-        if cached is not None:
-            value, generated_at = cached  # type: ignore[misc]
-            return value, {
-                "generated_at": generated_at,
-                "stale_after_s": ttl,
-                "source": source,
-                "cache": "miss",
-            }
+    # One snapshot under the lock the worker publishes under: the value, its
+    # error and whether a refresh is still pending always describe the same
+    # moment, so an expired value is never labelled current nor a new one stale.
+    with _detached_orient_lock:
+        cached = cache_get(cache_key, ttl=ttl) if ttl > 0 else None
+        last_good = _detached_orient_last_good.get(cache_key)
+        last_error = _detached_orient_last_error.get(cache_key)
+        refreshing = cache_key in _detached_orient_pending
 
-    last_good = _detached_orient_last_good.get(cache_key)
-    if last_good is not None:
-        value, generated_at, stored_at = last_good
-        age = _orient_clock() - stored_at
-        # Product sections may use their own TTL (including zero). Last-good
-        # is a bounded stale fallback, never another freshness window.
-        if age >= max(120.0, ttl * 2):
-            last_good = None
-    if last_good is not None:
+    if cached is not None:
+        value, generated_at = cached  # type: ignore[misc]
+        return value, {
+            "generated_at": generated_at,
+            "stale_after_s": ttl,
+            "source": source,
+            "cache": "miss",
+        }
+
+    # Product sections may use their own TTL (including zero). Last-good is a
+    # bounded stale fallback, never another freshness window.
+    if last_good is not None and _orient_clock() - last_good[2] < max(120.0, ttl * 2):
         value, generated_at, _stored_at = last_good
         meta: dict[str, Any] = {
             "generated_at": generated_at,
             "stale_after_s": ttl,
             "source": source,
             "cache": "miss",
-            "stale": refreshing or cache_key in _detached_orient_last_error,
+            "stale": refreshing or last_error is not None,
             "refreshing": refreshing,
         }
-        last_error = _detached_orient_last_error.get(cache_key)
         if last_error is not None:
             meta["error"] = last_error
         return value, meta
 
-    short_err = _detached_orient_last_error.get(cache_key) or "refreshing"
+    short_err = last_error or "refreshing"
     meta = {
         "generated_at": _isoformat_z(datetime.now(UTC)),
         "stale_after_s": ttl,
