@@ -234,9 +234,9 @@ order:
      `"$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"`.
      Every required route must pass, and the final receipt check, which uses
      the sealed candidate's gate and catalog, must succeed. The installed gate
-     originally matched the keeper's current runtime; at cut time the candidate
-     gate validates the models that will be installed together and used by
-     `pr-merge` and the keeper. A failing route or an incomplete run
+     originally matched the keeper's runtime when canaries gated PR admission.
+     At cut time, the candidate gate validates the models and catalog that this
+     release installs together. A failing route or an incomplete run
      blocks the release. PR merge does not require these receipts.
 9. **Promote.** `release-edit --no-prerelease` replaces the notes with the
    final Acceptance section: the per-route canary table, the Node and npm
