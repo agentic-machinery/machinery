@@ -27,7 +27,6 @@ def test_write_to_real_task_store_fails(tmp_path: Path) -> None:
             (primary / ".git" / part).mkdir(parents=True)
         (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (original / "batch_state" / "tasks").mkdir(parents=True)
-    configured_bridge = tmp_path / "configured-bridge.sqlite3"
     child = """
 import json, pathlib, pytest, sys
 import tests.conftest as guard
@@ -38,33 +37,25 @@ except pytest.fail.Exception:
     refused = True
 else:
     refused = False
-print(json.dumps([str(guard._REAL_TASKS_DIR), str(guard._REAL_BRIDGE_DB_PATH),
-                  str(guard._CONFIGURED_BRIDGE_DB_PATH), refused]))
+print(json.dumps([str(guard._REAL_TASKS_DIR), refused]))
 """
     parent = """
 import os, subprocess, sys
 import tests.conftest
 os.environ['LEARN_UKRAINIAN_PRIMARY_REPO_ROOT'] = sys.argv[1]
-os.environ['AB_DB_PATH'] = sys.argv[1] + '/isolated-bridge.sqlite3'
 subprocess.run([sys.executable, '-B', '-c', sys.argv[2], sys.argv[3]], check=True)
 """
     environment = {
         key: value for key, value in os.environ.items()
         if key not in {"LU_TEST_PROTECTED_STORES", "LEARN_UKRAINIAN_STATE_ROOT"}
     }
-    environment.update(
-        LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(original), AB_DB_PATH=str(configured_bridge)
-    )
+    environment.update(LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(original))
     result = subprocess.run(
         [sys.executable, "-B", "-c", parent, str(session), child, str(original)],
         cwd=Path(__file__).resolve().parents[2], env=environment,
         capture_output=True, text=True, check=True, timeout=30,
     )
-    assert json.loads(result.stdout) == [
-        str(original / "batch_state" / "tasks"),
-        str(original / ".mcp" / "servers" / "message-broker" / "messages.db"),
-        str(configured_bridge), True,
-    ]
+    assert json.loads(result.stdout) == [str(original / "batch_state" / "tasks"), True]
     assert not (original / "batch_state" / "tasks" / "private-write-probe").exists()
     target = _REAL_TASKS_DIR / "t-guard-should-not-exist.json"
     assert not target.exists()

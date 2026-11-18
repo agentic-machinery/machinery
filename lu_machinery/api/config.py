@@ -7,7 +7,6 @@ code in ``scripts.project_api.config`` (Monitor split, C-4687).
 import os
 from pathlib import Path
 
-from lu_machinery.common.bridge_paths import configured_bridge_db_path
 from lu_machinery.common.repo_root import machinery_path, product_root, state_root
 
 
@@ -44,8 +43,6 @@ def __getattr__(name: str) -> Path:
     elif name == "DASHBOARDS_DIR":
         # The machinery pages ship in the release, never in the product checkout.
         selected = machinery_path("api/dashboards")
-    elif name == "MESSAGE_DB":
-        selected = configured_bridge_db_path(state_root())
     elif name == "BATCH_STATE_DIR":
         override = os.environ.get("LEARN_UKRAINIAN_BATCH_STATE_DIR")
         selected = Path(override) if override is not None else state_root() / "batch_state"

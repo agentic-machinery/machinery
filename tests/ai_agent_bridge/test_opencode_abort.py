@@ -96,9 +96,7 @@ def test_run_opencode_attaches_standing_notice_when_agent_chat():
         assert prompt not in argv
 
 
-def test_opencode_permission_abort_fails_ask_loud_and_writes_sidecar(
-    tmp_path, monkeypatch, isolated_bridge_db
-):
+def test_opencode_permission_abort_fails_ask_loud_and_writes_sidecar(tmp_path, monkeypatch):
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet"))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("OPENCODE_HOME", str(tmp_path / ".local" / "share"))

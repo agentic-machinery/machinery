@@ -105,7 +105,7 @@ def isolated_monitor_state(monkeypatch):
             if config is not None:
                 for name in (
                     "PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT",
-                    "DASHBOARDS_DIR", "BATCH_STATE_DIR", "MESSAGE_DB",
+                    "DASHBOARDS_DIR", "BATCH_STATE_DIR",
                 ):
                     vars(config).pop(name, None)
             monitor_context._cached_production_context.cache_clear()

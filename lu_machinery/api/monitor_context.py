@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
-from lu_machinery.common.bridge_paths import configured_bridge_db_path
 from lu_machinery.common.repo_root import state_root
 
 from . import config
@@ -57,9 +56,7 @@ class MonitorRoots:
     backup_dir: Path
     logs_dir: Path
     queue_dir: Path
-    pid_dir: Path
     effective_roots: Mapping[str, Path] = field(default_factory=dict)
-    message_db_path: Path = Path()
     session_streams_db_path: Path = Path()
     epics_db_path: Path = Path()
 
@@ -91,7 +88,6 @@ class MonitorStores:
     built by ``scripts.project_api.context`` on the context runtime.
     """
 
-    message_db: DatabaseHandle | None = None
     presence_store: dict[tuple[str, str, str], ObserverPresence] | None = None
     report_store: dict[str, StoredReport] | None = None
     session_streams_database: SessionStreamDatabase | None = None
@@ -202,7 +198,7 @@ class MonitorContext:
 
         ``replace(self, roots=replace(self.roots, **overrides))`` looks
         equivalent but is not: it leaves ``stores`` bound to the *old*
-        roots (e.g. ``stores.message_db`` still points at the pre-override
+        roots (e.g. ``stores.session_streams_store`` still points at the pre-override
         path). This mirrors ``_build_context``'s two-step build instead —
         an interim context with the overridden roots, empty stores, and a
         fresh runtime, then stores rebuilt against that interim context so
@@ -278,7 +274,6 @@ def _roots(
     dashboards_dir: Path,
     batch_state_dir: Path,
     curriculum_root: Path,
-    message_db_path: Path,
     session_streams_db_path: Path,
     backup_dir: Path,
 ) -> MonitorRoots:
@@ -293,9 +288,7 @@ def _roots(
         backup_dir=backup_dir,
         logs_dir=state_root_path / "logs",
         queue_dir=state_root_path / "agents_extensions" / "shared" / "consultation-queue",
-        pid_dir=state_root_path / ".mcp" / "servers" / "message-broker" / "pids",
         effective_roots=_effective_roots(project_root),
-        message_db_path=message_db_path,
         session_streams_db_path=session_streams_db_path,
         epics_db_path=session_streams_db_path,
     )
@@ -330,7 +323,6 @@ def _stores(context: MonitorContext, *, fixture: bool) -> MonitorStores:
     session_store = SessionStreamStore(session_database)
 
     return MonitorStores(
-        message_db=DatabaseHandle(roots.message_db_path, context._open_db),
         presence_store=presence_store,
         report_store=report_store,
         session_streams_database=session_database,
@@ -352,7 +344,6 @@ def _build_context(
     dashboards_dir: Path,
     batch_state_dir: Path,
     curriculum_root: Path,
-    message_db_path: Path,
     session_streams_db_path: Path,
     backup_dir: Path,
     fixture: bool,
@@ -365,7 +356,6 @@ def _build_context(
         dashboards_dir=dashboards_dir,
         batch_state_dir=batch_state_dir,
         curriculum_root=curriculum_root,
-        message_db_path=message_db_path,
         session_streams_db_path=session_streams_db_path,
         backup_dir=backup_dir,
     )
@@ -381,7 +371,6 @@ def _cached_production_context(
     dashboards_dir: Path,
     batch_state_dir: Path,
     curriculum_root: Path,
-    message_db_path: Path,
     session_streams_db_path: Path,
     backup_dir: Path,
 ) -> MonitorContext:
@@ -392,7 +381,6 @@ def _cached_production_context(
         dashboards_dir=dashboards_dir,
         batch_state_dir=batch_state_dir,
         curriculum_root=curriculum_root,
-        message_db_path=message_db_path,
         session_streams_db_path=session_streams_db_path,
         backup_dir=backup_dir,
         fixture=False,
@@ -415,7 +403,6 @@ def production_context() -> MonitorContext:
         Path(config.DASHBOARDS_DIR),
         Path(os.environ.get("LEARN_UKRAINIAN_BATCH_STATE_DIR", str(shared_root / "batch_state"))),
         Path(config.CURRICULUM_ROOT),
-        configured_bridge_db_path(shared_root),
         default_database_path(shared_root),
         Path(os.environ.get("BACKUP_DIR", str(shared_root / "data" / "backups"))),
     )
@@ -436,7 +423,6 @@ def fixture_context(root: os.PathLike[str] | str) -> MonitorContext:
         dashboards_dir=fixture_root / "dashboards",
         batch_state_dir=fixture_root / "batch_state",
         curriculum_root=fixture_root / "curriculum" / "l2-uk-en",
-        message_db_path=fixture_root / ".mcp" / "servers" / "message-broker" / "messages.db",
         session_streams_db_path=fixture_root / ".agent" / "session-streams" / "v1" / "session-streams.sqlite3",
         backup_dir=fixture_root / "data" / "backups",
         fixture=True,

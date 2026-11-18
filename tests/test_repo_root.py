@@ -61,7 +61,6 @@ def wt_layout(tmp_path) -> tuple[Path, Path]:
 
     files_to_copy = [
         "lu_machinery/common/__init__.py",
-        "lu_machinery/common/bridge_paths.py",
         "lu_machinery/common/repo_root.py",
         "lu_machinery/common/github_client.py",
         "lu_machinery/ai_agent_bridge/_config.py",

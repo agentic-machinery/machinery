@@ -104,7 +104,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Importing repo_root installs the env formatter before any test runs.
 # scripts.common is on the rules-workflow allowlist; scripts.lib is not.
-from lu_machinery.common.bridge_paths import configured_bridge_db_path, default_bridge_db_path
 from lu_machinery.common.flake_quarantine import TIMEOUT_PATTERN, load_registry, rerun_node_ids
 from lu_machinery.common.repo_root import configured_primary_root, main_checkout_root
 from tests import sparse_trees
@@ -1111,31 +1110,18 @@ def _fake_github_bin(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return fake_bin
 
 
-def _protected_store_paths() -> tuple[Path, Path, Path]:
-    """Keep the caller's write-guard anchors across worker and nested sessions."""
+def _protected_store_paths() -> Path:
+    """Keep the caller's write-guard anchor across worker and nested sessions."""
     key = "LU_TEST_PROTECTED_STORES"
     if key not in os.environ:
         primary = configured_primary_root() or main_checkout_root(_REPO_ROOT)
-        os.environ[key] = json.dumps({
-            "tasks": str((primary / "batch_state" / "tasks").resolve()),
-            "bridge": str(default_bridge_db_path(primary).resolve()),
-            "configured_bridge": str(configured_bridge_db_path(primary).resolve()),
-        })
+        os.environ[key] = json.dumps({"tasks": str((primary / "batch_state" / "tasks").resolve())})
     # Descendants inherit this snapshot before importing conftest. Their
-    # temporary primary and AB_DB_PATH must not redefine what stays protected.
-    protected = json.loads(os.environ[key])
-    return (
-        Path(protected["tasks"]),
-        Path(protected["bridge"]),
-        Path(protected["configured_bridge"]),
-    )
+    # temporary primary must not redefine what stays protected.
+    return Path(json.loads(os.environ[key])["tasks"])
 
 
-_REAL_TASKS_DIR, _REAL_BRIDGE_DB_PATH, _CONFIGURED_BRIDGE_DB_PATH = _protected_store_paths()
-_API_BRIDGE_DB_PATH = default_bridge_db_path(_REPO_ROOT).resolve()
-_UNISOLATED_BRIDGE_DB_PATHS = frozenset({_REAL_BRIDGE_DB_PATH, _CONFIGURED_BRIDGE_DB_PATH, _API_BRIDGE_DB_PATH})
-_BRIDGE_DB_SUFFIXES = tuple(sorted({path.name for path in _UNISOLATED_BRIDGE_DB_PATHS}))
-_BRIDGE_DB_BINDINGS_TO_REPLACE = set(_UNISOLATED_BRIDGE_DB_PATHS)
+_REAL_TASKS_DIR = _protected_store_paths()
 
 
 def _sqlite_database_path(database: object) -> tuple[Path | None, bool]:
@@ -1153,52 +1139,6 @@ def _sqlite_database_path(database: object) -> tuple[Path | None, bool]:
         query = parse_qs(parsed.query)
         return Path(unquote(parsed.path)).resolve(), query.get("mode") == ["ro"]
     return Path(raw_path).resolve(), False
-
-
-@pytest.fixture(autouse=True)
-def isolated_bridge_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Redirect imported and future bridge users to one per-test database."""
-    isolated_path = tmp_path / "messages.db"
-    monkeypatch.setenv("AB_DB_PATH", str(isolated_path))
-    # A module first imported during a prior test may retain that test's path.
-    # Carry those paths forward so each test gets its own DB under xdist too.
-    _BRIDGE_DB_BINDINGS_TO_REPLACE.add(isolated_path.resolve())
-    for name, module in tuple(sys.modules.items()):
-        if module is None or not name.startswith(("lu_machinery.", "ai_agent_bridge", "agent_runtime.")):
-            continue
-        for attribute, value in tuple(vars(module).items()):
-            if not isinstance(value, (str, os.PathLike)) or not os.fspath(value).endswith(_BRIDGE_DB_SUFFIXES):
-                continue
-            if Path(value).resolve() in _BRIDGE_DB_BINDINGS_TO_REPLACE:
-                monkeypatch.setattr(module, attribute, isolated_path)
-
-    # The production API app has a context and store handles created at import.
-    # Rebuild both against the isolated path, preserving other configured roots.
-    api_main = _loaded_module("lu_machinery", "api", "main")
-    if api_main is not None:
-        app = vars(api_main).get("app")
-        context = getattr(getattr(app, "state", None), "ctx", None)
-        if context is not None and context.roots.message_db_path.resolve() in _BRIDGE_DB_BINDINGS_TO_REPLACE:
-            monkeypatch.setattr(app.state, "ctx", context.with_roots(message_db_path=isolated_path))
-    return isolated_path
-
-
-@pytest.fixture(autouse=True)
-def _guard_real_bridge_db_writes(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
-    """Fail the test that tries to open the live bridge DB with write access."""
-    original_connect = sqlite3.connect
-
-    def guarded_connect(database, *args, **kwargs):
-        path, read_only = _sqlite_database_path(database)
-        if path in _UNISOLATED_BRIDGE_DB_PATHS and not read_only:
-            pytest.fail(
-                f"{request.node.nodeid} attempted a writable connection to the real bridge DB "
-                f"at {path}; isolate it with AB_DB_PATH or a DB_PATH fixture",
-                pytrace=False,
-            )
-        return original_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
 
 
 def _pytest_tmp_size(root: Path, stop_after_bytes: int | None = None) -> tuple[int, bool]:

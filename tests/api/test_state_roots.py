@@ -36,14 +36,14 @@ def roots(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     # config caches its lazy product paths. Each test starts with its own selection.
     for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR",
-                 "BATCH_STATE_DIR", "MESSAGE_DB"):
+                 "BATCH_STATE_DIR"):
         if name in vars(config):
             monkeypatch.delitem(vars(config), name)
     monitor_context.production_context.cache_clear()
     yield product, state
     monitor_context.production_context.cache_clear()
     for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR",
-                 "BATCH_STATE_DIR", "MESSAGE_DB"):
+                 "BATCH_STATE_DIR"):
         vars(config).pop(name, None)
 
 
@@ -60,10 +60,8 @@ def test_context_keeps_state_stores_out_of_product_and_refreshes_anchor(roots, t
     assert ctx.roots.dashboards_dir == machinery_path("api/dashboards")
     assert ctx.roots.logs_dir == state / "logs"
     assert ctx.roots.queue_dir == state / "agents_extensions/shared/consultation-queue"
-    assert ctx.roots.pid_dir == state / ".mcp/servers/message-broker/pids"
     assert ctx.roots.backup_dir == state / "data/backups"
     assert ctx.roots.batch_state_dir == state / "batch_state"
-    assert ctx.roots.message_db_path == state / ".mcp/servers/message-broker/messages.db"
     assert ctx.roots.session_streams_db_path == state / ".agent/session-streams/v1/session-streams.sqlite3"
     assert ctx.stores.session_streams_database.path == ctx.roots.session_streams_db_path
     assert {p for root in roots for p in root.rglob("*")} == before
@@ -75,7 +73,6 @@ def test_context_keeps_state_stores_out_of_product_and_refreshes_anchor(roots, t
     assert fresh is not ctx
     assert fresh.roots.state_root == other
     assert fresh.roots.batch_state_dir == other / "batch_state"
-    assert fresh.roots.message_db_path == other / ".mcp/servers/message-broker/messages.db"
     assert fresh.roots.project_root == product
     fixture = monitor_context.fixture_context(tmp_path / "fixture")
     assert fixture.roots.state_root == tmp_path / "fixture"

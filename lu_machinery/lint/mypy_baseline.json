@@ -948,11 +948,6 @@
       "message": "Item \"None\" of \"None | dict[str, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/api/docs_router.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"meta\" (hint: \"meta: dict[<type>, <type>] = ...\")"
-    },
-    {
       "path": "lu_machinery/api/epics_router.py",
       "code": "arg-type",
       "message": "Argument 1 to \"EntryRef\" has incompatible type \"**dict[str, object]\"; expected \"None | int\""
