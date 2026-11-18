@@ -165,8 +165,8 @@ def _settled_receipt(record: Mapping[str, Any], result: str, *, head: str) -> di
     whole dispatcher tree, to the clean dispatcher checkout at that head that settled the
     task, read-only from start to settlement so that no process could write code into it,
     and to the route and model. A verdict-bound task settles ``done`` only after that
-    candidate dispatcher's own receipt gate accepted its reply, so the gate, running main's
-    code, need not re-parse the reply with main's copy of the contract.
+    candidate dispatcher's own receipt gate accepted its reply, so rebuilding this receipt
+    needs the settlement facts rather than another parse of the reply.
     """
     if not SHA.fullmatch(head):
         raise CanaryError("PR head is not a full commit SHA")
@@ -289,8 +289,8 @@ def _load_task(task_id: str) -> tuple[dict, str]:
 def record(task_id: str, root: Path | None = None) -> Path:
     """Write the receipt for one settled canary task at the head it reviewed.
 
-    The keeper and ``pr-merge`` read receipts only at the PR's live head, so a receipt
-    for any other head never admits anything.
+    The release cut checks receipts only at the candidate's exact head, so a receipt
+    for any other head never admits a release.
     """
     task, result = _load_task(task_id)
     receipt = build_receipt(task, result, head=str(task.get("head_sha")))
@@ -500,8 +500,8 @@ def run(args: argparse.Namespace) -> int:
         wheelhouse,
     )
     # Force a full score even if this head's changed files do not touch the contract.
-    # Isolated host imports select the installed gate used by the keeper, not the candidate.
-    check = [str(interpreter), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
+    # The sealed candidate supplies the gate and catalog that will be installed together.
+    check = [str(work / "consumer/bin/python"), "-I", "-B", "-m", "lu_machinery.review.contract_canary",
              "check", "--head", head, *args.paths, f"{_MACHINERY}/review/contract_canary.py"]
     if args.dry_run:
         print("DRY RUN: no files, mount, user unit, tasks or receipts created; no live proof")
