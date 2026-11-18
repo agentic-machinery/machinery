@@ -16,12 +16,13 @@ from tests.helpers.product_tree import configured_roots  # noqa: F401
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
 @pytest.fixture(autouse=True)
-def isolate_db(tmp_path: Path):
-    """Keep legacy-message rows isolated for each consumption-state test."""
+def isolate_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep legacy rows and their shadow mode in one fixture lifetime."""
     db_file = tmp_path / "messages.db"
-    with patch.dict(os.environ, {"AB_DB_PATH": str(db_file), "FLEET_COMMS_MESSAGE_PLANE": "shadow"}):
-        _db.init_db().close()
-        yield db_file
+    monkeypatch.setenv("AB_DB_PATH", str(db_file))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+    _db.init_db().close()
+    return db_file
 
 
 def _run_cli(argv: list[str]) -> int:
@@ -105,7 +106,7 @@ def test_live_driver_ack_is_distinct_from_plain_one_shot_ack(capsys):
     assert _message_consumption(one_shot_id) == (1, 0, None)
 
 
-def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys, monkeypatch):
+def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys):
     """Existing ack-all callers stay plain while the explicit flag marks live consumption."""
     plain_id = _messaging.send_message(
         "plain acknowledgement", task_id="review-pr-5687-plain", from_llm="claude", to_llm="codex", quiet=True
@@ -122,7 +123,6 @@ def test_ack_all_flag_is_opt_in_and_asks_surfaces_consumption(capsys, monkeypatc
     assert (acknowledged, consumed) == (1, 1)
     assert consumed_at is not None
 
-    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
     assert _run_cli(["asks", "--task-id", "review-pr-5687-live"]) == 0
     asks = capsys.readouterr().out
     assert "CONSUMPTION" in asks
