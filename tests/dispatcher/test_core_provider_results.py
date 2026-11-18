@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from lu_machinery.dispatcher import worker
+from lu_machinery.dispatcher import watchdog, worker
 from lu_machinery.dispatcher.types import Invocation, TaskSpec
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -225,7 +225,10 @@ def test_agy_stream_from_another_model_family_settles_as_a_failure(sandbox, term
         server.server_close()
 
 
-@pytest.mark.parametrize("failure", [None, "unclassified", "missing", "truncated", "schema", "dirty_stream", "wrong_model"])
+@pytest.mark.parametrize("failure", [
+    None, "unclassified", "missing", "truncated", "schema", "over_deep", "dirty_stream", "wrong_model",
+    "linger", "model_selection", "incomplete", "unknown_status",
+])
 def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monkeypatch, failure):
     """Defect: AGY exit 0 with terminal ERROR discarded a complete Carbon review."""
     tasks = tmp_path / "tasks"
@@ -237,6 +240,7 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
     run_git(repo, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
             "commit", "--allow-empty", "-m", "Fixture base")
     monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     monkeypatch.setattr(worker, "_reap_settled", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.headroom, "check_plan", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_args, **_kwargs: None)
@@ -248,8 +252,15 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
         "overall": {"correctness": "correct", "confidence": 0.9, "explanation": "No defects."},
         "findings": [],
     })
-    response = {"missing": None, "truncated": valid[:-1], "schema": '{"findings": []}'}.get(failure, valid)
-    terminal = {"status": "ERROR", "error": "fixture" if failure == "unclassified" else "API error: fixture"}
+    response = {
+        "missing": None, "truncated": valid[:-1], "schema": '{"findings": []}', "over_deep": "[" * 513 + "]" * 513,
+    }.get(failure, valid)
+    terminal = {
+        "status": "UNKNOWN" if failure == "unknown_status" else "ERROR",
+        "error": {"unclassified": "fixture", "model_selection": "invalid model selection: fixture"}.get(
+            failure, "API error: fixture",
+        ),
+    }
     if response is not None:
         terminal["response"] = response
     model = "gemini-4-carbon-medium"
@@ -258,11 +269,20 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
         {"event": "init", "init": {"model": attested}},
         {"event": "result", "result": terminal},
     ]
+    if failure == "incomplete":
+        events.insert(1, {"event": "step_update", "step_update": {
+            "step_index": 4, "state": "ACTIVE", "tool_name": "run_command",
+        }})
     stream = "\n".join(json.dumps(event) for event in events) + "\n"
     if failure == "dirty_stream":
         stream += "{"
+    code = f"print({stream!r}, end='', flush=True)"
+    if failure == "linger":
+        monkeypatch.setattr(watchdog, "TERMINAL_EXIT_GRACE_S", 0.1)
+        monkeypatch.setattr(worker, "TERMINAL_EXIT_GRACE_S", 0.1)
+        code += "\nimport signal\nsignal.pause()"
     monkeypatch.setattr(worker.runtime_context, "build", lambda _spec, env: Invocation(
-        [sys.executable, "-c", f"print({stream!r}, end='')"], None, env, None,
+        [sys.executable, "-c", code], None, env, None,
     ))
     spec = TaskSpec(
         "agy-terminal-error", "agy", model, None, "read-only", repo,
@@ -278,9 +298,16 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
     worker.supervise(path)
 
     settled = json.loads(path.read_text())
-    error_class = "unclassified" if failure == "unclassified" else "transport"
-    terminal_error = f"agy: terminal result unsuccessful (ERROR): {error_class} error; its text is in the task's retained stream"
-    assert settled["returncode"] == 0, settled["error"]
+    error_class = {"unclassified": "unclassified", "model_selection": "model_selection"}.get(failure, "transport")
+    terminal_status = "unrecognized" if failure == "unknown_status" else "ERROR"
+    terminal_error = (
+        f"agy: terminal result unsuccessful ({terminal_status}): {error_class} error; "
+        "its text is in the task's retained stream"
+    )
+    if failure == "linger":
+        assert settled["returncode"] < 0
+    else:
+        assert settled["returncode"] == 0, settled["error"]
     if failure in (None, "unclassified"):
         assert settled["status"] == "done"
         assert settled["error"] is None

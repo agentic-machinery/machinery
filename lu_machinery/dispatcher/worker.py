@@ -1883,7 +1883,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             parse_options: dict[str, object] = (
                 {"output_schema": schema} if spec.agent in {"agy", "claude"} and schema is not None else {}
             )
-            if spec.agent == "agy" and spec.mode == "read-only":
+            if spec.agent == "agy" and spec.mode == "read-only" and returncode == 0 and not lingered:
                 parse_options["settle_read_only"] = True
             parsed = provider.parse(stdout, stderr_path.read_text(errors="replace"), exit_code, final_text, **parse_options)
             text, usage, sources_calls = parsed.text, parsed.usage, parsed.sources_mcp_call_count
@@ -1930,14 +1930,13 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 from lu_machinery.agent_runtime.adapters._output_schema import json_value
                 from lu_machinery.review.review_contract import ContractError, validate_reviewer_payload
 
-                payload = json_value(text)
-                if isinstance(payload, dict):
-                    try:
+                try:
+                    payload = json_value(text)
+                    if isinstance(payload, dict):
                         validate_reviewer_payload(payload)
-                    except ContractError:
-                        pass
-                    else:
                         transport_warning = parsed.terminal_warning
+                except (ContractError, RecursionError):
+                    pass
         status = "done" if exit_code == 0 and (not parsed.error or transport_warning) and text and text.strip() else "failed"
         if exit_code < 0:
             status = "crashed"
