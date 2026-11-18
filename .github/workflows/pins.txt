@@ -127,8 +127,7 @@ MYPY_VERSION=2.1.0
 #   is required: typed packages change the error census, and on 2026-11-08 a
 #   venv with only mypy and its own dependencies reported 16 ratchet
 #   violations on a tree the full closure passes. uv.lock was first written
-#   with the previous heredoc pins as constraints, so every version stayed
-#   (httpcore2 and httpx2 take the runtime 2.16.0); on 2026-11-17 the ratchet
+#   with the previous heredoc pins as constraints. On 2026-11-17 the ratchet
 #   matched the baseline in that environment on CPython 3.14.8, with mypy's
 #   python_version still 3.12. Bump these pins together with the baseline.
 ZIZMOR_VERSION=1.31.1

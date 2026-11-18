@@ -79,7 +79,7 @@ from lu_machinery.secret_redactor import redact_value
 from lu_machinery.telemetry.emit import current_run_id, current_session_id
 
 from .accounting import model_accounting_fields
-from .adapters.base import AgentAdapter
+from .adapters.base import AgentAdapter, refuse_retired_isolation
 from .adapters.codex_events import mcp_tool_event
 from .attribution import InvocationAttribution, resolve_invocation_attribution
 from .binary_resolve import augment_path_for_login_bins, resolve_agent_binary
@@ -111,7 +111,6 @@ from .result import AgyModelIdentity, ParseResult, Result
 from .retired_seat_admission import ACP_MODE, KimiAdmissionRefused, refuse_kimi_execution
 from .target_admission import resolve_and_admit
 from .telemetry import InvocationTelemetry, codex_model_identity, resolve_invocation_telemetry
-from .trail_isolation import prepare_trail_isolation
 from .usage import has_headroom as _usage_has_headroom
 from .usage import write_record
 from .watchdog import (
@@ -1937,8 +1936,7 @@ def _execute_invocation_once(
     # review_isolation, replace ambient agent env + wrap argv with the
     # fail-closed OS sandbox policy. Never silently weaken.
     review_cmd = list(plan.cmd)
-    # InvocationPlan.cwd is the authoritative spawn location. Trail isolation
-    # uses this to isolate native Grok from ambient project MCP configuration.
+    # InvocationPlan.cwd is the authoritative spawn location.
     review_cwd = Path(getattr(plan, "cwd", None) or cwd)
     isolation_evidence: dict | None = None
     isolation_capability_digest: str | None = None
@@ -3936,7 +3934,7 @@ def invoke(
     rules_core_delivery: RulesCoreDelivery = RulesCoreDelivery.INJECT,
     attempt_evidence: dict | None = None,
 ) -> Result:
-    """Invoke an agent CLI, provisioning trail isolation before any spawn.
+    """Invoke an agent CLI after checking launch admission.
 
     ``rules_seat`` selects the rules core independently of the adapter seat:
     a valid explicit value wins over ``LU_RULES_SEAT``, then defaults to core.
@@ -3946,17 +3944,13 @@ def invoke(
     ``attempt_evidence`` receives the boundary's egress summary after cleanup,
     even when invocation raises or cancellation unwinds past this call.
 
-    ``tool_config={"trail_isolation": ...}`` is handled before adapter
-    planning. Unsupported adapters refuse before spawn, while supported
-    profiles receive a private one-server MCP configuration that is removed
-    after success, refusal, timeout, or adapter error.
-
     Retired Kimi seats and models are refused before attribution, ownership
     resolution or execution-tree reads. Other retired models are refused next,
     still before attribution.
     """
     refuse_kimi_execution((agent_name,), (model,), mode=mode, cwd=cwd, tool_config=tool_config)
     _refuse_retired_launch_model(agent_name, model, tool_config)
+    refuse_retired_isolation(tool_config)
     attribution = resolve_invocation_attribution(
         explicit=initiator,
         task_id=task_id,
@@ -3968,7 +3962,6 @@ def invoke(
     identity_token = _AGY_OBSERVED_IDENTITY.set(None)
     selector_token = _REQUESTED_SELECTOR.set(model)
     nonce_token = _INVOCATION_NONCE.set((tool_config or {}).get("run_nonce"))
-    launch = None
     attempt = None
     try:
         from .attempt_boundary import prepare_attempt_boundary
@@ -3980,12 +3973,6 @@ def invoke(
             attempt = prepare_attempt_boundary(agent_name, mode, session_id, boundary_config)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
             raise AgentUnavailableError(_attempt_boundary_refusal(exc, stage="prepare")) from exc
-        prepared_config = attempt.tool_config if attempt is not None else tool_config
-        launch = prepare_trail_isolation(
-            agent_name=agent_name,
-            mode=mode,
-            tool_config=prepared_config,
-        )
         return _invoke_impl(
             agent_name,
             prompt,
@@ -3994,7 +3981,7 @@ def invoke(
             model=model,
             task_id=task_id,
             session_id=session_id,
-            tool_config=launch.tool_config if launch is not None else prepared_config,
+            tool_config=attempt.tool_config if attempt is not None else tool_config,
             entrypoint=entrypoint,
             hard_timeout=hard_timeout,
             stall_timeout=stall_timeout,
@@ -4018,16 +4005,12 @@ def invoke(
         raise
     finally:
         try:
-            try:
-                if launch is not None:
-                    launch.cleanup()
-            finally:
-                if attempt is not None:
-                    try:
-                        attempt.cleanup()
-                    finally:
-                        if attempt_evidence is not None:
-                            attempt_evidence.update(attempt.egress_evidence)
+            if attempt is not None:
+                try:
+                    attempt.cleanup()
+                finally:
+                    if attempt_evidence is not None:
+                        attempt_evidence.update(attempt.egress_evidence)
         except BaseException as exc:
             if agent_name == "agy":
                 exc.model_identity = _AGY_OBSERVED_IDENTITY.get()

@@ -698,11 +698,6 @@
       "message": "Returning Any from function declared to return \"None | str\""
     },
     {
-      "path": "lu_machinery/agent_runtime/trail_isolation.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[Any]\""
-    },
-    {
       "path": "lu_machinery/ai_agent_bridge/_acp_compat.py",
       "code": "type-var",
       "message": "Value of type variable \"_DataclassT\" of \"replace\" cannot be \"object\""
@@ -7411,41 +7406,6 @@
       "path": "lu_machinery/orchestration/thread_handoff.py",
       "code": "no-redef",
       "message": "Name \"_lock_timeout_exit\" already defined on line 7501"
-    },
-    {
-      "path": "lu_machinery/orchestration/trail_runner.py",
-      "code": "override",
-      "message": "Return type \"None\" of \"error\" incompatible with return type \"Never\" in supertype \"argparse.ArgumentParser\""
-    },
-    {
-      "path": "lu_machinery/orchestration/trails/executor.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"PreparedInvocation | TrailRun | dict[str, Any]\", variable has type \"TrailRun\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/trails/executor.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"TrailRun | TrailRunResult\", variable has type \"TrailRun\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/trails/executor.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"TrailRun | TrailRunResult\", variable has type \"TrailRun\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/trails/executor.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/trails/trail_certification.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"float\""
-    },
-    {
-      "path": "lu_machinery/orchestration/validate_trailspec.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"list[bool | str]\""
     },
     {
       "path": "lu_machinery/orchestration/worktree_artifacts.py",

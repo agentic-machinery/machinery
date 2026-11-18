@@ -1183,6 +1183,18 @@ def test_invoke_admits_active_explicit_model_past_retirement_gate(tmp_path):
         invoke("cursor", "hello", mode="read-only", cwd=tmp_path, model="grok-4.7")
 
 
+@pytest.mark.parametrize("agent", ["glm", "claude"])
+def test_retired_isolation_is_refused_before_attempt_preparation(agent, monkeypatch):
+    from lu_machinery.agent_runtime import attempt_boundary
+
+    def unexpected_preparation(*args):
+        pytest.fail("attempt preparation ran for retired isolation")
+
+    monkeypatch.setattr(attempt_boundary, "prepare_attempt_boundary", unexpected_preparation)
+    with pytest.raises(ValueError, match="trail isolation refused"):
+        invoke(agent, "Inspect the sample.", tool_config={"trail_isolation": True})
+
+
 def test_invoke_requires_cwd_for_write_mode():
     """A write invocation without an explicit working directory must fail before launch."""
     with pytest.raises(ValueError, match="cwd is mandatory"):
@@ -3562,7 +3574,7 @@ def test_agy_runtime_missing_origin_evidence_never_acquires_custody(tmp_path, mo
 
 def test_agy_init_custody_survives_cleanup_exception(tmp_path, monkeypatch):
     """A cleanup exception must not erase already verified provider-init evidence."""
-    from lu_machinery.agent_runtime import runner
+    from lu_machinery.agent_runtime import attempt_boundary, runner
     from tests.agent_runtime.adapters.test_agy_claude_routes import mock_agy_provider
 
     model = "claude-opus-5-5-high"
@@ -3576,9 +3588,8 @@ def test_agy_init_custody_survives_cleanup_exception(tmp_path, monkeypatch):
     def cleanup():
         raise RuntimeError("synthetic cleanup failure")
 
-    monkeypatch.setattr(runner, "prepare_trail_isolation", lambda **k: SimpleNamespace(
-        cleanup=cleanup, tool_config={"run_nonce": "cleanup-run"},
-    ))
+    attempt = SimpleNamespace(workspace=tmp_path, tool_config={"run_nonce": "cleanup-run"}, cleanup=cleanup)
+    monkeypatch.setattr(attempt_boundary, "prepare_attempt_boundary", lambda *args: attempt)
     with pytest.raises(RuntimeError, match="synthetic cleanup failure") as caught:
         invoke("agy", "Implement.", mode="workspace-write", cwd=tmp_path, model=model, task_id="cleanup-10420")
     assert len(launches) == 1
