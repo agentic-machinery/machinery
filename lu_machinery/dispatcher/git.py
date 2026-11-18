@@ -778,8 +778,9 @@ def _hidden_tracked_changes(tree: Path) -> bool:
     directory counts as changed. Each initialized submodule is checked the same way, with its own status run
     with --ignore-submodules=none, since its index flags and its own submodules' ignore settings hide work
     from the superproject; a submodule path under a symlink, or a non-empty submodule directory without its
-    Git metadata, counts as changed. Filter drivers stay disabled (execution_safe_git), so a driver-filtered or
-    re-encoded file can read changed, never clean.
+    Git metadata, counts as changed. Filter drivers stay disabled (execution_safe_git), so status compares a
+    filtered file's raw bytes with its stored blob and an edit that matches the blob reads clean: any tracked path
+    whose filter attribute names a driver the tree's config defines (_filtered_paths) counts as changed.
     """
     local = partial(execution_safe_git, cwd=tree, capture_output=True, check=True, timeout=30)
 
@@ -792,16 +793,20 @@ def _hidden_tracked_changes(tree: Path) -> bool:
 
     flagged: list[tuple[bool, str, str, str]] = []
     submodules: dict[str, None] = {}
+    names: list[bytes] = []
     for entry in local(["ls-files", "--stage", "-v", "-z"]).stdout.split(b"\0"):
         if not entry:
             continue
         meta, raw_name = entry[2:].split(b"\t", 1)
+        names.append(raw_name)
         mode, oid, _stage = meta.decode("ascii").split(" ")
         name = os.fsdecode(raw_name)
         if entry[:1].islower() or entry[:1] == b"S":
             flagged.append((entry[:1] in (b"S", b"s"), mode, oid, name))
         elif mode == "160000":
             submodules[name] = None
+    if _filtered_paths(local, names):
+        return True
     executable = symlinks = True
     if flagged:
         executable, symlinks = enabled("core.fileMode"), enabled("core.symlinks")
@@ -889,6 +894,25 @@ def _hidden_tracked_changes(tree: Path) -> bool:
         if nested(["status", "--porcelain", "--ignore-submodules=none"]).stdout or _hidden_tracked_changes(path):
             return True
     return False
+
+
+def _filtered_paths(local, names: list[bytes]) -> bool:
+    """Whether a filter attribute of any named path names a filter driver the tree's config defines.
+
+    Every scope counts except the runner's own command-line controls, which disable the drivers, and any
+    filter.<driver>.* key defines its driver, whatever its value. A failed read raises, so the tree is unknown.
+    """
+    rows = local(["config", "--null", "--show-scope", "--get-regexp", r"^filter\."], check=False)
+    if rows.returncode not in (0, 1):  # 1: no filter key at all
+        rows.check_returncode()
+    fields = rows.stdout.split(b"\0")
+    drivers = {key.partition(b"\n")[0][len(b"filter."):].rpartition(b".")[0]
+               for scope, key in zip(fields[::2], fields[1::2], strict=False) if scope != b"command"}
+    if not drivers or not names:
+        return False
+    # -z triples are path, attribute, value; a value is unspecified, unset, set or a driver name.
+    values = local(["check-attr", "--stdin", "-z", "filter"], input=b"".join(name + b"\0" for name in names)).stdout
+    return any(value in drivers for value in values.split(b"\0")[2::3])
 
 
 def _batch_blobs(local, oids: list[str]) -> list[bytes]:
