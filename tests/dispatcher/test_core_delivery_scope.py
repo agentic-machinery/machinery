@@ -211,7 +211,7 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     request = {"pr": 78, "repo": slug, "repo_root": str(root)}
     monkeypatch.setattr(git, "resolve_repo", lambda key: (root, {"github": slug}) if key == repo_key else None)
     monkeypatch.setattr(worker, "_stop_task_services", lambda _: None)
-    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _: None)
+    monkeypatch.setattr(worker, "_settle_task_scratch", lambda _record, **_kwargs: None)
     events = []
     disposition = "retained"
 

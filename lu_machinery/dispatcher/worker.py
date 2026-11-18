@@ -35,10 +35,11 @@ from lu_machinery.dispatcher import (
     ownership,
     providers,
     runtime_context,
+    scratch,
     store,
     write_boundary,
 )
-from lu_machinery.dispatcher.environment import child_env, task_scratch_path
+from lu_machinery.dispatcher.environment import child_env
 from lu_machinery.dispatcher.types import ParsedResult, TaskSpec
 from lu_machinery.dispatcher.watchdog import (
     TERMINAL_EXIT_GRACE_S,
@@ -105,7 +106,7 @@ def _remove_cache_entry(dir_fd: int, name: str) -> None:
     """Unlink a cache-named link, or remove one cache directory, relative to ``dir_fd``.
 
     A link is unlinked and never followed. A directory is removed by the same remover
-    ``_remove_task_scratch`` uses: this directory gets owner rwx when it lacks it, children
+    task scratch settlement uses (``scratch.settle``): this directory gets owner rwx when it lacks it, children
     are repaired on descent, and another device or a mount point is refused before anything
     is unlinked. The chmod and the deletion stay inside ``name``.
 
@@ -838,7 +839,9 @@ def _agy_unfinished(parsed: ParsedResult) -> ParsedResult:
 # Admission and worker exit never retry unrelated tasks. A public-push refusal
 # (opsec_refused) and an owner retention hold (retention_hold) are absent on purpose:
 # automation must not retry either.
-RETRY_REASONS = frozenset({"dirty", "provider_processes_alive", "provider_liveness_unknown", "borrowed_by_live_task",
+# The worktree reasons settlement records when it cannot prove the provider's process tree gone.
+LIVENESS_REASONS = frozenset({"provider_processes_alive", "provider_liveness_unknown"})
+RETRY_REASONS = frozenset({"dirty", *LIVENESS_REASONS, "borrowed_by_live_task",
                            "unpublished", "remote_mismatch", "unknown", "removal_refused",
                            "worktree_remove_failed", "settlement_failed",
                            "salvage_failed", "salvage_unverified", "large_ignored_output",
@@ -1238,82 +1241,19 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
         if "closeout" in record and record["closeout"].get("returncode") != 0:
             record.update(status="failed", error=f"closeout_failed: PR {record['closeout'].get('pr')} exit "
                                                  f"{record['closeout'].get('returncode')}")
-    _settle_task_scratch(record)
+    _settle_task_scratch(record, liveness_kept=_text(record.get("worktree_disposition_reason")) in LIVENESS_REASONS)
 
 
-def _settle_task_scratch(record: dict) -> None:
-    """Remove the task's scratch once its worktree is removed; keep it while the worktree stays.
+def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
+    """Remove the task's scratch, its write worker's TMPDIR, once the provider is proven gone (scratch.settle).
 
-    Records ``task_scratch_disposition`` (removed, absent, retained, refused or failed) with its reason and
-    the bytes found. A refusal or failure is recorded and never fails settlement.
+    The proof is taken fresh from the run's own identity on every pass, whatever the worktree or task status
+    says. ``liveness_kept`` is this pass's own verdict that the provider may still run, which keeps it too.
     """
-    worktree = record.get("worktree_disposition")
-    if worktree != "removed":
-        record.update(task_scratch_disposition="retained", task_scratch_bytes=None,
-                      task_scratch_disposition_reason=f"worktree {worktree or 'unsettled'}: scratch kept with it")
-        return
-    try:
-        disposition, reason, size = _remove_task_scratch(record.get("task_id"))
-    except Exception as exc:  # recorded, never raised: settlement must still publish the record
-        disposition, reason, size = "failed", f"{type(exc).__name__}: {exc}"[:300], None
-    record.update(task_scratch_disposition=disposition, task_scratch_disposition_reason=reason,
-                  task_scratch_bytes=size)
+    def provider_gone() -> bool:
+        return not liveness_kept and _provider_alive(record) is False
 
-
-def _remove_task_scratch(task_id: object) -> tuple[str, str, int | None]:
-    """Delete exactly ``<base>/<task-id>``; return (disposition, reason, bytes).
-
-    Refuses an invalid task id, a symlink, a non-directory, an entry another user owns, one on another
-    filesystem or with a mount below it. Deletion never follows a symlink, never leaves the entry's device
-    or mount, and gives a read-only directory owner rwx before emptying it (task_scratch's remover).
-    """
-    if not isinstance(task_id, str):
-        return "refused", "task id missing", None
-    try:
-        path = task_scratch_path(task_id)
-    except ValueError:
-        return "refused", "task id fails validation", None
-    base_fd = os.open(path.parent, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC)
-    try:
-        try:
-            info = os.stat(path.name, dir_fd=base_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return "absent", "no scratch directory", None
-        if stat.S_ISLNK(info.st_mode):
-            return "refused", "scratch path is a symlink", None
-        if not stat.S_ISDIR(info.st_mode):
-            return "refused", "scratch path is not a directory", None
-        if info.st_uid != os.geteuid():
-            return "refused", "scratch directory is owned by another user", None
-        base = os.fstat(base_fd)
-        mount_id = task_scratch.fd_mount_id(base_fd)
-        if info.st_dev != base.st_dev:
-            return "refused", "scratch directory is on another filesystem", None
-        if mount_id is None:
-            return "refused", "mount information unavailable", None
-        size = None
-        try:
-            if stat.S_IMODE(info.st_mode) & stat.S_IRWXU != stat.S_IRWXU:
-                # A read-only top directory would refuse to give up its entries; children are repaired on descent.
-                task_scratch.grant_owner_rwx(base_fd, path.name, info, device=base.st_dev, mount_id=mount_id)
-            scratch_fd = os.open(path.name, task_scratch._DIR_OPEN_FLAGS | os.O_CLOEXEC, dir_fd=base_fd)
-            try:
-                held = os.fstat(scratch_fd)
-                if (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino):
-                    return "refused", "scratch directory changed during settlement", None
-                size, _newest = task_scratch._walk_stats(scratch_fd, device=base.st_dev, mount_id=mount_id,
-                                                         opaque_locked=True)
-            finally:
-                os.close(scratch_fd)
-            task_scratch._remove_invocation_dir(base_fd, path.name, namespace=path.parent,
-                                                expected_dev=info.st_dev, expected_ino=info.st_ino)
-        except task_scratch.ContainmentError as exc:
-            return "refused", str(exc)[:300], size
-        except OSError as exc:
-            return "failed", f"{type(exc).__name__}: {exc.strerror or exc}"[:300], size
-        return "removed", "worktree removed", size
-    finally:
-        os.close(base_fd)
+    scratch.settle(record, provider_gone)
 
 
 def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> None:
@@ -1369,14 +1309,25 @@ def _holds_task_caches(record: dict) -> bool:
     result was recorded, never reaped, or with a provider not yet proven gone) is walked by the locked
     removal, which records its result.
     """
-    if record.get("status") in store.ACTIVE:
+    if not _finished(record):
         return False
     return bool(record.get("task_cache_residue") != [])
 
 
+def _text(value: object) -> str | None:
+    """A record field read for a membership test: a string, else None, so a malformed value never raises."""
+    return value if isinstance(value, str) else None
+
+
+def _finished(record: dict) -> bool:
+    """A terminal task; a malformed status reads as live."""
+    status = _text(record.get("status"))
+    return status is not None and status not in store.ACTIVE
+
+
 def _unsettled(record: dict) -> bool:
-    return record.get("status") not in store.ACTIVE and (
-        "worktree_disposition" not in record or record.get("worktree_disposition_reason") in RETRY_REASONS)
+    return _finished(record) and (
+        "worktree_disposition" not in record or _text(record.get("worktree_disposition_reason")) in RETRY_REASONS)
 
 
 def settle_left_worktrees(salvage: bool = False) -> None:
@@ -1393,7 +1344,7 @@ def settle_left_worktrees(salvage: bool = False) -> None:
             records.append(record)
     for record in records:
         reap = _unsettled(record) and Path(record.get("worktree_path") or "").is_dir()
-        if not reap and not _holds_task_caches(record):
+        if not reap and not _holds_task_caches(record) and not scratch.pending(record):
             continue
         try:
             path = store.record_path(record["task_id"])
@@ -1403,8 +1354,12 @@ def settle_left_worktrees(salvage: bool = False) -> None:
         with contextlib.suppress(OSError, ValueError, KeyError), store.task_state_lock(path):
             current = json_depth.loads(path.read_text(), max_depth=512)
             if not reap or not _unsettled(current):
-                # A task settled without a worktree, or by an earlier pass, still sheds its caches.
-                if _clear_task_caches(current):
+                # A task settled without a worktree, or by an earlier pass, still sheds its caches and scratch.
+                changed = _holds_task_caches(current) and _clear_task_caches(current)
+                if scratch.pending(current):
+                    _settle_task_scratch(current)
+                    changed = True
+                if changed:
                     store.replace(current, path)
             else:
                 _reap_settled(current, salvage=salvage)
@@ -1733,6 +1688,15 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status, error = "failed", "output schema binding invalid"
                 return
         provider = providers.load(spec.agent)
+        if spec.mode == "workspace-write":
+            try:
+                # The provider's TMPDIR (environment.child_env), made before any launch check runs a provider CLI
+                # with it, and persisted so settlement removes only this directory.
+                record["task_scratch"] = scratch.create(spec.task_id)
+                store.replace(record, path, require_existing=True)
+            except (OSError, ValueError) as exc:
+                status, error = "failed", f"task_scratch_unavailable: {exc}"
+                return
         invocation = runtime_context.build(spec, _provider_env(spec))
         record["runtime_input_sha256"] = hashlib.sha256(invocation.stdin or b"").hexdigest()
         pending_conversation = None

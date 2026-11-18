@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
 import yaml
-from lu_machinery.dispatcher import git, ownership, worker
+from lu_machinery.dispatcher import environment, git, ownership, worker
 from tests.dispatcher.worker_reap import Reaper, reap_root
 from lu_machinery.common.repo_root import machinery_root
 from tests.helpers import current_sol
@@ -232,6 +232,15 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     shutil.copy(SOURCE / "lu_machinery/schemas/code-review-findings.v1.schema.json", schema_dir)
     shutil.copy(Path(__file__).with_name("stub_provider.py"), repo / "lu_machinery/dispatcher/providers/codex.py")
     (repo / "lu_machinery/dispatcher/write_boundary.py").write_text(WRITE_BOUNDARY_DOUBLE)
+    # A write worker's TMPDIR is its task scratch: the subprocess dispatcher and an in-process supervise both get a
+    # private base, never /var/tmp.
+    scratch_base = tmp_path / "var-tmp"
+    scratch_base.mkdir()
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", scratch_base)
+    environment_py = repo / "lu_machinery/dispatcher/environment.py"
+    pinned = 'TASK_SCRATCH_BASE = Path("/var/tmp")'
+    assert pinned in environment_py.read_text()
+    environment_py.write_text(environment_py.read_text().replace(pinned, f"TASK_SCRATCH_BASE = Path({str(scratch_base)!r})"))
     monkeypatch.setattr(worker.write_boundary, "launcher", lambda _spec, invocation, _task: list(invocation.argv))
     monkeypatch.setattr(worker.write_boundary, "verify", lambda _task, _id, mode="workspace-write": (
         {"status": "test-double", "mode": mode}, None))
@@ -313,7 +322,8 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
         return "--base", "main", "--pinned-head", head
 
     box = SimpleNamespace(repo=repo, tasks=tasks, remote=remote, env=env, python=python, cli=cli, dispatch=dispatch,
-                          settle=settle, sweep=sweep, review_models=review_models, review_target=review_target)
+                          settle=settle, sweep=sweep, review_models=review_models, review_target=review_target,
+                          scratch_base=scratch_base)
     try:
         yield box
     finally:
