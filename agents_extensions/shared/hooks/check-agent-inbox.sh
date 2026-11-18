@@ -22,6 +22,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
 context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
 
 RECIPIENT="${LEARN_UK_HOOK_RECIPIENT:-${SESSION_HANDOFF_AGENT:-claude}}"
+if [ "$RECIPIENT" = "codex" ] && [ -n "${SESSION_HANDOFF_AGENT:-}" ]; then
+  RECIPIENT="$SESSION_HANDOFF_AGENT"
+fi
 
 RECIPIENT_LABEL=$(printf '%s' "$RECIPIENT" | tr '[:lower:]' '[:upper:]')
 INBOX_PYTHON="$CONTEXT_PROJECT_PYTHON"

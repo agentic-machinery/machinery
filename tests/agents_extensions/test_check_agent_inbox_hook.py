@@ -21,7 +21,7 @@ def _run_probe(monkeypatch, db: Path, recipient: str) -> None:
         print(result["count"])
 
 
-@pytest.mark.parametrize("recipient", ["codex", "grok", "grok-build"])
+@pytest.mark.parametrize("recipient", ["codex-infra", "grok-infra", "grok-monitor"])
 def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypatch, capsys, recipient):
     root = tmp_path / "inbox ? # % space"
     root.mkdir()
@@ -78,7 +78,7 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
             conn.commit()
     before = db.read_bytes() if db.exists() else None
 
-    _run_probe(monkeypatch, db, "codex")
+    _run_probe(monkeypatch, db, "codex-infra")
 
     captured = capsys.readouterr()
     assert captured.out == ("0\n" if state == "empty" else "")
@@ -87,6 +87,14 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
     assert list(tmp_path.iterdir()) == ([] if state == "missing" else [db])
 
     if state in ("empty", "missing"):
+        from lu_machinery.fleet_comms.authority import pending_delivery_snapshot
+
+        if state == "empty":
+            assert pending_delivery_snapshot("codex", root=tmp_path) == {
+                "count": None, "ids": [], "probe": "unknown", "content_included": False,
+                "reason": "recipient_not_registered",
+            }
+
         # The installed entry must reach the empty-inbox fast path with only
         # the configured primary, rather than its own path.
         subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -123,6 +131,7 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
                 "LEARN_UKRAINIAN_PYTHON": str(interpreter),
                 "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(tmp_path),
                 "FLEET_COMMS_ROOT": str(db.parent), "LEARN_UK_HOOK_RECIPIENT": "codex",
+                "SESSION_HANDOFF_AGENT": "codex-infra",
                 "PYTHONPATH": str(nested), "INBOX_PROBE_ARGS": str(calls),
             }, timeout=15,
         )
@@ -135,4 +144,4 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
         if state == "empty":
             assert db.read_bytes() == before
         assert not tripwire.exists()
-        assert "-I -m lu_machinery.fleet_comms deliveries pending --recipient codex" in calls.read_text().splitlines()
+        assert "-I -m lu_machinery.fleet_comms deliveries pending --recipient codex-infra" in calls.read_text().splitlines()

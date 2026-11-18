@@ -542,13 +542,21 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         from lu_machinery.common.bridge_paths import configured_bridge_db_path
         from lu_machinery.common.repo_root import state_root
 
+        legacy_alias = resolve_recipient_alias(recipient)
+        # Named historical aliases still consult the legacy inbox below.
+        if legacy_alias == recipient:
+            standing = _recipient_standing(recipient, *_load_roster())
+            if standing in {"not_registered", "settled_task"}:
+                return {**unknown, "reason": AuthorityRecipientRefused(recipient, standing).cause}
+            if standing == "unknown":
+                return {**unknown, "reason": "recipient_standing_unverified"}
         legacy_path = configured_bridge_db_path(state_root())
         if not legacy_path.is_absolute():
             return {**unknown, "reason": "pending_delivery_store_unavailable"}
         if legacy_path.exists():
             aliases = tuple(dict.fromkeys((
                 *seat_read_aliases(recipient),
-                *seat_read_aliases(resolve_recipient_alias(recipient)),
+                *seat_read_aliases(legacy_alias),
             )))
             placeholders = ",".join("?" for _ in aliases)
             with contextlib.closing(open_readonly(legacy_path, timeout=1.0)) as legacy:
