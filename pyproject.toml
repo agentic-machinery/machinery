@@ -42,6 +42,7 @@ test = ["hypothesis==6.170.15"]
 # environment has no pip of its own.
 test = [
     "pip==26.3",
+    "httpx2==2.16.0",  # ASGI transport used by the API and Work tests.
     "mcp==1.29.0",  # FastMCP used by the opt-in permission test.
     "PyMuPDF==2.1",
     "pymupdf4llm==2.1",
