@@ -79,6 +79,7 @@ def test_background_logs_use_state_and_ask_child_uses_primary(roots, monkeypatch
     monkeypatch.setattr(_ask_lifecycle, "_load_ask_row", lambda message_id: None)
     monkeypatch.setattr(_ask_lifecycle, "_confirm_worker_started", lambda *args: True)
     if kind == "ask":
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
         _ask_lifecycle.launch_background_ask(42, "claude", {})
         log_name = "ask-42.log"
     else:

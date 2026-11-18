@@ -285,8 +285,9 @@ def test_supported_bridge_command_defaults_to_durable_acp(
     from lu_machinery.ai_agent_bridge import _channels, _channels_cli, _config
 
     db_path = tmp_path / "bridge.db"
-    # The bridge repository is the registered primary checkout, as the product checkout was.
+    # The private bridge checkout uses the explicit ACP test workspace hook.
     monkeypatch.setenv("AB_REPO_ROOT", str(configured_roots.primary))
+    monkeypatch.setenv("LU_TEST_ACP_PRIMARY_ROOT", str(configured_roots.primary))
     monkeypatch.setattr(_config, "DB_PATH", db_path)
     monkeypatch.setattr(
         "lu_machinery.fleet_comms.artifacts.default_plane_root",
