@@ -778,9 +778,8 @@ def _hidden_tracked_changes(tree: Path) -> bool:
     directory counts as changed. Each initialized submodule is checked the same way, with its own status run
     with --ignore-submodules=none, since its index flags and its own submodules' ignore settings hide work
     from the superproject; a submodule path under a symlink, or a non-empty submodule directory without its
-    Git metadata, counts as changed. Filter drivers stay disabled (execution_safe_git), so status compares a
-    filtered file's raw bytes with its stored blob and an edit that matches the blob reads clean: any tracked path
-    whose filter attribute names a driver plain Git would see (_filtered_paths) counts as changed.
+    Git metadata, counts as changed. Filter drivers stay disabled (execution_safe_git), so a driver-filtered or
+    re-encoded file can read changed, never clean.
     """
     local = partial(execution_safe_git, cwd=tree, capture_output=True, check=True, timeout=30)
 
@@ -793,20 +792,16 @@ def _hidden_tracked_changes(tree: Path) -> bool:
 
     flagged: list[tuple[bool, str, str, str]] = []
     submodules: dict[str, None] = {}
-    names: list[bytes] = []
     for entry in local(["ls-files", "--stage", "-v", "-z"]).stdout.split(b"\0"):
         if not entry:
             continue
         meta, raw_name = entry[2:].split(b"\t", 1)
-        names.append(raw_name)
         mode, oid, _stage = meta.decode("ascii").split(" ")
         name = os.fsdecode(raw_name)
         if entry[:1].islower() or entry[:1] == b"S":
             flagged.append((entry[:1] in (b"S", b"s"), mode, oid, name))
         elif mode == "160000":
             submodules[name] = None
-    if _filtered_paths(tree, names):
-        return True
     executable = symlinks = True
     if flagged:
         executable, symlinks = enabled("core.fileMode"), enabled("core.symlinks")
@@ -896,32 +891,6 @@ def _hidden_tracked_changes(tree: Path) -> bool:
     return False
 
 
-def _filtered_paths(tree: Path, names: list[bytes]) -> bool:
-    """Whether a filter attribute of any named path names a filter driver plain Git would see.
-
-    Config and attributes are read with the global and system config plain Git reads (user_config), so a driver
-    or attributes file configured there counts too. Every scope counts except the runner's own command-line
-    controls, which disable the drivers, and any filter.<driver>.* key defines its driver, whatever its value.
-    check-attr --all lists only specified attributes, so Git's unspecified state never reads as a driver name;
-    it prints a bare or negated filter attribute as set or unset, which a driver of that name also matches.
-    A failed read raises, so the tree is unknown.
-    """
-    plain = partial(execution_safe_git, cwd=tree, user_config=True, capture_output=True, check=True, timeout=30)
-    rows = plain(["config", "--null", "--show-scope", "--get-regexp", r"^filter\."], check=False)
-    if rows.returncode not in (0, 1):  # 1: no filter key at all
-        rows.check_returncode()
-    fields = rows.stdout.split(b"\0")
-    drivers = {key.partition(b"\n")[0][len(b"filter."):].rpartition(b".")[0]
-               for scope, key in zip(fields[::2], fields[1::2], strict=False) if scope != b"command"}
-    if not drivers or not names:
-        return False
-    # -z triples are path, attribute, value.
-    fields = plain(["check-attr", "--all", "--stdin", "-z"], input=b"".join(name + b"\0" for name in names)).stdout
-    triples = fields.split(b"\0")
-    return any(attribute == b"filter" and value in drivers
-               for attribute, value in zip(triples[1::3], triples[2::3], strict=False))
-
-
 def _batch_blobs(local, oids: list[str]) -> list[bytes]:
     """Stored contents of the named blobs, in order, from one NUL-separated ``cat-file --batch`` request."""
     if not oids:
@@ -952,12 +921,18 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             head_sha=local(["rev-parse", "HEAD"]).stdout.strip(),
             commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
         )
-        # The tree is read as settlement's removal reads it, so the two never disagree on what is uncommitted.
-        changed, untracked = _tree_changes(spec.worktree)
+        # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
+        # edit or new submodule commit is reported whatever the tree configures. stat_integrity forces
+        # core.trustctime and core.checkStat to their defaults, so a worker's stat settings cannot hide an edit,
+        # and --untracked-files=all overrides status.showUntrackedFiles.
+        status = [line for line in local(["status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"],
+                                         stat_integrity=True).stdout.splitlines() if line]
+        hidden = _hidden_tracked_changes(spec.worktree)
         # Untracked files alone, which settlement's removal preserves, leave the merge rescue open
         # (worker._enforce_delivery); it reads this status, taken with head_sha, never the tree again.
-        delivery.update(worktree_dirty_on_exit=bool(changed or untracked),
-                        worktree_untracked_only_on_exit=bool(untracked) and not changed)
+        delivery.update(worktree_dirty_on_exit=bool(status) or hidden,
+                        worktree_untracked_only_on_exit=bool(status) and not hidden
+                        and all(line.startswith("?? ") for line in status))
         if spec.mode == "read-only":
             delivery["push_state"] = "not_applicable"
             delivery["push_state_reason"] = "read_only"
@@ -1240,36 +1215,41 @@ def merged_delivery(record: dict) -> dict | None:
 def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
     """Return the tree's uncommitted tracked changes and its untracked files; ignored files are neither.
 
-    The exit snapshot and removal both read the tree here, as the union of two status reads: one with the
-    repository's config only (execution_safe_git's default) and one that also reads the global and system config
-    plain Git reads (user_config). A global attributes file or conversion setting can make a file read changed
-    in one and clean in the other, so neither alone is safe. Both force core.trustctime and core.checkStat to
-    their defaults (stat_integrity), so a worker's stat settings cannot hide an edit, and keep configured
-    attributes, so a configured attributes file leaves a clean checkout clean. --untracked-files=all overrides
-    status.showUntrackedFiles and --ignore-submodules=none the submodule ignore settings; the hidden-change
-    check covers the index flags status trusts and filtered paths. Names are read as bytes: a text read folds CR
-    and CRLF into LF, so removal would preserve names that do not exist. In porcelain v1 -z, a rename or copy
-    is followed by its source path as a separate field, which belongs to that entry.
+    Removal's own read: plain Git with every config scope and the tree's filters, as before, plus controls that
+    can only reveal more. core.trustctime and core.checkStat are forced to their defaults and core.fsmonitor and
+    core.untrackedCache are off, so a worker's settings cannot hide an edit or a new file from it. Names are read
+    as bytes: a text read folds CR and CRLF into LF, so removal would preserve names that do not exist. In
+    porcelain v1 -z, a rename or copy is followed by its source path as a separate field, which belongs to that
+    entry. The exit snapshot's hidden-change check covers the index flags and submodule ignore settings status
+    trusts.
     """
-    changed: dict[str, None] = {}
-    untracked: dict[str, None] = {}
-    for user_config in (False, True):
-        fields = iter(execution_safe_git(
-            ["status", "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none"], cwd=tree,
-            stat_integrity=True, user_config=user_config, capture_output=True, check=True, timeout=30,
-        ).stdout.split(b"\0"))
-        for field in fields:
-            if not field:
-                continue
-            if field.startswith(b"?? "):
-                untracked[os.fsdecode(field[3:])] = None
-                continue
-            changed[os.fsdecode(field)] = None
-            if b"R" in field[:2] or b"C" in field[:2]:
-                next(fields, None)
+    # The argv is literal apart from the tree path and runs no shell; the environment is main's removal read's
+    # (_git with isolate=True). It is called directly only to read the output as bytes.
+    fields = iter(subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        ["git", "-C", str(tree), *_REVEALING, "status", "--porcelain", "-z", "--untracked-files=all",
+         "--ignore-submodules=none"],
+        capture_output=True, check=True, timeout=30,
+        env={**sanitized_git_env(strip_config_injection=True), "GIT_TERMINAL_PROMPT": "0"},
+    ).stdout.split(b"\0"))
+    changed, untracked = [], []
+    for field in fields:
+        if not field:
+            continue
+        if field.startswith(b"?? "):
+            untracked.append(os.fsdecode(field[3:]))
+            continue
+        changed.append(os.fsdecode(field))
+        if b"R" in field[:2] or b"C" in field[:2]:
+            next(fields, None)
     if _hidden_tracked_changes(tree):
-        changed["hidden tracked changes"] = None
-    return list(changed), list(untracked)
+        changed.append("hidden tracked changes")
+    return changed, untracked
+
+
+# Config controls that only make Git look harder: every stat field counts, and neither a filesystem monitor nor
+# the untracked cache can answer for the tree.
+_REVEALING = ("-c", "core.trustctime=true", "-c", "core.checkStat=default", "-c", "core.fsmonitor=false",
+              "-c", "core.untrackedCache=false")
 
 
 def _canonical_publication(record: dict, ref: str, head: str) -> tuple[str | None, bool]:
@@ -1355,18 +1335,15 @@ def _snapshot_tree(tree: Path, task_id: str) -> str:
     """The tree object of the checkout's tracked and untracked (not ignored) files.
 
     They are staged in a scratch copy of the checkout's index, so its own index, HEAD and branch stay as they were.
-    The copy keeps the index's timestamps, so racily clean entries stay racy. Staging forces core.trustctime and
-    core.checkStat to their defaults and turns off core.fsmonitor and core.untrackedCache, as _tree_changes reads
-    them, so a worker's settings cannot keep an edit it reports out of the snapshot.
+    The copy keeps the index's timestamps, so racily clean entries stay racy, and staging uses _REVEALING, as
+    _tree_changes does, so a worker's settings cannot keep an edit it reports out of the snapshot.
     """
     index = _git(tree, "rev-parse", "--path-format=absolute", "--git-path", "index", isolate=True)
     scratch = allocate(task_id + "-salvage")
     try:
         scratch.payload_dir.mkdir(exist_ok=True)
         env = {"GIT_INDEX_FILE": str(shutil.copy2(index, scratch.payload_dir / "index"))}
-        stat_forced = ("-c", "core.trustctime=true", "-c", "core.checkStat=default", "-c", "core.fsmonitor=false",
-                       "-c", "core.untrackedCache=false")
-        _git(tree, *stat_forced, "add", "--all", isolate=True, env=env)
+        _git(tree, *_REVEALING, "add", "--all", isolate=True, env=env)
         return _git(tree, "write-tree", isolate=True, env=env)
     finally:
         try:
