@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 import threading
 from contextlib import suppress
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 import lu_machinery.api.main as api_main
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import OrientSection, ProductContribution
+from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.guardrails import worktree_containment
 
 
 def _product(collector, *, ttl=0.0):
@@ -187,7 +191,7 @@ def test_orient_lifespan_warms_shared_sections_and_cancels_timer(monkeypatch, tm
     product = _product(collect)
     original_collect = api_main._collect_orient_sections
 
-    async def observe(context, layout, selected):
+    async def observe(context, layout, selected, **_options):
         # Use the actual collector path while avoiding unrelated machinery probes.
         result = await original_collect(context, layout, ["pipeline"])
         assert "pipeline" in selected
@@ -233,7 +237,7 @@ def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path
     product = _product(lambda context: {"summary": {}})
     warmer: list[list[str]] = []
 
-    async def collect(context, layout, selected):
+    async def collect(context, layout, selected, **_options):
         if asyncio.current_task().get_name() == "warmer":
             warmer.append(list(selected))
         return [({}, {"generated_at": "2026-01-01T00:00:00Z"}) for _ in selected]
@@ -272,3 +276,67 @@ def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path
                 await task
 
     asyncio.run(scenario())
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True, env=sanitized_git_env(), timeout=30,
+    ).stdout.strip()
+
+
+def _git_checkout(tmp_path: Path, layout: str) -> tuple[Path, Path]:
+    """A throwaway primary (with an owner/name origin) and the live root the orient reads.
+
+    ``bare_primary`` drifts the primary's ``core.bare`` to true; ``linked_worktree``
+    does the same and reads a linked worktree of it.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git(primary, "init", "-q", "-b", "main")
+    _git(primary, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+         "commit", "-q", "--allow-empty", "-m", "init")
+    _git(primary, "remote", "add", "origin", "https://github.com/example/checkout.git")
+    live = primary
+    if layout == "linked_worktree":
+        live = tmp_path / "linked"
+        _git(primary, "worktree", "add", "-q", "-b", "linked", str(live))
+    if layout != "work_tree":
+        _git(primary, "config", "core.bare", "true")
+    return primary, live
+
+
+@pytest.mark.parametrize("layout", ["work_tree", "bare_primary", "linked_worktree"])
+def test_orient_git_reads_authority_after_the_status_read_heals(monkeypatch, tmp_path, layout):
+    """Defect class: the authority read runs before or beside the status read's heal of a bare-drifted primary.
+
+    The heal writes Git configuration (``core.bare`` and, for linked worktrees,
+    ``extensions.worktreeConfig``); an authority read that overtakes it scans a
+    checkout the same request then changes, or fails on a bare one.
+    """
+    primary, live = _git_checkout(tmp_path, layout)
+    events: list[str] = []
+    real_status = worktree_containment.primary_checkout_dirty_status
+    real_authority = api_main.build_repository_authority
+
+    def status(root):
+        events.append("status-start")
+        try:
+            return real_status(root)
+        finally:
+            events.append("status-end")
+
+    def authority(**kwargs):
+        events.append("authority-start")
+        return real_authority(**kwargs)
+
+    monkeypatch.setattr(worktree_containment, "primary_checkout_dirty_status", status)
+    monkeypatch.setattr(api_main, "build_repository_authority", authority)
+
+    data = api_main._collect_git_orient_data(fixture_context(live))
+
+    assert events == ["status-start", "status-end", "authority-start"]
+    assert _git(primary, "config", "--get", "core.bare") == "false"
+    assert data["branch"] == ("linked" if layout == "linked_worktree" else "main")
+    assert data["authority"]["repository"] == "example/checkout"
+    assert data["authority"]["primary_checkout"]["dirty_count"] == 0
