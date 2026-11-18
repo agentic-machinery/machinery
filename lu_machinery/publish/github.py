@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 import yaml
 
+from lu_machinery import cto_safe_mode
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import PRODUCT_ROOT_ENV, product_root
 from lu_machinery.common.scratch import ensure_scratch_root
@@ -2152,6 +2153,9 @@ def publish(
     """
     if verb == "code-scanning-dismiss":
         _refuse_dispatched_dismissal(env)
+    if verb == "pr-merge" and (refusal := cto_safe_mode.refusal("pr-merge", {**os.environ, **(env or {})})):
+        # The CTO seat in safe mode lands nothing; dispatched workers keep landing their own PRs.
+        raise gate.PublishBlocked(refusal)
     _validate(verb, fields)
     fields = {
         key: tuple(value) if SCHEMAS[verb][1][key] in {"texts", "assets"} else value for key, value in fields.items()

@@ -1029,4 +1029,100 @@ def test_runtime_headroom_gates_each_codex_account_on_its_own_events(tmp_path, m
     usage._reset_rate_limit_cache_for_tests()
 
 
+
+_SAFE_MODE = {"set_at": "2026-11-18T18:00:00Z", "reason": "two fast deaths", "generation": 3, "outage_id": "out-7"}
+
+
+def _cto_seat(monkeypatch, tmp_path, body, *, seat=True):
+    """This process is the CTO seat (or a plain shell); the safe-mode file holds ``body`` (``None``: absent)."""
+    from lu_machinery import config
+
+    path = tmp_path / "cto-seat" / "safe-mode.json"
+    monkeypatch.setattr(config, "CTO_SAFE_MODE_FILE", str(path))
+    for name in ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER", "SESSION_SEAT", "SESSION_EPIC"):
+        monkeypatch.delenv(name, raising=False)
+    if seat:
+        monkeypatch.setenv("SESSION_SEAT", "cto")
+    if body is not None:
+        path.parent.mkdir()
+        if callable(body):
+            body(path)
+        else:
+            path.write_text(body if isinstance(body, str) else json.dumps(body))
+    return path
+
+
+def test_cto_safe_mode_refuses_a_cto_write_dispatch(admission_dispatch, tmp_path, monkeypatch, capsys):
+    """Defect class: a CTO seat in safe mode starts new write work."""
+    path = _cto_seat(monkeypatch, tmp_path, _SAFE_MODE)
+    assert admission_dispatch.dispatch() == 2
+    err = capsys.readouterr().err
+    assert "CTO_SAFE_MODE: write dispatch refused" in err
+    assert str(path) in err and "two fast deaths" in err and "out-7" in err
+    assert not admission_dispatch.spawned
+    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+
+
+@pytest.mark.parametrize("directory_mode", [None, 0o300], ids=["no-directory", "cleared-traverse-only-directory"])
+def test_cto_write_dispatch_runs_without_a_safe_mode_file(admission_dispatch, tmp_path, monkeypatch, capsys,
+                                                         directory_mode):
+    """Defect class: the safe-mode check refuses a CTO seat that is not in safe mode, or once the file is cleared."""
+    path = _cto_seat(monkeypatch, tmp_path, None)
+    if directory_mode is not None:
+        path.parent.mkdir()
+        path.parent.chmod(directory_mode)
+    try:
+        assert admission_dispatch.dispatch() == 0
+    finally:
+        if directory_mode is not None:
+            path.parent.chmod(0o700)
+    assert "CTO_SAFE_MODE" not in capsys.readouterr().err
+    assert [record["task_id"] for record in admission_dispatch.spawned] == ["adm-worker"]
+
+
+@pytest.mark.parametrize("body", [
+    "{not json", json.dumps({**_SAFE_MODE, "generation": "3"}), "[]",
+    json.dumps({**_SAFE_MODE, "reason": "x" * 70_000}),
+    lambda path: path.symlink_to(path.with_name("missing-target")),
+    lambda path: os.mkfifo(path),
+    lambda path: path.mkdir(),
+], ids=["syntax", "field-type", "not-object", "oversized", "dangling-symlink", "fifo-without-writer", "directory"])
+def test_malformed_cto_safe_mode_file_refuses_fail_closed(admission_dispatch, tmp_path, monkeypatch, capsys, body):
+    """Defect class: an unreadable safe-mode file is treated as no safe mode (fail open)."""
+    _cto_seat(monkeypatch, tmp_path, body)
+    assert admission_dispatch.dispatch() == 2
+    assert "CTO_SAFE_MODE_UNREADABLE: write dispatch refused" in capsys.readouterr().err
+    assert not admission_dispatch.spawned
+
+
+@pytest.mark.parametrize("mode,flags", [("read-only", ()), ("workspace-write", ("--print-advisory-binding",))],
+                         ids=["read-only", "advisory-binding"])
+def test_cto_safe_mode_keeps_read_only_dispatch(admission_dispatch, tmp_path, monkeypatch, capsys, mode, flags):
+    """Defect class: safe mode blocks the read-only diagnosis the CTO needs, or the advisory binding it computes."""
+    _cto_seat(monkeypatch, tmp_path, _SAFE_MODE)
+    assert admission_dispatch.dispatch(*flags, mode=mode) == 0
+    captured = capsys.readouterr()
+    assert "CTO_SAFE_MODE" not in captured.err
+    assert bool(flags) is (len(captured.out.strip()) == 64)
+
+
+@pytest.mark.parametrize("flags", [(), ("--initiator", "claude-cto")], ids=["plain", "copied-cto-initiator"])
+def test_cto_safe_mode_leaves_a_dispatched_worker_alone(admission_dispatch, tmp_path, monkeypatch, capsys, flags):
+    """Defect class: safe mode stops a running worker's own chain, even one that copies the CTO's initiator."""
+    _cto_seat(monkeypatch, tmp_path, _SAFE_MODE)
+    monkeypatch.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "worker-parent")
+    assert admission_dispatch.dispatch(*flags) == 0
+    assert "CTO_SAFE_MODE" not in capsys.readouterr().err
+    assert admission_dispatch.spawned[0]["parent_task_id"] == "worker-parent"
+
+
+@pytest.mark.parametrize("initiator", ["claude-cto", "claude-cto-27b21508"])
+def test_cto_safe_mode_refuses_the_cto_initiator_option(admission_dispatch, tmp_path, monkeypatch, capsys, initiator):
+    """Defect class: a write dispatch naming the CTO seat as initiator escapes safe mode outside its session."""
+    _cto_seat(monkeypatch, tmp_path, _SAFE_MODE, seat=False)
+    assert admission_dispatch.dispatch("--initiator", initiator) == 2
+    assert "CTO_SAFE_MODE: write dispatch refused" in capsys.readouterr().err
+    assert not admission_dispatch.spawned
+
+
 pytestmark = pytest.mark.usefixtures("sources_product_root")
