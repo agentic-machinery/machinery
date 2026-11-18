@@ -147,7 +147,6 @@ tests/agent_runtime/test_sibling_provider_signals.py
 tests/agent_runtime/test_stdin_tempfile_spawn.py
 tests/agent_runtime/test_target_admission.py
 tests/agent_runtime/test_trace_capture_no_contamination.py
-tests/agent_runtime/test_trail_isolation.py
 tests/agent_runtime/test_usage_headroom_corrupt.py
 tests/agents_extensions/test_catalog_routing_tables.py
 tests/agents_extensions/test_check_agent_inbox_hook.py
@@ -562,13 +561,7 @@ tests/orchestration/test_task_record_store.py
 tests/orchestration/test_thread_handoff.py
 tests/orchestration/test_thread_handoff_confirmation.py
 tests/orchestration/test_tmp_leak_sweep.py
-tests/orchestration/test_trail_authority.py
-tests/orchestration/test_trail_certification.py
-tests/orchestration/test_trail_closure.py
-tests/orchestration/test_trail_predicates.py
-tests/orchestration/test_trail_runner.py
 tests/orchestration/test_validate_fleet_taxonomy.py
-tests/orchestration/test_validate_trailspec.py
 tests/orchestration/test_worker_leftovers.py
 tests/orchestration/test_worktree_artifacts.py
 tests/orchestration/test_worktree_claims_cli.py
@@ -621,9 +614,6 @@ tests/test_agent_github_identity.py
 tests/test_sibling_git_https.py
 tests/test_worktree_claims_lock_identity.py
 tests/tools/test_detach_session_task.py
-tests/trails/test_rb1_rb6_v11.py
-tests/trails/test_rb2_rb5_v11.py
-tests/trails/test_rb3_rb4_v11.py
 tests/utils/test_claude_version.py
 tests/work/test_github_rest_cache.py
 tests/work/test_merged_pr_history.py
@@ -862,10 +852,6 @@ tests/lib/launcher_interactive_support.py
 tests/ops/_fake_tmux.py
 tests/opsec_fixtures.py
 tests/orchestration/closeout_fixtures.py
-tests/orchestration/fixtures/certification/case-matrix.v1.yaml
-tests/orchestration/fixtures/certification/executable.trail.yaml
-tests/orchestration/fixtures/certification/legacy.trail.yaml
-tests/orchestration/fixtures/certification/seats.yaml
 tests/orchestration/fixtures/pr_8264_status_check_rollup.json
 tests/orchestration/test_task_lifecycle.py
 tests/orchestration/worker_leftovers_fakes.py
@@ -892,10 +878,6 @@ tests/rules_core_view.py
 tests/sparse_trees.py
 tests/storage/__init__.py
 tests/test_sibling_git.py
-tests/trails/__init__.py
-tests/trails/fixtures/certification/executable.trail.yaml
-tests/trails/fixtures/certification/legacy.trail.yaml
-tests/trails/fixtures/certification/seats.yaml
 tests/wait_helpers.py
 tests/work/conftest.py
 tests/worktree_prep_helpers.py

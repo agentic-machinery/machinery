@@ -62,7 +62,6 @@ include agents_extensions/shared/rules/operator-expectations.md
 include agents_extensions/shared/rules/storage-topology.md
 include agents_extensions/shared/rules/task-scoped-reading.md
 include agents_extensions/shared/rules/workflow.md
-include agents_extensions/shared/schemas/trail-run-result.v1.schema.json
 include agents_extensions/shared/skills/benchmark-checklist/SKILL.md
 include agents_extensions/shared/skills/blast-radius/SKILL.md
 include agents_extensions/shared/skills/build-monitoring/SKILL.md

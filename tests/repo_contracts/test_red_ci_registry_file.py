@@ -18,7 +18,7 @@ from lu_machinery.orchestration.red_ci_known_failures import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REGISTRY_PATH = (
-    machinery_path("config/trails/red-ci-known-failures.yaml")
+    machinery_path("config/red-ci-known-failures.yaml")
 )
 MAX_REVIEW_HORIZON_DAYS = 30
 def _parse_iso_instant(value: Any) -> datetime:

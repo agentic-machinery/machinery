@@ -123,16 +123,6 @@
     ]
   },
   {
-    "path": "lu_machinery/orchestration/trails/store.py",
-    "reference_count": 5,
-    "kind": "writer",
-    "target_db": "trails projection DB",
-    "reason": "persists rebuildable trajectory index",
-    "calls": [
-      "sqlite3.connect(self.database_path, isolation_level=None, timeout=30)"
-    ]
-  },
-  {
     "path": "lu_machinery/publish/recovery.py",
     "reference_count": 2,
     "kind": "writer",

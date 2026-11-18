@@ -23,12 +23,20 @@ Issue: #1184
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..redacted_env import RedactedEnv
 from ..result import ParseResult
+
+
+def refuse_retired_isolation(tool_config: Mapping[str, object] | None) -> None:
+    """Reject requests for the retired profile before treating the invocation as ordinary."""
+    requested = tool_config.get("trail_isolation") if tool_config else None
+    if requested is not None and requested is not False:
+        raise ValueError("trail isolation refused: this profile is no longer supported")
 
 
 @dataclass(frozen=True)

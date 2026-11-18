@@ -731,24 +731,6 @@
         ]
       }
     },
-    "schemas/trail-run-result.v1.schema.json": {
-      "mode": 420,
-      "owner": "fleet",
-      "targets": {
-        "agy": [
-          ".agent/schemas/trail-run-result.v1.schema.json"
-        ],
-        "claude": [
-          ".claude/schemas/trail-run-result.v1.schema.json"
-        ],
-        "codex": [
-          ".codex/schemas/trail-run-result.v1.schema.json"
-        ],
-        "cursor": [
-          ".cursor/schemas/trail-run-result.v1.schema.json"
-        ]
-      }
-    },
     "skills/benchmark-checklist/SKILL.md": {
       "mode": 420,
       "owner": "fleet",

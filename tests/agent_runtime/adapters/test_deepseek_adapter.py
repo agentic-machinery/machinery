@@ -182,10 +182,8 @@ def test_mode_mapping_adds_auto_for_write_modes(tmp_path):
         _build("x", tmp_path, mode="invalid_mode")
 
 
-def test_trail_isolation_is_refused(tmp_path):
-    from lu_machinery.agent_runtime.trail_isolation import TrailIsolationError
-
-    with pytest.raises(TrailIsolationError, match="trail isolation refused for DeepSeek"):
+def test_retired_isolation_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="trail isolation refused"):
         _build("x", tmp_path, tool_config={"trail_isolation": True})
 
 
