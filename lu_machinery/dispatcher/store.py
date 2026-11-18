@@ -30,6 +30,8 @@ from lu_machinery.orchestration.task_record_store import (
 _JSON_MAX_DEPTH = 128
 
 ACTIVE = {"spawning", "running"}
+# The statuses a run settles with. Anything else (a damaged or unknown value) is never read as finished.
+TERMINAL = frozenset({"done", "failed", "timeout", "rate_limited", "cancelled", "crashed", "no_deliverable"})
 
 
 class TaskRecordError(ValueError):

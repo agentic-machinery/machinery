@@ -237,10 +237,14 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     scratch_base = tmp_path / "var-tmp"
     scratch_base.mkdir()
     monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", scratch_base)
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)  # the test base is longer than a real one
     environment_py = repo / "lu_machinery/dispatcher/environment.py"
     pinned = 'TASK_SCRATCH_BASE = Path("/var/tmp")'
     assert pinned in environment_py.read_text()
-    environment_py.write_text(environment_py.read_text().replace(pinned, f"TASK_SCRATCH_BASE = Path({str(scratch_base)!r})"))
+    budget = "TASK_SCRATCH_PATH_MAX = 72"
+    assert budget in environment_py.read_text()
+    source = environment_py.read_text().replace(pinned, f"TASK_SCRATCH_BASE = Path({str(scratch_base)!r})")
+    environment_py.write_text(source.replace(budget, "TASK_SCRATCH_PATH_MAX = 4096"))
     monkeypatch.setattr(worker.write_boundary, "launcher", lambda _spec, invocation, _task: list(invocation.argv))
     monkeypatch.setattr(worker.write_boundary, "verify", lambda _task, _id, mode="workspace-write": (
         {"status": "test-double", "mode": mode}, None))

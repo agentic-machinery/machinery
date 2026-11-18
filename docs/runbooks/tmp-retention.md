@@ -186,7 +186,12 @@ of these hold:
   hard-linked content, and is not on another device or a mount point.
 
 An entry whose name maps to a dispatch task still follows the task rules from
-#8755: it goes only Every dispatched worker gets `LU_TASK_SCRATCH=/var/tmp/<task-id>` in its
+#8755: it goes only once that task has settled. The scratch rule never
+overrides a task that is still unsettled.
+
+### Dispatched task scratch
+
+Every dispatched worker gets `LU_TASK_SCRATCH=/var/tmp/<task-id>` in its
 environment. For a workspace-write worker it is also `TMPDIR`, so Python's
 `tempfile`, uv, Git and Node put their temp files there. Managed pytest
 scratch keeps its own root and removal ([Inactive pytest
@@ -226,10 +231,6 @@ another filesystem or one with a mount below it. Removal never follows a
 symlink, never leaves the scratch's device or mount, and makes read-only
 directories writable before emptying them. A refusal or failure is recorded
 and never fails settlement.
-
-re emptying
-them. A refusal or failure is recorded and never fails settlement; whatever
-stays is left to the rules above.
 
 ### Listening sockets
 

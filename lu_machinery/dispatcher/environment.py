@@ -21,6 +21,11 @@ from lu_machinery.dispatcher.types import TaskSpec
 # whatever the terminal status (dispatcher.scratch). Inside a read-only boundary the launcher points both under
 # the boundary's private TMPDIR instead. Tests replace the base.
 TASK_SCRATCH_BASE = Path("/var/tmp")
+# The longest scratch path a write task may get. It is the worker's TMPDIR, and a Unix socket path holds 107 bytes:
+# Python's multiprocessing puts its listener 32 bytes below TMPDIR (pymp-XXXXXXXX/listener-XXXXXXXX) and ssh-agent
+# about 31 (ssh-XXXXXXXXXXXX/agent.<pid>), so 72 leaves room for both. A longer path refuses the launch
+# (dispatcher.scratch.create). Tests replace it with their base.
+TASK_SCRATCH_PATH_MAX = 72
 
 
 def task_scratch_path(task_id: str) -> Path:
