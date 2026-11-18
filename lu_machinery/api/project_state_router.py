@@ -312,7 +312,7 @@ class ProjectStateReport(BaseModel):
 
 
 @router.get("")
-async def get_projects(
+def get_projects(
     host_id: str | None = Query(default=None),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:

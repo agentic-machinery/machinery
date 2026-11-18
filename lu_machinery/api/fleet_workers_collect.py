@@ -11,6 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from lu_machinery.api.project_state_store import (
     get_live_report,
     workers_status_from_document,
 )
+from lu_machinery.common.task_store_paths import TASK_RECORD_CACHE_MAX_ENTRIES
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.dispatch_admission import _ACTIVE_STATUS_MARKERS
 from lu_machinery.orchestration.dispatch_admission import (
@@ -214,8 +216,14 @@ def _prefilter_bytes(raw: bytes) -> bool:
     return any(marker in raw for marker in _ACTIVE_STATUS_MARKERS) or b"\\u" in raw
 
 
-def _record_may_name_active_status(path: Path, tasks_root: str) -> bool:
-    """Whether ``path`` can name a stored ``running`` or ``spawning`` status.
+@lru_cache(maxsize=TASK_RECORD_CACHE_MAX_ENTRIES)
+def _record_may_name_active_status(
+    path: Path, tasks_root: str, _stamp: tuple[int, int, int, int, int],
+) -> bool:
+    """Whether one file version can name a stored running or spawning status.
+
+    Memoizing the byte filter avoids both repeated full-file reads and decoding
+    large terminal records merely to discover that no worker can be active.
 
     A symlink is resolved and rejected before its target is read when the
     real path is outside ``tasks_root``, the same containment as
@@ -275,8 +283,14 @@ def collect_delegate_workers(
     except OSError:
         tasks_root = None
     for entry in iter_task_records(tasks_dir, include_archive=False):
-        if tasks_root is not None and not _record_may_name_active_status(entry, tasks_root):
-            continue
+        if tasks_root is not None:
+            try:
+                info = entry.stat()
+                stamp = (info.st_mtime_ns, info.st_size, info.st_ctime_ns, info.st_dev, info.st_ino)
+            except OSError:
+                stamp = None
+            if stamp is not None and not _record_may_name_active_status(entry, tasks_root, stamp):
+                continue
         task = delegate_router._read_task_state(str(entry), tasks_dir=tasks_dir)
         if task is None:
             continue

@@ -1542,8 +1542,9 @@ async def runtime_transport_health():
     is fully sanitized status fields with no filesystem paths.
     """
     return await asyncio.to_thread(
-        codex_transport_health.current_transport_health,
-        config_path=codex_transport_health.default_config_path(),
+        lambda: codex_transport_health.current_transport_health(
+            config_path=codex_transport_health.default_config_path(),
+        ),
     )
 
 
@@ -1553,7 +1554,7 @@ async def runtime_transport_health():
 
 
 @router.get("/auth")
-async def runtime_auth():
+def runtime_auth():
     """Per-agent auth mode snapshot.
 
     Tells an operator — without grepping env vars — whether Gemini is
@@ -1746,7 +1747,7 @@ def _public_logins(raw: object, ends: object) -> dict[str, Any]:
 
 
 @router.get("/logins")
-async def runtime_logins():
+def runtime_logins():
     """Sign-in health of the subscription accounts and the cancelled subscriptions' end dates.
 
     ``accounts`` comes from a background snapshot (``account_logins``): signed in

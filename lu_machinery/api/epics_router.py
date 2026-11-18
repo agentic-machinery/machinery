@@ -625,8 +625,9 @@ def _safe_latest_entry(entry: Any) -> dict[str, Any] | None:
 async def remote_epic_list(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     try:
         store = _store(ctx)
-        prefix = ctx_scoped_ttl_key(ctx, "epics-v1", str(store.database.path))
-        cache_key = f"{prefix}:{_sqlite_generation(store.database.path)}"
+        prefix = await asyncio.to_thread(ctx_scoped_ttl_key, ctx, "epics-v1", str(store.database.path))
+        generation = await asyncio.to_thread(_sqlite_generation, store.database.path)
+        cache_key = f"{prefix}:{generation}"
         cache_retain(f"{prefix}:", cache_key)
         payload = await cache_get_or_compute_async(
             cache_key,

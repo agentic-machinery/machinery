@@ -574,8 +574,10 @@ def swr_route(
                 return await asyncio.to_thread(functools.partial(handler, **kwargs))
             ctx = kwargs["ctx"]
             # Every root, not just the project root: two contexts never share a value.
-            key = ctx_scoped_ttl_key(ctx, "swr", name, repr(ctx.roots),
-                                     *(f"{param}={kwargs.get(param)!r}" for param in vary))
+            key = await asyncio.to_thread(
+                ctx_scoped_ttl_key, ctx, "swr", name, repr(ctx.roots),
+                *(f"{param}={kwargs.get(param)!r}" for param in vary),
+            )
             value, age, stored = await cache_read_swr(
                 key, ttl, functools.partial(handler, **kwargs), storable=lambda value: not reports_failure(value),
             )

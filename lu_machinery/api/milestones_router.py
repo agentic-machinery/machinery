@@ -152,7 +152,7 @@ def _with_age(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("")
-async def milestones(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
+def milestones(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     """Serve one snapshot, refreshing off-loop with the established single-flight TTL cache."""
     key = ctx_scoped_ttl_key(ctx, "milestones")
     stored = cache_get_stored(key)

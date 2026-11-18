@@ -688,7 +688,7 @@ async def model_stats(
     background refresh beside it), waits for it up to ``COLD_WAIT_SECONDS`` and is answered as soon as it finishes,
     so the first page load waits for the collect itself, never a poll interval.
     """
-    key = _cache_key(ctx)
+    key = await asyncio.to_thread(_cache_key, ctx)
     stored = cache_get_stored(key)
     if stored is not None and stored[1] >= REFRESH_SECONDS:
         _refresh_off_loop(key, _compute(ctx))

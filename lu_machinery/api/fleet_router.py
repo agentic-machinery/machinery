@@ -763,8 +763,8 @@ async def fleet_operations(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, 
     """Sanitized legacy broker, zombie, and batch operations projection."""
     broker_result, process_result, zombie_result, batch_result = await asyncio.gather(
         asyncio.to_thread(_legacy_broker_snapshot, ctx),
-        legacy_comms.active_processes(ctx=ctx),
-        legacy_comms.detect_zombies(stale_hours=2.0, pingpong_threshold=5, ctx=ctx),
+        asyncio.to_thread(legacy_comms.active_processes, ctx=ctx),
+        asyncio.to_thread(legacy_comms.detect_zombies, stale_hours=2.0, pingpong_threshold=5, ctx=ctx),
         _product_batch_snapshot(ctx),
         return_exceptions=True,
     )

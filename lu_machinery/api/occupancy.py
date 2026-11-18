@@ -244,7 +244,7 @@ async def _load_entry_for_selected_async(
             return _unavailable_load_entry(now=now)
     if canonical is not None:
         return _unavailable_load_entry(now=now)
-    if fills_in_process_api_host(opaque, mapping):
+    if await asyncio.to_thread(fills_in_process_api_host, opaque, mapping):
         return await asyncio.to_thread(_in_process_api_host_load, now=now)
     return _unavailable_load_entry(now=now)
 
@@ -846,11 +846,11 @@ async def _occupancy_payload_async(
 ) -> dict[str, Any]:
     presence_store = None if ctx is None else ctx.stores.presence_store
     report_store = None if ctx is None else ctx.stores.report_store
-    snapshot = _build_snapshot(presence_store=presence_store)
+    snapshot = await asyncio.to_thread(_build_snapshot, presence_store=presence_store)
     selected = _selected_hosts(host_id, snapshot=snapshot)
     if not selected:
-        return _finalize_payload(
-            _empty_payload(now=snapshot.now),
+        return await asyncio.to_thread(
+            _finalize_payload, _empty_payload(now=snapshot.now),
             host_id,
             snapshot=snapshot,
             report_store=report_store,
@@ -872,12 +872,12 @@ async def _occupancy_payload_async(
 
     entries = await asyncio.gather(*tasks)
     load_entries = dict(zip(keys, entries, strict=True))
-    return _finalize_payload(
+    return await asyncio.to_thread(lambda: _finalize_payload(
         _payload_from_entries(selected, load_entries, snapshot=snapshot),
         host_id,
         snapshot=snapshot,
         report_store=report_store,
-    )
+    ))
 
 
 @router.get("")

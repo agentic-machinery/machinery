@@ -74,8 +74,7 @@ _DISPATCHER_SIDECAR_SUFFIXES = (
 
 def _is_dispatcher_sidecar(path: Path) -> bool:
     """Whether ``path`` is a sidecar the dispatcher writes beside a task record."""
-    name = path.name
-    return any(name.endswith(suffix) for suffix in _DISPATCHER_SIDECAR_SUFFIXES)
+    return path.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
 
 
 def _report_foreign(path: Path, raw: bytes) -> None:
@@ -268,13 +267,20 @@ def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Pat
     directories = [tasks_dir, tasks_dir / ARCHIVE_DIR_NAME] if include_archive else [tasks_dir]
     for directory in directories:
         try:
-            paths = sorted(
-                path for path in directory.glob("*.json")
-                if path.is_file() and not _is_dispatcher_sidecar(path)
-            )
+            with os.scandir(directory) as entries:
+                names = []
+                for entry in entries:
+                    if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
+                        continue
+                    try:
+                        if entry.is_file():
+                            names.append(entry.name)
+                    except OSError:
+                        continue  # one broken entry must not hide the other records
+                names.sort()
         except OSError:
             continue
-        yield from paths
+        yield from (directory / name for name in names)
 
 
 def relocated_result_file(record_path: Path, result_file: str | None) -> str | None:

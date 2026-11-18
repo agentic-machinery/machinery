@@ -9,6 +9,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -25,7 +26,8 @@ from pydantic import BaseModel
 
 from lu_machinery.common import github_client
 from lu_machinery.common.git_context import sanitized_git_env
-from lu_machinery.orchestration.task_record_store import locate_task_record, read_task_record
+from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.orchestration.task_record_store import locate_task_record
 
 from . import panel_values
 from .monitor_context import MonitorContext, get_ctx, resolve_context
@@ -282,9 +284,9 @@ _running_ids_memo: dict[str, tuple[_TaskFileIdentity, tuple[str, ...]]] = {}
 _running_ids_lock = threading.Lock()
 
 
-def _running_ids_in_record(path: str, name: str) -> tuple[str, ...]:
+def _running_ids_in_record(path: str, name: str, tasks_dir: Path) -> tuple[str, ...]:
     try:
-        payload = read_task_record(Path(path))
+        payload = read_cached_task_record(Path(path), tasks_dir=tasks_dir)
     except (OSError, ValueError):
         return ()
     if not isinstance(payload, dict) or payload.get("status") != "running":
@@ -318,7 +320,7 @@ def _active_task_ids(project_root: Path) -> set[str]:
             if cached is not None and cached[0] == identity:
                 ids = cached[1]
             else:
-                ids = _running_ids_in_record(entry.path, entry.name)
+                ids = _running_ids_in_record(entry.path, entry.name, tasks_dir)
                 _running_ids_memo[entry.path] = (identity, ids)
             active.update(ids)
         prefix = f"{tasks_dir}{os.sep}"
@@ -534,7 +536,7 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
     if path is None:
         return None
     try:
-        record = read_task_record(path)
+        record = read_cached_task_record(path, tasks_dir=tasks_dir)
     except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:
@@ -663,7 +665,7 @@ async def pull_requests(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     """
     # The record check reads this store. A key scoped only by project root
     # would reuse another context's authorization.
-    key = _pull_requests_cache_key(ctx)
+    key = await asyncio.to_thread(_pull_requests_cache_key, ctx)
     project_root = ctx.roots.project_root
 
     def compute() -> dict[str, Any]:

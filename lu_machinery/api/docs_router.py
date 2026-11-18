@@ -400,7 +400,7 @@ def _artifacts_page(request: Request, ctx: MonitorContext) -> FileResponse:
 
 
 @router.get("/")
-async def list_roots(
+def list_roots(
     request: Request,
     format: str | None = Query(None, pattern="^(json)$"),
     ctx: MonitorContext = Depends(get_ctx),
@@ -422,7 +422,7 @@ async def list_roots(
 
 
 @router.get("/{path:path}")
-async def serve_artifact(
+def serve_artifact(
     path: str,
     request: Request,
     format: str | None = Query(None, pattern="^(json)$"),
@@ -431,7 +431,7 @@ async def serve_artifact(
     """Serve a documentation artifact or list a directory."""
     resolved_ctx = resolve_context(ctx)
     if not path:
-        return await list_roots(request, format, ctx=resolved_ctx)
+        return list_roots(request, format, ctx=resolved_ctx)
 
     info = _get_root_info(path, resolved_ctx.roots.effective_roots)
     if not info:
