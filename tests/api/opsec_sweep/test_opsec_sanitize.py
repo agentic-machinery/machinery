@@ -143,14 +143,17 @@ def test_repeated_strings_scan_once_without_cross_document_cache(monkeypatch):
 
     monkeypatch.setattr(opsec_sanitize, "scan_text", counted)
     path = "/home/synthetic-private/project/file.json"
-    safe = "public-monitor"
-    payload = {"items": [{"title": path, "source": safe}] * 20, "attention": [{"title": path, "source": safe}] * 20}
+    safe_route = "/api/home/synthetic"
+    row = {"title": path, "source": safe_route, "label": "public-monitor"}
+    payload = {"items": [row] * 20, "attention": [row] * 20}
     sanitized = opsec_sanitize.sanitize_document(payload)
-    assert calls == [path, safe]
+    assert calls == [path, safe_route]
     assert all(row["title"] == "[redacted-path]" for rows in sanitized.values() for row in rows)
+    assert sanitized["items"][0]["source"] == safe_route
+    assert sanitized["items"][0]["label"] == "public-monitor"
     assert payload["items"][0]["title"] == path
     opsec_sanitize.sanitize_document(payload)
-    assert calls == [path, safe, path, safe]
+    assert calls == [path, safe_route, path, safe_route]
 
 
 def test_memo_preserves_equal_distinct_unchanged_values():

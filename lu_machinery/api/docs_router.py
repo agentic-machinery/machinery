@@ -30,8 +30,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["docs"])
 
-
-
+_FRONTMATTER_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 # Path prefixes (relative to project_root) to exclude from discovery.
 DISCOVERY_EXCLUDES = ("docs/archive", "docs/resources/podcasts/raw")
@@ -164,7 +163,7 @@ def _extract_md_frontmatter(path: Path) -> dict[str, str]:
 
     yaml_str = head[4:end_idx]  # Skip opening "---\n"
     try:
-        data = yaml.safe_load(yaml_str)
+        data = yaml.load(yaml_str, Loader=_FRONTMATTER_LOADER)
         if isinstance(data, dict):
             for key, value in data.items():
                 if value is not None:
@@ -202,10 +201,13 @@ def _is_hidden_path(remainder: str) -> bool:
 
 
 def _assert_under_root(full_path: Path, root_path: Path) -> None:
-    # codeql[py/path-injection] -- this IS the path-traversal validator; full_path
-    # has already been validated by safe_join (commonpath) upstream. See #1860.
+    # codeql[py/path-injection] -- this is the resolved path-traversal check (#1860).
     try:
-        _relative_to_root(full_path.resolve(), root_path.resolve())
+        resolved_path = full_path.resolve()
+        # A canonical root already appears in the resolved path. Resolve the
+        # root separately only when it may be a symlink alias.
+        if not resolved_path.is_relative_to(root_path):
+            _relative_to_root(resolved_path, root_path.resolve())
     except ValueError as e:
         raise HTTPException(status_code=403, detail="Path traversal not allowed") from e
 
