@@ -187,7 +187,7 @@ def test_orient_lifespan_warms_shared_sections_and_cancels_timer(monkeypatch, tm
     product = _product(collect)
     original_collect = api_main._collect_orient_sections
 
-    async def observe(context, layout, selected):
+    async def observe(context, layout, selected, **_options):
         # Use the actual collector path while avoiding unrelated machinery probes.
         result = await original_collect(context, layout, ["pipeline"])
         assert "pipeline" in selected
@@ -233,7 +233,7 @@ def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path
     product = _product(lambda context: {"summary": {}})
     warmer: list[list[str]] = []
 
-    async def collect(context, layout, selected):
+    async def collect(context, layout, selected, **_options):
         if asyncio.current_task().get_name() == "warmer":
             warmer.append(list(selected))
         return [({}, {"generated_at": "2026-01-01T00:00:00Z"}) for _ in selected]

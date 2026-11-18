@@ -20,6 +20,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as wait_for_futures
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -93,7 +94,7 @@ from .product_contribution import (
     product_file,
 )
 from .project_state_router import router as project_state_router
-from .repository_authority import build_repository_authority, cwd_role
+from .repository_authority import RepositoryAuthorityError, build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
 from .rules_router import router as rules_router
@@ -483,14 +484,40 @@ def _run_command(
         return subprocess.CompletedProcess(args=args, returncode=127, stdout="", stderr=str(exc))
 
 
+# The git section is seven independent reads of one checkout, each a subprocess
+# that spends its time waiting, not computing. Run together they cost the slowest
+# one (a ``git status`` scan) instead of the sum; serially they were ~0.9 s of every
+# cold or expired request, and longer while detached collectors held the GIL.
+_GIT_PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="orient-git")
+
+
 def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
     resolved_ctx = resolve_context(ctx)
-    branch_proc = _run_command(["git", "--no-optional-locks", "branch", "--show-current"], ctx=ctx)
-    head_proc = _run_command(["git", "--no-optional-locks", "rev-parse", "--short=9", "HEAD"], ctx=ctx)
-    full_head_proc = _run_command(["git", "--no-optional-locks", "rev-parse", "HEAD"], ctx=ctx)
-    ahead_proc = _run_command(["git", "--no-optional-locks", "rev-list", "--count", "origin/main..HEAD"], ctx=ctx)
-    log_proc = _run_command(["git", "--no-optional-locks", "log", "--oneline", "-5"], ctx=ctx)
+    git = ["git", "--no-optional-locks"]
+    probes = [
+        _GIT_PROBE_EXECUTOR.submit(_run_command, [*git, *args], ctx=ctx)
+        for args in (
+            ("branch", "--show-current"),
+            ("rev-parse", "--short=9", "HEAD"),
+            ("rev-parse", "HEAD"),
+            ("rev-list", "--count", "origin/main..HEAD"),
+            ("log", "--oneline", "-5"),
+        )
+    ]
+    status_probe = _GIT_PROBE_EXECUTOR.submit(
+        worktree_containment.primary_checkout_dirty_status, resolved_ctx.roots.live_repo_root
+    )
+    authority_probe = _GIT_PROBE_EXECUTOR.submit(
+        build_repository_authority,
+        project_root=resolved_ctx.roots.project_root,
+        live_repo_root=resolved_ctx.roots.live_repo_root,
+    )
+    branch_proc, head_proc, full_head_proc, ahead_proc, log_proc = (probe.result() for probe in probes)
 
+    if any(proc.returncode != 0 for proc in (branch_proc, head_proc, log_proc)):
+        # The status and authority reads started with the others; do not leave
+        # them running past the failure the caller is about to see.
+        wait_for_futures([status_probe, authority_probe])
     if branch_proc.returncode != 0:
         raise RuntimeError(branch_proc.stderr.strip() or "git branch failed")
     if head_proc.returncode != 0:
@@ -514,7 +541,7 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         except ValueError:
             ahead_value = 0
     try:
-        primary_status = worktree_containment.primary_checkout_dirty_status(resolved_ctx.roots.live_repo_root)
+        primary_status = status_probe.result()
     except Exception:
         branch = branch_proc.stdout.strip()
         primary_status = {
@@ -527,10 +554,16 @@ def _collect_git_orient_data(ctx: MonitorContext | None = None) -> dict:
         }
 
     branch = branch_proc.stdout.strip()
-    authority = build_repository_authority(
-        project_root=resolved_ctx.roots.project_root,
-        live_repo_root=resolved_ctx.roots.live_repo_root,
-    )
+    try:
+        authority = authority_probe.result()
+    except RepositoryAuthorityError:
+        # The status read above heals a bare-drifted primary before it counts
+        # entries; the concurrent authority read can lose that race. Read it
+        # again now that the heal has run; a second failure is a real one.
+        authority = build_repository_authority(
+            project_root=resolved_ctx.roots.project_root,
+            live_repo_root=resolved_ctx.roots.live_repo_root,
+        )
     return {
         "branch": branch,
         "head": head_proc.stdout.strip(),
@@ -857,6 +890,36 @@ def _run_detached_orient_refresh(
         _detached_orient_last_error[cache_key] = str(exc)
 
 
+_THREAD_WAIT_POLL_S = 0.005
+
+
+async def _await_thread(thread: threading.Thread, timeout: float) -> None:
+    """Wait up to ``timeout`` for ``thread`` without holding a pool thread.
+
+    A full orient waits on up to a dozen detached sections at once. Joining each
+    on ``_ORIENT_SYNC_EXECUTOR`` filled its eight workers with waiters, so the
+    section collectors that run there (git, runtime) queued behind a second wave
+    of waits and a cold read took twice the wait.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while thread.is_alive() and (remaining := deadline - loop.time()) > 0:
+        await asyncio.sleep(min(_THREAD_WAIT_POLL_S, remaining))
+
+
+def _due_for_stale_serve(cache_key: str, ttl: float) -> bool:
+    """True when a section's refresh has only just come due and its last value is still near-fresh.
+
+    A section under steady reads is refreshed once per TTL. That read gets the
+    last value at once, labelled ``stale`` and ``refreshing``, instead of
+    waiting out the join for a collector that usually outlasts it. A section
+    nobody read for two TTLs holds an old value, so its first read waits for
+    fresh data. A zero TTL means "never stale".
+    """
+    last_good = _detached_orient_last_good.get(cache_key)
+    return ttl > 0 and last_good is not None and _orient_clock() - last_good[2] < ttl * 2
+
+
 async def _cached_detached_orient_section(
     key: str,
     collector: Callable[..., Any],
@@ -866,12 +929,15 @@ async def _cached_detached_orient_section(
     ttl: float | None = None,
     source: str | None = None,
     is_async: bool = False,
+    fresh: bool = False,
 ) -> tuple[Any, dict]:
     """Cache-first section: never let a hung collector pin the gather.
 
     On a miss, one detached worker runs the collector. This request waits
     up to ``DETACHED_ORIENT_INLINE_WAIT_S`` only if *this* call started
-    that worker (so cheap test doubles still populate the same response).
+    that worker (so cheap test doubles still populate the same response),
+    except a refresh that has only just come due (``_due_for_stale_serve``),
+    which serves last-good at once. ``fresh`` always waits.
     Overlapping requests and live hangs return last-good or fallback with
     honest ``meta.error``.
     """
@@ -895,13 +961,8 @@ async def _cached_detached_orient_section(
 
     started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
     thread = _detached_orient_threads.get(cache_key)
-    if started and thread is not None and thread.is_alive():
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            _ORIENT_SYNC_EXECUTOR,
-            thread.join,
-            DETACHED_ORIENT_INLINE_WAIT_S,
-        )
+    if started and thread is not None and thread.is_alive() and (fresh or not _due_for_stale_serve(cache_key, ttl)):
+        await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
 
     if ttl > 0:
         cached = cache_get(cache_key, ttl=ttl)
@@ -1402,6 +1463,7 @@ async def _cached_orient_section(
     ttl: float | None = None,
     source: str | None = None,
     background: bool = False,
+    fresh: bool = False,
 ) -> tuple[Any, dict]:
     """Run one orient collector with TTL cache + hard timeout + fallback.
 
@@ -1420,7 +1482,7 @@ async def _cached_orient_section(
         return _cached_idle_pr_section(collector, fallback, ctx=ctx)  # type: ignore[arg-type]
     if background or key in DETACHED_ORIENT_SECTION_KEYS:
         return await _cached_detached_orient_section(
-            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async,
+            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
         )  # type: ignore[arg-type]
 
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
@@ -1562,7 +1624,7 @@ def _orient_section_specs(product: ProductContribution) -> dict[str, tuple[Calla
 
 
 async def _collect_orient_sections(
-    ctx: MonitorContext, layout: OrientLayout, selected: Sequence[str],
+    ctx: MonitorContext, layout: OrientLayout, selected: Sequence[str], *, fresh: bool = False,
 ) -> list[tuple[Any, dict]]:
     """Requests and the lifespan warmer share the same section collectors."""
     return await asyncio.gather(*(
@@ -1570,7 +1632,7 @@ async def _collect_orient_sections(
             key, layout.specs[key][0], layout.specs[key][1], is_async=layout.specs[key][2], ctx=ctx,
             ttl=layout.product[key].ttl_s if key in layout.product else None,
             source=layout.product[key].source if key in layout.product else None,
-            background=key in layout.product,
+            background=key in layout.product, fresh=fresh,
         )
         for key in selected
     ))
@@ -1708,7 +1770,7 @@ async def orient(
     scope = _ctx_cache_scope(request_ctx)
     for key in selected:
         _orient_demand.setdefault(f"orient_{key}{scope}", Demand()).touch()
-    gather_results = await _collect_orient_sections(request_ctx, layout, selected)
+    gather_results = await _collect_orient_sections(request_ctx, layout, selected, fresh=fresh)
 
     section_data: dict[str, Any] = {}
     section_metas: dict[str, dict[str, Any]] = {}
