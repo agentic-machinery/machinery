@@ -1348,31 +1348,6 @@
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/api/git_hygiene_router.py",
-      "code": "arg-type",
-      "message": "Argument \"branch\" to \"Worktree\" has incompatible type \"dict[str, Any]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/api/git_hygiene_router.py",
-      "code": "arg-type",
-      "message": "Argument \"branch\" to \"Worktree\" has incompatible type \"dict[str, Any]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/api/git_hygiene_router.py",
-      "code": "arg-type",
-      "message": "Argument 2 to \"_is_protected\" has incompatible type \"dict[str, Any]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/api/git_hygiene_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"Any | str\", variable has type \"dict[str, Any]\")"
-    },
-    {
-      "path": "lu_machinery/api/git_hygiene_router.py",
-      "code": "call-overload",
-      "message": "No overload variant of \"get\" of \"dict\" matches argument type \"dict[str, Any]\""
-    },
-    {
       "path": "lu_machinery/api/launchd_supervisor.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"Any | bool | list[Any]\", variable has type \"bool\")"
