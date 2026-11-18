@@ -17,7 +17,7 @@ from ._acp_compat import refuse_kimi_compat, require_compat_target, resolve_comp
 from ._ask_contract import requested_effort
 from ._ask_lifecycle import ask_target_model, record_ask_failure, record_ask_reply, skip_stored_kimi_row
 from ._db import get_db
-from ._messaging import acknowledge, read_message, send_message
+from ._messaging import acknowledge, read_message, require_legacy_message_writes, send_message
 
 _NO_TIMEOUT_CEILING_S = 86400
 
@@ -100,6 +100,7 @@ def process_message_for_recipient(
     returns None (``skip_stored_kimi_row``).
     """
     refuse_kimi_compat("", model=model)
+    require_legacy_message_writes()
     msg = read_message(message_id)
     if not msg or skip_stored_kimi_row(msg, message_id):
         return None

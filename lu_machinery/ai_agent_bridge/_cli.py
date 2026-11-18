@@ -163,6 +163,11 @@ def interactive_mode():
 
 def _dispatch_interactive(action: str, parts: list[str]):
     """Dispatch a single interactive mode command."""
+    if action in {"send", "process"}:
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            return _retired_legacy_write(action)
     if action == "inbox":
         agent = parts[1] if len(parts) > 1 else "gemini"
         check_inbox(agent)
@@ -189,6 +194,9 @@ def process_all_gemini(model: str | None = None):
     participant (#6915); a message is consumed only when the routed seat
     replies successfully, so failures stay in the inbox for retry.
     """
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -237,6 +245,9 @@ def process_all_gemini(model: str | None = None):
 
 def process_all_claude(new_session: bool = False):
     """Process ALL unread messages for Claude in batch (headless)."""
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -285,6 +296,9 @@ def process_all_claude(new_session: bool = False):
 
 def process_all_codex(new_session: bool = False):
     """Process ALL unread messages for Codex in batch (ordinary rows via ACP)."""
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     conn = get_db()
     cursor = conn.cursor()
 
@@ -1381,6 +1395,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _dispatch_command(args):
     """Dispatch parsed CLI arguments to the appropriate handler."""
+    legacy_process = args.command == "process" or (
+        args.command is not None and args.command.startswith("process-") and args.command != "process-ask"
+    ) or (args.command == "process-ask" and args.target not in {"opencode", "pool", "glm", "gemma"}) or (
+        args.command == "asks" and getattr(args, "watchdog", False)
+    )
+    if legacy_process:
+        from ._channels_cli import _legacy_writes_retired, _retired_legacy_write
+
+        if _legacy_writes_retired():
+            raise SystemExit(_retired_legacy_write(args.command))
     if args.command == "serve":
         if not args.openai:
             raise SystemExit("serve currently requires --openai")

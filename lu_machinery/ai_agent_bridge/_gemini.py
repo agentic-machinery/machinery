@@ -315,6 +315,9 @@ def process_and_respond(
     ``model`` defaults to the AGY seat's live ACP registry pin (or ``AB_GEMINI_MODEL``
     env override) (#6959).
     """
+    from ._messaging import require_legacy_message_writes
+
+    require_legacy_message_writes()
     if model is None:
         model = default_gemini_model()
 
