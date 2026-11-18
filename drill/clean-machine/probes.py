@@ -92,6 +92,37 @@ def clone_product(name: str) -> Path:
 # ---------------------------------------------------------------------------------------------
 
 
+@probe("bridge-inbox")
+def bridge_inbox(_: list[str]) -> tuple[bool, dict]:
+    """Check the inbox response before and after its retirement in v0.1.35 (#515)."""
+    import re
+
+    from packaging.version import Version
+
+    retired = Version(os.environ["DRILL_VERSION"]) >= Version("0.1.35")
+    result = module(
+        "lu_machinery.ai_agent_bridge", "inbox", "--for", "claude", "show", "claude"
+    )
+    if retired:
+        fleet = f"{shlex.quote(PY)} -I -m lu_machinery.fleet_comms"
+        expected = (
+            "ab inbox is retired: the legacy inbox, broker and channel stores are removed (#515); "
+            f"use {fleet} deliveries pending --recipient <slot>, then "
+            f"{fleet} deliveries receive --recipient <slot> --worker-id <slot>\n"
+        )
+        ok = result.returncode == 2 and result.stderr == expected
+    else:
+        ok = (
+            result.returncode == 0
+            and re.search(r"pending: +0", result.stdout) is not None
+        )
+    return ok, {
+        "exit_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
 @probe("fleet-roundtrip")
 def fleet_roundtrip(_: list[str]) -> tuple[bool, dict]:
     """Publish to the cto channel as another seat, then read the delivery's metadata back."""
