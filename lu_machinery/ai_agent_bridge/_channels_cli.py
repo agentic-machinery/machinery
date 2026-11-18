@@ -1290,7 +1290,7 @@ def _gemini_review_request_error(
     --with agy`` is always checked: a missing profile names the flag, ``code``
     cites the operator rule, and ``ukrainian`` is allowed.
     """
-    from ._agy import GEMINI_REVIEW_AGENTS, gemini_review_profile_error
+    from ._gemini_review import GEMINI_REVIEW_AGENTS, gemini_review_profile_error
 
     if not GEMINI_REVIEW_AGENTS.intersection({agent.strip().lower() for agent in agents}):
         return None

@@ -1816,11 +1816,13 @@ def _handle_acp_compat(args, target: str) -> None:
     if not review and (subject_seats or subject_families):
         raise SystemExit("--subject-seat/--subject-family require review intent (--review, --type review, --pr or --branch)")
 
-    from ._agy import is_gemini_family_model
+    from ._gemini_review import (
+        gemini_pr_or_branch_content_error,
+        gemini_review_profile_error,
+        gemini_review_targets_model,
+    )
 
-    if review and (target in {"agy", "gemini"} or is_gemini_family_model(model)):
-        from ._agy import gemini_pr_or_branch_content_error, gemini_review_profile_error
-
+    if review and gemini_review_targets_model(agent=target, model=model):
         profile_error = gemini_review_profile_error(getattr(args, "review_profile", None))
         if profile_error is not None:
             raise SystemExit(profile_error)
