@@ -916,8 +916,9 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
     would fail the ownership rule and settlement's removal preserves them, so they are not undelivered task
     work. Every tracked change is task work, inside the scope or not (an edit outside it may be work the
     worker could not commit), and so is any untracked file of an unscoped task or one whose scope is
-    unreadable, and a tree holding any nested repository (_nested_repository), whose commits may hold work the
-    published branch does not. The tree is read with _tree_changes, the reader settlement's removal uses.
+    unreadable, and a tree with any .git or HEAD entry below its root (_nested_repository), since a nested
+    repository's commits may hold work the published branch does not. The tree is read with _tree_changes, the
+    reader settlement's removal uses.
     """
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
@@ -1253,54 +1254,26 @@ def _tree_changes(tree: Path) -> tuple[list[str], list[str]]:
 
 
 def _nested_repository(tree: Path) -> bool:
-    """Whether any directory under the tree, ignored or not, holds a Git repository other than the tree's own.
+    """Whether any directory under the tree, ignored or not, may hold a Git repository of its own.
 
     Status cannot tell: it lists a nested checkout file by file when the tree tracks a path inside it, lists
-    none of it when the tree tracks or ignores all of it, and lists a bare repository as plain files. Only a
-    HEAD entry (a bare repository; setup.c is_git_directory) or a .git entry (a checkout's directory, gitfile
-    or link) can mark one. Git decides each marker on its own with ``rev-parse --resolve-git-dir``, which
-    resolves it to a repository or rejects it (exit 128); discovery is not used, since it stops at the first
-    marker it meets and so passes over a bare repository that holds a .git entry. A marker that resolves to
-    a repository other than the tree's counts, such as a nested checkout, a bare repository or a submodule; a
-    rejected one, such as an empty or invalid gitfile or marker-shaped output, does not. A marker file Git
-    could not read (a gitfile, or a Git directory's HEAD or commondir), a directory the walk cannot list and
-    any other Git failure count as one.
+    none of it when the tree tracks or ignores all of it, and lists a bare repository as plain files. Every
+    repository is marked by a .git entry (a checkout's directory, gitfile or link) or a HEAD entry (a bare
+    repository; setup.c is_git_directory), so any such entry below the tree's root counts, whatever it holds:
+    nothing is interpreted, so no marker can pass as scratch. A directory the walk cannot list counts too.
     """
-    def resolve(marker: Path) -> str | None:
-        found = execution_safe_git(["rev-parse", "--resolve-git-dir", os.fspath(marker)], cwd=tree,
-                                   capture_output=True, check=False, timeout=30)
-        if found.returncode == 128:
-            return None
-        # Git ends the path with one LF; any other byte, blanks included, is part of the path.
-        if found.returncode or not found.stdout.endswith(b"\n"):
-            raise ValueError("rev-parse --resolve-git-dir failed")
-        return os.path.realpath(os.fsdecode(found.stdout[:-1]))
-
-    def unreadable(marker: Path) -> bool:
-        # Git reads a symbolic HEAD with readlink, which needs no read permission.
-        files = [marker / "HEAD", marker / "commondir"] if marker.is_dir() else [marker]
-        return any(os.path.exists(path) and not (path.name == "HEAD" and path.is_symlink())
-                   and not os.access(path, os.R_OK) for path in files)
-
     def unlistable(error: OSError) -> None:
         raise error
 
-    own = resolve(tree / ".git")
-    if own is None:
-        raise ValueError("the tree's own Git directory does not resolve")
     try:
         for directory, directories, files in os.walk(tree, onerror=unlistable):
             if directory == os.fspath(tree):
                 if ".git" in directories:
                     directories.remove(".git")  # the tree's own repository
                 continue
-            entries = {*directories, *files}
-            markers = [Path(directory)] if "HEAD" in entries else []
-            if ".git" in entries:
-                markers.append(Path(directory, ".git"))
-            if any(unreadable(marker) or resolve(marker) not in (None, own) for marker in markers):
+            if not {".git", "HEAD"}.isdisjoint({*directories, *files}):
                 return True
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except OSError:
         return True
     return False
 

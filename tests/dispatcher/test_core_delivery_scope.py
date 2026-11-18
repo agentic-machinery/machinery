@@ -160,7 +160,7 @@ LINE_BREAK_NAMES = ["scratch/lf\nname", "scratch/cr\rname", "scratch/crlf\r\nnam
     ("bare", None, False),  # a bare repository's commits may hold work, even beside a .git link to the tree's own
     ("bare-symlink-head", None, False),  # Git still opens a bare repository whose HEAD is a symbolic link
     ("bare-trailing-blank", None, False),  # a repository name ending in a blank is still that repository
-    ("marker-output", None, True),  # HEAD, objects/ and .git files that Git would not open as a repository
+    ("marker-output", None, False),  # any HEAD or .git entry, even one Git would not open, may mark a repository
     ("nested-listed", None, False),  # a checkout under a path the tree tracks: status lists its files one by one
     ("nested-gitfile", None, False),  # the same checkout, its .git a file naming a separate Git directory
     ("nested-all-tracked", None, False),  # a checkout whose files the tree tracks: status lists none of them
