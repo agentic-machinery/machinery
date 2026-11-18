@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from lu_machinery.orchestration.fleet_repos import FleetRepo, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -30,7 +30,6 @@ _PACKAGE = f"{Path(os.path.abspath(__file__)).parents[1].name}.{Path(os.path.abs
 _MACHINERY = _PACKAGE.partition(".")[0]
 
 GIT = shutil.which("git", path=os.defpath) or "/usr/bin/git"
-CANONICAL_ORIGIN = "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git"
 
 
 class SnapshotRefusal(RuntimeError):
@@ -53,26 +52,36 @@ class SafeGitContext:
         *,
         objects: Path,
         temp_root: Path,
-        origin: str = CANONICAL_ORIGIN,
+        origin: str | None = None,
         token: str | None = None,
         local_remote: bool = False,
         borrow_objects: bool = True,
         repository: FleetRepo | None = None,
     ) -> None:
-        registered = load_fleet_repos()
-        selected = repository or next(repo for repo in registered.values() if repo.default)
-        if registered.get(selected.key) != selected:
-            raise SnapshotRefusal("rescue_push_url_unavailable")
-        canonical = f"https://github.com/{selected.github}.git"
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", selected.github):
-            raise SnapshotRefusal("rescue_push_url_unavailable")
-        if origin != canonical and not (local_remote and Path(origin).is_absolute()):
-            raise SnapshotRefusal("rescue_push_url_unavailable")
-        self.repository = selected.github
+        canonical = None
+        if repository is not None:
+            try:
+                registered = load_fleet_repos()
+            except FleetRepoError as exc:
+                raise SnapshotRefusal("rescue_push_url_unavailable") from exc
+            if (
+                registered.get(repository.key) != repository
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository.github)
+            ):
+                raise SnapshotRefusal("rescue_push_url_unavailable")
+            canonical = f"https://github.com/{repository.github}.git"
+        if local_remote:
+            if origin is None or not Path(origin).is_absolute():
+                raise SnapshotRefusal("rescue_push_url_unavailable")
+            self.origin = origin
+        else:
+            if canonical is None or (origin is not None and origin != canonical):
+                raise SnapshotRefusal("rescue_push_url_unavailable")
+            self.origin = canonical
+        self.repository = repository.github if repository is not None else None
         self.objects = objects.resolve(strict=True)
         self.lfs_objects = self.objects.parent / "lfs/objects"
         self.temp_root = temp_root
-        self.origin = origin
         self.token = token
         self.local_remote = local_remote
         # Finalize contexts never borrow: isolate_objects receives everything.

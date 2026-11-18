@@ -24,6 +24,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from lu_machinery.common import github_client, json_depth
+from lu_machinery.fleet.pr_identity import (
+    ACTIVE_TASK_STATUSES,
+    RecordRepositoryRefusal,
+    record_repository,
+    supervisor_liveness,
+)
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 
 # The machinery package's import name, which is also the directory its files have in checkout
@@ -32,9 +38,6 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 # This CLI as it was started: by its import name under ``-m``, else by its file.
 _ENTRY = f"-m {__spec__.name}" if __spec__ is not None else os.fspath(__file__)
 
-# Repositories whose open PRs the CTO cycle must account for ("both repositories").
-DEFAULT_REPO_KEYS = ("public", "infra-private")
-_ACTIVE = {"spawning", "running"}
 _GH_TIMEOUT_SECONDS = 60
 _PR_LIMIT = 200
 # ``headRefOid`` lets the ownerless alert fetch the head commit's X-Agent trailer. Never list
@@ -49,56 +52,57 @@ class Unowned:
     branch: str
     reason: str
     last_task: str | None = None
-
-
-def _supervisor_alive(record: dict) -> bool:
-    """True only on positive evidence: the recorded pid still has the recorded start identity."""
-    pid, started = record.get("pid"), record.get("process_start")
-    if not pid or not started:
-        return False
-    from lu_machinery.dispatcher.worker import _identity
-
-    return _identity(pid) == started
-
-
-def _record_repository(record: dict, repos: Mapping[str, FleetRepo]) -> str:
-    slug = record.get("repository") or record.get("repository_id")
-    if not slug:
-        key = record.get("repo")
-        slug = repos[key].github if key in repos else next(r.github for r in repos.values() if r.default)
-    return str(slug).casefold()
+    unknown: bool = False
 
 
 def evaluate(
     open_prs: Mapping[str, list[dict]],
     records: list[dict],
     repos: Mapping[str, FleetRepo],
-    alive: Callable[[dict], bool] = _supervisor_alive,
+    alive: Callable[[dict], bool | None] = supervisor_liveness,
 ) -> list[Unowned]:
-    """Return every open PR (keyed by repo slug) lacking a live owner task."""
+    """Return every open PR lacking a verifiably live, repository-bound owner."""
     by_branch: dict[tuple[str, str], list[dict]] = {}
+    unbound: dict[str, str] = {}
     for record in records:
         branch = record.get("worktree_branch")
-        if branch:
-            by_branch.setdefault((_record_repository(record, repos), branch), []).append(record)
+        if not isinstance(branch, str) or not branch:
+            continue
+        try:
+            slug = record_repository(record, repos)
+        except RecordRepositoryRefusal as exc:
+            if record.get("status") in ACTIVE_TASK_STATUSES and alive(record) is not False:
+                unbound[branch] = exc.code
+            continue
+        by_branch.setdefault((slug.casefold(), branch), []).append(record)
     unowned = []
     for slug, prs in open_prs.items():
         for pr in prs:
             branch = pr.get("headRefName") or ""
             fork = bool(pr.get("isCrossRepository"))
             tasks = [] if fork else by_branch.get((slug.casefold(), branch), [])
-            if any(t.get("status") in _ACTIVE and alive(t) for t in tasks):
+            states = {alive(t) for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES}
+            if True in states:
+                continue
+            if not fork and branch in unbound:
+                unowned.append(Unowned(slug, int(pr["number"]), branch, unbound[branch], unknown=True))
                 continue
             last = max(tasks, key=lambda t: t.get("started_at") or "", default=None)
-            if last is None:
+            unknown = None in states
+            if unknown:
+                reason = "an active owner's supervisor is not verifiably alive"
+            elif last is None:
                 reason = "fork PR: no branch owner possible" if fork else "no task record owns this branch"
-            elif last.get("status") in _ACTIVE:
+            elif last.get("status") in ACTIVE_TASK_STATUSES:
                 reason = f"last owner {last['status']} but its supervisor is not verifiably alive"
             elif last.get("status") == "done":
                 reason = "last owner finished done, PR still open (not MERGED)"
             else:
                 reason = f"last owner ended {last.get('status')}, PR not MERGED"
-            unowned.append(Unowned(slug, int(pr["number"]), branch, reason, last.get("task_id") if last else None))
+            unowned.append(Unowned(
+                slug, int(pr["number"]), branch, reason, last.get("task_id") if last else None,
+                unknown=unknown,
+            ))
     return unowned
 
 
@@ -146,10 +150,14 @@ def fetch_open_prs(slug: str) -> list[dict]:
     return prs
 
 
+def fetch_fleet_open_prs(repositories: Mapping[str, FleetRepo]) -> dict[str, list[dict]]:
+    return {repo.github: fetch_open_prs(repo.github) for repo in repositories.values()}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "List open PRs, in both fleet repositories, that have no live dispatch-task owner.\n"
+            "List open PRs across the fleet that lack a verifiably live dispatch-task owner.\n"
             "Use it every CTO cycle (cto/references/cycle.md); then dispatch an owner for each PR "
             "it prints. Not for judging review or CI state."
         ),
@@ -159,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"  .venv/bin/python {_ENTRY} --repo infra-private --json\n\n"
             "Outputs: one line per unowned PR on stdout (or a JSON list with --json); no side effects.\n"
             "Exit codes: 0 every open PR has a live owner task; 1 at least one PR is unowned;\n"
-            "  2 GitHub, the repository catalog or the task records could not be read (unknown, never clean).\n"
+            "  2 Owner repository binding or scan evidence is unknown.\n"
             f"Related: dispatch task records ({_MACHINERY}/dispatch.py list), {_MACHINERY}/config/fleet_repos.yaml, "
             "epic #10453."
         ),
@@ -169,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo",
         action="append",
         metavar="KEY",
-        help=f"fleet_repos.yaml key to check, repeatable (default: {' and '.join(DEFAULT_REPO_KEYS)})",
+        help="fleet_repos.yaml key to check, repeatable (default: every registered repository)",
     )
     parser.add_argument(
         "--json", action="store_true", help="print the unowned PRs as a JSON list (default: text lines)"
@@ -181,14 +189,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         repos = load_fleet_repos()
-        keys = args.repo or list(DEFAULT_REPO_KEYS)
+        keys = args.repo or repos
         unknown = [k for k in keys if k not in repos]
         if unknown:
             raise FleetRepoError(f"unknown fleet repo key(s): {', '.join(unknown)}")
         from lu_machinery.dispatcher import store
 
         records = store.list_tasks(strict=True)
-        open_prs = {repos[k].github: fetch_open_prs(repos[k].github) for k in keys}
+        open_prs = fetch_fleet_open_prs({key: repos[key] for key in keys})
         unowned = evaluate(open_prs, records, repos)
     except (FleetRepoError, RuntimeError, ValueError, OSError, KeyError, TypeError, AttributeError) as exc:
         print(f"UNKNOWN: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -200,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{u.repo}#{u.number} {u.branch}: {u.reason}" + (f" [{u.last_task}]" if u.last_task else ""))
         total = sum(len(p) for p in open_prs.values())
         print(f"{total - len(unowned)}/{total} open PRs have a live owner task", file=sys.stderr)
+    if any(row.unknown for row in unowned):
+        return 2
     return 1 if unowned else 0
 
 
