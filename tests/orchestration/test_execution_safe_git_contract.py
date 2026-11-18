@@ -106,7 +106,7 @@ def test_scoped_commit_keeps_unowned_index_and_admits_only_closed_operations(tmp
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(safe.subprocess, "run", observe)
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path) as context:
+    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=str(repo), local_remote=True) as context:
         context.source_git_dir = repo / ".git"
 
         def prepare(**kwargs):
@@ -185,7 +185,7 @@ def test_scoped_commit_sees_same_size_edit_in_the_index_timestamp(tmp_path):
     os.utime(owned, ns=(stamp, stamp))
     _restat_index_entry(repo / ".git/index", b"owned.txt", owned.lstat())
     os.utime(repo / ".git/index", ns=(stamp, stamp))
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path) as context:
+    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=str(repo), local_remote=True) as context:
         context.source_git_dir = repo / ".git"
         result = safe.prepare_scoped_commit(
             context,
@@ -227,7 +227,7 @@ def test_scoped_preparation_rejects_unbounded_inputs_before_mutation(tmp_path, o
     repo = _primary(tmp_path)
     head = _git(repo, "rev-parse", "HEAD")
     index = (repo / ".git/index").read_bytes()
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path) as context:
+    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=str(repo), local_remote=True) as context:
         context.source_git_dir = repo / ".git"
         args = {
             "worktree": repo,

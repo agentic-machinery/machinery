@@ -1,9 +1,12 @@
 # Stalled dispatch work
 
 Issue #11212 returns committed work to its dispatching lane until it lands or
-the owner explicitly abandons it. The report scans hot task records younger
-than 14 days and open PRs in the public repository. It imports the existing
-stale-record classifiers without settling, archiving or editing any record.
+the owner explicitly abandons it. The report scans live task records,
+terminal records younger than 14 days, and open PRs in every repository in
+the fleet catalog. It uses the dispatch record's repository fields to match
+branches and PR numbers.
+It imports the existing stale-record classifiers without settling, archiving
+or editing any record.
 
 ```bash
 .venv/bin/python -m lu_machinery.orchestration.stalled_work stalled
@@ -20,8 +23,10 @@ without a matching recent task go to `claude-cto`. Worker provider and branch
 prefix do not establish ownership.
 
 Unpushed work requires a local branch or worktree commit absent from every
-freshly fetched origin branch. Pushed branches without an open PR get a
-two-hour grace period measured from terminal dispatch completion. Git does
+current remote branch. The scanner reads remote branch tips with
+`git ls-remote` and checks their reachability locally. Pushed branches
+without an open PR get a two-hour grace period measured from terminal
+dispatch completion. Git does
 not retain the remote push timestamp. Branches already contained in origin's
 `main` or tied to a merged PR by exact commit identity are excluded. This also
 excludes squash merges. Rejected PRs require a trusted recorder comment for the
@@ -58,7 +63,9 @@ send no messages. Keys include cycle, lane and
 the digest of the sorted row set, excluding changing age values. Retries in
 one cycle deduplicate; the next cycle repeats unresolved work. No tmux input,
 push, rebase, deletion or task-record write occurs. Missing Git or GitHub
-evidence produces errors, exit 1 and no routing from that report. An unknown
+evidence produces errors, exit 1 and no routing from that report. The same
+applies if a registered checkout is missing or a task with a branch or PR
+has missing, unregistered or conflicting repository fields. An unknown
 PR verdict instead produces a `verdict_unknown` row for `claude-cto`, with the
 reason and unknown age, while other rows continue routing. The keeper's
 post-step ignores the observer's exit status so a scan failure does not mark

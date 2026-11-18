@@ -1,4 +1,4 @@
-"""The one shared open-PR identity probe for worktree-retention callers (#7127).
+"""Repository binding for dispatch records and the shared open-PR probe (#7127).
 
 Callers such as ``hramatka_hygiene_check._branch_has_open_pr`` (the closeout
 gate) answer "does this branch still have an open PR?" for dispatch worktrees,
@@ -32,12 +32,18 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from lu_machinery.common import github_client, json_depth
 
+if TYPE_CHECKING:
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+
 DEFAULT_PROBE_TIMEOUT_SECONDS = 30.0
 _REPO_SLUG_TIMEOUT_SECONDS = 15.0
+ACTIVE_TASK_STATUSES = frozenset({"spawning", "running"})
 
 # Same isolation contract as the reaper modules: gh/git must resolve nothing
 # from a stray GIT_* environment pointing at an unrelated checkout.
@@ -60,6 +66,65 @@ _GITHUB_REMOTE_PATTERNS = (
     re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
     re.compile(r"^git://github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?/?$", re.IGNORECASE),
 )
+
+
+class RecordRepositoryRefusal(ValueError):
+    """A task record does not identify one registered repository."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def record_repository(record: Mapping[str, object], repos: Mapping[str, FleetRepo]) -> str:
+    """Resolve the recorded slug or dispatch key. Populated fields must agree."""
+    selected: set[str] = set()
+    for field in ("repository", "repository_id", "repo"):
+        value = record.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            spelling = value.casefold()
+            matches = {
+                repo.github for key, repo in repos.items()
+                if spelling == (key if field == "repo" else repo.github).casefold()
+            }
+            if len(matches) == 1:
+                selected.update(matches)
+                continue
+        raise RecordRepositoryRefusal("task_repository_unregistered")
+    if not selected:
+        raise RecordRepositoryRefusal("task_repository_missing")
+    if len(selected) != 1:
+        raise RecordRepositoryRefusal("task_repository_conflict")
+    return selected.pop()
+
+
+def supervisor_liveness(record: Mapping[str, Any] | None) -> bool | None:
+    """Check the dispatch supervisor's recorded boot ID and process start time.
+
+    ``None`` means the record or host lacks the evidence needed to decide.
+    """
+    if record is None or record.get("status") not in ACTIVE_TASK_STATUSES:
+        return False
+    pid, started = record.get("pid"), record.get("process_start")
+    if not pid or not isinstance(started, str) or not started:
+        return None
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+    except FileNotFoundError:
+        return False if Path("/proc/self/stat").exists() else None
+    except (OSError, ValueError, TypeError):
+        return None
+    try:
+        fields = stat.rsplit(")", 1)[1].split()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        start_ticks = fields[19]
+    except (OSError, IndexError):
+        return None
+    if fields[0] == "Z":
+        return False
+    return f"{boot}:{start_ticks}" == started
 
 
 def _sanitized_env() -> dict[str, str]:
