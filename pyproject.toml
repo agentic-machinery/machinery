@@ -38,6 +38,30 @@ dependencies = [
 [project.optional-dependencies]
 test = ["hypothesis==6.170.15", "PyMuPDF==2.1"]
 
+# Development tools, locked in uv.lock beside the runtime closure (PEP 735;
+# never part of the wheel's metadata). CI selects them per job with
+# `uv sync --locked`; see .github/workflows/ci-gate.yml.
+[dependency-groups]
+# pip: tests drive `python -m pip` in the test environment, and a uv
+# environment has no pip of its own.
+test = [
+    "pip==26.3",
+    "pymupdf4llm==2.1",
+    "pytest-cov==7.1.0",
+    "pytest-rerunfailures==16.7",
+    "pytest-timeout==2.4.0",
+]
+typecheck = ["mypy==2.1.0"]
+lint = ["ruff==0.15.21", "zizmor==1.31.1"]
+audit = ["pip-audit==2.10.1"]
+attribution = ["markdown-it-py>=4.2.0"]
+
+[tool.uv]
+# One uv for the lock and every CI job (pins.txt UV_VERSION).
+required-version = "==0.13.1"
+# Semgrep stays a hash-pinned install in ci-gate.yml and tests.yml: semgrep
+# 1.183.0 requires mcp==1.29.0, which this project's mcp>=2.2 excludes.
+
 [tool.setuptools]
 include-package-data = true
 
