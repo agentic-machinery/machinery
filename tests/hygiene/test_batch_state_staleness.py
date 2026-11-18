@@ -126,6 +126,16 @@ def test_cli_json_table_and_errors(batch, tmp_path, capsys):
     with pytest.raises(SystemExit) as exc:
         retention.main(["--batch-root", str(batch), "--retention-list", str(tmp_path / "missing.json")])
     assert exc.value.code == 2
+    # An invalid run removes nothing: a symlinked root or a bad argument is refused before the prune starts.
+    (batch / "tasks").mkdir()
+    task(batch / "tasks", "settled")
+    (batch / "tasks" / "settled.artifacts").mkdir()
+    age(batch / "tasks", 10)
+    (tmp_path / "linked-root").symlink_to(batch, target_is_directory=True)
+    for bad in (["--batch-root", str(tmp_path / "linked-root")], ["--batch-root", str(batch), "--stale-days", "0"]):
+        with pytest.raises(SystemExit) as exc:
+            retention.main([*bad, "--retention-list", str(holds_file(tmp_path, []))])
+        assert exc.value.code == 2 and (batch / "tasks" / "settled.artifacts").is_dir()
 
 
 def age(path: Path, days: float) -> None:
