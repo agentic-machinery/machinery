@@ -20,7 +20,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
-import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -39,6 +38,16 @@ from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
 from .state_helpers import swr_route
+
+_DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
+try:
+    from psycopg import Error as PostgresError
+except ModuleNotFoundError as exc:
+    if exc.name != "psycopg":
+        raise
+else:
+    _DATABASE_ERRORS += (PostgresError,)
+_OVERVIEW_ERRORS: tuple[type[Exception], ...] = (*_DATABASE_ERRORS, storage.ControlPlaneError)
 
 router = APIRouter(tags=["fleet"])
 # Fleet read models served stale-while-revalidate (``state_helpers.swr_route``):
@@ -505,7 +514,7 @@ def _authority_health_snapshot(
                     (window["since"], "expired_by_cleanup"),
                 ).fetchone()[0]
             )
-    except (sqlite3.Error, psycopg.Error):
+    except _DATABASE_ERRORS:
         logger.warning("Fleet observer could not derive authority health")
         return {**unavailable, "availability": "schema_read_failed"}
     total = sum(states.values())
@@ -877,7 +886,7 @@ def fleet_overview(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
     }
     try:
         return _populate_fleet_overview(result, status, ctx)
-    except (sqlite3.Error, psycopg.Error, storage.ControlPlaneError):
+    except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
         return result
