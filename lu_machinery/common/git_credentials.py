@@ -8,6 +8,7 @@ store. Only gh and Git handle credential bytes, over their private pipe.
 import os
 import re
 import shlex
+from functools import cache
 from pathlib import Path
 
 import yaml
@@ -17,9 +18,31 @@ from lu_machinery.opsec.prepublish import PublishBlocked, real_gh
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
 
 
+@cache
+def repository_registry(path: Path) -> dict:
+    """Cache registry row types; each reader requires the fields it uses."""
+    try:
+        registry = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError:
+        raise ValueError("invalid fleet repository registry") from None
+    repos = registry.get("repos") if isinstance(registry, dict) else None
+    if not isinstance(repos, dict) or not repos:
+        raise ValueError("invalid fleet repository registry")
+    for key, entry in repos.items():
+        if (not isinstance(key, str) or not key.strip() or not isinstance(entry, dict)
+                or not isinstance(entry.get("github", ""), str)
+                or entry.get("transport", "ssh") not in ("file", "https", "ssh")
+                or not isinstance(entry.get("local_name", ""), str)
+                or not isinstance(entry.get("default", False), bool)):
+            raise ValueError("invalid fleet repository registry")
+    return repos
+
+
 def canonical_origins(repository: dict) -> tuple[str, ...]:
     """Derive exact destinations from registry identity, not clone transport."""
-    github = repository["github"]
+    github = repository.get("github")
+    if not isinstance(github, str):
+        raise ValueError("invalid registered repository identity")
     transport = repository.get("transport", "ssh")
     if transport == "file" and Path(github).is_absolute():
         return (github,)
@@ -40,7 +63,7 @@ def verification_credentials(remote: str) -> list[str]:
     """
     if not remote.startswith("https://github.com/"):
         return []
-    repositories = yaml.safe_load(CONFIG.read_text())["repos"].values()
+    repositories = repository_registry(CONFIG).values()
     if not any(remote in canonical_origins(repository) for repository in repositories):
         return []
     try:

@@ -18,9 +18,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 
-import yaml
-
-from lu_machinery.common import json_depth
+from lu_machinery.common import git_credentials, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.git_credentials import canonical_origins as canonical_origins
 from lu_machinery.common.git_credentials import verification_credentials
@@ -153,7 +151,7 @@ def verification_origin(path: Path) -> str:
 def _complete_since_task_base(run, shallow: Path, task_base: str) -> bool:
     """Whether the fetched graph is enough to walk the delivery above the task start.
 
-    Callers walk from the delivery tip, excluding the task start and a merge base
+    Callers walk from the delivery tip, excluding the task start and each merge base
     with the base tip. Single-parent commits are diffed against their parent and
     merges are re-run, which recomputes the merge bases of their parents.
 
@@ -168,11 +166,8 @@ def _complete_since_task_base(run, shallow: Path, task_base: str) -> bool:
     delivery with any merge above the task start requires non-shallow history.
     """
     tips = ("refs/heads/delivery", "refs/heads/base")
-    if task_base not in run("rev-list", *tips).split():
-        return False
-    if run("rev-parse", "--is-shallow-repository") == "false":
-        return True
-    return (set(shallow.read_text().split()).isdisjoint(run("rev-list", *tips, "--not", task_base).split())
+    return (task_base in run("rev-list", *tips).split()
+            and set(shallow.read_text().split()).isdisjoint(run("rev-list", *tips, "--not", task_base).split())
             and not run("rev-list", "--min-parents=2", "refs/heads/delivery", "--not", task_base))
 
 
@@ -267,7 +262,8 @@ def ownership_git(record: dict, head: str | None = None):
     if head is None and delivery_source == base_source:
         raise ValueError("delivery ref must differ from base ref")
     refspecs = (f"+{base_source}:refs/heads/base",
-                f"+{delivery_source}:refs/heads/delivery")
+                f"+{delivery_source}:refs/heads/delivery",
+                f"+{task_base}:refs/heads/start")
     with _private_remote_git(record["task_id"], remote) as (run, git_dir):
         def fetch(*args: str, phase: str) -> None:
             nonlocal refspecs
@@ -280,11 +276,11 @@ def ownership_git(record: dict, head: str | None = None):
                 if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", snapshot):
                     raise ValueError("delivery head must be a full object name") from None
                 previous = refspecs[1]
-                refspecs = (refspecs[0], f"+{snapshot}:refs/heads/delivery")
+                refspecs = (refspecs[0], f"+{snapshot}:refs/heads/delivery", refspecs[2])
                 _ownership_fetch(run, record, *(refspecs[1] if arg == previous else arg for arg in args),
                                  phase=f"recorded-head-{phase}")
 
-        fetch("--depth=1", "--", "origin", task_base, *refspecs, phase="initial")
+        fetch("--depth=1", "--", "origin", *refspecs, phase="initial")
         since = int(run("show", "-s", "--format=%ct", task_base)) - HISTORY_SLACK_SECONDS
         # Git selects no history below a tip dated before the cutoff and aborts the
         # bounded fetch; its message does not reach HTTPS clients, so decide by date.
@@ -292,15 +288,16 @@ def ownership_git(record: dict, head: str | None = None):
                                    "refs/heads/delivery").split())) >= since
         if bounded:
             fetch(f"--shallow-since=@{since}", "--", "origin", *refspecs, phase="bounded-history")
-        shallow = git_dir / "shallow"
-        if not (bounded and _complete_since_task_base(run, shallow, task_base)):
-            if run("rev-parse", "--is-shallow-repository") == "false":
-                raise ValueError("task base is not reachable from the remote tips")
+        if run("rev-parse", "--is-shallow-repository") == "true" and (
+            not bounded or not _complete_since_task_base(run, git_dir / "shallow", task_base)
+        ):
+            # A takeover can rewrite the original tip. Fetch its history explicitly so
+            # excluding the recorded start still excludes its inherited ancestors.
             fetch("--unshallow", "--", "origin", *refspecs, phase="full-history")
             if run("rev-parse", "--is-shallow-repository") != "false":
                 raise ValueError("full history could not be fetched")
-            if not _complete_since_task_base(run, shallow, task_base):
-                raise ValueError("task base is not reachable from the remote tips")
+        if run("rev-parse", "--verify", "refs/heads/start^{commit}") != task_base:
+            raise ValueError("fetched task start does not match recorded start")
         if run("rev-parse", "--verify", "refs/heads/delivery^{commit}") != (head or record["head_sha"]):
             raise ValueError("remote delivery tip does not match snapshot")
         yield run
@@ -343,9 +340,18 @@ def _git(path: Path, *args: str, isolate: bool = False, strip: bool = True, env:
     return output.strip() if strip else output
 
 
+def pin_settlement_registry() -> None:
+    """Load the registry for Git, guarded worktree removal, and closeout before provider execution."""
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+
+    git_credentials.repository_registry(git_credentials.CONFIG)
+    git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
+    load_fleet_repos()
+
+
 def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
-    repos = yaml.safe_load(machinery_path("config/fleet_repos.yaml").read_text())["repos"]
-    key = key or next(name for name, item in repos.items() if item.get("default"))
+    repos = git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
+    key = key or next((name for name, item in repos.items() if item.get("default")), None)
     if key not in repos:
         raise ValueError("unknown repository key")
     item = {**repos[key], "key": key}
@@ -353,7 +359,11 @@ def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
     if slug is not None:
         # A configured slug names the default repository (#12681); unset, the catalog's value stands.
         item["github"] = slug
-    return (main_checkout_root(product_root()) if item.get("default") else state_root().parent / item["local_name"]).resolve(), item
+    if item.get("default"):
+        return main_checkout_root(product_root()).resolve(), item
+    if not item.get("local_name", "").strip():
+        raise ValueError("repository registry entry requires a local name")
+    return (state_root().parent / item["local_name"]).resolve(), item
 
 
 def publish_start(repo: Path, repository: dict, branch: str, task_id: str, *, label: str = "publish branch") -> tuple[str, str]:
@@ -1070,8 +1080,10 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
     if head and isinstance(commits, int) and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         listed = _gh("api", "--paginate", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
         for pr in json_depth.loads(listed or "[]", max_depth=512):
-            if (pr["number"] not in seen and pr["head"]["sha"] == head
-                    and (pr["head"]["repo"] or {}).get("full_name") == (pr["base"]["repo"] or {}).get("full_name")):
+            head_repo = (pr["head"]["repo"] or {}).get("full_name")
+            base_repo = (pr["base"]["repo"] or {}).get("full_name")
+            if (pr["number"] not in seen and head_repo == base_repo
+                    and head_repo and head_repo.casefold() == repo.casefold()):
                 seen.add(pr["number"])
                 yield pr["number"]
 
@@ -1113,12 +1125,12 @@ def merged_delivery(record: dict) -> dict | None:
     it MERGED after the task started into the task's recorded base branch or the remote's
     default branch (a stacked task's base is the parent branch, and the pull request is
     retargeted onto the default branch once that parent is gone), with a merge commit and a
-    task-authored commit (or an explicit task acceptance when it added no commits). All attributed
+    task-authored commit, an exact exit head on a recorded branch, or explicit task acceptance. All attributed
     candidates contribute paths, so an earlier valid split cannot hide a later ownership violation. Any lookup
     failure is None, so the caller falls back to refusing on the local evidence. ``paths`` is
-    every path the PR changed, rename sources included, plus every path any commit of the task's
-    touched, as the settlement walk reads them from the PR's final head (a reverted change still
-    counts). The task's own head must also be published (nothing ahead of the task start, the
+    every path touched by commits since the task's recorded start, read from the PR's final head.
+    The walk catches reverted edits and excludes inherited paths. The task's own head must also
+    be published (nothing ahead of the task start, the
     PR's final head, or already in the PR or the base), so merged work never hides further work
     that was not pushed.
     """
@@ -1136,7 +1148,11 @@ def merged_delivery(record: dict) -> dict | None:
         paths: set[str] = set()
         primary = None
         strong_delivery = False
-        snapshot_published = record.get("commits_ahead") == 0
+        snapshot = record.get("head_sha")
+        start = record.get("worktree_start_sha", record["worktree_base_sha"])
+        # A reset to an ancestor can have zero commits ahead while leaving unpublished work.
+        snapshot_published = snapshot is not None and snapshot == start
+        branches = {record["worktree_branch"], record.get("publish_branch")} - {None}
         accepted = set(_accepted_prs(record["task_id"], repo))
 
         def accepted_base(name: str) -> bool:
@@ -1157,11 +1173,14 @@ def merged_delivery(record: dict) -> dict | None:
                     or datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) < started
                     or not accepted_base(pr["baseRefName"])):
                 continue
-            strong = (number in accepted or pr["headRefName"] in {
-                record["worktree_branch"], record.get("publish_branch")} or pr["headRefOid"] == record["head_sha"])
-            # An accepted pull request is the task's whatever it committed; otherwise a commit of its own must carry
-            # its trailer, and a matching branch name alone never attributes another task's work.
-            if number not in accepted:
+            pr_head = pr["headRefOid"]
+            recorded_branch = pr["headRefName"] in branches
+            exact_snapshot = pr_head == snapshot
+            # Some release tools supply their own trailer. An exact exit head on the recorded
+            # branch can prove new commits through the same Git walk as a live branch.
+            exact_delivery = exact_snapshot and recorded_branch and (record.get("commits_ahead") or 0) > 0
+            strong = number in accepted or recorded_branch or exact_snapshot
+            if number not in accepted and not exact_delivery:
                 messages = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/commits", "--jq",
                                ".[] | .commit.message | @json")
                 trailer = f"X-Agent: {record['agent']}/{record['task_id']}"
@@ -1174,34 +1193,31 @@ def merged_delivery(record: dict) -> dict | None:
                     record.setdefault("merged_delivery_exclusions", []).append(
                         {"repo": repo, "number": number, "reason": "ambiguous_task_attribution"})
                     continue  # inherited task commits do not establish custody of a successor's PR
-            # Any exact merged head proves the snapshot's publication, even after branch deletion.
-            snapshot_published = snapshot_published or pr["headRefOid"] == record["head_sha"]
-            # One JSON string per line keeps a name with a newline or quote whole.
-            changed = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/files",
-                          "--jq", ".[] | (.filename, (.previous_filename // empty)) | @json")
-            # The net file list omits a change a later commit reverted, so settlement's own walk also reads
-            # every commit the PR's final head adds to the base it merged into (the merge's first parent).
-            with ownership_git(record, head=pr["headRefOid"]) as run:
-                start = record.get("worktree_start_sha", record["worktree_base_sha"])
+            # Use the actual pre-merge base. The live base may now include the task's commits.
+            with ownership_git(record, head=pr_head) as run:
                 parent = _fetch_merged_parent(run, pr["mergeCommit"]["oid"], record)
                 # The exit snapshot may be a reset to the squash merge. Count the PR head's own range.
-                commits_expected = bool(run("rev-list", "--max-count=1", f"{start}..{pr['headRefOid']}"))
+                commits_expected = exact_delivery or bool(run("rev-list", "--max-count=1", f"{start}..{pr_head}"))
                 history = ownership.delivered_paths(
-                    run, pr["headRefOid"], parent, start, commits_expected=commits_expected)
-            paths.update(json_depth.loads(line, max_depth=512) for line in changed.splitlines() if line)
+                    run, pr_head, parent, start, commits_expected=commits_expected)
+                # GitHub can merge the base into the PR after the worker's last push.
+                snapshot_published = (snapshot_published or exact_snapshot or
+                                      snapshot in run("rev-list", pr_head, "--not", parent, start).splitlines())
             paths.update(history)
             delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=pr["mergeCommit"]["oid"])
             deliveries.append(delivery)
             strong_delivery = strong_delivery or strong
-            if pr["headRefOid"] == record["head_sha"]:
+            if exact_snapshot:
                 primary = delivery
         if deliveries:
             if record.get("merged_delivery_exclusions") and not strong_delivery:
                 return None  # only family-prefix evidence cannot resolve the mixed-task ambiguity
             if not snapshot_published:
+                if not snapshot:
+                    return None
                 tip, merged = _canonical_publication(
-                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", record["head_sha"])
-                if not (merged or tip == record["head_sha"]):
+                    record, f"refs/heads/{record.get('publish_branch') or record['worktree_branch']}", snapshot)
+                if not (merged or tip == snapshot):
                     return None  # merged splits cannot conceal further unpublished work
             record.pop("merged_delivery_lookup", None)
             return {**(primary or deliveries[0]), "pull_requests": deliveries, "paths": sorted(paths - {""})}
@@ -1560,13 +1576,15 @@ def _code_load_failure(error: str | None) -> bool:
     return (error or "").partition(":")[0] in {"ImportError", "ModuleNotFoundError"}
 
 
-def settle_worktree(record: dict, borrowed=lambda: False, salvage: bool = False) -> dict:
+def settle_worktree(record: dict, borrowed=lambda: False, salvage: bool = False, *,
+                    verified_merged_head: str | None = None) -> dict:
     """Remove the task's own worktree when nothing in it can be lost; otherwise record why it stays.
 
     Runs from outside the worktree after the provider has exited. Uncommitted tracked changes keep the
     tree. A write task that committed keeps it until its HEAD is the publish branch's tip on the
     canonical remote recorded at dispatch (without --branch that is the task branch), a pull-request
     head there, or is already in that remote's main; a task that committed nothing needs no proof.
+    A fresh merged-delivery proof also counts if it covers the worktree's current HEAD.
     borrowed() is asked under the worktree lock, right before removal, whether another task's
     provider may still work in this tree. Removal goes through the guarded chokepoint
     (worktree_claims.remove_unclaimed_worktree), which records ignored output and copies untracked
@@ -1617,7 +1635,9 @@ def settle_worktree(record: dict, borrowed=lambda: False, salvage: bool = False)
             return disposition("retained", "dirty", "; ".join(changed[:5]))
         committed = head != record.get("worktree_start_sha", record["worktree_base_sha"])
         if not changed and record["mode"] != "read-only" and committed:
-            remote, merged = _canonical_publication(record, f"refs/heads/{record.get('publish_branch') or branch}", head)
+            merged = head == verified_merged_head
+            if not merged:
+                remote, merged = _canonical_publication(record, f"refs/heads/{record.get('publish_branch') or branch}", head)
         hold = _salvage_hold(tree, repo, untracked) if salvage else None
     except GitHubRefused:
         return disposition("retained", "github_deferred")

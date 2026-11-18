@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-import yaml
+from lu_machinery.common.git_credentials import repository_registry
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
 
@@ -52,21 +52,12 @@ class MissingFleetCheckout(FleetRepoError):
 def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
     cfg_path = path or _CONFIG_PATH
     try:
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    except (yaml.YAMLError, OSError) as exc:
+        repos_raw = repository_registry(cfg_path.resolve())
+    except (ValueError, OSError) as exc:
         raise FleetRepoError(f"fleet_repos catalog unreadable: {cfg_path} ({type(exc).__name__}: {exc})") from exc
-    if not isinstance(raw, Mapping):
-        raise FleetRepoError(f"fleet_repos catalog must be a mapping: {cfg_path}")
-    repos_raw = raw.get("repos")
-    if not isinstance(repos_raw, Mapping) or not repos_raw:
-        raise FleetRepoError(f"fleet_repos.repos missing or empty: {cfg_path}")
     out: dict[str, FleetRepo] = {}
     defaults = 0
     for key, body in repos_raw.items():
-        if not isinstance(key, str) or not key.strip():
-            raise FleetRepoError("fleet_repos key must be a non-empty string")
-        if not isinstance(body, Mapping):
-            raise FleetRepoError(f"fleet_repos[{key!r}] must be a mapping")
         github = body.get("github")
         local_name = body.get("local_name")
         role = body.get("role") or ""
@@ -177,6 +168,7 @@ def _repository_catalog(path: Path) -> dict[str, FleetRepo]:
 
 def clear_repository_cache() -> None:
     """Reload registry edits on the next canonical repository lookup."""
+    repository_registry.cache_clear()
     _repository_catalog.cache_clear()
 
 

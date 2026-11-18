@@ -3,6 +3,7 @@
 import contextlib
 import ctypes
 import hashlib
+import io
 import json
 import logging
 import math
@@ -1023,6 +1024,8 @@ def load_post_start_code(bound_review: bool = False) -> None:
             worktree_git,
             worktree_prep,
         )
+    with contextlib.suppress(Exception):
+        from lu_machinery.orchestration import merge_closeout, task_closeout, task_lifecycle  # noqa: F401
 
 
 # Seconds settlement waits for a provider's lingering processes to exit before it retains the tree.
@@ -1236,17 +1239,18 @@ def _run_merge_closeout(request: dict) -> dict:
             and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}", repo)
             and isinstance(root, str) and Path(root).is_absolute() and Path(root).is_dir()):
         return {"pr": pr, "returncode": None, "reason": "the closeout request is malformed"}
-    code = ("import sys; sys.path.insert(0, sys.argv[1]); from lu_machinery.orchestration.merge_closeout "
-            "import main; raise SystemExit(main(sys.argv[2:]))")
-    argv = [sys.executable, "-I", "-c", code, str(machinery_path("orchestration/merge_closeout.py").parents[2]),
-            str(pr), "--repo", repo, "--repo-root", root, "--apply", "--json"]
+    stdout = io.StringIO()
+    stderr = io.StringIO()
     try:
-        # A fixed argv: this interpreter, the package's own closeout module and checked request fields.
-        result = subprocess.run(argv, cwd=root, capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                                timeout=900)
-    except (OSError, subprocess.SubprocessError) as exc:
+        from lu_machinery.orchestration import merge_closeout
+
+        # Keep the supervisor's release and pinned registry across an on-disk package replacement.
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = merge_closeout.main([str(pr), "--repo", repo, "--repo-root", root, "--apply", "--json"])
+    except Exception as exc:
+        # A closeout crash must remain a receipt, as it was in the separate process.
         return {"pr": pr, "returncode": None, "reason": f"{type(exc).__name__}"}
-    return {"pr": pr, "returncode": result.returncode, "stdout": result.stdout[-4000:], "stderr": result.stderr[-2000:]}
+    return {"pr": pr, "returncode": returncode, "stdout": stdout.getvalue()[-4000:], "stderr": stderr.getvalue()[-2000:]}
 
 
 def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> None:
@@ -1259,7 +1263,8 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     request = merged = None
     if record.get("mode") == "workspace-write" and "closeout" not in record:
         merged = git.merged_delivery(record)
-    _reap_worktree(record, patience=patience, salvage=salvage)
+    _reap_worktree(record, patience=patience, salvage=salvage,
+                   verified_merged_head=record.get("head_sha") if merged else None)
     if record.get("worktree_disposition") == "removed":
         if merged:
             record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
@@ -1316,7 +1321,8 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
     scratch.settle(record, provider_gone, hold=services_running)
 
 
-def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> None:
+def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
+                   verified_merged_head: str | None = None) -> None:
     """Record the task worktree's disposition and remove the task's caches.
 
     The worktree goes only once the provider's whole process tree is proven gone; liveness that
@@ -1348,7 +1354,8 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False) -> 
             return (salvage and _provider_alive(record) is not False) or _borrowed(record)
 
         try:
-            record.update(git.settle_worktree(record, borrowed=borrowed, salvage=salvage))
+            record.update(git.settle_worktree(record, borrowed=borrowed, salvage=salvage,
+                                              verified_merged_head=verified_merged_head))
         except ImportError as exc:
             # Settlement's code could not be loaded: keep the tree and let the scheduled cleanup, a fresh process, finish.
             record.update(worktree_disposition="retained", worktree_disposition_reason=git.CODE_UNAVAILABLE,
@@ -1706,6 +1713,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     stderr_path = path.parent / "logs" / f"{spec.task_id}.stderr.log"
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGINT})
+        try:
+            git.pin_settlement_registry()
+        except (OSError, ValueError) as exc:
+            status, error = "failed", f"settlement_registry_unavailable: {type(exc).__name__}"
+            return
         if record.get("launch_mode") == "popen-fallback" and not _adopt_orphans():
             # Without it a double-forked descendant would escape settlement's sweep unseen.
             status, error = "failed", "fallback_adoption_unavailable: PR_SET_CHILD_SUBREAPER was refused"
