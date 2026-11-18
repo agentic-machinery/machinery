@@ -27,6 +27,8 @@ RETIRED_CALLS = (
     ("read", "12"),
     ("read", "12", "--json"),
     ("process-ask", "12", "opencode"),
+    ("read", "-12"),
+    ("process-ask", "-12", "opencode"),
     ("send", "hello", "--to", "claude"),
     ("ack", "--consumed-by-live-driver", "12"),
     ("ack-all", "claude"),

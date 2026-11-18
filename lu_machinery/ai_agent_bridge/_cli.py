@@ -1597,12 +1597,13 @@ def main():
     """CLI entry point."""
     argv = sys.argv[1:]
     # A legacy message id on a kept job verb is refused before parsing, whatever follows it.
-    # Options (``-h``) go to argparse; ``--`` only ends options before the id.
+    # Options (``-h``) go to argparse; ``--`` only ends options before the id. A
+    # signed integer (``-12``) is a legacy id, as argparse itself parses it.
     if argv and argv[0] in _JOB_ID_VERBS:
         rest = argv[1:]
         if rest[:1] == ["--"]:
             rest = rest[1:]
-        elif rest[:1] and rest[0].startswith("-"):
+        elif rest[:1] and rest[0].startswith("-") and not rest[0][1:].isdigit():
             rest = []
         if rest and not rest[0].startswith("authority-job_"):
             refuse_retired_verb(f"{argv[0]} <message-id>", _JOB_ID_VERBS[argv[0]])
