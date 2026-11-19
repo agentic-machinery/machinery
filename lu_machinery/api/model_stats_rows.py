@@ -44,7 +44,6 @@ from typing import Any, cast
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
-from lu_machinery.common.git_credentials import repository_registry
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.fleet_comms.review_publication import (
@@ -53,7 +52,7 @@ from lu_machinery.fleet_comms.review_publication import (
     normalize_verdict,
 )
 from lu_machinery.model_families import canonical_cursor_model
-from lu_machinery.orchestration.fleet_repos import load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepo, clear_repository_cache, load_fleet_repos
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
@@ -525,9 +524,9 @@ def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
-            # The schema the payload just passed requires every finding's priority and location path.
-            paths = sorted(path_digest(finding["location"]["path"]) for finding in payload["findings"]
-                           if finding["priority"] in BLOCKING_PRIORITIES)
+            # From the same findings as the counts, so the reader's check (one path per P0-P1 finding) always holds.
+            paths = sorted(path_digest(finding.path) for finding in evidence.findings
+                           if finding.priority in BLOCKING_PRIORITIES)
             return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts), "blocking_paths": paths}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
             recorded = _recorded_review(payload["verdict"])
@@ -831,16 +830,30 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, dict[str, Any]],
     return latest, counts
 
 
-def repository_keys() -> dict[str, str]:
-    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``), read from
-    the file now: the registry cache is cleared first, so a catalog that was unreadable, or valid, at an earlier
-    reading is never reused. Empty when the catalog cannot be read, so no publication matches a row in that reading."""
-    repository_registry.cache_clear()
+def refresh_readings() -> None:
+    """Forget every catalog reading this module and the fleet registry keep, so their next use reads the files.
+
+    The statistics collector calls it once as each collection starts: a catalog that was unreadable, or valid, at
+    an earlier collection is never reused, and a failed reading lasts only for the collection that made it.
+    """
+    _catalog.cache_clear()
+    _fleet_repo_visibility.cache_clear()
+    _public_data_classes.cache_clear()
+    clear_repository_cache()
+
+
+def fleet_catalog() -> dict[str, FleetRepo] | None:
+    """The fleet repository catalog, or None when it cannot be read (no publication then matches a row)."""
     try:
-        repos = load_fleet_repos()
+        return load_fleet_repos()
     except Exception:  # fail closed: an unreadable catalog matches no publication
-        return {}
-    return {repo.github.lower(): key for key, repo in repos.items()}
+        return None
+
+
+def repository_keys(repos: Mapping[str, FleetRepo] | None) -> dict[str, str]:
+    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``); empty
+    without a catalog."""
+    return {} if repos is None else {repo.github.lower(): key for key, repo in repos.items()}
 
 
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")

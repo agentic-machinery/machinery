@@ -181,10 +181,10 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   counts by the verdict the recorder published (a P3-only reply published as an approval is an approval; a
   published review whose reply is not parsed counts with unknown findings), the PR's author is the published
   reviews' author, and its first published review sets both its risk tier (`critical`, `high`, `medium`, `low`,
-  then any other recorded tier; a class with no tier is `other`) and the window it falls in. A PR of the parsed
-  cohort with no published review at all is left out and counted per author in
-  `author_risks[].prs_without_review_of_record`. The author totals above still read the parsed replies, so the
-  tiers need not sum to them.
+  then any other recorded tier; a class with no tier is `other`) and the window it falls in. A PR the author
+  totals count in the window that these tiers do not (no published review at all, or a first published review
+  before the window) is counted per author in `author_risks[].prs_without_review_of_record`. The author totals
+  above still read the parsed replies, so the tiers need not sum to them.
 - **Reviewer accuracy** (`reviewer_accuracy`): per reviewer model, the outcome of every P0-P1 finding of its
   blocking reviews of record, and the planted-defect recall. See [Reviewer accuracy](#reviewer-accuracy).
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
@@ -310,8 +310,13 @@ column) and in nothing else, so it never enters the denominator. Before the ledg
 two apart: published and unpublished formal runs carry the same task-record fields. Measured on 2026-11-19
 against the PR comments of the machinery and public repositories over 30 days, 34 of 234 blocking reviews whose
 findings a later approval settled had no published verdict (rounds whose head moved before recording, for
-example). Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. As
-in every author figure, a review here must name the PR and the author's model.
+example). Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. A
+review here must name the author's model; its PR is the one its ledger entry names, so a review dispatched by
+branch alone counts once it is published (see [Publication ledger](#publication-ledger)).
+
+Per reviewer, `reviews_approved_later` counts the blocking reviews with finding paths that the same reviewer later
+approved, and `reviews_approved_later_read` those whose changed files were read; the page's note under the table
+sums both over the reviewers it shows, in the selected window.
 
 ### Publication ledger
 
@@ -331,8 +336,10 @@ comment time wins (a later line breaks a tie), so an import never supersedes a n
 entry only when the entry's repository is the row's and its head is the row's; a review dispatched by branch alone
 keeps no PR in its row, and joins the PR the recorder resolved from the entry for the publication figures only
 (reviewer accuracy and the risk tiers); the legacy author totals, matrix and review levels still read only rows
-that name their PR. The repository map is read from the fleet catalog file at each collection (its registry cache
-is cleared first); an unreadable catalog matches no entry in that collection. A parsed rejection of
+that name their PR. Each collection starts by dropping every catalog reading the statistics and the fleet
+registry keep (`refresh_readings`), so the model and fleet catalogs are read afresh and no reading of an earlier
+collection, failed or valid, is reused; the repository map and the changed-file read share one reading of the
+fleet catalog, and an unreadable one matches no entry and reads no file in that collection. A parsed rejection of
 a formal review (one that names its author's model) with no matching entry counts as unknown publication, whether
 or not its row names a PR.
 
@@ -357,7 +364,8 @@ Reviews older than the import stay of unknown publication.
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one
 `git diff-tree --stdin --raw` per repository over every (blocked head, approved head) pair, from local objects only
-(`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the pairs and how many were read. Measured on
+(`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the distinct pairs of all history and how many were
+read (the page's note uses the per-reviewer window counts instead). Measured on
 2026-11-19 on a backfilled copy of the store (29,274 rows, 625 pairs, host load 10): the read took 0.7 s and the
 whole collect 13.3 s against 11.9 s before.
 

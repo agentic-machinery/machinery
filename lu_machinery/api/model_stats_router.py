@@ -45,7 +45,7 @@ from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
+from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
 from lu_machinery.review.model_catalog import (
     MECHANICAL_FAMILIES,
@@ -60,9 +60,11 @@ from .model_stats_rows import (
     POOLS,
     UNPARSED_REASONS,
     VERDICTS,
+    fleet_catalog,
     path_digest,
     read_publications,
     read_rows,
+    refresh_readings,
     repository_keys,
     timestamp,
     variant_effort,
@@ -171,13 +173,17 @@ _HeadPair = tuple[str, str, str]
 _SHA_HEX = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 
 
-def scan_touched(primary_root: Path, pairs: Iterable[_HeadPair]) -> dict[_HeadPair, frozenset[str]]:
+def scan_touched(primary_root: Path, pairs: Iterable[_HeadPair],
+                 repos: Mapping[str, FleetRepo] | None) -> dict[_HeadPair, frozenset[str]]:
     """The files changed from each blocked head to its approving head, read from the local checkouts; never fetch.
 
-    One ``cat-file --batch-check`` and one ``diff-tree --stdin`` per repository. A pair whose repository has no
+    ``repos`` is the collection's one reading of the fleet catalog; without one nothing is read. One
+    ``cat-file --batch-check`` and one ``diff-tree --stdin`` per repository. A pair whose repository has no
     checkout, or either of whose heads is not a commit there, is left out (its findings stay unknown). When the
     output does not line up with the pairs fed in, that repository's pairs are all left out.
     """
+    if not repos:
+        return {}
     by_repo: dict[str, set[tuple[str, str]]] = defaultdict(set)
     for repo, blocked, approved in pairs:
         if _SHA_HEX.fullmatch(blocked) and _SHA_HEX.fullmatch(approved):
@@ -187,7 +193,7 @@ def scan_touched(primary_root: Path, pairs: Iterable[_HeadPair]) -> dict[_HeadPa
     touched: dict[_HeadPair, frozenset[str]] = {}
     for repo, repo_pairs in sorted(by_repo.items()):
         try:
-            _, checkout = resolve_fleet_repo(repo, primary_root=primary_root, require_checkout=True)
+            _, checkout = resolve_fleet_repo(repo, primary_root=primary_root, repos=repos, require_checkout=True)
             heads = sorted({head for pair in repo_pairs for head in pair})
             check = subprocess.run(
                 ["git", "-C", str(checkout), "cat-file", "--batch-check=%(objectname) %(objecttype)"],
@@ -651,20 +657,17 @@ def _prs(rows: Iterable[_Row], *, of_record: bool = False) -> list[dict[str, Any
     first round is the earliest review of the earliest head, and its reviewer and review class are the ones the
     matrix splits by.
 
-    By default the cohort is the PR's parsed replies (an unparsed reply is no round), and ``has_record`` says whether
-    any review of the PR has a recorded publication. With ``of_record`` it is the PR's published reviews alone: each
-    counts by the verdict the recorder published, an unparsed one with unknown findings, and the authors, rounds and
-    first review (``first_at``, which places the PR in a window) are theirs.
+    By default the cohort is the PR's parsed replies (an unparsed reply is no round). With ``of_record`` it is the
+    PR's published reviews alone: each counts by the verdict the recorder published, an unparsed one with unknown
+    findings, and the authors, rounds and first review (``first_at``, which places the PR in a window) are theirs.
+    ``key`` (repository, PR) says which PR an outcome is, so the two cohorts can be compared; it is never served.
     """
     prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": defaultdict(list)})
-    published: set[tuple[str, str]] = set()
     never = datetime.max.replace(tzinfo=UTC)
     for row in rows:
         if row.review is None:
             continue
         repo = str(row.raw.get("repo") or "public")
-        if row.published is not None and row.review_author is not None:
-            published.add((repo, str(row.published_pr)))
         if of_record:
             # A published review joins its PR by the PR it was published on, even when its row names none.
             if row.published is None or row.review_author is None:
@@ -678,8 +681,7 @@ def _prs(rows: Iterable[_Row], *, of_record: bool = False) -> list[dict[str, Any
         entry["authors"].add(author)
         entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
             (row.started or never, row.task_id, verdict, row.review[1], row.model, row.task_class, row.moment))
-    return [{"author": "+".join(sorted(entry["authors"])), **_outcome(entry["heads"]),
-             **({} if of_record else {"has_record": key in published})}
+    return [{"author": "+".join(sorted(entry["authors"])), "key": key, **_outcome(entry["heads"])}
             for key, entry in prs.items()]
 
 
@@ -793,8 +795,9 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     from before the ledger) is of unknown publication: it adds to ``reviews_unknown_publication`` and to nothing
     else. The outcome waits for the same reviewer's later approval of the PR at another head. ``fixed``: that head changed
     the finding's file. ``dismissed``: it left the file unchanged. ``open``: no such approval yet. ``unknown``: the
-    row keeps no finding paths, or a head is missing from the row or the local checkout. Precision is fixed over
-    fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
+    row keeps no finding paths, or a head is missing from the row or the local checkout. Of the blocking reviews with
+    finding paths, ``reviews_approved_later`` have such an approval and ``reviews_approved_later_read`` of those had
+    their changed files read. Precision is fixed over fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
     only when the counts are grouped, so one reviewer's approval never settles another's finding.
     """
     rows = list(rows)
@@ -817,7 +820,12 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         approved = approval.raw.get("pinned_head") if approval else None
         if approval is None:
             tally["open"] += len(paths)
-        elif (changed := touched.get((str(row.raw.get("repo") or "public"), str(blocked), str(approved)))) is None:
+            continue
+        changed = touched.get((str(row.raw.get("repo") or "public"), str(blocked), str(approved)))
+        if paths:
+            tally["reviews_approved_later"] += 1
+            tally["reviews_approved_later_read"] += changed is not None
+        if changed is None:
             tally["unknown"] += len(paths)
         else:
             for path in paths:
@@ -829,6 +837,8 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
             "model": model, "identity": identity(model), "blocking_reviews": tally["reviews"],
             "reviews_unknown_publication": tally["unknown_publication"],
             "reviews_without_paths": tally["reviews_without_paths"],
+            "reviews_approved_later": tally["reviews_approved_later"],
+            "reviews_approved_later_read": tally["reviews_approved_later_read"],
             "blocking_findings": sum(tally[outcome] for outcome in FINDING_OUTCOMES),
             **{outcome: tally[outcome] for outcome in FINDING_OUTCOMES},
             "precision": _rate(tally["fixed"], decided), "precision_ci": _wilson(tally["fixed"], decided),
@@ -848,9 +858,12 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
                   name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Per author of record: first-round approval and findings per PR split by the risk tier of the PR's first
     published review, all from published reviews (``_prs(of_record=True)``); and per author the PRs of the parsed
-    cohort with no published review at all, which are left out (``prs_without_review_of_record``)."""
+    cohort ``prs`` that ``record_prs`` lacks, which these tiers leave out (``prs_without_review_of_record``): in a
+    window, a PR with no published review at all, or whose first published review came before the window."""
+    record_prs = list(record_prs)
+    recorded = {pr["key"] for pr in record_prs}
     cells: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
-    without_record: Counter[str] = Counter(name(pr["author"]) for pr in prs if not pr["has_record"])
+    without_record: Counter[str] = Counter(name(pr["author"]) for pr in prs if pr["key"] not in recorded)
     for pr in record_prs:
         cell = cells[name(pr["author"])][_risk(pr["class"])]
         cell["prs"] += 1
@@ -1530,11 +1543,18 @@ def _weeks(groups: _Weeks) -> list[dict[str, Any]]:
 def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = None, *,
             landing: Landing | None = None) -> dict[str, Any]:
     """One snapshot: every window and the ISO-week buckets, from the summary rows, the publication ledger, one landing
-    scan and one read of the files changed between blocked and approved review heads."""
+    scan and one read of the files changed between blocked and approved review heads.
+
+    The catalogs are read afresh for each collection: no reading of an earlier one, failed or valid, is reused.
+    """
+    refresh_readings()
+    for reading in (_catalog_models, _known_models, _model_runtime_levels):
+        reading.cache_clear()
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
     publications, publication_counts = read_publications(batch_state_dir)
-    keys = repository_keys() if publications else {}
+    catalog = fleet_catalog()
+    keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     if landing is None:
@@ -1542,7 +1562,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications, keys)
             if row.moment < until]
     pairs = head_pairs(rows)
-    touched = scan_touched(primary_root, pairs)
+    touched = scan_touched(primary_root, pairs, catalog)
     all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
     page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),

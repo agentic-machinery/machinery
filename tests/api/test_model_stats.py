@@ -1165,7 +1165,8 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     another reviewer's approval (or an unrecordable same-head approval, or one that finished first) settle it,
     counts a verdict that was never published (or settles a finding on an unpublished approval), trusts a
     publication from another repository, drops a review dispatched by branch alone, reads a path as a commit header,
-    guesses an outcome for a head the checkout lacks, or reports a planted-defect recall the rows cannot support.
+    guesses an outcome for a head the checkout lacks, reports a planted-defect recall the rows cannot support, or
+    states how many approved-later reviews had their files read from any rows but each reviewer's own.
     Every expected figure below is counted by hand."""
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         monkeypatch.delenv(key, raising=False)
@@ -1273,10 +1274,13 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     opus = {
         "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 4,
         "reviews_without_paths": 0, "blocking_findings": 8, "fixed": 2, "dismissed": 1, "open": 4, "unknown": 1,
+        # PRs 1, 4 and 12 were approved later by Opus at another head; PR 4's blocked head could not be read.
+        "reviews_approved_later": 3, "reviews_approved_later_read": 2,
         "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
     }
     assert opus["precision"]["low_sample"] and opus["precision"]["n"] == 3
-    pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0}
+    pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0,
+             "reviews_approved_later": 0, "reviews_approved_later_read": 0}
     for payload, pilot_label in ((snapshot["windows"]["7d"], "pilot-model-a"),
                                  (snapshot["page_windows"]["7d"], "other")):
         accuracy = payload["reviewer_accuracy"]
@@ -1287,6 +1291,7 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         sol_row = found["gpt-6.1-sol"]
         assert (sol_row["blocking_reviews"], sol_row["reviews_without_paths"]) == (1, 1)
         assert (sol_row["blocking_findings"], sol_row["unknown"], sol_row["precision"]["value"]) == (2, 2, None)
+        assert (sol_row["reviews_approved_later"], sol_row["reviews_approved_later_read"]) == (0, 0)
         recall = accuracy["planted_defect_recall"]
         assert recall["value"] is None and recall["status"] == "unknown"
         assert "review_eval" in recall["missing_input"]
@@ -1302,8 +1307,8 @@ def test_author_results_split_by_risk_tier(tmp_path):
     """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
     critical work looks worse than its peers, that take a later round for the first when a window starts mid-PR, or
     that read a reply instead of the published verdict (a P3-only rejection published as an approval, an unpublished
-    run taken for the first round, its window or its author, a published review whose reply is unparsed left out).
-    Every expected figure below is counted by hand."""
+    run taken for the first round, its window or its author, a published review whose reply is unparsed left out),
+    or that miscount the PRs the tiers leave out of a window. Every expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     grok, sol = {"review_author_model": "grok-4.7"}, {"review_author_model": "gpt-6.1-sol"}
     critical = {"review_profile": "infra", "review_risk": "critical"}
@@ -1336,6 +1341,13 @@ def test_author_results_split_by_risk_tier(tmp_path):
     # PR 21: an approval dispatched by branch alone (its row names no PR), published on PR 21: it joins the published
     # cohort, and never the legacy author figures, which read only rows that name their PR.
     _review(tasks, "r21-review", "correct", [], pinned_head="e" * 40, review_risk="low", **grok)
+    # PR 22: its first published review, a low-risk approval with an unparsed reply, finished 8 days ago; a parsed but
+    # unpublished approval inside the week puts it in the week's author totals, and outside the week's tiers.
+    _review(tasks, "r22a-review", "correct", [], pr=22, pinned_head="0" * 40, review_risk="low",
+            started_at=(NOW - timedelta(days=8, hours=1)).isoformat(),
+            finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    (tasks / "r22a-review.result").unlink()
+    _review(tasks, "r22b-review", "correct", [], pr=22, pinned_head="0" * 40, **grok)
     rows.backfill(tasks, batch_state)
     approved, blocked = "APPROVED", "CHANGES_REQUESTED"
     assert _publish(batch_state, ("r10-review", 10, "a" * 40, approved), ("r11-review", 11, "b" * 40, blocked),
@@ -1344,7 +1356,8 @@ def test_author_results_split_by_risk_tier(tmp_path):
                     ("r15b-review", 15, "2" * 40, approved), ("r16-review", 16, "3" * 40, approved),
                     ("r17b-review", 17, "5" * 40, approved), ("r19b-review", 19, "8" * 40, approved),
                     ("r20-review", 20, "9" * 40, approved), ("r21-review", 21, "e" * 40, approved),
-                    repository="learn-ukrainian/learn-ukrainian.github.io") == 12
+                    ("r22a-review", 22, "0" * 40, approved),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 13
 
     snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
 
@@ -1360,27 +1373,33 @@ def test_author_results_split_by_risk_tier(tmp_path):
              stats._rate(2, 3, 2)["value"], True),
             ("low", 4, 1.0, 0.0, 0.0, True)]
     assert tiers("7d", "grok-4.7") == week == tiers("7d", "grok-4.7", "page_windows")
-    assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), *week[1:]]
+    # Over 30 days PR 15 adds the high tier and PR 22 a fifth low-tier approval with unknown findings.
+    assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), week[1],
+                                        ("low", 5, 1.0, 0.0, 0.0, True)]
     # Sol authored only the unpublished r17a and the published r14.
     assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
-    without = {a["model"]: a["prs_without_review_of_record"] for a in snapshot["windows"]["7d"]["author_risks"]}
-    assert without == {"grok-4.7": 1, "gpt-6.1-sol": 0}
-    # The legacy cohort is the parsed replies of rows that name their PR: grok's PRs 10-13, 16 and 18 this week
+    # Left out of the week's tiers though in the week's author totals: PR 18 (never published) and PR 22 (first
+    # published before the week).
+    for view in ("windows", "page_windows"):
+        without = {a["model"]: a["prs_without_review_of_record"] for a in snapshot[view]["7d"]["author_risks"]}
+        assert without == {"grok-4.7": 2, "gpt-6.1-sol": 0}
+    # The legacy cohort is the parsed replies of rows that name their PR: grok's PRs 10-13, 16, 18 and 22 this week
     # (PR 17 is a joint author's, PR 19 started before the week, PR 20 is unparsed, PR 21's row names no PR).
     (legacy,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
-    assert legacy["prs"] == 6
+    assert legacy["prs"] == 7
 
 
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
     """Defect class: a malformed publication is written, or a damaged ledger line is trusted, so a review counts as
     published without proof; a missing ledger reads as anything but "no publication known"; or an older publication
-    appended later (a history import) supersedes a newer one; or a catalog that was unreadable once stays unreadable
-    to the collector."""
+    appended later (a history import) supersedes a newer one; or a collection reuses a catalog reading of an earlier
+    one (an unreadable catalog then hides publications and reply samples after its repair, or a valid one outlives
+    the file)."""
     from collections import Counter
 
     import pytest
 
-    batch_state, _ = _state(tmp_path)
+    batch_state, tasks = _state(tmp_path)
     assert rows.read_publications(batch_state) == ({}, Counter({"missing": 1, "tasks": 0}))
     fields = {"task_id": "t-review", "repository": "learn-ukrainian/machinery", "pr": 3, "head": "a" * 40,
               "verdict": "APPROVED", "published_at": NOW.isoformat()}
@@ -1401,20 +1420,41 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert rows.record_publications(batch_state, [later, good]) == 1
     assert rows.read_publications(batch_state) == (
         {"t-review": later}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
-    # A catalog that cannot be read matches nothing, and the file is read again the next time, through every cache.
-    from lu_machinery.orchestration import fleet_repos
-
-    catalog = tmp_path / "fleet_repos.yaml"
-    registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
-    assert "github: learn-ukrainian/machinery" in registry
-    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
-    catalog.write_text(registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"))
-    assert rows.repository_keys() == {}
-    catalog.write_text(registry)
-    assert rows.repository_keys()["learn-ukrainian/machinery"] == "machinery"
-    catalog.write_text("repos: [")
-    assert rows.repository_keys() == {}
     # An import appends an older publication after the newer one: the newer one still stands.
     older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
     assert rows.record_publications(batch_state, [older]) == 1
     assert rows.read_publications(batch_state)[0] == {"t-review": later}
+
+    # Each collection reads the catalogs afresh through every cache, the real loader included: one that cannot be
+    # read matches no publication and admits no reply sample in that collection only, and a valid reading is never
+    # kept once the file breaks.
+    from lu_machinery.orchestration import fleet_repos
+
+    _review(tasks, "c-review", "incorrect", ["P1"], pr=3, pinned_head="c" * 40, review_author_model="grok-4.7",
+            repo="machinery")
+    _record(tasks, "u-review", mode="read-only", agent="claude", model="claude-opus-5-5")
+    (tasks / "u-review.result").write_text("prose reply", encoding="utf-8")
+    rows.backfill(tasks, batch_state)
+    stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+    assert stored["u-review"]["review"]["unparsed_sample"] == "prose reply"
+    assert _publish(batch_state, ("c-review", 3, "c" * 40, "CHANGES_REQUESTED")) == 1
+    registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
+    assert "github: learn-ukrainian/machinery" in registry
+    catalog = tmp_path / "fleet_repos.yaml"
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
+
+    def collected() -> tuple[int, int, int]:
+        snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
+        (found,) = snapshot["windows"]["7d"]["reviewer_accuracy"]["findings"]
+        return (found["blocking_reviews"], found["reviews_unknown_publication"],
+                snapshot["coverage"]["rows"].get("malformed_lines", 0))
+
+    unreadable = (0, 1, 1)
+    for text, expected in (
+            (registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"), unreadable),
+            (registry, (1, 0, 0)), ("repos: [", unreadable), (registry, (1, 0, 0))):
+        catalog.write_text(text, encoding="utf-8")
+        assert collected() == expected, text[:40]
+    # Leave no reading of the scratch catalog to later tests.
+    monkeypatch.undo()
+    rows.refresh_readings()

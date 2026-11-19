@@ -524,12 +524,14 @@ function strictness(items) {
 function accuracy(data) {
   const block = data.reviewer_accuracy || {}, recall = block.planted_defect_recall || {};
   const items = (block.findings || []).filter((r) => keepModel(r.model));
-  const heads = data.coverage?.finding_heads;
+  // Counted over the reviewers the table shows, in this window.
+  const later = items.reduce((s, r) => s + (r.reviews_approved_later || 0), 0);
+  const read = items.reduce((s, r) => s + (r.reviews_approved_later_read || 0), 0);
   const recallText = recall.value === null || recall.value === undefined
     ? `<p class="note"><strong class="warn">Planted-defect recall: unknown.</strong> Missing input: ${esc(recall.missing_input)}</p>`
     : `<p class="note">Planted-defect recall: ${num(recall.value * 100)}%</p>`;
-  const headText = heads && heads.pairs
-    ? `<p class="note">Changed files were read for ${num(heads.read)} of ${num(heads.pairs)} blocked-to-approved head pairs; the rest count as unknown.</p>` : "";
+  const headText = later
+    ? `<p class="note">Changed files were read for ${num(read)} of ${num(later)} blocking reviews the same reviewer later approved; the findings of the rest count as unknown.</p>` : "";
   if (!items.length) return '<p class="muted">No blocking review of record in this selection.</p>' + recallText;
   return table(["Reviewer", "Blocking reviews", "Blocking replies of unknown publication", "Reviews without finding counts or paths", "Counted P0–P1 findings", "Fixed", "Dismissed", "Open", "Unknown", "Precision", "Interval", "Settled"],
     grouped(items, (r) => [`<tr><td>${named(r)}</td>${cell(r.blocking_reviews)}`
@@ -547,7 +549,7 @@ function risks(authors) {
   const without = authors.filter((a) => a.prs_without_review_of_record)
     .map((a) => `${named(a)}: ${num(a.prs_without_review_of_record)}`);
   const note = without.length
-    ? `<p class="note"><strong class="warn">PRs with no published review, left out:</strong> ${without.join(", ")}</p>` : "";
+    ? `<p class="note"><strong class="warn">Reviewed PRs with no published first review in this selection, left out:</strong> ${without.join(", ")}</p>` : "";
   return (rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
     : '<p class="muted">No PR with a published review in this selection.</p>') + note;
 }
