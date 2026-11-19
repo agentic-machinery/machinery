@@ -66,12 +66,15 @@ _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{
 # "https://tmp.example.org" stay unflagged.  A file URI is the exception: its
 # slashes and optional authority ("file:///home/...", "file://host/home/...",
 # "file:////home/...") belong to the path, and the whole URI is the token so a
-# redaction also removes the authority.
-_FILE_URI_PREFIX = r"(?i:file):(?://[^/\s\"'<>?#]*)?/*"
+# redaction also removes the authority.  "//" after the scheme always opens an
+# authority (RFC 8089), so a host such as "file://home.example/..." is never
+# re-read as a path, and the URI's first path segment must be the whole root
+# ("file:///tmp.backup/..." is not under /tmp).
+_FILE_URI_PREFIX = r"(?<![A-Za-z0-9+.-])(?i:file):(?://[^/\s\"'<>?#]*|(?!//))/*"
 _FILESYSTEM_PATH_RE = re.compile(
-    rf"(?:{_FILE_URI_PREFIX}|(?<![A-Za-z0-9/]))"
+    rf"(?:(?P<uri>{_FILE_URI_PREFIX})|(?<![A-Za-z0-9/]))"
     rf"(?P<slash>/)(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
-    r"(?![A-Za-z0-9_-])"
+    r"(?(uri)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])|(?![A-Za-z0-9_-]))"
     r"(?P<tail>/[^\s\"'<>]*)?"
 )
 _USER_AT_HOST_RE = re.compile(
@@ -380,11 +383,13 @@ def scan_text(
         for match in re.finditer(re.escape(canary), text):
             candidates.append(_Candidate(match.start(), match.end(), "canary", match.group(0), 100))
 
+    # Only a bare hash route ("#/home") exempts a path, and only when it covers
+    # the root itself.  A SHA, timestamp or duration in the tail, or an /api
+    # route whose query or authority carries the path, never does.
+    hash_routes = tuple((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
     for match in _FILESYSTEM_PATH_RE.finditer(text):
         start, end, token = _trim_path_token(match)
-        # Only a protected span over the root itself (a bare "#/home" route)
-        # exempts a path; a SHA, timestamp or duration in the tail does not.
-        if token and not _overlaps(match.start("slash"), match.end("root"), protected):
+        if token and not _overlaps(match.start("slash"), match.end("root"), hash_routes):
             candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
 
     for match in _USER_AT_HOST_RE.finditer(text):
