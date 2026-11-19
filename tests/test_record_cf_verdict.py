@@ -711,6 +711,139 @@ def test_clean_publication_bytes_unchanged(scanned_recorder, tmp_path):
     assert result["score"] == 8 and sweep.parse_marker(expected)["verdict"] == "APPROVED"
 
 
+def _ledger(tmp_path):
+    path = tmp_path / "model-stats" / "publications.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+@pytest.mark.parametrize("verdict", ["APPROVED", "CHANGES_REQUESTED"])
+def test_published_verdict_stores_one_local_publication_marker(monkeypatch, tmp_path, verdict):
+    """Defect class: a verdict published on the PR leaves no local marker, so the model statistics cannot tell it
+    from an unpublished run (#902), or a recorder rerun stores it twice."""
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply=f"VERDICT: {verdict}\nOrdinary reviewer text.\n")
+    first = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    second = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert (first["comment"], second["comment"]) == ("posted", "existing") and calls["posts"] == 1
+    assert first["publication_marker"] == second["publication_marker"] == "stored"
+    assert _ledger(tmp_path) == [{
+        "schema": "review-publication.v1", "task_id": "review-one", "repository": "owner/repo", "pr": 42,
+        "head": SHA, "verdict": verdict, "published_at": comments[0]["created_at"],
+    }]
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_unwritable_publication_marker_never_undoes_the_publication(monkeypatch, tmp_path):
+    """Defect class: a marker write failure hides the posted verdict, retries the post, or passes silently; the
+    receipt must name the failure and a recovery that still works once the PR has moved on (a rerun of record
+    refuses then), and that recovery must store the marker without posting again."""
+    from lu_machinery.api import model_stats_rows
+
+    tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n")
+    real = model_stats_rows.record_publications
+
+    def busy(*_args, **_kwargs):
+        raise TimeoutError("the model-stats rows lock is busy")
+
+    monkeypatch.setattr(model_stats_rows, "record_publications", busy)
+    first = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert first["comment"] == "posted" and first["status"] == "posted"
+    assert first["publication_marker"].startswith("failed: TimeoutError; store it with: ")
+    assert first["publication_marker"].endswith(" import-publications --repository owner/repo --pr 42")
+    assert _ledger(tmp_path) == []
+    monkeypatch.setattr(model_stats_rows, "record_publications", real)
+    # The PR head has moved on, so record itself would refuse; the one-PR import reads the posted comment.
+    monkeypatch.setattr(recorder, "_pr", lambda *_a, **_k: pytest.fail("the import never reads the PR head"))
+    counts = recorder.import_publications(days=1, dry_run=False, task_root=tasks, only=("owner/repo", 42))
+    assert (counts["prs_read"], counts["added"], calls["posts"]) == (1, 1, 1)
+    assert [entry["verdict"] for entry in _ledger(tmp_path)] == ["APPROVED"]
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_import_publications_keeps_only_trusted_unedited_verdicts_of_record(tmp_path, monkeypatch):
+    """Defect class: the history import counts a verdict the recorder would not trust (another login, an outside
+    association, an edited comment, malformed author fields), reads one the verdict reader does not (a P3-only
+    rejection it reads as an approval, a voided chunk, a second review), loses what it read when GitHub rate-limits
+    it, reads PRs outside the window or of write tasks, or writes on a dry run."""
+    from lu_machinery.common.github_client import GitHubRateLimited
+    from datetime import UTC, datetime
+
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+    from tests.review.record_support import REPOSITORY, recorded_verdict
+
+    now = datetime(2026, 9, 30, tzinfo=UTC)
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    base = {"schema": model_stats_rows.ROW_SCHEMA, "harness": "codex", "model": "gpt-6.2-sol", "effort": "high",
+            "role": "review", "class": "code/medium", "status": "done", "never_started_reason": None,
+            "duration_s": None, "tokens": {"fresh_input": 0, "cached_input": 0, "output": 0}, "allowance": None,
+            "review": None, "repo": "unit", "data_class": None, "pinned_head": None, "author_model": None,
+            "landing": None, "source_mtime_ns": 1, "started_at": None}
+    for task_id, pr, finished in (("fresh-review", 42, "2026-09-29T00:00:00+00:00"),
+                                  ("limited-review", 43, "2026-09-29T00:00:00+00:00"),
+                                  ("old-review", 7, "2026-08-01T00:00:00+00:00"),
+                                  ("write-task", 8, "2026-09-29T00:00:00+00:00")):
+        model_stats_rows.append_row(tmp_path, {**base, "task_id": task_id, "pr": pr, "finished_at": finished,
+                                               **({"role": "write", "class": "unclassified"}
+                                                  if task_id == "write-task" else {})})
+    other_head = "c" * 40
+    written = recorded_verdict(SHA, "CHANGES_REQUESTED", task_id="p3-review")
+    started = {"sha": SHA, "started": "2026-09-23T11:00:00.000001+00:00", "model": "claude-opus-5-5",
+               "family": "anthropic"}
+    comments = [
+        recorded_verdict(SHA, "CHANGES_REQUESTED", task_id="fresh-review"),
+        recorded_verdict(other_head, "APPROVED", task_id="later-review"),
+        {**recorded_verdict(SHA, "APPROVED", task_id="stranger-review"), "user": {"login": "someone"}},
+        {**recorded_verdict(SHA, "APPROVED", task_id="outside-review"), "author_association": "NONE"},
+        recorded_verdict(SHA, "APPROVED", task_id="edited-review", edited=True),
+        {**recorded_verdict(SHA, "APPROVED", task_id="nulluser-review"), "user": None},
+        {**recorded_verdict(SHA, "APPROVED", task_id="listassoc-review"), "author_association": ["MEMBER"]},
+        # The verdict reader reads a rejection whose findings are all P3 as an approval.
+        {**written, "body": recorder.build_comment(task_id="p3-review", verdict="CHANGES_REQUESTED",
+                                                   reply=_P3_OBJECT, **started)},
+        {**written, "body": recorder.build_comment(
+            task_id="void-review", verdict="APPROVED", reply="VERDICT: APPROVED", review_profile="ukrainian",
+            sources_mcp_call_count=3, denominator=["i1"], coverage=[], void="quote-mismatch", **started)},
+        {**written, "body": recorder.build_comment(
+            task_id="second-review", verdict="APPROVED", reply="VERDICT: APPROVED", second_review=True,
+            **{**started, "model": "gemini-4-carbon-medium", "family": "google"})},
+        {"body": "an ordinary comment", "user": {"login": "fleet"}, "author_association": "MEMBER"},
+    ]
+    read = []
+
+    class Adapter:
+        def identity(self):
+            return "fleet"
+
+        def comments(self, repository, number):
+            read.append((repository, number))
+            if number == 43:
+                raise GitHubRateLimited(1_900_000_000, "secondary")
+            return comments
+
+    catalog = {"unit": FleetRepo("unit", REPOSITORY, "unit", "test")}
+    monkeypatch.setattr(recorder, "load_fleet_repos", lambda: catalog)
+    dry = recorder.import_publications(days=30, dry_run=True, task_root=tasks, now=now, adapter=Adapter())
+    assert _ledger(tmp_path) == [] and read == [(REPOSITORY, 42), (REPOSITORY, 43)]
+    assert dry == {"prs": 2, "prs_read": 1, "prs_unreadable": 0, "rate_limited": 1, "markers": 3,
+                   "markers_untrusted": 5, "markers_skipped": 2, "rows_unregistered_repo": 0, "would_add": 3}
+    # What was read before the rate limit is stored.
+    done = recorder.import_publications(days=30, dry_run=False, task_root=tasks, now=now, adapter=Adapter())
+    assert (done["added"], done["rate_limited"]) == (3, 1)
+    assert [(e["task_id"], e["pr"], e["head"], e["verdict"], e["published_at"]) for e in _ledger(tmp_path)] == [
+        ("fresh-review", 42, SHA, "CHANGES_REQUESTED", "2026-09-23T11:30:00Z"),
+        ("later-review", 42, other_head, "APPROVED", "2026-09-23T11:30:00Z"),
+        ("p3-review", 42, SHA, "APPROVED", "2026-09-23T11:30:00Z"),
+    ]
+    again = recorder.import_publications(days=30, dry_run=False, task_root=tasks, now=now, adapter=Adapter())
+    assert again["added"] == 0 and len(_ledger(tmp_path)) == 3
+
+
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_skeleton_scanner_rejection_has_no_write(scanned_recorder, tmp_path, monkeypatch, synthetic_opsec):

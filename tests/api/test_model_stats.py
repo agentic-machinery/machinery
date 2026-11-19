@@ -54,6 +54,8 @@ def test_model_value_sections_explain_how_to_read_the_figures():
         "Reviews": ("includes settled reviews", "fewer unreadable or unfinished results"),
         "Compare reviewer levels": ("readable results, first-round approval", "lower time or allowance cost"),
         "Reviewed PRs": ("reviewed PRs for the shown authors", "higher first-round approval and fewer rounds"),
+        "Reviewer accuracy": ("counts as fixed when the author changed its file", "check the settled count"),
+        "Authors by risk tier": ("risk tier of each PR's first published review", "Compare authors within one tier"),
     }
     for section, phrases in explanations.items():
         rendered = next(fragment for fragment in sections if f"<h2>{section}" in fragment
@@ -573,6 +575,9 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
         ("other", 11, "other"), ("bounded", 10, "gpt-6.1-sol"),
     ]
     assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
+    # A joint author keeps its join on the page, each member bounded like a model label.
+    assert stats._page_author(f"{author}+gpt-6.1-sol") == "gpt-6.1-sol+other"
+    assert stats._page_author(f"{author}+{model}") == "other"
 
 
 def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
@@ -1129,3 +1134,355 @@ def test_pinned_astra_rows_counted_separately(tmp_path, monkeypatch):
     assert _row(payload, "gpt-6.2-astra", "review")["tasks"] == 1
     assert (_row(payload, "gpt-6.2-sol", "write")["tasks"], _row(payload, "gpt-6.2-sol", "write")["landed"]) == (1, 0)
     assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 1
+
+
+def _findings_review(tasks: Path, task_id: str, correctness: str, findings: list[tuple[str, str]], **fields) -> None:
+    """A review of record whose reply is a ``code-review-findings.v1`` object with (priority, path) findings."""
+    _record(tasks, task_id, **{"mode": "read-only", "agent": "claude", "model": "opus",
+                               "resolved_model": "claude-opus-5-5", "resolved_model_known": True,
+                               "review_profile": "code", "review_risk": "medium", "repo": "machinery",
+                               "review_author_model": "grok-4.7", **fields})
+    (tasks / f"{task_id}.result").write_text(json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": correctness, "explanation": "Checked the change.", "confidence": 0.9},
+        "findings": [{
+            "id": f"F{index}", "priority": priority, "category": "bug", "confidence": 0.9,
+            "title": "A defect", "body": "The change breaks a case.",
+            "location": {"path": path, "start_line": 1, "end_line": 1, "claim_type": "present"},
+            "verbatim": "x", "why_wrong": "It is wrong.", "smallest_fix": "Fix it.", "sources": ["none"],
+        } for index, (priority, path) in enumerate(findings)],
+    }))
+
+
+def _publish(batch_state: Path, *published: tuple[str, int, str, str],
+             repository: str = "learn-ukrainian/machinery") -> int:
+    """Ledger lines, as the verdict recorder writes them, for (task id, PR, head, verdict) publications."""
+    return rows.record_publications(batch_state, [rows.publication(
+        task_id=task_id, repository=repository, pr=pr, head=head, verdict=verdict,
+        published_at=NOW.isoformat()) for task_id, pr, head, verdict in published])
+
+
+def test_finding_precision_follows_the_files_the_author_changed_before_the_same_reviewer_approved(
+        tmp_path, monkeypatch):
+    """Defect class: reviewer precision that counts a finding as real without the author changing its file, lets
+    another reviewer's approval (or an unrecordable same-head approval, or one that finished first) settle it,
+    counts a verdict that was never published (or settles a finding on an unpublished approval), trusts a
+    publication from another repository, drops a review dispatched by branch alone, reads a path as a commit header,
+    guesses an outcome for a head the checkout lacks, reports a planted-defect recall the rows cannot support, or
+    states how many approved-later reviews had their files read from any rows but each reviewer's own.
+    Every expected figure below is counted by hand."""
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "fixture")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "fixture@example.invalid")
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    _git(repo, "init", "-q", "--template=")
+    for name in ("a.py", "b.py", "c.py"):
+        (repo / "src" / name).write_text("one\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "blocked head")
+    h1 = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "src" / "a.py").write_text("two\n")
+    _git(repo, "commit", "-q", "-am", "fix a.py only")
+    h2 = _git(repo, "rev-parse", "HEAD").strip()
+    missing = "e" * 40
+
+    def resolve(key, **_):
+        if key != "machinery":
+            raise stats.FleetRepoError(f"no checkout for {key}")
+        return None, repo
+
+    monkeypatch.setattr(stats, "resolve_fleet_repo", resolve)
+    batch_state, tasks = _state(tmp_path)
+    sonnet = {"resolved_model": "claude-sonnet-5-5"}
+    sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
+    blocked, approved = {"started_at": _at(7), "finished_at": _at(6)}, {"started_at": _at(5), "finished_at": _at(4)}
+    # PR 1: two blocking findings; the next head changed a.py only, then Opus approved: 1 fixed, 1 dismissed.
+    # The P2 finding is not blocking and never counts.
+    _findings_review(tasks, "p1a-review", "incorrect", [("P1", "src/a.py"), ("P1", "src/b.py"), ("P2", "src/c.py")],
+                     pr=1, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p1b-review", "correct", [], pr=1, pinned_head=h2, **approved)
+    # PR 2: an approval of the blocked head itself can never be recorded, so the finding stays open.
+    _findings_review(tasks, "p2a-review", "incorrect", [("P0", "src/a.py")], pr=2, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p2b-review", "correct", [], pr=2, pinned_head=h1, **approved)
+    # PR 3: only another reviewer approved: Opus's finding stays open.
+    _findings_review(tasks, "p3a-review", "incorrect", [("P1", "src/a.py")], pr=3, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p3b-review", "correct", [], pr=3, pinned_head=h2, **approved, **sonnet)
+    # PR 4: the blocked head is not in the checkout: 1 unknown, never guessed.
+    _findings_review(tasks, "p4a-review", "incorrect", [("P1", "src/a.py")], pr=4, pinned_head=missing, **blocked)
+    _findings_review(tasks, "p4b-review", "correct", [], pr=4, pinned_head=h2, **approved)
+    # PR 5: a Sol reply without finding locations: its two blocking findings are unknown.
+    _review(tasks, "p5a-review", "incorrect", ["P1", "P1"], pr=5, review_author_model="grok-4.7",
+            repo="machinery", pinned_head=h1, **blocked, **sol)
+    _review(tasks, "p5b-review", "correct", [], pr=5, review_author_model="grok-4.7", repo="machinery",
+            pinned_head=h2, **approved, **sol)
+    # PR 6: the approval started after the block but finished before it: it settles nothing, the finding is open.
+    _findings_review(tasks, "p6a-review", "incorrect", [("P1", "src/a.py")], pr=6, pinned_head=h1,
+                     started_at=_at(7), finished_at=_at(2))
+    _findings_review(tasks, "p6b-review", "correct", [], pr=6, pinned_head=h2, started_at=_at(5), finished_at=_at(3))
+    # PR 7: two uncatalogued reviewers the page groups as "other": one's approval never settles the other's finding.
+    _findings_review(tasks, "p7a-review", "incorrect", [("P1", "src/a.py")], pr=7, pinned_head=h1, **blocked,
+                     resolved_model="pilot-model-a")
+    _findings_review(tasks, "p7b-review", "correct", [], pr=7, pinned_head=h2, **approved,
+                     resolved_model="pilot-model-b")
+    # PR 8: a blocking review with only a P2 finding has no P0-P1 finding to settle and needs no head pair.
+    _findings_review(tasks, "p8a-review", "incorrect", [("P2", "src/c.py")], pr=8, pinned_head=h2, **blocked)
+    _findings_review(tasks, "p8b-review", "correct", [], pr=8, pinned_head=h1, **approved)
+    # PR 9: a blocking reply whose verdict was never published: of unknown publication, none of its findings count.
+    _findings_review(tasks, "p9a-review", "incorrect", [("P1", "src/a.py")], pr=9, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p9b-review", "correct", [], pr=9, pinned_head=h2, **approved)
+    # PR 10: the ledger names the task at another head than the row's: still of unknown publication.
+    _findings_review(tasks, "p10a-review", "incorrect", [("P1", "src/a.py")], pr=10, pinned_head=h1, **blocked)
+    # PR 11: the same reviewer approved a new head, but that approval was never published: the finding stays open.
+    _findings_review(tasks, "p11a-review", "incorrect", [("P1", "src/b.py")], pr=11, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p11b-review", "correct", [], pr=11, pinned_head=h2, **approved)
+    # PR 12: reviews dispatched by branch alone keep no PR in their rows; the ledger names it: 1 fixed.
+    _findings_review(tasks, "p12a-review", "incorrect", [("P1", "src/a.py")], pinned_head=h1, **blocked)
+    _findings_review(tasks, "p12b-review", "correct", [], pinned_head=h2, **approved)
+    # PR 13: the ledger names the task in another repository than the row's: of unknown publication.
+    _findings_review(tasks, "p13a-review", "incorrect", [("P1", "src/a.py")], pr=13, pinned_head=h1, **blocked)
+    # A rejection dispatched by branch alone with no publication: of unknown publication too.
+    _findings_review(tasks, "p14a-review", "incorrect", [("P1", "src/a.py")], pinned_head=h1, **blocked)
+    rows.backfill(tasks, batch_state)
+    assert "src/a.py" not in rows.rows_path(batch_state).read_text()
+    blocked_by, approved_by = "CHANGES_REQUESTED", "APPROVED"
+    published = [
+        ("p1a-review", 1, h1, blocked_by), ("p1b-review", 1, h2, approved_by),
+        ("p2a-review", 2, h1, blocked_by), ("p2b-review", 2, h1, approved_by),
+        ("p3a-review", 3, h1, blocked_by), ("p3b-review", 3, h2, approved_by),
+        ("p4a-review", 4, missing, blocked_by), ("p4b-review", 4, h2, approved_by),
+        ("p5a-review", 5, h1, blocked_by), ("p5b-review", 5, h2, approved_by),
+        ("p6a-review", 6, h1, blocked_by), ("p6b-review", 6, h2, approved_by),
+        ("p7a-review", 7, h1, blocked_by), ("p7b-review", 7, h2, approved_by),
+        ("p8a-review", 8, h2, blocked_by), ("p8b-review", 8, h1, approved_by),
+        ("p9b-review", 9, h2, approved_by), ("p10a-review", 10, h2, blocked_by), ("p11a-review", 11, h1, blocked_by),
+    ]
+    published += [("p12a-review", 12, h1, blocked_by), ("p12b-review", 12, h2, approved_by)]
+    assert _publish(batch_state, *published) == 21
+    assert _publish(batch_state, ("p13a-review", 13, h1, blocked_by),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 1
+    # The ledger holds each publication once: a recorder rerun adds nothing.
+    assert _publish(batch_state, published[0]) == 0
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+
+    # Distinct (repository, blocked, approved) heads with finding paths: PR 1 and PR 7 share h1 to h2 (PR 5 keeps no
+    # paths, so it needs no pair); PR 4's blocked head is missing.
+    assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
+    assert snapshot["coverage"]["publications"] == {"lines": 22, "tasks": 22}
+    opus = {
+        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 4,
+        "reviews_without_paths": 0, "blocking_findings": 8, "fixed": 2, "dismissed": 1, "open": 4, "unknown": 1,
+        # PRs 1, 4 and 12 were approved later by Opus at another head; PR 4's blocked head could not be read.
+        "reviews_approved_later": 3, "reviews_approved_later_read": 2,
+        "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
+    }
+    assert opus["precision"]["low_sample"] and opus["precision"]["n"] == 3
+    pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0,
+             "reviews_approved_later": 0, "reviews_approved_later_read": 0}
+    for payload, pilot_label in ((snapshot["windows"]["7d"], "pilot-model-a"),
+                                 (snapshot["page_windows"]["7d"], "other")):
+        accuracy = payload["reviewer_accuracy"]
+        found = {row["model"]: row for row in accuracy["findings"]}
+        assert set(found) == {"claude-opus-5-5", "gpt-6.1-sol", pilot_label}
+        assert found["claude-opus-5-5"] == opus
+        assert {key: found[pilot_label][key] for key in pilot} == pilot
+        sol_row = found["gpt-6.1-sol"]
+        assert (sol_row["blocking_reviews"], sol_row["reviews_without_paths"]) == (1, 1)
+        assert (sol_row["blocking_findings"], sol_row["unknown"], sol_row["precision"]["value"]) == (2, 2, None)
+        assert (sol_row["reviews_approved_later"], sol_row["reviews_approved_later_read"]) == (0, 0)
+        recall = accuracy["planted_defect_recall"]
+        assert recall["value"] is None and recall["status"] == "unknown"
+        assert "review_eval" in recall["missing_input"]
+
+    # A changed file named like the next pair's header is still a path: every path follows a raw record.
+    record = b":100644 100644 " + b"1" * 40 + b" " + b"2" * 40 + b" M"
+    output = b"\0".join([b"a" * 40, record, b"b" * 40, b"b" * 40, record, b"real.py", b""])
+    assert stats._diff_blocks(output, ["a" * 40, "b" * 40]) == [["b" * 40], ["real.py"]]
+    assert stats._diff_blocks(output, ["a" * 40]) is None
+
+
+def test_author_results_split_by_risk_tier(tmp_path):
+    """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
+    critical work looks worse than its peers, that take a later round for the first when a window starts mid-PR, or
+    that read a reply instead of the published verdict (a P3-only rejection published as an approval, an unpublished
+    run taken for the first round, its window or its author, a published review whose reply is unparsed left out),
+    or that miscount the PRs the tiers leave out of a window. Every expected figure below is counted by hand."""
+    batch_state, tasks = _state(tmp_path)
+    grok, sol = {"review_author_model": "grok-4.7"}, {"review_author_model": "gpt-6.1-sol"}
+    critical = {"review_profile": "infra", "review_risk": "critical"}
+    _review(tasks, "r10-review", "correct", [], pr=10, pinned_head="a" * 40, **grok, **critical)
+    _review(tasks, "r11-review", "incorrect", ["P1", "P2"], pr=11, pinned_head="b" * 40, **grok, **critical)
+    _review(tasks, "r12-review", "correct", ["P3"], pr=12, pinned_head="c" * 40, review_risk="low", **grok)
+    _review(tasks, "r13-review", "incorrect", ["P0", "P1"], pr=13, pinned_head="d" * 40, **grok)
+    _review(tasks, "r14-review", "correct", [], pr=14, pinned_head="f" * 40, review_risk="high", **sol)
+    # PR 15 was first blocked at high risk before the 7-day window; its later medium approval is inside it.
+    _review(tasks, "r15a-review", "incorrect", ["P1"], pr=15, pinned_head="1" * 40, review_risk="high",
+            started_at=(NOW - timedelta(days=9)).isoformat(), finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    _review(tasks, "r15b-review", "correct", [], pr=15, pinned_head="2" * 40, **grok)
+    # PR 16: a reply with only a P3 finding, published as an approval: a first-round approval.
+    _review(tasks, "r16-review", "incorrect", ["P3"], pr=16, pinned_head="3" * 40, review_risk="low", **grok)
+    # PR 17: an unpublished high-risk run by another author's PR came first; the first review of record is the medium
+    # approval, and its author is the published review's alone.
+    _review(tasks, "r17a-review", "incorrect", ["P1"], pr=17, pinned_head="4" * 40, review_risk="high", **sol)
+    _review(tasks, "r17b-review", "correct", [], pr=17, pinned_head="5" * 40, **grok)
+    # PR 18: no review of it was published: left out of the tiers and counted.
+    _review(tasks, "r18-review", "correct", [], pr=18, pinned_head="6" * 40, **grok)
+    # PR 19: an unpublished high-risk run 8 days ago, then a published medium approval inside the week: the PR is in
+    # the week's tiers, from its first published review.
+    _review(tasks, "r19a-review", "incorrect", ["P1"], pr=19, pinned_head="7" * 40, review_risk="high",
+            started_at=(NOW - timedelta(days=8, hours=1)).isoformat(),
+            finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    _review(tasks, "r19b-review", "correct", [], pr=19, pinned_head="8" * 40, **grok)
+    # PR 20: its only review was published as an approval, but its reply is not parsed: counted, findings unknown.
+    _review(tasks, "r20-review", "correct", [], pr=20, pinned_head="9" * 40, review_risk="low", **grok)
+    (tasks / "r20-review.result").unlink()
+    # PR 21: an approval dispatched by branch alone (its row names no PR), published on PR 21: it joins the published
+    # cohort, and never the legacy author figures, which read only rows that name their PR.
+    _review(tasks, "r21-review", "correct", [], pinned_head="e" * 40, review_risk="low", **grok)
+    # PR 22: its first published review, a low-risk approval with an unparsed reply, finished 8 days ago; a parsed but
+    # unpublished approval inside the week puts it in the week's author totals, and outside the week's tiers.
+    _review(tasks, "r22a-review", "correct", [], pr=22, pinned_head="0" * 40, review_risk="low",
+            started_at=(NOW - timedelta(days=8, hours=1)).isoformat(),
+            finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    (tasks / "r22a-review.result").unlink()
+    _review(tasks, "r22b-review", "correct", [], pr=22, pinned_head="0" * 40, **grok)
+    rows.backfill(tasks, batch_state)
+    approved, blocked = "APPROVED", "CHANGES_REQUESTED"
+    assert _publish(batch_state, ("r10-review", 10, "a" * 40, approved), ("r11-review", 11, "b" * 40, blocked),
+                    ("r12-review", 12, "c" * 40, approved), ("r13-review", 13, "d" * 40, blocked),
+                    ("r14-review", 14, "f" * 40, approved), ("r15a-review", 15, "1" * 40, blocked),
+                    ("r15b-review", 15, "2" * 40, approved), ("r16-review", 16, "3" * 40, approved),
+                    ("r17b-review", 17, "5" * 40, approved), ("r19b-review", 19, "8" * 40, approved),
+                    ("r20-review", 20, "9" * 40, approved), ("r21-review", 21, "e" * 40, approved),
+                    ("r22a-review", 22, "0" * 40, approved),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 13
+
+    snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
+
+    def tiers(window: str, author: str, view: str = "windows") -> list[tuple]:
+        (found,) = [a for a in snapshot[view][window]["author_risks"] if a["model"] == author]
+        return [(r["risk"], r["prs"], r["first_round_approved"]["value"], r["blocking_per_pr"]["value"],
+                 r["p0_p2_per_pr"]["value"], r["low_sample"]) for r in found["by_risk"]]
+
+    # Medium: r13 blocked (P0, P1), r17b and r19b approved without findings. Low: r12, r16, r20 and r21 approved;
+    # r20's findings are unknown, so the per-PR findings rates count r12, r16 and r21 only.
+    week = [("critical", 2, 0.5, 0.5, 1.0, True),
+            ("medium", 3, stats._rate(2, 3)["value"], stats._rate(2, 3, 2)["value"],
+             stats._rate(2, 3, 2)["value"], True),
+            ("low", 4, 1.0, 0.0, 0.0, True)]
+    assert tiers("7d", "grok-4.7") == week == tiers("7d", "grok-4.7", "page_windows")
+    # Over 30 days PR 15 adds the high tier and PR 22 a fifth low-tier approval with unknown findings.
+    assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), week[1],
+                                        ("low", 5, 1.0, 0.0, 0.0, True)]
+    # Sol authored only the unpublished r17a and the published r14.
+    assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
+    # Left out of the week's tiers though in the week's author totals: PR 18 (never published) and PR 22 (first
+    # published before the week).
+    for view in ("windows", "page_windows"):
+        without = {a["model"]: a["prs_without_review_of_record"] for a in snapshot[view]["7d"]["author_risks"]}
+        assert without == {"grok-4.7": 2, "gpt-6.1-sol": 0}
+    # The legacy cohort is the parsed replies of rows that name their PR: grok's PRs 10-13, 16, 18 and 22 this week
+    # (PR 17 is a joint author's, PR 19 started before the week, PR 20 is unparsed, PR 21's row names no PR).
+    (legacy,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
+    assert legacy["prs"] == 7
+    # PR 17's joint author stays joint on the page too, so either member's picker selection finds it.
+    for view in ("windows", "page_windows"):
+        assert ("gpt-6.1-sol+grok-4.7", 1) in [(a["model"], a["prs"]) for a in snapshot[view]["7d"]["authors"]]
+
+
+def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
+    """Defect class: a malformed publication is written, or a damaged ledger line is trusted, so a review counts as
+    published without proof; a missing ledger reads as anything but "no publication known"; or an older publication
+    appended later (a history import) supersedes a newer one; or a line for another repository, PR or head blocks or
+    hides the real publication; or a collection reuses a fleet or model catalog reading of an earlier one (an
+    unreadable catalog then hides publications and reply samples after its repair, or a valid one outlives the
+    file)."""
+    from collections import Counter
+
+    import pytest
+
+    batch_state, tasks = _state(tmp_path)
+    assert rows.read_publications(batch_state) == ({}, Counter({"missing": 1, "tasks": 0}))
+    fields = {"task_id": "t-review", "repository": "learn-ukrainian/machinery", "pr": 3, "head": "a" * 40,
+              "verdict": "APPROVED", "published_at": NOW.isoformat()}
+    good = rows.publication(**fields)
+    for bad in ({"verdict": "APPROVE"}, {"pr": 0}, {"head": "a" * 39}, {"published_at": None},
+                {"repository": "../x"}, {"task_id": "../x"}):
+        with pytest.raises(ValueError):
+            rows.publication(**{**fields, **bad})
+    # One malformed entry in a batch writes nothing at all.
+    with pytest.raises(ValueError):
+        rows.record_publications(batch_state, [good, {**good, "pr": True}])
+    ledger = batch_state / rows.ROWS_DIR / rows.PUBLICATIONS_FILE
+    assert not ledger.exists()
+    assert rows.record_publications(batch_state, [good]) == 1
+    with ledger.open("ab") as stream:
+        stream.write(b'{"schema": "review-publication.v1", "task_id": "t-review"}\nnot json\n')
+    later = {**good, "verdict": "CHANGES_REQUESTED"}
+    assert rows.record_publications(batch_state, [later, good]) == 1
+    # Newest first; of two at the same comment time, the later line first.
+    assert rows.read_publications(batch_state) == (
+        {"t-review": [later, good]}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
+    # An import appends an older publication after the newer one: the newer one still stands.
+    older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
+    assert rows.record_publications(batch_state, [older]) == 1
+    assert rows.read_publications(batch_state)[0] == {"t-review": [later, good, older]}
+    # Newer lines naming the task on another PR, repository or head are other publications: each is stored, and the
+    # row's join still takes the newest entry that matches its own repository, PR and head.
+    newer = (NOW + timedelta(hours=1)).isoformat()
+    elsewhere = [{**later, "pr": 4, "published_at": newer}, {**later, "head": "b" * 40, "published_at": newer},
+                 {**later, "repository": "learn-ukrainian/learn-ukrainian.github.io", "published_at": newer}]
+    assert rows.record_publications(batch_state, elsewhere) == 3
+    row = {"task_id": "t-review", "role": "review", "repo": "machinery", "pr": 3, "pinned_head": "a" * 40}
+    keys = rows.repository_keys(rows.fleet_catalog())
+    assert stats._publication(row, rows.read_publications(batch_state)[0], keys) == later
+
+    # Each collection reads the catalogs afresh through every cache, the real loader included: one that cannot be
+    # read matches no publication and admits no reply sample in that collection only, and a valid reading is never
+    # kept once the file breaks.
+    from lu_machinery.orchestration import fleet_repos
+
+    _review(tasks, "c-review", "incorrect", ["P1"], pr=3, pinned_head="c" * 40, review_author_model="grok-4.7",
+            repo="machinery")
+    _record(tasks, "u-review", mode="read-only", agent="claude", model="claude-opus-5-5", data_class="public-code")
+    (tasks / "u-review.result").write_text("prose reply", encoding="utf-8")
+    rows.backfill(tasks, batch_state)
+    stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+    assert stored["u-review"]["review"]["unparsed_sample"] == "prose reply"
+    assert _publish(batch_state, ("c-review", 3, "c" * 40, "CHANGES_REQUESTED")) == 1
+    registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
+    assert "github: learn-ukrainian/machinery" in registry
+    catalog = tmp_path / "fleet_repos.yaml"
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
+
+    def collected() -> tuple[int, int, int, bool]:
+        snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
+        (found,) = snapshot["windows"]["7d"]["reviewer_accuracy"]["findings"]
+        return (found["blocking_reviews"], found["reviews_unknown_publication"],
+                snapshot["coverage"]["rows"].get("malformed_lines", 0),
+                snapshot["windows"]["7d"]["idle_catalog_models"] is not None)
+
+    unreadable, valid = (0, 1, 1, True), (1, 0, 0, True)
+    for text, expected in (
+            (registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"), unreadable),
+            (registry, valid), ("repos: [", unreadable), (registry, valid)):
+        catalog.write_text(text, encoding="utf-8")
+        assert collected() == expected, text[:40]
+    # The model catalog through its own loader's cache: unreadable, it admits no public data class (the sample row
+    # is skipped) and leaves the idle models unknown (null, never an empty list), in that collection only.
+    from lu_machinery.review import model_catalog
+
+    models_file = tmp_path / "model_catalog.yaml"
+    models_text = model_catalog.CATALOG_PATH.read_text(encoding="utf-8")
+    monkeypatch.setattr(model_catalog.load_model_catalog.__wrapped__, "__defaults__", (models_file,))
+    for text, expected in ((models_text, valid), ("models: [", (1, 0, 1, False)), (models_text, valid)):
+        models_file.write_text(text, encoding="utf-8")
+        assert collected() == expected, text[:40]
+    # Leave no reading of the scratch catalog to later tests.
+    monkeypatch.undo()
+    rows.refresh_readings()

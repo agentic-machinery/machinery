@@ -19,6 +19,10 @@ Every settled dispatch task has one summary row in `batch_state/model-stats/rows
 (`lu_machinery/api/model_stats_rows.py`, schema `model-stats-row.v1`): task id, harness, concrete model, effective
 effort, role, class, terminal status, any typed pre-start refusal, start and finish times, wall seconds, normalised tokens, allowance readings,
 the review verdict and finding priorities, the reviewed PR and head, and the merged delivery the task recorded.
+A `code-review-findings.v1` reply also keeps `blocking_paths`: a 16-hex SHA-256 prefix of each P0-P1 finding's
+file path, never the path itself (see [Reviewer accuracy](#reviewer-accuracy)). Rows written before this field
+existed get it from the next backfill while the review's `.result` file is retained. A release without the field
+reads such a row as malformed and its next backfill rewrites it in the older shape.
 The dispatcher store appends a row after each write of a settled record in a `tasks/` directory; the last row of a
 task id wins, so the record's final update decides. Each row carries its record version (`source_mtime_ns`, the
 modification time of the record file it came from). A failed row write is logged and never changes the task's
@@ -102,7 +106,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   catalog models first and groups the rest under "Not a concrete model id". The full view retains the recorded
   model labels.
 - **Idle catalog models**: `idle_catalog_models` lists every catalog model the catalog still routes (lifecycle
-  not `retired`) that ran no task in the window, so a routed model never silently drops off the page.
+  not `retired`) that ran no task in the window, so a routed model never silently drops off the page. It is
+  `null` when the model catalog cannot be read, and the page then says the list is unknown.
 - **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
   `high`, `gemini-3.8-flash-medium` is `medium`); else `unset`. A catalog id that merely ends in an effort word
   (`gemini-3.8-flash-high`) is `unset` without a recorded effort. Legacy values such as `not-exposed` stay as
@@ -158,18 +163,32 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   a PR through an exact head match in the same repository. The time per landed PR divides time across PR-linked
   reviews by linked PRs with recorded merges. Quota uses valid readings and counts landed PRs once per pool.
   Levels with fewer than 10 parsed verdicts carry a **Low sample** badge.
-- **Author figures**: per PR reviewed in the window, only parsed reviews of record count; an unparsed reply is no
-  round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
-  review; the first round is the earliest review of the earliest head. "Approved eventually" means any parsed
-  review approved. They split by author model only: a review records its author's model but not the author's
+- **Author figures**: per PR whose first review of record finished in the window (else started), only parsed
+  reviews of record count, read from the PR's whole history so a window that starts mid-PR never takes a later
+  round for the first; an unparsed reply is no round. Rounds are the distinct pinned heads those reviews judged,
+  ordered by the start of each head's first review; the first round is the earliest review of the earliest head.
+  "Approved eventually" means any parsed review approved. They split by author model only: a review records its author's model but not the author's
   effort. A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
-  exports as `other`.
+  exports as `other`. The page keeps the join with each member bounded like a model label (`gpt-6.1-sol+other`),
+  and its model picker selects a joint author's PRs by any of its members.
 - **After a blocked first round** (`after_blocked_first_round`, per author): of the PRs whose first round did not
   approve, the share where a later review approved a new head (the author changed the code), approved the same
   head (no change), or where nothing approved yet in the window.
 - **First-round matrix** (`first_round_matrix`): per author, first reviewer and review class of that first
   review (`profile/risk`, and `all`), the PRs and how many the first round approved. See [Author or
   reviewer](#author-or-reviewer).
+- **Author results per risk tier** (`author_risks[].by_risk`): PRs, first-round approval and P0-P1 and P0-P2
+  findings per PR with a known count, from published reviews only (see [Publication ledger](#publication-ledger)).
+  This cohort is built from the published reviews alone: a round is a head with a published review, each review
+  counts by the verdict the recorder published (a P3-only reply published as an approval is an approval; a
+  published review whose reply is not parsed counts with unknown findings), the PR's author is the published
+  reviews' author, and its first published review sets both its risk tier (`critical`, `high`, `medium`, `low`,
+  then any other recorded tier; a class with no tier is `other`) and the window it falls in. A PR the author
+  totals count in the window that these tiers do not (no published review at all, or a first published review
+  before the window) is counted per author in `author_risks[].prs_without_review_of_record`. The author totals
+  above still read the parsed replies, so the tiers need not sum to them.
+- **Reviewer accuracy** (`reviewer_accuracy`): per reviewer model, the outcome of every P0-P1 finding of its
+  blocking reviews of record, and the planted-defect recall. See [Reviewer accuracy](#reviewer-accuracy).
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
   `agy_claude`, `cursor`) and its remaining weekly allowance at start and finish from the Monitor
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
@@ -259,18 +278,121 @@ so differences between columns are on the reviewers' side; choosing a review cla
 confounds inside a class (some authors get the hardest or most security-sensitive work), and a cell below 10 PRs
 is marked low sample.
 
-What the records cannot show is which reviewer findings were real. Counting the share of findings fixed in a
-later round, against PRs approved without that change, needs per finding an id that stays the same across rounds
-and the finding's recorded disposition (fixed, disputed, waived). Neither exists: a summary row keeps only the
-number of findings per priority, the reviewer chooses finding ids afresh in every reply, and the verdict recorder
-links no later round to an earlier finding (it keeps only the P3 residual ids of an approval). The PR-level
-outcome after a blocked first round (new head, same head, none) is what is shown instead, and is labelled as such.
+No record says which reviewer findings were real: the reviewer chooses finding ids afresh in every reply, and
+the verdict recorder links no later round to an earlier finding (it keeps only the P3 residual ids of an
+approval). [Reviewer accuracy](#reviewer-accuracy) estimates it from what the author changed instead.
 
 On 2026-11-16 over all history (parsed reviews of record): with Sol 6.1 as first reviewer, Grok 4.7 PRs were
 approved first time 78% (178 PRs), Sonnet 5.5 68% (164) and Opus 5.5 45% (362); inside infra/critical alone
 Opus 5.5 41% (227) and Grok 4.7 63% (38). Opus 5.5 as first reviewer approved Sol 6.1 58% (211) and Grok 4.7
 65% (62), lower than Sol 6.1 approved Grok 4.7, so Sol 6.1 is not the stricter reviewer of the two. After a
 blocked first round, 81% of Opus 5.5 PRs were approved on a new head and 1.5% on the same head.
+
+## Reviewer accuracy
+
+Approval rate and findings per review say how strict a reviewer is, not whether it is right. `reviewer_accuracy`
+adds two measures.
+
+**Finding precision** (`reviewer_accuracy.findings`). A blocking review of record is a review whose
+`CHANGES_REQUESTED` verdict the verdict recorder published on the PR at the row's head, as the
+[publication ledger](#publication-ledger) records it. Each of its P0-P1 findings waits for the same reviewer's
+first published approval of that PR at another head that finished after the blocking review finished:
+
+- `fixed`: the approved head differs from the blocked head in the finding's file (the author changed it);
+- `dismissed`: the approved head left that file unchanged (the reviewer accepted the author's answer);
+- `open`: no such approval yet. Another reviewer's approval does not settle the finding, nor does an unpublished
+  approval, nor an approval of the blocked head itself: the verdict recorder refuses an APPROVE at a head with a recorded rejection
+  (`require_no_same_head_rejection`), so that reply is never a verdict of record;
+- `unknown`: the row keeps no finding paths (a reply in the older unversioned format, or a row not yet
+  backfilled), or a head is missing from the row or from the repository's local checkout.
+
+A parsed blocking reply (verdict `incorrect`) that the ledger does not name at its PR and head is of unknown
+publication: it counts in `reviews_unknown_publication` (the page's "Blocking replies of unknown publication"
+column) and in nothing else, so it never enters the denominator. Before the ledger, nothing local could tell the
+two apart: published and unpublished formal runs carry the same task-record fields. Measured on 2026-11-19
+against the PR comments of the machinery and public repositories over 30 days, 34 of 234 blocking reviews whose
+findings a later approval settled had no published verdict (rounds whose head moved before recording, for
+example). Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. A
+review here must name the author's model; its PR is the one its ledger entry names, so a review dispatched by
+branch alone counts once it is published (see [Publication ledger](#publication-ledger)).
+
+Per reviewer, `reviews_approved_later` counts the blocking reviews with finding paths that the same reviewer later
+approved, and `reviews_approved_later_read` those whose changed files were read; the page's note under the table
+sums both over the reviewers it shows, in the selected window.
+
+### Publication ledger
+
+`batch_state/model-stats/publications.jsonl` (schema `review-publication.v1`) holds one line per verdict the
+recorder published: task id, repository, PR, head, verdict and GitHub's comment time. Its one writer is
+`lu_machinery/review/record_cf_verdict.py`, under the rows lock. Both of its paths read a posted comment the way
+the verdict reader (`integration_sweep.lookup_verdict`) does (`publication_of`): a `CHANGES_REQUESTED` whose open
+findings are all P3, and that no repair receipt holds back, is an approval; a voided chunk, a second review and a
+marker of a model that cannot supply a review of record store nothing. `record` stores the line after it posts
+the verdict or finds it already posted, and reports `publication_marker`: `stored`, `not stored: <reason>`, or
+`failed: <reason>; store it with: ... import-publications --repository <owner/name> --pr <N>`. A failure never
+undoes the publication, and that one-PR import works even after the PR has moved on or closed.
+
+The statistics read the ledger; the Monitor never reads GitHub. A line that does not have the writer's shape is
+skipped and counted in `coverage.publications.malformed_lines`. A line is one publication of a task's verdict on
+one repository, PR and head: a line for another repository, PR or head is stored beside it, never taken for a
+duplicate. A row takes the newest entry by GitHub comment time (of two at the same time, the later line) whose
+repository is the row's, whose head is the row's and, when the row names a PR, whose PR is the row's; so an import
+never supersedes a newer publication, and an entry for another target never hides a matching one. A review
+dispatched by branch alone keeps no PR in its row, and joins the PR the recorder resolved from the entry for the
+publication figures only (reviewer accuracy and the risk tiers); the legacy author totals, matrix and review
+levels still read only rows that name their PR. Each collection starts by dropping every catalog reading the
+statistics, the model catalog loader and the fleet registry keep (`refresh_readings`), so the model and fleet
+catalogs are read afresh and no reading of an earlier collection, failed or valid, is reused. Within a collection
+every statistics consumer of the model catalog (labels, idle models, runtime levels, alias resolution, the public
+data classes of reply samples) shares one reading, or all see none; the repository map and the changed-file read
+share one reading of the fleet catalog, and an unreadable one matches no entry and reads no file in that
+collection. A parsed rejection of
+a formal review (one that names its author's model) with no matching entry counts as unknown publication, whether
+or not its row names a PR.
+
+History: verdicts published before the ledger existed are imported once, after the release installs, by the same
+module from the PRs' `cf-verdict` comments. It keeps only the markers the recorder itself would trust (the
+current identity, an owner, member or collaborator association, never edited, well-formed author fields) and
+adds what the ledger lacks:
+
+```
+.venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --dry-run
+.venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --days 30
+```
+
+It reads each PR of the review rows that finished in the last `--days` days once. A review dispatched by branch
+alone names no PR in its row, so its verdict is imported only when another review row names the same PR; otherwise
+it stays of unknown publication (on 2026-11-19, 18 parsed branch-only formal reviews in 30 days, none in the
+ledger), and `--repository R --pr N` imports that PR by hand. Measured on 2026-11-19 against
+a copy of the store: 1,976 PRs for 30 days in about 15 minutes, 3,303 verdicts. A rate limit stops the reads and
+keeps what was read; rerunning it is safe, and it exits 1 when a PR could not be read or a rate limit stopped it.
+Reviews older than the import stay of unknown publication.
+
+`precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
+below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one
+`git diff-tree --stdin --raw` per repository over every (blocked head, approved head) pair, from local objects only
+(`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the distinct pairs of all history and how many were
+read (the page's note uses the per-reviewer window counts instead). Measured on
+2026-11-19 on a backfilled copy of the store (29,274 rows, 625 pairs, host load 10): the read took 0.7 s and the
+whole collect 13.3 s against 11.9 s before.
+
+Why the file, not the head: over the 30 days to 2026-11-19, of the blocked reviews of record a later review
+approved, 2 of 942 were approved on the same head (the recorder refuses such an approval). Authors push a new head while answering, so
+"approved on a new head" cannot separate a fix from an accepted rebuttal. The file test can, within limits:
+
+- a file the author changed for another reason (another finding in the same file, a merge of `main`) counts the
+  finding as fixed;
+- a fix made in a different file than the finding's location (a `missing` claim placed at a caller) counts it as
+  dismissed;
+- the measure needs the reply's finding locations, so it covers `code-review-findings.v1` replies only.
+
+On 2026-11-19 over 30 days (backfilled copy): GPT-6.1 Sol 0.949 (237 settled findings, 157 open), Opus 5.5 0.868
+(91, 28 open), GPT-6.2 Sol 1.0 (3, 35 open, low sample), Grok 4.7 1.0 (7, low sample).
+
+**Planted-defect recall** (`reviewer_accuracy.planted_defect_recall`) is `unknown` with `missing_input` named: the
+summary rows carry no seeded or known-answer defect result. The frozen known-answer set (`docs/review-eval`) is
+scored by `lu_machinery/bakeoff/review_eval.py` into its own output directory, which this route does not read,
+and on 2026-11-19 no run output existed and the lesson findings database's `seed_results` table was empty.
 
 ## Landing source
 

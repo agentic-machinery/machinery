@@ -122,6 +122,9 @@
   <section><h2>Reviewer strictness <span class="meta" id="review-meta"></span></h2>
     <p class="note">Higher points approve more often, and points farther right report more P0–P2 findings per review with a findings count. Compare similar assignments and read the intervals before calling a reviewer strict or lenient.</p>
     <div id="strictness">Loading…</div></section>
+  <section><h2>Reviewer accuracy <span class="meta" id="accuracy-meta"></span></h2>
+    <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out.</p>
+    <div id="accuracy">Loading…</div></section>
   <section><h2>Time to finish</h2>
     <p class="note">The box spans the middle half of timed writes, the line inside marks the median, and the whisker ends at the time that 90% finished within. Shorter times are better for comparable work that lands.</p>
     <div id="boxes">Loading…</div></section>
@@ -155,6 +158,9 @@
   <section><h2>Reviewed PRs <span class="meta" id="author-meta"></span></h2>
     <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show approval on a new head, approval on the same head, or no approval in the window.</p>
     <div id="author">Loading…</div></section>
+  <section><h2>Authors by risk tier <span class="meta" id="risk-meta"></span></h2>
+    <p class="note">Author figures from published reviews only, split by the risk tier of each PR's first published review. Compare authors within one tier, where the work is alike; higher first-round approval and fewer findings per PR are better.</p>
+    <div id="risk">Loading…</div></section>
   <section><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
 </main>
@@ -278,6 +284,19 @@ function withClasses(models, role, render, width) {
       ...((e.by_class || []).map((c) => render(c, "cls")))])], width);
 }
 function keepModel(name) { return !picked() || name === picked(); }
+// An author label can join several models (`a+b`): it matches the picked model when that model is one of them, exactly.
+function keepAuthor(name) { return !picked() || String(name).split("+").includes(picked()); }
+// Every model a filtered table can show, so each one can be picked: task models, authors (each member of a joint
+// author), the matrix's reviewers and the reviewer accuracy rows.
+function pickerModels(data) {
+  const members = (name) => String(name).split("+");
+  return [...new Set([
+    ...(data.models || []).map((m) => m.model),
+    ...[...(data.authors || []), ...(data.author_risks || [])].flatMap((a) => members(a.model)),
+    ...(data.first_round_matrix || []).flatMap((c) => [...members(c.author), c.reviewer]),
+    ...(data.reviewer_accuracy?.findings || []).map((r) => r.model),
+  ])].sort();
+}
 
 function recommend(rec) {
   const sample = `Ranking requires at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per catalog model.`;
@@ -512,8 +531,40 @@ function strictness(items) {
     + cell(num(p.p0_p2, 3)) + cell(p.findings_n) + "</tr>");
   return scatter(shown.map((p) => ({...p, x: p.p0_p2, y: p.approve, ci: p.approve_ci})),
     "strictness", "Reviewer approval", "P0–P2 findings per review →")
-    + '<p class="note">Hollow markers have low samples. The records count reviewer findings and verdicts. They cannot tell whether each finding was correct.</p>'
+    + '<p class="note">Hollow markers have low samples. The records count reviewer findings and verdicts. Reviewer accuracy below estimates which blocking findings were real.</p>'
     + values("Approval and findings values by reviewer", ["Reviewer", "Approval", "Interval", "Verdicts", "P0–P2 per review", "Reviews with counts"], rows);
+}
+function accuracy(data) {
+  const block = data.reviewer_accuracy || {}, recall = block.planted_defect_recall || {};
+  const items = (block.findings || []).filter((r) => keepModel(r.model));
+  // Counted over the reviewers the table shows, in this window.
+  const later = items.reduce((s, r) => s + (r.reviews_approved_later || 0), 0);
+  const read = items.reduce((s, r) => s + (r.reviews_approved_later_read || 0), 0);
+  const recallText = recall.value === null || recall.value === undefined
+    ? `<p class="note"><strong class="warn">Planted-defect recall: unknown.</strong> Missing input: ${esc(recall.missing_input)}</p>`
+    : `<p class="note">Planted-defect recall: ${num(recall.value * 100)}%</p>`;
+  const headText = later
+    ? `<p class="note">Changed files were read for ${num(read)} of ${num(later)} blocking reviews the same reviewer later approved; the findings of the rest count as unknown.</p>` : "";
+  if (!items.length) return '<p class="muted">No blocking review of record in this selection.</p>' + recallText;
+  return table(["Reviewer", "Blocking reviews", "Blocking replies of unknown publication", "Reviews without finding counts or paths", "Counted P0–P1 findings", "Fixed", "Dismissed", "Open", "Unknown", "Precision", "Interval", "Settled"],
+    grouped(items, (r) => [`<tr><td>${named(r)}</td>${cell(r.blocking_reviews)}`
+      + `${cell(r.reviews_unknown_publication, r.reviews_unknown_publication ? "warn" : "")}`
+      + `${cell(r.reviews_without_paths, r.reviews_without_paths ? "warn" : "")}${cell(r.blocking_findings)}${cell(r.fixed)}`
+      + `${cell(r.dismissed)}${cell(r.open)}${cell(r.unknown, r.unknown ? "warn" : "")}${cell(pct(r.precision))}`
+      + `${cell(ciText(r.precision_ci))}${cell(nOf(r.precision))}</tr>`], 12)) + headText + recallText;
+}
+// A findings rate counts only PRs with a known findings count, so it carries its own low-sample mark.
+const rateOf = (r) => r && r.value !== null && r.value !== undefined ? `${num(r.value, 2)}${r.low_sample ? LOW : ""}` : "—";
+function risks(authors) {
+  const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}</td>`
+    + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
+    + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
+  const without = authors.filter((a) => a.prs_without_review_of_record)
+    .map((a) => `${named(a)}: ${num(a.prs_without_review_of_record)}`);
+  const note = without.length
+    ? `<p class="note"><strong class="warn">Reviewed PRs with no published first review in this selection, left out:</strong> ${without.join(", ")}</p>` : "";
+  return (rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
+    : '<p class="muted">No PR with a published review in this selection.</p>') + note;
 }
 function boxes(items) {
   const timed = (items || []).filter((item) => item.p90 !== null && keepModel(item.model));
@@ -553,7 +604,7 @@ function ukrainian(items) {
     + `${cell(share(item.rate, item.tasks), item.landed ? "good" : "")}${cell(share(item.approve, item.approve_n || 0))}</tr>`), [0, 1, 2]);
 }
 function matrix(data, cls) {
-  const cells = (data.first_round_matrix || []).filter((c) => c.class === cls && (keepModel(c.author) || keepModel(c.reviewer)));
+  const cells = (data.first_round_matrix || []).filter((c) => c.class === cls && (keepAuthor(c.author) || keepModel(c.reviewer)));
   if (!cells.length) return '<p class="muted">No parsed review of record in this window and class.</p>';
   const tally = (key) => {
     const totals = new Map();
@@ -637,7 +688,7 @@ function render() {
   $("failures").innerHTML = failures(charts.failures);
   $("neon").innerHTML = neon(data);
   $("ukrainian").innerHTML = ukrainian(charts.ukrainian);
-  $("limits").innerHTML = ["difficulty", "wall_hours", "attribution", "quota", "links"].filter((key) => charts.limits?.[key])
+  $("limits").innerHTML = ["precision", "recall", "difficulty", "wall_hours", "attribution", "quota", "links"].filter((key) => charts.limits?.[key])
     .map((key) => `<p>${esc(charts.limits[key])}</p>`).join("");
   const cls = $("matrix-class").value;
   $("matrix-meta").textContent = `${label}; ${cls === "all" ? "all review classes" : cls}`;
@@ -654,7 +705,7 @@ function render() {
     "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 14));
   $("unparsed-samples").innerHTML = unparsedSamples(reviews);
   const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
-  const authors = (data.authors || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
+  const authors = (data.authors || []).filter((a) => keepAuthor(a.model));
   $("author-meta").textContent = `${label} · ${num(authors.reduce((s, a) => s + a.prs, 0))} PRs`;
   $("author").innerHTML = table(["Author model", "PRs", "Rounds / PR", "Approved eventually", "Approved first round",
     "Blocked first round", "New head", "Same head", "No approval", "Blocking / PR", "P0–P2 / PR"],
@@ -662,13 +713,21 @@ function render() {
       + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}${cell(a.after_blocked_first_round.blocked)}`
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
+  const authorRisks = (data.author_risks || []).filter((a) => keepAuthor(a.model));
+  const riskPrs = authorRisks.reduce((s, a) => s + (a.by_risk || []).reduce((t, r) => t + r.prs, 0), 0);
+  $("risk-meta").textContent = `${label} · ${num(riskPrs)} PRs with a published review`;
+  $("risk").innerHTML = risks(authorRisks);
+  $("accuracy-meta").textContent = label;
+  $("accuracy").innerHTML = accuracy(data);
   const allowance = (data.allowance || []).filter((a) => keepModel(a.model));
   $("allowance").innerHTML = allowance.length ? table(["Pool", "Model", "Effort", "Tasks with readings", "Landed",
     "Points spent", "Points per landed", "Overlapping tasks", "Reset crossed"], allowance.map((a) =>
     `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>${cell(nOf({n: a.tasks, low_sample: a.tasks < lowBelow()}))}${cell(a.landed)}`
     + `${cell(num(a.pct_points_spent, 1))}${cell(rate(a.pct_points_per_landed))}${cell(a.overlapped_tasks, a.overlapped_tasks ? "warn" : "")}${cell(a.reset_crossed, a.reset_crossed ? "warn" : "")}</tr>`), [0, 1, 2])
     : '<p class="muted">No write task in this window has both readings.</p>';
-  $("idle").textContent = (data.idle_catalog_models || []).length
+  $("idle").textContent = data.idle_catalog_models == null
+    ? "Routed catalog models with no task in this window: unknown, because the model catalog could not be read."
+    : data.idle_catalog_models.length
     ? `Routed catalog models with no task in this window: ${data.idle_catalog_models.join(", ")}.`
     : "Every routed catalog model ran at least one task in this window.";
   updateTableScroll();
@@ -721,7 +780,7 @@ async function load() {
   $("age").textContent = `${num(data.records)} settled tasks across all models in ${label}. The snapshot was collected ${num(data.age_seconds)} seconds ago.`;
   renderCoverage(data);
   const select = $("model"), previous = select.value;
-  const names = [...new Set((data.models || []).map((m) => m.model))].sort();
+  const names = pickerModels(data);
   select.innerHTML = '<option value="">All models</option>' + names.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join("");
   if (names.includes(previous)) select.value = previous;
   current = {data, label};
