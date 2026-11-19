@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest
 
 from lu_machinery.agent_runtime import model_pause
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
 from lu_machinery.api.monitor_context import get_ctx
@@ -374,7 +375,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     page = stats.page_window(snapshot["windows"]["all"])
     assert all("by_class" not in model and "by_class" not in effort
                for model in page["models"] for effort in model["by_effort"])
-    html = (Path(__file__).parents[2] / "lu_machinery/api/dashboards/model-stats.html").read_text()
+    html = machinery_path("api/dashboards/model-stats.html").read_text()
     assert "view=page" in html and "not enough data yet" in html and "Best value" in html
 
 
