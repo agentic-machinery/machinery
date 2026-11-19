@@ -100,7 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
         ("pinned-head", None, "Exact review commit (default: branch or base)"),
-        ("cwd", None, "Existing dispatch worktree root (default: create one)"),
+        ("cwd", None, ("Existing dispatch worktree root; a write task borrowing a tree enrolled in the agent "
+                       "deployment (its start or HEAD tracks agents_extensions/deployment.v1.json) is refused and "
+                       "needs a fresh worktree; read-only tasks may borrow any tree (default: create one)")),
         ("review-author-model", None, "Author model for family check (default: no review check)"),
         ("codex-account", None, "Codex route: sub or api (account a; also a-sub, a-api), b-sub (also b) or b-api (default: sub; every route but sub requires its entry in the private codex_accounts.json)"),
         ("claude-account", None, "Claude account: subscription a or b, or API key kk or szb (default: inherited configuration)"),
@@ -698,7 +700,7 @@ def _dispatch(args) -> int:
                 attribution = store.worktree_attribution(spec, info, branch, sha)
                 git.create_worktree(repo, worktree, branch, sha, full_checkout=args.full_checkout,
                                     sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
-                                    **exact_start,
+                                    **exact_start, deploy_agents=args.mode == "workspace-write",
                                     on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
             record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
             # A task dispatched from inside another task's run names that run, whose settlement then names it while
@@ -723,6 +725,11 @@ def _dispatch(args) -> int:
                 with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
+                    if args.cwd and args.mode == "workspace-write" and git.agent_deploy_enrolled(worktree, sha):
+                        # Another task in a borrowed tree could commit, enroll or redeploy at any moment, so only a
+                        # tree this dispatch creates gets, and keeps, the deployment its start commit composes.
+                        raise ValueError("agent_deploy_attach_refused: a write task cannot borrow (--cwd) a tree "
+                                         "enrolled in the agent deployment; dispatch it without --cwd")
                 worker.start(spec, record, prompt, args.hard_timeout)
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.
