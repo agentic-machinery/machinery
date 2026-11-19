@@ -341,6 +341,7 @@ REPO = None
 CATALOGUE = None
 REGISTRY = None
 ALLOWLIST = None
+ALLOWLIST_PATH = 'scripts/config/backup-allowlist.json'
 
 
 def store(root: Path, logical: str, *, wal: bool = False, tables: tuple[str, ...] = ('t',)) -> Path:
@@ -387,7 +388,7 @@ def row_by_path(reg: dict, path: str) -> dict:
 
 def writer_sources() -> tuple[set[str], dict[str, str]]:
     files = sc.writer_files(CATALOGUE)
-    return files | {sc.ALLOWLIST_PATH}, {p: (REPO / p).read_text(encoding='utf-8') for p in files}
+    return files | {ALLOWLIST_PATH}, {p: (REPO / p).read_text(encoding='utf-8') for p in files}
 
 
 OWNERS = None
@@ -395,12 +396,14 @@ OWNERS = None
 
 def static(catalogue: dict, literals: dict[str, list[str]] | None = None) -> list[str]:
     tracked, sources = writer_sources()
-    return sc.registry_errors(catalogue, tracked, OWNERS, ALLOWLIST, sources, literals)
+    return sc.registry_errors(catalogue, tracked, OWNERS, ALLOWLIST, sources, literals, allowlist_path=ALLOWLIST_PATH)
 
 
 @pytest.mark.usefixtures("census_product_snapshot")
 def test_the_repository_registry_has_no_static_errors():
-    assert static(CATALOGUE) == []
+    files = cat.index_entries(REPO)
+    literals = cat.store_literals(REPO, files).stores
+    assert cat.store_registry_errors(REPO, CATALOGUE, files, literals) == []
 
 
 def mutated(change) -> dict:
@@ -426,7 +429,7 @@ def _set(path: str, **fields):
 MUTATIONS = {
     'backup fact contradicts the allowlist': (
         _set('batch_state/tasks/write-ownership.sqlite3', backup='keep', protection_gap=DROP),
-        "backup is 'keep' but lu_machinery/config/backup-allowlist.json gives 'none'"),
+        "backup is 'keep' but scripts/config/backup-allowlist.json gives 'none'"),
     'protection below the nightly': (_set('data/atlas.db', protection='rebuild'), 'backup reduction'),
     'keep without a recorded gap': (_set('batch_state/review-findings/a1.sqlite', protection_gap=DROP),
                                     'needs protection_gap'),
@@ -917,16 +920,12 @@ def census_product_snapshot(tmp_path_factory, monkeypatch):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
-    # The reader's package spelling moved; the frozen policy bytes did not.
-    path = root / sc.ALLOWLIST_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(data["scripts/config/backup-allowlist.json"])
     subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=30)
     subprocess.run(["git", "-C", str(root), "add", "."], check=True, timeout=30)
     catalogue = cat.load(root / cat.CATALOGUE_PATH)
     for name, value in {
         "REPO": root, "CATALOGUE": catalogue, "REGISTRY": sc.registry(catalogue),
-        "ALLOWLIST": json.loads((root / sc.ALLOWLIST_PATH).read_text()),
+        "ALLOWLIST": json.loads((root / ALLOWLIST_PATH).read_text()),
         "OWNERS": cat.owner_keys(root),
     }.items():
         monkeypatch.setitem(globals(), name, value)

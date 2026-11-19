@@ -58,7 +58,6 @@ SQLITE_SIDECARS = ('-wal', '-shm', '-journal')
 SQLITE_MAGIC = b'SQLite format 3\x00'
 HEADER_BYTES = 100
 GIT_COMMON_DIR = '<git-common-dir>'
-ALLOWLIST_PATH = f"{Path(__file__).parents[1].name}/config/backup-allowlist.json"
 # Header byte 18 (file format write version): 1 for a rollback journal, 2 for WAL.
 JOURNAL_HEADER = {'delete': 1, 'wal': 2}
 # task_record_is_staged in scripts/backup-data.sh: the only batch_state/tasks files the nightly stages.
@@ -277,7 +276,8 @@ def _where(section: str, row: dict) -> str:
 
 
 def registry_errors(catalogue: dict, tracked: set[str], owners: set[str], allowlist: dict,
-                    sources: dict[str, str], literals: dict[str, list[str]] | None = None) -> list[str]:
+                    sources: dict[str, str], literals: dict[str, list[str]] | None = None, *,
+                    allowlist_path: str) -> list[str]:
     """Registry consistency. ``sources`` maps writer files to their text; a missing key is unreadable."""
     reg = registry(catalogue)
     if not reg:
@@ -294,7 +294,7 @@ def registry_errors(catalogue: dict, tracked: set[str], owners: set[str], allowl
 
     def fact(here: str, path: str, declared: str) -> None:
         if (actual := backup_fact(path, allowlist)) != declared:
-            errors.append(f'{here}: backup is {declared!r} but {ALLOWLIST_PATH} gives {actual!r} for {path!r}')
+            errors.append(f'{here}: backup is {declared!r} but {allowlist_path} gives {actual!r} for {path!r}')
 
     def defined(here: str, label: str, refs: list[str]) -> list[str]:
         """The refs whose function is defined in a readable tracked file; errors for the rest."""
