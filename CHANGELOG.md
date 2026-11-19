@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.41"></a>
+## [0.1.41] - 2026-11-19
+
+### Fixed
+
+- Infer subjects for extracted reviewer boundaries ([#886](https://github.com/learn-ukrainian/machinery/pull/886))
+- Use host configuration for worker-originated Savant runs ([#888](https://github.com/learn-ukrainian/machinery/pull/888))
+- Link retained AGY diagnostics from task records ([#891](https://github.com/learn-ukrainian/machinery/pull/891))
+- Bound model-stats page labels ([#894](https://github.com/learn-ukrainian/machinery/pull/894))
+- Ignore local agent state under /.agent/ ([#896](https://github.com/learn-ukrainian/machinery/pull/896))
+- Record refusals before model start ([#892](https://github.com/learn-ukrainian/machinery/pull/892))
+
 <a id="v0.1.40"></a>
 ## [0.1.40] - 2026-11-19
 
@@ -1037,7 +1049,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...HEAD
+[0.1.41]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...v0.1.41
 [0.1.40]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...v0.1.40
 [0.1.39]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...v0.1.39
 [0.1.38]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...v0.1.38
