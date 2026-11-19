@@ -361,10 +361,15 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     assert git.deploy_agent_extensions(tree) is True
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
-    # Guards come from committed sources: an uncommitted edit to one refuses the attachment.
+    # Guards come from committed sources: an uncommitted edit to one refuses the attachment before anything is
+    # written, so the earlier deployment keeps its bytes.
+    before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
+                                                             ".deploy-state/agent-deploy.v1.json")}
     (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
-    with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: output drift: .claude/README.md"):
+    with pytest.raises(ValueError, match="^agent_deploy_failed: deployment inputs differ from HEAD: "
+                                         "agents_extensions/shared/README.md"):
         git.deploy_agent_extensions(tree)
+    assert {name: (tree / name).read_bytes() for name in before} == before
 
 
 @pytest.mark.parametrize("broken, global_excludes, reason", [

@@ -603,16 +603,27 @@ def deploy_agent_extensions(path: Path) -> bool:
     worker's hooks use. The deployer's own check then recomposes the plan from the HEAD commit's objects
     (``--check --inputs-commit``) and verifies the written outputs against it, so a sparse checkout that hides
     an input from the apply (a source, or a product marker that selects a validation) refuses instead of
-    deploying less, and an attached tree's outputs must match its committed sources. Applying again is
+    deploying less. An attached tree's deployment inputs must equal HEAD's: a difference refuses before
+    anything is written. Applying again is
     idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each
     refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
     deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
     not ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes
     file, which the worker may not share), so the worker could commit it.
     """
-    if deployment_sources(path, "HEAD") is None:
+    sources = deployment_sources(path, "HEAD")
+    if sources is None:
         return False
     root = path.resolve()  # the deployer takes only the canonical checkout root
+    # The apply composes from the working tree. Refuse before anything is written when an input there differs
+    # from HEAD (a change, or an untracked or ignored file the deployer would read; it skips bytecode caches),
+    # so a refused attachment leaves the tree's earlier deployment as it was.
+    pending = [line[3:] for line in _git(
+        root, "status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--",
+        AGENT_DEPLOY_DESCRIPTOR, *sources, isolate=True, strip=False, env={"GIT_LITERAL_PATHSPECS": "1"},
+    ).splitlines() if "__pycache__" not in PurePosixPath(line[3:]).parts]
+    if pending:
+        raise ValueError(f"agent_deploy_failed: deployment inputs differ from HEAD: {', '.join(pending[:3])}")
     _agent_deploy(root)
     _agent_deploy(root, "--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
     # Only the deployment's own outputs are checked: an attached worktree may hold the worker's own changes.
