@@ -1633,7 +1633,15 @@ def _owned_checkout(record: Mapping[str, Any], *, anchored: bool = False) -> str
     if isinstance(cwd, str) and cwd.strip():
         checkout = read(cwd)
         # An unattributed relative cwd is no evidence of a primary checkout: never look it up under our cwd.
-        if (anchored and not os.path.isabs(checkout)) or not (Path(checkout) / ".git").is_dir():
+        if anchored and not os.path.isabs(checkout):
+            return checkout
+        try:
+            primary = (Path(checkout) / ".git").is_dir()
+        except OSError:  # 3.12 raises EACCES here; an unreadable cwd is left to _path_state
+            if not anchored:
+                raise
+            primary = False
+        if not primary:
             return checkout
     return None
 
@@ -1646,7 +1654,7 @@ def _repository_checkout(slug: Any) -> Path | None:
         for key, repo in fleet_repos.load_fleet_repos().items():
             if repo.github == slug:
                 return fleet_repos.resolve_fleet_repo(key, primary_root=state_root())[1]
-    except (fleet_repos.FleetRepoError, OSError, RuntimeError):  # RuntimeError: a symlink loop on 3.12
+    except (ValueError, OSError, RuntimeError):  # FleetRepoError, MachineryConfigError; a 3.12 symlink loop
         return None
     return None
 
@@ -1673,25 +1681,19 @@ def _anchored(raw: str, record: Mapping[str, Any]) -> str:
 def _path_state(path: str) -> bool | None:
     """Whether a recorded path exists: ``True``, ``False``, or ``None`` when that is unknown.
 
-    A dangling symlink counts as present. An absent spelling such as
-    ``missing/../tree`` is also checked as the canonical path its lock takes. A
-    relative (unattributed) path, an invalid value and any failure other than
-    "not found" (``ELOOP``, ``EACCES``, ``ENOTDIR``) are unknown, never absent.
+    A dangling symlink counts as present. "Not found" means absent only for a
+    spelling without ``..``: ``missing/../tree`` names whatever its lock
+    canonicalizes to, which ``lstat`` cannot see, so it is unknown. A relative
+    (unattributed) path, an invalid value and any failure other than "not
+    found" (``ELOOP``, ``EACCES``, ``ENOTDIR``) are unknown, never absent.
     """
     if not os.path.isabs(path):
         return None
     try:
         os.lstat(path)
-        return True
     except FileNotFoundError:
-        pass
+        return None if ".." in Path(path).parts else False
     except (OSError, ValueError):
-        return None
-    try:
-        os.lstat(Path(path).resolve())
-    except FileNotFoundError:
-        return False
-    except (OSError, RuntimeError, ValueError):
         return None
     return True
 

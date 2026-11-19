@@ -1255,6 +1255,9 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
               acp_runtime_paths=[str(tmp_path / "acp\x00gone")])
     _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"), acp_runtime_paths=[42, " ", "", None])
+    blocked = primary / "blocked"
+    blocked.mkdir(mode=0o000)
+    _terminal(tasks_dir, "old-blocked-cwd", **old, cwd="blocked/child")
     # The caller's cwd holds the gone path and the junk names and lacks the kept one: none may decide.
     elsewhere = tmp_path / "elsewhere"
     for name in (codex / "gone", Path("42"), Path(" ")):
@@ -1278,20 +1281,22 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     finally:
         release.set()
         thread.join()
+        blocked.chmod(0o700)
 
     assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
         "old-gone.json": ("archived", None),
         "old-acp-junk.json": ("archived", None),
     }
     assert report["kept_hot"] == {
-        "worktree path still exists": 4,
-        "worktree path state unknown": 3,
+        "worktree path still exists": 3,
+        "worktree path state unknown": 5,
         "ACP runtime path state unknown": 1,
     }
     assert live_still_held == worktree_claims.LOCK_BUSY
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
         "live-task.json",
         "old-acp-nul.json",
+        "old-blocked-cwd.json",
         "old-canonical-kept.json",
         "old-dangling-slash.json",
         "old-kept.json",
@@ -1301,6 +1306,9 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
         "old-unattributed.json",
     ]
     assert (tasks_dir / "archive" / "old-gone.json").is_file()
+    # Without a configured primary, a library dry run reads every relative path as unattributed.
+    monkeypatch.setattr(str_mod, "state_root", lambda: (_ for _ in ()).throw(str_mod.MachineryConfigError("unset")))
+    assert str_mod.archive_terminal(tasks_dir, now=NOW)["selected"] == 0
 
 
 @pytest.mark.parametrize("names_checkout", [True, False])
