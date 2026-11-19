@@ -54,6 +54,8 @@ def test_model_value_sections_explain_how_to_read_the_figures():
         "Reviews": ("includes settled reviews", "fewer unreadable or unfinished results"),
         "Compare reviewer levels": ("readable results, first-round approval", "lower time or allowance cost"),
         "Reviewed PRs": ("reviewed PRs for the shown authors", "higher first-round approval and fewer rounds"),
+        "Reviewer accuracy": ("counts as fixed when the author changed its file", "check the settled count"),
+        "Authors by risk tier": ("risk tier of each PR's first review", "Compare authors within one tier"),
     }
     for section, phrases in explanations.items():
         rendered = next(fragment for fragment in sections if f"<h2>{section}" in fragment
@@ -1129,3 +1131,154 @@ def test_pinned_astra_rows_counted_separately(tmp_path, monkeypatch):
     assert _row(payload, "gpt-6.2-astra", "review")["tasks"] == 1
     assert (_row(payload, "gpt-6.2-sol", "write")["tasks"], _row(payload, "gpt-6.2-sol", "write")["landed"]) == (1, 0)
     assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 1
+
+
+def _findings_review(tasks: Path, task_id: str, correctness: str, findings: list[tuple[str, str]], **fields) -> None:
+    """A review of record whose reply is a ``code-review-findings.v1`` object with (priority, path) findings."""
+    _record(tasks, task_id, **{"mode": "read-only", "agent": "claude", "model": "opus",
+                               "resolved_model": "claude-opus-5-5", "resolved_model_known": True,
+                               "review_profile": "code", "review_risk": "medium", "repo": "machinery",
+                               "review_author_model": "grok-4.7", **fields})
+    (tasks / f"{task_id}.result").write_text(json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": correctness, "explanation": "Checked the change.", "confidence": 0.9},
+        "findings": [{
+            "id": f"F{index}", "priority": priority, "category": "bug", "confidence": 0.9,
+            "title": "A defect", "body": "The change breaks a case.",
+            "location": {"path": path, "start_line": 1, "end_line": 1, "claim_type": "present"},
+            "verbatim": "x", "why_wrong": "It is wrong.", "smallest_fix": "Fix it.", "sources": ["none"],
+        } for index, (priority, path) in enumerate(findings)],
+    }))
+
+
+def test_finding_precision_follows_the_files_the_author_changed_before_the_same_reviewer_approved(
+        tmp_path, monkeypatch):
+    """Defect class: reviewer precision that counts a finding as real without the author changing its file, lets
+    another reviewer's approval (or an unrecordable same-head approval, or one that finished first) settle it,
+    reads a path as a commit header, guesses an outcome for a head the checkout lacks, or reports a planted-defect
+    recall the rows cannot support. Every expected figure below is counted by hand."""
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for role in ("AUTHOR", "COMMITTER"):
+        monkeypatch.setenv(f"GIT_{role}_NAME", "fixture")
+        monkeypatch.setenv(f"GIT_{role}_EMAIL", "fixture@example.invalid")
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    _git(repo, "init", "-q", "--template=")
+    for name in ("a.py", "b.py", "c.py"):
+        (repo / "src" / name).write_text("one\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "blocked head")
+    h1 = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "src" / "a.py").write_text("two\n")
+    _git(repo, "commit", "-q", "-am", "fix a.py only")
+    h2 = _git(repo, "rev-parse", "HEAD").strip()
+    missing = "e" * 40
+
+    def resolve(key, **_):
+        if key != "machinery":
+            raise stats.FleetRepoError(f"no checkout for {key}")
+        return None, repo
+
+    monkeypatch.setattr(stats, "resolve_fleet_repo", resolve)
+    batch_state, tasks = _state(tmp_path)
+    sonnet = {"resolved_model": "claude-sonnet-5-5"}
+    sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
+    blocked, approved = {"started_at": _at(7), "finished_at": _at(6)}, {"started_at": _at(5), "finished_at": _at(4)}
+    # PR 1: two blocking findings; the next head changed a.py only, then Opus approved: 1 fixed, 1 dismissed.
+    # The P2 finding is not blocking and never counts.
+    _findings_review(tasks, "p1a-review", "incorrect", [("P1", "src/a.py"), ("P1", "src/b.py"), ("P2", "src/c.py")],
+                     pr=1, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p1b-review", "correct", [], pr=1, pinned_head=h2, **approved)
+    # PR 2: an approval of the blocked head itself can never be recorded, so the finding stays open.
+    _findings_review(tasks, "p2a-review", "incorrect", [("P0", "src/a.py")], pr=2, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p2b-review", "correct", [], pr=2, pinned_head=h1, **approved)
+    # PR 3: only another reviewer approved: Opus's finding stays open.
+    _findings_review(tasks, "p3a-review", "incorrect", [("P1", "src/a.py")], pr=3, pinned_head=h1, **blocked)
+    _findings_review(tasks, "p3b-review", "correct", [], pr=3, pinned_head=h2, **approved, **sonnet)
+    # PR 4: the blocked head is not in the checkout: 1 unknown, never guessed.
+    _findings_review(tasks, "p4a-review", "incorrect", [("P1", "src/a.py")], pr=4, pinned_head=missing, **blocked)
+    _findings_review(tasks, "p4b-review", "correct", [], pr=4, pinned_head=h2, **approved)
+    # PR 5: a Sol reply without finding locations: its two blocking findings are unknown.
+    _review(tasks, "p5a-review", "incorrect", ["P1", "P1"], pr=5, review_author_model="grok-4.7",
+            repo="machinery", pinned_head=h1, **blocked, **sol)
+    _review(tasks, "p5b-review", "correct", [], pr=5, review_author_model="grok-4.7", repo="machinery",
+            pinned_head=h2, **approved, **sol)
+    # PR 6: the approval started after the block but finished before it: it settles nothing, the finding is open.
+    _findings_review(tasks, "p6a-review", "incorrect", [("P1", "src/a.py")], pr=6, pinned_head=h1,
+                     started_at=_at(7), finished_at=_at(2))
+    _findings_review(tasks, "p6b-review", "correct", [], pr=6, pinned_head=h2, started_at=_at(5), finished_at=_at(3))
+    # PR 7: two uncatalogued reviewers the page groups as "other": one's approval never settles the other's finding.
+    _findings_review(tasks, "p7a-review", "incorrect", [("P1", "src/a.py")], pr=7, pinned_head=h1, **blocked,
+                     resolved_model="pilot-model-a")
+    _findings_review(tasks, "p7b-review", "correct", [], pr=7, pinned_head=h2, **approved,
+                     resolved_model="pilot-model-b")
+    # PR 8: a blocking review with only a P2 finding has no P0-P1 finding to settle and needs no head pair.
+    _findings_review(tasks, "p8a-review", "incorrect", [("P2", "src/c.py")], pr=8, pinned_head=h2, **blocked)
+    _findings_review(tasks, "p8b-review", "correct", [], pr=8, pinned_head=h1, **approved)
+    rows.backfill(tasks, batch_state)
+    assert "src/a.py" not in rows.rows_path(batch_state).read_text()
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+
+    # Distinct (repository, blocked, approved) heads with finding paths: PR 1 and PR 7 share h1 to h2 (PR 5 keeps no
+    # paths, so it needs no pair); PR 4's blocked head is missing.
+    assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
+    opus = {
+        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 6, "reviews_without_paths": 0,
+        "blocking_findings": 6, "fixed": 1, "dismissed": 1, "open": 3, "unknown": 1,
+        "precision": {"value": 0.5, "n": 2, "low_sample": True}, "precision_ci": stats._wilson(1, 2),
+    }
+    pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0}
+    for payload, pilot_label in ((snapshot["windows"]["7d"], "pilot-model-a"),
+                                 (snapshot["page_windows"]["7d"], "other")):
+        accuracy = payload["reviewer_accuracy"]
+        found = {row["model"]: row for row in accuracy["findings"]}
+        assert set(found) == {"claude-opus-5-5", "gpt-6.1-sol", pilot_label}
+        assert found["claude-opus-5-5"] == opus
+        assert {key: found[pilot_label][key] for key in pilot} == pilot
+        sol_row = found["gpt-6.1-sol"]
+        assert (sol_row["blocking_reviews"], sol_row["reviews_without_paths"]) == (1, 1)
+        assert (sol_row["blocking_findings"], sol_row["unknown"], sol_row["precision"]["value"]) == (2, 2, None)
+        recall = accuracy["planted_defect_recall"]
+        assert recall["value"] is None and recall["status"] == "unknown"
+        assert "review_eval" in recall["missing_input"]
+
+    # A changed file named like the next pair's header is still a path: every path follows a raw record.
+    record = b":100644 100644 " + b"1" * 40 + b" " + b"2" * 40 + b" M"
+    output = b"\0".join([b"a" * 40, record, b"b" * 40, b"b" * 40, record, b"real.py", b""])
+    assert stats._diff_blocks(output, ["a" * 40, "b" * 40]) == [["b" * 40], ["real.py"]]
+    assert stats._diff_blocks(output, ["a" * 40]) is None
+
+
+def test_author_results_split_by_risk_tier(tmp_path):
+    """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
+    critical work looks worse than its peers, or that take a later round for the first when a window starts
+    mid-PR. Every expected figure below is counted by hand."""
+    batch_state, tasks = _state(tmp_path)
+    grok, sol = {"review_author_model": "grok-4.7"}, {"review_author_model": "gpt-6.1-sol"}
+    critical = {"review_profile": "infra", "review_risk": "critical"}
+    _review(tasks, "r10-review", "correct", [], pr=10, pinned_head="a" * 40, **grok, **critical)
+    _review(tasks, "r11-review", "incorrect", ["P1", "P2"], pr=11, pinned_head="b" * 40, **grok, **critical)
+    _review(tasks, "r12-review", "correct", ["P3"], pr=12, pinned_head="c" * 40, review_risk="low", **grok)
+    _review(tasks, "r13-review", "incorrect", ["P0", "P1"], pr=13, pinned_head="d" * 40, **grok)
+    _review(tasks, "r14-review", "correct", [], pr=14, pinned_head="f" * 40, review_risk="high", **sol)
+    # PR 15 was first blocked at high risk before the 7-day window; its later medium approval is inside it.
+    _review(tasks, "r15a-review", "incorrect", ["P1"], pr=15, pinned_head="1" * 40, review_risk="high",
+            started_at=(NOW - timedelta(days=9)).isoformat(), finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    _review(tasks, "r15b-review", "correct", [], pr=15, pinned_head="2" * 40, **grok)
+    rows.backfill(tasks, batch_state)
+
+    snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
+
+    def tiers(window: str, author: str) -> list[tuple]:
+        (found,) = [a for a in snapshot["windows"][window]["authors"] if a["model"] == author]
+        return [(r["risk"], r["prs"], r["first_round_approved"]["value"], r["blocking_per_pr"]["value"],
+                 r["p0_p2_per_pr"]["value"], r["low_sample"]) for r in found["by_risk"]]
+
+    week = [("critical", 2, 0.5, 0.5, 1.0, True), ("medium", 1, 0.0, 2.0, 2.0, True), ("low", 1, 1.0, 0.0, 0.0, True)]
+    assert tiers("7d", "grok-4.7") == week
+    assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), *week[1:]]
+    assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
