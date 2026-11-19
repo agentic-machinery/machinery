@@ -38,13 +38,14 @@ copy is writable.
 ## The deliverable: a patch
 
 After the sandbox exits, the launcher (on the host) compares the view with the start commit and
-writes a Git patch beside the task record, `<task-id>.patch`. It refuses the draft, and the run
+stages a Git patch beside the task record, `<task-id>.patch-staged`. It refuses the draft, and the run
 fails with `write_boundary_import_failed: refused: savant_draft_refused: ...`, when:
 
 - the run changed, added or deleted more than 256 files;
 - an edit lies outside the task's owned paths;
 - an entry is a link, a hard link or another non-regular file;
-- a path has an excluded or unprintable name;
+- a path has an excluded or unprintable name, or is longer than 1024 bytes (longer tracked paths
+  are left out of a write run's view, as deeper ones are);
 - a new file lies outside the `--read-path` view (with no `--read-path`, the whole tree is the view);
 - a new file names, sits below or sits above a path of the start commit that the view left out;
 - an edited file holds a private key, a known token format, a configured secret or a host name;
@@ -57,11 +58,18 @@ directories the fix may add files to, not only the files it edits.
 The primary is only read, for the changed files' own blobs, and never fetches. The check for new
 files uses the listing taken when the view was made. The patch is built in a private bare
 repository that holds just the changed paths before and after, so nothing is written to the
-repository or the worktree. Settlement then checks the patch's paths against the owned paths
-again and records the run `done`. The task record's `write_boundary.import` holds `patch`,
-`patch_sha256` and `paths`. An unchanged view settles `no_deliverable` (`no_commits_or_unknown`).
-A failed or interrupted patch write leaves no file behind, and the launcher refuses to start a
-write run whose patch file already exists.
+repository or the worktree.
+
+Settlement checks the patch's paths against the owned paths again. Then, at the moment the run's
+status is final, it keeps the staged file as `<task-id>.patch` only when the run settled `done`
+and the file is the regular, single-link file whose size and SHA-256 the receipt names. Any other
+file settles `no_deliverable` (`savant_draft_patch_missing_or_changed`,
+`savant_draft_receipt_malformed`). The staged file is always removed, so a refused, cancelled or
+over-ceiling run leaves no patch, and `<task-id>.patch` exists only beside a `done` record. The
+task record's `write_boundary.import` holds `patch` (that path), `patch_sha256`, `bytes` and
+`paths`. An unchanged view settles `no_deliverable` (`no_commits_or_unknown`). A failed or
+interrupted patch write leaves no file behind, and the launcher refuses to start a write run
+whose staged file already exists.
 
 OpenCode's formatters and language servers are off for every Savant run, so the patch holds only
 the model's own edits and no language server starts or downloads inside the boundary.
@@ -70,7 +78,8 @@ the model's own edits and no language server starts or downloads inside the boun
 
 Savant does not publish. A driver hands the patch to a normal write worker:
 
-1. Copy `<savant-task>.patch` into the landing task's inputs,
+1. Take the patch only from a Savant task whose status is `done`, and check its SHA-256
+   against the record's `write_boundary.import.patch_sha256`. Copy `<savant-task>.patch` into the landing task's inputs,
    `batch_state/tasks/<landing-task>.inputs/`. In the brief, record the Savant task id, the
    `patch_sha256`, and the start commit the patch was taken against (`write_boundary.import.before`).
 2. Dispatch the landing worker from `--base origin/main` with the same owned paths.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -435,7 +436,8 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     argv = write_boundary.launcher(trial, invocation, task_file)
     argv = argv[:argv.index("--")]
     assert argv[argv.index("--mode") + 1] == "workspace-write"
-    assert argv[argv.index("--draft-patch") + 1] == str(task_file.with_suffix(".patch"))
+    # The launcher only stages the patch; settlement keeps it as <task>.patch for a done run.
+    assert argv[argv.index("--draft-patch") + 1] == str(task_file.with_suffix(".patch-staged"))
     assert argv[argv.index("--owned-path") + 1] == "docs" and argv[argv.index("--read-path") + 1] == "docs"
     assert "--no-github-relays" in argv and "--no-sources-relay" in argv and "--snapshot-bytes" in argv
     assert "--sources-mcp" not in argv
@@ -453,6 +455,8 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     ({"dirty": True}, "no_deliverable", "savant_draft_worktree_changed_or_unknown"),
     ({"commits": 1}, "no_deliverable", "savant_draft_worktree_changed_or_unknown"),
     ({"provider": "deepseek"}, "no_deliverable", "no_commits_or_unknown"),
+    # A malformed path list is refused whole, never read as its well-formed part (review of #919).
+    ({"paths": ["docs/a.md", 7]}, "no_deliverable", "savant_draft_unowned_or_empty"),
 ])
 def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause):
     """Defect class (#898): settlement rejects a Savant write run's owned-path patch, accepts one with another
@@ -465,3 +469,35 @@ def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause)
     }
     worker._enforce_delivery(record)
     assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
+
+
+@pytest.mark.parametrize(("case", "status", "cause"), [
+    ("kept", "done", None),
+    ("missing", "no_deliverable", "savant_draft_patch_missing_or_changed"),
+    ("changed", "no_deliverable", "savant_draft_patch_missing_or_changed"),
+    ("failed-run", "failed", None),
+    # A supervisor that died after keeping the patch, before publishing done: crash recovery removes it.
+    ("crashed-after-keep", "crashed", None),
+])
+def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path):
+    """Defect class (#898, review of #919): a refused run leaves a patch, or a run settles done with its patch
+    missing or different from the one its receipt names."""
+    task_file = tmp_path / "oc-write.json"
+    patch = b"diff --git a/docs/a.md b/docs/a.md\n"
+    staged = write_boundary.staged_patch(task_file)
+    if case != "missing":
+        staged.write_bytes(patch + (b"tampered\n" if case == "changed" else b""))
+    if case == "crashed-after-keep":
+        write_boundary.draft_patch(task_file).write_bytes(patch)
+    record = {
+        "task_id": "oc-write", "agent": "opencode", "provider": "subq", "mode": "workspace-write",
+        "status": {"failed-run": "failed", "crashed-after-keep": "crashed"}.get(case, "done"),
+        "write_boundary": {"import": {"status": "drafted", "paths": ["docs/a.md"], "bytes": len(patch),
+                                      "patch_sha256": hashlib.sha256(patch).hexdigest(), "patch": str(staged)}},
+    }
+    worker._settle_savant_patch(record, task_file)
+    assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
+    kept = write_boundary.draft_patch(task_file)
+    assert not staged.exists() and kept.exists() == (status == "done")
+    if status == "done":
+        assert kept.read_bytes() == patch and record["write_boundary"]["import"]["patch"] == str(kept)

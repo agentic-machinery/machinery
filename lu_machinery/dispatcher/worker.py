@@ -281,6 +281,7 @@ def _observe(record: dict) -> dict:
             return current
         record.update(status="crashed", finished_at=store.now(), error="supervisor exited without a result")
         _discard_read_only_scratch(record)  # a killed supervisor never reached its own cleanup
+        _settle_savant_patch(record, store.record_path(record["task_id"]))  # nor its patch's
         record["duration_s"] = (
             datetime.fromisoformat(record["finished_at"]) - datetime.fromisoformat(record["started_at"])
         ).total_seconds()
@@ -620,14 +621,68 @@ def _verification_cause(exc: Exception) -> str:
 def _savant_draft(record: dict) -> list[str] | None:
     """The paths of a Savant write run's draft patch, from its verified boundary receipt; None for any other run.
 
-    The launcher wrote the patch beside the task record after the sandbox exited (``write_boundary``); the run
+    The launcher staged the patch beside the task record after the sandbox exited (``write_boundary``); the run
     left the worktree untouched, so a normal worker applies the patch and lands it (docs/runbooks/savant.md).
+    A malformed path list reads as empty, never as its well-formed part.
     """
-    draft = (record.get("write_boundary") or {}).get("import") or {}
-    if record.get("agent") != "opencode" or record.get("provider") != SAVANT_PROVIDER or draft.get("status") != "drafted":
+    boundary = record.get("write_boundary")
+    draft = boundary.get("import") if isinstance(boundary, dict) else None
+    if (record.get("agent") != "opencode" or record.get("provider") != SAVANT_PROVIDER or not isinstance(draft, dict)
+            or draft.get("status") != "drafted"):
         return None
     paths = draft.get("paths")
-    return [path for path in paths if isinstance(path, str)] if isinstance(paths, list) else []
+    return paths if isinstance(paths, list) and all(isinstance(path, str) and path for path in paths) else []
+
+
+def _settle_savant_patch(record: dict, task_file: Path) -> None:
+    """Keep a Savant write run's staged patch as ``<task>.patch`` only when the run settles ``done``.
+
+    Called where a Savant write record's status becomes final: the supervisor's publication cutoff, and crash
+    recovery for a supervisor that died first (``_observe``). The staged file must be the regular single-link
+    file whose size and SHA-256 the receipt names; that very file becomes the patch, never replacing an existing
+    one. Anything else settles ``no_deliverable``. Neither file outlives a run that does not end ``done``
+    (refused, cancelled, timed out, past its upload ceiling, or crashed even between the link and publication).
+    Task ids are unique, so both names are this run's own. Any other record is left alone.
+    """
+    if (record.get("agent"), record.get("provider"), record.get("mode")) != ("opencode", SAVANT_PROVIDER,
+                                                                            "workspace-write"):
+        return
+    staged = write_boundary.staged_patch(task_file)
+    try:
+        if record["status"] == "done" and (paths := _savant_draft(record)) is not None:
+            draft = record["write_boundary"]["import"]
+            digest, size = draft.get("patch_sha256"), draft.get("bytes")
+            cause = None
+            if not paths or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or (
+                    type(size) is not int or size <= 0):
+                cause = "savant_draft_receipt_malformed"
+            else:
+                try:
+                    descriptor = os.open(staged, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                    try:
+                        info, hasher, read = os.fstat(descriptor), hashlib.sha256(), 0
+                        if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == size:
+                            while chunk := os.read(descriptor, 1 << 20):
+                                hasher.update(chunk)
+                                read += len(chunk)
+                        if read != size or hasher.hexdigest() != digest:
+                            cause = "savant_draft_patch_missing_or_changed"
+                        else:  # the checked file itself, through its descriptor; link refuses an existing path
+                            final = write_boundary.draft_patch(task_file)
+                            os.link(f"/proc/self/fd/{descriptor}", final, follow_symlinks=True)
+                            draft["patch"] = str(final)
+                    finally:
+                        os.close(descriptor)
+                except OSError:
+                    cause = "savant_draft_patch_missing_or_changed"
+            if cause:
+                record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+    finally:
+        with contextlib.suppress(OSError):
+            staged.unlink(missing_ok=True)
+        if record["status"] != "done":
+            with contextlib.suppress(OSError):
+                write_boundary.draft_patch(task_file).unlink(missing_ok=True)
 
 
 def _enforce_delivery(record: dict) -> None:
@@ -2184,6 +2239,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     if cancel_requested and record["status"] != "cancelled":
                         record.pop("no_deliverable_reason", None)
                         record.update(status="cancelled", error="cancelled by client")
+                    # The status is final here: a Savant patch exists only beside a run settled done.
+                    _settle_savant_patch(record, path)
                     if start_refusal is not None and record["status"] in {"failed", "rate_limited"}:
                         record["never_started_reason"] = start_refusal
                     if transport_warning and record["status"] == "done":
@@ -2194,6 +2251,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         store.replace(record, path, require_existing=True)
                     except store.TaskRecordError:
                         store.publish_failed_record(record, path)
+                        _settle_savant_patch(record, path)  # published as crashed: no patch stays
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
@@ -2202,6 +2260,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
                     store.publish_failed_record(record, path)
+                    _settle_savant_patch(record, path)
         finally:
             signal.signal(signal.SIGTERM, previous_term)
             signal.signal(signal.SIGINT, previous_int)

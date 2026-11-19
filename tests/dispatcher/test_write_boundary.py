@@ -984,6 +984,11 @@ def test_savant_write_run_drafts_nothing_after_a_failed_provider_or_from_an_over
     ("too-many-edits", "for i in $(seq 257); do printf x > docs/f$i; done", "edited more than 256 files"),
     # Paths are kept in memory and in the receipt, so their bytes count against the budget like content.
     ("long-paths", "for i in $(seq 300); do mkdir docs/$(printf %0250d $i); done", "more than 65536 bytes"),
+    # One path a landing checkout could not create (review of #919): its bytes exceed the per-path bound.
+    ("long-path", ("d=docs/$(printf %0250d 1)/$(printf %0250d 2)/$(printf %0250d 3)/$(printf %0250d 4)/"
+                   "$(printf %0250d 5); mkdir -p $d && printf 'x\\n' > $d/f"), "a path is longer than 1024 bytes"),
+    # The sandbox owns the view root too and can take away its permissions (review of #919).
+    ("view-root-unreadable", "chmod 300 .", "the view could not be read (PermissionError)"),
 ])
 def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path, case, script, reason):
     """Defect class (#898): an edit outside the owned paths, a link, an excluded or filtered path, a secret or an

@@ -166,6 +166,9 @@ MAX_SNAPSHOT_FILES = 20_000
 MAX_VIEW_DEPTH = 64
 # A write run's view holds at most this many files and directories, at snapshot time and when its draft is read.
 MAX_VIEW_ENTRIES = 2 * MAX_SNAPSHOT_FILES
+# A write run's view paths are at most this many bytes, so every path a draft holds can be created in a landing
+# checkout, whose absolute paths add the checkout's own location (Linux PATH_MAX is 4096 bytes in all).
+MAX_VIEW_PATH_BYTES = 1024
 # A write run's draft changes, adds or deletes at most this many files: a bounded mechanical fix. The bound keeps
 # the draft's Git steps and the paths its receipt and task record carry small.
 MAX_DRAFT_PATHS = 256
@@ -279,9 +282,19 @@ def receipt_file(task_file: Path) -> Path:
     return task_file.with_suffix(RECEIPT_SUFFIX)
 
 
+class _Cancelled(Refused):
+    """The launcher's SIGTERM: the run ends as interrupted, whatever step it reached."""
+
+
 def draft_patch(task_file: Path) -> Path:
-    """Where a Savant write run's draft patch is kept, beside its task record."""
+    """Where a Savant write run's patch is kept, beside its task record; only a run settled ``done`` has one."""
     return task_file.with_suffix(".patch")
+
+
+def staged_patch(task_file: Path) -> Path:
+    """Where the launcher leaves a Savant write run's patch; settlement keeps it as ``draft_patch`` or removes it
+    (``worker._settle_savant_patch``)."""
+    return task_file.with_suffix(".patch-staged")
 
 
 def scratch(task_id: str) -> Path:
@@ -375,7 +388,7 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
             owned = ownership.effective_scope(store.read(spec.task_id) or {})
             if not owned:
                 raise ValueError("write_boundary_refused: a Savant write run needs owned paths")
-            argv += ["--draft-patch", str(draft_patch(task_file))]
+            argv += ["--draft-patch", str(staged_patch(task_file))]
             argv += [arg for path in owned for arg in ("--owned-path", path)]
     host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
             if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
@@ -396,6 +409,8 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         receipt = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return {"status": "missing"}, "write_boundary_unproven: no boundary receipt"
+    if not isinstance(receipt, dict):
+        return {"status": "missing"}, "write_boundary_unproven: the boundary receipt is not an object"
     summary = {key: receipt.get(key) for key in (
         "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker")}
     summary["canary_passed"] = bool(receipt.get("canary", {}).get("passed"))
@@ -405,7 +420,7 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return summary, "write_boundary_unproven: the receipt names another mode"
     if receipt.get("status") != "ran" or not summary["canary_passed"]:
         return summary, f"write_boundary_refused: {receipt.get('reason') or receipt.get('status')}"
-    imported = receipt.get("import") or {}
+    imported = receipt.get("import") if isinstance(receipt.get("import"), dict) else {}
     # Only a write run (Savant's) can leave a draft patch; every other run changes nothing.
     if imported.get("status") not in ("unchanged", *(("drafted",) if mode == "workspace-write" else ())):
         reason = f": {imported['reason']}" if isinstance(imported.get("reason"), str) else ""
@@ -969,10 +984,11 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         if not parts or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
             raise Refused("savant_snapshot_refused: the tree names a path outside itself")
         # A name is screened like content: the run would see it, and a draft screens every name it exports.
-        # A write run's view also keeps to the draft's depth bound, so an unchanged deep file cannot refuse it.
+        # A write run's view also keeps to the draft's depth and path bounds, so an unchanged deep or long path
+        # cannot refuse it.
         if (kind != b"blob" or mode not in (b"100644", b"100755") or not name.isprintable()
                 or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts) or _sensitive(raw, needles, accounts)
-                or (manifest is not None and len(parts) > MAX_VIEW_DEPTH)):
+                or (manifest is not None and (len(parts) > MAX_VIEW_DEPTH or len(raw) > MAX_VIEW_PATH_BYTES))):
             left_out += 1
             if left_out_paths is not None:
                 left_out_paths.append(name)
@@ -1716,7 +1732,17 @@ class _Boundary:
                 if not select.select([init], [], [], _CANARY_TIMEOUT)[0]:
                     raise Refused("savant_draft_refused: the sandbox's processes did not stop")
                 if returncode == 0:  # a failed provider keeps its own failure; its partial edits are not drafted
+                    if self.egress is not None:
+                        # Nothing inside sends any more; stopped, the egress's upload ceiling state is final.
+                        try:
+                            self.egress.cleanup()
+                        except Exception:
+                            raise Refused("savant_draft_refused: the run's egress did not stop") from None
+                        if self.egress.ceiling_reached:
+                            raise Refused("savant_draft_refused: the run reached its upload ceiling")
                     self.receipt["import"].update(self._draft(boundary / Path(SNAPSHOT_INSIDE).name))
+            except _Cancelled:
+                raise  # a cancelled launch is the run's own end, never a draft refusal
             except Refused as exc:
                 self.receipt["import"].update(status="refused", reason=str(exc))
             finally:
@@ -2047,9 +2073,10 @@ class _Boundary:
 
         Each component is opened with ``O_NOFOLLOW`` relative to its parent's descriptor, so no entry a sandbox
         process plants can lead outside the view. An entry that is not a directory or a single-link regular file,
-        an excluded, unprintable or screened name, more than ``MAX_VIEW_ENTRIES`` entries or more than
-        ``--snapshot-bytes`` bytes of content and paths refuse the draft; the listing is read lazily, so memory
-        stays within those bounds. Refusals never name the entry: names are the model's.
+        an excluded, unprintable or screened name, a path over ``MAX_VIEW_PATH_BYTES``, more than
+        ``MAX_VIEW_ENTRIES`` entries or more than ``--snapshot-bytes`` bytes of content and paths refuse the draft;
+        the listing is read lazily, so memory stays within those bounds. Refusals never name the entry: names are
+        the model's.
         """
         assert self.args.snapshot_bytes is not None
         refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
@@ -2057,7 +2084,10 @@ class _Boundary:
         total = entries = 0
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         pending = [""]
-        root = os.open(view, flags | os.O_DIRECTORY)
+        try:  # the view root is the sandbox's too: it can take away its permissions
+            root = os.open(view, flags | os.O_DIRECTORY)
+        except OSError as exc:
+            raise Refused(f"{refusal}: the view could not be read ({type(exc).__name__})") from None
 
         def below(prefix: str) -> int:
             # One component at a time: O_NOFOLLOW holds for each, not only the last.
@@ -2084,8 +2114,11 @@ class _Boundary:
                             if (not relative.isprintable() or _sensitive(os.fsencode(relative), needles, accounts)
                                     or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in relative.split("/"))):
                                 raise Refused(f"{refusal}: an entry has an excluded, unprintable or screened name")
+                            encoded = len(os.fsencode(relative))
+                            if encoded > MAX_VIEW_PATH_BYTES:
+                                raise Refused(f"{refusal}: a path is longer than {MAX_VIEW_PATH_BYTES} bytes")
                             # Paths count against the budget too, as at snapshot time: they are kept in memory.
-                            total += len(os.fsencode(relative))
+                            total += encoded
                             if total > limit:
                                 raise Refused(f"{refusal}: the edited view holds more than {limit} bytes")
                             try:
@@ -2398,7 +2431,7 @@ def main(argv: list[str]) -> int:
     boundary = None
 
     def cancelled(_signum, _frame):
-        raise Refused("cancelled")
+        raise _Cancelled("cancelled")
 
     previous = signal.signal(signal.SIGTERM, cancelled)
     try:
