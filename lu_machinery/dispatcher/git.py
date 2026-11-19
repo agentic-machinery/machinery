@@ -481,8 +481,8 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
     """Create a task worktree; ``registration`` (see register_worktree) also keeps its registry entry true.
 
     ``deploy_agents`` (write tasks) applies the checkout's agent deployment (``deploy_agent_extensions``) under
-    the same locks, so an attachment waits for it. A deployment that refuses removes the new tree and its
-    branch again before it raises, so the task never launches and leaves nothing behind.
+    the same locks, so an attachment waits for it. A deployment that refuses raises, so the task never
+    launches; the tree it leaves stays attributed like any other failed creation's.
 
     The entry is written before the tree exists and confirmed after, all under the worktree lock that
     settlement removes (and archives) under, so a later dispatch to the same path cannot interleave.
@@ -521,11 +521,7 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
                 run_git(path, "sparse-checkout", "set", "--no-cone", "--", "/*", *(f"!/{name}/" for name in excluded))
             run_git(path, "reset", "--hard", sha)
             if deploy_agents:
-                try:
-                    deploy_agent_extensions(path)
-                except ValueError:
-                    _discard_refused_worktree(repo, path, branch, sha)
-                    raise
+                deploy_agent_extensions(path, sha)
             from lu_machinery.orchestration.worktree_claims import new_helper_creator, publish_helper_creator
 
             receipt_path, receipt = new_helper_creator(
@@ -586,34 +582,40 @@ def _agent_deploy(root: Path, *args: str) -> str:
     return result.stdout
 
 
-def deploy_agent_extensions(path: Path) -> bool:
+def deploy_agent_extensions(path: Path, commit: str, *, apply: bool = True) -> bool:
     """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
 
     Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
     enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
-    product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
-    ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
-    worker's hooks use, composed from the HEAD commit's objects (``--inputs-commit``), never from the checkout:
-    no working-tree edit (even one Git status cannot see), file the sparse checkout hides or concurrent write
-    by a task that borrows the tree changes the plan. The deployer's own check then verifies
-    the written outputs against that same plan and prints its manifest, which names the outputs checked here.
-    Applying again is idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it
-    is (False). Each refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed``
-    when the deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its
-    outputs is tracked or not ignored by the repository's own rules (its ignore files and ``info/exclude``; no
-    user-level excludes file, which the worker may not share), so the worker could commit it.
+    product's guards. Everything is bound to ``commit``, the task's admitted start: the checkout is enrolled
+    when that commit or its HEAD tracks the descriptor, whatever the working tree holds, and an enrolled
+    checkout whose HEAD is no longer that commit refuses. ``apply`` (a tree this creation just checked out)
+    runs the checkout's own apply contract (``agent_deploy --project-root``, as ``npm run agents:deploy`` or
+    ``agents_extensions/deploy.sh`` run it), under the project interpreter the worker's hooks use, composed
+    from the commit's objects (``--inputs-commit``), never from the checkout, so no working-tree edit or file
+    the sparse checkout hides changes the plan. Without ``apply`` (a tree a task borrows with ``--cwd``)
+    nothing is written into the tree: its existing deployment must already match the commit's plan. Either
+    way the deployer's own check verifies the outputs against that plan and prints its manifest, which names
+    the outputs checked here. A checkout that is not enrolled is left as it is (False). Each refusal is a
+    ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the deployment cannot be
+    applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is tracked or not
+    ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes file,
+    which the worker may not share), so the worker could commit it.
     """
     root = path.resolve()  # the deployer takes only the canonical checkout root
     try:
         head = _git(root, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
-        # Enrollment is the descriptor entry of that commit, whatever the working tree holds.
-        if not _git(root, "--no-replace-objects", "ls-tree", "--name-only", head, "--", AGENT_DEPLOY_DESCRIPTOR,
-                    isolate=True):
-            return False
+        enrolled = any(_git(root, "--no-replace-objects", "ls-tree", "--name-only", tip, "--", AGENT_DEPLOY_DESCRIPTOR,
+                            isolate=True) for tip in dict.fromkeys((commit, head)))
     except (OSError, subprocess.SubprocessError) as exc:
         raise _git_failure("enrollment read", exc) from None
-    _agent_deploy(root, "--inputs-commit", head)
-    verified = _agent_deploy(root, "--check", "--print-manifest", "--inputs-commit", head)
+    if not enrolled:
+        return False
+    if head != commit:
+        raise ValueError(f"agent_deploy_failed: the checkout's HEAD {head[:12]} is not the task's start {commit[:12]}")
+    if apply:
+        _agent_deploy(root, "--inputs-commit", commit)
+    verified = _agent_deploy(root, "--check", "--print-manifest", "--inputs-commit", commit)
     try:
         outputs = [AGENT_DEPLOY_STATE, *(str(name) for name in json_depth.loads(verified, max_depth=16)["files"])]
     except (ValueError, RecursionError, KeyError, TypeError):
@@ -628,20 +630,6 @@ def deploy_agent_extensions(path: Path) -> bool:
     if names := [name for name in listed if name]:
         raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {', '.join(names[:3])}")
     return True
-
-
-def _discard_refused_worktree(repo: Path, path: Path, branch: str, sha: str) -> None:
-    """Remove a tree this creation checked out after its agent deployment refused, so the refusal leaves none.
-
-    No worker has run in it, and the creation still holds the lock every attachment and removal take. The
-    branch goes only while it still names the start commit. A removal that fails keeps the tree, attributed
-    like any other failed creation.
-    """
-    try:
-        _git(repo, "worktree", "remove", "--force", str(path), isolate=True)
-        _git(repo, "update-ref", "-d", f"refs/heads/{branch}", sha, isolate=True)
-    except (OSError, subprocess.SubprocessError) as exc:
-        logging.getLogger(__name__).warning("refused worktree kept: %s", f"{type(exc).__name__}: {exc}"[:300])
 
 
 def registry_path(repo: Path, repository: dict) -> Path | None:

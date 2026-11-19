@@ -1000,3 +1000,7 @@ def test_inputs_commit_reads_ignore_worker_git_settings(deployed, redirect):
         inputs = plan.CommitInputs(tree, head)
         assert inputs.read(plan.DESCRIPTOR) == (committed, 0o644)
         assert set(inputs.inventory("agents_extensions/claude")) == {"settings.json", "hooks/product.py"}
+        # A path below a non-directory entry is refused as the checkout refuses it, never read as absent.
+        for reader in (inputs, tree):
+            with pytest.raises(plan.Invalid, match="^non-directory deployment path: agents_extensions/claude/settings"):
+                reader.read("agents_extensions/claude/settings.json/source")
