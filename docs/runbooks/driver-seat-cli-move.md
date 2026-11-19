@@ -134,8 +134,8 @@ The current examples map to `grok-infra` and `cursor-devops`; arbitrary
 Publication admits explicit recipients through `_admit_recipients`; it normalizes
 whitespace and applies bridge admission. It does not certify an arbitrary name
 as a registered driver slot. Verify registration separately as above. Sources:
-[scripts/fleet_comms/authority.py:135](../../scripts/fleet_comms/authority.py#L135),
-[scripts/fleet_comms/authority.py:563](../../scripts/fleet_comms/authority.py#L563).
+[`_admit_recipients`](../../lu_machinery/fleet_comms/authority.py#L175),
+[`publish_message`](../../lu_machinery/fleet_comms/authority.py#L882).
 
 Have the authorized sender reconcile unfinished orders against their durable
 outcomes before any re-publication. Preserve each original kind, body, reference,
@@ -152,7 +152,7 @@ Replace every placeholder and use the project interpreter prescribed for the
 seat. In a dispatch worktree, use the primary interpreter, not a worktree `.venv`.
 
 ```bash
-"$PROJECT_PYTHON" -m lu_machinery.fleet_comms channel publish cto - \
+"$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
   --sender "<authorized-sender>" --recipient "<new-registered-slot>" \
   --kind "<original-non-supervisory-kind>" \
   --conversation-id "<original-conversation-id>" \
@@ -169,13 +169,13 @@ order reference and remaining criteria in durable continuity records even when
 the body only refers to them. Record the original message ID alongside the new
 message and delivery IDs. An `--in-reply-to` parent must exist in the same
 authority store; stop on a missing parent instead of dropping the reference.
-Source: [scripts/fleet_comms/authority.py:1887](../../scripts/fleet_comms/authority.py#L1887).
+Source: [reply reference validation](../../lu_machinery/fleet_comms/authority.py#L2465).
 
 `channel publish` passes the explicit recipient, original kind, conversation,
 correlation, reply reference, and idempotency key to
 `AuthorityService.publish_message`, which creates the message and deliveries
-in one transaction. Sources: [scripts/fleet_comms/cli.py:983](../../scripts/fleet_comms/cli.py#L983),
-[scripts/fleet_comms/authority.py:541](../../scripts/fleet_comms/authority.py#L541).
+in one transaction. Sources: [`cmd_channel_publish`](../../lu_machinery/fleet_comms/cli.py#L959),
+[`publish_message`](../../lu_machinery/fleet_comms/authority.py#L882).
 
 For `supervisory-request`, retain the canonical supervisory path instead of
 using the ordinary-message template. The existing
@@ -184,7 +184,7 @@ uses `AuthorityService.enqueue_supervisory_request(sender=..., recipient=...,
 body=..., correlation_id=..., idempotency_key=..., deadline_at=...)`. Preserve the
 original body, correlation ID, and optional deadline and use a fresh delivery key. Its recipient remains
 `supervisor:epic:<number>`, not the new driver inbox slot. Source:
-[scripts/fleet_comms/authority.py:582](../../scripts/fleet_comms/authority.py#L582).
+[`enqueue_supervisory_request`](../../lu_machinery/fleet_comms/authority.py#L928).
 The supervisor accepts only the existing bounded `supervisory-wake.v1` wake/restart contract;
 do not convert arbitrary driver orders to wake/restart events. Reconcile the
 body's predecessor generation with the existing supervisor lifecycle. A stale
@@ -196,19 +196,23 @@ The successor claims ordinary messages only from its own new slot with its own
 worker identity:
 
 ```bash
-"$PROJECT_PYTHON" -m lu_machinery.fleet_comms deliveries claim \
+"$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms deliveries claim \
   --recipient "<new-registered-slot>" --worker-id "<successor-worker-id>"
 ```
 
-Read the original body through the existing authority reader,
-`AuthorityService.read_message_body(message_id)`. Source:
-[scripts/fleet_comms/authority.py:645](../../scripts/fleet_comms/authority.py#L645). Claim output contains metadata and body artifact references, not the
-order body. Reconcile prior effects and remaining criteria, apply only the
+Read the original body with the delivery ID and fence token returned by the claim.
+
+```bash
+"$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms deliveries read "<delivery-id>" \
+  --worker-id "<successor-worker-id>" --fence-token "<returned-fence-token>"
+```
+
+Reconcile prior effects and remaining criteria, apply only the
 remaining authorized work, record its verified outcome, and acknowledge the
 exact claimed delivery with that worker identity and its returned fence token:
 
 ```bash
-"$PROJECT_PYTHON" -m lu_machinery.fleet_comms deliveries ack "<delivery-id>" \
+"$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms deliveries ack "<delivery-id>" \
   --worker-id "<successor-worker-id>" --fence-token "<returned-fence-token>"
 ```
 
@@ -220,7 +224,7 @@ command shape is shown below for reference. The launcher/watcher owns this
 sequence; do not execute supervisory consumption from the agent seat.
 
 ```bash
-"$PROJECT_PYTHON" -m lu_machinery.fleet_comms deliveries consume "<supervisor-delivery-id>" \
+"$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms deliveries consume "<supervisor-delivery-id>" \
   --worker-id "<supervisor-worker-id>" --fence-token "<current-delivery-fence>" \
   --driver-generation "<launcher-driver-generation>"
 ```
@@ -228,16 +232,15 @@ sequence; do not execute supervisory consumption from the agent seat.
 The ordinary-message ack example above is not a substitute for this supervisory
 sequence. Do not use `consume` for ordinary messages; it refuses them.
 The CLI exposes claim, consume, and ack with explicit identities and fences.
-Sources: [scripts/fleet_comms/cli.py:854](../../scripts/fleet_comms/cli.py#L854),
-[scripts/fleet_comms/authority.py:1372](../../scripts/fleet_comms/authority.py#L1372).
+Sources: [`cmd_deliveries`](../../lu_machinery/fleet_comms/cli.py#L678),
+[`record_supervisory_consumption`](../../lu_machinery/fleet_comms/authority.py#L1655).
 Recipient mismatch, worker mismatch, stale fences, and missing supervisory
 consumption have existing counterexamples in
-[tests/fleet_comms/test_delivery_cli.py:77](../../tests/fleet_comms/test_delivery_cli.py#L77).
+[delivery CLI tests](../../tests/fleet_comms/test_delivery_cli.py#L91).
 
 Never claim or acknowledge the old slot's deliveries as the new identity.
-Legacy bridge `send`, `inbox`, and `ack --consumed-by-live-driver` are not the
-authority delivery path. An empty legacy inbox proves nothing about new-slot
-orders. Stop if the slot, plane, body artifact, current fence, or order outcome
+Use the publication and fenced delivery commands above for new-slot orders.
+Stop if the slot, plane, body artifact, current fence, or order outcome
 is unknown. Keep unresolved orders durable with their owner and next action;
 a new prompt or successful launch alone does not prove continuity.
 

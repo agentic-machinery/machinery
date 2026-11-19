@@ -22,7 +22,7 @@ that skill). Do not reintroduce claims Sol rejected (see §Plane modes).
 | **Seat onboarding contract** | Task-oriented ownership matrix (discuss / delegate / fleet-comms / ACPX / Buzz deferred), retired-seat refusal, smoke | `docs/runbooks/agent-seat-onboarding.md` |
 | **`drive-epic` skill** | Method playbook (orient → topology → route → dispatch → settle → CF → merge → handoff) | `agents_extensions/shared/skills/drive-epic/SKILL.md` |
 | **Epic roster runbook** | Operator seat routing (which model drives which epic) | `docs/runbooks/epic-orchestrator-roster.md` |
-| **Live routing data** | Caps, ladders, reviewer seats, **live plane mode** | `/api/rules?scope=task:routing` (or `scope=full`) model-assignment + `lu_machinery/config/model_catalog.yaml` + `lu_machinery/config/fleet_communications.yaml` + `.venv/bin/python -m lu_machinery.fleet_comms plane-status` |
+| **Live routing data** | Caps, ladders, reviewer seats, **live plane mode** | `/api/rules?scope=task:routing` (or `scope=full`) model-assignment + `lu_machinery/config/model_catalog.yaml` + `lu_machinery/config/fleet_communications.yaml` + `.venv/bin/python -I -m lu_machinery.fleet_comms plane-status` |
 | **Launchers** | Lease claim + dual-aware pointer (not a second design) | interactive `start-*.sh`, provider `start-*-driver.sh` |
 
 **Golden rule (from drive-epic):** rules + skill teach **method**; roster/caps/modes are
@@ -58,16 +58,21 @@ Remote leases remain live until `expires_at`; a local PID is not remote liveness
 proof. Wait for expiry or an attributed operator release through the existing
 supervisor flow.
 
-The live driver reads and applies its inbox, then acknowledges consumption with
-`ack --consumed-by-live-driver <message-id>` through the project bridge CLI.
-Plain `ack` and detached worker receipts do not prove live-driver consumption.
-Use the launcher's `SESSION_HANDOFF_AGENT` identity; do not borrow another seat's
-identity or infer it from the provider/model name.
+The live driver claims, reads, and applies its own ordinary deliveries, then
+acknowledges each delivery with its returned fence token:
+
+```bash
+.venv/bin/python -I -m lu_machinery.fleet_comms deliveries ack "<delivery-id>" \
+  --worker-id "<launcher-worker-id>" --fence-token "<returned-fence-token>"
+```
+
+Use the launcher-provided worker identity throughout the
+[delivery procedure](../../../docs/runbooks/driver-seat-cli-move.md#5-restore-open-orders-to-the-new-authority-inbox-slot).
 
 ## Plane modes
 
 ```bash
-.venv/bin/python -m lu_machinery.fleet_comms plane-status
+.venv/bin/python -I -m lu_machinery.fleet_comms plane-status
 ```
 
 Implemented modes are `off` | `shadow` | `dual_write` | `authority`. Production
@@ -94,10 +99,10 @@ cold-prompts; silent plane flips; “for now” cutovers.
 
 ```bash
 # Topology / health / parity
-.venv/bin/python -m lu_machinery.fleet_comms plane-status
-.venv/bin/python -m lu_machinery.fleet_comms metrics
-.venv/bin/python -m lu_machinery.fleet_comms backlog
-.venv/bin/python -m lu_machinery.fleet_comms dead-letters
+.venv/bin/python -I -m lu_machinery.fleet_comms plane-status
+.venv/bin/python -I -m lu_machinery.fleet_comms metrics
+.venv/bin/python -I -m lu_machinery.fleet_comms backlog
+.venv/bin/python -I -m lu_machinery.fleet_comms dead-letters
 
 # Continuity (lease already claimed by launcher — do not re-open)
 .venv/bin/python -m lu_machinery.session_streams tail --stream epic:<N> --limit 20
@@ -138,7 +143,7 @@ Every epic driver session (any harness) MUST:
 
 1. Obey this rule (via `/api/rules?scope=task:fleet-comms`, `scope=task:driver`,
    `scope=full`, or offline fallback of this file).
-2. Run `.venv/bin/python -m lu_machinery.fleet_comms plane-status` before assuming message-plane availability.
+2. Run `.venv/bin/python -I -m lu_machinery.fleet_comms plane-status` before assuming message-plane availability.
 3. Use fleet-comms for durable coordination, queues, messages, conversations, artifacts,
    retries, dead letters, receipts, formal jobs, and session continuity. In authority
    mode, never create a new legacy bridge/channel/broker/file coordination write.
@@ -221,9 +226,9 @@ For normal **read-only inter-agent communication**, ACP is the only provider
 transport. Fleet launchers make ordinary (non-review) `ask-*` and `discuss`
 calls that name **2 to 4 distinct enabled seats** use the durable ACP controller:
 Codex, Claude, Cursor, Pool, AGY, GLM, and DeepSeek. Kimi seats are never participants (retired, OO-58, #11327; the runtime refuses them). Grok 4.7 codes and reviews through Cursor at `grok-4.7-high` (C-5307); it is not a driver.
-Any other participant count is rejected
-loudly before a conversation begins. The direct `.venv/bin/python -m
-scripts.fleet_comms acp-discuss` surface remains available to operators.
+Any other participant count is rejected before a conversation begins. Operators
+can inspect the direct command with
+`.venv/bin/python -I -m lu_machinery.fleet_comms acp-discuss --help`.
 Selection starts no process at cold start and does not change `dispatch.py`.
 The default is two rounds and the hard maximum is three.
 

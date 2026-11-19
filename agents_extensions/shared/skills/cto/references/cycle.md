@@ -10,8 +10,9 @@ never fine.
    (`lu_cto_source_ok == 0`) is an attention item. Use hand-run commands (`gh`, usage
    meters) only for what no metric covers; a missing or wrong metric is a monitoring task,
    not a reason to keep measuring by hand.
-1. **Inbox.** Drain the four recipients ([startup](startup.md#4-identity-and-inbox)) at
-   cycle start, after workers settle and before handoff. `claude-cto` is the durable CTO
+1. **Inbox.** Inspect the launcher slot and drain the three driver recipients
+   ([startup](startup.md#4-identity-and-inbox)) at cycle start, after workers settle and
+   before handoff. `claude-cto` is the durable CTO
    recipient: claim it with your session identity as `--worker-id`, and a worker escalation
    waits there at most one cycle. Any backlog still queued at a `claude-cto-<id>` name is a
    leftover to drain once, then report it as a producer defect.
