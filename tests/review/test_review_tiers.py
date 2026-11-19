@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pytest
 
+from lu_machinery.dispatcher.checks import check_model_admission
+from lu_machinery.orchestration.integration_sweep import reviews_of_record
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
@@ -114,6 +116,17 @@ def test_flash_explicit_pin_is_refused_as_the_reviewer_of_record(low_review, tmp
     with pytest.raises(recorder.RecordError, match="holds no review"):
         recorder.record(name, pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
     assert comments == [] and statuses == []
+
+
+def test_advisory_neon_variants_do_not_qualify_as_formal_reviewers():
+    """An advisory runtime selector cannot inherit the Neon High review seat."""
+    for model in ("gemini-4-neon-low", "gemini-4-neon-medium", "gemini-4-neon-xhigh"):
+        check_model_admission("agy", model, "read-only", {"research_role": "advisory"}, b"")
+        with pytest.raises(ValueError, match="REVIEW_SELECTOR_REFUSED"):
+            check_model_admission("agy", model, "read-only", {"review_profile": "code"}, b"")
+        with pytest.raises(recorder.RecordError, match="REVIEW_SELECTOR_REFUSED"):
+            recorder.reviewer_identity({"agent": "agy", "model": model, "review_profile": "ukrainian"})
+        assert not reviews_of_record(model, recorded=True)
 
 
 def test_second_review_is_not_recorded(low_review, tmp_path):

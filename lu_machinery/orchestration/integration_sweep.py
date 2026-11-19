@@ -296,17 +296,24 @@ def reviews_of_record(model: object, *, recorded: bool = False) -> bool:
     The recorded-marker reader also accepts Flash approvals issued before its seat moved.
     New review admission uses the active catalog roles. Second-review roles never qualify.
     """
-    from lu_machinery.review.model_catalog import load_model_catalog, resolve_catalog_model_id
+    from lu_machinery.review.model_catalog import (
+        agy_review_selector_refusal,
+        load_model_catalog,
+        resolve_catalog_model_id,
+    )
 
+    if not isinstance(model, str):
+        return False
     try:
         catalog = load_model_catalog()
-        model_id = resolve_catalog_model_id(model, catalog) if isinstance(model, str) else None
+        model_id = resolve_catalog_model_id(model, catalog)
         if model_id is None:
             return False
         if recorded and model_id == "gemini-3.8-flash-high":
             return True
         review = set(catalog["review_scheduler"]["activity_roles"]["review"]) - {"second_review"}
-        return bool(review & set(catalog["models"][model_id]["roles"]))
+        spec = catalog["models"][model_id]
+        return bool(review & set(spec["roles"])) and agy_review_selector_refusal(model, model_id, spec) is None
     except Exception:  # an unreadable catalog admits no reviewer of record
         return False
 

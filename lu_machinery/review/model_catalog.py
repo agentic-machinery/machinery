@@ -1446,6 +1446,14 @@ def retired_model_refusal(
     return f"model {text!r} is retired in the model catalog ({model_id}); {advice}"
 
 
+def agy_review_selector_refusal(model: str, model_id: str, spec: Mapping[str, Any]) -> str | None:
+    """An AGY-only review seat pins one wire selector, independent of runtime variant recognition."""
+    wire_id = spec.get("routing_wire_ids", {}).get("agy")
+    if spec["transports"] == ["agy"] and wire_id and model not in (model_id, wire_id, *spec.get("aliases", ())):
+        return f"REVIEW_SELECTOR_REFUSED: {model!r} is not the pinned AGY review selector {wire_id!r}"
+    return None
+
+
 def activity_role_refusal(
     model: Any, activity: str, catalog: dict[str, Any] | None = None, *,
     review_context: Mapping[str, Any] | None = None,
@@ -1476,8 +1484,11 @@ def activity_role_refusal(
         admitted |= set(activity_roles[CONSULT_ACTIVITY])
     elif activity != REVIEW_ACTIVITY:
         raise ValueError(f"unknown activity {activity!r}; expected one of {sorted(ACTIVITIES)}")
-    roles = catalog["models"][model_id]["roles"]
+    spec = catalog["models"][model_id]
+    roles = spec["roles"]
     if admitted.intersection(roles):
+        if activity == REVIEW_ACTIVITY:
+            return agy_review_selector_refusal(text, model_id, spec)
         return None
     work = "review, critique or approval" if activity == REVIEW_ACTIVITY else "ACP ask, consult or discussion"
     return (
