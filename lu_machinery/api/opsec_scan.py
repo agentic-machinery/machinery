@@ -62,8 +62,15 @@ _ISO_DURATION_RE = re.compile(
 # subtly different IP parser.  Bracketed addresses keep an optional port as a
 # single candidate.  Unbracketed IPv4:port is handled by the same parser.
 _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{1,5})?|[0-9A-Fa-f:.]+)(?![A-Za-z0-9])")
+# A bare root must not follow a slash, so URL authorities such as
+# "https://tmp.example.org" stay unflagged.  A file URI is the exception: its
+# slashes and optional authority ("file:///home/...", "file://host/home/...",
+# "file:////home/...") belong to the path, and the whole URI is the token so a
+# redaction also removes the authority.
+_FILE_URI_PREFIX = r"(?i:file):(?://[^/\s\"'<>?#]*)?/*"
 _FILESYSTEM_PATH_RE = re.compile(
-    rf"(?<![A-Za-z0-9/])/(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
+    rf"(?:{_FILE_URI_PREFIX}|(?<![A-Za-z0-9/]))"
+    rf"(?P<slash>/)(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
     r"(?![A-Za-z0-9_-])"
     r"(?P<tail>/[^\s\"'<>]*)?"
 )
@@ -375,7 +382,9 @@ def scan_text(
 
     for match in _FILESYSTEM_PATH_RE.finditer(text):
         start, end, token = _trim_path_token(match)
-        if token and not _overlaps(start, end, protected):
+        # Only a protected span over the root itself (a bare "#/home" route)
+        # exempts a path; a SHA, timestamp or duration in the tail does not.
+        if token and not _overlaps(match.start("slash"), match.end("root"), protected):
             candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
 
     for match in _USER_AT_HOST_RE.finditer(text):

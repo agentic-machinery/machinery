@@ -74,6 +74,7 @@ def test_sanitize_document_strips_planted_absolute_paths() -> None:
         "ok": True,
         "nested": {"repo_root": PLANTED_PATH},
         "hint": f"store lives at {PLANTED_PATH}/data.sqlite",
+        "uri": f"file://fixture-host{PLANTED_PATH}/data.sqlite",
         "safe_route": "/api/session-streams/v1/health",
         "sha": "0123456789abcdef" * 2 + "01234567",
     }
@@ -90,6 +91,7 @@ def test_sanitize_document_strips_planted_absolute_paths() -> None:
     assert sanitized["safe_route"] == "/api/session-streams/v1/health"
     assert sanitized["nested"]["repo_root"] == REDACTED_ABSOLUTE_PATH
     assert REDACTED_ABSOLUTE_PATH in sanitized["hint"]
+    assert sanitized["uri"] == REDACTED_ABSOLUTE_PATH
     assert scan_body(sanitized) == []
     assert scan_text(sanitized["hint"]) == []
 
