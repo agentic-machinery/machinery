@@ -720,12 +720,14 @@ def github_networks() -> tuple:
 
 
 def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
-    """Raw output of a read-only Git plumbing command, with no user or system configuration, hooks or fsmonitor."""
+    """Raw output of a read-only Git plumbing command over the objects' own links: no user or system configuration,
+    hooks, fsmonitor, replacement objects, grafts or commit-graph."""
     env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
+           "GIT_GRAFT_FILE": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1"}
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         ["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
-         "-c", "core.fsmonitor=false", "-C", str(repository), *args],
+         "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", "-C", str(repository), *args],
         input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=env)
     if result.returncode:
         raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
@@ -767,7 +769,8 @@ def _remote_tips(slug: str) -> dict[str, str]:
 def _published(repository: Path, commit: str) -> None:
     """Refuse unless GitHub serves publicly a branch whose tip is ``commit``, or whose main branch contains it.
 
-    Ancestry is read from local objects of the anonymously listed tip: object ids bind that history.
+    Ancestry follows the parent links recorded in the commit objects below the anonymously listed tip, which its
+    object id binds: grafts, replacement objects and the commit-graph are off (``_plain_git``).
     """
     tips = _remote_tips(_public_origin(repository))
     if commit in tips.values():
@@ -775,7 +778,7 @@ def _published(repository: Path, commit: str) -> None:
     main = tips.get("refs/heads/main", "")
     if main:
         try:
-            _git(repository, "merge-base", "--is-ancestor", commit, main)
+            _plain_git(repository, "merge-base", "--is-ancestor", commit, main)
             return
         except Refused:
             pass
@@ -785,7 +788,11 @@ def _published(repository: Path, commit: str) -> None:
 def _known_secrets() -> tuple[bytes, ...]:
     """Values of the launcher's own credential-named variables (the run's SubQ key among them), as needles."""
     names = re.compile(r".*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL).*", re.IGNORECASE)
-    return tuple(value.encode() for name, value in os.environ.items() if names.fullmatch(name) and len(value) >= 16)
+    found = [value for name, value in os.environ.items() if names.fullmatch(name) and len(value) >= 16]
+    # The run's configured SubQ key is screened at every length its loader accepts.
+    if os.environ.get("SUBQ_API_KEY"):
+        found.append(os.environ["SUBQ_API_KEY"])
+    return tuple(dict.fromkeys(value.encode() for value in found))
 
 
 def _sensitive(data: bytes, needles: tuple[bytes, ...]) -> bool:
