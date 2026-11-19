@@ -244,7 +244,10 @@ def _published_repository(tmp_path, files, links=()):
     run("add", "-A")
     run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fixture")
     commit = run("rev-parse", "HEAD")
-    run("update-ref", "refs/remotes/origin/main", commit)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
+    run("remote", "add", "origin", remote.as_uri())
+    run("push", "-q", "origin", "main")
     return repository, commit, run
 
 
@@ -256,6 +259,9 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
         ".env": secret, "config/.env.local": secret, "keys/id_ed25519": secret, "keys/server.pem": secret,
         "secrets/token.txt": secret, "app/credentials.json": secret, ".ssh/config": secret, "deploy/site.key": secret,
         "AGENTS.md": secret, "nested/CLAUDE.md": secret, "opencode.json": secret, ".opencode/agent.md": secret,
+        "docs/CONTEXT.md": secret, "home/auth.json": secret,
+        "docs/notes.txt": b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + secret,
+        "src/token.py": b"TOKEN = 'ghp_" + b"A" * 36 + b"'\n" + secret,
     }
     repository, commit, run = _published_repository(tmp_path, files, links=[("link.py", "src/allowed.py"),
                                                                              ("outside", "/etc")])
@@ -266,18 +272,19 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
     assert not any(path.is_symlink() for path in target.rglob("*"))
     assert all(secret not in path.read_bytes() for path in written.values())
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in written.values())
-    assert info == {"commit": commit, "files": 2, "bytes": 20, "left_out": 14, "read_paths": 0}
+    # 14 excluded names and 2 links leave before reading; 2 files leave for their key or token content.
+    assert info["files"] == 2 and info["left_out"] == 18 and info["commit"] == commit
     # --read-path narrows it to the named directory.
     narrowed = write_boundary._snapshot(repository, commit, ["docs"], tmp_path / "narrow", 1024)
     assert narrowed["files"] == 1 and (tmp_path / "narrow" / "docs" / "guide.md").is_file()
     # Fail closed, each with its reason: a path naming nothing, an over-cap tree and an unpublished commit.
-    with pytest.raises(write_boundary.Refused, match="a --read-path may name nothing"):
+    with pytest.raises(write_boundary.Refused, match="a --read-path names no readable file"):
         write_boundary._snapshot(repository, commit, ["missing"], tmp_path / "missing", 1024)
-    with pytest.raises(write_boundary.Refused, match="exceed 10 bytes; name the task's files"):
+    with pytest.raises(write_boundary.Refused, match="exceed 10 bytes or 20000 files; name the task's files"):
         write_boundary._snapshot(repository, commit, [], tmp_path / "small", 10)
     (repository / "src" / "allowed.py").write_bytes(b"UNPUBLISHED = 1\n")
     run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "local only")
-    with pytest.raises(write_boundary.Refused, match="on no branch of the public remote"):
+    with pytest.raises(write_boundary.Refused, match="no branch of the public remote contains the start commit"):
         write_boundary._snapshot(repository, run("rev-parse", "HEAD"), [], tmp_path / "local", 1024)
 
 
@@ -300,6 +307,8 @@ def test_savant_launch_builds_the_snapshot_and_ceiling_only_for_public_classes(t
                                       tmp_path / "task.json")
     private = private[:private.index("--")]
     assert "--upload-ceiling" in private and "--snapshot-bytes" not in private and "--read-path" not in private
+    # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process).
+    assert "--no-github-relays" in public and "--no-github-relays" in private
     # A malformed record's paths are refused, never read as the whole tree.
     with pytest.raises(ValueError, match="savant_read_path_refused"):
         opencode.savant_read_paths({"read_paths": "{}"})

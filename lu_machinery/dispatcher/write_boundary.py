@@ -148,9 +148,15 @@ SNAPSHOT_INSIDE = "/run/lu-write-boundary/snapshot"
 _SNAPSHOT_EXCLUDED = re.compile(
     r"\.git|\.env.*|\.?secrets?(\..*)?|\.ssh|\.gnupg|\.aws|\.docker|\.kube|\.netrc|\.npmrc|\.pypirc"
     r"|\.git-credentials|credentials(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\..*)?"
-    r"|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc)|agents\.md|claude\.md|opencode\.jsonc?|\.opencode",
+    r"|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc)|auth\.json|agents\.md|claude\.md|context\.md"
+    r"|opencode\.jsonc?|\.opencode",
     re.IGNORECASE)
+# Content a snapshot file must not carry: a private key block or a known provider token format.
+_SNAPSHOT_SECRET = re.compile(
+    rb"-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60,}"
+    rb"|sk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})")
 MAX_READ_PATHS = 64
+MAX_SNAPSHOT_FILES = 20_000
 _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor/mcp.json", "opencode": None}
 # Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
@@ -336,7 +342,7 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
     if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
         from lu_machinery.dispatcher.providers import opencode
 
-        argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES)]
+        argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES), "--no-github-relays"]
         if opencode.savant_tools(spec.options.get("data_class")):
             argv += ["--snapshot-bytes", str(opencode.SAVANT_SNAPSHOT_MAX_BYTES)]
             argv += [arg for path in opencode.savant_read_paths(spec.options) for arg in ("--read-path", path)]
@@ -713,58 +719,106 @@ def github_networks() -> tuple:
     return tuple(dict.fromkeys(networks))
 
 
+def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
+    """Raw output of a read-only Git plumbing command, with no user or system configuration, hooks or fsmonitor."""
+    env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
+    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        ["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
+         "-c", "core.fsmonitor=false", "-C", str(repository), *args],
+        input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=env)
+    if result.returncode:
+        raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
+    return result.stdout
+
+
+def _published(repository: Path, commit: str) -> None:
+    """Refuse unless origin advertises now a branch whose tip is ``commit``, or whose main branch contains it."""
+    try:
+        url = _git(repository, "remote", "get-url", "origin").strip()
+        listing = _git(repository, "ls-remote", url, "refs/heads/*", network=True)
+    except Refused:
+        raise Refused("savant_snapshot_refused: the public remote's branches could not be read") from None
+    tips = dict(reversed(line.split("\t", 1)) for line in listing.splitlines() if "\t" in line)
+    if commit in tips.values():
+        return
+    main = tips.get("refs/heads/main", "")
+    if _OBJECT_ID.fullmatch(main):
+        try:
+            _git(repository, "merge-base", "--is-ancestor", commit, main)
+            return
+        except Refused:
+            pass
+    raise Refused("savant_snapshot_refused: no branch of the public remote contains the start commit now")
+
+
+def _sensitive(data: bytes, needles: tuple[bytes, ...]) -> bool:
+    """Whether a file's bytes hold a private key, a known token format or one of the host's OPSEC needles."""
+    return bool(_SNAPSHOT_SECRET.search(data)) or any(needle in data for needle in needles)
+
+
 def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int) -> dict:
     """Write the published ``commit``'s regular files below ``paths`` (default: all) into ``target``, read-only.
 
-    Refuses a commit no remote-tracking branch of origin contains, a snapshot over ``limit`` bytes, and one with
-    no file. Excluded names (``_SNAPSHOT_EXCLUDED``) and anything but a regular file are left out.
+    The bytes are the commit's own blobs (``ls-tree`` and ``cat-file``), never an export that attributes or
+    filters change. Refuses an unpublished commit, a ``paths`` entry that names nothing, more than
+    ``MAX_SNAPSHOT_FILES`` files or ``limit`` bytes, and an empty result. Leaves out excluded names
+    (``_SNAPSHOT_EXCLUDED``), links and submodules, and files whose content looks sensitive (``_sensitive``).
     """
-    import tarfile
     from pathlib import PurePosixPath
 
-    if not _OBJECT_ID.fullmatch(commit) or not _git(
-            repository, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/remotes/origin").strip():
-        raise Refused("savant_snapshot_refused: the start commit is on no branch of the public remote")
-    env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
-    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
-               "-c", "core.fsmonitor=false", "-C", str(repository), "archive", "--format=tar", commit, "--", *paths]
-    target.mkdir(mode=0o700)
-    files = total = left_out = 0
-    unreadable = None
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+    if not _OBJECT_ID.fullmatch(commit):
+        raise Refused("savant_snapshot_refused: the start commit is not an object id")
+    _published(repository, commit)
+    from lu_machinery.opsec.needles import NeedlesError, load_needles
+
     try:
-        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
-            for member in archive:
-                parts = PurePosixPath(member.name).parts
-                if not parts or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts):
-                    raise Refused("savant_snapshot_refused: the archive names a path outside the tree")
-                if member.isdir():
-                    continue
-                if not member.isreg() or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts):
-                    left_out += 1
-                    continue
-                total += member.size
-                if total > limit:
-                    raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes; "
-                                  "name the task's files or directories with --read-path")
-                path = target.joinpath(*parts)
-                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                source = archive.extractfile(member)
-                _write_private(path, source.read() if source is not None else b"", 0o400)
-                files += 1
-    except tarfile.TarError as exc:
-        unreadable = type(exc).__name__  # judged after Git's own status, which explains an empty stream
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-    if process.returncode != 0:
-        raise Refused("savant_snapshot_refused: git archive failed; a --read-path may name nothing at the start commit")
-    if unreadable is not None:
-        raise Refused(f"savant_snapshot_refused: the archive could not be read ({unreadable})")
+        loaded = load_needles()
+    except NeedlesError:
+        raise Refused("savant_snapshot_refused: the host's OPSEC needles cannot be read") from None
+    needles = tuple(needle.encode() for needle in (*loaded.run_users, *loaded.home_dirs) if needle)
+    entries, left_out, total = [], 0, 0
+    for record in _plain_git(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths).split(b"\0"):
+        if not record:
+            continue
+        meta, _, raw = record.partition(b"\t")
+        mode, kind, oid, size = meta.split()
+        name = raw.decode("utf-8", "surrogateescape")
+        parts = PurePosixPath(name).parts
+        if not parts or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            raise Refused("savant_snapshot_refused: the tree names a path outside itself")
+        if (kind != b"blob" or mode not in (b"100644", b"100755") or not name.isprintable()
+                or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts)):
+            left_out += 1
+            continue
+        total += int(size)
+        if total > limit or len(entries) >= MAX_SNAPSHOT_FILES:
+            raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes or {MAX_SNAPSHOT_FILES} "
+                          "files; name the task's files or directories with --read-path")
+        entries.append((oid.decode("ascii"), int(size), parts))
+    names = ["/".join(parts) for _oid, _size, parts in entries]
+    for path in paths:
+        prefix = path.rstrip("/")
+        if not any(name == prefix or name.startswith(prefix + "/") for name in names):
+            raise Refused("savant_snapshot_refused: a --read-path names no readable file at the start commit")
+    if not entries:
+        raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
+    blobs = _plain_git(repository, "cat-file", "--batch", data="".join(f"{oid}\n" for oid, _s, _p in entries).encode())
+    target.mkdir(mode=0o700)
+    offset, files = 0, 0
+    for oid, size, parts in entries:
+        header_end = blobs.index(b"\n", offset)
+        if blobs[offset:header_end] != f"{oid} blob {size}".encode():
+            raise Refused("savant_snapshot_refused: git cat-file returned another object")
+        data = blobs[header_end + 1:header_end + 1 + size]
+        offset = header_end + 2 + size
+        if _sensitive(data, needles):
+            left_out += 1
+            continue
+        path = target.joinpath(*parts)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_private(path, data, 0o400)
+        files += 1
     if not files:
         raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
     return {"commit": commit, "files": files, "bytes": total, "left_out": left_out, "read_paths": len(paths)}
@@ -1340,7 +1394,8 @@ class _Boundary:
                 argv += ["--tmpfs", str(path)] if path.is_dir() else ["--ro-bind", "/dev/null", str(path)]
         for path in sockets:
             argv += ["--ro-bind", "/dev/null", str(path)]
-        self.broker = _Broker(self, boundary / "broker.sock")
+        # A Savant run gets no GitHub relay at all: its tools read only the snapshot.
+        self.broker = None if self.args.no_github_relays else _Broker(self, boundary / "broker.sock")
         argv += ["--ro-bind", str(boundary), _INSIDE]
         interpreter = sources_command()[0]
         # The emptied roots are read-only, so no worker moves a restored path's parent aside to plant files there.
@@ -1353,8 +1408,9 @@ class _Boundary:
         # no GitHub login and the egress proxy refuses GitHub, so without it ``gh pr view``/``pr checks`` fail.
         (boundary / "bin").mkdir(mode=0o700)
         _write_private(boundary / "json_depth.py", Path(json_depth.__file__).read_bytes(), 0o400)
-        _write_private(boundary / "bin" / "gh", agy_sandbox._GH_SHIM.format(interpreter=interpreter).encode(), 0o500)
-        self.gh = agy_sandbox._GhBroker(boundary / "gh.sock", self.worktree)
+        if not self.args.no_github_relays:
+            _write_private(boundary / "bin" / "gh", agy_sandbox._GH_SHIM.format(interpreter=interpreter).encode(), 0o500)
+            self.gh = agy_sandbox._GhBroker(boundary / "gh.sock", self.worktree)
         try:
             # Sources goes through the read-only AGY boundary's relay: read-only tools only, one server per
             # connection, started by the launcher from the product checkout. Providers reach it through
@@ -1824,6 +1880,8 @@ def main(argv: list[str]) -> int:
                         "definitions retained (default: none)")
     parser.add_argument("--upload-ceiling", type=_positive_bytes,
                         help="At most this many bytes sent upstream by the whole run, e.g. 16777216 (default: none)")
+    parser.add_argument("--no-github-relays", action="store_true",
+                        help="Start neither GitHub read relay nor the gh shim inside (default: both start)")
     parser.add_argument("--snapshot-bytes", type=_positive_bytes,
                         help="Write a read-only snapshot of the published start commit at most this large, e.g. "
                         f"67108864, at {SNAPSHOT_INSIDE} (default: none)")
