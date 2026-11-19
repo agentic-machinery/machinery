@@ -1754,12 +1754,11 @@ def test_invoke_gemini_runtime_timeout_ladder_raises_timeout(tmp_path):
     timed_out_proc.pid = 60606
     _popen_proc_for_subprocess_run(timed_out_proc)
 
-    # Preserve the native harness controller contract with explicit fixture rungs;
-    # the production default now selects only AGY Flash.
+    # An explicit fixture rung exercises the Gemini CLI timeout controller.
     from lu_machinery.ai_llm.fallback import GeminiRung
 
     with (
-        patch("lu_machinery.ai_llm.fallback.build_gemini_ladder", return_value=[GeminiRung(1, 1, "gemini-3.8-flash-high", "oauth")]),
+        patch("lu_machinery.ai_llm.fallback.build_gemini_ladder", return_value=[GeminiRung(1, 1, "gemini-4-hydrogen-medium", "oauth")]),
         patch.dict(
             "os.environ",
             {
@@ -1805,7 +1804,7 @@ def test_invoke_gemini_runtime_timeout_ladder_raises_timeout(tmp_path):
 
     written = mock_write.call_args.args[0]
     assert written["outcome"] == "hard_timeout"
-    assert written["model"] == "gemini-3.8-flash-high"
+    assert written["model"] == "gemini-4-hydrogen-medium"
 
 
 # ---------------------------------------------------------------------------
