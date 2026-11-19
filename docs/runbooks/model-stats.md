@@ -72,8 +72,10 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   `claude-opus-5-5[1m]` is `claude-opus-5-5`). Known Cursor display names map via `canonical_cursor_model`
   (`Grok 4.7 256K High` is `grok-4.7`, `Composer 2.5` is `composer-2.5`); harness prefixes or catalog ids with one
   slash are preserved or resolved (`deepseek-direct/deepseek-v4-flash` is `deepseek-v4-flash`,
-  `kimi-code/k3-256k` stays `kimi-code/k3-256k`). When `resolved_model_known` is true and the attested spelling is
-  unrecognized, it stays `unknown` without falling back to the requested model.
+  `kimi-code/k3-256k` stays `kimi-code/k3-256k`). When `resolved_model_known` is true, `concrete_model` never falls
+  back to the requested model: an unrecognized spelling that fits the model-label grammar (at most one slash, no
+  spaces or `..`, e.g. `claude-opus-5-6`) stays as recorded (`not_in_catalog`), while an empty or grammar-rejected
+  spelling (e.g. an unmapped display name with spaces like `Grok 4.7 256K High Fast`) becomes `unknown`.
   Rows store a bare harness alias with no observed model (`opus`, `sonnet`, `haiku`, `fable`) as recorded. The
   statistics count it as the catalog id it ran only where that is unambiguous: the dispatcher resolves the alias
   to its family's newest catalog id (`model_pause._newest_claude`), and a row counts as that id when it is no
@@ -139,9 +141,11 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   aggregation. Overlapping write tasks on one pool are grouped into a cluster charged that pool's net drop once
   (`earliest.start_pct - latest.finish_pct`). A cluster stays unknown (`null`, never `0`) when a later reading is
   above an earlier one (a reset anywhere in the cluster, including a task's own finish above its start or a rise
-  between tasks), when two readings share a timestamp and disagree, when net drop is negative, or when the cluster
-  spans multiple models, efforts or classes. Tasks with a finish above start stay in their group's selection and
-  count in `reset_crossed`, so that group reports unknown spend rather than `0`.
+  between tasks), when two readings share a timestamp and disagree, or when net drop is negative. Clusters are not
+  split across subgroups: any reporting group (model, effort, class, or pool/model/effort row) uses the cluster's
+  net drop when it contains all tasks in that cluster, and reports `null` when it only partly owns a cluster. Tasks
+  with a finish above start stay in their group's selection and count in `reset_crossed`, so that group reports
+  unknown spend rather than `0`.
 - **Low sample**: every rate carries its denominator `n`; below 10 it is marked `low_sample`.
 
 ## Metrics (Grafana's contract)
@@ -242,9 +246,9 @@ These numbers describe our routing, not the models alone. Harder and security wo
 so their per-task wall time and rounds are inflated. Author and reviewer families are paired by policy, so a
 reviewer's blocking rate partly measures the authors it is paired with; read the first-round matrix, not one
 author figure, before blaming either side. Allowance readings are pool-wide:
-overlapping write tasks on one pool are grouped and charged the pool's net drop once, while clusters shared across
-models, efforts or classes or containing a reset or tied-timestamp conflict stay unknown (`null`); the meter's
-resolution is one reading per probe. Landing depends on the
+overlapping write tasks on one pool are grouped and charged the pool's net drop once, while a cluster with a reset,
+tied-timestamp conflict, or negative net drop stays unknown (`null`) and any subgroup that only partly owns a shared
+cluster reports `null`; the meter's resolution is one reading per probe. Landing depends on the
 trailer surviving the merge or on the task observing its own merge; work merged later by another seat, through
 a squash merge that drops `X-Agent` lines, is counted as not landed. Treat a comparison as a question for the
 CTO, not a routing verdict; routing changes stay a catalog decision.

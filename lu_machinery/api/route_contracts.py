@@ -465,8 +465,9 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "task when at most 1% or 1 of 10+ tasks is untimed), review verdicts and blocking findings of parsed reviews "
         "of record, reviewer levels, author-side review rounds, first-round approval per author, first reviewer and "
         "review class, what followed a blocked first round, routed catalog models idle in the window, cluster-grouped "
-        "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). /metrics exposes "
-        "the same snapshot for 7d, 30d, 90d, all and ISO weeks.",
+        "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). /metrics exports "
+        "selected gauges from the same cached snapshot for 7d, 30d, 90d, all and ISO weeks (omitting 24h, observed "
+        "wall hours and chart series).",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
         "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
