@@ -56,7 +56,7 @@ def register_discuss_command(subparsers: Any) -> None:
         help=(
             "Required when a review discussion includes agy/gemini "
             "(--review, or channel reviews). code is refused "
-            "(the bridge refuses code review; native AGY admits low/medium risk code reviews). "
+            "(the bridge refuses code review; native AGY admits low, medium or high risk code reviews). "
             "Ukrainian content review must pass ukrainian."
         ),
     )

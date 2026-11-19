@@ -55,7 +55,7 @@ one of its paths, either name of a rename or a deletion included, is reviewed at
 whatever risk was passed. Nothing lowers that floor.
 
 One exact-head cross-family review per change (owner decision C-5345, 2026-11-12).
-High and critical risk keep an Opus or Sol reviewer. There is no second review.
+Critical risk keeps an Opus or Sol reviewer. High risk takes Sol, then Opus, then Gemini 4 Neon High (GEMINI-TIERS-1119). There is no second review.
 
 ## 3. Findings
 

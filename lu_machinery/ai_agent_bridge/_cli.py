@@ -538,7 +538,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Required for a Gemini review. code is refused "
-            "(the bridge refuses code review; native AGY admits low/medium risk code reviews). "
+            "(the bridge refuses code review; native AGY admits low, medium or high risk code reviews). "
             "Ukrainian content review must pass ukrainian."
         ),
     )
@@ -580,7 +580,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Required with --review. code is refused "
-            "(the bridge refuses code review; native AGY admits low/medium risk code reviews). "
+            "(the bridge refuses code review; native AGY admits low, medium or high risk code reviews). "
             "Ukrainian content review must pass ukrainian. "
             "Omitting the flag refuses the review and names this flag."
         ),
