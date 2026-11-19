@@ -23,7 +23,6 @@ from lu_machinery.dispatcher import checks, cli, git, store, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.review.render_contract import trusted_core_context
 from tests.helpers import current_sol
-from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
@@ -267,7 +266,7 @@ def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
     (prompts / "lexical-review.md.j2").write_text("Review {{ items }}\n")
     monkeypatch.setattr(review_mcp, "review_server_checkout", lambda: checkout)
 
-    # Git configuration is isolated by the autouse ``host_isolated_env`` fixture (tests/helpers/host_env.py).
+    # Git configuration is the session's own (tests/conftest.py keeps no inherited GIT_* setting or home).
     # The dispatch commit: one public candidate file the manifest pins.
     inputs = (tmp_path / "inputs").resolve()
     inputs.mkdir()

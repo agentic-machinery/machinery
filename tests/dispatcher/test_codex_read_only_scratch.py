@@ -13,7 +13,6 @@ from lu_machinery.dispatcher.environment import child_env, probe_env, task_scrat
 from lu_machinery.dispatcher.providers import load
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.dispatcher import write_boundary
-from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots as configured_roots
 import json
 import re

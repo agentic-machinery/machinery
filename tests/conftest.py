@@ -8,6 +8,10 @@ It cannot intercept direct terminal writes with ``-s``, ``--capture=no``,
 ``--capture=tee-sys``, ``-o log_cli=true`` or ``--log-cli-level=...``. Keep capture enabled and live logging disabled when running
 tests with credentials. Such sessions emit one warning, without values.
 ``--noconftest`` disables credential stripping, redaction and this warning together.
+
+The test process keeps only an explicit list of the environment it inherits
+(``_INHERITED_ENV``, applied at the end of this module's import); see
+``_keep_only_inherited_env``.
 """
 
 import os
@@ -106,6 +110,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # scripts.common is on the rules-workflow allowlist; scripts.lib is not.
 from lu_machinery.common.flake_quarantine import TIMEOUT_PATTERN, load_registry, rerun_node_ids
 from lu_machinery.common.repo_root import configured_primary_root, main_checkout_root
+from lu_machinery.common.test_thread_caps import THREAD_CAPS
 from tests import sparse_trees
 from tests.helpers.monitor import UNREACHABLE_MONITOR_URL, UNREACHABLE_TOOL_TIMING_URL
 
@@ -459,10 +464,15 @@ SESSION_IDENTITY_ENV_VARS = (
     "CLAUDE_ENV_FILE",
 )
 
+# The caller's choice of host test-slot pool, size and wait. The session's dispatch cap reads them when it starts
+# (``_INHERITED_ENV`` keeps them for that); a test that exercises a pool sets its own (#917 R2 F8: a caller's pool
+# otherwise reaches dispatch admission and sandbox children).
+TEST_SLOT_POOL_ENV_VARS = ("LU_TEST_SLOTS_DIR", "LU_TEST_SLOTS_COUNT", "LU_TEST_SLOTS_WAIT_S")
+
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, object, object]:
-    """Run every test without the launching agent session's identity (#8778).
+    """Run every test without the launching agent session's identity (#8778) or the caller's test-slot pool.
 
     The outermost wrapper around setup, call, and teardown, so no fixture of
     any scope sees the identity. Tests that need a variable set it themselves;
@@ -472,7 +482,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     Variables published later by the suite remain available to its tests.
     """
     with pytest.MonkeyPatch.context() as patch:
-        for name in SESSION_IDENTITY_ENV_VARS:
+        for name in (*SESSION_IDENTITY_ENV_VARS, *TEST_SLOT_POOL_ENV_VARS):
             patch.delenv(name, raising=False)
         parent = getattr(item, "callspec", None)
         mode = parent.params.get("_launcher_parent_environment") if parent is not None else None
@@ -2958,6 +2968,16 @@ def pytest_configure_node(node: Any) -> None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # Every process gets its own home inside the session's scratch run, before any hook, fixture or child process
+    # runs; the caller's home was dropped at import. Git's global configuration, its default ignore and attributes
+    # files, the XDG directories and the CODEX_HOME default resolve inside it, and so does the CLAUDE_CONFIG_DIR
+    # default wherever pytest_scratch has not set one (xdist workers). Git reads no system configuration.
+    home = tempfile.TemporaryDirectory(prefix="home-")
+    config.add_cleanup(home.cleanup)
+    home_env = pytest.MonkeyPatch()
+    config.add_cleanup(home_env.undo)
+    home_env.setenv("HOME", home.name)
+    home_env.setenv("GIT_CONFIG_NOSYSTEM", "1")
     # A session fixture alone starts after collection: test-module imports can
     # also open stores. Set the default before importing any test module.
     fleet_root = tempfile.TemporaryDirectory(prefix="fleet-comms-")
@@ -4167,3 +4187,94 @@ def low_review(monkeypatch, tmp_path):
         )
 
     return tasks, comments, statuses, files, admit
+
+
+# Inherited environment (#904). The test process keeps only these names from whoever started it. Everything else is
+# deleted once, at the end of this module's import, before any hook, fixture or child process runs: Git's GIT_*
+# settings (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_CONFIG_*), HOME and the XDG directories, Python, proxy, locale
+# and agent-session settings, product and state roots, and any name nobody listed. xdist workers and child pytest
+# sessions import this module too, so they apply the same list to what they inherit, including ``--tx env:`` values.
+_INHERITED_ENV = frozenset({
+    # The commands and the temp directory the run uses. pytest_scratch allocates the run under TMPDIR and then points
+    # TMPDIR at it; workers find the run through it. PATH loses relative entries and agent-runtime shims below.
+    "PATH",
+    "TMPDIR",
+    # What CI passes (.github/workflows/tests.yml runs pytest under ``env -i``), and what the suite's CI readers check.
+    "LU_TEST_WHEEL",
+    "MACHINERY_GATE_SEMGREP_VENV",
+    "MACHINERY_GATE_RULES_SOURCE",
+    "LEARN_UKRAINIAN_CP_PG_DSN",
+    "CI",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_STEP_SUMMARY",
+    # pytest's and xdist's own; a worker sets its PYTEST_XDIST_* names before it imports this module.
+    "PYTEST_ADDOPTS",
+    "PYTEST_PLUGINS",
+    "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+    "PYTEST_CURRENT_TEST",
+    "PYTEST_VERSION",
+    "PYTEST_XDIST_WORKER",
+    "PYTEST_XDIST_WORKER_COUNT",
+    "PYTEST_XDIST_TESTRUNUID",
+    "PYTEST_XDIST_AUTO_NUM_WORKERS",
+    # The suite's own switches (this file, pytest_scratch, tests/sparse_trees.py) and opt-ins for skipped checks.
+    "LU_PYTEST_TMP_BUDGET_GB",
+    "LU_PYTEST_SHARD_FILES",
+    "LU_PYTEST_NEEDS_ARTIFACT_COLLECTED",
+    "LU_GH_GUARD",
+    "LU_WORKTREE_GUARD",
+    "LU_FLAKE_DISABLE_RERUN",
+    "LU_KEEP_PYTEST_SCRATCH",
+    "PYTEST_BREADCRUMB_DIR",
+    "SPARSE_TEST_FORCE_MISSING_TREES",
+    "LU_TEST_FORCE_DISPATCH_SCOPE",
+    "LU_LIVE_CLAUDE_PERMISSIONS",
+    "LU_OPSEC_TEST_TOOLING",
+    # The host test-slot pool and dispatch cap (lu_machinery.ci.pytest_dispatch_cap), read as the session and each
+    # xdist worker start, before ``pytest_configure``; each test runs without the pool settings (TEST_SLOT_POOL_ENV_VARS)
+    # and without the dispatch task id (SESSION_IDENTITY_ENV_VARS).
+    "LU_TEST_SLOTS",
+    "LU_TEST_SLOTS_COUNT",
+    "LU_TEST_SLOTS_WAIT_S",
+    "LU_TEST_SLOTS_DIR",
+    "LU_TEST_SLOTS_HOLDER",
+    "LU_TEST_SLOTS_SESSION",
+    "LU_SCRATCH_ROOT",
+    "LU_PYTEST_FULL_SUITE_LOCK",
+    "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
+    *THREAD_CAPS,
+    # The write guard's anchor, which this module publishes (``_protected_store_paths``) for workers and child sessions.
+    "LU_TEST_PROTECTED_STORES",
+})
+_INHERITED_ENV_APPLIED = "_lu_inherited_env_applied"
+
+
+def _keep_only_inherited_env() -> None:
+    """Delete every inherited variable not in ``_INHERITED_ENV``, then set the values the suite owns.
+
+    It runs after the snapshots above that must see the caller's environment to protect the host (the real ``gh``
+    the guard refuses, the task store the write guard protects), and once per process. Set here:
+
+    - ``PYTHONDONTWRITEBYTECODE``: no child writes bytecode.
+    - ``LEARN_UKRAINIAN_PYTHON``: child launchers resolve this interpreter.
+    - ``PYTHONPATH``: this checkout, only when the ``lu_machinery`` this process imported is this checkout's, so a
+      child imports the same code the tests do; otherwise (CI's installed wheel) none.
+
+    ``pytest_configure`` then gives each process its own ``HOME``.
+    """
+    if getattr(sys, _INHERITED_ENV_APPLIED, False):
+        return
+    setattr(sys, _INHERITED_ENV_APPLIED, True)
+    for name in [name for name in os.environ if name not in _INHERITED_ENV]:
+        del os.environ[name]
+    entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
+    kept = [entry for entry in entries if os.path.isabs(entry) and Path(entry).parts[-2:] != ("agent_runtime", "shims")]
+    os.environ["PATH"] = os.pathsep.join(kept) or os.defpath
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.environ["LEARN_UKRAINIAN_PYTHON"] = sys.executable
+    imported = sys.modules["lu_machinery"].__file__
+    if imported is not None and Path(imported).resolve().parent.parent == _REPO_ROOT:
+        os.environ["PYTHONPATH"] = str(_REPO_ROOT)
+
+
+_keep_only_inherited_env()

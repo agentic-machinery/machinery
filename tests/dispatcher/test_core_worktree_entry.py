@@ -21,7 +21,6 @@ import sys
 import pytest
 
 from tests.dispatcher.conftest import prior_worktree
-from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 ENTRIES = [("lu_machinery/dispatch.py",), ("-m", "lu_machinery.dispatcher.cli")]

@@ -25,7 +25,6 @@ from lu_machinery.dispatcher import git, worker
 from lu_machinery.dispatcher.cli import ALIASES
 from lu_machinery.review.record_cf_verdict import _review_branch
 from tests.dispatcher.conftest import await_file, run_git
-from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 

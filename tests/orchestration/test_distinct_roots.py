@@ -465,7 +465,10 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
         with pytest.raises(rr.MachineryConfigError, match="not a real Git directory"):
             resolve()
     real = tmp_path / "real"
-    subprocess.run(["git", "init", "-q", str(real)], check=True, capture_output=True, timeout=30)
+    real.mkdir()
+    # Each repository is named explicitly, so no inherited setting can make Git initialize another.
+    subprocess.run(["git", f"--git-dir={real / '.git'}", f"--work-tree={real}", "init", "-q"],
+                   check=True, capture_output=True, timeout=30)
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(real))
     assert rr.configured_primary_root() == real
     assert rr.state_root() == real
@@ -475,8 +478,9 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
     odb = tmp_path / "odb"
     odb.mkdir()
     external = tmp_path / "external"
-    subprocess.run(["git", "init", "-q", str(external)], check=True, capture_output=True, timeout=30,
-                   env={**os.environ, "GIT_OBJECT_DIRECTORY": str(odb)})
+    external.mkdir()
+    subprocess.run(["git", f"--git-dir={external / '.git'}", f"--work-tree={external}", "init", "-q"],
+                   check=True, capture_output=True, timeout=30, env={**os.environ, "GIT_OBJECT_DIRECTORY": str(odb)})
     assert not (external / ".git" / "objects").exists()
     configured = {rr.PRIMARY_ROOT_ENV: str(external), "GIT_OBJECT_DIRECTORY": str(odb)}
     assert rr.configured_primary_root(configured) == external

@@ -38,8 +38,10 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
 
 
 def _git(root: Path, *args: str) -> str:
+    """Run Git in the fixture repository at ``root``, named explicitly so no inherited setting can choose another."""
     return subprocess.check_output(
-        ["git", *args], cwd=root, text=True, stderr=subprocess.STDOUT, timeout=30
+        ["git", f"--git-dir={root / '.git'}", f"--work-tree={root}", *args],
+        cwd=root, text=True, stderr=subprocess.STDOUT, timeout=30,
     ).strip()
 
 
