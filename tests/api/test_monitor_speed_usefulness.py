@@ -529,10 +529,11 @@ def _swr_app(monkeypatch, tmp_path, handler_factory, *, ttl: float = 10.0, vary:
     from fastapi import APIRouter, Depends, FastAPI
 
     from lu_machinery.api import state_helpers
+    from lu_machinery.api.monitor_context import MonitorRuntime
 
     now = [1000.0]
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
-    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path))
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path), runtime=MonitorRuntime())
     router = APIRouter()
     router.get("/probe")(state_helpers.swr_route("probe", ttl, vary=vary)(handler_factory(Depends(lambda: ctx))))
     probe_app = FastAPI()
@@ -635,3 +636,60 @@ def test_swr_route_caches_only_default_or_varied_parameters(monkeypatch, tmp_pat
         assert direct.json() == {"status": "done", "agent": "codex", "n": expected}
         assert "X-Snapshot-Age-S" not in direct.headers
     assert len(calls) == 4
+
+
+def test_swr_route_cached_hit_ignores_saturated_default_executor(tmp_path):
+    """Defect class: cached routes wait for a saturated executor or mix cache scopes."""
+    import asyncio
+    import concurrent.futures
+    import threading
+    from types import SimpleNamespace
+
+    from fastapi import Response
+
+    from lu_machinery.api.monitor_context import MonitorRuntime
+    from lu_machinery.api.state_helpers import swr_route
+
+    calls = []
+
+    @swr_route("executor-saturation-probe", 60, vary=("choice",))
+    def route(ctx, choice="a"):
+        calls.append((ctx.roots.project_root, choice))
+        return str(ctx.roots.project_root), choice
+
+    async def exercise():
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        release = threading.Event()
+        started = threading.Event()
+        contexts = [
+            SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path / name), runtime=MonitorRuntime())
+            for name in ("one", "two")
+        ]
+        combinations = [(contexts[0], "a"), (contexts[0], "b"), (contexts[1], "a")]
+        blocked = None
+        try:
+            for ctx, choice in combinations:
+                assert await route(ctx=ctx, choice=choice, _swr_response=Response()) == (
+                    str(ctx.roots.project_root), choice
+                )
+
+            def block_worker():
+                started.set()
+                release.wait(timeout=5)
+
+            blocked = loop.run_in_executor(None, block_worker)
+            assert started.wait(1)
+            for ctx, choice in combinations:
+                assert await asyncio.wait_for(
+                    route(ctx=ctx, choice=choice, _swr_response=Response()), timeout=0.5
+                ) == (str(ctx.roots.project_root), choice)
+            assert len(calls) == len(combinations)
+        finally:
+            release.set()
+            if blocked is not None:
+                await blocked
+            executor.shutdown(wait=True)
+
+    asyncio.run(exercise())
