@@ -374,7 +374,7 @@ Operationalizes the Claude seat selection within the 2-Tier Formal Review Routin
 * **Everyday Routine Formal Reviews** (practical roles; Codex and other seats @ `high` effort):
   * **Claude seat**: `claude-sonnet-5-5` (preserves frontier window; fast & efficient). For the `code` and `infra` review profiles, security-sensitive changed paths automatically raise effective review risk to `critical`, even when the author requests low, medium or high. The shared `lu_machinery/review/security_paths.py` classifier includes both rename names and deletions; owned paths can only add coverage. Resolve the target first. The resolver and every code/infra review-typed dispatch collect target changed paths before admission and require the catalog `critical_review` role, preserve cross-family and subject-seat exclusions, and refuse with a reason when no qualified reviewer is available (#9125). Catalog weaknesses remain descriptive.
   * **Codex seat**: `gpt-6.2-sol` @ `high` (standard review)
-  * **Gemini seat:** `gemini-4-neon-high` through native AGY. The resolver admits low-risk and medium-risk code review. Ukrainian review requires the Sources MCP and VESUM.
+  * **Gemini seat:** `gemini-4-neon-high` through native AGY. The resolver admits low-, medium- and high-risk code review (high after the OpenAI and Anthropic seats, GEMINI-TIERS-1119). Ukrainian review requires the Sources MCP and VESUM.
 Every `code` or `infra` review-typed dispatch, including `ask-* --review`, resolves its target before admission:
 branch/PR reviews collect literal changes from the base-branch merge-base to the pinned head;
 attempts require the record's `target.changed_paths`. An unresolved target refuses with
@@ -972,7 +972,8 @@ permanent capability claim. Confirm exact live strings in native CLI catalogs an
 ## Gemini routing on AGY
 
 Hydrogen Medium is the AGY work and driver pin. Neon High is the pinned consultation
-model and the native AGY reviewer for low-risk and medium-risk code. Neon High handles
+model and the native AGY reviewer for low-, medium- and high-risk code (high after the
+OpenAI and Anthropic seats, GEMINI-TIERS-1119). Neon High handles
 Ukrainian review with Sources MCP and VESUM.
 
 | Model | AGY selector | Tier | Use |

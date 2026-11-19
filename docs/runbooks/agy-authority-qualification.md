@@ -104,8 +104,10 @@ actual qualification. Infra owns #9302 role migration. The installed CLI has an
 effort flag but the inspected adapter does not wire it; actual identity proof
 has not been established here. Content-review tooling is not a substitute for
 the missing native authority-review proof. The 2026-10-08 approval lifts the
-driver exclusion and admits low-risk and medium-risk code review. The design
-input, designated approval, and high-risk and critical code/infra exclusions
+driver exclusion and admits low-risk and medium-risk code review; operator order
+GEMINI-TIERS-1119 (2026-11-19) also admits Gemini 4 Neon High for high-risk code
+review after the OpenAI and Anthropic seats. The design input, designated
+approval, infra review and critical code/infra exclusions
 remain binding until Gemini 4 qualifies here, the necessary explicit policy
 clearance is given, and the implementation is reviewed. No fallback, guessed model ID, release
 date, synthetic pass or prototype capability proof closes these gaps.
