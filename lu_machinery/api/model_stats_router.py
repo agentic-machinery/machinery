@@ -721,9 +721,12 @@ def _resolution(row: _Row, later: list[_Row]) -> _Row | None:
 
 
 def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
-    """The (repository, blocked head, approving head) pairs whose file changes decide a finding's outcome."""
+    """The (repository, blocked head, approving head) pairs whose file changes decide a finding's outcome: only
+    blocking reviews that kept the paths of at least one P0-P1 finding need one."""
     pairs: set[_HeadPair] = set()
-    for row, later, _, _ in _blocking_reviews(rows):
+    for row, later, paths, _ in _blocking_reviews(rows):
+        if not paths:
+            continue
         approval = _resolution(row, later)
         blocked = row.raw.get("pinned_head")
         approved = approval.raw.get("pinned_head") if approval else None

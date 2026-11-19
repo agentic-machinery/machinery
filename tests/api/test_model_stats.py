@@ -1183,15 +1183,19 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
                      resolved_model="pilot-model-a")
     _findings_review(tasks, "p7b-review", "correct", [], pr=7, pinned_head=h2, **approved,
                      resolved_model="pilot-model-b")
+    # PR 8: a blocking review with only a P2 finding has no P0-P1 finding to settle and needs no head pair.
+    _findings_review(tasks, "p8a-review", "incorrect", [("P2", "src/c.py")], pr=8, pinned_head=h2, **blocked)
+    _findings_review(tasks, "p8b-review", "correct", [], pr=8, pinned_head=h1, **approved)
     rows.backfill(tasks, batch_state)
     assert "src/a.py" not in rows.rows_path(batch_state).read_text()
 
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
 
-    # Distinct (repository, blocked, approved) heads: PR 1 and PR 5 share h1 to h2; PR 4's blocked head is missing.
+    # Distinct (repository, blocked, approved) heads with finding paths: PR 1 and PR 7 share h1 to h2 (PR 5 keeps no
+    # paths, so it needs no pair); PR 4's blocked head is missing.
     assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
     opus = {
-        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 5, "reviews_without_paths": 0,
+        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 6, "reviews_without_paths": 0,
         "blocking_findings": 6, "fixed": 1, "dismissed": 1, "open": 3, "unknown": 1,
         "precision": {"value": 0.5, "n": 2, "low_sample": True}, "precision_ci": stats._wilson(1, 2),
     }
