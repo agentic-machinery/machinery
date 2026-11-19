@@ -7,13 +7,15 @@ The caller's environment reaches a test, and everything it spawns, in six ways:
   files Git reads from ``$XDG_CONFIG_HOME/git`` or ``$HOME/.config/git`` when ``core.excludesFile`` and
   ``core.attributesFile`` are unset.
 - User configuration: ``HOME``, every ``XDG_*`` base directory and the config-directory overrides
-  (``CODEX_HOME``, ``CLAUDE_CONFIG_DIR``). The dispatcher reads private account bindings from these, for example
-  ``codex_accounts.json`` under the XDG learn-ukrainian config directory.
+  (``CODEX_HOME``, ``CLAUDE_CONFIG_DIR``) the caller exported. The dispatcher reads private account bindings from
+  these, for example ``codex_accounts.json`` under the XDG learn-ukrainian config directory. The suite's own
+  ``CLAUDE_CONFIG_DIR`` (a session scratch directory, ``lu_machinery.common.pytest_scratch``) stays.
 - Exported machinery and agent-shim settings: ``LU_*``, ``LEARN_UKRAINIAN_*`` and ``AGENT_*`` variables that the
   caller exported, including the product-root and primary-root variables and the shims' ``AGENT_ORIGINAL_PATH``.
 - Python startup settings: ``PYTHON*`` variables the caller exported. ``PYTHONSAFEPATH`` keeps a child's working
   directory off ``sys.path``, so ``-m lu_machinery...`` loads another installed copy; ``PYTHONPATH`` selects which
-  code a child imports.
+  code a child imports. The suite prepends its own entry to ``PYTHONPATH`` (the cursor exec tripwire), so the
+  caller's entries are removed from it and the suite's stay.
 - Agent shims on ``PATH``: an agent session puts machinery's ``git``, ``gh`` and ``npm`` shims first on ``PATH``
   (``lu_machinery.dispatcher.site_deps.SHIM_DIRS``); its ``git`` shim refuses a fixture's ``git push``.
 - Temporary files: ``TMPDIR``, which children use for their own scratch.
@@ -23,7 +25,9 @@ A module opts in by importing the fixture; it is autouse, so it runs before the 
 
     from tests.helpers.host_env import host_isolated_env  # noqa: F401
 
-An exported setting is one whose current value is the value this process inherited (``/proc/self/environ``). The
+An exported setting is one whose current value is the caller's: the environment this process started with
+(``/proc/self/environ``) or, in an xdist worker, the one its controller started with (the worker's own start
+environment already holds what the controller published, such as ``PYTHONDONTWRITEBYTECODE``). The
 values the suite publishes itself, such as the telemetry redirect, scratch root and task store, differ from the
 inherited ones and stay, so a child never loses a redirect and writes to production. Equal values cannot show who
 set a variable, so the names in ``SUITE_PUBLISHED`` are never dropped: the suite publishes each of them for every
@@ -50,35 +54,48 @@ EXPORTED_PREFIXES = ("LU_", "LEARN_UKRAINIAN_", "AGENT_", "PYTHON")
 # Values tests/conftest.py publishes for every test before this fixture runs that can equal an inherited value: the
 # constants of the session fixture ``no_free_disk_floor`` and of the autouse ``_no_host_claude_default_account``,
 # ``_no_host_usage_cache`` and ``_hermetic_dispatch_admission_host``, and the write-guard anchor
-# ``_protected_store_paths`` sets once and xdist workers and nested sessions inherit on purpose.
+# ``_protected_store_paths`` sets once and xdist workers and nested sessions inherit on purpose; the checkout path
+# of the autouse ``_scope_real_checkout_acp_execution_to_tmp``; and the ``PYTHONDONTWRITEBYTECODE=1`` that
+# ``lu_machinery.common.pytest_scratch`` publishes for every session.
 SUITE_PUBLISHED = frozenset({
     "LU_EVIDENCE_FREE_DISK_FLOOR_BYTES",
     "LU_CLAUDE_DEFAULT_ACCOUNT_FILE",
     "LU_USAGE_CACHE_FILE",
     "LU_TEST_DISPATCH_HEALTHY_HOST",
     "LU_TEST_PROTECTED_STORES",
+    "LU_TEST_ACP_PRIMARY_ROOT",
+    "PYTHONDONTWRITEBYTECODE",
 })
+SEARCH_PATH_VARIABLE = "PYTHONPATH"
 INTERPRETER_VARIABLE = "LEARN_UKRAINIAN_PYTHON"
 
 
 def inherited_environment() -> dict[str, str]:
-    """The environment this process started with, before the suite or a test changed ``os.environ``.
+    """The caller's environment, before the suite or a test changed ``os.environ``.
 
-    Fails the test rather than guessing when the start environment cannot be read.
+    That is this process's start environment, or for an xdist worker (``PYTEST_XDIST_WORKER``) its controller's,
+    the process that started it. Fails the test rather than guessing when it cannot be read.
     """
+    source = f"/proc/{os.getppid()}/environ" if os.environ.get("PYTEST_XDIST_WORKER") else "/proc/self/environ"
     try:
-        raw = Path("/proc/self/environ").read_bytes()
+        raw = Path(source).read_bytes()
     except OSError as exc:
-        pytest.fail(f"host_isolated_env needs /proc/self/environ to tell inherited settings apart: {exc}")
+        pytest.fail(f"host_isolated_env needs {source} to tell the caller's settings apart: {exc}")
     pairs = (entry.split(b"=", 1) for entry in raw.split(b"\0") if b"=" in entry)
     return {os.fsdecode(name): os.fsdecode(value) for name, value in pairs}
 
 
 def caller_exported(name: str, value: str, inherited: dict[str, str]) -> bool:
-    """True for a machinery, shim or Python setting that still holds the caller's value and the suite does not own."""
-    if not name.startswith(EXPORTED_PREFIXES) or name in SUITE_PUBLISHED:
+    """True for a machinery, shim, Python or config-directory setting that still holds the caller's value."""
+    if not (name.startswith(EXPORTED_PREFIXES) or name in CONFIG_DIR_VARIABLES) or name in SUITE_PUBLISHED:
         return False
     return inherited.get(name) == value
+
+
+def without_caller_entries(value: str, inherited: str | None) -> str:
+    """``value`` without the entries of the caller's ``inherited`` search path, in order."""
+    caller = set((inherited or "").split(os.pathsep))
+    return os.pathsep.join(entry for entry in value.split(os.pathsep) if entry and entry not in caller)
 
 
 def without_shims(search_path: str) -> str:
@@ -106,12 +123,14 @@ def host_isolated_env(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pyt
     """Drop the caller's Git, user-config, exported, Python, shim and temp settings; return the test's private home."""
     inherited = inherited_environment()
     for name, value in list(os.environ.items()):
-        if (
-            name.startswith((GIT_PREFIX, XDG_PREFIX))
-            or name in CONFIG_DIR_VARIABLES
-            or caller_exported(name, value, inherited)
-        ):
+        if name.startswith((GIT_PREFIX, XDG_PREFIX)) or caller_exported(name, value, inherited):
             monkeypatch.delenv(name)
+    if SEARCH_PATH_VARIABLE in os.environ:
+        search_path = without_caller_entries(os.environ[SEARCH_PATH_VARIABLE], inherited.get(SEARCH_PATH_VARIABLE))
+        if search_path:
+            monkeypatch.setenv(SEARCH_PATH_VARIABLE, search_path)
+        else:
+            monkeypatch.delenv(SEARCH_PATH_VARIABLE)
     monkeypatch.setenv("PATH", without_shims(os.environ.get("PATH", os.defpath)))
 
     home = tmp_path_factory.mktemp("home")
