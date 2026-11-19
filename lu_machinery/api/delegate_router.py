@@ -628,7 +628,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                     if not alive:
                         continue
             else:
-                task = read_cached_task_record(path, tasks_dir=tasks_dir, display_unknown_schema=True)
+                task = _read_task_state(str(path), tasks_dir=tasks_dir)
                 if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
                     continue
                 status, alive = _derived_task_status(task)
