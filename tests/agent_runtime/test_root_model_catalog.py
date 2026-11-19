@@ -46,7 +46,7 @@ CURRENT_SOL = current_sol()
     ("anthropic_practical", "native", "lu_machinery.dispatch", "claude", "claude-sonnet-5-5", None),
     ("mechanical_worker", "native", "lu_machinery.dispatch", "claude", "claude-haiku-5-5", "high"),
     ("bounded_worker", "native", "lu_machinery.dispatch", "codex", "gpt-6-luna", "high"),
-    ("google_bounded", "native", "lu_machinery.dispatch", "agy", "gemini-3.8-flash-high", "high"),
+    ("google_bounded", "native", "lu_machinery.dispatch", "agy", "gemini-4-neon-high", "high"),
 ])
 def test_catalog_invocations_pin_supported_launchers_and_flags(seat, route, launcher, agent, model, effort):
     catalog = load_model_catalog()
@@ -317,7 +317,7 @@ def test_fable_is_refused_every_review_and_consult_activity(model, activity):
     assert f"review_scheduler.activity_roles.{activity}" in refusal
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", CURRENT_SOL, "gemini-3.8-flash-high", "claude-sonnet-5-5"])
+@pytest.mark.parametrize("model", ["claude-opus-5-5", CURRENT_SOL, "gemini-4-neon-high", "claude-sonnet-5-5"])
 @pytest.mark.parametrize("activity", ["review", "consult"])
 def test_opus_sol_and_reviewers_are_admitted_every_activity(model, activity):
 
@@ -328,7 +328,8 @@ def test_recon_models_consult_but_never_review():
 
     assert activity_role_refusal("gpt-6-luna", "consult") is None
     assert activity_role_refusal("gemini-4-neon-high", "consult") is None
-    assert "holds no review" in activity_role_refusal("gemini-4-neon-high", "review")
+    assert "holds no review" in activity_role_refusal("gemini-4-hydrogen-medium", "review")
+    assert "holds no review" in activity_role_refusal("gemini-3.8-flash-high", "review")
     assert "is retired" in activity_role_refusal("gemini-4-carbon-medium", "consult")
     assert "holds no review" in activity_role_refusal("gpt-6-luna", "review")
 
@@ -436,7 +437,7 @@ def test_catalog_requires_activity_roles_for_reviewers_and_the_advisor(mutate, m
         validate_catalog(catalog)
 
 
-@pytest.mark.parametrize("candidate", ["claude-sonnet-5-5", "gemini-3.8-flash-high"])
+@pytest.mark.parametrize("candidate", ["claude-sonnet-5-5", "gemini-4-neon-high"])
 def test_catalog_rejects_a_high_ladder_seat_outside_risk_reviewer_models(candidate):
     """#9538: the high ladder can list only the models risk_reviewer_models.high names."""
     broken = deepcopy(load_model_catalog())
@@ -479,7 +480,7 @@ def test_catalog_refuses_gemini_on_other_review_transport():
     broken = deepcopy(load_model_catalog())
     broken["review_candidates"]["google_review"] = {
         **broken["review_candidates"]["openai_frontier"],
-        "model_id": "gemini-3.8-flash-high",
+        "model_id": "gemini-4-neon",
     }
     with pytest.raises(ModelCatalogError, match="requires the native AGY route"):
         validate_catalog(broken)
@@ -1224,7 +1225,7 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
 
 @pytest.mark.parametrize(
     ("agent", "model"),
-    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-neon-high"),
+    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-3.8-flash-high"),
      ("agy", "gemini-4-hydrogen-medium"), ("agy", "gemini-4-hydrogen-xhigh")],
 )
 def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent, model):
@@ -1232,7 +1233,7 @@ def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent,
 
     Dispatch admission must refuse it before any worktree or provider starts; the verdict
     recorder's later refusal only discards a run that already happened (#9583). The same
-    model stays admitted for untyped read-only work. Neon and Hydrogen hold no review role.
+    model stays admitted for untyped read-only work. Flash and Hydrogen hold no review role.
     """
     from lu_machinery.dispatcher import checks
 

@@ -45,7 +45,7 @@ project_python_command "$py"
 if ! printf '%s\n' "$PROMPT" | timeout 180 \
         "${PROJECT_PYTHON_COMMAND[@]}" -m lu_machinery.ai_agent_bridge ask-agy - \
             --task-id "$TASK_ID" \
-            --to-model gemini-3.8-flash-high \
+            --to-model gemini-4-neon-high \
             --stdout-only \
             --from claude \
         > "$OUT_FILE" 2> "$ERR_FILE"; then

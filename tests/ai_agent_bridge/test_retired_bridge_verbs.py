@@ -233,7 +233,7 @@ def test_ask_gemini_default_model_is_none_so_registry_pin_applies() -> None:
     assert resolve_compat_model("gemini", args.model) is None
     # The route resolver then applies the live pin — and accepts it.
     route = resolve_inter_agent_route("agy")
-    assert route.model == registered_participant_model("agy")
+    assert route.model == registered_participant_model("agy") == "gemini-4-neon-high"
 
 
 def test_resolve_compat_model_tracks_pin_rotation(monkeypatch) -> None:
@@ -251,7 +251,7 @@ def test_resolve_compat_model_tracks_pin_rotation(monkeypatch) -> None:
     # generation must not silently upgrade, even when the registry rotates (#9301).
     assert resolve_compat_model("gemini", "gemini-3-flash-preview") == "gemini-9.9-flash-high"
     assert resolve_compat_model("gemini", "gemini-3.0-flash-preview") == "gemini-9.9-flash-high"
-    with pytest.raises(ValueError, match=r"gemini-3\.7-flash.*retired.*use gemini-3\.8-flash-high"):
+    with pytest.raises(ValueError, match=r"gemini-3\.7-flash.*retired.*use gemini-4-hydrogen"):
         resolve_compat_model("gemini", "gemini-3.7-flash")
     # Non-Gemini model ids pass through for the route resolver to judge loudly.
     assert resolve_compat_model("gemini", "custom-provider/model-x") == "custom-provider/model-x"

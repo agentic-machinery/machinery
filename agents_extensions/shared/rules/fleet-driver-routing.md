@@ -94,7 +94,7 @@ stampede one hot lane.
 | **Cursor, Other Models** | named third-party model, non-review work only; never a review (D-129, #10464) | Pin only an approved concrete slug from § Cursor pools. Draws the API pool. A review goes to the `resolve-reviewer` pick instead. |
 | **DeepSeek V4.1 Flash** | Latest `deepseek-v4.1-flash` coding through opencode | Direct DeepSeek API or OpenRouter with a named US provider allow-list; never private-repository content or secrets. Pro and older are retired. Review-of-record and Ukrainian work need measured evidence first. `lu_machinery/ai_agent_bridge/routing_guard.py` still refuses `openrouter/deepseek` until a named US provider allow-list exists. `ask-deepseek` remains consult-only for non-language work. |
 | **Kimi** | retired (OO-58, #11327) | do not dispatch; every Kimi id is refused |
-| **AGY Gemini** | agentic scripts; language-lane content review stays on `gemini-3.8-flash-high` | `gemini-4-hydrogen-medium` (work default, HYDROGEN-REPLACES-38) |
+| **AGY Gemini** | agentic scripts; Ukrainian review uses `gemini-4-neon-high` with Sources MCP and VESUM | `gemini-4-hydrogen-medium` (work default, HYDROGEN-REPLACES-38) |
 | **Claude Sonnet** | routine judgment/CF | Opus 5.5 / Sol 6.2 for hard judgment; ~1 Claude driver |
 
 **OpenRouter:** use only active catalog routes with their data and provider restrictions.

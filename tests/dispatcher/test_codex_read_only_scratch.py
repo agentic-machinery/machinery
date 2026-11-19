@@ -156,7 +156,7 @@ def dispatch(tmp_path, monkeypatch):
     schema.write_text('{"type":"object","required":["verdict"]}')
 
     def invoke(path="schema.json", agent="sol", expected=0, review=False, review_profile="code", task_id="schema"):
-        model = {"agy": "gemini-3.8-flash-high", "claude": "claude-opus-5-5"}.get(agent, CURRENT_SOL)
+        model = {"agy": "gemini-4-neon-high", "claude": "claude-opus-5-5"}.get(agent, CURRENT_SOL)
         args = ["dispatch", "--agent", agent, "--model", model, "--task-id", task_id, "--prompt", "Review"]
         if agent == "agy" and review_profile is not None:
             args += ["--review-profile", review_profile]

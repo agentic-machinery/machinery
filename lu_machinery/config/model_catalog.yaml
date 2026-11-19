@@ -284,7 +284,7 @@ execution_routing:
     # for the preferred worker. Luna needs a complete advisory envelope from the
     # advisor above, supplied by the driver, unless a driver brief admits it.
     # Dispatch does not inject the envelope. Bounded execution is not review
-    # authority. Gemini 3.8 Flash High on AGY is a general worker and is not
+    # authority. Gemini 4 Hydrogen on AGY is a general worker and is not
     # on this route (#12291).
     autonomous_fallback:
       model_id: {role: openai_frontier_coder}
@@ -750,32 +750,11 @@ models:
     tier: frontier_practical
     lifecycle: active
     aliases: [gemini-3.8-flash, gemini-3.8-flash-medium, gemini-3.8-flash-low]
-    # The first-choice Ukrainian reviewer (core.md P2). The 2026-10-08 approval adds low-risk and
-    # medium-risk code review through native AGY; high/critical and security paths remain excluded.
-    # Hard gates, suitability and quality still precede health/quota tie-breaks.
-    roles: [implementation, agentic_coding, subagent_work, multimodal_analysis, ukrainian_review, long_context_review]
+    roles: [historical_record_resolution]
     transports: [agy]
     strengths: [token_efficient_agentic_loops, fast_tool_use, coding_benchmark_gains, low_cost]
     weaknesses: [not_default_critical_authority, deep_architecture_prefers_sol]
-    notes: >-
-      Operator order HYDROGEN-REPLACES-38 (2026-11-15): Google is retiring 3.8
-      Flash, and Gemini 4 Hydrogen at medium replaces it as the default AGY and
-      Gemini work model. This row stays selectable by explicit pin until Google
-      retires it, and it keeps the review, Ukrainian review, driver and ACP
-      consultation seats that Hydrogen does not hold, plus the legacy gemini
-      runtime lane's fallback ladder. Was the default AGY Flash
-      pin (operator GO 2026-09-02). Live `agy models` probe
-      2026-09-02 lists gemini-3.8-flash-high/medium/low; older Flash
-      generations are retired. Native AGY subscribed seat — never OpenRouter.
-      Ukrainian-lane default is the Text Arena language-category jump vs 3.7
-      Flash High (lmarena 2026-09-02, Gemini 3.8 Flash High): Writing,
-      Literature & Language #7→#3; Multi-Turn #9→#4; Longer Query #13→#5;
-      Hard Prompts (English) #23→#6; Hard Prompts #13→#7; Instruction
-      Following #11→#9; Coding #22→#7. Text Arena overall #7 (1494) vs
-      Claude Opus 5 High #8 (1492) and Gemini 3.7 Flash High #10 (1491).
-      Agent Arena #14 (+5.94%) vs 3.7 Flash High #32 (+0.84%) is supporting
-      agentic evidence, not the language-lane reason. WebDev Code Arena #18
-      (1567) is not a Ukrainian-lane claim. Not Sol/Opus authority.
+    notes: Explicit AGY pin until Google retires it. Existing receipts retain this identity.
     sources:
       - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/3-8-flash-and-3-8-flash-cyber/
@@ -831,7 +810,7 @@ models:
     tier: frontier_practical
     lifecycle: active
     runtime_model_ids: [gemini-4-neon-low, gemini-4-neon-medium, gemini-4-neon-xhigh]
-    roles: [advisory]
+    roles: [advisory, long_context_review, ukrainian_review]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels]
     weaknesses: [provider_listing_is_not_qualification]
@@ -842,11 +821,14 @@ models:
       medium for even PR numbers. For non-PR work, use the first hex digit of
       the stable task ID's SHA-256, with the same parity rule. Without a stable
       ID use high, the AGY wire default. Pass the exact selector in each
-      dispatch. Formal review still requires its own catalog seat. Google's
+      dispatch for supplemental work. Native formal code review uses Neon High
+      at low or medium risk and excludes security paths. Ukrainian review uses
+      Neon High with the Sources MCP and VESUM. ACP consultation pins Neon High.
+      Google's
       AA Index v5.0.1 chart shows Neon high
       around 60 at USD 3.7 per task, matching Carbon's highest score and
       costing less than Carbon medium (around 58 at USD 5.2). These are vendor
-      claims. Neon review qualification depends on observed review outcomes.
+      claims.
     sources:
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-neon/
   gemini-4-hydrogen:
@@ -859,7 +841,7 @@ models:
     # -medium is the routing wire id; -low, -high and -xhigh are runtime ids for
     # explicit selection and identity attestation, not aliases.
     runtime_model_ids: [gemini-4-hydrogen-low, gemini-4-hydrogen-high, gemini-4-hydrogen-xhigh]
-    # Work roles only: no review, Ukrainian review or advisory role.
+    # Work and driving; review and consultation use the Neon seat.
     roles: [implementation, agentic_coding, subagent_work, multimodal_analysis]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels, lower_price_than_carbon]
@@ -880,8 +862,7 @@ models:
       gemini-4-hydrogen-low. Dispatch: `python -m lu_machinery.dispatch dispatch
       --agent agy --model gemini-4-hydrogen-medium`; -low, -high and -xhigh are
       explicit selections only. Hydrogen holds no review role, so it is refused
-      for any review of record; it is not a council member. Review ladders, the
-      Ukrainian review route and the certified Gemini driver seat are unchanged.
+      for any review of record; it is not a council member.
       Model card (2026-11-12):
       adapted from Gemini 4 Carbon, one 1M-token window shared by input and
       output (64K synchronous output by default), knowledge cutoff March 2026,
@@ -945,7 +926,7 @@ models:
     family: google
     tier: frontier_practical
     lifecycle: retired
-    replaced_by: gemini-3.8-flash-high
+    replaced_by: gemini-4-hydrogen
     aliases: [gemini-3.7-flash, gemini-3.7-flash-medium, gemini-3.7-flash-low]
     roles: [historical_record_resolution]
     transports: []
@@ -961,7 +942,7 @@ models:
     family: google
     tier: frontier_practical
     lifecycle: retired
-    replaced_by: gemini-3.8-flash-high
+    replaced_by: gemini-4-hydrogen
     aliases: [gemini-3.6-flash, gemini-3.6-flash-medium, gemini-3.6-flash-low]
     roles: [historical_record_resolution]
     transports: []
@@ -985,7 +966,7 @@ models:
     family: google
     tier: strong_efficient
     lifecycle: retired
-    replaced_by: gemini-3.8-flash-high
+    replaced_by: gemini-4-hydrogen
     aliases: [gemini-3.5-flash, gemini-3.5-flash-medium, gemini-3.5-flash-low]
     roles: [historical_record_resolution]
     transports: []
@@ -1371,7 +1352,7 @@ review_candidates:
   claude-opus-5-5-agy: {role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: candidate}
   claude-sonnet-5-5: {role: legacy_reviewers, seat: anthropic_practical, route_name: native, field: candidate}
   claude-sonnet-5-5-agy: {role: legacy_reviewers, seat: anthropic_practical, route_name: agy, field: candidate}
-  gemini-3.8-flash-high: {role: legacy_reviewers, seat: google_bounded, route_name: native, field: candidate}
+  gemini-4-neon-high: {role: legacy_reviewers, seat: google_bounded, route_name: native, field: candidate}
 
 # Fleet-comms stream orchestrator seats (#5512 / #4707 / #5703). These lanes may own a
 # cold-start loop (prioritize → delegate → CF → merge-in-lane).
@@ -1379,7 +1360,6 @@ review_candidates:
 # parent-owned sealed MCP. Grok reviews through Cursor and holds no driver seat;
 # Kimi: web, UI and backend coding only, never review.
 # Parallel escalate ladder (user 2026-07-22): practical default + authority deep.
-# Same shape for every orchestrator seat — like AGY Flash → Pro.
 orchestrator_seats:
   claude:
     model_id: {role: anthropic_authority_reviewer}
@@ -1418,18 +1398,14 @@ orchestrator_seats:
   # start/end rollover-token overhead relative to its small context" — see the 2026-07-23 note
   # above for why that calculus changed.
   agy:
-    model_id: {role: legacy_reviewers, seat: google_bounded}
-    effort: high
-    escalate_model_id: {role: legacy_reviewers, seat: google_bounded}
-    escalate_effort: high
+    model_id: gemini-4-hydrogen
+    effort: medium
+    escalate_model_id: gemini-4-hydrogen
+    escalate_effort: medium
     escalate_when: n/a_same_sku
     note: >-
-      Google-family seat. Gemini may drive epics (2026-10-08 approval):
-      start-gemini-driver.sh defaults to gemini-3.8-flash-high and refuses every other Gemini id. The 2026-10-08 approval also
-      admits Gemini as a formal reviewer of low-risk and medium-risk code, and of Ukrainian work with
-      the Sources MCP; high-risk and critical review stay with Opus 5.5 or Sol 6.2 under the current qualification policy. Security-path code reviews remain excluded.
-      Native AGY review dispatches run directly in the exact-head worktree. Design input and designated approval stay
-      with Opus 5.5 and Sol 6.2.
+      start-gemini-driver.sh uses the Hydrogen Medium wire ID
+      gemini-4-hydrogen-medium as the only certified Gemini driver pin.
   # C-5307 restores an explicit Cursor review pin, not a Cursor driver or Auto allowlist.
 
 # Formal CF transport defaults (model + effort; sealed review-pr was removed in #8520). Advisor/authority
@@ -1649,14 +1625,14 @@ seats:
         effort: high
         invocation: .venv/bin/python -m lu_machinery.dispatch dispatch --agent codex --model {wire_id} --effort high
   google_bounded:
-    model_id: gemini-3.8-flash-high
+    model_id: gemini-4-neon
     bindings:
     - legacy_review_candidate
     priority: 100
     decision_reference: scripts/config/model_catalog.yaml#execution_routing
     routes:
       native:
-        legacy_name: gemini-3.8-flash-high
+        legacy_name: gemini-4-neon-high
         review_profiles: [code]
         capabilities: [code_review]
         health_keys: [agy, gemini]

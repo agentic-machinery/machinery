@@ -1456,14 +1456,14 @@ fi
         ("start-gemini.sh", ["--effort", "xhigh"], {}, "", 2),
         ("start-gemini.sh", ["--effort", "max"], {}, "", 2),
         ("start-gemini-driver.sh", ["--epic", "infra", "--effort", "low"], {}, "", 4),
-        ("start-gemini-driver.sh", ["--epic", "infra"], {"LAUNCHER_EFFORT": "medium"}, "", 4),
+        ("start-gemini-driver.sh", ["--epic", "infra"], {"LAUNCHER_EFFORT": "high"}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "--effort", "low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "--effort=low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-effort", "low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-effort=low"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model", "gemini-4-neon-high"], {}, "", 4),
         ("start-gemini-driver.sh", ["--epic", "infra", "--", "-model=gemini-4-neon-high"], {}, "", 4),
-        ("start-gemini-driver.sh", ["--epic", "infra", "--effort", "high"], {}, "gemini-3.8-flash-high", 0),
+        ("start-gemini-driver.sh", ["--epic", "infra", "--effort", "medium"], {}, "gemini-4-hydrogen-medium", 0),
     ],
 )
 def test_gemini_effort_does_not_conflict_or_bypass_driver_certification(name, args, env, model, code):

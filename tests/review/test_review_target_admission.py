@@ -233,7 +233,7 @@ def test_a_non_kimi_request_resolves_unchanged():
 
 
 @pytest.mark.parametrize("seat", ["agy", "gemini"])
-@pytest.mark.parametrize("model", [None, "gemini-3.8-flash-high"])
+@pytest.mark.parametrize("model", [None, "gemini-4-neon-high"])
 @pytest.mark.parametrize("author", [None, CURRENT_SOL])
 def test_explicit_review_risk_dispatch_refuses_before_target_reads(seat, model, author):
     """D1: omission refuses before target reads, alias resolution and route probes."""
@@ -257,7 +257,7 @@ def test_explicit_review_risk_dispatch_refuses_before_target_reads(seat, model, 
     assert all(value in str(refused.value) for value in ("low", "medium", "high", "critical"))
 
 
-@pytest.mark.parametrize("model", [None, "gemini-3.8-flash-high"])
+@pytest.mark.parametrize("model", [None, "gemini-4-neon-high"])
 @pytest.mark.parametrize("risk", [None, "", "invalid"])
 @pytest.mark.parametrize("branch_facts", [False, True])
 def test_explicit_review_risk_direct_agy_requires_valid_declaration(tmp_path, monkeypatch, model, risk, branch_facts):
@@ -296,7 +296,7 @@ def test_explicit_review_risk_direct_agy_requires_valid_declaration(tmp_path, mo
 @pytest.mark.parametrize("stage", ["selection", "budget", "route", "registry"])
 def test_explicit_review_risk_selected_agy_cannot_bypass_declaration(monkeypatch, stage):
     """D2: check risk even if an upstream selection unexpectedly returns AGY."""
-    selected = ("agy", "gemini-3.8-flash-high")
+    selected = ("agy", "gemini-4-neon-high")
     calls = []
     if stage in {"selection", "budget"}:
 
@@ -331,27 +331,33 @@ def test_explicit_review_risk_selected_agy_cannot_bypass_declaration(monkeypatch
 @pytest.mark.parametrize("path_kind", ["changed", "owned"])
 def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
     """D5/D6: declared low risk never bypasses a security floor or attempt identity."""
-    paths = {f"review_{path_kind}_paths": ("scripts/delegate.py",)}
+    request = {
+        "model": "gemini-4-neon-high",
+        "mode": "read-only",
+        "review_dispatch": True,
+        "review_author_model": CURRENT_SOL,
+        "review_risk": risk,
+        "review_attempt": True,
+        "claude_account": HOST_ACCOUNT,
+    }
+    scope_argument = f"review_{path_kind}_paths"
+    (ordinary_target,) = resolve_and_admit(
+        ("agy",), **request, **{scope_argument: ("ordinary.py",)},
+    )
+    assert (ordinary_target.recipient, ordinary_target.model) == ("agy", "gemini-4-neon-high")
+
     with pytest.raises(ReviewAdmissionRefused, match="REVIEW_ATTEMPT_IDENTITY_REFUSED"):
         resolve_and_admit(
-            ("agy",),
-            model="gemini-3.8-flash-high",
-            mode="read-only",
-            review_dispatch=True,
-            review_author_model=CURRENT_SOL,
-            review_risk=risk,
-            review_attempt=True,
-            **paths,
-            claude_account=HOST_ACCOUNT,
+            ("agy",), **request, **{scope_argument: ("scripts/delegate.py",)},
         )
 
 
 @pytest.mark.parametrize(
     "seat,model,entry,profile",
     [
-        ("agy", "gemini-3.8-flash-high", "dispatch", "ukrainian"),
-        ("agy", "gemini-3.8-flash-high", "mode", "ukrainian"),
-        ("agy", "gemini-3.8-flash-high", "flag", "ukrainian"),
+        ("agy", "gemini-4-neon-high", "dispatch", "ukrainian"),
+        ("agy", "gemini-4-neon-high", "mode", "ukrainian"),
+        ("agy", "gemini-4-neon-high", "flag", "ukrainian"),
         ("codex", CURRENT_SOL, "dispatch", "code"),
         ("codex", CURRENT_SOL, "mode", "code"),
         ("codex", CURRENT_SOL, "flag", "code"),
@@ -474,7 +480,7 @@ def test_review_admission_uses_complete_branch_authorship_like_the_recorder(tmp_
     # A third-family seat (Google; Grok is retired, GROK-CANCEL-1110) is refused for a mixed-family branch.
     with pytest.raises(ReviewAdmissionRefused, match="mixed-family review requires"):
         resolve_and_admit(
-            ("agy",), model="gemini-3.8-flash-high", review_facts=lambda: facts, **trusted, claude_account=HOST_ACCOUNT
+            ("agy",), model="gemini-4-neon-high", review_facts=lambda: facts, **trusted, claude_account=HOST_ACCOUNT
         )
 
     # The recorder reaches the same verdicts on the same facts.
@@ -483,7 +489,7 @@ def test_review_admission_uses_complete_branch_authorship_like_the_recorder(tmp_
     )
     with pytest.raises(recorder.RecordError, match="mixed-family review requires"):
         recorder._require_qualified_reviewer(
-            facts, task={"agent": "agy", "review_risk": "medium"}, model="gemini-3.8-flash-high", family="google"
+            facts, task={"agent": "agy", "review_risk": "medium"}, model="gemini-4-neon-high", family="google"
         )
 
 

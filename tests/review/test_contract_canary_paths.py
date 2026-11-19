@@ -43,7 +43,7 @@ RECEIPT = json.dumps({
 
 
 MODELS = {
-    "agy": "gemini-3.8-flash-high",
+    "agy": "gemini-4-neon-high",
     "claude": "claude-sonnet-5-5",
     "codex": CURRENT_SOL,
     "cursor": "grok-4.7-high",
@@ -161,7 +161,7 @@ def test_record_refuses_a_task_that_is_not_canary_evidence(repo, changes: dict, 
     [
         ("cursor", {"resolved_model": "Claude Fable 5.1"}),
         ("cursor", {"resolved_model_known": False}),
-        ("agy", {"resolved_model": "claude-fable-5-1"}),
+        ("agy", {"resolved_model": "gemini-4-hydrogen-medium"}),
         ("agy", {"resolved_model_known": False}),
     ],
 )

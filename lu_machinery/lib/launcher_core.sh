@@ -156,13 +156,12 @@ $driver_mode
 Options:
   -h, --help                 Show this help and exit.
   --model MODEL              Provider model. Claude driver default: claude-opus-5-5[1m].
-                             Gemini driver default: gemini-3.8-flash-high (only certified id);
-                             Gemini interactive default:
-                             gemini-4-hydrogen-medium. Claude interactive: omit to use
+                             Gemini default: ${LC_GEMINI_DRIVER_MODEL} (only certified driver id).
+                             Claude interactive: omit to use
                              project settings (Sonnet 5.5).
   --effort LEVEL             Session effort when supported (Claude Code/AGY --effort).
                              Gemini selects the matching model
-                             variant; its driver requires high and forbids forwarded
+                             variant; its driver requires medium and forbids forwarded
                              effort flags. Claude driver default: high. Otherwise omit
                              to keep last session selection. Other providers ignore.
   --harness HARNESS          Provider harness (default: ${LC_HARNESS}).
@@ -384,13 +383,7 @@ launcher_defaults() {
       LC_HARNESS="${LAUNCHER_HARNESS:-codex}"
       ;;
     gemini)
-      # The driver keeps the certified Flash seat; interactive sessions use the
-      # Gemini work default, Hydrogen at medium (operator 2026-11-15/17).
-      if [ "$LC_MODE" = driver ]; then
-        LC_MODEL="${LAUNCHER_MODEL:-gemini-3.8-flash-high}"
-      else
-        LC_MODEL="${LAUNCHER_MODEL:-gemini-4-hydrogen-medium}"
-      fi
+      LC_MODEL="${LAUNCHER_MODEL:-$LC_GEMINI_DRIVER_MODEL}"
       LC_HARNESS="${LAUNCHER_HARNESS:-agy}"
       ;;
     muse)
@@ -863,12 +856,12 @@ launcher_validate_mode() {
   LC_EPIC="$(launcher_session_epic "$LC_EPIC")"
 }
 
-# Gemini drives epics only through start-gemini-driver.sh on the two certified
-# AGY pins (2026-10-08 approval). Any other Gemini model id, and a Gemini model
+# Gemini drives epics only through start-gemini-driver.sh on the certified
+# AGY pin. Any other Gemini model id, and a Gemini model
 # id on another provider's driver, is refused before scope entry or startup.
 # A provider --model forwarded after `--` would put a second, uncertified model
 # on the agy exec line, so the Gemini driver refuses it as well.
-LC_GEMINI_DRIVER_MODELS='gemini-3.8-flash-high'
+LC_GEMINI_DRIVER_MODEL='gemini-4-hydrogen-medium'
 
 launcher_refuse_uncertified_gemini_driver() {
   local arg
@@ -878,26 +871,26 @@ launcher_refuse_uncertified_gemini_driver() {
     for arg in "${LC_FORWARD_ARGS[@]+"${LC_FORWARD_ARGS[@]}"}"; do
       case "$arg" in
         --model|--model=*|-model|-model=*|--effort|--effort=*|-effort|-effort=*)
-          launcher_error "the gemini driver takes its model and effort from launcher options, not from forwarded '$arg' (certified: $LC_GEMINI_DRIVER_MODELS)."
+          launcher_error "the gemini driver takes its model and effort from launcher options, not from forwarded '$arg' (certified: $LC_GEMINI_DRIVER_MODEL)."
           exit 4
           ;;
       esac
     done
   fi
   case "$LC_PROVIDER:$LC_MODEL" in
-    gemini:gemini-3.8-flash-high)
-      if [ -n "${LC_EFFORT:-}" ] && [ "$LC_EFFORT" != high ]; then
-        launcher_error "effort '$LC_EFFORT' is not certified for the gemini driver (requires high)."
+    gemini:"$LC_GEMINI_DRIVER_MODEL")
+      if [ -n "${LC_EFFORT:-}" ] && [ "$LC_EFFORT" != medium ]; then
+        launcher_error "effort '$LC_EFFORT' is not certified for the gemini driver (requires medium)."
         exit 4
       fi
       return 0
       ;;
     gemini:*)
-      launcher_error "model '$LC_MODEL' is not certified for the gemini driver (certified: $LC_GEMINI_DRIVER_MODELS)."
+      launcher_error "model '$LC_MODEL' is not certified for the gemini driver (certified: $LC_GEMINI_DRIVER_MODEL)."
       exit 4
       ;;
     *:gemini-*|*:gemini:*)
-      launcher_error "model '$LC_MODEL' is a Gemini model; it drives only through start-gemini-driver.sh (certified: $LC_GEMINI_DRIVER_MODELS)."
+      launcher_error "model '$LC_MODEL' is a Gemini model; it drives only through start-gemini-driver.sh (certified: $LC_GEMINI_DRIVER_MODEL)."
       exit 4
       ;;
   esac
@@ -912,7 +905,7 @@ launcher_validate_driver_certification() {
     return 0
   fi
   case "$LC_PROVIDER:$LC_MODEL" in
-    claude:claude-opus-5-5|claude:claude-opus-5-5\[1m\]|claude:claude-fable-5-1|claude:claude-fable-5-2|claude:claude-sonnet-5-5|codex:gpt-6.2-sol|gemini:gemini-3.8-flash-high|muse:muse-wonder-full-1.0)
+    claude:claude-opus-5-5|claude:claude-opus-5-5\[1m\]|claude:claude-fable-5-1|claude:claude-fable-5-2|claude:claude-sonnet-5-5|codex:gpt-6.2-sol|gemini:"$LC_GEMINI_DRIVER_MODEL"|muse:muse-wonder-full-1.0)
       return 0
       ;;
     *)

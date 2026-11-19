@@ -129,8 +129,13 @@ def resolve_compat_model(command_target: str, model: str | None) -> str | None:
                     f"model {model!r}. A model accepted by AGY is "
                     f"`{accepted_model or AgyAdapter.default_model}`."
                 )
-            if AgyAdapter.model_ids_match(model, pin) or (
-                accepted_model and "flash" in accepted_model and AgyAdapter.is_legacy_model_alias(model)
+            if AgyAdapter.model_ids_match(model, pin):
+                return pin
+            if (
+                accepted_model
+                and "-flash-" in accepted_model
+                and "-flash-" in pin
+                and AgyAdapter.is_legacy_model_alias(model)
             ):
                 return pin
             if accepted_model is None:

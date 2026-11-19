@@ -40,7 +40,7 @@ DEFAULT_COUNTS = {
 # #10073 adds a native low/medium seat outside Google-authored work.
 # Muse retirement removes its low/medium seat.
 DEFAULT_COUNTS = {
-    family: [*seats, *(["gemini-3.8-flash-high"] if family != "google" else [])]
+    family: [*seats, *(["gemini-4-neon-high"] if family != "google" else [])]
     for family, seats in DEFAULT_COUNTS.items()
 }
 
@@ -231,7 +231,7 @@ def test_bench_health_preserves_egress_gate(policy, monkeypatch):
     results = check_bench_health(routing_snapshot={}, data_egress_policy=policy)
     assert all("glm-5.3" not in seats for seats in results.values())
     assert all("openai_frontier" not in seats for seats in results.values())
-    assert results["anthropic"] == ["gemini-3.8-flash-high"]
+    assert results["anthropic"] == ["gemini-4-neon-high"]
     pinned = evaluate_candidate(
         retired_candidate("glm-5.3"),
         ResolverInputs(
@@ -273,7 +273,7 @@ def test_bench_health_preserves_capacity_gate(status, reason, route, names, caps
             if REVIEW_CANDIDATES[name].family != finding["author_family"]:
                 assert finding["excluded_seats"][name] == reason
     assert results["anthropic"] == (
-        ["gemini-3.8-flash-high"] if route == "codex" and blocked else DEFAULT_COUNTS["anthropic"]
+        ["gemini-4-neon-high"] if route == "codex" and blocked else DEFAULT_COUNTS["anthropic"]
     )
     # Check exclusion reasons even when the remaining seats prevent a CLI shortfall.
     _, excluded = bench_health._bench_inventory(

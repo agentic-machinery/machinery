@@ -137,7 +137,9 @@ def test_only_registered_agy_pin_alias_resolves_and_other_gemini_fails() -> None
 
     pin = ACPX_SUPPORTED_PARTICIPANTS["agy"]["model"]
     assert resolve_compat_model("gemini", pin) == pin
-    assert resolve_compat_model("gemini", "Gemini 3.8 Flash (High)") == pin
+    assert resolve_compat_model("gemini", "Gemini 4 Neon (High)") == pin
+    with pytest.raises(ValueError, match="only its registered model pin"):
+        resolve_compat_model("gemini", "gemini-3-flash-preview")
     with pytest.raises(ValueError, match="is retired in the model catalog") as exc_info:
         resolve_compat_model("gemini", "gemini-3.1-pro-high")
     assert "is retired in the model catalog" in str(exc_info.value)

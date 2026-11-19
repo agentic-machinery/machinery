@@ -650,6 +650,7 @@ def _resolve_review_target(
         UNKNOWN_AUTHOR_FAMILY,
         UNRESOLVED_AUTHOR_FAMILIES,
         ResolverInputs,
+        ReviewerCandidate,
         candidate_dispatch_model,
         evaluate_candidate,
         red_team_seat_refusal,
@@ -784,6 +785,18 @@ def _resolve_review_target(
     if facts is not None:
         # evaluate_candidate reads the complete set from ``inputs``.
         author_family = None
+
+    def matches_requested_selector(candidate: ReviewerCandidate) -> bool:
+        if candidate.route != seat:
+            return False
+        dispatch_model = candidate_dispatch_model(candidate)
+        if candidate.transport == "agy":
+            from lu_machinery.dispatcher.providers.agy import transport_model
+
+            return transport_model(dispatch_model) == transport_model(requested_model)
+        # Cursor passes the actual slug unchanged, including any suffix.
+        return dispatch_model == (requested_model if candidate.transport == "cursor" else concrete)
+
     if profile == "ukrainian":
         eligible = seat in {"claude", "codex", "agy"} and family in {"anthropic", "openai", "google"}
         exclusion = subject_exclusion_reason(
@@ -795,13 +808,8 @@ def _resolve_review_target(
         if exclusion:
             raise ReviewAdmissionRefused(f"REVIEW_ROUTE_REFUSED: {exclusion}")
     else:
-        # A Cursor seat is admitted only at its exact pinned slug: the adapter
-        # sends the requested string unchanged, so a bracket suffix
-        # (``grok-4.7-high[fast]``) would run an unattested variant (#9488).
         eligible = family not in forbidden and any(
-            candidate.route == seat
-            and candidate_dispatch_model(candidate)
-            == (requested_model if candidate.transport == "cursor" else concrete)
+            matches_requested_selector(candidate)
             and evaluate_candidate(candidate, inputs, author_family=author_family, review_mode=review_mode).status
             == "eligible"
             for candidate in REVIEW_CANDIDATES.values()
@@ -825,9 +833,7 @@ def _resolve_review_target(
     eligible = eligible and not blocked
     if review_mode == "red_team" and eligible:
         requested_cross_family = any(
-            candidate.route == seat
-            and candidate_dispatch_model(candidate)
-            == (requested_model if candidate.transport == "cursor" else concrete)
+            matches_requested_selector(candidate)
             and evaluate_candidate(candidate, inputs, author_family=author_family).status == "eligible"
             for candidate in REVIEW_CANDIDATES.values()
         )

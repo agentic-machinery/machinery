@@ -102,8 +102,7 @@ def test_one_holder_edit_moves_all_consumer_references(seat, new_id):
     if seat == "bounded_worker":
         assert bounded_execution_policy(result).bounded_worker_model_id == new_id
     if seat == "google_bounded":
-        assert result["orchestrator_seats"]["agy"]["model_id"] == new_id
-        assert result["orchestrator_seats"]["agy"]["escalate_model_id"] == new_id
+        assert result["orchestrator_seats"]["agy"] == baseline["orchestrator_seats"]["agy"]
         assert result["formal_cf_defaults"]["agy"]["model_id"] == new_id
     # The xai_reviewer seat and the Cursor seat it pinned retired with Grok (GROK-CANCEL-1110).
     assert "cursor" not in result["orchestrator_seats"]

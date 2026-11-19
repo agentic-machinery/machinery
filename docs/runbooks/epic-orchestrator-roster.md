@@ -129,7 +129,7 @@ Exact tables below must match `lu_machinery/config/model_catalog.yaml` → `orch
 <!-- fleet-roster-projection:begin orchestrator_seats -->
 | seat | model_id | effort | escalate_model_id | escalate_effort |
 | --- | --- | --- | --- | --- |
-| agy | gemini-3.8-flash-high | high | gemini-3.8-flash-high | high |
+| agy | gemini-4-hydrogen | medium | gemini-4-hydrogen | medium |
 | claude | claude-opus-5-5 | high | gpt-6.2-sol | high |
 | codex | gpt-6.2-sol | high | gpt-6.2-sol | high |
 <!-- fleet-roster-projection:end orchestrator_seats -->

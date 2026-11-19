@@ -165,17 +165,14 @@ probe (`codexbar usage` is retired, 2026-10-16):
 
 Use the live model catalog and rules as authority. Standing task-fit defaults:
 
-- Ukrainian pedagogy, CEFR, authoring, or content review uses only `agy`,
-  `codex`, or `claude`, with AGY
-  `gemini-3.8-flash-high` first for current Ukrainian teaching voice and
-  `gemini-3.8-flash-high` for deep work when live policy permits. Require
-  `sources`/VESUM evidence for linguistic claims.
+- Use the catalog's language lanes for Ukrainian work. AGY uses
+  `gemini-4-hydrogen-medium` for authoring and `gemini-4-neon-high` for
+  review. Require Sources MCP and VESUM evidence for linguistic claims.
 - Codex routing: Sol @ `high` handles coding and review; Luna @ `high` handles
   routine bounded work and scouting; hard consequential advisory judgment uses
   Opus 5.5 / Sol 6.2 @ `high` (#9583).
-- Claude Opus 5.5 handles hard Claude-lane coding where applicable. Gemini 3.8
-  Flash handles Ukrainian and well-defined work with a complete brief and
-  acceptance criteria.
+- Claude Opus 5.5 handles hard Claude-lane coding where applicable. Give each
+  Hydrogen worker a complete brief with acceptance criteria.
 - Grok may own sustained daily driving where the roster permits. Advisors
   (Opus 5.5 / Sol 6.2) are summoned for short judgment, not polling.
 - GLM-5.3/z.ai is eligible for public, non-sensitive code/infra, bug/security,

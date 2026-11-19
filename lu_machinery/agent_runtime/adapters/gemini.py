@@ -107,7 +107,7 @@ class GeminiAdapter:
     """Loadable Gemini seat. ``build_invocation`` does not run the ``gemini`` CLI."""
 
     name: str = "gemini"
-    default_model: str = "gemini-3.8-flash-high"
+    default_model: str = "gemini-4-hydrogen-medium"
     # The runner checks this set before the AGY fallback rung. Keep the
     # historical mode names so that check still passes.
     supported_modes: frozenset[str] = frozenset(

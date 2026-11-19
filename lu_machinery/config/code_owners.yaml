@@ -62,7 +62,7 @@ areas:
       - scripts/verification/**
 
   - area: ukrainian-content-and-language
-    owner: language lanes (gemini-3.8-flash-high via AGY; gpt-6.2-sol)
+    owner: language lanes (gemini-4-neon-high via AGY; gpt-6.2-sol)
     note: VESUM and sources evidence required
     paths:
       - curriculum/**

@@ -229,13 +229,12 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
         return subprocess.run(command, check=True, capture_output=True, text=True, env=env, timeout=30).stdout.strip()
 
     repo.mkdir()
-    run("init", "-q")
+    run("init", "-q", "--initial-branch=main")
     run("commit", "-q", "--allow-empty", "-m", "base")
     # Origin's default branch is the base commit; the reviewed commits are the branch's own.
-    run("init", "-q", "--bare", str(origin))
-    run("--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main")
+    run("clone", "-q", "--bare", str(repo), str(origin))
     run("remote", "add", "origin", str(origin))
-    run("push", "-q", "origin", "HEAD:refs/heads/main")
+    run("fetch", "-q", "origin")
     commits = [run("rev-parse", "HEAD")]
     for trailer in trailers:
         run("commit", "-q", "--allow-empty", "-m", f"work\n\nX-Agent: {trailer}")
@@ -253,7 +252,7 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
     dispatch(*review, agent=reviewer[0], model=reviewer[1], expected=2)
     assert refusal in capsys.readouterr().err
     # A reviewer from a third family (Google; Grok is retired, GROK-CANCEL-1110) is outside every author family.
-    outside = ("agy", "gemini-3.8-flash-high")
+    outside = ("agy", "gemini-4-neon-high")
     if trailers and refusal.startswith("["):
         if "--dry-run" in flags:
             assert cli.main(["dispatch", "--agent", outside[0], "--model", outside[1],
@@ -328,7 +327,7 @@ def test_mixed_family_head_refuses_neon(dispatch, monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(checks, "check_branch_author_families", BRANCH_AUTHOR_FAMILIES)
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     review = ("--mode", "read-only", "--branch", "review/target", "--review-profile", "infra", "--risk", "critical")
-    dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2)
-    assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
     dispatch(*review, agent="agy", model="gemini-4-neon-high", expected=2)
+    assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
+    dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2)
     assert "holds no review" in capsys.readouterr().err

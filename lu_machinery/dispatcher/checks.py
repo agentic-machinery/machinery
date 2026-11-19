@@ -224,7 +224,8 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         typed = {key: value for key, value in options.items()
                  if key not in _REPEATABLE_SELECTORS or value not in ([], "[]")}
         reviewed = identity is not None and "review" in dispatch_roles(typed)
-        if reviewed and (refusal := activity_role_refusal(identity, REVIEW_ACTIVITY, catalog)):
+        role_model = model if agent == "agy" else identity
+        if reviewed and (refusal := activity_role_refusal(role_model, REVIEW_ACTIVITY, catalog)):
             raise ValueError(refusal)
         if identity == SAVANT_MODEL or options.get("provider") == SAVANT_PROVIDER:
             _check_savant_route(agent, model, identity, options)

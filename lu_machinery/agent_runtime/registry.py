@@ -139,7 +139,7 @@ AGENTS: dict[str, AgentEntry] = {
     },
     "gemini": {
         "adapter": f"{_ADAPTERS}.gemini:GeminiAdapter",
-        "default_model": "gemini-3.8-flash-high",
+        "default_model": "gemini-4-hydrogen-medium",
         "cost_tier": "low",
         "capabilities": frozenset(
             {
@@ -308,7 +308,7 @@ AGENTS: dict[str, AgentEntry] = {
     },
     "acpx-agy-shadow": {
         "adapter": f"{_ADAPTERS}.acpx:AcpxAgyShadowAdapter",
-        "default_model": "gemini-3.8-flash-high",
+        "default_model": "gemini-4-neon-high",
         "cost_tier": "unknown",
         "capabilities": frozenset(),
         "cli_available": False,
