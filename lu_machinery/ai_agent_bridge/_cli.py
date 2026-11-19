@@ -546,7 +546,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ask-agy
     ask_agy_parser = subparsers.add_parser(
         "ask-agy",
-        help="Send message AND invoke Agy (Antigravity CLI, Gemini-3.8-Flash-High)",
+        help="Send a consultation through Antigravity CLI",
     )
     ask_agy_parser.add_argument("content", help="Message content (use '-' to read from stdin)")
     ask_agy_parser.add_argument("--task-id", help="Task ID for session tracking")
