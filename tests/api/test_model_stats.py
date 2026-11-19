@@ -23,6 +23,7 @@ from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
 from lu_machinery.api.monitor_context import get_ctx
 from lu_machinery.api.state_helpers import cache_invalidate
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import store, worker
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
@@ -110,7 +111,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert write["tasks"] == 3 and write["low_sample"] is True
     assert write["status"]["done"] == 2 and write["status"]["no_deliverable"] == 1
     assert write["landed"] == 1 and write["landed_rate"] == {"value": 0.333, "n": 3, "low_sample": True}
-    assert write["wall_seconds"] == {"median": 1200.0, "p90": 1800.0, "total_hours": 1.0, "total_seconds": 3600.0, "n": 3}
+    assert write["wall_seconds"] == {"p25": 600.0, "median": 1200.0, "p75": 1800.0, "p90": 1800.0,
+                                     "total_hours": 1.0, "total_seconds": 3600.0, "n": 3}
     assert write["wall_hours_per_landed"]["value"] == 1.0
     assert write["tokens"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
     assert write["output_tokens_per_landed"]["value"] == 300
@@ -246,7 +248,10 @@ def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
     """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
-    launch or settlement on an unready Monitor, or the wrong window recorded as the weekly allowance."""
+    launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, overlapping
+    tasks on one pool each charged the pool's whole drop, a nested reset reported as zero spend, a rise
+    between two tasks' readings reported as measured spend, or a number taken from two readings that share
+    a timestamp and disagree."""
     readings = iter([None, 35.0])
     monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
@@ -286,11 +291,139 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
     rows.backfill(tasks, batch_state)
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
     assert stored["half"]["allowance"]["start"] == "unknown"
-    window = _window(batch_state, stats.Landing(task_ids={"both", "half"}))
-    assert window["allowance"] == [{"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1,
-                                    "landed": 1, "reset_crossed": 0, "low_sample": True, "pct_points_spent": 5.5,
-                                    "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}}]
+    _record(tasks, "overlap-a", model="gemini-4-hydrogen", effort="medium",
+            started_at=(NOW - timedelta(hours=3)).isoformat(),
+            finished_at=(NOW - timedelta(hours=1)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 60.0}})
+    _record(tasks, "overlap-b", model="gemini-4-hydrogen", effort="medium",
+            started_at=(NOW - timedelta(hours=3) + timedelta(minutes=3)).isoformat(),
+            finished_at=(NOW - timedelta(hours=2)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "shared-a", model="grok-4.7",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "cursor", "start": {"remaining_pct": 100.0}, "finish": {"remaining_pct": 88.0}})
+    _record(tasks, "shared-b", model="composer-2.5",
+            started_at=(NOW - timedelta(hours=8) + timedelta(minutes=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "cursor", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 82.0}})
+    _record(tasks, "reset-a", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "codex:b", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "reset-b", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8) + timedelta(minutes=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "codex:b", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "outer", model="claude-opus-5-5",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "agy_claude", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "inner", model="claude-opus-5-5",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "agy_claude", "start": {"remaining_pct": 75.0}, "finish": {"remaining_pct": 95.0}})
+    # The reset is a different effort from the task it runs inside. Dropping it used to report 0 points spent.
+    _record(tasks, "cross-outer", model="claude-sonnet-5-5", effort="high",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "claude:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "cross-inner", model="claude-sonnet-5-5", effort="medium",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "claude:a", "start": {"remaining_pct": 75.0}, "finish": {"remaining_pct": 95.0}})
+    # The inner reading rises, but stays below the cluster's first reading. That is still a reset.
+    _record(tasks, "buried-outer", model="claude-haiku-5-5",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "claude:b", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "buried-inner", model="claude-haiku-5-5",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "claude:b", "start": {"remaining_pct": 40.0}, "finish": {"remaining_pct": 55.0}})
+    # The pool falls, then a later reading from the outer task sits above the inner finish. Chronological
+    # readings are 80, 40, 35, 70. That rise is a reset even though neither task's own finish rose.
+    _record(tasks, "gap-outer", model="gemini-3.8-flash-high",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "gap-inner", model="gemini-3.8-flash-high",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 40.0}, "finish": {"remaining_pct": 35.0}})
+    # Crossing tasks: 80, 70, 50, 65. The rise from 50 to 65 is a reset.
+    _record(tasks, "cross-read-a", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 50.0}})
+    _record(tasks, "cross-read-b", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=7, minutes=30)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 70.0}, "finish": {"remaining_pct": 65.0}})
+    # Same start timestamp, 80 and 95. Finish order does not say which start came first, so 15 points would
+    # be a guess. The clock sits between the other codex:a clusters so this pair is its own row.
+    _record(tasks, "tie-a", model="gpt-6.2-sol", effort="medium",
+            started_at=(NOW - timedelta(hours=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=4)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "tie-b", model="gpt-6.2-sol", effort="medium",
+            started_at=(NOW - timedelta(hours=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=3)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 65.0}})
+    rows.backfill(tasks, batch_state)
+    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer",
+              "inner", "cross-outer", "cross-inner", "buried-outer", "buried-inner", "gap-outer", "gap-inner",
+              "cross-read-a", "cross-read-b", "tie-a", "tie-b"}
+    window = _window(batch_state, stats.Landing(task_ids=landed))
+    unknown = {"value": None, "n": 1, "low_sample": True}
+    assert window["allowance"] == [
+        {"pool": "agy_claude", "model": "claude-opus-5-5", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "claude:a", "model": "claude-sonnet-5-5", "effort": "high", "tasks": 1, "landed": 1,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "claude:a", "model": "claude-sonnet-5-5", "effort": "medium", "tasks": 1, "landed": 1,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "claude:b", "model": "claude-haiku-5-5", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
+         "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
+        {"pool": "codex:a", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "codex:a", "model": "gpt-6.2-sol", "effort": "medium", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "codex:b", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "cursor", "model": "composer-2.5", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "cursor", "model": "grok-4.7", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "gemini", "model": "gemini-3.8-flash-high", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "gemini", "model": "gemini-4-hydrogen", "effort": "medium", "tasks": 2, "landed": 2,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": 20.0,
+         "pct_points_per_landed": {"value": 10.0, "n": 2, "low_sample": True}},
+    ]
     assert _row(window, "gpt-6.1-sol", "write")["allowance_pct_points_per_landed"]["value"] == 5.5
+    # view=page is what the dashboard prints. None is a dash; 0.0 would be shown as measured spend.
+    page = stats.page_window(window)
+    medium = next(row for row in page["allowance"] if row["model"] == "claude-sonnet-5-5" and row["effort"] == "medium")
+    assert medium["pct_points_spent"] is None and medium["tasks"] == 1 and medium["overlapped_tasks"] == 1
+    sonnet = {item["effort"]: item for item in _row(window, "claude-sonnet-5-5", "write")["by_effort"]}
+    assert sonnet["medium"]["allowance_pct_points_per_landed"]["value"] is None
+    assert sonnet["high"]["allowance_pct_points_per_landed"]["value"] is None
+    assert _row(window, "claude-haiku-5-5", "write")["allowance_pct_points_per_landed"] == {
+        "value": None, "n": 2, "low_sample": True}
 
 
 def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
@@ -308,6 +441,22 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "context": dict(agent="claude", model="claude-opus-5-5[1m]", effort="not-exposed"),
         "unknown-version": dict(agent="claude", model="claude-opus-5-6", effort="High"),
         "free-effort": dict(agent="codex", model="gpt-6.1-sol", effort="request-0", research_task_family="docs"),
+        "cursor-display": dict(agent="cursor", model="Grok 4.7 256K High", resolved_model="Grok 4.7 256K High",
+                               resolved_model_known=True, effort=None),
+        "cursor-fast": dict(agent="cursor", model="Grok 4.7 256K High Fast",
+                            resolved_model="Grok 4.7 256K High Fast", resolved_model_known=True, effort=None),
+        "composer": dict(agent="cursor", model="Composer 2.5", resolved_model="Composer 2.5",
+                         resolved_model_known=True, effort=None),
+        "kimi-slash": dict(agent="kimi", model="kimi-code/k3-256k", effort=None),
+        "kimi-alias": dict(agent="kimi", model="k3-256k", effort=None),
+        "deepseek-prefix": dict(agent="deepseek", model="deepseek-direct/deepseek-v4-flash", effort=None),
+        "attested-over-auto": dict(agent="cursor", model="auto", resolved_model="Grok 4.7 256K High",
+                                   resolved_model_known=True, effort=None),
+        "attested-fast-over-request": dict(agent="cursor", model="grok-4.7",
+                                           resolved_model="Grok 4.7 256K High Fast",
+                                           resolved_model_known=True, effort=None),
+        "attested-kimi-over-request": dict(agent="kimi", model="k3", resolved_model="kimi-code/k3-256k",
+                                           resolved_model_known=True, effort=None),
     }
     for task_id, fields in cases.items():
         _record(tasks, task_id, **fields)
@@ -326,6 +475,15 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "context": ("claude-opus-5-5", "not-exposed"),
         "unknown-version": ("claude-opus-5-6", "high"),
         "free-effort": ("gpt-6.1-sol", "request-0"),
+        "cursor-display": ("grok-4.7", "unset"),
+        "cursor-fast": ("unknown", "unset"),
+        "composer": ("composer-2.5", "unset"),
+        "kimi-slash": ("kimi-code/k3-256k", "unset"),
+        "kimi-alias": ("kimi-code/k3-256k", "unset"),
+        "deepseek-prefix": ("deepseek-v4-flash", "unset"),
+        "attested-over-auto": ("grok-4.7", "unset"),
+        "attested-fast-over-request": ("unknown", "unset"),
+        "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
     flash = _row(window, "gemini-3.8-flash-high", "write")
     assert flash["effort"] == "all" and [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [
@@ -334,10 +492,57 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     sol = _row(window, "gpt-6.1-sol", "write")
     assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("request-0", ["docs"])]
     # /metrics keeps finite label sets: values outside the catalog's known set export as "other".
-    metrics = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())["metrics"]["windows"]["all"]
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    assert "24h" in snapshot["windows"] and "24h" not in snapshot["metrics"]["windows"]
+    metrics = snapshot["metrics"]["windows"]["all"]
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
     assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
+    page = stats.page_window(snapshot["windows"]["all"])
+    dropped = ("by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed")
+    assert all(key not in model and key not in effort
+               for model in page["models"] for effort in model["by_effort"] for key in dropped)
+    html = machinery_path("api/dashboards/model-stats.html").read_text()
+    assert "view=page" in html and "not enough data yet" in html and "Best value" in html
+    assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
+    # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
+    rank_root = tmp_path / "value"
+    rank_tasks = rank_root / "tasks"
+    rank_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3)
+        _review(rank_tasks, f"short-review-{index}", "correct", [], pr=100 + index,
+                review_author_model="gpt-6.2-sol")
+        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600)
+        _review(rank_tasks, f"long-review-{index}", "correct" if index < 5 else "incorrect", [], pr=200 + index,
+                review_author_model="gpt-6.1-sol")
+    rows.backfill(rank_tasks, rank_root)
+    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(
+        task_ids={f"short-{index}" for index in range(10)} | {f"long-{index}" for index in range(10)}))
+    recommendation = ranked["windows"]["7d"]["charts"]["recommendation"]
+    assert recommendation["model"] == "gpt-6.2-sol"
+    assert recommendation["approvals"] == 10
+    # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
+    fine = tmp_path / "fine"
+    fine_tasks = fine / "tasks"
+    fine_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(fine_tasks, f"a-{index}", model="gpt-6.1-sol", duration_s=3.001)
+        _review(fine_tasks, f"a-review-{index}", "correct", [], pr=300 + index, review_author_model="gpt-6.1-sol")
+        _record(fine_tasks, f"b-{index}", model="gpt-6.2-sol", duration_s=3.004)
+        _review(fine_tasks, f"b-review-{index}", "correct", [], pr=400 + index, review_author_model="gpt-6.2-sol")
+    rows.backfill(fine_tasks, fine)
+    fine_window = stats.collect(fine, tmp_path, NOW, landing=stats.Landing(
+        task_ids={f"a-{index}" for index in range(10)} | {f"b-{index}" for index in range(10)}))
+    assert fine_window["windows"]["7d"]["charts"]["recommendation"]["model"] == "gpt-6.1-sol"
+    classes = []
+    for index in range(9):
+        classes.append({"role": "write", "model": "gpt-6.1-sol", "identity": "catalog", "tasks": 11, "landed": 11,
+                        "landed_rate": {"value": 1.0, "n": 11, "low_sample": False}, "status": {"done": 11},
+                        "wall_seconds": {"n": 0, "total_seconds": 0},
+                        "by_class": [{"class": f"job-{index}", "tasks": 11, "landed": 11,
+                                      "landed_rate": {"value": 1.0}}]})
+    assert len(stats._charts(classes, [], [])["jobs"]) == 9
 
 
 def _at(hours: float) -> str:
@@ -404,6 +609,9 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     (author,) = window["authors"]
     assert (author["prs"], author["rounds_per_pr"]["value"], author["first_round_approved"]["value"]) == (1, 1.0, 1.0)
     assert author["after_blocked_first_round"]["blocked"] == 0
+    neon_chart = window["charts"]["neon"]
+    assert neon_chart["enough"] is False
+    assert {arm["effort"]: arm["review_results"] for arm in neon_chart["arms"]} == {"medium": 1, "high": 1}
 
 
 def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):
