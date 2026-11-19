@@ -298,17 +298,22 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (Path("/nonexistent"), "codex/review", a[3]))
     review = ("--mode", "read-only", "--branch", "codex/fix", "--pr", "42", "--risk", "medium",
               "--require-review-verdict", "--prompt", "Review this change")
+    # GitHub knows the Medium-tier diff, with no recorded verdicts at the third or fourth head.
+    current_head = "3" * 40
+    monkeypatch.setattr(cf, "_run_json", lambda args, **_k: dict(headRefOid=current_head, headRefName="codex/fix",
+                                                                 state="OPEN"))
+    monkeypatch.setattr(cf, "_review_repository_root", lambda *_a: Path("/nonexistent"))
+    path = "lu_machinery/common/example.py"
+    monkeypatch.setattr(cf, "pr_review_facts", lambda *_a, **_k: SimpleNamespace(changed_paths=(path,),
+                                                                                 scope_paths=()))
+    monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows",
+                        lambda *_a: [{"filename": path, "status": "modified"}])
+    monkeypatch.setattr(cf.GitHubAdapter, "identity", lambda self: "fleet")
+    monkeypatch.setattr(cf.GitHubAdapter, "comments", lambda self, repository, number: [])
     for round_number in (1, 2, 3):
         assert cli.main(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, "--task-id", f"round-{round_number}",
                          *review]) == 0
-    # GitHub knows the PR at the fourth head, with a default-tier diff and no recorded verdict at all.
-    monkeypatch.setattr(cf, "_run_json", lambda args, **_k: dict(headRefOid="4" * 40, headRefName="codex/fix",
-                                                                 state="OPEN"))
-    monkeypatch.setattr(cf, "_review_repository_root", lambda *_a: Path("/nonexistent"))
-    monkeypatch.setattr(cf, "pr_review_facts", lambda *_a, **_k: SimpleNamespace(changed_paths=("docs/readme.md",),
-                                                                                 scope_paths=()))
-    monkeypatch.setattr(cf.GitHubAdapter, "identity", lambda self: "fleet")
-    monkeypatch.setattr(cf.GitHubAdapter, "comments", lambda self, repository, number: [])
+    current_head = "4" * 40
     assert cli.main(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, "--task-id", "round-4", *review]) == 2
     assert "review dispatch refused: REVIEW_BUDGET_EXHAUSTED: PR #42 already has verdicts at 3 heads (3 dispatched " \
            "with no recorded verdict" in capsys.readouterr().err
