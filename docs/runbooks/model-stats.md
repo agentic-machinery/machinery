@@ -297,9 +297,14 @@ finished after the blocking review finished:
   backfilled), or a head is missing from the row or from the repository's local checkout.
 
 Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. The summary
-rows do not record whether a verdict was published (that lives only in the PR's `cf-verdict` comment, which the
-Monitor does not read), so a settled reply whose verdict was never recorded still counts, as it does in every
-author figure.
+rows do not record whether a verdict was published: that lives only in the PR's `cf-verdict` comment, which the
+Monitor does not read, and no local record tells a published formal review from an unpublished one (both carry
+`review_mode: cross_family` and `require_review_verdict`). Measured on 2026-11-19 against the PR comments of
+the machinery and public repositories over 30 days: every one of the 234 settling approvals had a recorded
+verdict, while 34 of the 234 blocking reviews whose findings they settled had none (rounds whose verdict was
+never recorded, for example because the head moved first). Those findings still count; as in every author
+figure, a review of record here means a parsed formal review that names the PR and the author's model. A local
+record of each published verdict, written by the recorder, would close this gap.
 
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one

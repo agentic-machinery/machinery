@@ -1292,7 +1292,8 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             "precision": "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
                          "later head changed its file before the same reviewer approved, else dismissed; a file "
                          "changed for another reason (another finding, a merge of main) still counts as fixed, and "
-                         "a fix made in a different file counts as dismissed.",
+                         "a fix made in a different file counts as dismissed. Whether a blocking verdict was "
+                         "published is not recorded locally, so an unpublished formal review still counts.",
             "recall": "No planted-defect result is recorded in the summary rows.",
             "savant": "No Savant model is in the catalog, and no row names one.",
             "links": "This snapshot does not include task ids.",

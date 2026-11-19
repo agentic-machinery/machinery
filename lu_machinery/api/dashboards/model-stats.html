@@ -531,15 +531,18 @@ function accuracy(data) {
   const headText = heads && heads.pairs
     ? `<p class="note">Changed files were read for ${num(heads.read)} of ${num(heads.pairs)} blocked-to-approved head pairs; the rest count as unknown.</p>` : "";
   if (!items.length) return '<p class="muted">No blocking review of record in this selection.</p>' + recallText;
-  return table(["Reviewer", "Blocking reviews", "P0–P1 findings", "Fixed", "Dismissed", "Open", "Unknown", "Precision", "Interval", "Settled"],
-    grouped(items, (r) => [`<tr><td>${named(r)}</td>${cell(r.blocking_reviews)}${cell(r.blocking_findings)}${cell(r.fixed)}`
+  return table(["Reviewer", "Blocking reviews", "Reviews without finding counts or paths", "Counted P0–P1 findings", "Fixed", "Dismissed", "Open", "Unknown", "Precision", "Interval", "Settled"],
+    grouped(items, (r) => [`<tr><td>${named(r)}</td>${cell(r.blocking_reviews)}`
+      + `${cell(r.reviews_without_paths, r.reviews_without_paths ? "warn" : "")}${cell(r.blocking_findings)}${cell(r.fixed)}`
       + `${cell(r.dismissed)}${cell(r.open)}${cell(r.unknown, r.unknown ? "warn" : "")}${cell(pct(r.precision))}`
-      + `${cell(ciText(r.precision_ci))}${cell(nOf(r.precision))}</tr>`], 10)) + headText + recallText;
+      + `${cell(ciText(r.precision_ci))}${cell(nOf(r.precision))}</tr>`], 11)) + headText + recallText;
 }
+// A findings rate counts only PRs with a known findings count, so it carries its own low-sample mark.
+const rateOf = (r) => r && r.value !== null && r.value !== undefined ? `${num(r.value, 2)}${r.low_sample ? LOW : ""}` : "—";
 function risks(authors) {
   const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}</td>`
     + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
-    + `${cell(rate(r.blocking_per_pr))}${cell(rate(r.p0_p2_per_pr))}</tr>`));
+    + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
   return rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
     : '<p class="muted">No reviewed PR in this selection.</p>';
 }
