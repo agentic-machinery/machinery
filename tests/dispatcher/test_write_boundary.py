@@ -1039,17 +1039,17 @@ def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypa
     omitted = _git(source, "rev-parse", "HEAD:docs/omitted.md")
     repo = tmp_path / "partial"
     subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", source.as_uri(), str(repo)],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=120)
     worktree = repo / ".worktrees" / "task"
     _git(repo, "worktree", "add", "-q", "--no-checkout", "-b", "task", str(worktree), "main")
 
     def local(oid: str) -> bool:
-        return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", oid], capture_output=True,
-                              env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}).returncode == 0
+        return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", oid], capture_output=True, check=False,
+                              timeout=60, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}).returncode == 0
 
     assert not local(omitted)
     partial = (repo, worktree, tmp_path / "receipt.json")
-    code, receipt, patch = _savant_write(partial, monkeypatch, tmp_path, "printf 'x\\n' > docs/omitted.md",
+    _code, receipt, patch = _savant_write(partial, monkeypatch, tmp_path, "printf 'x\\n' > docs/omitted.md",
                                          "docs", read_path="docs/guide.md")
     assert receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
     # The run never saw docs/ beyond its read path, so a new file there is refused without reading the primary.
