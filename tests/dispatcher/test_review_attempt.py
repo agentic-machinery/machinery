@@ -41,7 +41,16 @@ def git_commands_name_their_repository(monkeypatch):
     """
     from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
 
-    for name in (*GIT_REDIRECT_ENV_KEYS, "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
+    for name in (
+        *GIT_REDIRECT_ENV_KEYS,
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
         monkeypatch.delenv(name, raising=False)
     # Home and system Git config are also inputs. Point both at an empty file so a
     # caller's core.worktree cannot select a repository after the names above are gone.
