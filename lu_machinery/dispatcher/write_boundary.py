@@ -16,6 +16,7 @@ the run; nothing falls back to an uncontained launch. The receipt records the re
 from __future__ import annotations
 
 import argparse
+import bisect
 import contextlib
 import hashlib
 import json
@@ -165,6 +166,9 @@ MAX_SNAPSHOT_FILES = 20_000
 MAX_VIEW_DEPTH = 64
 # A write run's view holds at most this many files and directories, at snapshot time and when its draft is read.
 MAX_VIEW_ENTRIES = 2 * MAX_SNAPSHOT_FILES
+# A write run's draft changes, adds or deletes at most this many files: a bounded mechanical fix. The bound keeps
+# the draft's Git steps and the paths its receipt and task record carry small.
+MAX_DRAFT_PATHS = 256
 # The recursive tree listing, excluded and skipped entries included, is read up to this size (about 16 times what
 # MAX_SNAPSHOT_FILES records of ordinary paths need), so the launcher's memory before the caps apply is bounded too.
 MAX_TREE_LISTING_BYTES = 16 * 1024 * 1024
@@ -778,11 +782,11 @@ def _plain_git(repository: Path, *args: str, data: bytes | None = None, env: dic
     return result.stdout
 
 
-def _plain_git_bounded(repository: Path, *args: str, max_bytes: int, env: dict[str, str] | None = None,
-                       refusal: str = "savant_snapshot_refused") -> bytes:
+def _plain_git_bounded(repository: Path, *args: str, max_bytes: int, refusal: str = "savant_snapshot_refused"
+                       ) -> bytes:
     """Output of a read-only Git plumbing command, refused and the process killed once it passes ``max_bytes``
     or ``_GIT_TIMEOUT`` seconds, so host memory never scales with what the command would print."""
-    argv, full = _plain_git_command(repository, *args, env=env)
+    argv, full = _plain_git_command(repository, *args)
     deadline = time.monotonic() + _GIT_TIMEOUT
     output = bytearray()
     process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
@@ -832,6 +836,18 @@ def _cat_blobs(repository: Path, oids: list[str], refusal: str) -> list[bytes]:
         blobs.append(output[end + 1:end + 1 + size])
         offset = end + 2 + size
     return blobs
+
+
+def _holds(paths: list[str], path: str) -> bool:
+    """Whether the sorted ``paths`` hold ``path``, one of its parent directories, or a path below it."""
+    parts = path.split("/")
+    for name in ("/".join(parts[:depth]) for depth in range(1, len(parts) + 1)):
+        index = bisect.bisect_left(paths, name)
+        if index < len(paths) and paths[index] == name:
+            return True
+    # Paths below ``path`` sort together, from the first one at or after ``path/``.
+    index = bisect.bisect_left(paths, path + "/")
+    return index < len(paths) and paths[index].startswith(path + "/")
 
 
 def _public_origin(repository: Path) -> str:
@@ -920,7 +936,8 @@ def _screen(refusal: str) -> tuple[tuple[bytes, ...], re.Pattern[bytes] | None]:
 
 
 def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int,
-              manifest: dict[str, tuple[str, str, bytes]] | None = None) -> dict:
+              manifest: dict[str, tuple[str, str, bytes]] | None = None, left_out_paths: list[str] | None = None
+              ) -> dict:
     """Write the published ``commit``'s regular files below ``paths`` (default: all) into ``target``, read-only.
 
     The bytes are the commit's own blobs (``ls-tree`` and ``cat-file``), never an export that attributes or
@@ -928,7 +945,9 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
     ``MAX_SNAPSHOT_FILES`` files or ``limit`` bytes, and an empty result. Leaves out excluded names
     (``_SNAPSHOT_EXCLUDED``), links and submodules, and files whose content looks sensitive (``_sensitive``).
     With ``manifest`` (a write run) the files are writable and each written path maps to its Git mode, object id
-    and SHA-256, the baseline its draft is taken against.
+    and SHA-256, the baseline its draft is taken against; ``left_out_paths`` gets every listed path the view left
+    out, so the draft checks new files without reading the primary again. A write run's ``limit`` also counts
+    every file and directory path's bytes, as its draft does.
     """
     from pathlib import PurePosixPath
 
@@ -955,8 +974,10 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
                 or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts) or _sensitive(raw, needles, accounts)
                 or (manifest is not None and len(parts) > MAX_VIEW_DEPTH)):
             left_out += 1
+            if left_out_paths is not None:
+                left_out_paths.append(name)
             continue
-        total += int(size_field)
+        total += int(size_field) + (len(raw) if manifest is not None else 0)
         if total > limit or len(entries) >= MAX_SNAPSHOT_FILES:
             raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes or {MAX_SNAPSHOT_FILES} "
                           "files; name the task's files or directories with --read-path")
@@ -979,6 +1000,8 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         offset = header_end + 2 + size
         if _sensitive(data, needles, accounts):
             left_out += 1
+            if left_out_paths is not None:
+                left_out_paths.append("/".join(parts))
             continue
         destination = target.joinpath(*parts)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -994,6 +1017,12 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         if len(manifest) + len(directories) > MAX_VIEW_ENTRIES:
             raise Refused(f"savant_snapshot_refused: the view would hold more than {MAX_VIEW_ENTRIES} files and "
                           "directories; name the task's files or directories with --read-path")
+        total += sum(len(os.fsencode(directory)) for directory in directories)
+        if total > limit:
+            raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes with their paths; name "
+                          "the task's files or directories with --read-path")
+    if left_out_paths is not None:
+        left_out_paths.sort()  # the draft searches it (``_holds``)
     return {"commit": commit, "files": files, "bytes": total, "left_out": left_out, "read_paths": len(paths)}
 
 
@@ -1369,6 +1398,8 @@ class _Boundary:
         self.status_read: int | None = None
         # A write run's baseline: each path of its writable view and that file's Git mode, object id and SHA-256.
         self.manifest: dict[str, tuple[str, str, bytes]] | None = {} if args.mode == "workspace-write" else None
+        # And the start commit's paths below the read paths that the view left out, sorted.
+        self.left_out: list[str] = []
 
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
@@ -1436,7 +1467,7 @@ class _Boundary:
         if self.args.snapshot_bytes is not None:
             self.receipt["snapshot"] = _snapshot(repository, self.tip, self.args.read_path,
                                                  boundary / Path(SNAPSHOT_INSIDE).name, self.args.snapshot_bytes,
-                                                 self.manifest)
+                                                 self.manifest, None if self.manifest is None else self.left_out)
 
         outputs = []
         for raw in self.args.output or []:
@@ -2017,8 +2048,8 @@ class _Boundary:
         Each component is opened with ``O_NOFOLLOW`` relative to its parent's descriptor, so no entry a sandbox
         process plants can lead outside the view. An entry that is not a directory or a single-link regular file,
         an excluded, unprintable or screened name, more than ``MAX_VIEW_ENTRIES`` entries or more than
-        ``--snapshot-bytes`` bytes refuse the draft; the listing is read lazily, so memory stays within those
-        bounds. Refusals never name the entry: names are the model's.
+        ``--snapshot-bytes`` bytes of content and paths refuse the draft; the listing is read lazily, so memory
+        stays within those bounds. Refusals never name the entry: names are the model's.
         """
         assert self.args.snapshot_bytes is not None
         refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
@@ -2053,6 +2084,10 @@ class _Boundary:
                             if (not relative.isprintable() or _sensitive(os.fsencode(relative), needles, accounts)
                                     or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in relative.split("/"))):
                                 raise Refused(f"{refusal}: an entry has an excluded, unprintable or screened name")
+                            # Paths count against the budget too, as at snapshot time: they are kept in memory.
+                            total += len(os.fsencode(relative))
+                            if total > limit:
+                                raise Refused(f"{refusal}: the edited view holds more than {limit} bytes")
                             try:
                                 descriptor = os.open(entry.name, flags, dir_fd=directory)
                             except OSError:
@@ -2087,15 +2122,14 @@ class _Boundary:
         """A write run's edits of its view as a Git patch against the start commit, written to ``--draft-patch``.
 
         ``run`` calls it only after the run's init has exited (``_sandbox_init``). Each file is read once
-        (``_read_view``), and Git gets those bytes, never the view's paths. An edit outside ``--owned-path``,
-        a new file whose path or any of its parents names something of the start commit that the view left out,
-        and edited bytes the view's own screen would refuse (``_sensitive``) refuse the draft. The primary is only
-        read (``cat-file``); Git builds the before and after trees of the changed paths in a private bare
-        repository that shares nothing with it, and the tree delta must be exactly the validated paths. Settlement checks the paths again. An empty dict means
-        nothing changed.
+        (``_read_view``), and Git gets those bytes, never the view's paths. More than ``MAX_DRAFT_PATHS`` edits,
+        an edit outside ``--owned-path``, a new file outside the read paths or at, above or below a path the view
+        left out (``_holds``), and edited bytes the view's own screen would refuse (``_sensitive``) refuse the
+        draft. The primary is only read, for the changed files' blobs (``cat-file``); Git builds the before and
+        after trees of the changed paths in a private bare repository that shares nothing with it, and the tree
+        delta must be exactly the validated paths. Settlement checks the paths again. An empty dict means nothing
+        changed.
         """
-        from pathlib import PurePosixPath
-
         from lu_machinery.dispatcher.ownership import outside_owned
 
         assert self.manifest is not None and self.args.snapshot_bytes is not None
@@ -2110,37 +2144,26 @@ class _Boundary:
         edits.update(dict.fromkeys(self.manifest.keys() - files.keys()))
         if not edits:
             return {}
+        if len(edits) > MAX_DRAFT_PATHS:
+            raise Refused(f"{refusal}: the run edited more than {MAX_DRAFT_PATHS} files")
         if outside := outside_owned(edits, self.args.owned_path):
             raise Refused(f"{refusal}: {len(outside)} edited path(s) lie outside the owned paths")
         if any(_sensitive(files[path], needles, accounts) for path, mode in edits.items() if mode is not None):
             raise Refused(f"{refusal}: an edit holds a private key, a token, a configured secret or a host name")
-        # A new file must not name, below or at any of its parents, a path of the start commit: the view left
-        # that one out (its name, content or --read-path), and Git would replace what the run never read. The
-        # primary is only read here and below (ls-tree, cat-file, never fetching), and nothing is written there.
-        new = {path for path in edits if path not in self.manifest}
-        prefixes = sorted({str(parent) for path in new for parent in (PurePosixPath(path), *PurePosixPath(path).parents)
-                           if str(parent) != "."})
-        # Tree entries only, never a blob, so nothing is fetched. ls-tree lists each exact path as its own entry
-        # unless the same call also names something below it (then it lists the tree's children), so each call
-        # names paths of one depth only.
-        kinds: dict[str, bytes] = {}
-        by_depth: dict[int, list[str]] = {}
-        for prefix in prefixes:
-            by_depth.setdefault(prefix.count("/"), []).append(prefix)
-        for group in by_depth.values():
-            for start in range(0, len(group), 512):
-                listing = _plain_git_bounded(self.repository, "ls-tree", "-z", "--full-tree", self.tip, "--",
-                                             *group[start:start + 512], max_bytes=MAX_TREE_LISTING_BYTES,
-                                             env=_NO_LAZY_FETCH, refusal=refusal)
-                for record in listing.split(b"\0"):
-                    if record:
-                        meta, _, name = record.partition(b"\t")
-                        kinds[os.fsdecode(name)] = meta.split()[1]
-        # A new path must be absent; a parent may only be a directory, never a file, link or submodule the view
-        # left out.
-        if any(name in new or kind != b"tree" for name, kind in kinds.items()):
-            raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
+        # A new file goes only where the run saw the start commit: below a --read-path (all of it without one),
+        # where the snapshot listed every path. There it must not be, sit above or sit below a path the view left
+        # out (by name, kind or content): Git would replace what the run never read. The primary is not read for
+        # this; the snapshot's own listing answers it.
+        reads = [path.rstrip("/") for path in self.args.read_path]
+        for path in edits:
+            if path in self.manifest:
+                continue
+            if reads and not any(path == read or path.startswith(read + "/") for read in reads):
+                raise Refused(f"{refusal}: a new file lies outside the --read-path view")
+            if _holds(self.left_out, path):
+                raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
         changed = sorted(path for path in edits if path in self.manifest)
+        # The only read of the primary after the run: the changed files' own blobs, by id, never fetching.
         originals = _cat_blobs(self.repository, [self.manifest[path][1] for path in changed], refusal)
         # The draft's own repository holds just the changed paths before and after; it shares nothing with the
         # primary, so no Git step can write or freshen the primary's objects.
@@ -2163,8 +2186,9 @@ class _Boundary:
 
         before = tree([f"{self.manifest[path][0]} {blob(data)}\t{path}\0"
                        for path, data in zip(changed, originals, strict=True)])
+        # Deletions first, so a file may replace a deleted directory and a directory a deleted file.
         after = tree([f"0 {'0' * len(self.tip)}\t{path}\0" if mode is None else f"{mode} {blob(files[path])}\t{path}\0"
-                      for path, mode in edits.items()])
+                      for path, mode in sorted(edits.items(), key=lambda item: item[1] is not None)])
         delta = _plain_git(draft, "diff-tree", "-r", "-z", "--name-only", "--no-renames", before, after,
                            refusal=refusal)
         if {os.fsdecode(name) for name in delta.split(b"\0") if name} != set(edits):
@@ -2172,7 +2196,20 @@ class _Boundary:
         patch = _plain_git_bounded(draft, "diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames",
                                    "--no-ext-diff", "--no-textconv", before, after, max_bytes=4 * limit,
                                    refusal=refusal)
-        _write_private(Path(self.args.draft_patch), patch, 0o600)
+        target = Path(self.args.draft_patch)
+        try:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            raise Refused(f"{refusal}: the patch file cannot be created") from None
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(patch)
+        except BaseException as exc:
+            # A failed or interrupted write leaves no partial patch; the receipt's digest names only a whole one.
+            target.unlink(missing_ok=True)
+            if isinstance(exc, OSError):
+                raise Refused(f"{refusal}: the patch could not be written") from None
+            raise
         return {"status": "drafted", "patch": self.args.draft_patch, "patch_sha256": hashlib.sha256(patch).hexdigest(),
                 "paths": sorted(edits), "bytes": len(patch)}
 
@@ -2339,8 +2376,8 @@ def main(argv: list[str]) -> int:
         parser.error("--mode workspace-write needs --draft-patch, --owned-path, --snapshot-bytes, "
                      "--no-github-relays and --no-sources-relay, without --sources-mcp; --draft-patch and "
                      "--owned-path need it")
-    if write and not Path(args.draft_patch).is_absolute():
-        parser.error("--draft-patch must be an absolute path")
+    if write and (not Path(args.draft_patch).is_absolute() or os.path.lexists(args.draft_patch)):
+        parser.error("--draft-patch must be an absolute path that does not exist yet")
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "mode": args.mode, "status": "refused", "started_at": _now()}
     if not _TASK_ID.fullmatch(args.task_id):
         receipt["reason"] = "unsafe task id"

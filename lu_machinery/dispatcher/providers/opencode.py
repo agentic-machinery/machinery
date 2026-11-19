@@ -239,6 +239,9 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         "enabled_providers": [SAVANT_PROVIDER],
         "autoupdate": False,
         "share": "disabled",
+        # No formatter rewrites an edit and no language server starts or downloads: the draft is the model's edits.
+        "formatter": False,
+        "lsp": False,
         "permission": {"*": "deny", **({"external_directory": "deny", **dict.fromkeys(_SAVANT_READ_TOOLS, "allow"),
                                         **({"edit": "allow"} if write else {})} if tools else {})},
         "provider": {SAVANT_PROVIDER: {

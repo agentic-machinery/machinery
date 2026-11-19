@@ -425,6 +425,8 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     # Editing its own copy of the view is the only tool beyond the read-only ones; no shell, task or web tool.
     assert config["permission"] == {"*": "deny", "external_directory": "deny", "read": "allow", "grep": "allow",
                                     "glob": "allow", "edit": "allow"}
+    # No formatter rewrites the model's edits and no language server starts inside.
+    assert config["formatter"] is False and config["lsp"] is False
     assert invocation.argv[invocation.argv.index("--dir") + 1] == write_boundary.SNAPSHOT_INSIDE
     # It always runs inside the boundary, with the patch target and the record's owned paths, and no relay.
     assert worker._in_boundary(trial) and not worker._in_boundary(replace(trial, provider="deepseek"))

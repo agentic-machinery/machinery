@@ -981,6 +981,9 @@ def test_savant_write_run_drafts_nothing_after_a_failed_provider_or_from_an_over
     ("secret", "printf 'k = ghp_%s\\n' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > docs/guide.md", "a private key, a token"),
     ("oversize", "head -c 70000 /dev/zero > docs/big.bin", "more than 65536 bytes"),
     ("too-deep", "mkdir -p docs/" + "d/" * 64 + " && printf 'x\\n' > docs/" + "d/" * 64 + "f", "nests deeper than 64"),
+    ("too-many-edits", "for i in $(seq 257); do printf x > docs/f$i; done", "edited more than 256 files"),
+    # Paths are kept in memory and in the receipt, so their bytes count against the budget like content.
+    ("long-paths", "for i in $(seq 300); do mkdir docs/$(printf %0250d $i); done", "more than 65536 bytes"),
 ])
 def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path, case, script, reason):
     """Defect class (#898): an edit outside the owned paths, a link, an excluded or filtered path, a secret or an
@@ -1014,6 +1017,10 @@ def test_savant_write_run_needs_its_bounds(primary, tmp_path):
     for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):
         with pytest.raises(SystemExit):
             _run(primary, "true", *full, *extra)
+    # A patch file already there (another run's, or a partial one) refuses before the provider starts.
+    (tmp_path / "p.patch").write_bytes(b"")
+    with pytest.raises(SystemExit):
+        _run(primary, "true", *full)
 
 
 def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypatch, tmp_path):
@@ -1045,7 +1052,8 @@ def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypa
     code, receipt, patch = _savant_write(partial, monkeypatch, tmp_path, "printf 'x\\n' > docs/omitted.md",
                                          "docs", read_path="docs/guide.md")
     assert receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
-    assert receipt["import"]["status"] == "refused" and "left out" in receipt["import"]["reason"]
+    # The run never saw docs/ beyond its read path, so a new file there is refused without reading the primary.
+    assert receipt["import"]["status"] == "refused" and "outside the --read-path view" in receipt["import"]["reason"]
     assert not patch.exists() and not local(omitted)
 
 
@@ -1060,9 +1068,17 @@ def test_savant_write_draft_checks_only_the_new_paths_in_a_wide_directory(primar
     _git(repo, "add", "docs")
     _git(repo, "commit", "-qm", "fixture")
     _git(worktree, "merge", "-q", "--ff-only", "main")
-    # The 40 siblings' entries (about 2.6 KB) would exceed this cap; one exact entry per path stays far below it.
-    monkeypatch.setattr(write_boundary, "MAX_TREE_LISTING_BYTES", 1024)
+    # Every listing of the primary: the snapshot's one. The draft answers from it and lists nothing after the run.
+    listings: list[tuple[str, ...]] = []
+    bounded = write_boundary._plain_git_bounded
+
+    def record(repository, *args, **kwargs):
+        if Path(repository).resolve() == repo.resolve():
+            listings.append(args)
+        return bounded(repository, *args, **kwargs)
+
+    monkeypatch.setattr(write_boundary, "_plain_git_bounded", record)
     _code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, "printf 'new\\n' > docs/new.md", "docs",
-                                          read_path="docs/guide.md")
+                                          read_path="docs")
     assert receipt["import"]["status"] == "drafted" and receipt["import"]["paths"] == ["docs/new.md"], receipt["import"]
-    assert patch.exists()
+    assert patch.exists() and [args[0] for args in listings] == ["ls-tree"], listings
