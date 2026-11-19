@@ -483,7 +483,10 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     """
     with pytest.MonkeyPatch.context() as patch:
         for name in (*SESSION_IDENTITY_ENV_VARS, *TEST_SLOT_POOL_ENV_VARS):
-            patch.delenv(name, raising=False)
+            # Recorded even when absent (the usual case: the list at import dropped it), so a value the test
+            # writes is gone after teardown.
+            patch.setenv(name, "")
+            patch.delenv(name)
         parent = getattr(item, "callspec", None)
         mode = parent.params.get("_launcher_parent_environment") if parent is not None else None
         if mode is not None:

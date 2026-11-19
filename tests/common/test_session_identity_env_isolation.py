@@ -273,5 +273,6 @@ def pytest_sessionfinish(session):
     result = pytester.runpytest_subprocess("-q", "-s")
 
     result.assert_outcomes(passed=2)
-    # The test's own write is undone; the launching session's value returns.
-    result.stdout.fnmatch_lines(["*AFTER live-operator-session"])
+    # The test's own write is undone, and the launching session's value never enters the process: the
+    # conftest keeps only its listed inherited names (#904).
+    result.stdout.fnmatch_lines(["*AFTER None"])
