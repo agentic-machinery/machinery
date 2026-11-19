@@ -102,7 +102,7 @@ _HOST_CONTEXT = frozenset({
     "XDG_CACHE_HOME", "XDG_DATA_HOME", "GH_CONFIG_DIR", "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
 })
 # A provider may point these at its own private, empty roots (the Savant route does). The launcher's host steps
-# (gh, its credential and toolchain lookups) always take the dispatcher's values, an empty value meaning unset;
+# (gh and the masks of its credential stores) always take the dispatcher's values, an empty value meaning unset;
 # the provider keeps its own.
 _HOST_ROOTS = frozenset({"XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"})
 
@@ -554,15 +554,17 @@ def _package_roots(path_env: str, executables: list[str]) -> list[Path]:
     return sorted(roots)
 
 
-def _pre_commit_store(home: Path) -> Path | None:
-    """pre-commit's hook store, found as pre-commit finds it: ``PRE_COMMIT_HOME``, else ``pre-commit`` below
-    ``XDG_CACHE_HOME`` or HOME's ``.cache``. None when the configured value is not absolute."""
-    store = os.environ.get("PRE_COMMIT_HOME") or os.path.join(os.environ.get("XDG_CACHE_HOME") or home / ".cache",
-                                                              "pre-commit")
+def _pre_commit_store(home: Path, env: dict[str, str]) -> Path | None:
+    """pre-commit's hook store, found as the provider's pre-commit finds it in ``env``: ``PRE_COMMIT_HOME``, else
+    ``pre-commit`` below ``XDG_CACHE_HOME`` or HOME's ``.cache``. None when the configured value is not absolute.
+
+    ``env`` is the provider's own environment, never the launcher's host context: a provider with a private cache
+    root has no host store restored."""
+    store = env.get("PRE_COMMIT_HOME") or os.path.join(env.get("XDG_CACHE_HOME") or home / ".cache", "pre-commit")
     return Path(store) if os.path.isabs(store) else None
 
 
-def _toolchain(home: Path, executable: str) -> list[Path]:
+def _toolchain(home: Path, executable: str, env: dict[str, str]) -> list[Path]:
     """Read-only restores below HOME and the data roots: the provider's toolchain and this launcher's own
     interpreter and installation (decision A4). Nothing of a provider's configuration is one of them.
 
@@ -571,7 +573,7 @@ def _toolchain(home: Path, executable: str) -> list[Path]:
     a hook whose environment is not installed fails the commit instead of installing one."""
     path_env = os.environ.get("PATH", os.defpath)
     candidates = [home / name for name in _HOME_TOOLCHAIN]
-    if (store := _pre_commit_store(home)) is not None:
+    if (store := _pre_commit_store(home, env)) is not None:
         candidates.append(store)
     candidates += [Path(entry) for entry in path_env.split(os.pathsep) if entry and os.path.isabs(entry)]
     candidates += _package_roots(path_env, [executable, sources_command()[0]])
@@ -1156,7 +1158,7 @@ class _Boundary:
 
         product = _product_checkout()
         checkouts = [repository, *([product] if product is not None and product != repository else [])]
-        toolchain = _toolchain(home, command[0])
+        toolchain = _toolchain(home, command[0], self.args.provider_env)
         data = list(dict.fromkeys(found for root in _DATA_ROOTS if (found := _resolved(root)) is not None
                                   and found.is_dir() and found != Path("/")))
         own = task_reads(self.args.task_id)
@@ -1306,7 +1308,7 @@ class _Boundary:
             env["CODEX_HOME"] = str(codex_home)
         if self.args.sources_mcp == "opencode":
             env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
-        if (store := _pre_commit_store(home)) is not None and (found := _resolved(store)) is not None and found.is_dir():
+        if (store := _pre_commit_store(home, self.args.provider_env)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
             env["PRE_COMMIT_HOME"] = str(found)
