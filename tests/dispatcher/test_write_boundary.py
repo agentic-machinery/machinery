@@ -876,11 +876,18 @@ def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str,
     monkeypatch.setenv("LU_OPSEC_NEEDLES_FILE", str(needles))
     # Production checkouts sit below an emptied data root; so does this one: the run sees its view only.
     monkeypatch.setattr(write_boundary, "_DATA_ROOTS", _ALL_DATA_ROOTS)
+    # The supervisor's unnamed patch file; the test names its bytes only when the launcher wrote some.
     patch = tmp_path / "wb-test.patch"
-    code, data = _run(primary, script, "--mode", "workspace-write", "--snapshot-bytes", "65536", "--no-github-relays",
-                      "--no-sources-relay", "--upload-ceiling", "65536", "--draft-patch", str(patch),
-                      *(arg for path in owned for arg in ("--owned-path", path)),
-                      *(("--read-path", read_path) if read_path else ()))
+    descriptor = os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        code, data = _run(primary, script, "--mode", "workspace-write", "--snapshot-bytes", "65536",
+                          "--no-github-relays", "--no-sources-relay", "--upload-ceiling", "65536",
+                          "--draft-patch-fd", str(descriptor), *(arg for path in owned for arg in ("--owned-path", path)),
+                          *(("--read-path", read_path) if read_path else ()))
+        if written := os.pread(descriptor, 1 << 24, 0):
+            patch.write_bytes(written)
+    finally:
+        os.close(descriptor)
     return code, data, patch
 
 
@@ -1012,9 +1019,10 @@ def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path,
 def test_savant_write_run_needs_its_bounds(primary, tmp_path):
     """Defect class (#898): a write run starts without the view, the patch target, its owned paths or with a
     GitHub or Sources relay or Sources MCP."""
+    descriptor = os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
     full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--no-github-relays", "--no-sources-relay",
-            "--draft-patch", str(tmp_path / "p.patch"), "--owned-path", "docs"]
-    for drop in ("--snapshot-bytes", "--no-github-relays", "--no-sources-relay", "--draft-patch", "--owned-path"):
+            "--draft-patch-fd", str(descriptor), "--owned-path", "docs"]
+    for drop in ("--snapshot-bytes", "--no-github-relays", "--no-sources-relay", "--draft-patch-fd", "--owned-path"):
         index = full.index(drop)
         argv = full[:index] + full[index + (1 if drop.startswith("--no-") else 2):]
         with pytest.raises(SystemExit):
@@ -1022,10 +1030,17 @@ def test_savant_write_run_needs_its_bounds(primary, tmp_path):
     for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):
         with pytest.raises(SystemExit):
             _run(primary, "true", *full, *extra)
-    # A patch file already there (another run's, or a partial one) refuses before the provider starts.
-    (tmp_path / "p.patch").write_bytes(b"")
-    with pytest.raises(SystemExit):
-        _run(primary, "true", *full)
+    # Only the supervisor's fresh unnamed file takes the patch: a named file, or one already written to, refuses
+    # before the provider starts.
+    os.write(descriptor, b"partial")
+    named = os.open(tmp_path / "p.patch", os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    try:
+        for target in (descriptor, named):
+            with pytest.raises(SystemExit):
+                _run(primary, "true", *[str(target) if arg == str(descriptor) else arg for arg in full])
+    finally:
+        os.close(descriptor)
+        os.close(named)
 
 
 def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypatch, tmp_path):

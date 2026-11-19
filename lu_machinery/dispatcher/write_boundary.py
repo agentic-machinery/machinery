@@ -291,12 +291,6 @@ def draft_patch(task_file: Path) -> Path:
     return task_file.with_suffix(".patch")
 
 
-def staged_patch(task_file: Path) -> Path:
-    """Where the launcher leaves a Savant write run's patch; settlement keeps it as ``draft_patch`` or removes it
-    (``worker._settle_savant_patch``)."""
-    return task_file.with_suffix(".patch-staged")
-
-
 def scratch(task_id: str) -> Path:
     if not _TASK_ID.fullmatch(task_id):
         raise ValueError("write boundary: the task id is unsafe as a scratch name")
@@ -340,7 +334,7 @@ def declared_outputs(spec, invocation) -> list[Path]:
     return [Path(path) for path in outputs]
 
 
-def launcher(spec, invocation, task_file: Path) -> list[str]:
+def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> list[str]:
     """The argv that runs ``invocation.argv`` inside the write boundary."""
     found = shutil.which(invocation.argv[0], path=invocation.env.get("PATH")) if invocation.argv else None
     if not found:
@@ -388,7 +382,10 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
             owned = ownership.effective_scope(store.read(spec.task_id) or {})
             if not owned:
                 raise ValueError("write_boundary_refused: a Savant write run needs owned paths")
-            argv += ["--draft-patch", str(staged_patch(task_file))]
+            # The patch goes into the supervisor's unnamed file; only settlement of a done run names it.
+            if draft_fd is None:
+                raise ValueError("write_boundary_refused: a Savant write run needs its patch descriptor")
+            argv += ["--draft-patch-fd", str(draft_fd)]
             argv += [arg for path in owned for arg in ("--owned-path", path)]
     host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
             if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
@@ -413,7 +410,8 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return {"status": "missing"}, "write_boundary_unproven: the boundary receipt is not an object"
     summary = {key: receipt.get(key) for key in (
         "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker")}
-    summary["canary_passed"] = bool(receipt.get("canary", {}).get("passed"))
+    canary = receipt.get("canary")
+    summary["canary_passed"] = isinstance(canary, dict) and bool(canary.get("passed"))
     if receipt.get("schema") != SCHEMA or receipt.get("task_id") != task_id:
         return summary, "write_boundary_unproven: the receipt names another run"
     if receipt.get("mode") != mode:
@@ -2156,7 +2154,7 @@ class _Boundary:
         return files
 
     def _draft(self, view: Path) -> dict:
-        """A write run's edits of its view as a Git patch against the start commit, written to ``--draft-patch``.
+        """A write run's edits of its view as a Git patch against the start commit, written to ``--draft-patch-fd``.
 
         ``run`` calls it only after the run's init has exited (``_sandbox_init``). Each file is read once
         (``_read_view``), and Git gets those bytes, never the view's paths. More than ``MAX_DRAFT_PATHS`` edits,
@@ -2233,22 +2231,18 @@ class _Boundary:
         patch = _plain_git_bounded(draft, "diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames",
                                    "--no-ext-diff", "--no-textconv", before, after, max_bytes=4 * limit,
                                    refusal=refusal)
-        target = Path(self.args.draft_patch)
+        # Into the supervisor's unnamed file: an interrupted or late write leaves nothing anyone can find, and
+        # settlement names it only for a done run whose receipt gives this size and digest.
         try:
-            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            written = 0
+            while written < len(patch):
+                if not (count := os.pwrite(self.args.draft_patch_fd, patch[written:], written)):
+                    raise OSError("short write")
+                written += count
         except OSError:
-            raise Refused(f"{refusal}: the patch file cannot be created") from None
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(patch)
-        except BaseException as exc:
-            # A failed or interrupted write leaves no partial patch; the receipt's digest names only a whole one.
-            target.unlink(missing_ok=True)
-            if isinstance(exc, OSError):
-                raise Refused(f"{refusal}: the patch could not be written") from None
-            raise
-        return {"status": "drafted", "patch": self.args.draft_patch, "patch_sha256": hashlib.sha256(patch).hexdigest(),
-                "paths": sorted(edits), "bytes": len(patch)}
+            raise Refused(f"{refusal}: the patch could not be written") from None
+        return {"status": "drafted", "patch_sha256": hashlib.sha256(patch).hexdigest(), "paths": sorted(edits),
+                "bytes": len(patch)}
 
     def current_tip(self) -> str:
         """The dispatched branch's tip as the worker sees it now (its private layer, else the launch tip)."""
@@ -2368,13 +2362,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--receipt", required=True, help="Boundary receipt output path")
     parser.add_argument("--mode", choices=("read-only", "workspace-write"), default="read-only",
                         help="The dispatch mode; workspace-write only for a Savant run with --snapshot-bytes, "
-                        "--draft-patch and --no-github-relays, whose tools edit their own copy of the view "
+                        "--draft-patch-fd and --no-github-relays, whose tools edit their own copy of the view "
                         "(default: read-only)")
-    parser.add_argument("--draft-patch", help="A workspace-write run's patch of its edits against the start commit, "
-                        "written after the run exits; must not exist yet (default: none)")
+    parser.add_argument("--draft-patch-fd", type=int, help="An inherited descriptor of an empty, unnamed regular "
+                        "file (O_TMPFILE) that takes a workspace-write run's patch against the start commit after "
+                        "the run exits, e.g. 3 (default: none)")
     parser.add_argument("--owned-path", action="append", default=[],
                         help="A path a workspace-write run's draft may change, e.g. docs/x.md; repeatable, "
-                        "required with --draft-patch (default: none)")
+                        "required with --draft-patch-fd (default: none)")
     parser.add_argument("--runtime", help="The read-only Codex task's existing private scratch lease")
     parser.add_argument("--pr", type=_pr_number, help="The PR the task record names (a review's PR); in a private "
                         "repository github-read acts on this PR only (default: the open PR "
@@ -2407,14 +2402,21 @@ def main(argv: list[str]) -> int:
     if len(args.read_path) > MAX_READ_PATHS or (args.read_path and args.snapshot_bytes is None):
         parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
     write = args.mode == "workspace-write"
-    if write != (args.draft_patch is not None) or write != bool(args.owned_path) or (
+    if write != (args.draft_patch_fd is not None) or write != bool(args.owned_path) or (
             write and (args.snapshot_bytes is None or not args.no_github_relays or not args.no_sources_relay
                        or args.sources_mcp is not None)):
-        parser.error("--mode workspace-write needs --draft-patch, --owned-path, --snapshot-bytes, "
-                     "--no-github-relays and --no-sources-relay, without --sources-mcp; --draft-patch and "
+        parser.error("--mode workspace-write needs --draft-patch-fd, --owned-path, --snapshot-bytes, "
+                     "--no-github-relays and --no-sources-relay, without --sources-mcp; --draft-patch-fd and "
                      "--owned-path need it")
-    if write and (not Path(args.draft_patch).is_absolute() or os.path.lexists(args.draft_patch)):
-        parser.error("--draft-patch must be an absolute path that does not exist yet")
+    if write:
+        try:
+            info = os.fstat(args.draft_patch_fd)
+            os.set_inheritable(args.draft_patch_fd, False)  # never into the sandbox or a Git step
+        except (OSError, OverflowError):
+            info = None
+        # Only the supervisor's own fresh, unnamed file: never a named one a write could reach by path.
+        if info is None or not stat.S_ISREG(info.st_mode) or info.st_nlink != 0 or info.st_size != 0:
+            parser.error("--draft-patch-fd must name an empty, unnamed regular file")
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "mode": args.mode, "status": "refused", "started_at": _now()}
     if not _TASK_ID.fullmatch(args.task_id):
         receipt["reason"] = "unsafe task id"

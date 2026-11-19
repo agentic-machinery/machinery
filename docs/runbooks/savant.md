@@ -38,7 +38,8 @@ copy is writable.
 ## The deliverable: a patch
 
 After the sandbox exits, the launcher (on the host) compares the view with the start commit and
-stages a Git patch beside the task record, `<task-id>.patch-staged`. It refuses the draft, and the run
+writes a Git patch into an unnamed file the supervisor opened beside the task record (`O_TMPFILE`,
+passed as `--draft-patch-fd`). It refuses the draft, and the run
 fails with `write_boundary_import_failed: refused: savant_draft_refused: ...`, when:
 
 - the run changed, added or deleted more than 256 files;
@@ -60,16 +61,18 @@ files uses the listing taken when the view was made. The patch is built in a pri
 repository that holds just the changed paths before and after, so nothing is written to the
 repository or the worktree.
 
-Settlement checks the patch's paths against the owned paths again. Then, at the moment the run's
-status is final, it keeps the staged file as `<task-id>.patch` only when the run settled `done`
-and the file is the regular, single-link file whose size and SHA-256 the receipt names. Any other
-file settles `no_deliverable` (`savant_draft_patch_missing_or_changed`,
-`savant_draft_receipt_malformed`). The staged file is always removed, so a refused, cancelled or
-over-ceiling run leaves no patch, and `<task-id>.patch` exists only beside a `done` record. The
-task record's `write_boundary.import` holds `patch` (that path), `patch_sha256`, `bytes` and
-`paths`. An unchanged view settles `no_deliverable` (`no_commits_or_unknown`). A failed or
-interrupted patch write leaves no file behind, and the launcher refuses to start a write run
-whose staged file already exists.
+Settlement checks the patch's paths against the owned paths again. A Savant write delivers only
+this patch: a run without a draft settles `no_deliverable` (`savant_draft_missing`), whatever
+commits, branches or merged PRs exist elsewhere. Then, at the moment the run's status is final
+and before the record is published, settlement links the unnamed file as `<task-id>.patch` only
+when the run settled `done` and the file holds exactly the size and SHA-256 the receipt names.
+Anything else settles `no_deliverable` (`savant_draft_patch_missing_or_changed`,
+`savant_draft_receipt_malformed`). A refused, cancelled, timed-out, over-ceiling or crashed run,
+and a launcher that writes late or only in part, leave no file at all: the unnamed file vanishes
+with its last descriptor. Every path that publishes a record that is not `done` (including crash
+recovery) removes `<task-id>.patch` first, so it exists only beside a `done` record. The task
+record's `write_boundary.import` holds `patch` (that path, once linked), `patch_sha256`, `bytes`
+and `paths`. An unchanged view settles `no_deliverable` (`savant_draft_missing`).
 
 OpenCode's formatters and language servers are off for every Savant run, so the patch holds only
 the model's own edits and no language server starts or downloads inside the boundary.

@@ -433,17 +433,19 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     assert worker._in_boundary(trial) and not worker._in_boundary(replace(trial, provider="deepseek"))
     monkeypatch.setattr(write_boundary.shutil, "which", lambda *args, **kwargs: os.devnull)
     task_file = store.record_path("oc-write")
-    argv = write_boundary.launcher(trial, invocation, task_file)
+    with pytest.raises(ValueError, match="needs its patch descriptor"):
+        write_boundary.launcher(trial, invocation, task_file)
+    argv = write_boundary.launcher(trial, invocation, task_file, draft_fd=7)
     argv = argv[:argv.index("--")]
     assert argv[argv.index("--mode") + 1] == "workspace-write"
     # The launcher only stages the patch; settlement keeps it as <task>.patch for a done run.
-    assert argv[argv.index("--draft-patch") + 1] == str(task_file.with_suffix(".patch-staged"))
+    assert argv[argv.index("--draft-patch-fd") + 1] == "7"
     assert argv[argv.index("--owned-path") + 1] == "docs" and argv[argv.index("--read-path") + 1] == "docs"
     assert "--no-github-relays" in argv and "--no-sources-relay" in argv and "--snapshot-bytes" in argv
     assert "--sources-mcp" not in argv
     store.replace({**record, "owned_paths": []})
     with pytest.raises(ValueError, match="a Savant write run needs owned paths"):
-        write_boundary.launcher(trial, invocation, task_file)
+        write_boundary.launcher(trial, invocation, task_file, draft_fd=7)
     with pytest.raises(ValueError, match="savant_write_refused"):
         opencode.build(replace(trial, options={**trial.options, "data_class": "private-code"}), {})
 
@@ -457,6 +459,8 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     ({"provider": "deepseek"}, "no_deliverable", "no_commits_or_unknown"),
     # A malformed path list is refused whole, never read as its well-formed part (review of #919).
     ({"paths": ["docs/a.md", 7]}, "no_deliverable", "savant_draft_unowned_or_empty"),
+    # A Savant write delivers only its draft: commits found elsewhere never make it done (review of #919).
+    ({"draft": "unchanged", "commits": 1}, "no_deliverable", "savant_draft_missing"),
 ])
 def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause):
     """Defect class (#898): settlement rejects a Savant write run's owned-path patch, accepts one with another
@@ -465,7 +469,7 @@ def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause)
         "task_id": "oc-write", "agent": "opencode", "provider": change.get("provider", "subq"),
         "mode": "workspace-write", "status": "done", "owned_paths": ["docs"],
         "commits_ahead": change.get("commits", 0), "worktree_dirty_on_exit": change.get("dirty", False),
-        "write_boundary": {"import": {"status": "drafted", "paths": change.get("paths", ["docs/a.md"])}},
+        "write_boundary": {"import": {"status": change.get("draft", "drafted"), "paths": change.get("paths", ["docs/a.md"])}},
     }
     worker._enforce_delivery(record)
     assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
@@ -484,20 +488,26 @@ def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path)
     missing or different from the one its receipt names."""
     task_file = tmp_path / "oc-write.json"
     patch = b"diff --git a/docs/a.md b/docs/a.md\n"
-    staged = write_boundary.staged_patch(task_file)
-    if case != "missing":
-        staged.write_bytes(patch + (b"tampered\n" if case == "changed" else b""))
+    # The supervisor's unnamed file, as the launcher left it.
+    descriptor = None if case == "missing" else os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    if descriptor is not None:
+        os.write(descriptor, patch + (b"tampered\n" if case == "changed" else b""))
     if case == "crashed-after-keep":
         write_boundary.draft_patch(task_file).write_bytes(patch)
     record = {
         "task_id": "oc-write", "agent": "opencode", "provider": "subq", "mode": "workspace-write",
         "status": {"failed-run": "failed", "crashed-after-keep": "crashed"}.get(case, "done"),
         "write_boundary": {"import": {"status": "drafted", "paths": ["docs/a.md"], "bytes": len(patch),
-                                      "patch_sha256": hashlib.sha256(patch).hexdigest(), "patch": str(staged)}},
+                                      "patch_sha256": hashlib.sha256(patch).hexdigest()}},
     }
-    worker._settle_savant_patch(record, task_file)
+    try:
+        worker._settle_savant_patch(record, task_file, descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
     kept = write_boundary.draft_patch(task_file)
-    assert not staged.exists() and kept.exists() == (status == "done")
+    assert kept.exists() == (status == "done") and sorted(path.name for path in tmp_path.iterdir()) == (
+        ["oc-write.patch"] if status == "done" else [])
     if status == "done":
         assert kept.read_bytes() == patch and record["write_boundary"]["import"]["patch"] == str(kept)
