@@ -74,8 +74,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   slash are preserved or resolved (`deepseek-direct/deepseek-v4-flash` is `deepseek-v4-flash`,
   `kimi-code/k3-256k` stays `kimi-code/k3-256k`). When `resolved_model_known` is true, `concrete_model` never falls
   back to the requested model: an unrecognized spelling that fits the model-label grammar (at most one slash, no
-  spaces or `..`, e.g. `claude-opus-5-6` or AGY's `unrecognized`) stays as recorded and takes its `identity` below
-  (`unrecognized` is `unreported`; other uncatalogued spellings are `not_in_catalog`), while an empty or
+  spaces or `..`, e.g. `claude-opus-5-6` or AGY's `unrecognized`) stays as recorded and takes its `identity`
+  from the identity list below, while an empty or
   grammar-rejected spelling (e.g. an unmapped display name with spaces like `Grok 4.7 256K High Fast`) becomes
   `unknown`.
   Rows store a bare harness alias with no observed model (`opus`, `sonnet`, `haiku`, `fable`) as recorded. The
