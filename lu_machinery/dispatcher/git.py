@@ -18,6 +18,9 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 
+# A checkout that tracks DESCRIPTOR is enrolled in the installed agent deployment; STATE is its ownership manifest.
+from lu_machinery.agent_deploy.plan import DESCRIPTOR as AGENT_DEPLOY_DESCRIPTOR
+from lu_machinery.agent_deploy.plan import STATE as AGENT_DEPLOY_STATE
 from lu_machinery.common import git_credentials, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.git_credentials import canonical_origins as canonical_origins
@@ -27,6 +30,7 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     main_checkout_root,
     product_root,
+    project_interpreter,
     state_root,
 )
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
@@ -62,6 +66,9 @@ VERIFICATION_FETCH_TIMEOUT = 60
 # Committer-clock slack below the task start date. Speed depends on this value;
 # correctness does not, because _complete_since_task_base checks the fetched graph.
 HISTORY_SLACK_SECONDS = 86400
+# One apply measured 2.2 s on learn-ukrainian (947 outputs). It runs under the worktree lock, so the bound
+# also caps how long a hung deployer delays other creations and attachments.
+AGENT_DEPLOY_TIMEOUT = 120
 
 
 class VerificationFetchError(subprocess.CalledProcessError):
@@ -470,8 +477,12 @@ def worktree_lock(repo: Path, *, timeout: float | None = None):
 
 def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_checkout=False, sparse_include=(),
                     exact=False, registration: dict | None = None, creator_actor: str | None = None,
-                    on_reserved=None) -> None:
+                    on_reserved=None, deploy_agents: bool = False) -> None:
     """Create a task worktree; ``registration`` (see register_worktree) also keeps its registry entry true.
+
+    ``deploy_agents`` (write tasks) applies the checkout's agent deployment (``deploy_agent_extensions``) under
+    the same locks, so an attachment waits for it; the sources its descriptor declares stay in the sparse tree.
+    A deployment that cannot be applied raises, so the task never launches.
 
     The entry is written before the tree exists and confirmed after, all under the worktree lock that
     settlement removes (and archives) under, so a later dispatch to the same path cannot interleave.
@@ -479,7 +490,9 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
     reserves it. Thus even a death immediately after ``mkdir`` leaves attribution. A failure removes the
     reservation only while it is still empty; attribution must survive until the tree is verifiably gone.
     """
-    excluded = sparse_excludes(sparse_include)
+    sources = deployment_sources(repo, sha) if deploy_agents else None
+    excluded = [tree for tree in sparse_excludes(sparse_include) if not any(
+        source == tree or source.startswith(tree + "/") or tree.startswith(source + "/") for source in sources or ())]
     # A published start is checked out as that exact object, not a shared replacement.
     no_replace = ("--no-replace-objects",) if exact else ()
 
@@ -520,6 +533,8 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             if registration:
                 confirm_worktree(registration["registry"], path)
                 _install_refresh_hooks(path, registration["registry"])
+            if sources is not None:
+                deploy_agent_extensions(path)
         except BaseException as exc:
             if reserved:
                 with suppress(OSError):
@@ -540,6 +555,95 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             raise
     # Outside the lock: a store miss runs one npm install, and other creations must not wait for it.
     site_deps.provision(repo, path)
+
+
+def deployment_sources(repo: Path, commit: str) -> list[str] | None:
+    """The source paths the agent deployment descriptor at ``commit`` declares, or None when it tracks none.
+
+    Enrollment is the committed entry, whatever the working tree holds. A present entry that is not a readable
+    descriptor yields no paths, and the deployer then refuses it with its own reason.
+    """
+    def read(*args: str) -> str:
+        return _git(repo, "--no-replace-objects", *args, isolate=True, strip=False)
+    if not read("ls-tree", "--name-only", commit, "--", AGENT_DEPLOY_DESCRIPTOR):
+        return None
+    try:
+        descriptor = json_depth.loads(read("cat-file", "blob", f"{commit}:{AGENT_DEPLOY_DESCRIPTOR}"), max_depth=16)
+        return [str(source["path"]).strip("/") for source in descriptor["sources"].values()]
+    except (subprocess.CalledProcessError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
+        return []
+
+
+def _agent_deploy(root: Path, *args: str, drift_ok: bool = False) -> None:
+    """Run the deployer on the checkout at ``root``; any failure is ``agent_deploy_failed`` with its last line.
+
+    ``drift_ok`` accepts a check's exit 1 (outputs differ from the plan), never its exit 2 (invalid input).
+    """
+    try:
+        interpreter = project_interpreter(env=os.environ)
+        # The interpreter is the configured project interpreter every worker hook runs (child_env), not task input.
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [str(interpreter), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root), *args],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+            timeout=AGENT_DEPLOY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"agent_deploy_failed: no result within {AGENT_DEPLOY_TIMEOUT} s") from None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"agent_deploy_failed: project interpreter unavailable ({type(exc).__name__})") from None
+    if result.returncode and not (drift_ok and result.returncode == 1):
+        reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
+        raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
+
+
+def deploy_agent_extensions(path: Path) -> bool:
+    """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
+
+    Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
+    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
+    product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
+    ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
+    worker's hooks use. The deployer's own check then recomposes the plan from the HEAD commit's objects
+    (``--check --inputs-commit``) and verifies the written outputs against it, so a sparse checkout that hides
+    an input from the apply (a source, or a product marker that selects a validation) refuses instead of
+    deploying less. Before anything is written, the same check refuses a commit whose plan is invalid (its
+    drift is what the apply then fixes), and an attached tree's deployment inputs must equal HEAD's. Applying
+    again is
+    idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each
+    refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
+    deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
+    not ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes
+    file, which the worker may not share), so the worker could commit it.
+    """
+    sources = deployment_sources(path, "HEAD")
+    if sources is None:
+        return False
+    root = path.resolve()  # the deployer takes only the canonical checkout root
+    # The apply composes from the working tree. Refuse before anything is written when an input there differs
+    # from HEAD (a change, or an untracked or ignored file the deployer would read; it skips bytecode caches),
+    # so a refused attachment leaves the tree's earlier deployment as it was.
+    pending = [line[3:] for line in _git(
+        root, "status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--",
+        AGENT_DEPLOY_DESCRIPTOR, *sources, isolate=True, strip=False, env={"GIT_LITERAL_PATHSPECS": "1"},
+    ).splitlines() if "__pycache__" not in PurePosixPath(line[3:]).parts]
+    if pending:
+        raise ValueError(f"agent_deploy_failed: deployment inputs differ from HEAD: {', '.join(pending[:3])}")
+    verify = ("--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
+    _agent_deploy(root, *verify, drift_ok=True)  # an invalid commit plan refuses before anything is written
+    _agent_deploy(root)
+    _agent_deploy(root, *verify)
+    # Only the deployment's own outputs are checked: an attached worktree may hold the worker's own changes.
+    try:
+        manifest = json_depth.loads((root / AGENT_DEPLOY_STATE).read_text(encoding="utf-8"), max_depth=16)
+        outputs = [AGENT_DEPLOY_STATE, *manifest["files"]]
+    except (OSError, ValueError, RecursionError, KeyError, TypeError):
+        raise ValueError("agent_deploy_failed: the ownership manifest cannot be read after apply") from None
+    changed = _git(root, "-c", "core.excludesFile=/dev/null", "status", "--porcelain", "--untracked-files=all",
+                   "--", *outputs, isolate=True, strip=False, env={"GIT_LITERAL_PATHSPECS": "1"}).splitlines()
+    if changed:
+        listed = ", ".join(line[3:] for line in changed[:3])
+        raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {listed}")
+    return True
 
 
 def registry_path(repo: Path, repository: dict) -> Path | None:

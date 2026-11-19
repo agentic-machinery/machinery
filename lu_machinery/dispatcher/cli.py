@@ -656,7 +656,7 @@ def _dispatch(args) -> int:
     with host_admission.reserve(
         task_id, args.mode, decision, agent=agent, force_reason=force_reason,
         disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
-    ) as hold:
+    ) as hold, contextlib.ExitStack() as attachment:
         if binding:
             store.check_review_attempt(binding)  # the supervisor claims it (review_attempt.run)
         if not args.cwd:
@@ -670,8 +670,16 @@ def _dispatch(args) -> int:
             attribution = store.worktree_attribution(spec, info, branch, sha)
             git.create_worktree(repo, worktree, branch, sha, full_checkout=args.full_checkout,
                                 sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
-                                **exact_start,
+                                **exact_start, deploy_agents=args.mode == "workspace-write",
                                 on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
+        elif args.mode == "workspace-write":
+            # An attached write task gets the same agent deployment as a created one, after any creation still
+            # applying it, and before a record exists, so a refusal leaves none. The lock (the one settlement
+            # removes under) stays held until the worker starts, so the tree launched is the tree deployed.
+            attachment.enter_context(git.worktree_lock(repo))
+            if not worktree.is_dir():
+                raise ValueError("cwd worktree was removed before the task started")
+            git.deploy_agent_extensions(worktree)
         record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
         # A task dispatched from inside another task's run names that run, whose settlement then names it while
         # it still runs (worker._running_children, #12156).
