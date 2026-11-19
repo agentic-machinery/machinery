@@ -355,10 +355,20 @@
       ? Math.max(repo.open_total, list.length) : list.length;
   }
 
-  function prChips(prs, href = "/pull-requests", expired = false) {
+  function prSnapshotUnavailable(readingOrData, state = null) {
+    const data = readingOrData && Object.hasOwn(readingOrData, "data") ? readingOrData.data : readingOrData;
+    const snapState = state ?? (readingOrData && Object.hasOwn(readingOrData, "state") ? readingOrData.state : null);
+    if (!data || data.status !== "ok" || snapState === "unavailable") return true;
+    const repos = Array.isArray(data.repositories) ? data.repositories : null;
+    return Boolean(repos && repos.length > 0 && !repos.some(repo => repo && repo.status === "ok"));
+  }
+
+  function prChips(prs, href = "/pull-requests", prState = null) {
     if (!prs) return [];
-    if (prs.status !== "ok") return [chip(href, "?", "PRs unknown", "warn")];
     const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+    const unavailable = prState === "unavailable" || prSnapshotUnavailable(prs, prState);
+    if (unavailable) return [chip(href, "?", "PRs unknown", "warn")];
+    const expired = prState === "expired" || prState === true;
     const open = repos.reduce((sum, repo) => sum + repoOpenCount(repo), 0);
     const queued = repos.reduce((sum, repo) => sum + (repo.status === "ok" ? (repo.pull_requests || []).filter(pr => pr.queue).length : 0), 0);
     const partial = repos.some(repo => repo.status !== "ok");
@@ -384,40 +394,47 @@
   const PULL_REQUESTS_BOUND_S = 210;
   const finiteAge = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 
-  function prReadingAge(reading, now = Date.now()) {
-    if (!reading || typeof now !== "number" || !Number.isFinite(now)) return null;
-    const headerAge = finiteAge(reading.age);
-    if (headerAge !== null) {
-      const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
-        ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
-      return headerAge + elapsed;
-    }
-    const observed = toDate(reading.data?.observed_at);
-    return observed ? Math.max(0, (now - observed.getTime()) / 1000) : null;
-  }
-
   function prReadingBound(reading) {
     const headerBound = typeof reading?.bound === "number" && Number.isFinite(reading.bound) && reading.bound > 0
       ? reading.bound : null;
     return headerBound !== null ? Math.min(headerBound, PULL_REQUESTS_BOUND_S) : PULL_REQUESTS_BOUND_S;
   }
 
+  function prSnapshotState(reading, now = Date.now()) {
+    if (!reading || !reading.data || prSnapshotUnavailable(reading)) {
+      return {status: "unavailable", expired: false, unavailable: true};
+    }
+    const repos = Array.isArray(reading.data.repositories) ? reading.data.repositories : [];
+    const partial = repos.some(repo => !repo || repo.status !== "ok");
+    if (typeof now !== "number" || !Number.isFinite(now)) {
+      return {status: "expired", expired: true, unavailable: false};
+    }
+    const headerAge = finiteAge(reading.age);
+    if (headerAge !== null) {
+      const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
+        ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
+      const expired = headerAge + elapsed > prReadingBound(reading);
+      return {status: expired ? "expired" : "fresh", expired, unavailable: false};
+    }
+    // Without a valid X-Snapshot-Age-S header, stale on a fully readable response means age expiry;
+    // when a sibling repository is unknown, stale may come from partial coverage so fall back to observed_at.
+    if (reading.state === "stale" && !partial) {
+      return {status: "expired", expired: true, unavailable: false};
+    }
+    const observed = toDate(reading.data.observed_at);
+    if (!observed) {
+      return {status: "expired", expired: true, unavailable: false};
+    }
+    const expired = Math.max(0, (now - observed.getTime()) / 1000) > prReadingBound(reading);
+    return {status: expired ? "expired" : "fresh", expired, unavailable: false};
+  }
+
   function prSnapshotFresh(reading, now = Date.now()) {
-    if (!reading || !reading.data || reading.data.status !== "ok") return false;
-    if (reading.state === "unavailable") return false;
-    const age = prReadingAge(reading, now);
-    return age !== null && age <= prReadingBound(reading);
+    return prSnapshotState(reading, now).status === "fresh";
   }
 
   function prSnapshotExpired(reading, now = Date.now()) {
-    if (!reading || !reading.data || reading.data.status !== "ok") return true;
-    if (reading.state === "unavailable") return true;
-    if (typeof now !== "number" || !Number.isFinite(now)) return true;
-    const fresh = freshnessOf(reading);
-    if (fresh.unavailable || fresh.age === null || fresh.bound === null) return true;
-    const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
-      ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
-    return fresh.age + elapsed > fresh.bound;
+    return prSnapshotState(reading, now).expired;
   }
 
   function rowsFreshness(rows, bound) {
@@ -477,10 +494,14 @@
     const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
     const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
     if (reading.url === "/api/git/pull-requests" && own) {
-      const age = finiteAge(reading.age) ?? own.age;
+      const headerAge = finiteAge(reading.age);
+      const age = headerAge ?? own.age;
       const bound = prReadingBound(reading);
-      const unavailable = own.unavailable || reading.state === "unavailable";
-      return {...own, age, bound, unavailable};
+      const repos = Array.isArray(reading.data.repositories) ? reading.data.repositories : [];
+      const partial = repos.some(repo => !repo || repo.status !== "ok");
+      const unavailable = own.unavailable || prSnapshotUnavailable(reading);
+      const flag = own.flag || (headerAge === null && !partial && reading.state === "stale" ? "stale" : null);
+      return {...own, age, bound, flag, unavailable};
     }
     if (own && (own.age !== null || own.flag !== null || own.unavailable)) return own;
     const flag = reading.state === "stale" ? "stale" : null;
@@ -509,7 +530,7 @@
 
   const DEFAULT_SOURCE_LABELS = ["Usage", "API balances", "Sign-in"];
 
-  function headingAge(readings, badOnFailure, attemptedAt = null, sourceLabels = DEFAULT_SOURCE_LABELS) {
+  function headingAge(readings, badOnFailure, attemptedAt = null, sourceLabels = DEFAULT_SOURCE_LABELS, now = Date.now()) {
     const sources = Array.isArray(readings) ? readings : [];
     const moment = sources[0]?.receivedAt ?? attemptedAt;
     const label = sources.length ? "Fetched" : "Last attempt";
@@ -518,7 +539,7 @@
     let bad = false, caution = false;
     const labels = sources.map((reading, index) => {
       const fresh = freshnessOf(reading);
-      const elapsed = reading?.receivedAt ? Math.max(0, Date.now() - reading.receivedAt) / 1000 : 0;
+      const elapsed = reading?.receivedAt ? Math.max(0, now - reading.receivedAt) / 1000 : 0;
       const state = freshnessState(fresh, elapsed);
       bad ||= state === "stale" || state === "unavailable";
       caution ||= state === "last_good" || state === "unknown" || state === "partial";
@@ -577,10 +598,10 @@
       : `${name} couldn't load.`;
   }
 
-  function updatePanelAge(panel) {
+  function updatePanelAge(panel, now = Date.now()) {
     const age = document.getElementById(`${panel.id}-age`);
     if (!age) return;
-    const line = headingAge(panel.readings, panel.ok === false && !panel.refusal, panel.attemptedAt, panel.sourceLabels);
+    const line = headingAge(panel.readings, panel.ok === false && !panel.refusal, panel.attemptedAt, panel.sourceLabels, now);
     age.textContent = line.text;
     age.className = line.bad ? "age bad" : line.caution ? "age warn" : "age";
   }
@@ -638,12 +659,13 @@
         const readings = await Promise.all(panel.urls.map(readSource));
         const data = readings.map(reading => reading.data);
         panel.readings = readings;
-        const renderArgs = panel.withReadings ? [...data, readings] : data;
+        const renderNow = Date.now();
+        const renderArgs = panel.withReadings ? [...data, readings, renderNow] : data;
         if (content) content.innerHTML = panel.render(...renderArgs);
         latest[panel.id] = data[0];
-        if (typeof panel.onData === "function") panel.onData(data, latest, readings);
+        if (typeof panel.onData === "function") panel.onData(data, latest, readings, renderNow);
         if (onAfterLoad) onAfterLoad(panel, data, latest);
-        const ageLine = headingAge(readings, false, panel.attemptedAt, panel.sourceLabels);
+        const ageLine = headingAge(readings, false, panel.attemptedAt, panel.sourceLabels, renderNow);
         if (age) {
           age.textContent = ageLine.text;
           age.className = ageLine.bad ? "age bad" : ageLine.caution ? "age warn" : "age";
@@ -714,10 +736,13 @@
       refreshAll();
       setInterval(refreshAll, REFRESH_MS);
       // This clock advances even if a refresh stalls or the network disappears. It makes no requests.
-      setInterval(() => panels.filter(panel => panel.ok !== undefined).forEach(panel => {
-        updatePanelAge(panel);
-        if (typeof panel.onTick === "function") panel.onTick(panel, latest, updateChips);
-      }), 1000);
+      setInterval(() => {
+        const now = Date.now();
+        panels.filter(panel => panel.ok !== undefined).forEach(panel => {
+          updatePanelAge(panel, now);
+          if (typeof panel.onTick === "function") panel.onTick(panel, latest, updateChips, now);
+        });
+      }, 1000);
     }
 
     return {panels, latest, loadPanel, retryPanel, refreshAll, start};
@@ -775,8 +800,8 @@
     repoOpenCount,
     prChips,
     finiteAge,
-    prReadingAge,
     prReadingBound,
+    prSnapshotState,
     prSnapshotFresh,
     prSnapshotExpired,
     rowsFreshness,

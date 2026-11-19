@@ -58,8 +58,8 @@ const CODEX_ACCOUNTS = {sub: "Codex a", "b-sub": "Codex b", api: "Codex API", "b
 
 let latestPrsReading = null;
 
-function currentPrs() {
-  return latestPrsReading && prSnapshotFresh(latestPrsReading) ? latestPrsReading.data : null;
+function currentPrs(now = Date.now()) {
+  return latestPrsReading && prSnapshotFresh(latestPrsReading, now) ? latestPrsReading.data : null;
 }
 
 function account(task) {
@@ -177,18 +177,19 @@ function renderChips(latest) {
 // Optional non-blocking enrichment so the PR column of active workers shows CI and queue state.
 // Clears enrichment and repaints workers whenever the optional fetch fails or returns an expired/unusable snapshot.
 let prsInFlight = false;
-function repaintWorkers() {
+function repaintWorkers(now = Date.now()) {
   if (!runner.latest.workers) return;
   const box = document.getElementById("workers-content");
-  if (box) box.innerHTML = renderWorkers(runner.latest.workers);
+  if (box) box.innerHTML = renderWorkers(runner.latest.workers, currentPrs(now));
 }
 
 function enrichWorkerPrs() {
   if (prsInFlight) return;
   prsInFlight = true;
   fetchJson("/api/git/pull-requests").then(reading => {
-    latestPrsReading = prSnapshotFresh(reading) ? reading : null;
-    repaintWorkers();
+    const now = Date.now();
+    latestPrsReading = prSnapshotFresh(reading, now) ? reading : null;
+    repaintWorkers(now);
   }).catch(() => {
     latestPrsReading = null;
     repaintWorkers();
@@ -197,10 +198,10 @@ function enrichWorkerPrs() {
   });
 }
 
-function expireWorkerPrsIfStale() {
-  if (latestPrsReading && !prSnapshotFresh(latestPrsReading)) {
+function expireWorkerPrsIfStale(_panel, _latest, _updateChips, now = Date.now()) {
+  if (latestPrsReading && !prSnapshotFresh(latestPrsReading, now)) {
     latestPrsReading = null;
-    repaintWorkers();
+    repaintWorkers(now);
   }
 }
 

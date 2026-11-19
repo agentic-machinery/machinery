@@ -41,15 +41,21 @@
 "use strict";
 const {
   escapeHtml, safeHttpUrl, ageSpan, table, td, text, unknown,
-  ciLabel, reviewLabel, prChips, prSnapshotExpired, createPanelRunner,
+  ciLabel, reviewLabel, prChips, prSnapshotState, createPanelRunner,
 } = Machinery;
 
-function renderPrs(prs, expired = false) {
+function renderPrs(prs, prState = null) {
   if (prs.status !== "ok") return unknown(prs.reason);
-  const expiredNote = expired
-    ? '<p class="warn">PR snapshot is expired; showing cached observations (CI rollup, review status, and queue positions may be out of date).</p>'
-    : "";
-  return expiredNote + (Array.isArray(prs.repositories) ? prs.repositories : []).map(repo => {
+  const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
+  const unavailable = prState === "unavailable" || allUnknown;
+  const expired = !unavailable && (prState === "expired" || prState === true);
+  const stateNote = unavailable
+    ? '<p class="warn">All repositories are unavailable; open pull request and merge queue counts are unknown.</p>'
+    : expired
+      ? '<p class="warn">PR snapshot is expired; showing cached observations (CI rollup, review status, and queue positions may be out of date).</p>'
+      : "";
+  return stateNote + repos.map(repo => {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
     if (repo.status !== "ok") return title + unknown(repo.reason);
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
@@ -83,16 +89,17 @@ const PANELS = [
     label: "Pull requests",
     urls: ["/api/git/pull-requests"],
     withReadings: true,
-    render: (prs, readings) => renderPrs(prs, prSnapshotExpired(readings?.[0])),
-    onData: (_data, latest, readings) => { latest.prsExpired = prSnapshotExpired(readings?.[0]); },
-    onError: latest => { latest.prsExpired = false; },
-    onTick: (panel, latest, updateChips) => {
-      if (!panel.ok || latest.prsExpired) return;
+    render: (prs, readings, now) => renderPrs(prs, prSnapshotState(readings?.[0], now).status),
+    onData: (_data, latest, readings, now) => { latest.prsStatus = prSnapshotState(readings?.[0], now).status; },
+    onError: latest => { latest.prsStatus = null; },
+    onTick: (panel, latest, updateChips, now) => {
+      if (!panel.ok || latest.prsStatus !== "fresh") return;
       const reading = panel.readings?.[0];
-      if (!reading || !prSnapshotExpired(reading)) return;
-      latest.prsExpired = true;
+      const next = prSnapshotState(reading, now);
+      if (!next.expired) return;
+      latest.prsStatus = next.status;
       const box = document.getElementById("prs-content");
-      if (box) box.innerHTML = renderPrs(reading.data, true);
+      if (box) box.innerHTML = renderPrs(reading.data, next.status);
       updateChips();
     },
   },
@@ -100,7 +107,7 @@ const PANELS = [
 
 const runner = createPanelRunner({
   panels: PANELS,
-  renderChips: latest => prChips(latest.prs, "#prs", Boolean(latest.prsExpired)).join(""),
+  renderChips: latest => prChips(latest.prs, "#prs", latest.prsStatus).join(""),
 });
 runner.start();
 </script>

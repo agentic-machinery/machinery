@@ -435,6 +435,74 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     await prsClock.runner.refreshAll();
     assert.doesNotMatch(document.getElementById('prs-content').innerHTML, /snapshot is expired/);
     assert.match(document.getElementById('prs-content').innerHTML, /<td class="ok">position 1 Â· queued<\/td>/);
+
+    // F6 boundary race: 209.999s age when renderNow is sampled; even if clock advances 2ms before onTick, body, chip, and tick stay consistent.
+    const boundaryReading = {
+      url: '/api/git/pull-requests', age: 209.999, bound: 210, state: 'fresh', receivedAt: fakeNow,
+      data: {status: 'ok', observed_at: new Date(fakeNow - 209999).toISOString(), repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: []}]},
+    };
+    const origNowFn = Date.now;
+    let calls = 0;
+    Date.now = () => { calls += 1; return calls <= 1 ? fakeNow : fakeNow + 2; };
+    const racePrsPanel = {id: 'prs', label: 'Merge queue', urls: ['/api/git/pull-requests'], ok: true, readings: [boundaryReading]};
+    const raceLatest = {prs: boundaryReading.data};
+    const loadNow = Date.now();
+    const initState = M.prSnapshotState(boundaryReading, loadNow);
+    assert.equal(initState.status, 'fresh');
+    raceLatest.prsStatus = initState.status;
+    const initHtml = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn renderQueueSummary;')(M)(boundaryReading.data, initState.status);
+    assert.match(initHtml, /No PRs currently in the merge queue/);
+    overviewClock.PANELS[2].onTick(racePrsPanel, raceLatest, () => {}, Date.now());
+    assert.equal(raceLatest.prsStatus, 'expired');
+    assert.match(document.getElementById('prs-content').innerHTML, /PR snapshot is expired \(cached\)/);
+    Date.now = origNowFn;
+
+    // F7: Missing or invalid X-Snapshot-Age-S with X-Snapshot-State: stale on fully readable response and -120s clock skew.
+    for (const badAge of [null, Number.NaN]) {
+      const f7Reading = {
+        url: '/api/git/pull-requests', age: badAge, bound: 210, state: 'stale', receivedAt: fakeNow,
+        data: {status: 'ok', observed_at: new Date(fakeNow - 120000).toISOString(), repositories: [
+          {name: 'machinery', status: 'ok', open_total: 0, pull_requests: []},
+        ]},
+      };
+      assert.equal(M.prSnapshotFresh(f7Reading, fakeNow), false, `F7: fleetFresh false when age=${badAge}`);
+      assert.equal(M.prSnapshotExpired(f7Reading, fakeNow), true, `F7: overviewExpired true when age=${badAge}`);
+      assert.match(M.headingAge([f7Reading], false, fakeNow, undefined, fakeNow).text, /STALE/);
+      // With an unreadable sibling, stale may reflect partial coverage so age fallback stays active.
+      const f7Partial = {
+        ...f7Reading,
+        data: {status: 'ok', observed_at: new Date(fakeNow - 30000).toISOString(), repositories: [
+          {name: 'machinery', status: 'ok', open_total: 1, pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', queue: {position: 1}}]},
+          {name: 'infra-private', status: 'unknown', reason: 'not_readable', open_total: null, pull_requests: []},
+        ]},
+      };
+      assert.equal(M.prSnapshotFresh(f7Partial, fakeNow), true, 'F7: partial coverage keeps fresh readable rows via observed_at fallback');
+      assert.equal(M.prSnapshotExpired(f7Partial, fakeNow), false, 'F7: partial coverage stays non-expired when observed_at is 30s');
+    }
+
+    // F8: status: ok with every repository unknown and X-Snapshot-State: unavailable renders unknown counts (never cached zeros) while retaining repo failures.
+    const f8Reading = {
+      url: '/api/git/pull-requests', age: null, bound: 210, state: 'unavailable', receivedAt: fakeNow,
+      data: {status: 'ok', observed_at: new Date(fakeNow).toISOString(), repositories: [
+        {name: 'machinery', status: 'unknown', reason: 'github_unavailable', open_total: null, pull_requests: []},
+        {name: 'learn-ukrainian', status: 'unknown', reason: 'github_timeout', open_total: null, pull_requests: []},
+      ]},
+    };
+    const f8State = M.prSnapshotState(f8Reading, fakeNow);
+    assert.deepEqual(f8State, {status: 'unavailable', expired: false, unavailable: true});
+    assert.match(M.headingAge([f8Reading], false, fakeNow, undefined, fakeNow).text, /unavailable/);
+    assert.match(M.prChips(f8Reading.data, '/pull-requests', f8State.status).join(''), /\?.*PRs unknown/);
+    assert.doesNotMatch(M.prChips(f8Reading.data, '/pull-requests', f8State.status).join(''), /cached/);
+    const ovF8 = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn renderQueueSummary;')(M)(f8Reading.data, f8State.status);
+    assert.match(ovF8, /<b>\?<\/b> open PRs/);
+    assert.match(ovF8, /<b>\?<\/b> queued/);
+    assert.match(ovF8, /All repositories are unavailable/);
+    assert.match(ovF8, /github unavailable/);
+    assert.doesNotMatch(ovF8, /cached/);
+    const prF8 = new Function('Machinery', extractScript('pull-requests.html', '\nrunner.start();') + '\nreturn renderPrs;')(M)(f8Reading.data, f8State.status);
+    assert.match(prF8, /All repositories are unavailable/);
+    assert.match(prF8, /github timeout/);
+    assert.doesNotMatch(prF8, /cached/);
   } finally {
     Date.now = realDateNow;
   }
