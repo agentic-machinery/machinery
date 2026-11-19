@@ -335,8 +335,9 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
     Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
     or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
-    Git status cannot see, reaching the guards; a borrowed tree written into, or launched with a deployment
-    that does not match its start commit; a deployed output the checkout tracks, which could enter the
+    Git status cannot see, reaching the guards; a borrowed tree written into, launched with a deployment
+    that does not match its start commit, or launched while another live task in it can commit and redeploy
+    between the check and the start; a deployed output the checkout tracks, which could enter the
     worker's commit; and a read-only (review) worktree widened by settings the dispatch did not ask for."""
     import sys
 
@@ -353,15 +354,26 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
         assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
         # A write task borrowing (--cwd) this undeployed tree refuses; nothing is written into a borrowed tree.
         with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
-            git.deploy_agent_extensions(tree, sha, apply=False)
+            git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
         assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
         return
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
     # A borrowing write task verifies the deployment; the worker's own change is not a deployment output.
     (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
-    assert git.deploy_agent_extensions(tree, sha, apply=False) is True
+    assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    # Another live task in a borrowed tree can commit and redeploy between the check and the start: refused until
+    # it is finished.
+    tasks = git.tasks_dir()
+    tasks.mkdir(parents=True, exist_ok=True)
+    claim = dict(schema_version=2, task_id="cotenant", run_nonce="cotenant-run", status="running", pid=None,
+                 worktree_path=str(tree))
+    (tasks / "cotenant.json").write_text(json.dumps(claim))
+    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: worktree claimed by active task cotenant$"):
+        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
+    (tasks / "cotenant.json").write_text(json.dumps({**claim, "status": "done"}))
+    assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
     # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
     before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
                                                              ".deploy-state/agent-deploy.v1.json")}
@@ -373,20 +385,20 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     # A borrowed tree whose guard was removed refuses, and is left as it is.
     deployed.unlink()
     with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
-        git.deploy_agent_extensions(tree, sha, apply=False)
+        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
     assert not deployed.exists()
     assert git.deploy_agent_extensions(tree, sha) is True
     # The deployment is bound to the task's start: a checkout whose HEAD moved refuses before anything runs.
     run_git(tree, "commit", "--allow-empty", "-m", "worker commit")
     with pytest.raises(ValueError, match=f"^agent_deploy_failed: the checkout's HEAD [0-9a-f]{{12}} is not the "
                                          f"task's start {sha[:12]}$"):
-        git.deploy_agent_extensions(tree, sha, apply=False)
+        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
     sha = run_git(tree, "rev-parse", "HEAD")
     # A tracked output refuses, however clean it is.
     run_git(tree, "add", "--force", ".claude/README.md")
     with pytest.raises(ValueError, match="^agent_deploy_outputs_not_ignored: the checkout does not ignore "
                                          r"\.claude/README\.md$"):
-        git.deploy_agent_extensions(tree, sha, apply=False)
+        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
 
 
 @pytest.mark.parametrize("broken, global_excludes, reason", [
