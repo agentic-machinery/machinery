@@ -672,6 +672,11 @@ def _dispatch(args) -> int:
                                 sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
                                 **exact_start, deploy_agents=args.mode == "workspace-write",
                                 on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
+        elif args.mode == "workspace-write":
+            # An attached write task gets the same agent deployment as a created one, after any creation still
+            # applying it (which holds this lock), and before a record exists, so a refusal leaves none.
+            with git.worktree_lock(repo):
+                git.deploy_agent_extensions(worktree)
         record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
         # A task dispatched from inside another task's run names that run, whose settlement then names it while
         # it still runs (worker._running_children, #12156).
