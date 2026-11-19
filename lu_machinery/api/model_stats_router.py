@@ -783,9 +783,12 @@ def _review_level(level: str, observed: Mapping[str, Any] | None, linked: list[t
 
 def _observed_hours(model: Mapping[str, Any]) -> float | None:
     observed = model.get("wall_hours_observed") or {}
-    if observed.get("value") is None or not model.get("landed"):
+    seconds = model.get("wall_seconds")
+    total = _number(seconds.get("total_seconds") if isinstance(seconds, Mapping) else None)
+    landed = _number(model.get("landed"))
+    if observed.get("value") is None or total is None or not landed:
         return None
-    return model["wall_seconds"]["total_seconds"] / 3600 / model["landed"]
+    return total / 3600 / landed
 
 
 def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[_Row]) -> dict[str, Any]:
