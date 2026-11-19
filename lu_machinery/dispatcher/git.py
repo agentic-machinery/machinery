@@ -574,28 +574,13 @@ def deployment_sources(repo: Path, commit: str) -> list[str] | None:
         return []
 
 
-def deploy_agent_extensions(path: Path) -> bool:
-    """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
-
-    Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
-    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
-    product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
-    ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
-    worker's hooks use, composed from the worktree's own sources. Applying again is idempotent. A checkout
-    whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each refusal is a
-    ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the deployment cannot be
-    applied, ``agent_deploy_outputs_not_ignored`` when one of its outputs is not ignored by the repository's own
-    rules (its ignore files and ``info/exclude``; no user-level excludes file, which the worker may not share), so
-    the worker could commit it.
-    """
-    if deployment_sources(path, "HEAD") is None:
-        return False
-    root = path.resolve()  # the deployer takes only the canonical checkout root
+def _agent_deploy(root: Path, *args: str) -> None:
+    """Run the deployer on the checkout at ``root``; any failure is ``agent_deploy_failed`` with its last line."""
     try:
         interpreter = project_interpreter(env=os.environ)
         # The interpreter is the configured project interpreter every worker hook runs (child_env), not task input.
         result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            [str(interpreter), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root)],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            [str(interpreter), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root), *args],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
             cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
             timeout=AGENT_DEPLOY_TIMEOUT,
         )
@@ -606,6 +591,30 @@ def deploy_agent_extensions(path: Path) -> bool:
     if result.returncode:
         reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
         raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
+
+
+def deploy_agent_extensions(path: Path) -> bool:
+    """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
+
+    Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
+    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
+    product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
+    ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
+    worker's hooks use. The deployer's own check then recomposes the plan from the HEAD commit's objects
+    (``--check --inputs-commit``) and verifies the written outputs against it, so a sparse checkout that hides
+    an input from the apply (a source, or a product marker that selects a validation) refuses instead of
+    deploying less, and an attached tree's outputs must match its committed sources. Applying again is
+    idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each
+    refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
+    deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
+    not ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes
+    file, which the worker may not share), so the worker could commit it.
+    """
+    if deployment_sources(path, "HEAD") is None:
+        return False
+    root = path.resolve()  # the deployer takes only the canonical checkout root
+    _agent_deploy(root)
+    _agent_deploy(root, "--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
     # Only the deployment's own outputs are checked: an attached worktree may hold the worker's own changes.
     try:
         manifest = json_depth.loads((root / AGENT_DEPLOY_STATE).read_text(encoding="utf-8"), max_depth=16)

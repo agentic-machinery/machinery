@@ -289,11 +289,12 @@ def test_a_home_relative_hooks_path_keeps_its_guards(sandbox, monkeypatch, tmp_p
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
 
-def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None):
+def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None, extra=None):
     """Enroll the checkout in the installed agent deployment, with the Claude hooks its release makes mandatory.
 
     The Claude source lives under a tree dispatch worktrees exclude by default (wiki), as a product may declare.
     ``descriptor`` replaces the descriptor's bytes; the value ``"symlink"`` commits it as a dangling symlink.
+    ``extra`` maps further paths to the text committed there.
     """
     import os
     from importlib import resources
@@ -320,6 +321,9 @@ def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None):
             "sources": {"shared": {"path": "agents_extensions/shared", "required": True},
                         "claude": {"path": "wiki/agents-claude", "required": True}}}))
     (primary / ".gitignore").write_text(ignored)
+    for name, text in (extra or {}).items():
+        (primary / name).parent.mkdir(parents=True, exist_ok=True)
+        (primary / name).write_text(text)
     run_git(primary, "add", ".")
     run_git(primary, "commit", "-m", "enroll")
     return run_git(primary, "rev-parse", "HEAD"), settings
@@ -352,11 +356,15 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
     # A write task attached later (--cwd) applies again; the worker's own change is not a deployment output.
-    (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
+    (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
     deployed.unlink()
     assert git.deploy_agent_extensions(tree) is True
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
-    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M agents_extensions/shared/README.md"
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    # Guards come from committed sources: an uncommitted edit to one refuses the attachment.
+    (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
+    with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: output drift: .claude/README.md"):
+        git.deploy_agent_extensions(tree)
 
 
 @pytest.mark.parametrize("broken, global_excludes, reason", [
@@ -364,12 +372,17 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     ({"descriptor": "symlink"}, False, "agent_deploy_failed: exit 2: "),
     ({"ignored": "/.deploy-state/\n"}, False, "agent_deploy_outputs_not_ignored: the checkout does not ignore .claude/"),
     ({"ignored": "/.deploy-state/\n"}, True, "agent_deploy_outputs_not_ignored: the checkout does not ignore .claude/"),
+    # The product marker that selects prompt lint lies in a tree the sparse checkout hides.
+    ({"extra": {"curriculum/l2-uk-en/curriculum.yaml": "levels: {}\n",
+                "agents_extensions/shared/phases/research.md": "Write in the persona voice.\n"}}, False,
+     "agent_deploy_failed: exit 2: invalid deployment: prompt lint: PERSONA_IN_RESEARCH"),
 ])
 def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
         sandbox, tmp_path, broken, global_excludes, reason):
     """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
     checkout's agent deployment failed: a broken or dangling descriptor skipped, or outputs only the
-    dispatcher's own user-level excludes file hides, which the worker does not share. A read-only task of the
+    dispatcher's own user-level excludes file hides, which the worker does not share, or a validation the
+    commit selects but the sparse checkout hid from the apply. A read-only task of the
     same checkout is never deployed, so the same breakage cannot refuse it."""
     sandbox.env["LEARN_UKRAINIAN_PYTHON"] = sandbox.python
     if global_excludes:
