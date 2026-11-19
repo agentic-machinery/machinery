@@ -15,6 +15,7 @@ from lu_machinery.dispatcher import write_boundary
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.opsec.test_git_push_scan import push_sandbox  # noqa: F401
 
+_ALL_DATA_ROOTS = write_boundary._DATA_ROOTS
 # One of GitHub's published address ranges; the launcher reads the real ones on the host.
 _GITHUB_RANGE = "140.82.112.0/20"
 
@@ -860,3 +861,114 @@ def test_write_dispatch_launches_the_provider_directly_with_its_own_login(sandbo
     assert seen["HOME"] == str(home)
     assert seen["CLAUDE_CONFIG_DIR"] == str(home / ".claude")
     assert write_boundary.BROKER_ENV not in seen
+
+
+def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str) -> tuple[int, dict, Path]:
+    """Run ``script`` as a Savant write run's provider over the view of the primary's published commit."""
+    repo = primary[0]
+    tip = _git(repo, "rev-parse", "HEAD")
+    # A registered public origin whose anonymous listing serves the start commit (C2), as on GitHub.
+    monkeypatch.setattr(write_boundary, "_public_origin", lambda _repository: "example/public")
+    monkeypatch.setattr(write_boundary, "_remote_tips", lambda slug: {"refs/heads/main": tip})
+    needles = tmp_path / "needles.json"
+    needles.write_text('{"schema_version": 1, "run_users": [], "home_dirs": []}', encoding="utf-8")
+    monkeypatch.setenv("LU_OPSEC_NEEDLES_FILE", str(needles))
+    # Production checkouts sit below an emptied data root; so does this one: the run sees its view only.
+    monkeypatch.setattr(write_boundary, "_DATA_ROOTS", _ALL_DATA_ROOTS)
+    patch = tmp_path / "wb-test.patch"
+    code, data = _run(primary, script, "--mode", "workspace-write", "--snapshot-bytes", "65536", "--no-github-relays",
+                      "--upload-ceiling", "65536", "--draft-patch", str(patch),
+                      *(arg for path in owned for arg in ("--owned-path", path)))
+    return code, data, patch
+
+
+def _verify(tmp_path, mode: str) -> str | None:
+    """The settlement's reading of the launcher's receipt, as the worker reads it beside the task record."""
+    task = tmp_path / "wb-test.json"
+    write_boundary.receipt_file(task).write_bytes((tmp_path / "receipt.json").read_bytes())
+    return write_boundary.verify(task, "wb-test", mode)[1]
+
+
+def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkeypatch, tmp_path):
+    """Defect class (#898): a Savant write run reaches the worktree, Git metadata, the primary, the host's files,
+    another repository or GitHub, or its edits leave the boundary other than as an owned-path patch of the
+    published commit."""
+    repo, worktree, _ = primary
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.md").write_text("old\n")
+    (repo / "gone.txt").write_text("remove me\n")
+    _git(repo, "add", "docs", "gone.txt")
+    _git(repo, "commit", "-qm", "fixture")
+    _git(worktree, "merge", "-q", "--ff-only", "main")
+    tip = _git(repo, "rev-parse", "HEAD")
+    objects, status = _git(repo, "count-objects", "-v"), _git(repo, "status", "--porcelain")
+    host_tmp = tmp_path / "outside-written"
+    script = (
+        # Owned edits of its own view: change, add and delete.
+        "printf 'new text\\n' > docs/guide.md; printf 'added\\n' > docs/new.md; rm gone.txt;"
+        # Every other write path fails or lands in the private, discarded HOME and TMPDIR.
+        f"echo x > {worktree}/a.txt; echo x > {repo}/a.txt; echo x > {repo}/.git/HEAD; echo x > {host_tmp};"
+        f"git -C {repo} commit -q --allow-empty -m evil; git -C {worktree} status;"
+        "echo x > $HOME/home-file; echo x > $TMPDIR/tmp-file; true"
+    )
+    code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, script, "docs", "gone.txt")
+    assert code == 0 and receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
+    probes = {(probe["op"], probe["path"]): probe["outcome"] for probe in receipt["canary"]["probes"]}
+    assert probes[("stat", str(worktree))] == "ENOENT" and probes[("stat", str(repo / ".git" / "HEAD"))] == "ENOENT"
+    imported = receipt["import"]
+    assert imported["status"] == "drafted" and imported["paths"] == ["docs/guide.md", "docs/new.md", "gone.txt"]
+    assert imported["patch_sha256"] == hashlib.sha256(patch.read_bytes()).hexdigest()
+    assert _verify(tmp_path, "workspace-write") is None
+    assert _verify(tmp_path, "read-only") == "write_boundary_unproven: the receipt names another mode"
+    # Nothing outside the patch changed: the worktree, the primary's files, refs and objects, the host.
+    assert _git(worktree, "status", "--porcelain") == "" and _git(repo, "status", "--porcelain") == status
+    assert _git(repo, "rev-parse", "HEAD") == tip and _git(repo, "count-objects", "-v") == objects
+    assert not host_tmp.exists() and not (tmp_path / "home" / "home-file").exists()
+    assert not write_boundary.scratch("wb-test").exists()
+    # A normal worker applies the patch to the start commit and gets exactly the run's edits.
+    _git(worktree, "apply", "--index", str(patch))
+    assert (worktree / "docs" / "guide.md").read_text() == "new text\n"
+    assert (worktree / "docs" / "new.md").read_text() == "added\n" and not (worktree / "gone.txt").exists()
+
+
+@pytest.mark.parametrize(("case", "script", "reason"), [
+    ("outside-owned", "printf 'x\\n' > a.txt", "edits outside the owned paths: a.txt"),
+    ("link", "ln -s ../a.txt docs/link", "is not a single-link regular file"),
+    ("hard-link", "ln docs/guide.md docs/second", "is not a single-link regular file"),
+    ("excluded-name", "printf 'x\\n' > docs/.env", "excluded or unprintable path"),
+    ("filtered-path", "printf 'x\\n' > docs/AGENTS.txt", "a path of the start commit that the view left out"),
+    ("secret", "printf 'k = ghp_%s\\n' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > docs/guide.md", "a private key, a token"),
+    ("oversize", "head -c 70000 /dev/zero > docs/big.bin", "more than 65536 bytes"),
+])
+def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path, case, script, reason):
+    """Defect class (#898): an edit outside the owned paths, a link, an excluded or filtered path, a secret or an
+    oversized view still yields a deliverable patch."""
+    repo, worktree, _ = primary
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.md").write_text("old\n")
+    # Left out of the view by its content: a new file there would replace bytes the run never read.
+    (repo / "docs" / "AGENTS.txt").write_text("k = ghp_" + "A" * 36 + "\n")
+    _git(repo, "add", "docs")
+    _git(repo, "commit", "-qm", "fixture")
+    _git(worktree, "merge", "-q", "--ff-only", "main")
+    _code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, script, "docs")
+    assert receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
+    assert receipt["import"]["status"] == "refused" and reason in receipt["import"]["reason"], receipt["import"]
+    assert not patch.exists() and _git(worktree, "status", "--porcelain") == ""
+    refusal = _verify(tmp_path, "workspace-write")
+    assert refusal.startswith("write_boundary_import_failed: refused: savant_draft_refused")
+
+
+def test_savant_write_run_needs_its_bounds(primary, tmp_path):
+    """Defect class (#898): a write run starts without the view, the patch target, its owned paths or with a
+    GitHub relay or Sources MCP."""
+    full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--no-github-relays",
+            "--draft-patch", str(tmp_path / "p.patch"), "--owned-path", "docs"]
+    for drop in ("--snapshot-bytes", "--no-github-relays", "--draft-patch", "--owned-path"):
+        index = full.index(drop)
+        argv = full[:index] + full[index + (1 if drop == "--no-github-relays" else 2):]
+        with pytest.raises(SystemExit):
+            _run(primary, "true", *argv)
+    for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):
+        with pytest.raises(SystemExit):
+            _run(primary, "true", *full, *extra)

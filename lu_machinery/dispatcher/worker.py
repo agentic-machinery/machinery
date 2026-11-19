@@ -25,6 +25,7 @@ from lu_machinery.agent_runtime import bounded_advisory, model_pause
 from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, resolve_codex_account_label
 from lu_machinery.agent_runtime.env_sanitize import CLAUDE_LAUNCH_GUARD_EXIT
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.repo_root import in_tree_source, machinery_path, primary_root, state_root
 from lu_machinery.common.scratch import ensure_scratch_root
@@ -616,6 +617,19 @@ def _verification_cause(exc: Exception) -> str:
     return f"owned_paths_verification_failed: {detail}"[:200]
 
 
+def _savant_draft(record: dict) -> list[str] | None:
+    """The paths of a Savant write run's draft patch, from its verified boundary receipt; None for any other run.
+
+    The launcher wrote the patch beside the task record after the sandbox exited (``write_boundary``); the run
+    left the worktree untouched, so a normal worker applies the patch and lands it (docs/runbooks/savant.md).
+    """
+    draft = (record.get("write_boundary") or {}).get("import") or {}
+    if record.get("agent") != "opencode" or record.get("provider") != SAVANT_PROVIDER or draft.get("status") != "drafted":
+        return None
+    paths = draft.get("paths")
+    return [path for path in paths if isinstance(path, str)] if isinstance(paths, list) else []
+
+
 def _enforce_delivery(record: dict) -> None:
     if record["mode"] == "read-only":
         return
@@ -633,6 +647,15 @@ def _enforce_delivery(record: dict) -> None:
             return
         record.update(status="no_deliverable", error=_verification_cause(exc),
                       no_deliverable_reason=_verification_cause(exc))
+        return
+    if not provider_failed and (drafted := _savant_draft(record)) is not None:
+        # A Savant draft is its patch: owned paths only, and the worktree it never wrote is clean with no commits.
+        cause = (_outside_cause(drafted, owned) if owned and drafted else "savant_draft_unowned_or_empty")
+        if cause is None and (record.get("commits_ahead") != 0 or record.get("worktree_dirty_on_exit") is not False):
+            cause = "savant_draft_worktree_changed_or_unknown"
+        record["owned_path_grants_used"] = ownership.grants_used(record, drafted)
+        if cause:
+            record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
         return
     # With no commits ahead there is nothing to verify, and the remote branch may never have existed.
     if owned and (record.get("commits_ahead") or 0) > 0:
@@ -1586,13 +1609,17 @@ def _adopt_orphans() -> bool:
         return False
 
 
-def _read_only_boundary(spec: TaskSpec) -> bool:
-    """Whether the supervisor runs this provider inside ``write_boundary``: native read-only routes only.
+def _in_boundary(spec: TaskSpec) -> bool:
+    """Whether the supervisor runs this provider inside ``write_boundary``: native read-only routes and Savant.
 
     Read-only AGY and Muse keep their own sandboxes. A workspace-write worker runs as the dispatching user, in
     its dispatch worktree, with its own provider login, network, ``git`` and ``gh`` (operator order
     NO-WORKER-SANDBOX-1115); the worktree, owned-path hooks, push scan, review and merge queue still apply.
+    Savant runs inside in every mode: its write run edits a private copy of the published view, and the
+    boundary's patch of those edits is its deliverable (#898, ``_savant_draft``).
     """
+    if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        return True
     return spec.mode == "read-only" and spec.agent not in {"agy", "muse"}
 
 
@@ -1867,7 +1894,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 stdin.seek(0)
                 output_sizes = out.tell(), err.tell()
                 checkpoint()  # the last one before the provider starts: a cancelled run launches nothing
-                if _read_only_boundary(spec):
+                if _in_boundary(spec):
                     # Native reviewers run inside the OS boundary (#423, #100); there is no unsandboxed fallback.
                     # The launcher refuses with its receipt when the boundary cannot start. A relaunch always
                     # rebuilds the invocation first, so it is wrapped exactly once.
@@ -1946,7 +1973,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 "stderr": stderr_path.relative_to(path.parent).as_posix(),
             }
         store.begin_settlement(record)
-        if _read_only_boundary(spec):
+        if _in_boundary(spec):
             # Only the receipt the launcher writes outside the sandbox proves the run was contained (#423).
             boundary, refusal = write_boundary.verify(path, spec.task_id, spec.mode)
             record["write_boundary"] = boundary
@@ -2093,7 +2120,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     status, error = "crashed", exc.code
                     start_refusal = None
             # A killed launcher leaves its scratch; residue is recorded, never raised.
-            if _read_only_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
+            if _in_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
                 record["write_boundary_cleanup"] = residue
             if spec.agent == "agy" and spec.mode == "read-only":
                 # A bound attempt already counted its Sources bodies and replaced the stream with

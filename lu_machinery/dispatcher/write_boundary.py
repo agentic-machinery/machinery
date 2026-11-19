@@ -1,6 +1,8 @@
-"""OS boundary for native read-only review dispatches (#423, #100).
+"""OS boundary for native read-only review dispatches and Savant runs (#423, #100, #898).
 
-Write workers run directly in their dispatch worktrees. Native read-only providers run under
+Write workers run directly in their dispatch worktrees, except Savant: its write run edits a
+private copy of the published view, and the launcher turns the edits into a patch after it
+exits (``_Boundary._draft``; docs/runbooks/savant.md). Native read-only providers run under
 bubblewrap, reusing agy_sandbox's canary, Sources relay and GitHub read relay. The worktree,
 Git metadata and public checkouts are read-only mounts. HOME and temporary runtime state are
 private; only declared outputs and the selected provider's refreshable login are writable.
@@ -268,6 +270,11 @@ def receipt_file(task_file: Path) -> Path:
     return task_file.with_suffix(RECEIPT_SUFFIX)
 
 
+def draft_patch(task_file: Path) -> Path:
+    """Where a Savant write run's draft patch is kept, beside its task record."""
+    return task_file.with_suffix(".patch")
+
+
 def scratch(task_id: str) -> Path:
     if not _TASK_ID.fullmatch(task_id):
         raise ValueError("write boundary: the task id is unsafe as a scratch name")
@@ -334,7 +341,8 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         # The selected account's login: the only thing the task-local CODEX_HOME takes from the real one.
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
-    if spec.agent in _SOURCES_MCP_HOME and (spec.mode == "workspace-write" or spec.agent == "cursor"):
+    savant = spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER
+    if spec.agent in _SOURCES_MCP_HOME and not savant and (spec.mode == "workspace-write" or spec.agent == "cursor"):
         argv += ["--sources-mcp", spec.agent]
     if spec.options.get("pr"):
         # The task record's PR, frozen here: a private repository's github-read is that PR and its checks (#565).
@@ -343,13 +351,23 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
         argv += ["--runtime", str(dispatch_lease(spec.task_id))]
-    if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+    if savant:
         from lu_machinery.dispatcher.providers import opencode
 
         argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES), "--no-github-relays"]
         if opencode.savant_tools(spec.options.get("data_class")):
             argv += ["--snapshot-bytes", str(opencode.SAVANT_SNAPSHOT_MAX_BYTES)]
             argv += [arg for path in opencode.savant_read_paths(spec.options) for arg in ("--read-path", path)]
+        if spec.mode == "workspace-write":
+            # The run's deliverable: the launcher's patch of its owned-path edits, beside the task record
+            # (docs/runbooks/savant.md). The scope is the record's, grants included; settlement checks it again.
+            from lu_machinery.dispatcher import ownership, store
+
+            owned = ownership.effective_scope(store.read(spec.task_id) or {})
+            if not owned:
+                raise ValueError("write_boundary_refused: a Savant write run needs owned paths")
+            argv += ["--draft-patch", str(draft_patch(task_file))]
+            argv += [arg for path in owned for arg in ("--owned-path", path)]
     host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
             if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
     # The launcher starts with the provider's environment. Its own GitHub reads (the published address ranges, the
@@ -378,8 +396,11 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return summary, "write_boundary_unproven: the receipt names another mode"
     if receipt.get("status") != "ran" or not summary["canary_passed"]:
         return summary, f"write_boundary_refused: {receipt.get('reason') or receipt.get('status')}"
-    if (receipt.get("import") or {}).get("status") != "unchanged":
-        return summary, f"write_boundary_import_failed: {(receipt.get('import') or {}).get('status')}"
+    imported = receipt.get("import") or {}
+    # Only a write run (Savant's) can leave a draft patch; every other run changes nothing.
+    if imported.get("status") not in ("unchanged", *(("drafted",) if mode == "workspace-write" else ())):
+        reason = f": {imported['reason']}" if isinstance(imported.get("reason"), str) else ""
+        return summary, f"write_boundary_import_failed: {imported.get('status')}{reason}"
     ceiling = receipt.get("upload_ceiling")
     if isinstance(ceiling, dict):
         summary["upload_ceiling"] = ceiling
@@ -729,51 +750,55 @@ def github_networks() -> tuple:
     return tuple(dict.fromkeys(networks))
 
 
-def _plain_git_command(repository: Path, *args: str) -> tuple[list[str], dict[str, str]]:
+def _plain_git_command(repository: Path, *args: str, env: dict[str, str] | None = None
+                       ) -> tuple[list[str], dict[str, str]]:
     """Argv and environment of a read-only Git plumbing command over the objects' own links: no user or system
-    configuration, hooks, fsmonitor, replacement objects, grafts or commit-graph."""
-    env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
-           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
-           "GIT_GRAFT_FILE": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1"}
+    configuration, hooks, fsmonitor, replacement objects, grafts or commit-graph. ``env`` adds variables, such as
+    the private object directory and index of a draft (``_Boundary._draft``)."""
+    base = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_GRAFT_FILE": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1", **(env or {})}
     return (["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
-             "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", "-C", str(repository), *args], env)
+             "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", "-C", str(repository), *args], base)
 
 
-def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
+def _plain_git(repository: Path, *args: str, data: bytes | None = None, env: dict[str, str] | None = None,
+               refusal: str = "savant_snapshot_refused") -> bytes:
     """Raw output of a read-only Git plumbing command (``_plain_git_command``) whose output the caller bounds."""
-    argv, env = _plain_git_command(repository, *args)
+    argv, full = _plain_git_command(repository, *args, env=env)
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        argv, input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=env)
+        argv, input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=full)
     if result.returncode:
-        raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
+        raise Refused(f"{refusal}: git {args[0]} failed")
     return result.stdout
 
 
-def _plain_git_bounded(repository: Path, *args: str, max_bytes: int) -> bytes:
+def _plain_git_bounded(repository: Path, *args: str, max_bytes: int, env: dict[str, str] | None = None,
+                       refusal: str = "savant_snapshot_refused") -> bytes:
     """Output of a read-only Git plumbing command, refused and the process killed once it passes ``max_bytes``
     or ``_GIT_TIMEOUT`` seconds, so host memory never scales with what the command would print."""
-    argv, env = _plain_git_command(repository, *args)
+    argv, full = _plain_git_command(repository, *args, env=env)
     deadline = time.monotonic() + _GIT_TIMEOUT
     output = bytearray()
     process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=full)
     assert process.stdout is not None
     try:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
-                raise Refused(f"savant_snapshot_refused: git {args[0]} timed out")
+                raise Refused(f"{refusal}: git {args[0]} timed out")
             chunk = os.read(process.stdout.fileno(), 1 << 16)
             if not chunk:
                 break
             output += chunk
             if len(output) > max_bytes:
-                raise Refused(f"savant_snapshot_refused: git {args[0]} printed more than {max_bytes} bytes; name "
+                raise Refused(f"{refusal}: git {args[0]} printed more than {max_bytes} bytes; name "
                               "the task's files or directories with --read-path")
         if process.wait(timeout=max(deadline - time.monotonic(), 0.001)):
-            raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
+            raise Refused(f"{refusal}: git {args[0]} failed")
     except subprocess.TimeoutExpired:
-        raise Refused(f"savant_snapshot_refused: git {args[0]} timed out") from None
+        raise Refused(f"{refusal}: git {args[0]} timed out") from None
     finally:
         if process.poll() is None:
             process.kill()
@@ -850,32 +875,41 @@ def _sensitive(data: bytes, needles: tuple[bytes, ...], names: re.Pattern[bytes]
             or (names is not None and names.search(data) is not None))
 
 
-def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int) -> dict:
-    """Write the published ``commit``'s regular files below ``paths`` (default: all) into ``target``, read-only.
-
-    The bytes are the commit's own blobs (``ls-tree`` and ``cat-file``), never an export that attributes or
-    filters change. Refuses an unpublished commit, a ``paths`` entry that names nothing, more than
-    ``MAX_SNAPSHOT_FILES`` files or ``limit`` bytes, and an empty result. Leaves out excluded names
-    (``_SNAPSHOT_EXCLUDED``), links and submodules, and files whose content looks sensitive (``_sensitive``).
-    """
-    from pathlib import PurePosixPath
-
-    if not _OBJECT_ID.fullmatch(commit):
-        raise Refused("savant_snapshot_refused: the start commit is not an object id")
-    _published(repository, commit)
+def _screen(refusal: str) -> tuple[tuple[bytes, ...], re.Pattern[bytes] | None]:
+    """The exact needles and the account-name pattern ``_sensitive`` screens a file's bytes with."""
     from lu_machinery.opsec.needles import NeedlesError, load_needles
 
     try:
         loaded = load_needles()
     except NeedlesError:
-        raise Refused("savant_snapshot_refused: the host's OPSEC needles cannot be read") from None
+        raise Refused(f"{refusal}: the host's OPSEC needles cannot be read") from None
     needles = (*(home.encode() for home in loaded.home_dirs if home), *_known_secrets())
     # An account name counts only as a whole word, so a short one does not drop every file that contains it. Its
     # characters are letters, digits, "_" and "-" (the needles loader's rule), so a period or other punctuation
     # beside it is a boundary: "Run as name." still matches.
     accounts = re.compile(rb"(?<![\w-])(?:" + b"|".join(re.escape(user.encode()) for user in loaded.run_users) + rb")(?![\w-])"
                        ) if loaded.run_users else None
-    entries: list[tuple[str, int, tuple[str, ...]]] = []
+    return needles, accounts
+
+
+def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int,
+              manifest: dict[str, tuple[str, str, bytes]] | None = None) -> dict:
+    """Write the published ``commit``'s regular files below ``paths`` (default: all) into ``target``, read-only.
+
+    The bytes are the commit's own blobs (``ls-tree`` and ``cat-file``), never an export that attributes or
+    filters change. Refuses an unpublished commit, a ``paths`` entry that names nothing, more than
+    ``MAX_SNAPSHOT_FILES`` files or ``limit`` bytes, and an empty result. Leaves out excluded names
+    (``_SNAPSHOT_EXCLUDED``), links and submodules, and files whose content looks sensitive (``_sensitive``).
+    With ``manifest`` (a write run) the files are writable and each written path maps to its Git mode, object id
+    and SHA-256, the baseline its draft is taken against.
+    """
+    from pathlib import PurePosixPath
+
+    if not _OBJECT_ID.fullmatch(commit):
+        raise Refused("savant_snapshot_refused: the start commit is not an object id")
+    _published(repository, commit)
+    needles, accounts = _screen("savant_snapshot_refused")
+    entries: list[tuple[str, str, int, tuple[str, ...]]] = []
     left_out = total = 0
     listing = _plain_git_bounded(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths,
                                  max_bytes=MAX_TREE_LISTING_BYTES)
@@ -896,18 +930,18 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         if total > limit or len(entries) >= MAX_SNAPSHOT_FILES:
             raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes or {MAX_SNAPSHOT_FILES} "
                           "files; name the task's files or directories with --read-path")
-        entries.append((oid_field.decode("ascii"), int(size_field), parts))
-    names = ["/".join(parts) for _oid, _size, parts in entries]
+        entries.append((mode.decode("ascii"), oid_field.decode("ascii"), int(size_field), parts))
+    names = ["/".join(parts) for _mode, _oid, _size, parts in entries]
     for path in paths:
         prefix = path.rstrip("/")
         if not any(name == prefix or name.startswith(prefix + "/") for name in names):
             raise Refused("savant_snapshot_refused: a --read-path names no readable file at the start commit")
     if not entries:
         raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
-    blobs = _plain_git(repository, "cat-file", "--batch", data="".join(f"{oid}\n" for oid, _s, _p in entries).encode())
+    blobs = _plain_git(repository, "cat-file", "--batch", data="".join(f"{oid}\n" for _m, oid, _s, _p in entries).encode())
     target.mkdir(mode=0o700)
     offset, files = 0, 0
-    for oid, size, parts in entries:
+    for mode_text, oid, size, parts in entries:
         header_end = blobs.index(b"\n", offset)
         if blobs[offset:header_end] != f"{oid} blob {size}".encode():
             raise Refused("savant_snapshot_refused: git cat-file returned another object")
@@ -918,7 +952,9 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
             continue
         destination = target.joinpath(*parts)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _write_private(destination, data, 0o400)
+        _write_private(destination, data, 0o400 if manifest is None else 0o600)
+        if manifest is not None:
+            manifest["/".join(parts)] = (mode_text, oid, hashlib.sha256(data).digest())
         files += 1
     if not files:
         raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
@@ -1294,6 +1330,8 @@ class _Boundary:
         self.gh: Any = None
         self.created = False
         self.created_outputs: list[Path] = []
+        # A write run's baseline: each path of its writable view and that file's Git mode, object id and SHA-256.
+        self.manifest: dict[str, tuple[str, str, bytes]] | None = {} if args.mode == "workspace-write" else None
 
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
@@ -1360,7 +1398,8 @@ class _Boundary:
             _write_private(boundary / name, source.read_bytes(), 0o500)
         if self.args.snapshot_bytes is not None:
             self.receipt["snapshot"] = _snapshot(repository, self.tip, self.args.read_path,
-                                                 boundary / Path(SNAPSHOT_INSIDE).name, self.args.snapshot_bytes)
+                                                 boundary / Path(SNAPSHOT_INSIDE).name, self.args.snapshot_bytes,
+                                                 self.manifest)
 
         outputs = []
         for raw in self.args.output or []:
@@ -1502,6 +1541,9 @@ class _Boundary:
         # A Savant run gets no GitHub relay at all: its tools read only the snapshot.
         self.broker = None if self.args.no_github_relays else _Broker(self, boundary / "broker.sock")
         argv += ["--ro-bind", str(boundary), _INSIDE]
+        if self.manifest is not None:
+            # A write run edits its own copy of the view; only the draft taken after it exits leaves (``_draft``).
+            argv += ["--bind", str(boundary / Path(SNAPSHOT_INSIDE).name), SNAPSHOT_INSIDE]
         interpreter = sources_command()[0]
         # The emptied roots are read-only, so no worker moves a restored path's parent aside to plant files there.
         if alias is not None:
@@ -1584,6 +1626,11 @@ class _Boundary:
         returncode = process.wait()
         self.receipt["returncode"] = returncode
         self.receipt["import"] = {"status": "unchanged", "before": self.tip, "after": self.tip}
+        if self.manifest is not None:
+            try:
+                self.receipt["import"].update(self._draft(boundary / Path(SNAPSHOT_INSIDE).name))
+            except Refused as exc:
+                self.receipt["import"].update(status="refused", reason=str(exc))
         return returncode
 
     def _claude_login(self, home: Path, repository: Path) -> tuple[tuple[Path, Path] | None, list[Path]]:
@@ -1730,7 +1777,10 @@ class _Boundary:
             expect("stat", common / "HEAD", "ENOENT")
             if (tracked := _writable_tracked_file(repository)) is not None:
                 expect("stat", tracked, "ENOENT")
-            expect("create", Path(SNAPSHOT_INSIDE) / f".write-boundary-canary-{nonce}", "EROFS")
+            if self.manifest is None:
+                expect("create", Path(SNAPSHOT_INSIDE) / f".write-boundary-canary-{nonce}", "EROFS")
+            else:  # a write run's own copy of the view takes edits; the probe leaves nothing behind
+                expect("scratch_cycle", Path(SNAPSHOT_INSIDE) / f".write-boundary-canary-{nonce}", "OK")
             return self._common_probes(probes, expect, sockets, outputs, tmp, nonce)
         absent = repository / f".write-boundary-canary-{nonce}"
         if (tracked := _writable_tracked_file(repository)) is not None:
@@ -1866,6 +1916,90 @@ class _Boundary:
             chunks.append(chunk)
         raise Refused("the write boundary canary did not report in time")
 
+    def _draft(self, view: Path) -> dict:
+        """A write run's edits of its view as a Git patch against the start commit, written to ``--draft-patch``.
+
+        Runs on the host once the sandbox has exited, so nothing inside can change the view while it is read.
+        Every entry must be a directory or a single-link regular file whose printable path has no excluded
+        component; a new file may not name a path the start commit holds (one the view left out); edited bytes are
+        screened as the view's own were (``_sensitive``) and bounded by ``--snapshot-bytes``. Git builds the patch
+        with a private object directory and index that read the primary's objects as alternates, so nothing is
+        written to the repository or the worktree. An edit outside ``--owned-path`` refuses the draft, and
+        settlement checks the patch's paths again. An empty dict means nothing changed.
+        """
+        from pathlib import PurePosixPath
+
+        assert self.manifest is not None and self.args.snapshot_bytes is not None
+        refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
+        edits: dict[str, str | None] = {}  # path: the Git mode of its new bytes, or None when deleted
+        contents: dict[str, bytes] = {}
+        seen: set[str] = set()
+        total = entries = 0
+        for directory, dirs, files in os.walk(view):  # never follows a link
+            for name in (*dirs, *files):
+                path = Path(directory, name)
+                relative = path.relative_to(view).as_posix()
+                entries += 1
+                if entries > 2 * MAX_SNAPSHOT_FILES:
+                    raise Refused(f"{refusal}: the view holds more than {2 * MAX_SNAPSHOT_FILES} entries")
+                if not relative.isprintable() or any(_SNAPSHOT_EXCLUDED.fullmatch(part)
+                                                     for part in PurePosixPath(relative).parts):
+                    raise Refused(f"{refusal}: an edit names an excluded or unprintable path")
+                info = os.lstat(path)
+                if name in dirs and stat.S_ISDIR(info.st_mode):
+                    continue
+                if name in dirs or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise Refused(f"{refusal}: {relative[:200]!r} is not a single-link regular file")
+                total += info.st_size
+                if total > limit:
+                    raise Refused(f"{refusal}: the edited view holds more than {limit} bytes")
+                seen.add(relative)
+                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                with os.fdopen(descriptor, "rb") as stream:
+                    data = stream.read(limit + 1)
+                baseline = self.manifest.get(relative)
+                if baseline is None or hashlib.sha256(data).digest() != baseline[2]:
+                    edits[relative], contents[relative] = (baseline[0] if baseline else "100644"), data
+        edits.update(dict.fromkeys(self.manifest.keys() - seen))
+        if not edits:
+            return {}
+        from lu_machinery.dispatcher.ownership import outside_owned
+
+        if outside := outside_owned(edits, self.args.owned_path):
+            raise Refused(f"{refusal}: edits outside the owned paths: {', '.join(outside[:5])[:300]}")
+        # A new file must not name a path of the start commit: the view left that one out (name, content or
+        # --read-path), so the run never read what it would replace.
+        new = [path for path in edits if path not in self.manifest]
+        listed = _plain_git(self.repository, "cat-file", "--batch-check", refusal=refusal,
+                            data="".join(f"{self.tip}:{path}\n" for path in new).encode()).decode()
+        if any(not line.endswith(" missing") for line in listed.splitlines()):
+            raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
+        needles, accounts = _screen(refusal)
+        if any(_sensitive(data, needles, accounts) for data in contents.values()):
+            raise Refused(f"{refusal}: an edit holds a private key, a token, a configured secret or a host name")
+        work = self.base / "draft"
+        (work / "objects").mkdir(mode=0o700, parents=True)
+        env = {"GIT_OBJECT_DIRECTORY": str(work / "objects"), "GIT_INDEX_FILE": str(work / "index"),
+               "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.common / "objects")}
+        _plain_git(self.repository, "read-tree", self.tip, env=env, refusal=refusal)
+        written = [path for path, mode in edits.items() if mode is not None]
+        oids = _plain_git(self.repository, "hash-object", "-w", "--no-filters", "--stdin-paths", env=env,
+                          refusal=refusal, data="".join(f"{view / path}\n" for path in written).encode()).split()
+        if len(oids) != len(written):
+            raise Refused(f"{refusal}: git hash-object returned {len(oids)} ids for {len(written)} files")
+        zero = "0" * len(self.tip)
+        index = [f"{edits[path]} {oid.decode()}\t{path}\0" for path, oid in zip(written, oids, strict=True)]
+        index += [f"0 {zero}\t{path}\0" for path, mode in edits.items() if mode is None]
+        _plain_git(self.repository, "update-index", "-z", "--index-info", data="".join(index).encode(), env=env,
+                   refusal=refusal)
+        tree = _plain_git(self.repository, "write-tree", env=env, refusal=refusal).decode().strip()
+        patch = _plain_git_bounded(self.repository, "diff-tree", "-r", "-p", "--binary", "--full-index",
+                                   "--no-renames", "--no-ext-diff", "--no-textconv", self.tip, tree,
+                                   max_bytes=4 * limit, env=env, refusal=refusal)
+        _write_private(Path(self.args.draft_patch), patch, 0o600)
+        return {"status": "drafted", "patch": self.args.draft_patch, "patch_sha256": hashlib.sha256(patch).hexdigest(),
+                "paths": sorted(edits), "bytes": len(patch)}
+
     def current_tip(self) -> str:
         """The dispatched branch's tip as the worker sees it now (its private layer, else the launch tip)."""
         return self.tip
@@ -1979,8 +2113,15 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--worktree", required=True, help="Absolute path of the linked review worktree")
     parser.add_argument("--scratch", required=True, help="This task's private boundary scratch directory")
     parser.add_argument("--receipt", required=True, help="Boundary receipt output path")
-    parser.add_argument("--mode", choices=("read-only",), default="read-only",
-                        help="The dispatch mode (read-only only; default: read-only)")
+    parser.add_argument("--mode", choices=("read-only", "workspace-write"), default="read-only",
+                        help="The dispatch mode; workspace-write only for a Savant run with --snapshot-bytes, "
+                        "--draft-patch and --no-github-relays, whose tools edit their own copy of the view "
+                        "(default: read-only)")
+    parser.add_argument("--draft-patch", help="A workspace-write run's patch of its edits against the start commit, "
+                        "written after the run exits; must not exist yet (default: none)")
+    parser.add_argument("--owned-path", action="append", default=[],
+                        help="A path a workspace-write run's draft may change, e.g. docs/x.md; repeatable, "
+                        "required with --draft-patch (default: none)")
     parser.add_argument("--runtime", help="The read-only Codex task's existing private scratch lease")
     parser.add_argument("--pr", type=_pr_number, help="The PR the task record names (a review's PR); in a private "
                         "repository github-read acts on this PR only (default: the open PR "
@@ -2010,6 +2151,13 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if len(args.read_path) > MAX_READ_PATHS or (args.read_path and args.snapshot_bytes is None):
         parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
+    write = args.mode == "workspace-write"
+    if write != (args.draft_patch is not None) or write != bool(args.owned_path) or (
+            write and (args.snapshot_bytes is None or not args.no_github_relays or args.sources_mcp is not None)):
+        parser.error("--mode workspace-write needs --draft-patch, --owned-path, --snapshot-bytes and "
+                     "--no-github-relays, without --sources-mcp; --draft-patch and --owned-path need it")
+    if write and not Path(args.draft_patch).is_absolute():
+        parser.error("--draft-patch must be an absolute path")
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "mode": args.mode, "status": "refused", "started_at": _now()}
     if not _TASK_ID.fullmatch(args.task_id):
         receipt["reason"] = "unsafe task id"
