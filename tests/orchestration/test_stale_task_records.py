@@ -1211,6 +1211,55 @@ def test_cli_defaults_to_dry_run_json(tasks_dir, capsys):
     assert str_mod.main(["archive", "--tasks-dir", str(tasks_dir / "missing")]) == str_mod.EXIT_USAGE
 
 
+def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_claim(
+    tasks_dir, tmp_path, configured_roots, monkeypatch
+):
+    """Defect class: a legacy repo-relative ``worktree_path`` read relative to the caller's cwd.
+
+    Its lock refused it as not absolute ("worktree lock unavailable"), so archive
+    skipped every such record while live tasks ran, and its keep-hot check looked
+    in the wrong directory. Dispatch resolves ``--worktree`` against the primary
+    checkout, and so must archive: from any cwd, with another task's claim held.
+    """
+    primary = configured_roots.primary
+    live = primary / ".worktrees" / "dispatch" / "codex" / "live"
+    live.mkdir(parents=True)
+    (primary / ".worktrees" / "dispatch" / "codex" / "kept").mkdir()
+    _terminal(tasks_dir, "live-task", status="running", age_days=0, worktree_path=str(live))
+    _terminal(tasks_dir, "old-gone", status="failed", worktree_path=".worktrees/dispatch/codex/gone")
+    _terminal(tasks_dir, "old-kept", status="failed", worktree_path=".worktrees/dispatch/codex/kept")
+    # The caller's cwd holds the gone path and lacks the kept one: neither may decide.
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / ".worktrees" / "dispatch" / "codex" / "gone").mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    held, release = threading.Event(), threading.Event()
+
+    def live_worker() -> None:
+        with str_mod.worktree_lock(str(live), timeout_s=1):
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=live_worker)
+    thread.start()
+    try:
+        assert held.wait(5)
+        report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, lock_timeout_s=0.1)
+        live_still_held = worktree_claims.existing_worktree_lock_refusal(
+            live, lock_dir=worktree_claims.repository_lock_dir(primary)
+        )
+    finally:
+        release.set()
+        thread.join()
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "old-gone.json": ("archived", None)
+    }
+    assert report["kept_hot"] == {"worktree path still exists": 1}
+    assert live_still_held == worktree_claims.LOCK_BUSY
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == ["live-task.json", "old-kept.json"]
+    assert (tasks_dir / "archive" / "old-gone.json").is_file()
+
+
 @pytest.mark.parametrize("names_checkout", [True, False])
 def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_checkout):
     """Archive takes the canonical task lock: the checkout's, else the record file's own."""

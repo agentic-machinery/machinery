@@ -122,7 +122,7 @@ def lock_path(path: Path | str, *, lock_dir: Path) -> tuple[str, Path]:
         raise WorktreeLockError(f"worktree lock path must be absolute: {raw}")
     try:
         canonical = str(raw.resolve())
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:  # ValueError: an embedded NUL
         raise WorktreeLockError(f"worktree lock path {raw} unresolvable: {type(exc).__name__}: {exc}") from exc
     key = hashlib.sha256(canonical.encode("utf-8", "surrogateescape")).hexdigest()[:32]
     return canonical, lock_dir / f"{key}.lock"

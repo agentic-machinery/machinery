@@ -24,7 +24,9 @@ D record also settles failed, after rechecking refs under the record lock.
 into ``batch_state/tasks/archive/`` with their ``.result`` and read-only
 snapshot sidecars. A record stays hot while its checkout path (``worktree_path``,
 else a ``cwd`` that is not a primary checkout) exists at all, with or without a
-``.git`` file, or while any ``acp_runtime_paths`` entry exists: the
+``.git`` file, or while any ``acp_runtime_paths`` entry exists. A relative
+recorded path (legacy records) is read under the primary checkout, as dispatch
+resolves ``--worktree``, never under the caller's cwd. The
 branch-holder release reads the hot record as the ownership proof. ``restore`` moves an archived record back. Which readers see
 the archive is documented in :mod:`scripts.orchestration.task_record_store`.
 
@@ -832,7 +834,7 @@ def _unrecoverable_work(candidate: Candidate, facts: RepoFacts) -> bool:
     branch = candidate.evidence.get("branch")
     if facts.checkout is None or facts.all_refs is None:
         return False
-    paths = [candidate.evidence.get("worktree_path"), *(candidate.record.get("acp_runtime_paths") or [])]
+    paths = [candidate.evidence.get("worktree_path"), *_acp_runtime_paths(candidate.record)]
     for raw in paths:
         if not isinstance(raw, str) or not raw.strip():
             continue
@@ -840,7 +842,7 @@ def _unrecoverable_work(candidate: Candidate, facts: RepoFacts) -> bool:
             os.lstat(raw)
         except FileNotFoundError:
             continue
-        except OSError:
+        except (OSError, ValueError):
             return False
         candidate.evidence.setdefault("surviving_paths", []).append(raw)
         candidate.skip_reason = "work survives at " + raw
@@ -1226,7 +1228,7 @@ def _close_abandoned(candidate: Candidate, facts: RepoFacts, index: PullIndex) -
                    if not any(_is_ancestor(facts.checkout, sha, ref) for ref in default_refs)]
     # Check even records missing a branch name, which the original classifier
     # returns before inspecting the checkout. Unreadable paths remain unknown.
-    paths = [_owned_checkout(candidate.record), *(candidate.record.get("acp_runtime_paths") or [])]
+    paths = [_owned_checkout(candidate.record), *_acp_runtime_paths(candidate.record)]
     for raw in paths:
         if not isinstance(raw, str) or not raw.strip():
             continue
@@ -1234,7 +1236,7 @@ def _close_abandoned(candidate: Candidate, facts: RepoFacts, index: PullIndex) -
             os.lstat(raw)
         except FileNotFoundError:
             continue
-        except OSError:
+        except (OSError, ValueError):
             candidate.skip_reason = "worktree or runtime path evidence unavailable"
             return
         candidate.evidence.setdefault("surviving_paths", []).append(raw)
@@ -1613,19 +1615,42 @@ def sidecar_paths(record_path: Path) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _anchored(raw: str) -> str:
+    """A recorded path as dispatch resolves ``--worktree``: a relative one sits under the primary checkout.
+
+    Legacy records name their checkout repo-relative (``.worktrees/dispatch/...``).
+    Read as written, such a path depends on the caller's cwd, and its lock refuses
+    it as not absolute. Symlinks are not resolved here, so a dangling link still
+    counts as present; the lock canonicalizes the path itself. ``~`` is not
+    expanded: dispatch records absolute paths and legacy records repo-relative
+    ones, and expanding would make the answer depend on ``HOME``.
+    """
+    path = Path(raw)
+    return str(path if path.is_absolute() else state_root() / path)
+
+
 def _owned_checkout(record: Mapping[str, Any]) -> str | None:
     """The checkout a record may still own: ``worktree_path``, else a non-primary ``cwd``.
 
     Read-only tasks run in a repository's primary checkout, whose ``.git`` is a
-    directory. No task owns that checkout, so it never keeps a record hot.
+    directory. No task owns that checkout, so it never keeps a record hot. The
+    path is :func:`_anchored`.
     """
     raw = record.get("worktree_path")
     if isinstance(raw, str) and raw.strip():
-        return raw
+        return _anchored(raw)
     cwd = record.get("cwd")
-    if isinstance(cwd, str) and cwd.strip() and not (Path(cwd) / ".git").is_dir():
-        return cwd
+    if isinstance(cwd, str) and cwd.strip():
+        checkout = _anchored(cwd)
+        if not (Path(checkout) / ".git").is_dir():
+            return checkout
     return None
+
+
+def _acp_runtime_paths(record: Mapping[str, Any]) -> list[str]:
+    """The record's non-empty ``acp_runtime_paths`` entries, :func:`_anchored`."""
+    paths = record.get("acp_runtime_paths")
+    return [_anchored(str(item)) for item in paths if item] if isinstance(paths, list) else []
 
 
 def keep_hot_reason(record: Mapping[str, Any]) -> str | None:
@@ -1639,8 +1664,7 @@ def keep_hot_reason(record: Mapping[str, Any]) -> str | None:
     checkout = _owned_checkout(record)
     if checkout is not None and os.path.lexists(checkout):
         return "worktree path still exists"
-    acp_paths = record.get("acp_runtime_paths")
-    if isinstance(acp_paths, list) and any(item and os.path.lexists(str(item)) for item in acp_paths):
+    if any(os.path.lexists(item) for item in _acp_runtime_paths(record)):
         return "ACP runtime path still exists"
     return None
 
@@ -2130,8 +2154,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Move terminal records (done, failed, no_deliverable, timeout, rate_limited, cancelled, crashed,\n"
             "dry_run, reaped) older than --min-age-days, with their .result and .snapshots sidecars, into\n"
             "batch_state/tasks/archive/. A record stays in place while its checkout path or any\n"
-            "acp_runtime_paths entry still exists. Each move holds the record's lock and re-checks its\n"
-            "mtime and status first."
+            "acp_runtime_paths entry still exists; a relative path is read under the primary checkout.\n"
+            "Each move holds the record's lock and re-checks its mtime and status first."
         ),
         epilog=(
             "Examples:\n"
@@ -2140,7 +2164,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "\n"
             "Outputs: moves files into <tasks-dir>/archive/ (with --apply only); a clashing name gets\n"
             "a .<stamp>.archived suffix, nothing is overwritten.\n"
-            "Exit codes: 0 finished, 1 a move failed, 2 bad arguments.\n" + _RELATED
+            "Exit codes: 0 finished, 1 a move failed, 2 bad arguments or no configured primary checkout.\n"
+            + _RELATED
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2176,8 +2201,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         tasks_dir: Path = args.tasks_dir or default_tasks_dir()
-        if args.command == "settle-stale" or (args.command == "archive" and args.apply):
-            state_root()  # fleet checkouts and the shared lock: refuse before any record moves
+        if args.command in ("settle-stale", "archive"):
+            # Fleet checkouts, the shared lock and the anchor of relative record paths: a dry run
+            # must judge records as --apply would, so both refuse before reading any record.
+            state_root()
     except MachineryConfigError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_USAGE
