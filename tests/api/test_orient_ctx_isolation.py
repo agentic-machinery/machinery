@@ -240,6 +240,59 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
             thread.join(timeout=5)
 
 
+def test_fresh_read_supersedes_only_its_own_apps_refreshes_and_never_labels_them_current(monkeypatch, tmp_path):
+    """Defect class: a fresh read let an older refresh read as current, or discarded another app's refresh.
+
+    A zero-TTL section's waiting read gets the value its own refresh published,
+    labelled current, when a fresh read in another app context lands meanwhile.
+    When a fresh read in the same app supersedes that refresh, nothing it
+    collected is stored and the older value it returns is labelled stale.
+    """
+    monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 10.0)
+    entered, release = threading.Event(), threading.Event()
+    revision = [0]
+
+    async def collect(context):
+        revision[0] += 1
+        if revision[0] > 1:
+            entered.set()
+            assert await asyncio.to_thread(release.wait, 10)
+        return {"summary": {"revision": revision[0]}}
+
+    ctx = fixture_context(tmp_path / "app")
+    client = TestClient(api_main.create_app(ctx, product=_product(collect)))
+    other = TestClient(api_main.create_app(fixture_context(tmp_path / "other")))
+
+    def read_while(fresh_client):
+        entered.clear()
+        release.clear()
+        result = {}
+        waiting = threading.Thread(target=lambda: result.update(client.get("/api/orient?sections=pipeline").json()))
+        waiting.start()
+        assert entered.wait(5)
+        fresh_client.get("/api/orient?sections=session_hints&fresh=true")
+        release.set()
+        waiting.join(10)
+        assert not waiting.is_alive()
+        _join_refresh(ctx)
+        return result
+
+    try:
+        assert client.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {"revision": 1}
+
+        across = read_while(other)
+        assert across["pipeline"]["summary"] == {"revision": 2}
+        assert across["meta"]["pipeline"]["stale"] is False
+
+        superseded = read_while(client)
+        assert superseded["pipeline"]["summary"] == {"revision": 2}
+        assert superseded["meta"]["pipeline"]["stale"] is True
+        assert superseded["meta"]["pipeline"]["generated_at"] == across["meta"]["pipeline"]["generated_at"]
+    finally:
+        release.set()
+        _join_refresh(ctx)
+
+
 def test_orient_lifespan_warms_shared_sections_and_cancels_timer(monkeypatch, tmp_path):
     """A warmer must use this app's collectors and stop when the app shuts down."""
     from unittest.mock import Mock

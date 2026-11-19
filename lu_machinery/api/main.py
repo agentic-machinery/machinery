@@ -10,6 +10,7 @@ import asyncio
 import functools
 import html
 import importlib.metadata
+import itertools
 import logging
 import os
 import re
@@ -18,7 +19,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
@@ -431,15 +432,20 @@ _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
 # value, generated_at, and when it was stored (only a zero-TTL section ages out).
-_detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
+# value, generated_at, when it was stored (only a zero-TTL value ages out), and
+# the publish event (``_orient_epoch``) that stored it.
+_detached_orient_last_good: dict[str, tuple[Any, str, float, int]] = {}
 _detached_orient_last_error: dict[str, str] = {}
 # A zero-TTL section keeps no orient-layer cache; its last value is only a short
 # fallback while its own refresh runs, never another freshness window (#1309 B2).
 _ZERO_TTL_LAST_GOOD_MAX_AGE_S = 120.0
-# Bumped by every ``fresh`` invalidation. A result collected under an older
-# generation observed the checkout before that invalidation: it is dropped, so it
-# never reads as current nor replaces a newer value.
-_orient_generation = 0
+# Per section cache key, the last event that changed what is current: a ``fresh``
+# read of that key's app or a published refresh. A collection publishes only if no
+# event happened since it started, so an observation from before a fresh read
+# never reads as current nor replaces a newer value, and another app's fresh read
+# never discards it.
+_orient_events = itertools.count(1)
+_orient_epoch: dict[str, int] = {}
 # Section cache keys whose refresh worker has not yet published. The worker
 # publishes its value and leaves this set in one critical section, so a reader's
 # snapshot never pairs a new value with "still refreshing" or an old one with "done".
@@ -846,16 +852,26 @@ def reset_detached_orient_state_for_tests() -> None:
     _detached_orient_last_good.clear()
     _detached_orient_last_error.clear()
     _detached_orient_pending.clear()
+    _orient_epoch.clear()
     _orient_demand.clear()
     _integrity_verdicts.clear()
 
 
-def _invalidate_orient_cache() -> None:
-    """Drop every cached orient section and supersede every refresh already running."""
-    global _orient_generation
+def _invalidate_orient_cache(cache_keys: Iterable[str]) -> None:
+    """Drop every cached orient section and supersede this app's collections already running."""
     with _detached_orient_lock:
-        _orient_generation += 1
+        for cache_key in cache_keys:
+            _orient_epoch[cache_key] = next(_orient_events)
         cache_invalidate("orient_")
+
+
+def _publish_orient_section(cache_key: str, value: Any, generated_at: str, ttl: float) -> None:
+    """Store a collection as the section's current value. The caller holds ``_detached_orient_lock``."""
+    published = _orient_epoch[cache_key] = next(_orient_events)
+    if ttl > 0:
+        cache_set(cache_key, (value, generated_at))
+    _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock(), published)
+    _detached_orient_last_error.pop(cache_key, None)
 
 
 def _schedule_detached_orient_refresh(
@@ -865,8 +881,11 @@ def _schedule_detached_orient_refresh(
     *,
     ttl: float | None = None,
     collect_slot: bool = True,
-) -> bool:
-    """Start a single-flight worker for ``key``. Return True if this call started it.
+) -> int | None:
+    """Start a single-flight worker for ``key``.
+
+    Returns the section's epoch the worker started under, or None when a worker
+    was already running.
 
     ``collect_slot`` False keeps the worker off the shared collect slots: a hung
     inline-section refresh must not stop every other section from refreshing.
@@ -875,43 +894,40 @@ def _schedule_detached_orient_refresh(
         state_key = cache_key or f"orient_{key}"
         thread = _detached_orient_threads.get(state_key)
         if thread is not None and thread.is_alive():
-            return False
+            return None
+        epoch = _orient_epoch.get(state_key, 0)
         worker = threading.Thread(
             target=_run_detached_orient_refresh,
-            args=(key, collector, state_key, ttl, _orient_generation, collect_slot),
+            args=(key, collector, state_key, ttl, epoch, collect_slot),
             daemon=True,
             name=f"orient-{key}-refresh",
         )
         _detached_orient_threads[state_key] = worker
         _detached_orient_pending.add(state_key)
         worker.start()
-        return True
+        return epoch
 
 
 def _run_detached_orient_refresh(
     key: str,
     collector: Callable[[], Any],
     cache_key: str,
-    ttl: float | None = None,
-    generation: int | None = None,
+    ttl: float | None,
+    epoch: int,
     collect_slot: bool = True,
 ) -> None:
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
-    generation = _orient_generation if generation is None else generation
     try:
         with _DETACHED_ORIENT_COLLECT_SLOTS if collect_slot else nullcontext():
             value = collector()
         generated_at = _isoformat_z(datetime.now(UTC))
         with _detached_orient_lock:
-            if generation == _orient_generation:
-                if ttl > 0:
-                    cache_set(cache_key, (value, generated_at))
-                _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
-                _detached_orient_last_error.pop(cache_key, None)
+            if _orient_epoch.get(cache_key, 0) == epoch:
+                _publish_orient_section(cache_key, value, generated_at, ttl)
             _detached_orient_pending.discard(cache_key)
     except Exception as exc:
         with _detached_orient_lock:
-            if generation == _orient_generation:
+            if _orient_epoch.get(cache_key, 0) == epoch:
                 _detached_orient_last_error[cache_key] = str(exc)
             _detached_orient_pending.discard(cache_key)
     finally:
@@ -991,7 +1007,8 @@ async def _cached_detached_orient_section(
                 "cache": "hit",
             }
 
-    started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl, collect_slot=collect_slot)
+    epoch = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl, collect_slot=collect_slot)
+    started = epoch is not None
     thread = _detached_orient_threads.get(cache_key)
     if started and thread is not None and thread.is_alive() and (fresh or not _serves_last_good_at_once(cache_key, ttl)):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
@@ -1004,6 +1021,7 @@ async def _cached_detached_orient_section(
         last_good = _detached_orient_last_good.get(cache_key)
         last_error = _detached_orient_last_error.get(cache_key)
         refreshing = cache_key in _detached_orient_pending
+        epoch_now = _orient_epoch.get(cache_key, 0)
 
     if cached is not None:
         value, generated_at = cached  # type: ignore[misc]
@@ -1018,22 +1036,25 @@ async def _cached_detached_orient_section(
     # stale fallback, never another freshness window: it keeps its own
     # ``generated_at``. With a positive TTL a current value is in the cache, so
     # a last-good value read here is always stale. A zero-TTL value is current
-    # only when the refresh this read waited for has just published it.
+    # only when the refresh this read started published it and nothing (another
+    # publish, or a fresh read) has happened since.
     if last_good is not None and (ttl > 0 or _orient_clock() - last_good[2] < _ZERO_TTL_LAST_GOOD_MAX_AGE_S):
-        value, generated_at, _stored_at = last_good
+        value, generated_at, _stored_at, published = last_good
+        current = ttl <= 0 and started and published == epoch_now and epoch_now != epoch
         meta: dict[str, Any] = {
             "generated_at": generated_at,
             "stale_after_s": ttl,
             "source": source,
             "cache": "miss",
-            "stale": ttl > 0 or refreshing or last_error is not None,
+            "stale": not current,
             "refreshing": refreshing,
         }
         if last_error is not None:
             meta["error"] = last_error
         return value, meta
 
-    short_err = last_error or "refreshing"
+    # A refresh this read started that a fresh read superseded stored nothing.
+    short_err = last_error or ("refresh_superseded" if started and epoch_now != epoch else "refreshing")
     meta = {
         "generated_at": _isoformat_z(datetime.now(UTC)),
         "stale_after_s": ttl,
@@ -1531,7 +1552,7 @@ async def _cached_orient_section(
                 "cache": "hit",
             }
 
-    generation = _orient_generation
+    epoch = _orient_epoch.get(cache_key, 0)
     generated_at = _isoformat_z(datetime.now(UTC))
     meta: dict[str, Any] = {
         "generated_at": generated_at,
@@ -1573,10 +1594,8 @@ async def _cached_orient_section(
 
     if ttl > 0:
         with _detached_orient_lock:
-            if generation == _orient_generation:
-                cache_set(cache_key, (value, generated_at))
-                _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
-                _detached_orient_last_error.pop(cache_key, None)
+            if _orient_epoch.get(cache_key, 0) == epoch:
+                _publish_orient_section(cache_key, value, generated_at, ttl)
     return value, meta
 
 
@@ -1790,9 +1809,6 @@ async def orient(
             the shared ``orient_*`` cache, so two roles can never contaminate
             each other's pointers.
     """
-    if fresh:
-        _invalidate_orient_cache()
-
     layout = _orient_layout(request.app.state.product)
     selected = _parse_orient_sections(sections, lean=lean, layout=layout)
     # #7494: thread THIS app's context into every collector — the zero-arg
@@ -1800,6 +1816,8 @@ async def orient(
     # defeating create_app() isolation (and rebuilding contexts per call).
     request_ctx = get_ctx(request)
     scope = _ctx_cache_scope(request_ctx)
+    if fresh:
+        _invalidate_orient_cache(f"orient_{key}{scope}" for key in layout.keys)
     for key in selected:
         _orient_demand.setdefault(f"orient_{key}{scope}", Demand()).touch()
     gather_results = await _collect_orient_sections(request_ctx, layout, selected, fresh=fresh)
