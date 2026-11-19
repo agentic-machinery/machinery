@@ -17,7 +17,6 @@ paths.
 from __future__ import annotations
 
 import argparse
-import errno
 import fcntl
 import hashlib
 import json
@@ -33,7 +32,7 @@ from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -408,8 +407,12 @@ def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str,
         fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return _unparsed("missing_result"), "pruned"
-    except OSError as exc:  # a symlink (ELOOP) or a socket (ENXIO) is not a result file
-        return _unparsed("missing_result"), "rejected" if exc.errno in (errno.ELOOP, errno.ENXIO) else "unreadable"
+    except OSError:  # a symlink, socket or directory in the sidecar's place is not a result file
+        try:
+            regular = stat.S_ISREG(os.lstat(sidecar).st_mode)
+        except OSError:
+            regular = True
+        return _unparsed("missing_result"), "unreadable" if regular else "rejected"
     allow_sample = _record_allows_sample(record)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -697,12 +700,8 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
         built = _summary_candidate(path, record, source_mtime_ns)
         if built is not None:
             row, sidecar, sample_allowed = built
-            if sidecar in _UNOBSERVED:
-                def _merge(existing: Mapping[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
-                    return _preserve_review_evidence(existing, candidate, unobserved=True, sample_allowed=sample_allowed)
-                append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S, merge=_merge)
-            else:
-                append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
+            merge = partial(_preserve_review_evidence, unobserved=True, sample_allowed=sample_allowed)
+            append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S, merge=merge if sidecar in _UNOBSERVED else None)
     except Exception as exc:
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
 
@@ -892,15 +891,8 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any], reje
     if old_review is None or old_review["verdict"] != "unparsed":
         return False
     new_reason = review.get("unparsed_reason")
-    old_reason = old_review.get("unparsed_reason")
-    if new_reason is None:
-        return False
-    if old_reason is None:
-        return True
-    return bool(
-        new_reason != "missing_result" and (
-            old_reason != new_reason or old_review.get("unparsed_sample") != review.get("unparsed_sample")
-        )
+    return new_reason is not None and (
+        old_review.get("unparsed_reason") is None or (new_reason != "missing_result" and old_review != review)
     )
 
 
@@ -931,30 +923,28 @@ def _preserve_review_evidence(
         return {**candidate, "review": dict(old_review)} if keep and old_review.get("priorities") is not None else candidate
     if new_review.get("unparsed_reason") != "missing_result":
         return candidate
-    has_richer_old = (
-        old_review.get("verdict") != "unparsed"
-        or old_review.get("unparsed_reason") in ("too_big", "bad_format", "bad_fields")
-    )
-    if not has_richer_old:
+    if old_review.get("verdict") == "unparsed" and old_review.get("unparsed_reason") not in (
+        "too_big", "bad_format", "bad_fields",
+    ):
         return candidate
     copied = dict(old_review)
-    if copied.get("verdict") == "unparsed" and "unparsed_sample" in copied:
-        prior_sample = copied.get("unparsed_sample")
-        if not sample_allowed or (prior_sample is not None and not _sample_ok(prior_sample)):
-            copied["unparsed_sample"] = None
+    if copied.get("unparsed_sample") is not None and not (sample_allowed and _sample_ok(copied["unparsed_sample"])):
+        copied["unparsed_sample"] = None
     return {**candidate, "review": copied}
 
 
-def _merged(present: Mapping[str, Any], candidates: list[tuple[dict[str, Any], str | None, bool]]) -> list[Any]:
-    """Each candidate row with retained evidence merged in, and whether its sidecar was rejected."""
-    merged = []
+def _changed(present: Mapping[str, Any], candidates: list[tuple[dict[str, Any], str | None, bool]]) -> list[Any]:
+    """The candidate rows, with retained evidence merged in, that supersede the stored row of their task."""
+    changed = []
     for row, sidecar, allowed in candidates:
         old = present.get(row["task_id"])
         unobserved = sidecar in _UNOBSERVED
         kept = _preserve_review_evidence(old, row, unobserved=unobserved, sample_allowed=allowed)
         # Evidence that cannot be carried over to the current record, or that its sidecar rejects, no longer stands.
-        merged.append((kept, sidecar == "rejected" or (unobserved and kept is row and old is not None)))
-    return merged
+        rejected = sidecar == "rejected" or (unobserved and kept is row and old is not None)
+        if _stale(old, kept, rejected):
+            changed.append(kept)
+    return changed
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
@@ -973,15 +963,13 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
     counts["settled_records"] = len(candidates)
     if dry_run:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        merged = _merged(present, candidates)
-        counts["would_add"] = sum(row["task_id"] not in present for row, _ in merged)
-        counts["would_refresh"] = sum(row["task_id"] in present and _stale(present[row["task_id"]], row, rejected)
-                                      for row, rejected in merged)
+        written = _changed(present, candidates)
+        counts["would_add"] = sum(row["task_id"] not in present for row in written)
+        counts["would_refresh"] = len(written) - counts["would_add"]
         return dict(sorted(counts.items()))
     with _locked(batch_state_dir) as path:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        written = [row for row, rejected in _merged(present, candidates)
-                   if _stale(present.get(row["task_id"]), row, rejected)]
+        written = _changed(present, candidates)
         counts["added"] = sum(row["task_id"] not in present for row in written)
         counts["refreshed"] = len(written) - counts["added"]
         counts["already_present"] = len(candidates) - len(written)

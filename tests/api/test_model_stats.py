@@ -357,6 +357,7 @@ def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp
     for task_id, replace in (
         ("swapped-sidecar-review", lambda p: p.write_bytes(b"replacement prose")),
         ("symlinked-sidecar-review", lambda p: (p.unlink(), p.symlink_to(p.name))),
+        ("unopenable-dir-sidecar-review", lambda p: (p.unlink(), p.mkdir(mode=0o000))),
     ):
         _record(tasks, task_id, mode="read-only", agent="claude", model="claude-opus-5-5", result_sha256=digest)
         (tasks / f"{task_id}.result").write_bytes(body)
@@ -373,7 +374,8 @@ def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp
     os.utime(undigested_path, ns=(mtime_ns, mtime_ns))
     assert rows.backfill(tasks, batch_state)["refreshed"] == 1
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
-    for task_id in ("swapped-sidecar-review", "symlinked-sidecar-review", "late-digest-review"):
+    for task_id in ("swapped-sidecar-review", "symlinked-sidecar-review", "unopenable-dir-sidecar-review",
+                    "late-digest-review"):
         assert stored[task_id]["review"] == gone
 
     # A transient read error keeps the retained sample; a record corrected to a private repository drops it.
