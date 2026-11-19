@@ -335,89 +335,58 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
     Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
     or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
-    Git status cannot see, reaching the guards; a borrowed tree written into, launched with a deployment
-    that does not match its start commit, or launched while another task, or the provider of a crashed one,
-    can still commit, enroll or redeploy in it between the check and the start, even when the tree is not
-    enrolled yet; a deployed output the checkout tracks, which could enter the worker's commit; and a
-    read-only (review) worktree widened by settings the dispatch did not ask for."""
-    import os
+    Git status cannot see, reaching the guards; a deployment that does not match its start commit; an enrolled
+    tree, which a write task must not borrow (--cwd) because another task there can commit, enroll or
+    redeploy at any moment, taken for one that is not; a deployed output the checkout tracks, which could
+    enter the worker's commit; and a read-only (review) worktree widened by settings the dispatch did not ask
+    for."""
     import sys
 
     from lu_machinery.dispatcher import git
 
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     primary, _, _ = declared_repo(sandbox)
-    tasks = git.tasks_dir()
-    tasks.mkdir(parents=True, exist_ok=True)
-    # Another task live in a borrowed tree can commit, enroll or redeploy between the check and the start, so
-    # it refuses before anything is read, enrolled or not.
+    # A tree that is not enrolled is left as it is, and a write task may still borrow it.
     plain = primary / ".worktrees/dispatch/codex/plain"
     run_git(primary, "worktree", "add", "--detach", str(plain), "HEAD")
     start = run_git(plain, "rev-parse", "HEAD")
-    assert git.deploy_agent_extensions(plain, start, borrowed_by="borrower") is False
-    claim = dict(schema_version=2, task_id="cotenant", run_nonce="cotenant-run", status="running", pid=None,
-                 worktree_path=str(plain))
-    (tasks / "cotenant.json").write_text(json.dumps(claim))
-    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: worktree claimed by active task cotenant$"):
-        git.deploy_agent_extensions(plain, start, borrowed_by="borrower")
-    (tasks / "cotenant.json").unlink()
+    assert git.agent_deploy_enrolled(plain, start) is False
+    assert git.deploy_agent_extensions(plain, start) is False and not (plain / ".claude").exists()
     sha, settings = enroll(primary)
+    assert git.agent_deploy_enrolled(plain, start) is False
+    # Enrollment follows the start or HEAD commit, whatever the working tree holds.
+    run_git(plain, "checkout", "--detach", sha)
+    assert git.agent_deploy_enrolled(plain, start) is True and git.agent_deploy_enrolled(plain, sha) is True
     tree = primary / ".worktrees/dispatch/codex/enrolled"
     git.create_worktree(primary, tree, "codex/enrolled", sha, deploy_agents=deploy_agents)
     deployed = tree / ".claude/settings.json"
     assert not (tree / "wiki").exists()  # the source stays hidden: the deployment reads the commit, not the tree
     if not deploy_agents:
         assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
-        # A write task borrowing (--cwd) this undeployed tree refuses; nothing is written into a borrowed tree.
-        with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
-            git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
-        assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
         return
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
-    # A borrowing write task verifies the deployment; the worker's own change is not a deployment output.
-    (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
-    assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
-    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
-    # The same in an enrolled tree, until the co-tenant is finished and its provider is proven gone: a crashed
-    # supervisor (its own pid reused) can leave a provider (here this test's process group) still working.
-    claim["worktree_path"] = str(tree)
-    (tasks / "cotenant.json").write_text(json.dumps(claim))
-    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: worktree claimed by active task cotenant$"):
-        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
-    crashed = {**claim, "status": "crashed", "pid": os.getpid(), "process_start": "an earlier process",
-               "provider_pgid": os.getpgrp()}
-    (tasks / "cotenant.json").write_text(json.dumps(crashed))
-    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: another task's provider may still work in the "
-                                         "tree$"):
-        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
-    (tasks / "cotenant.json").write_text(json.dumps({**crashed, "status": "done", "provider_pgid": None}))
-    assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
     # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
     before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
                                                              ".deploy-state/agent-deploy.v1.json")}
     run_git(tree, "update-index", "--assume-unchanged", "agents_extensions/shared/README.md")
     (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
-    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
     assert git.deploy_agent_extensions(tree, sha) is True
     assert {name: (tree / name).read_bytes() for name in before} == before
-    # A borrowed tree whose guard was removed refuses, and is left as it is.
-    deployed.unlink()
-    with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
-        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
-    assert not deployed.exists()
-    assert git.deploy_agent_extensions(tree, sha) is True
     # The deployment is bound to the task's start: a checkout whose HEAD moved refuses before anything runs.
+    deployed.unlink()
     run_git(tree, "commit", "--allow-empty", "-m", "worker commit")
     with pytest.raises(ValueError, match=f"^agent_deploy_failed: the checkout's HEAD [0-9a-f]{{12}} is not the "
                                          f"task's start {sha[:12]}$"):
-        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
+        git.deploy_agent_extensions(tree, sha)
+    assert not deployed.exists()
     sha = run_git(tree, "rev-parse", "HEAD")
     # A tracked output refuses, however clean it is.
     run_git(tree, "add", "--force", ".claude/README.md")
     with pytest.raises(ValueError, match="^agent_deploy_outputs_not_ignored: the checkout does not ignore "
                                          r"\.claude/README\.md$"):
-        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
+        git.deploy_agent_extensions(tree, sha)
 
 
 @pytest.mark.parametrize("broken, global_excludes, reason", [
@@ -435,7 +404,7 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
     """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
     checkout's agent deployment failed: a broken or dangling descriptor skipped, or outputs only the
     dispatcher's own user-level excludes file hides, which the worker does not share, or a validation the
-    commit selects but the sparse checkout hid from the apply; or a write task borrowing (--cwd) an undeployed
+    commit selects but the sparse checkout hid from the apply; or a write task borrowing (--cwd) an enrolled
     tree launched, or deployed into. A read-only task of the same checkout is never deployed, so the same
     breakage cannot refuse it."""
     sandbox.env["LEARN_UKRAINIAN_PYTHON"] = sandbox.python
@@ -467,8 +436,8 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
     if not global_excludes:
         assert settled["worktree_disposition"] == "removed"
         assert run_git(primary, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "main"
-    # A task borrowing (--cwd) a tree without the deployment: read-only runs as it is; a write task refuses
-    # before it starts, recorded as a setup refusal under its own id, and nothing is written into the tree.
+    # A task borrowing (--cwd) an enrolled tree: read-only runs as it is; a write task refuses before it
+    # starts, recorded as a setup refusal under its own id, and nothing is written into the tree.
     tree = primary / ".worktrees/dispatch/codex/attached"
     run_git(primary, "worktree", "add", "-b", "attached", str(tree), "main")
     record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--cwd", str(tree), "--base", "origin/main",
@@ -477,7 +446,9 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
     attached = sandbox.cli("dispatch", "--agent", "sol", "--model", "echo", "--prompt", "never launched",
                            "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
                            "--cwd", str(tree), "--task-id", "attached", expected=2)
-    assert attached.stderr.splitlines()[-1].startswith("dispatcher: agent_deploy_failed: exit "), attached.stderr
+    assert attached.stderr.splitlines()[-1] == ("dispatcher: agent_deploy_attach_refused: a write task cannot borrow "
+                                                "(--cwd) a tree enrolled in the agent deployment; dispatch it without "
+                                                "--cwd"), attached.stderr
     refusals = [entry for entry in (json.loads(path.read_text()) for path in sandbox.tasks.glob("*.json"))
                 if entry.get("requested_task_id") == "attached"]
     assert [(entry["status"], entry["never_started_reason"]) for entry in refusals] == [("failed", "setup_refusal")]

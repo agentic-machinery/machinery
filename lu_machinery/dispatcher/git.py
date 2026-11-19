@@ -582,64 +582,59 @@ def _agent_deploy(root: Path, *args: str) -> str:
     return result.stdout
 
 
-def deploy_agent_extensions(path: Path, commit: str, *, borrowed_by: str | None = None,
-                            repo: Path | None = None) -> bool:
+def agent_deploy_enrolled(path: Path, commit: str) -> bool:
+    """Whether the checkout at ``path`` is enrolled in the installed agent deployment.
+
+    It is when ``commit`` (the task's admitted start) or the checkout's HEAD tracks the descriptor, whatever
+    the working tree holds; read from the objects (``--no-replace-objects``). A Git step that fails is
+    ``agent_deploy_failed``.
+    """
+    root = path.resolve()
+    head = _checkout_head(root)
+    try:
+        return any(_git(root, "--no-replace-objects", "ls-tree", "--name-only", tip, "--", AGENT_DEPLOY_DESCRIPTOR,
+                        isolate=True) for tip in dict.fromkeys((commit, head)))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("enrollment read", exc) from None
+
+
+def _checkout_head(root: Path) -> str:
+    try:
+        return _git(root, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("enrollment read", exc) from None
+
+
+def deploy_agent_extensions(path: Path, commit: str) -> bool:
     """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
 
     Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
-    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
-    product's guards. Everything is bound to ``commit``, the task's admitted start: the checkout is enrolled
-    when that commit or its HEAD tracks the descriptor, whatever the working tree holds, and an enrolled
-    checkout whose HEAD is no longer that commit refuses. A tree this creation just checked out (no
-    ``borrowed_by``) runs the checkout's own apply contract (``agent_deploy --project-root``, as ``npm run
-    agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the worker's hooks
-    use, composed from the commit's objects (``--inputs-commit``), never from the checkout, so no working-tree
-    edit or file the sparse checkout hides changes the plan. A tree the task ``borrowed_by`` borrows with
-    ``--cwd`` must be that task's alone, enrolled or not, before anything in it is read: another task's provider
-    could commit, enroll or redeploy at any moment, between this check and the start too. Settlement's own
-    pair decides it: the worktree claim scan of ``repo`` (default: the tree's own primary checkout), which
-    exempts only the borrowing task's record, and ``worker._borrowed``, which holds a tree for a finished task
-    until its provider is proven gone. The caller holds ``worktree_lock`` through the start, so no other task
-    can attach before this one's record names the tree. Nothing is written into a borrowed tree; its existing
-    deployment must already match the commit's plan. Either way the deployer's own check verifies the outputs
-    against that plan and prints its manifest, which names the outputs checked here. A checkout that is not
-    enrolled is left as it is (False). Each refusal is a ``ValueError`` whose
-    first word is its typed reason: ``agent_deploy_tree_in_use`` when another task may still work in a borrowed
-    tree, or that cannot be ruled out, ``agent_deploy_failed`` when the deployment cannot be applied or verified,
-    ``agent_deploy_outputs_not_ignored`` when one of its outputs is tracked or not ignored by the
-    repository's own rules (its ignore files and ``info/exclude``; no user-level excludes file,
-    which the worker may not share), so the worker could commit it.
+    enrolled checkout (``agent_deploy_enrolled``) tracks none of its generated outputs: without this a headless
+    worker runs without the product's guards. Only a tree its creation just checked out gets it; a write task
+    never borrows (``--cwd``) an enrolled tree. Everything is bound to ``commit``, the task's admitted start: an
+    enrolled checkout whose HEAD is no longer that commit refuses. The checkout's own apply contract
+    (``agent_deploy --project-root``, as ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it)
+    runs under the project interpreter the worker's hooks use, composed from the commit's objects
+    (``--inputs-commit``), never from the checkout, so no working-tree edit or file the sparse checkout hides
+    changes the plan. The deployer's own check then verifies the outputs against that plan and prints its
+    manifest, which names the outputs checked here. A checkout that is not enrolled is left as it is (False).
+    Each refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
+    deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
+    tracked or not ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level
+    excludes file, which the worker may not share), so the worker could commit it.
     """
     root = path.resolve()  # the deployer takes only the canonical checkout root
-    if borrowed_by is not None:
-        from lu_machinery.dispatcher import worker  # deferred: worker imports this module
-        from lu_machinery.orchestration import worktree_claims
-
-        refusal = worktree_claims.active_worktree_claim_refusal(
-            root, tasks_dir=tasks_dir(), repo_root=repo or worktree_claims.owning_repo_root(root, default=root),
-            owner_task_id=borrowed_by)
-        if refusal is None and worker._borrowed({"task_id": borrowed_by, "worktree_path": str(root)}):
-            refusal = "another task's provider may still work in the tree"
-        if refusal is not None:
-            raise ValueError(f"agent_deploy_tree_in_use: {refusal}")
-    try:
-        head = _git(root, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
-        enrolled = any(_git(root, "--no-replace-objects", "ls-tree", "--name-only", tip, "--", AGENT_DEPLOY_DESCRIPTOR,
-                            isolate=True) for tip in dict.fromkeys((commit, head)))
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise _git_failure("enrollment read", exc) from None
-    if not enrolled:
+    if not agent_deploy_enrolled(root, commit):
         return False
-    if head != commit:
+    if (head := _checkout_head(root)) != commit:
         raise ValueError(f"agent_deploy_failed: the checkout's HEAD {head[:12]} is not the task's start {commit[:12]}")
-    if borrowed_by is None:
-        _agent_deploy(root, "--inputs-commit", commit)
+    _agent_deploy(root, "--inputs-commit", commit)
     verified = _agent_deploy(root, "--check", "--print-manifest", "--inputs-commit", commit)
     try:
         outputs = [AGENT_DEPLOY_STATE, *(str(name) for name in json_depth.loads(verified, max_depth=16)["files"])]
     except (ValueError, RecursionError, KeyError, TypeError):
         raise ValueError("agent_deploy_failed: the verified manifest cannot be read") from None
-    # Only the deployment's own outputs are listed: an attached worktree may hold the worker's own changes.
+    # Only the deployment's own outputs are listed.
     try:
         listed = _git(root, "-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--cached", "--others",
                       "--exclude-standard", "--", *outputs, isolate=True, strip=False,

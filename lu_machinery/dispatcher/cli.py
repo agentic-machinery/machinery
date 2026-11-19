@@ -100,11 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
         ("pinned-head", None, "Exact review commit (default: branch or base)"),
-        ("cwd", None, ("Existing dispatch worktree root; a write task there needs the tree to itself, with no other "
-                       "task or its provider still working in it, so a running task cannot hand its own tree to a "
-                       "write helper, and, when its HEAD is enrolled in the agent deployment, that deployment already "
-                       "applied, e.g. by create_worktree(deploy_agents=True); read-only tasks may share it "
-                       "(default: create one)")),
+        ("cwd", None, ("Existing dispatch worktree root; a write task borrowing a tree enrolled in the agent "
+                       "deployment (its start or HEAD tracks agents_extensions/deployment.v1.json) is refused and "
+                       "needs a fresh worktree; read-only tasks may borrow any tree (default: create one)")),
         ("review-author-model", None, "Author model for family check (default: no review check)"),
         ("codex-account", None, "Codex route: sub or api (account a; also a-sub, a-api), b-sub (also b) or b-api (default: sub; every route but sub requires its entry in the private codex_accounts.json)"),
         ("claude-account", None, "Claude account: subscription a or b, or API key kk or szb (default: inherited configuration)"),
@@ -727,12 +725,11 @@ def _dispatch(args) -> int:
                 with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
-                    if args.cwd and args.mode == "workspace-write":
-                        # A write task borrowing a tree needs it to itself and, when enrolled, the deployment its
-                        # start commit composes; nothing is written into a borrowed tree. Checked after any creation
-                        # still applying it, under the lock held through the start, so the tree verified is the
-                        # tree launched and no other task attaches before this record names it.
-                        git.deploy_agent_extensions(worktree, sha, borrowed_by=task_id, repo=repo)
+                    if args.cwd and args.mode == "workspace-write" and git.agent_deploy_enrolled(worktree, sha):
+                        # Another task in a borrowed tree could commit, enroll or redeploy at any moment, so only a
+                        # tree this dispatch creates gets, and keeps, the deployment its start commit composes.
+                        raise ValueError("agent_deploy_attach_refused: a write task cannot borrow (--cwd) a tree "
+                                         "enrolled in the agent deployment; dispatch it without --cwd")
                 worker.start(spec, record, prompt, args.hard_timeout)
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.
