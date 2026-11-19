@@ -57,6 +57,7 @@ ROWS_DIR = "model-stats"
 ROWS_FILE = "rows.jsonl"
 LOCK_FILE = "rows.lock"
 MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_DIGEST_STREAM_BYTES = 256 * 1024 * 1024
 MAX_SAMPLE_CHARS = 200
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
@@ -74,7 +75,7 @@ _FIELD_CONTRACT_ERRORS = (
     "review_envelope_invalid_verdict:",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_ATTEMPT_KEYS = ("role", "status", "model", "repo", "started_at", "finished_at", "pr", "pinned_head")
+_ATTEMPT_KEYS = ("role", "status", "model", "repo", "started_at", "finished_at", "pr", "pinned_head", "result_sha256")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -232,27 +233,86 @@ def role_of(record: Mapping[str, Any]) -> str:
 
 
 @lru_cache(maxsize=1)
-def _public_repo_keys() -> frozenset[str]:
+def _fleet_repo_visibility() -> tuple[frozenset[str], dict[str, str], str | None]:
+    """(public_keys, github_slug_to_key, default_key); fail closed to empty when unreadable."""
     try:
-        return frozenset(key for key, repo in load_fleet_repos().items() if repo.role.startswith("public-"))
+        repos = load_fleet_repos()
     except Exception:  # fail closed: an unreadable repo catalog admits no reply samples
+        return frozenset(), {}, None
+    public_keys = frozenset(key for key, repo in repos.items() if repo.role.startswith("public-"))
+    by_github = {repo.github.lower(): key for key, repo in repos.items()}
+    default_key = next((key for key, repo in repos.items() if repo.default), None)
+    return public_keys, by_github, default_key
+
+
+@lru_cache(maxsize=1)
+def _public_data_classes() -> frozenset[str]:
+    """Exact catalogued public data classes (``store: true``); fail closed to empty when unreadable."""
+    catalog = _catalog()
+    models = catalog.get("models") if isinstance(catalog, Mapping) else None
+    if not isinstance(models, Mapping):
         return frozenset()
+    admitted: set[str] = set()
+    for info in models.values():
+        classes = info.get("data_classes") if isinstance(info, Mapping) else None
+        if isinstance(classes, Mapping):
+            admitted.update(
+                name for name, allowed in classes.items()
+                if isinstance(name, str) and allowed is True
+            )
+    return frozenset(admitted)
 
 
 def _repo_is_public(repo: object) -> bool:
-    return isinstance(repo, str) and repo in _public_repo_keys()
+    public_keys, _, _ = _fleet_repo_visibility()
+    return isinstance(repo, str) and repo in public_keys
 
 
 def _record_allows_sample(record: Mapping[str, Any]) -> bool:
-    """Whether a failing reply from ``record`` is eligible for a bounded stats sample (public repos/data only)."""
-    options = _options(record)
-    repo = label(record.get("repo") or options.get("repo"), "public")
-    if not _repo_is_public(repo):
+    """Whether a failing reply from ``record`` is eligible for a bounded stats sample (exact allowlists, fail closed)."""
+    public_keys, by_github, default_key = _fleet_repo_visibility()
+    if not public_keys:
         return False
-    data_class = record.get("data_class")
-    if data_class is None:
-        data_class = options.get("data_class")
-    return data_class is None or (isinstance(data_class, str) and data_class.strip().lower().startswith("public"))
+    options = _options(record)
+    declared_repos = [value for value in (record.get("repo"), options.get("repo")) if value is not None]
+    resolved_repo: str | None = None
+    for value in declared_repos:
+        if not isinstance(value, str) or value not in public_keys:
+            return False
+        if resolved_repo is not None and value != resolved_repo:
+            return False
+        resolved_repo = value
+    slugs = [
+        value for value in (
+            record.get("repository"), record.get("repository_id"),
+            options.get("repository"), options.get("repository_id"),
+        )
+        if value is not None
+    ]
+    for slug in slugs:
+        if not isinstance(slug, str):
+            return False
+        slug_key = by_github.get(slug.strip().lower())
+        if slug_key is None or slug_key not in public_keys:
+            return False
+        if resolved_repo is not None and slug_key != resolved_repo:
+            return False
+        resolved_repo = slug_key
+    if resolved_repo is None and default_key not in public_keys:
+        return False
+    declared_classes = [value for value in (record.get("data_class"), options.get("data_class")) if value is not None]
+    if declared_classes:
+        public_classes = _public_data_classes()
+        if not public_classes:
+            return False
+        first_class: str | None = None
+        for value in declared_classes:
+            if not isinstance(value, str) or value not in public_classes:
+                return False
+            if first_class is not None and value != first_class:
+                return False
+            first_class = value
+    return True
 
 
 def _needs_escape(ch: str) -> bool:
@@ -302,46 +362,79 @@ def _unparsed(reason: str, sample: str | None = None) -> dict[str, Any]:
 
 
 def _sidecar_path(path: Path, record: Mapping[str, Any]) -> Path | None:
-    """Resolve the ``.result`` sidecar bound to ``path``, preserving stamped archive renames."""
-    task_id = record.get("task_id")
-    if isinstance(task_id, str) and path.stem != task_id:
-        return path.with_name(f"{path.stem}.result")
+    """Derive the owning ``.result`` sidecar from ``path.stem`` and reject conflicting/malformed declarations."""
+    expected_name = f"{path.stem}.result"
     declared = record.get("result_file")
-    name = Path(declared).name if isinstance(declared, str) and declared else f"{path.stem}.result"
-    if not name.endswith(".result"):
-        return None
-    return path.with_name(name)
+    if declared is not None:
+        if not isinstance(declared, str) or not declared.endswith(".result"):
+            return None
+        declared_name = Path(declared).name
+        if declared_name != expected_name:
+            task_id = record.get("task_id")
+            stamped_archive = (
+                isinstance(task_id, str)
+                and path.stem.startswith(f"{task_id}.")
+                and path.stem.endswith(".archived")
+                and declared_name == f"{task_id}.result"
+            )
+            if not stamped_archive:
+                return None
+    return path.with_name(expected_name)
+
+
+def _verify_stream_digest(initial: bytes, stream: Any, expected: str) -> bool | None:
+    """Stream-verify ``expected`` SHA-256 with bounded memory; True=match, False=mismatch, None=exceeded cap."""
+    hasher = hashlib.sha256(initial)
+    total = len(initial)
+    while chunk := stream.read(65536):
+        total += len(chunk)
+        if total > MAX_DIGEST_STREAM_BYTES:
+            return None
+        hasher.update(chunk)
+    return hasher.hexdigest() == expected
+
+
+def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Return ``(review_summary, sidecar_pruned)``; ``sidecar_pruned`` is True only on clean FileNotFoundError."""
+    sidecar = _sidecar_path(path, record)
+    if sidecar is None:
+        return _unparsed("missing_result"), False
+    expected = record.get("result_sha256")
+    if expected is not None and (not isinstance(expected, str) or not _SHA256.fullmatch(expected)):
+        return _unparsed("missing_result"), False
+    try:
+        fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return _unparsed("missing_result"), True
+    except OSError:
+        return _unparsed("missing_result"), False
+    allow_sample = _record_allows_sample(record)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return _unparsed("missing_result"), False
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(MAX_RESULT_BYTES + 1)
+            if len(raw) > MAX_RESULT_BYTES:
+                preview = raw[: MAX_SAMPLE_CHARS * 4]
+                if expected is not None:
+                    verified = _verify_stream_digest(raw, stream, expected)
+                    if verified is False:
+                        return _unparsed("missing_result"), False
+                    sample = _sample(preview) if allow_sample and verified is True else None
+                    return _unparsed("too_big", sample), False
+                return _unparsed("too_big", _sample(preview) if allow_sample else None), False
+    except OSError:
+        return _unparsed("missing_result"), False
+    finally:
+        os.close(fd)
+    if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
+        return _unparsed("missing_result"), False
+    return review_summary(raw, allow_sample=allow_sample), False
 
 
 def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
     """Verdict and finding priorities from the record's bound ``.result`` sidecar, or a typed unparsed cause."""
-    sidecar = _sidecar_path(path, record)
-    if sidecar is None:
-        return _unparsed("missing_result")
-    expected = record.get("result_sha256")
-    if expected is not None and (not isinstance(expected, str) or not _SHA256.fullmatch(expected)):
-        return _unparsed("missing_result")
-    try:
-        fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        return _unparsed("missing_result")
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return _unparsed("missing_result")
-        with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(MAX_RESULT_BYTES + 1)
-    except OSError:
-        return _unparsed("missing_result")
-    finally:
-        os.close(fd)
-    allow_sample = _record_allows_sample(record)
-    if len(raw) > MAX_RESULT_BYTES:
-        # Withhold the sample when the recorded digest cannot be verified within the read budget.
-        sample = _sample(raw) if allow_sample and expected is None else None
-        return _unparsed("too_big", sample)
-    if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
-        return _unparsed("missing_result")
-    return review_summary(raw, allow_sample=allow_sample)
+    return _result_with_state(path, record)[0]
 
 
 def _recorded_review(verdict: object) -> dict[str, Any] | None:
@@ -392,12 +485,18 @@ def review_summary(raw: bytes, *, allow_sample: bool = True) -> dict[str, Any]:
     return {"verdict": verdict, "priorities": dict(sorted(priorities.items()))}
 
 
-def _review(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
-    reply = _result(path, record)
+def _review_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str, Any], bool]:
+    reply, sidecar_pruned = _result_with_state(path, record)
     if reply["verdict"] != "unparsed":
-        return reply
+        return reply, False
     recorded = _recorded_review(record.get("verdict"))
-    return recorded if recorded is not None else reply
+    if recorded is not None:
+        return recorded, False
+    return reply, sidecar_pruned
+
+
+def _review(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    return _review_with_state(path, record)[0]
 
 
 def _reading(value: object) -> dict[str, float] | str:
@@ -436,12 +535,10 @@ def _iso(value: object) -> str | None:
     return moment.isoformat() if moment else None
 
 
-def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None) -> dict[str, Any] | None:
-    """The summary row of a settled task record, or None for an active or foreign record or an invalid task id.
-
-    ``source_mtime_ns`` is the record file's modification time when it was read: of two rows for one task id, the
-    one from the later record version is the current one.
-    """
+def _summary_candidate(
+    path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None,
+) -> tuple[dict[str, Any], bool, bool] | None:
+    """Return ``(summary_row, sidecar_pruned, sample_allowed)`` or None for active/foreign records."""
     task_id = record.get("task_id")
     status = record.get("status")
     if not valid_task_id(task_id) or not isinstance(status, str) or status in ACTIVE:
@@ -456,8 +553,17 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     pr = record.get("pr", options.get("pr"))
     head = record.get("pinned_head") or options.get("pinned_head") or record.get("worktree_base_ref")
     author = record.get("review_author_model") or options.get("review_author_model")
+    raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
+    repo = "public" if raw_repo is None else label(raw_repo, "unknown")
+    raw_sha = record.get("result_sha256")
+    result_sha = raw_sha if isinstance(raw_sha, str) and _SHA256.fullmatch(raw_sha) else None
     fresh, cached, output = tokens(record.get("usage"))
-    return {
+    sample_allowed = _record_allows_sample(record)
+    if role == "review" and status == "done":
+        review, sidecar_pruned = _review_with_state(path, record)
+    else:
+        review, sidecar_pruned = None, False
+    row = {
         "schema": ROW_SCHEMA,
         "task_id": task_id,
         "harness": label(record.get("agent")),
@@ -471,14 +577,26 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "duration_s": _number(record.get("duration_s")),
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
         "allowance": _allowance(record),
-        "review": _review(path, record) if role == "review" and status == "done" else None,
-        "repo": label(record.get("repo") or options.get("repo"), "public"),
+        "review": review,
+        "repo": repo,
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
         "author_model": model_id(author) if author else None,
         "landing": _landing(record),
+        "result_sha256": result_sha,
         "source_mtime_ns": source_mtime_ns,
     }
+    return row, sidecar_pruned, sample_allowed
+
+
+def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None) -> dict[str, Any] | None:
+    """The summary row of a settled task record, or None for an active or foreign record or an invalid task id.
+
+    ``source_mtime_ns`` is the record file's modification time when it was read: of two rows for one task id, the
+    one from the later record version is the current one.
+    """
+    built = _summary_candidate(path, record, source_mtime_ns)
+    return None if built is None else built[0]
 
 
 def rows_path(batch_state_dir: Path) -> Path:
@@ -532,14 +650,48 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def append_row(batch_state_dir: Path, row: Mapping[str, Any], wait_s: float | None = None) -> None:
+def _latest_row_for_task(fd: int, task_id: str) -> dict[str, Any] | None:
+    """Scan an open rows file for the latest well-formed row of ``task_id`` while holding ``rows.lock``."""
+    needle = task_id.encode("utf-8")
+    os.lseek(fd, 0, os.SEEK_SET)
+    latest: dict[str, Any] | None = None
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        for line in stream:
+            if needle not in line:
+                continue
+            try:
+                row = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+            except (ValueError, RecursionError):
+                continue
+            if (
+                isinstance(row, dict)
+                and row.get("schema") == ROW_SCHEMA
+                and row.get("task_id") == task_id
+                and valid_task_id(task_id)
+                and _well_formed(row)
+            ):
+                latest = _sanitised(row)
+    return latest
+
+
+def append_row(
+    batch_state_dir: Path,
+    row: Mapping[str, Any],
+    wait_s: float | None = None,
+    *,
+    merge: Any = None,
+) -> None:
     """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
     with _locked(batch_state_dir, wait_s) as path:
         fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
         try:
             size = os.fstat(fd).st_size
+            to_write: Mapping[str, Any] = row
+            if merge is not None and size > 0 and isinstance(row.get("task_id"), str):
+                existing = _latest_row_for_task(fd, row["task_id"])
+                to_write = merge(existing, dict(row))
             open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
-            _write_all(fd, (b"\n" if open_fragment else b"") + _line(row))
+            _write_all(fd, (b"\n" if open_fragment else b"") + _line(to_write))
         finally:
             os.close(fd)
 
@@ -548,11 +700,21 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
     """Append the row of a just-written settled record. Never raises: the record's status stays as written.
 
     ``source_mtime_ns`` is the modification time of the file the writer renamed into place (its content's version).
+    When a settled review is rewritten after its sidecar was pruned, preserve earlier retained review evidence
+    under ``rows.lock`` after revalidating privacy eligibility against the current record.
     """
     try:
-        row = summary_row(path, record, source_mtime_ns)
-        if row is not None:
-            append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
+        built = _summary_candidate(path, record, source_mtime_ns)
+        if built is not None:
+            row, sidecar_pruned, sample_allowed = built
+            if sidecar_pruned:
+                def _merge(existing: Mapping[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
+                    return _preserve_review_evidence(
+                        existing, candidate, sidecar_pruned=True, sample_allowed=sample_allowed,
+                    )
+                append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S, merge=_merge)
+            else:
+                append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
 
@@ -658,6 +820,7 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
                   and _count_value(d["pr"]) and _sha(d["merge_sha"])),
+        _optional(row.get("result_sha256"), lambda v: isinstance(v, str) and _SHA256.fullmatch(v) is not None),
         _optional(row.get("source_mtime_ns"), _count_value),
     ))
 
@@ -722,6 +885,8 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
         return True
     if stored != source:
         return False
+    if present.get("result_sha256") is not None and present.get("result_sha256") != candidate.get("result_sha256"):
+        return True
     review = candidate["review"]
     old_review = present.get("review")
     if review is None:
@@ -756,9 +921,15 @@ def _same_review_attempt(present: Mapping[str, Any], candidate: Mapping[str, Any
     )
 
 
-def _preserve_review_evidence(present: Mapping[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
-    """Keep earlier retained review evidence when a newer version of the same attempt lost its sidecar."""
-    if present is None or not _same_review_attempt(present, candidate):
+def _preserve_review_evidence(
+    present: Mapping[str, Any] | None,
+    candidate: dict[str, Any],
+    *,
+    sidecar_pruned: bool,
+    sample_allowed: bool,
+) -> dict[str, Any]:
+    """Keep earlier retained review evidence when a pruned sidecar belongs to the same verified review attempt."""
+    if not sidecar_pruned or present is None or not _same_review_attempt(present, candidate):
         return candidate
     old_review = present.get("review")
     new_review = candidate.get("review")
@@ -772,7 +943,12 @@ def _preserve_review_evidence(present: Mapping[str, Any] | None, candidate: dict
     )
     if not has_richer_old:
         return candidate
-    return {**candidate, "review": dict(old_review)}
+    copied = dict(old_review)
+    if copied.get("verdict") == "unparsed" and "unparsed_sample" in copied:
+        prior_sample = copied.get("unparsed_sample")
+        if not sample_allowed or (prior_sample is not None and not _sample_ok(prior_sample)):
+            copied["unparsed_sample"] = None
+    return {**candidate, "review": copied}
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
@@ -781,24 +957,34 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
     A new last line supersedes an older record version or a review summary improved by retained evidence.
     """
     counts: Counter[str] = Counter()
-    candidates: list[dict[str, Any]] = []
+    candidates: list[tuple[dict[str, Any], bool, bool]] = []
     for path, record, mtime_ns in _settled_records(tasks_dir, counts):
-        row = summary_row(path, record, mtime_ns)
-        if row is None:
+        built = _summary_candidate(path, record, mtime_ns)
+        if built is None:
             counts["active_or_foreign"] += 1
             continue
-        candidates.append(row)
+        candidates.append(built)
     counts["settled_records"] = len(candidates)
     if dry_run:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        merged = [_preserve_review_evidence(present.get(row["task_id"]), row) for row in candidates]
+        merged = [
+            _preserve_review_evidence(
+                present.get(row["task_id"]), row, sidecar_pruned=pruned, sample_allowed=allowed,
+            )
+            for row, pruned, allowed in candidates
+        ]
         counts["would_add"] = sum(row["task_id"] not in present for row in merged)
         counts["would_refresh"] = sum(row["task_id"] in present and _stale(present[row["task_id"]], row)
                                       for row in merged)
         return dict(sorted(counts.items()))
     with _locked(batch_state_dir) as path:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        merged = [_preserve_review_evidence(present.get(row["task_id"]), row) for row in candidates]
+        merged = [
+            _preserve_review_evidence(
+                present.get(row["task_id"]), row, sidecar_pruned=pruned, sample_allowed=allowed,
+            )
+            for row, pruned, allowed in candidates
+        ]
         written = [row for row in merged if _stale(present.get(row["task_id"]), row)]
         counts["added"] = sum(row["task_id"] not in present for row in written)
         counts["refreshed"] = len(written) - counts["added"]

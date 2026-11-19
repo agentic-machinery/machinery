@@ -149,10 +149,19 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     _record(u_tasks, "u-tampered-review", mode="read-only", agent="claude", model="claude-opus-5-5",
             started_at=_at(5.5), result_sha256="0" * 64)
     (u_tasks / "u-tampered-review.result").write_text("TAMPERED-PROSE-NEVER-SHOWN", encoding="utf-8")
-    # Oversized sidecar with a recorded digest withholds its sample (unverifiable within 4 MB); without a digest keeps it.
+    # Oversized sidecar with a valid recorded digest authenticates via streaming SHA-256 and keeps its preview;
+    # a mismatching digest on an oversized sidecar fails verification as missing_result with no sample.
+    big_ok_bytes = b"DIGEST-BIG\n" + b"X" * rows.MAX_RESULT_BYTES
     _record(u_tasks, "u-big-digested-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            started_at=_at(5.2), result_sha256="a" * 64)
-    (u_tasks / "u-big-digested-review.result").write_bytes(b"DIGEST-BIG\n" + b"X" * rows.MAX_RESULT_BYTES)
+            started_at=_at(5.2), result_sha256=hashlib.sha256(big_ok_bytes).hexdigest())
+    (u_tasks / "u-big-digested-review.result").write_bytes(big_ok_bytes)
+    _record(u_tasks, "u-big-bad-digest-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            started_at=_at(5.1), result_sha256="b" * 64)
+    (u_tasks / "u-big-bad-digest-review.result").write_bytes(b"BAD-BIG\n" + b"Y" * rows.MAX_RESULT_BYTES)
+    # Conflicting unstamped result_file declaration must never attach another task's sidecar.
+    (u_tasks / "other-secret.result").write_text("OTHER-TASK-REPLY-NEVER-SHOWN", encoding="utf-8")
+    _record(u_tasks, "u-conflict-sidecar-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            started_at=_at(5.05), result_file=str(u_tasks / "other-secret.result"))
     _record(u_tasks, "u-big-review", mode="read-only", agent="claude", model="claude-opus-5-5",
             started_at=_at(5))
     (u_tasks / "u-big-review.result").write_bytes(b"BIG\n" + b"A" * rows.MAX_RESULT_BYTES)
@@ -206,7 +215,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert before_backfill["unparsed_reasons"]["unknown"] == 1 and before_backfill["unparsed_samples"] == {}
 
     bf1 = rows.backfill(u_tasks, u_state)
-    assert (bf1["added"], bf1["refreshed"]) == (10, 1)
+    assert (bf1["added"], bf1["refreshed"]) == (12, 1)
     assert rows.backfill(u_tasks, u_state)["refreshed"] == 0
     # Deleting a retained .result after backfill must not overwrite a recorded bad_format reason/sample,
     # even when a newer version of the same settled task record updates metadata like duration_s.
@@ -217,6 +226,40 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     os.utime(legacy_path, ns=(old_mtime_ns + 1_000_000, old_mtime_ns + 1_000_000))
     assert rows.backfill(u_tasks, u_state)["refreshed"] == 1
     assert rows.backfill(u_tasks, u_state)["refreshed"] == 0
+    # Dispatcher store.replace after sidecar pruning also preserves retained evidence via record_settled (F6),
+    # while changing data_class to private revokes the sample and changing result_sha256 refuses carry-over (F8).
+    live_body = b"dispatcher rewrite sample"
+    live_sha = hashlib.sha256(live_body).hexdigest()
+    (u_tasks / "u-settled-rewrite-review.result").write_bytes(live_body)
+    live_rec = _record(u_tasks, "u-settled-rewrite-review", mode="read-only", agent="claude",
+                       model="claude-opus-5-5", started_at=_at(1.2), duration_s=50,
+                       data_class="public-code", result_sha256=live_sha)
+    store.replace(live_rec, u_tasks / "u-settled-rewrite-review.json")
+    (u_tasks / "u-settled-rewrite-review.result").unlink()
+    store.replace({**live_rec, "duration_s": 90}, u_tasks / "u-settled-rewrite-review.json")
+    after_rewrite = {row["task_id"]: row for row in rows.read_rows(u_state)[0]}
+    assert after_rewrite["u-settled-rewrite-review"]["duration_s"] == 90.0
+    assert after_rewrite["u-settled-rewrite-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None,
+        "unparsed_reason": "bad_format", "unparsed_sample": "dispatcher rewrite sample",
+    }
+    # Changing data_class to private-code clears the sample while retaining bad_format.
+    store.replace({**live_rec, "duration_s": 95, "data_class": "private-code"},
+                  u_tasks / "u-settled-rewrite-review.json")
+    after_private = {row["task_id"]: row for row in rows.read_rows(u_state)[0]}
+    assert after_private["u-settled-rewrite-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None,
+        "unparsed_reason": "bad_format", "unparsed_sample": None,
+    }
+    # Changing result_sha256 refuses carry-over (new reply identity cannot inherit old review evidence).
+    store.replace({**live_rec, "duration_s": 99, "result_sha256": "f" * 64},
+                  u_tasks / "u-settled-rewrite-review.json")
+    after_rehash = {row["task_id"]: row for row in rows.read_rows(u_state)[0]}
+    assert after_rehash["u-settled-rewrite-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None,
+        "unparsed_reason": "missing_result", "unparsed_sample": None,
+    }
+
     stored_u = {row["task_id"]: row for row in rows.read_rows(u_state)[0]}
     assert stored_u["u-legacy-review"]["duration_s"] == 250.0
     assert stored_u["u-legacy-review"]["review"] == {
@@ -227,15 +270,20 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert stored_u["u-tampered-review"]["review"] == {
         "verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None,
     }
-    assert stored_u["u-big-digested-review"]["review"] == {
-        "verdict": "unparsed", "priorities": None, "unparsed_reason": "too_big", "unparsed_sample": None,
+    assert stored_u["u-conflict-sidecar-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None,
     }
+    assert stored_u["u-big-bad-digest-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None,
+    }
+    assert stored_u["u-big-digested-review"]["review"]["unparsed_reason"] == "too_big"
+    assert stored_u["u-big-digested-review"]["review"]["unparsed_sample"].startswith(r"DIGEST-BIG\nXXXX")
 
     u_window = _window(u_state, stats.Landing())
     u_review = _row(u_window, "claude-opus-5-5", "review")
-    assert u_review["verdicts"]["unparsed"] == 11
+    assert u_review["verdicts"]["unparsed"] == 14
     assert u_review["unparsed_reasons"] == {
-        "missing_result": 2, "too_big": 2, "bad_format": 4, "bad_fields": 2, "not_done": 1, "unknown": 0,
+        "missing_result": 5, "too_big": 2, "bad_format": 4, "bad_fields": 2, "not_done": 1, "unknown": 0,
     }
     assert sum(u_review["unparsed_reasons"].values()) == u_review["verdicts"]["unparsed"]
     assert set(u_review["unparsed_samples"]) == {"too_big", "bad_format", "bad_fields"}
@@ -246,11 +294,12 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert "later-effort-reply" not in json.dumps(u_window)
     assert "TAMPERED-PROSE-NEVER-SHOWN" not in json.dumps(u_window)
     assert "WRONG-UNSTAMPED-ARCHIVE" not in json.dumps(u_window)
-    assert "DIGEST-BIG" not in json.dumps(u_window)
+    assert "OTHER-TASK-REPLY-NEVER-SHOWN" not in json.dumps(u_window)
+    assert "BAD-BIG" not in json.dumps(u_window)
     fmt_stored = stored_u["u-fmt-first-review"]["review"]["unparsed_sample"]
     assert fmt_stored.startswith(r"first\n\t\x1b[31m\u202e<script>B")
     assert "TAIL-BEYOND-200" not in fmt_stored and len(fmt_stored) <= rows.MAX_SAMPLE_CHARS
-    assert u_review["unparsed_samples"]["too_big"].startswith(r"BIG\nAAAA")
+    assert u_review["unparsed_samples"]["too_big"].startswith(r"DIGEST-BIG\nXXXX")
     assert len(u_review["unparsed_samples"]["too_big"]) <= rows.MAX_SAMPLE_CHARS
     assert u_review["unparsed_samples"]["bad_fields"] == '{"overall": {"correctness": "maybe"}, "findings": []}'
     page_u = _row(stats.page_window(u_window), "claude-opus-5-5", "review")
@@ -326,7 +375,7 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     batch_state, tasks = _state(tmp_path)
     secrets = ["PROMPT-TEXT-x1", "/home/leaky/worktree", "kk", "ERROR-DETAIL-x2", "EXPLANATION-x3",
                "finding body 0", "/srv/private/model", "../escape", "acct-identity@example.invalid",
-               "PRIVATE-BRIEF-x5", "AFTER-200-DIFF-TEXT-x9"]
+               "PRIVATE-BRIEF-x5", "INVALID-REPO-x6", "UNKNOWN-CLASS-x7", "AFTER-200-DIFF-TEXT-x9"]
     _record(tasks, "leaky", prompt="PROMPT-TEXT-x1", prompt_file="/home/leaky/worktree/prompt.md",
             worktree_path="/home/leaky/worktree", claude_account="kk", error="ERROR-DETAIL-x2",
             research_task_family="../escape", allowance={"pool": "claude:kk", "start": {"remaining_pct": 50},
@@ -338,17 +387,23 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     payload = json.loads(result.read_text())
     payload["overall"]["explanation"] = "EXPLANATION-x3"
     result.write_text(json.dumps(payload))
-    # Private-repo and OPSEC-bearing failing replies keep their reason count while suppressing the sample.
+    # Private-repo, invalid-repo, unknown-data-class, and OPSEC-bearing replies suppress the sample (F1).
     _record(tasks, "unparsed-private-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="infra-private", started_at=_at(4))
+            repo="infra-private", started_at=_at(5))
     (tasks / "unparsed-private-review.result").write_text("PRIVATE-BRIEF-x5 quoted line", encoding="utf-8")
+    _record(tasks, "unparsed-invalid-repo-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="/srv/private/repo", started_at=_at(4.5))
+    (tasks / "unparsed-invalid-repo-review.result").write_text("INVALID-REPO-x6 quoted line", encoding="utf-8")
+    _record(tasks, "unparsed-bad-class-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="public", data_class="public-unadmitted", started_at=_at(4))
+    (tasks / "unparsed-bad-class-review.result").write_text("UNKNOWN-CLASS-x7 quoted line", encoding="utf-8")
     _record(tasks, "unparsed-opsec-review", mode="read-only", agent="claude", model="claude-opus-5-5",
             repo="public", started_at=_at(3))
     (tasks / "unparsed-opsec-review.result").write_text(
         "failed for acct-identity@example.invalid in /home/leaky/worktree", encoding="utf-8",
     )
     _record(tasks, "unparsed-public-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="public", started_at=_at(2))
+            repo="public", data_class="public-code", started_at=_at(2))
     (tasks / "unparsed-public-review.result").write_text(
         "UNPARSED-PREFIX-x4 " + "z" * 220 + "AFTER-200-DIFF-TEXT-x9", encoding="utf-8",
     )
