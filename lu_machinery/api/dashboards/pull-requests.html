@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pull requests — Machinery</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header>
+  <div class="header-top">
+    <div class="title">
+      <h1>Pull requests and merge queue</h1>
+      <p class="purpose">Open pull requests, CI rollups, cross-family review status, and merge queue positions.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  <section class="wide" id="prs">
+    <h2>Pull requests and merge queue <span class="age" id="prs-age">Loading…</span></h2>
+    <p id="prs-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="prs-content">Loading…</div>
+  </section>
+</main>
+<script src="/machinery.js"></script>
+<script>
+"use strict";
+const {
+  escapeHtml, safeHttpUrl, ageSpan, table, td, text, unknown,
+  ciLabel, reviewLabel, prChips, prSnapshotState, createPanelRunner,
+} = Machinery;
+
+function renderPrs(prs, prState = null) {
+  if (prs.status !== "ok") return unknown(prs.reason);
+  const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
+  const unavailable = prState === "unavailable" || allUnknown;
+  const ageUnknown = !unavailable && prState === "unknown";
+  const unbounded = !unavailable && prState === "unbounded";
+  const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);
+  const stateNote = unavailable
+    ? '<p class="warn">All repositories are unavailable; open pull request and merge queue counts are unknown.</p>'
+    : expired
+      ? '<p class="warn">PR snapshot is expired; showing cached observations (CI rollup, review status, and queue positions may be out of date).</p>'
+      : ageUnknown
+        ? '<p class="warn">Snapshot age unknown. CI, review, and queue positions are not confirmed as current.</p>'
+        : unbounded
+          ? '<p class="warn">Freshness unknown. The snapshot age is known, and the freshness bound is not, so CI, review, and queue positions are not confirmed as current.</p>'
+          : "";
+  if (unavailable) {
+    return stateNote + repos.map(repo => {
+      const reason = repo && repo.status !== "ok" ? repo.reason : "snapshot unavailable";
+      return `<h3>${escapeHtml(repo && repo.name || "")}</h3>` + unknown(reason);
+    }).join("");
+  }
+  return stateNote + repos.map(repo => {
+    const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
+    if (repo.status !== "ok") return title + unknown(repo.reason);
+    const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
+    const truncatedNote = typeof repo.open_total !== "number" || !Number.isFinite(repo.open_total)
+      ? `<p class="warn">Total open PR count is unknown; showing ${list.length} returned PR${list.length === 1 ? "" : "s"}.</p>`
+      : repo.open_total > list.length
+        ? `<p class="warn">Showing newest ${list.length} of ${repo.open_total} open PRs; older open PRs are not listed.</p>`
+        : "";
+    const rows = list.map(pr => {
+      const [ci, ciClass] = ciLabel(pr.ci);
+      const [review, reviewClass] = reviewLabel(pr.review);
+      const name = text(pr.draft ? "draft" : "ready for review");
+      const safe = safeHttpUrl(pr.url);
+      return [
+        td(safe ? `<a href="${escapeHtml(safe)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
+        name,
+        text(ci, ciClass),
+        text(review, reviewClass),
+        pr.queue ? text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok")
+          : text(null, "muted"),
+        text(ageSpan(pr.created_at), "num"),
+      ];
+    });
+    return title + truncatedNote + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
+  }).join("");
+}
+
+const PANELS = [
+  {
+    id: "prs",
+    label: "Pull requests",
+    urls: ["/api/git/pull-requests"],
+    withReadings: true,
+    render: (prs, readings, now) => renderPrs(prs, prSnapshotState(readings?.[0], now).status),
+    onData: (_data, latest, readings, now) => { latest.prsStatus = prSnapshotState(readings?.[0], now).status; },
+    onError: latest => { latest.prsStatus = null; },
+    onTick: (panel, latest, updateChips, now) => {
+      if (!panel.ok) return;
+      const reading = panel.readings?.[0];
+      const next = prSnapshotState(reading, now);
+      if (next.status === latest.prsStatus) return;
+      latest.prsStatus = next.status;
+      const box = document.getElementById("prs-content");
+      if (box && reading && reading.data) box.innerHTML = renderPrs(reading.data, next.status);
+      updateChips();
+    },
+  },
+];
+
+const runner = createPanelRunner({
+  panels: PANELS,
+  renderChips: latest => prChips(latest.prs, "#prs", latest.prsStatus).join(""),
+});
+runner.start();
+</script>
+</body>
+</html>

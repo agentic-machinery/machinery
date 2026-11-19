@@ -2102,25 +2102,33 @@ def test_public_projection_does_not_trust_cached_provider_metadata():
     ]
 
 
-# Presentation controls (#9869), run against the shipped machinery home renderer.
+# Presentation controls (#9869), run against the shipped machinery subscriptions renderer.
 def _render_home_usage(subs, budget=None):
     import subprocess
 
     from lu_machinery.common.repo_root import machinery_path
 
-    script = """
+    script = r"""
     const fs = require('fs');
-    const html = fs.readFileSync(process.argv[1], 'utf8');
-    const start = html.indexOf('function escapeHtml');
-    const end = html.indexOf('const OPTIONAL = new Set(');
-    if (start < 0 || end < 0) throw new Error('home render helpers not found');
+    globalThis.Machinery = require(process.argv[1]);
+    const html = fs.readFileSync(process.argv[2], 'utf8');
+    const marker = '<script src="/machinery.js"></script>';
+    const after = html.slice(html.indexOf(marker) + marker.length);
+    const body = after.slice(after.indexOf('<script>') + '<script>'.length, after.indexOf('const PANELS = ['));
+    if (!body.includes('function renderUsage')) throw new Error('subscriptions render helpers not found');
     Date.now = () => Date.parse('2030-01-01T12:00:00Z');
-    eval(html.slice(start, end));
+    const renderUsage = new Function('Machinery', body + '\nreturn renderUsage;')(globalThis.Machinery);
     const input = JSON.parse(fs.readFileSync(0, 'utf8'));
     console.log(renderUsage(input.subs, input.budget));
     """
     result = subprocess.run(
-        ['node', '-e', script, str(machinery_path('api/dashboards/index.html'))],
+        [
+            'node',
+            '-e',
+            script,
+            str(machinery_path('api/dashboards/machinery.js')),
+            str(machinery_path('api/dashboards/subscriptions.html')),
+        ],
         input=json.dumps({'subs': subs, 'budget': budget}), capture_output=True,
         text=True, check=True, timeout=30,
     )

@@ -100,10 +100,16 @@ def test_milestone_percent_and_private_counts_only(tmp_path, monkeypatch):
     assert len(calls) == 6
     assert all(etag == '"fixture"' for _, etag in calls[3:])
 
-    page = Path(milestones.__file__).with_name("dashboards").joinpath("index.html").read_text()
-    script = page.split("<script>", 1)[1].split("</script>", 1)[0].rsplit("refreshAll();", 1)[0]
+    dashboards = Path(milestones.__file__).with_name("dashboards")
+    page = dashboards.joinpath("milestones.html").read_text()
+    marker = '<script src="/machinery.js"></script>'
+    after = page.split(marker, 1)[1]
+    script = after.split("<script>", 1)[1].split("const PANELS = [", 1)[0]
     rendered = subprocess.run(
-        ["node", "-e", 'global.document = {querySelectorAll: () => []};\n' + script
+        ["node", "-e",
+         'global.document = {querySelectorAll: () => []};\n'
+         f'global.Machinery = require({json.dumps(str(dashboards / "machinery.js"))});\n'
+         + script
          + '\nprocess.stdout.write(renderMilestones(' + json.dumps(data) + '));'],
         capture_output=True, text=True, check=True, timeout=10,
     ).stdout

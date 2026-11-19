@@ -335,7 +335,8 @@ this change. False positives remain for the repository owner to adjudicate.
 Rows #27 to #33 trace the Python and Actions analyses on main commit
 `af630e462c5b9d2d4b7d916ebb4550cc0b46a30c` (2026-11-18) and their locations at
 that commit.
-Row #41 traces the Python analysis on main commit `4ab0a78b` (2026-11-19).
+Row #41 traces Python analysis `2209383055` on main commit
+`e3f9a8b271959791e079316188adb734f1bb6295` (2026-11-19).
 
 | Alert | Rule | Reviewed location | Disposition and data-flow evidence |
 | --- | --- | --- | --- |
@@ -370,7 +371,7 @@ Row #41 traces the Python analysis on main commit `4ab0a78b` (2026-11-19).
 | 31 | `py/command-line-injection` | `lu_machinery/common/github_client.py:3569` | Fixed at the source in #767, as #29. This sink is `_run_command`'s pass-through for a non-`gh` argv list. |
 | 32 | `py/command-line-injection` | `lu_machinery/common/github_client.py:3581` | Fixed at the source in #767, as #29. This sink is `_run_command`'s pass-through for `gh --version`. |
 | 33 | `py/polynomial-redos` | `lu_machinery/common/github_client.py:1717` | Fixed in #767. The source of #29 reached `_canonical_endpoint`'s scheme pattern. `re.match` tries only position 0, so the run was already linear (one million `A` characters take 2 ms; the same pattern unanchored is quadratic), but the analysis treated the pattern as unanchored. The pattern now begins with `^`, and the source no longer reaches it. |
-| 41 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:336` | False positive. The same flow as #3 at a newer line. The SARIF source is `trusted_core_context()` in `tests/agent_runtime/test_attempt_network.py:403`; CodeQL's sensitive-name heuristic classifies "trusted" as secret. The helper returns public rules Markdown with source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`). The test appends fixture text and passes it to `store.create()` (`test_attempt_network.py:404-415`), which writes it at `store.py:335-336` into an exclusive `0600` prompt file. In production the prompt bytes come only from the caller's argument, stdin or selected file (`dispatcher/cli.py:378-386,733`, then `worker.py:535-547`, then `store.py:322-336`). Provider keys reach only child environments (`dispatcher/environment.py:37-45,86-111`; `worker.py:555-570`). For Savant, `LU_SUBQ_API_KEY_FILE` supplies a path, preflight discards the value, and OpenCode places the key only in the child environment (`providers/opencode.py:116-170,210-274,357-365`). No credential value reaches this write. This conclusion applies to the reported trace, not to arbitrary future prompt contents. |
+| 41 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:339` | False positive. All three SARIF flows start at `trusted_core_context()` in `tests/agent_runtime/test_attempt_network.py:403`. The helper returns public rules Markdown and provenance that contains repository-relative source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`). The test appends fixture text and passes the rendered prompt to `store.create()` (`test_attempt_network.py:404-415`). The prompt enters at `store.py:325` and is written to an exclusive `0600` file at `store.py:338-339`. The reported flows contain public rules, provenance and fixture text. |
 
 ### Queue-ref instances still block dismissal
 
