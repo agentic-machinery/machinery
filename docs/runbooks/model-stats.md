@@ -68,15 +68,18 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   `[since, until)`; `all` starts at the first row. One refresh computes all five windows and the weekly buckets;
   `/metrics` omits `24h`.
 - **Model**: the concrete model id: the model the runtime observed from the provider when it attested one
-  (`resolved_model_known: true`), else the requested model's catalog id (`grok-4.7-high` is `grok-4.7`,
-  `claude-opus-5-5[1m]` is `claude-opus-5-5`). Known Cursor display names map via `canonical_cursor_model`
-  (`Grok 4.7 256K High` is `grok-4.7`, `Composer 2.5` is `composer-2.5`); harness prefixes or catalog ids with one
-  slash are preserved or resolved (`deepseek-direct/deepseek-v4-flash` is `deepseek-v4-flash`,
-  `kimi-code/k3-256k` stays `kimi-code/k3-256k`). When `resolved_model_known` is true, `concrete_model` never falls
-  back to the requested model: an unrecognized spelling that fits the model-label grammar (at most one slash, no
-  spaces or `..`, e.g. `claude-opus-5-6` or AGY's `unrecognized`) stays as recorded and takes its `identity`
-  from the identity list below, while an empty or
-  grammar-rejected spelling (e.g. an unmapped display name with spaces like `Grok 4.7 256K High Fast`) becomes
+  (`resolved_model_known: true`), else the requested model (`resolved_model_known` false or absent). Before
+  stored-label validation, `model_id` trims whitespace, strips any `[...]` context suffix (`claude-opus-5-5[1m]` is
+  `claude-opus-5-5`, `claude-opus-5-6[1m]` is `claude-opus-5-6`), maps known Cursor display names via
+  `canonical_cursor_model` (`Grok 4.7 256K High` is `grok-4.7`, `Composer 2.5` is `composer-2.5`), and tries
+  catalog lookup across the spelling and each `:` or `/` suffix (`grok-4.7-high` is `grok-4.7`,
+  `deepseek-direct/deepseek-v4-flash` is `deepseek-v4-flash`, `openrouter/deepseek/deepseek-v4.1-flash` is
+  `deepseek-v4.1-flash`, `kimi-code/k3-256k` stays `kimi-code/k3-256k`). Validation then checks the resulting label
+  against the stored-label grammar (at most one slash, no spaces or `..`): when `resolved_model_known` is true,
+  `concrete_model` never falls back to the requested model, so an unmatched spelling that fits that grammar (e.g.
+  `claude-opus-5-6` or AGY's `unrecognized`) stays as that normalized label and takes its `identity` from the
+  identity list below, while an empty spelling or one still rejected after normalization and catalog lookup (e.g. an
+  unmapped display name with spaces like `Grok 4.7 256K High Fast`, or an uncatalogued two-slash string) becomes
   `unknown`.
   Rows store a bare harness alias with no observed model (`opus`, `sonnet`, `haiku`, `fable`) as recorded. The
   statistics count it as the catalog id it ran only where that is unambiguous: the dispatcher resolves the alias
@@ -140,8 +143,10 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
   request of at most 2 s with no readiness wait, so it never delays a launch or a settlement; `agy_claude` records
   its weekly window, not the stricter five-hour one admission uses. Only tasks with both readings join allowance
-  aggregation. Overlapping write tasks on one pool are grouped into a cluster charged that pool's net drop once
-  (`earliest.start_pct - latest.finish_pct`). A cluster stays unknown (`null`, never `0`) when a later reading is
+  aggregation. Within each window separately, overlapping write tasks on one pool among that window's selected rows
+  with valid readings are grouped into a cluster charged that pool's net drop once
+  (`earliest.start_pct - latest.finish_pct`), so an overlapping task outside the window does not split a cluster
+  inside it. A cluster stays unknown (`null`, never `0`) when a later reading is
   above an earlier one (a reset anywhere in the cluster, including a task's own finish above its start or a rise
   between tasks), when two readings share a timestamp and disagree, or when net drop is negative. Clusters are not
   split across subgroups: any reporting group (model, effort, class, or pool/model/effort row) uses the cluster's
@@ -247,10 +252,11 @@ dropped the trailer.
 These numbers describe our routing, not the models alone. Harder and security work is routed to Opus and Sol,
 so their per-task wall time and rounds are inflated. Author and reviewer families are paired by policy, so a
 reviewer's blocking rate partly measures the authors it is paired with; read the first-round matrix, not one
-author figure, before blaming either side. Allowance readings are pool-wide:
-overlapping write tasks on one pool are grouped and charged the pool's net drop once, while a cluster with a reset,
-tied-timestamp conflict, or negative net drop stays unknown (`null`) and any subgroup that only partly owns a shared
-cluster reports `null`; the meter's resolution is one reading per probe. Landing depends on the
+author figure, before blaming either side. Allowance readings are pool-wide: within each window separately,
+overlapping write tasks on one pool among that window's selected rows with valid readings are grouped and charged
+the pool's net drop once, while a cluster with a reset, tied-timestamp conflict, or negative net drop stays unknown
+(`null`) and any subgroup that only partly owns a shared cluster in that window reports `null`; the meter's
+resolution is one reading per probe. Landing depends on the
 trailer surviving the merge or on the task observing its own merge; work merged later by another seat, through
 a squash merge that drops `X-Agent` lines, is counted as not landed. Treat a comparison as a question for the
 CTO, not a routing verdict; routing changes stay a catalog decision.
