@@ -116,9 +116,9 @@ def test_bound_attempt_cannot_spend_an_exhausted_branch_pr_budget(attempt, tmp_p
     # Since machinery #892 the refused budget dispatch leaves one typed never-started record; earlier records stay.
     after = {path.name: path.read_bytes() for path in tasks.iterdir()}
     assert {name: after[name] for name in before} == before
-    added = [json.loads(after[name]) for name in after.keys() - before.keys() if name.endswith(".json")]
-    assert [(record["status"], record["never_started_reason"], record["pid"]) for record in added] == [
-        ("failed", "review_setup_refusal", None)]
+    [refusal] = [json.loads(after[name]) for name in after.keys() - before.keys() if name.endswith(".json")]
+    assert after.keys() - before.keys() == {f"{refusal['task_id']}.json", f"{refusal['task_id']}.json.lock"}
+    assert (refusal["status"], refusal["never_started_reason"], refusal["pid"]) == ("failed", "review_setup_refusal", None)
 
     budget.reset_mock()
     assert invoke(attempt, "--pinned-head", "a" * 40, "--review-profile", "infra") == 0
@@ -266,6 +266,13 @@ def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
     (prompts / "lexical-review.md.j2").write_text("Review {{ items }}\n")
     monkeypatch.setattr(review_mcp, "review_server_checkout", lambda: checkout)
 
+    # Fixture setup and admission's own Git calls read no developer or system Git configuration.
+    (tmp_path / "gitconfig").write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_CONFIG_PARAMETERS"):
+        monkeypatch.delenv(name, raising=False)
+
     # The dispatch commit: one public candidate file the manifest pins.
     inputs = (tmp_path / "inputs").resolve()
     inputs.mkdir()
@@ -314,6 +321,11 @@ def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
     assert attempt_boundary.authorized_closure(manifest, inputs) == {"candidates.txt": candidate}
     with pytest.raises(ValueError, match="review_render_record_stale"):
         review_attempt.admit(args, (prompt + "altered").encode(), binding, inputs, sha)
+    # The file and the supplied bytes agree; only the render record names other bytes.
+    prompt_file.write_text(prompt + "altered", encoding="utf-8")
+    with pytest.raises(ValueError, match="review_render_record_stale"):
+        review_attempt.admit(args, (prompt + "altered").encode(), binding, inputs, sha)
+    prompt_file.write_text(prompt, encoding="utf-8")
     with pytest.raises(ValueError, match="review_render_record_attempt_mismatch"):
         review_attempt.admit(args, prompt.encode(), dict(binding, attempt_id="other"), inputs, sha)
     for name, invalid in (("review_profile", "code"), ("review_author_model", None), ("effort", "low"),
