@@ -162,8 +162,9 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   a PR through an exact head match in the same repository. The time per landed PR divides time across PR-linked
   reviews by linked PRs with recorded merges. Quota uses valid readings and counts landed PRs once per pool.
   Levels with fewer than 10 parsed verdicts show “not enough data yet.”
-- **Author figures**: per PR reviewed in the window, only parsed reviews of record count; an unparsed reply is no
-  round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
+- **Author figures**: per PR whose first review of record finished in the window (else started), only parsed
+  reviews of record count, read from the PR's whole history so a window that starts mid-PR never takes a later
+  round for the first; an unparsed reply is no round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
   review; the first round is the earliest review of the earliest head. "Approved eventually" means any parsed
   review approved. They split by author model only: a review records its author's model but not the author's
   effort. A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
@@ -254,24 +255,31 @@ Approval rate and findings per review say how strict a reviewer is, not whether 
 adds two measures.
 
 **Finding precision** (`reviewer_accuracy.findings`). For each blocking review of record (parsed verdict
-`incorrect`), each P0-P1 finding waits for the same reviewer's first later approval of that PR:
+`incorrect`), each P0-P1 finding waits for the same reviewer's first approval of that PR at another head that
+finished after the blocking review finished:
 
 - `fixed`: the approved head differs from the blocked head in the finding's file (the author changed it);
-- `dismissed`: the reviewer approved with that file unchanged, on the same head or on a new head that left the file
-  alone (it accepted the author's answer);
-- `open`: that reviewer has not approved the PR yet (another reviewer's approval does not settle its finding);
+- `dismissed`: the approved head left that file unchanged (the reviewer accepted the author's answer);
+- `open`: no such approval yet. Another reviewer's approval does not settle the finding, and neither does an
+  approval of the blocked head itself: the verdict recorder refuses an APPROVE at a head with a recorded rejection
+  (`require_no_same_head_rejection`), so that reply is never a verdict of record;
 - `unknown`: the row keeps no finding paths (a reply in the older unversioned format, or a row not yet
-  backfilled), or a head is not a commit in the repository's local checkout.
+  backfilled), or a head is missing from the row or from the repository's local checkout.
+
+Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. The summary
+rows do not record whether a verdict was published (that lives only in the PR's `cf-verdict` comment, which the
+Monitor does not read), so a settled reply whose verdict was never recorded still counts, as it does in every
+author figure.
 
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one
-`git diff-tree --stdin` per repository over every (blocked head, approved head) pair, from local objects only
+`git diff-tree --stdin --raw` per repository over every (blocked head, approved head) pair, from local objects only
 (`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the pairs and how many were read. Measured on
 2026-11-19 on a backfilled copy of the store (29,274 rows, 625 pairs, host load 10): the read took 0.7 s and the
 whole collect 13.3 s against 11.9 s before.
 
 Why the file, not the head: over the 30 days to 2026-11-19, of the blocked reviews of record a later review
-approved, 2 of 942 were approved on the same head. Authors almost always push a new head while answering, so
+approved, 2 of 942 were approved on the same head (the recorder refuses such an approval). Authors push a new head while answering, so
 "approved on a new head" cannot separate a fix from an accepted rebuttal. The file test can, within limits:
 
 - a file the author changed for another reason (another finding in the same file, a merge of `main`) counts the

@@ -198,10 +198,11 @@ def scan_touched(primary_root: Path, pairs: Iterable[_HeadPair]) -> dict[_HeadPa
             if not ordered:
                 continue
             # "<approved> <blocked>" diffs the approved commit against the blocked one; --always prints the
-            # approved head even when no file changed, so every pair has exactly one block of output.
+            # approved head even when no file changed, so every pair has exactly one block of output. --raw puts a
+            # ":<modes> <objects> <status>" record before every path, so a path can never pass for a header.
             diff = subprocess.run(
-                ["git", "-C", str(checkout), "diff-tree", "--stdin", "--always", "-r", "--name-only",
-                 "--no-renames", "-z"],
+                ["git", "-C", str(checkout), "diff-tree", "--stdin", "--always", "-r", "--raw", "--no-renames",
+                 "-z"],
                 input=b"".join(f"{approved} {blocked}\n".encode() for blocked, approved in ordered),
                 capture_output=True, timeout=GIT_TIMEOUT_SECONDS, env=env, check=False)
         except (FleetRepoError, OSError, subprocess.SubprocessError):
@@ -215,17 +216,30 @@ def scan_touched(primary_root: Path, pairs: Iterable[_HeadPair]) -> dict[_HeadPa
     return touched
 
 
+# One ``diff-tree --raw`` record without renames: old and new mode, old and new object, one status letter.
+_RAW_RECORD = re.compile(rb":[0-7]{6} [0-7]{6} [0-9a-f]{40,64} [0-9a-f]{40,64} [ADMTUX]\Z")
+
+
 def _diff_blocks(output: bytes, headers: list[str]) -> list[list[str]] | None:
-    """Split ``diff-tree --stdin -z`` output into one file list per expected header, or None when it does not fit."""
+    """Split ``diff-tree --stdin --raw -z`` output into one path list per expected header, in order.
+
+    The output is ``<header> NUL`` then ``<record> NUL <path> NUL`` per changed file, for each pair. A token where
+    a record or the next header belongs that is neither, or any count that does not match, gives None.
+    """
+    tokens = output.split(b"\0")
+    if tokens[-1] != b"":
+        return None
+    tokens.pop()
     blocks: list[list[str]] = []
-    for token in output.split(b"\0"):
-        if not token:
-            continue
-        text = token.decode("utf-8", "surrogateescape")
-        if len(blocks) < len(headers) and text == headers[len(blocks)]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if _RAW_RECORD.fullmatch(token) and blocks and index + 1 < len(tokens):
+            blocks[-1].append(tokens[index + 1].decode("utf-8", "surrogateescape"))
+            index += 2
+        elif len(blocks) < len(headers) and token == headers[len(blocks)].encode():
             blocks.append([])
-        elif blocks:
-            blocks[-1].append(text)
+            index += 1
         else:
             return None
     return blocks if len(blocks) == len(headers) else None
@@ -603,7 +617,8 @@ def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
                            else "not_approved")
         outcomes.append({
             "author": "+".join(sorted(entry["authors"])), "rounds": len(heads), "first": verdict,
-            "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "after_block": after_block,
+            "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "first_at": first_moment,
+            "after_block": after_block,
             "approved": any(r[2] == "correct" for h in heads for r in h),
             # Findings of each round: the head's first review.
             "blocking": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in BLOCKING),
@@ -675,28 +690,34 @@ PLANTED_DEFECT_RECALL = {
 
 
 def _blocking_reviews(rows: Iterable[_Row]) -> Iterator[tuple[_Row, list[_Row], list[str] | None, int | None]]:
-    """Each parsed blocking review of record, the same PR's later parsed reviews of record (in review order), the
-    path digests of its P0-P1 findings (None when the row has none) and its P0-P1 count (None when unknown)."""
+    """Each parsed blocking review of record, the same PR's parsed reviews of record that finished after it (in
+    finish order), the path digests of its P0-P1 findings (None when the row has none) and its P0-P1 count (None
+    when unknown). A review counts by its finish (``moment``): a review that started later can finish first."""
     prs: dict[tuple[str, str], list[_Row]] = defaultdict(list)
     for row in rows:
         if row.review is not None and row.review[0] != "unparsed" and row.author is not None:
             prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))].append(row)
-    never = datetime.max.replace(tzinfo=UTC)
     for reviews in prs.values():
-        reviews.sort(key=lambda r: (r.started or never, r.task_id))
-        for index, row in enumerate(reviews):
+        reviews.sort(key=lambda r: (r.moment, r.task_id))
+        for row in reviews:
             verdict, priorities, _, _ = cast(tuple[str, Counter[str] | None, str | None, str | None], row.review)
             if verdict != "incorrect":
                 continue
             stored = row.raw["review"].get("blocking_paths") if isinstance(row.raw.get("review"), Mapping) else None
             count = None if priorities is None else sum(priorities[p] for p in BLOCKING)
-            yield row, reviews[index + 1:], stored if isinstance(stored, list) else None, count
+            later = [other for other in reviews if other.moment > row.moment]
+            yield row, later, stored if isinstance(stored, list) else None, count
 
 
 def _resolution(row: _Row, later: list[_Row]) -> _Row | None:
-    """The same reviewer's first later approval of the PR: the reviewer's own word that its findings are settled."""
+    """The same reviewer's first later approval of the PR at another head: the reviewer's own word that its findings
+    are settled. An approval of the blocked head itself never settles them: the verdict recorder refuses an APPROVE
+    at a head with a recorded rejection (``record_cf_verdict.require_no_same_head_rejection``), so such a reply is
+    never a verdict of record."""
+    blocked = row.raw.get("pinned_head")
     return next((other for other in later if other.model == row.model and other.review is not None
-                 and other.review[0] == "correct"), None)
+                 and other.review[0] == "correct"
+                 and (blocked is None or other.raw.get("pinned_head") != blocked)), None)
 
 
 def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
@@ -706,22 +727,24 @@ def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
         approval = _resolution(row, later)
         blocked = row.raw.get("pinned_head")
         approved = approval.raw.get("pinned_head") if approval else None
-        if isinstance(blocked, str) and isinstance(approved, str) and blocked != approved:
+        if isinstance(blocked, str) and isinstance(approved, str):
             pairs.add((str(row.raw.get("repo") or "public"), blocked, approved))
     return pairs
 
 
-def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozenset[str]]) -> list[dict[str, Any]]:
+def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozenset[str]],
+                      name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Per reviewer model: what became of each P0-P1 finding of its blocking reviews of record.
 
-    The outcome waits for the same reviewer's later approval of the PR. ``fixed``: the author's later head changed
-    the finding's file. ``dismissed``: the reviewer approved without that file changing (the same head, or a new head
-    that left the file alone). ``open``: no approval by that reviewer yet. ``unknown``: the row keeps no finding
-    paths, or a head is not in the local checkout. Precision is fixed over fixed plus dismissed.
+    The outcome waits for the same reviewer's later approval of the PR at another head. ``fixed``: that head changed
+    the finding's file. ``dismissed``: it left the file unchanged. ``open``: no such approval yet. ``unknown``: the
+    row keeps no finding paths, or a head is missing from the row or the local checkout. Precision is fixed over
+    fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
+    only when the counts are grouped, so one reviewer's approval never settles another's finding.
     """
     counts: dict[str, Counter[str]] = defaultdict(Counter)
     for row, later, paths, count in _blocking_reviews(rows):
-        tally = counts[row.model]
+        tally = counts[name(row.model)]
         tally["reviews"] += 1
         if paths is None:
             tally["unknown"] += count or 0
@@ -732,8 +755,6 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         approved = approval.raw.get("pinned_head") if approval else None
         if approval is None:
             tally["open"] += len(paths)
-        elif blocked is not None and blocked == approved:
-            tally["dismissed"] += len(paths)
         elif (changed := touched.get((str(row.raw.get("repo") or "public"), str(blocked), str(approved)))) is None:
             tally["unknown"] += len(paths)
         else:
@@ -745,8 +766,8 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         out.append({
             "model": model, "identity": identity(model), "blocking_reviews": tally["reviews"],
             "reviews_without_paths": tally["reviews_without_paths"],
-            "blocking_findings": sum(tally[name] for name in FINDING_OUTCOMES),
-            **{name: tally[name] for name in FINDING_OUTCOMES},
+            "blocking_findings": sum(tally[outcome] for outcome in FINDING_OUTCOMES),
+            **{outcome: tally[outcome] for outcome in FINDING_OUTCOMES},
             "precision": _rate(tally["fixed"], decided), "precision_ci": _wilson(tally["fixed"], decided),
         })
     return out
@@ -1288,8 +1309,11 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
 
 def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
               prs: list[dict[str, Any]] | None = None, *, history: list[_Row] | None = None,
-              touched: Mapping[_HeadPair, frozenset[str]] | None = None) -> dict[str, Any]:
-    """Every figure of one window's rows. ``touched`` is ``scan_touched`` over these rows' head pairs."""
+              touched: Mapping[_HeadPair, frozenset[str]] | None = None,
+              accuracy_rows: list[_Row] | None = None, reviewer_name: Callable[[str], str] = str) -> dict[str, Any]:
+    """Every figure of one window's rows. ``touched`` is ``scan_touched`` over these rows' head pairs. Reviewer
+    accuracy settles findings on ``accuracy_rows`` (default: these rows), whose reviewer ids must be the recorded
+    ones, and groups them under ``reviewer_name``."""
     selected = list(rows)
     fine = _fine(selected) if fine is None else fine
     prs = _prs(selected) if prs is None else prs
@@ -1298,7 +1322,8 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
     used = {model for model, *_ in fine}
     return {
         "models": models, "authors": _authors(prs), "first_round_matrix": _matrix(prs),
-        "reviewer_accuracy": {"findings": _finding_outcomes(selected, touched or {}),
+        "reviewer_accuracy": {"findings": _finding_outcomes(selected if accuracy_rows is None else accuracy_rows,
+                                                            touched or {}, reviewer_name),
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "charts": _charts(models, prs, selected), "records": len(selected),
@@ -1438,6 +1463,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs)
+    all_prs = _prs(rows)
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
     page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
                          task_class=_page_class(row.task_class)) for row in rows]
@@ -1445,7 +1471,9 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         selected = [row for row in rows if since <= row.moment]
-        fine, prs = _fine(selected), _prs(selected)
+        # A PR belongs to the window of its first review of record, and its rounds come from all of its history, so
+        # a window that starts mid-PR never takes a later round for the first one.
+        fine, prs = _fine(selected), [pr for pr in all_prs if since <= pr["first_at"]]
         window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                   "cohort": "finished_at, else started_at, in [since, until)"}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched)}
@@ -1455,7 +1483,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         page_selected = [row for row in page_rows if since <= row.moment]
         page_windows[name] = {
             "window": window,
-            **page_window(summarize(page_selected, prs=page_prs, history=page_rows, touched=touched)),
+            **page_window(summarize(page_selected, prs=page_prs, history=page_rows, touched=touched,
+                                    accuracy_rows=selected, reviewer_name=_page_model)),
         }
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         # 24h stays off this label set.
