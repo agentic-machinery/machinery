@@ -30,6 +30,37 @@ CENSUS = (
 )
 
 
+@pytest.fixture(autouse=True)
+def git_commands_name_their_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the repository-selection names this file's Git commands and CI subprocesses read.
+
+    ``_git`` names its repository with ``--git-dir`` and ``--work-tree``. The product CI modules
+    under test call Git with the environment ``_run`` copies, so a caller's ``GIT_DIR`` or object
+    directory would select another repository.
+    """
+    from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
+
+    for name in (
+        *GIT_REDIRECT_ENV_KEYS,
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # Home and system Git config are also inputs. Point both at an empty file so a
+    # caller's core.worktree cannot select a repository after the names above are gone.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in list(os.environ):
+        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture(scope="module")
 def installed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     scratch = tmp_path_factory.mktemp("product-ci-wheel")
@@ -38,8 +69,10 @@ def installed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
 
 
 def _git(root: Path, *args: str) -> str:
+    """Run Git in the fixture repository at ``root``, named explicitly so no inherited setting can choose another."""
     return subprocess.check_output(
-        ["git", *args], cwd=root, text=True, stderr=subprocess.STDOUT, timeout=30
+        ["git", f"--git-dir={root / '.git'}", f"--work-tree={root}", *args],
+        cwd=root, text=True, stderr=subprocess.STDOUT, timeout=30,
     ).strip()
 
 
