@@ -285,46 +285,38 @@ responses. `lu_machinery/api/opsec_sanitize.py` replaces each
 `BOUNDED_FILESYSTEM_ROOTS`: `/home`, `/Users`, `/Volumes`, `/private`, `/opt`,
 `/srv`, `/tmp` and `/var`.
 
-**Span contract.** A finding starts at the bounded root, or at the scheme of a
-file URI whose first path segment is a bounded root. It ends where its
-whitespace-, quote- or angle-bracket-delimited run ends, less trailing prose
-punctuation and backticks. Over-redaction of a glued neighbour is accepted;
-leaving path bytes behind is not.
+**Span contract.** A finding starts at the bounded root, the scheme of a file
+URI whose first path segment is a bounded root, or the raw start of a sensitive
+encoded component. It ends where its whitespace-, quote- or angle-bracket-
+delimited run ends, less trailing prose punctuation and backticks. The span
+covers the path and may also cover a glued neighbour.
 
-**Detection contract (fail closed).**
+The scanner reads Markdown link destinations and inline code as separate
+parts. It splits URI authorities, paths, queries and fragments before testing
+path components against the bounded roots. URI components follow [RFC 3986].
+The scanner reads query separators before percent-decoding a value once. If
+the decoded value contains a host path, the finding starts at the original
+encoded value so the sanitizer can remove it.
 
-- Bare rule: a bounded root after anything but a letter, digit or `/`, and
-  before anything but a name character, is flagged (`/tmp.backup` counts).
-- File URIs: a `file:` scheme not preceded by a letter or digit, with any
-  authority, is flagged whole when its first path segment passes the bare
-  rule's boundary.
-- Exemptions: a bare hash route (`#/home`) and an absolute `/api` route's path
-  component (`/api/x/{id}/home/view`) up to its first `.` or `..` segment.
-  An `/api` query or fragment, a SHA, a timestamp or a duration never exempts
-  a path.
+- An absolute path and the first path segment of a file URI use the bare root
+  boundary. A dot after a root still counts, as in `/tmp.backup`. A file URI
+  may contain an authority, an empty authority or extra slashes.
+- A valid non-file URI authority is outside the path. A root-shaped host or
+  an ordinary remote path can appear in a URL-valued parameter. A malformed
+  authority keeps the conservative local path checks.
+- Dot-relative paths use whole root segments. `../home/x` counts.
+  `../home.md`, `./docs/x` and `../guide.md` stay clear. An absolute path
+  uses whole segments after a `.` or `..` segment as well.
+- A bare hash route such as `#/home` is exempt. An absolute `/api` route
+  exempts its path up to its first dot segment. Query and fragment values
+  are scanned independently. An ordinary repository-relative query value
+  such as `examples/home/page` stays clear. The scanner still flags bounded
+  root segments inside absolute query values and `/api` fragment paths.
 
-**Relative paths (designated amendment, 2026-11-19).** A path token is a run
-of name characters and slashes. A token with a `.` or `..` segment followed by
-`/` is judged segment by segment: a relative one (a dot-relative path:
-`./home/x`, `../home/x`, `docs/../home/x`) from its start, an absolute one
-(`/api/..//home/x`) from that segment on. There, and in the query or fragment
-of an `/api` route (`/api?`, `/api#`, `/api/x?`), every whole bounded-root
-segment is flagged, whatever precedes it, repeated slashes included, and with
-no route exemption: `../api/../home/x`, `../api/home/x`,
-`/api/x?next=../home/x`, `/api?next=/api/y/{id}/home/view`. A whole segment is
-the root name after `/` that no name character continues; a run of dots
-followed by a name character also continues it. Over-flagging there is
-accepted: `./docs/home/x`, `/api/../docs/home/x`, a URL authority named like a
-root inside an `/api` query value, and a glued neighbour in the same run.
-Ordinary relative paths are not flagged: `./docs/x`, `../guide.md`,
-`../api/v1/x`, a longer name that starts with a root name (`../home.md`,
-`./tmp.log`, `../home+page/x`, `../home..md`) and a value that starts with a
-root name (`?path=home/x`). Finer parsing (URI components, decoded query
-values, Markdown destinations) is machinery #922.
+The scanner and sanitizer tests in `tests/api/opsec_sweep/` cover the #920
+corpus, the #924 regressions, and the parser's URI and Markdown boundaries.
 
-`tests/api/opsec_sweep/test_opsec_scan.py` holds the synthetic positive and
-negative cases. `tests/api/opsec_sweep/test_opsec_sanitize.py` proves that each
-relative finding is redacted whole.
+[RFC 3986]: https://www.rfc-editor.org/rfc/rfc3986.html
 
 ## CodeQL baseline alert triage
 

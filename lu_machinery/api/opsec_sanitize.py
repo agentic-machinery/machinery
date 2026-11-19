@@ -29,8 +29,8 @@ _UNCHANGED = object()
 
 def sanitize_text(text: str) -> str:
     """Replace leaked absolute filesystem-root tokens in one string."""
-    # The scanner builds its filesystem pattern from these literal roots.
-    if not any(root in text for root in BOUNDED_FILESYSTEM_ROOTS):
+    # A URI component can percent-encode the slash or any letter in a root.
+    if "%" not in text and not any(root in text for root in BOUNDED_FILESYSTEM_ROOTS):
         return text
     findings = [finding for finding in scan_text(text) if finding.kind == "filesystem-root"]
     if not findings:
@@ -39,7 +39,7 @@ def sanitize_text(text: str) -> str:
     # times.  Selected findings are disjoint; an overlap would be covered whole.
     parts: list[str] = []
     position = 0
-    for finding in sorted(findings, key=lambda item: item.start):
+    for finding in findings:
         if finding.start >= position:
             parts.append(text[position : finding.start])
             parts.append(REDACTED_ABSOLUTE_PATH)

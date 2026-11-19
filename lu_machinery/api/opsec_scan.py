@@ -11,12 +11,12 @@ failure output.
 from __future__ import annotations
 
 import bisect
-import heapq
 import ipaddress
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import unquote
 
 DEFAULT_OPERATION = "<unknown>"
 BOUNDED_FILESYSTEM_ROOTS = (
@@ -71,55 +71,30 @@ _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{
 # bytes behind.
 _PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
 _PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
-# A root is a bounded root name followed by anything but a name character, so
-# "/home.old" counts as under /home (fail closed) while "/homes" does not.
-_ROOT_NAMES = "|".join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)
-_ROOT = rf"(?P<root>{_ROOT_NAMES})(?![A-Za-z0-9_-])"
-# A bare root must not follow a slash, so URL authorities such as
-# "https://tmp.example.org" stay unflagged.  The pattern matches the root only:
-# the span comes from the path run, and an exempt root never consumes a later
-# root in the same run.
-_FILESYSTEM_PATH_RE = re.compile(rf"(?<![A-Za-z0-9/])/{_ROOT}")
-# A file URI carries its path after the scheme's slashes and optional
-# authority ("file:///home/...", "file://host/home/...", "file:////home/...",
-# "file:/home/..."), which the bare rule above cannot see.  "//" after the
-# scheme always opens an authority (RFC 8089); the authority excludes "/" and
-# backticks, so neither a host such as "home.example" nor a following inline
-# code span is re-read as a path.  Only a letter or digit before "file:" makes
-# it another scheme's suffix ("profile:"); punctuation ("...file:", a diff's
-# "+file:") does not.  Each scheme start is found on its own, so a rejected URI
-# never hides a later one, and its first path segment is judged with the bare
-# rule's root boundary.
-_FILE_SCHEME_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):")
-_FILE_URI_HEAD_RE = re.compile(r"(?://[^/?#\s\"'<>`]*|(?!//))(?P<path>/+)")
-_FILE_URI_ROOT_RE = re.compile(_ROOT)
-# Relative paths (designated amendment, 2026-11-19; fail closed).  A path
-# token is a run of name characters and slashes; it is relative unless it
-# starts with "/".  A token with a "." or ".." segment followed by "/" is
-# judged segment by segment: a relative one ("./home/x", "docs/../home/x", a
-# dot-relative path) from its start, an absolute one ("/api/..//home/x") from
-# that segment on.  There, and in an /api route's query or fragment ("/api?",
-# "/api#", "/api/x?"), every whole bounded-root segment is flagged whatever
-# precedes it, repeated slashes included ("../api/home/x",
-# "?next=/api/x/{id}/home/v"), and no route exemption applies: an /api path
-# component exempts roots only before its first dot segment.  A whole segment
-# is a root name after "/" that no name character continues, where a run of
-# dots before a name character also continues it: "../home.md", "./tmp.log",
-# "../homeX", "../home+page" and "../home..md" are ordinary relative paths.
-# A value that starts with a root name ("?path=home/x") names no root, like
-# "docs/x", and every finding keeps the "/root" text the sanitizer
-# pre-checks.  A bare root right after a dot segment of a relative token is
-# judged by this rule; in an absolute token the bare rule judges it too.
-# Each region runs to the end of its path run, like the span contract, so
-# over-flagging a glued neighbour is accepted.
-_NAME_CONTINUE_CHARS = r"\w~%+@$-"
-_PATH_NAME_CHARS = "." + _NAME_CONTINUE_CHARS
-_PATH_TOKEN_RE = re.compile(rf"[/{_PATH_NAME_CHARS}]+")
-_PATH_NAME_CHAR_RE = re.compile(rf"[{_PATH_NAME_CHARS}]")
-_ROOT_SEGMENT_RE = re.compile(rf"/(?:{_ROOT_NAMES})(?![{_NAME_CONTINUE_CHARS}]|\.+[{_NAME_CONTINUE_CHARS}])")
-# The filesystem rule's /api route also opens on "?" or "#" ("/api?next=...");
-# the protected-span pattern above keeps its shape for the other finding kinds.
-_API_PATH_ROUTE_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])/api(?:[/?#][^\s\"'<>]*)?")
+# Delimit scan parts independently of the wider redaction span. A comma or
+# semicolon can join references in prose as well as form part of a path.
+_MARKUP_RE = re.compile(r"`+|(?<!\\)\]\(|[()]")
+_PART_END_RE = re.compile(r"[?#&=]|[,;](?=\.{0,2}/)|(?<![A-Za-z0-9])(?=(?i:file):)")
+_AUTHORITY_END_RE = re.compile(r"[/#?`]|[,;](?=(?i:file):)")
+_SCHEME_RE = re.compile(r"[.!+\[:]*(?P<name>[A-Za-z][A-Za-z0-9+.-]*):")
+_AUTHORITY_RE = re.compile(
+    r"(?:[A-Za-z0-9._~!$%&'()*+,;=:-]*@)?"
+    r"(?:\[(?P<literal>[^\[\]]+)\]|[A-Za-z0-9._~!$%&'()*+,;=-]+)"
+    r"(?::[0-9]*)?"
+)
+_IPVFUTURE_RE = re.compile(
+    r"v[0-9A-Fa-f]+\.[A-Za-z0-9._~!$&'()*+,;=:-]+", re.IGNORECASE
+)
+_URI_PATH_RE = re.compile(r"[A-Za-z0-9._~!$%&'()*+,;=:@/-]*")
+_BAD_ESCAPE_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_API_SEGMENT_RE = re.compile(r"/api(?=[/?#]|$)", re.IGNORECASE)
+_DOT_SEGMENT_RE = re.compile(r"(?<![.\w~%+@$-])\.{1,2}(?=/)")
+_ROOT_PREFIX_RE = re.compile(
+    "|".join(re.escape(root) for root in BOUNDED_FILESYSTEM_ROOTS)
+)
+_BARE_NAME_RE = re.compile(r"[A-Za-z0-9_-]")
+_RELATIVE_NAME_RE = re.compile(r"[\w~%+@$-]|\.+[\w~%+@$-]")
+
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
@@ -400,38 +375,12 @@ class _Cursor:
         return self._index
 
 
-class _PathRuns:
-    """Trimmed end of the path run holding a position; each run is trimmed once.
-
-    A path run is a whitespace-, quote- or angle-bracket-delimited stretch;
-    its trimmed end drops trailing prose punctuation and backticks.  This is
-    the end of every ``filesystem-root`` finding (the span contract).
-    """
-
-    def __init__(self, text: str) -> None:
-        self._text = text
-        self._runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
-        self._cursor = _Cursor([start for start, _ in self._runs])
-        self._trimmed: dict[int, int] = {}
-
-    def end(self, position: int) -> int:
-        index = self._cursor.locate(position)
-        if index not in self._trimmed:
-            start, end = self._runs[index]
-            self._trimmed[index] = _trim_end(self._text, start, end)
-        return self._trimmed[index]
-
-
 class _SpanSet:
-    """Membership in and overlap with sorted, disjoint spans."""
+    """Overlap with sorted, disjoint spans."""
 
     def __init__(self, spans: Iterable[tuple[int, int]]) -> None:
         self._spans = list(spans)
         self._cursor = _Cursor([start for start, _ in self._spans])
-
-    def __contains__(self, position: int) -> bool:
-        index = self._cursor.locate(position)
-        return index >= 0 and position < self._spans[index][1]
 
     def overlaps(self, start: int, end: int) -> bool:
         """Whether ``[start, end)`` overlaps a span.
@@ -443,131 +392,221 @@ class _SpanSet:
         return index >= 0 and start < self._spans[index][1]
 
 
-class _PathTokens:
-    """Path tokens (runs of name characters and slashes)."""
-
-    def __init__(self, text: str) -> None:
-        self._text = text
-        self._tokens = [(match.start(), match.end()) for match in _PATH_TOKEN_RE.finditer(text)]
-        self._cursor = _Cursor([start for start, _ in self._tokens])
-
-    def is_relative(self, position: int) -> bool:
-        """Whether the token holding ``position`` does not start with "/"."""
-        index = self._cursor.locate(position)
-        if index < 0 or position >= self._tokens[index][1]:
-            return False
-        return self._text[self._tokens[index][0]] != "/"
-
-    def dot_region_starts(self) -> Iterable[int]:
-        """Yield where each token with a "." or ".." segment before a "/" is judged by segments.
-
-        A relative token (a dot-relative path) is judged from its start, an
-        absolute one from its first dot segment.  A lone "." or ".." (prose,
-        "x).(y") or a trailing one ("docs/..") leads to no path and opens no
-        region.
-        """
-        for start, end in self._tokens:
-            segments = f"/{self._text[start:end]}"
-            found = [index for index in (segments.find("/./"), segments.find("/../")) if index >= 0]
-            if not found:
-                continue
-            # segments[i] is text[start + i - 1]: the dot after that "/" is text[start + i].
-            yield start if self._text[start] != "/" else start + min(found)
-
-
-def _after_dot_segment(text: str, position: int) -> bool:
-    """Whether the "/" at ``position`` ends a "." or ".." path segment."""
-    for dots in ("..", "."):
-        start = position - len(dots)
-        if start < 0 or not text.startswith(dots, start):
-            continue
-        if start == 0 or text[start - 1] == "/" or not _PATH_NAME_CHAR_RE.match(text, start - 1):
-            return True
-    return False
-
-
-def _api_routes(text: str) -> list[tuple[int, int, int, int]]:
-    """Return each /api route's start, exempt end, path-component end and end.
-
-    The path component is exempt from the bare rule up to its first "." or
-    ".." segment; the query and fragment (from the path end to the route end)
-    are not, and are a relative-path region.
-    """
-    routes: list[tuple[int, int, int, int]] = []
-    for match in _API_PATH_ROUTE_RE.finditer(text):
-        start = match.start()
-        path_end = match.end()
-        for separator in "?#":
-            found = text.find(separator, start, path_end)
-            if found >= 0:
-                path_end = found
-        exempt_end = path_end
-        for dot_segment in ("/./", "/../"):
-            found = text.find(dot_segment, start, path_end)
-            if found >= 0:
-                exempt_end = min(exempt_end, found)
-        routes.append((start, exempt_end, path_end, match.end()))
-    return routes
-
-
-def _relative_segment_candidates(
-    text: str,
-    path_runs: _PathRuns,
-    path_tokens: _PathTokens,
-    api_routes: Iterable[tuple[int, int, int, int]],
-) -> list[_Candidate]:
-    """Flag every whole bounded-root segment in a dot-segment path or an /api query or fragment.
-
-    A dot-segment region runs from where its token is judged by segments to
-    the trimmed end of its path run; an /api region from the "?" or "#" to the
-    route end.  Both lists are already sorted, so they are merged in one pass
-    and each character is matched once.
-    """
-    dot_regions = [(start, path_runs.end(start)) for start in path_tokens.dot_region_starts()]
-    api_regions = [(path_end, end) for _, _, path_end, end in api_routes if path_end < end]
-    merged: list[tuple[int, int]] = []
-    for start, end in heapq.merge(dot_regions, api_regions):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        elif start < end:
-            merged.append((start, end))
-    candidates: list[_Candidate] = []
-    for region_start, region_end in merged:
-        for match in _ROOT_SEGMENT_RE.finditer(text, region_start, region_end):
-            end = max(path_runs.end(match.start()), match.end())
-            candidates.append(_Candidate(match.start(), end, "filesystem-root", None, 80))
-    return candidates
-
-
 def _trim_end(text: str, start: int, end: int) -> int:
-    """Return ``end`` moved back over trailing prose punctuation, never past ``start``."""
+    """Drop trailing prose punctuation from the whole redaction span."""
     while end > start and text[end - 1] in _PATH_TRAILING_PUNCTUATION:
         end -= 1
     return end
 
 
-def _file_uri_candidates(text: str, path_runs: _PathRuns) -> tuple[list[_Candidate], set[int]]:
-    """Return flagged file URIs and the path start of every file URI.
+def _valid_authority(text: str, start: int, end: int) -> bool:
+    """Accept only RFC 3986 authority syntax before treating a URI as remote."""
+    match = _AUTHORITY_RE.fullmatch(text, start, end)
+    if match is None or _BAD_ESCAPE_RE.search(text, start, end):
+        return False
+    literal = match.group("literal")
+    if literal is None or _IPVFUTURE_RE.fullmatch(literal):
+        return True
+    try:
+        ipaddress.IPv6Address(literal)
+    except ValueError:
+        return False
+    return True
 
-    A URI is flagged whole when its first path segment starts with a bounded
-    root followed by a non-name character, the bare rule's boundary; like the
-    bare rule this fails closed ("file:///tmp.backup/..." counts).  Every
-    flagged URI is a candidate, also inside an earlier one, because selection
-    may drop that earlier one; each costs offsets only.
+
+def _markup_parts(text: str, start: int, end: int) -> Iterable[tuple[int, int]]:
+    """Yield prose, inline code contents and Markdown destinations as parts."""
+    link_depth = code_ticks = 0
+    for match in _MARKUP_RE.finditer(text, start, end):
+        marker = match.group()
+        if marker.startswith("`"):
+            if code_ticks and code_ticks != len(marker):
+                continue
+            code_ticks = 0 if code_ticks else len(marker)
+        elif code_ticks:
+            continue
+        elif marker == "](" and not link_depth:
+            link_depth = 1
+        elif link_depth:
+            link_depth += -1 if marker == ")" else 1
+            if link_depth:
+                continue
+        else:
+            continue
+        yield start, match.start()
+        start = match.end()
+    yield start, end
+
+
+def _path_root(
+    text: str, start: int, end: int, *, check_segments: bool, allow_route: bool, remote: bool,
+) -> int | None:
+    """Return the first reportable slash in one path component."""
+    if start == end:
+        return None
+    absolute = text[start] == "/"
+    dot = _DOT_SEGMENT_RE.search(text, start, end)
+    dot_relative = not absolute and dot is not None
+    route = allow_route and _API_SEGMENT_RE.match(text, start, end) is not None
+    first = start
+    if absolute:
+        while first < end and text[first] == "/":
+            first += 1
+        first -= 1
+    for root in _ROOT_PREFIX_RE.finditer(text, start, end):
+        position = root.start()
+        after_dot = dot is not None and position >= dot.end()
+        if route and not after_dot:
+            continue
+        if (dot_relative or after_dot or check_segments) and not _RELATIVE_NAME_RE.match(
+            text, root.end(), end
+        ):
+            return position
+        if _BARE_NAME_RE.match(text, root.end(), end):
+            continue
+        if absolute and position == first and not remote:
+            return position
+        if position > start:
+            previous = text[position - 1]
+            if previous == "/" or (previous.isascii() and previous.isalnum()):
+                continue
+            if dot_relative and previous == "." and any(
+                offset >= start and _DOT_SEGMENT_RE.match(text, offset, position + 1)
+                for offset in (position - 2, position - 1)
+            ):
+                continue
+            return position
+    return None
+
+
+def _path_root_in_part(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    decode: bool = True,
+    value_context: Literal["value", "api-fragment"] | None = None,
+) -> int | None:
+    """Lex references and return the first sensitive path offset in the part.
+
+    Split the authority before testing the path. Within a query or fragment,
+    delimit values on the raw separators before decoding them once. Invalid
+    authorities get no remote-path exemption. Other punctuation can join
+    independent references, so the lexer checks both sides.
     """
-    candidates: list[_Candidate] = []
-    path_starts: set[int] = set()
-    for scheme in _FILE_SCHEME_RE.finditer(text):
-        head = _FILE_URI_HEAD_RE.match(text, scheme.end())
-        if head is None:
+    api_reference = _API_SEGMENT_RE.match(text, start, end) is not None
+    while start < end:
+        scheme = _SCHEME_RE.match(text, start, end)
+        path_start = scheme.end() if scheme is not None else start
+        file_uri = scheme is not None and scheme.group("name").lower() == "file"
+        remote = False
+        nested_file = None
+        has_authority = scheme is not None and text.startswith("//", path_start, end)
+        if has_authority:
+            authority_start = path_start + 2
+            authority_end = _AUTHORITY_END_RE.search(text, authority_start, end)
+            path_start = authority_end.start() if authority_end else end
+            remote = not file_uri and _valid_authority(
+                text, authority_start, path_start
+            )
+            if (path_start - authority_start == 5 and text[authority_start:path_start].lower() == "file:"
+                and text.startswith("//", path_start, end)):
+                nested_file = authority_start
+
+        # A file scheme at the cursor has already been consumed. A later
+        # zero-width delimiter starts another URI without discarding its scheme.
+        separator = _PART_END_RE.search(text, path_start, end)
+        part_end = separator.start() if separator else end
+        bare_hash = (
+            start > 0
+            and text[start - 1] == "#"
+            and value_context is None
+            and (hash_route := _HASH_ROUTE_RE.match(text, start - 1)) is not None
+            and hash_route.end() == part_end
+        )
+        remote = (
+            remote
+            and _URI_PATH_RE.fullmatch(text, path_start, part_end) is not None
+            and _BAD_ESCAPE_RE.search(text, path_start, part_end) is None
+        )
+        absolute_value = value_context is not None and text.startswith("/", path_start, part_end)
+        check_segments = not remote and (absolute_value or value_context == "api-fragment" or (has_authority and not file_uri))
+        allow_route = scheme is None and value_context is None
+
+        # A remote path is an RFC 3986 component even when the URL is a query
+        # value. Apply the conservative value policy only to host-like paths.
+        root = (
+            None
+            if bare_hash
+            else _path_root(
+                text,
+                path_start,
+                part_end,
+                check_segments=check_segments,
+                allow_route=allow_route,
+                remote=remote,
+            )
+        )
+        if (
+            decode
+            and not remote
+            and text.find("%", path_start, root if root is not None else part_end) >= 0
+        ):
+            # Preserve the authority boundary while examining decoded path data.
+            # An encoded value can itself be a reference, so lex it once after
+            # decoding. Its raw value is the redaction unit if it contains a root.
+            encoded = text[path_start:part_end]
+            decoded = unquote(encoded)
+            if decoded != encoded:
+                if scheme is not None:
+                    decoded_root = _path_root(
+                        decoded,
+                        0,
+                        len(decoded),
+                        check_segments=check_segments,
+                        allow_route=False,
+                        remote=False,
+                    )
+                else:
+                    decoded_root = _path_root_in_part(
+                        decoded, 0, len(decoded), decode=False, value_context=value_context
+                    )
+                if decoded_root is not None and (
+                    root is None or decoded_root < len(unquote(text[path_start:root]))
+                ):
+                    return scheme.start("name") if file_uri and scheme is not None else path_start
+        if root is not None:
+            if (
+                file_uri
+                and scheme is not None
+                and text.count("/", path_start, root) == root - path_start
+            ):
+                return scheme.start("name")
+            return root
+        if nested_file is not None:
+            start = nested_file
             continue
-        path_starts.add(head.start("path"))
-        root = _FILE_URI_ROOT_RE.match(text, head.end())
-        if root is None:
-            continue
-        end = max(path_runs.end(scheme.start()), root.end())
-        candidates.append(_Candidate(scheme.start(), end, "filesystem-root", None, 80))
-    return candidates, path_starts
+        if separator is None:
+            break
+        delimiter = separator.group()
+        if delimiter == "#" and api_reference:
+            value_context = "api-fragment"
+        elif delimiter in ("?", "#") and value_context is None and (scheme is not None or part_end > start):
+            value_context = "value"
+        start = separator.end()
+    return None
+
+
+def _filesystem_candidates(text: str) -> Iterable[_Candidate]:
+    # Path candidates in the same run all cover the tail. Selection would
+    # keep only the first one, so there is no need to materialize the others.
+    for run in _PATH_RUN_RE.finditer(text):
+        end = _trim_end(text, run.start(), run.end())
+        for part_start, part_end in _markup_parts(text, run.start(), run.end()):
+            start = _path_root_in_part(text, part_start, min(part_end, end))
+            if start is not None:
+                yield _Candidate(start, end, "filesystem-root", None, 80)
+                break
 
 
 def _is_css_numeric_property(text: str, match: re.Match[str]) -> bool:
@@ -585,9 +624,8 @@ def _select_candidates(candidates: Iterable[_Candidate]) -> list[_Candidate]:
 
     The higher priority wins, then the earlier start, then the longer span.
     Priorities are a handful of fixed tiers: within a tier candidates arrive
-    in start order, so only the last one taken can overlap; spans taken by
-    higher tiers are disjoint and sorted, so a bisect finds the only two that
-    can.  Each tier is merged in once, so no list is shifted per candidate.
+    in start order, so only the last one taken can overlap. Spans taken by
+    higher tiers are disjoint and sorted, so one forward pass finds overlaps.
     """
     unique = {(item.start, item.end, item.kind, item.token): item for item in candidates}
     tiers: dict[int, list[_Candidate]] = {}
@@ -595,14 +633,13 @@ def _select_candidates(candidates: Iterable[_Candidate]) -> list[_Candidate]:
         tiers.setdefault(item.priority, []).append(item)
     selected: list[_Candidate] = []
     for priority in sorted(tiers, reverse=True):
-        starts = [item.start for item in selected]
+        index = 0
         taken: list[_Candidate] = []
         for candidate in sorted(tiers[priority], key=lambda item: (item.start, -(item.end - item.start), item.kind)):
             if taken and candidate.start < taken[-1].end:
                 continue
-            index = bisect.bisect_right(starts, candidate.start)
-            if index and selected[index - 1].end > candidate.start:
-                continue
+            while index < len(selected) and selected[index].end <= candidate.start:
+                index += 1
             if index < len(selected) and selected[index].start < candidate.end:
                 continue
             taken.append(candidate)
@@ -619,26 +656,16 @@ def scan_text(
 ) -> list[Finding]:
     """Scan one text value and preserve its operation/field provenance.
 
-    Span contract for ``filesystem-root`` findings (the sanitizer redacts these
-    spans verbatim): a finding starts at the bounded root, or at the scheme of
-    a file URI whose first path segment is a bounded root, and ends where its
-    whitespace-, quote- or angle-bracket-delimited run ends, less trailing
-    prose punctuation and backticks.  It fails closed: over-redaction of a
-    glued neighbour (a Markdown closer, a later query parameter, a joined URI)
-    is accepted; leaving path bytes behind is not.
+    A filesystem finding starts at the bounded root, the scheme of a file URI
+    whose first path segment is a bounded root, or the raw start of a sensitive
+    encoded component. Its span covers the rest of the whitespace-, quote- or
+    angle-bracket-delimited run, less trailing prose punctuation and backticks.
+    The sanitizer replaces this span, which may include a glued neighbour.
 
-    Detection contract for relative paths (designated amendment, 2026-11-19;
-    fail closed): a path with a "." or ".." segment before a "/" (from the
-    start of a relative one, from that segment on in an absolute one), and an
-    /api route's query or fragment ("/api?", "/api#", "/api/x?"), are flagged
-    at each whole bounded-root segment, with no route exemption: "./home/x",
-    "../home/x", "../api/../home/x", "../api/home/x", "/api/..//home/x",
-    "/api?next=/api/y/{id}/home/v".  Over-flagging there ("./docs/home/x",
-    "/api/../docs/home/x") is accepted.  Ordinary relative paths are not
-    flagged: "./docs/x", "../guide.md", "../api/v1/x", and a root name that a
-    name character or a dot run plus one continues ("../home.md",
-    "../home+page", "../home..md"), and "?path=home/x".  An /api route's path
-    component exempts roots only before its first "." or ".." segment.
+    The lexer separates Markdown and code, URI authorities and paths, and
+    query and fragment values before checking for roots. A dot-relative path
+    still reports whole bounded-root segments. A malformed reference keeps
+    the local path checks, and a decoded value is redacted in its raw form.
     """
     if not isinstance(text, str):
         return []
@@ -650,33 +677,7 @@ def scan_text(
         for match in re.finditer(re.escape(canary), text):
             candidates.append(_Candidate(match.start(), match.end(), "canary", match.group(0), 100))
 
-    # The bare rule never re-reads a file URI's first segment, whatever the
-    # verdict on the URI.
-    path_runs = _PathRuns(text)
-    file_uri_candidates, file_uri_paths = _file_uri_candidates(text, path_runs)
-    candidates.extend(file_uri_candidates)
-
-    # A bare root is exempt only inside a bare hash route ("#/home") or an /api
-    # route's path component ("/api/x/{id}/home/view") before its first "." or
-    # ".." segment.  A SHA, timestamp or duration in the path, or an
-    # /api query or fragment carrying the path, never exempts it.  A bare root
-    # right after a dot segment of a relative token is left to the
-    # relative-segment rule, which judges whole segments.
-    hash_routes = _SpanSet((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
-    api_routes = _api_routes(text)
-    api_route_paths = _SpanSet((start, exempt_end) for start, exempt_end, _, _ in api_routes)
-    path_tokens = _PathTokens(text)
-    for match in _FILESYSTEM_PATH_RE.finditer(text):
-        start = match.start()
-        if start in file_uri_paths or start in hash_routes:
-            continue
-        if start in api_route_paths:
-            continue
-        if _after_dot_segment(text, start) and path_tokens.is_relative(start):
-            continue
-        end = max(path_runs.end(start), match.end("root"))
-        candidates.append(_Candidate(start, end, "filesystem-root", None, 80))
-    candidates.extend(_relative_segment_candidates(text, path_runs, path_tokens, api_routes))
+    candidates.extend(_filesystem_candidates(text))
 
     for match in _USER_AT_HOST_RE.finditer(text):
         host = match.group("token").rsplit("@", 1)[-1].split(":", 1)[0]
