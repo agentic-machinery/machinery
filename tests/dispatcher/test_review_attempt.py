@@ -30,6 +30,24 @@ CURRENT_SOL = current_sol()
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
 
+@pytest.fixture(autouse=True)
+def isolated_git(tmp_path_factory, monkeypatch):
+    """Every Git call here (fixture setup and the dispatcher's own) reads no caller, global or system config.
+
+    Autouse, so it applies before ``configured_roots`` initializes its repository. It drops every inherited
+    ``GIT_*`` variable (``GIT_CONFIG_COUNT`` and its indexed keys and values, ``GIT_CONFIG_PARAMETERS``,
+    ``GIT_DIR`` and the rest) and points the global config at an empty test-owned file.
+    """
+    import os
+
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(name)
+    config = tmp_path_factory.mktemp("git-config") / "gitconfig"
+    config.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+
 @pytest.fixture
 def attempt(tmp_path, monkeypatch):
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
@@ -266,13 +284,7 @@ def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
     (prompts / "lexical-review.md.j2").write_text("Review {{ items }}\n")
     monkeypatch.setattr(review_mcp, "review_server_checkout", lambda: checkout)
 
-    # Fixture setup and admission's own Git calls read no developer or system Git configuration.
-    (tmp_path / "gitconfig").write_text("")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_CONFIG_PARAMETERS"):
-        monkeypatch.delenv(name, raising=False)
-
+    # Git configuration is isolated by the module's autouse ``isolated_git`` fixture.
     # The dispatch commit: one public candidate file the manifest pins.
     inputs = (tmp_path / "inputs").resolve()
     inputs.mkdir()
@@ -683,6 +695,12 @@ def test_unknown_codex_account_refuses_a_bound_attempt_before_it_is_spent(attemp
     assert "codex_account_unknown" in capsys.readouterr().err
     launch.assert_not_called()
     assert not (tmp_path / "review-receipts").exists()
+    # Since machinery #892 the refusal leaves a typed record; it must not carry the binding that spends the pair.
+    records = [json.loads(path.read_text()) for path in (tmp_path / "tasks").glob("*.json")]
+    assert [(record["never_started_reason"], "review_attempt" in record) for record in records] == [
+        ("account_check", False)]
+    args = cli.build_parser().parse_args(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, *attempt])
+    store.check_review_attempt(store.review_binding(vars(args)))  # still unspent
 
 
 @pytest.mark.parametrize("label", ["c-sub", "API", ""])
