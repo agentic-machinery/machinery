@@ -1913,6 +1913,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 correction_launches += 1
                 continue
             break
+        if spec.agent == "agy":
+            # These logs live under the task store even when there is no final reply or the record is archived.
+            record["retained_stream"] = {
+                "stdout": stdout_path.relative_to(path.parent).as_posix(),
+                "stderr": stderr_path.relative_to(path.parent).as_posix(),
+            }
         store.begin_settlement(record)
         if _read_only_boundary(spec):
             # Only the receipt the launcher writes outside the sandbox proves the run was contained (#423).
