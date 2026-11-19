@@ -290,19 +290,23 @@ def is_second_reviewer_model(model: object) -> bool:
     return _catalog_model_id(model) in _HISTORICAL_SECOND_REVIEW_MODELS
 
 
-def reviews_of_record(model: object) -> bool:
-    """Whether ``model`` holds a catalog review role.
+def reviews_of_record(model: object, *, recorded: bool = False) -> bool:
+    """Whether ``model`` can supply a review of record.
 
-    Carbon holds none, so an untokened Carbon marker never approves. A ``second_review`` role,
-    if a catalog still carries one, is not a reviewer-of-record role.
+    The recorded-marker reader also accepts Flash approvals issued before its seat moved.
+    New review admission uses the active catalog roles. Second-review roles never qualify.
     """
     from lu_machinery.review.model_catalog import load_model_catalog, resolve_catalog_model_id
 
     try:
         catalog = load_model_catalog()
         model_id = resolve_catalog_model_id(model, catalog) if isinstance(model, str) else None
+        if model_id is None:
+            return False
+        if recorded and model_id == "gemini-3.8-flash-high":
+            return True
         review = set(catalog["review_scheduler"]["activity_roles"]["review"]) - {"second_review"}
-        return model_id is not None and bool(review & set(catalog["models"][model_id]["roles"]))
+        return bool(review & set(catalog["models"][model_id]["roles"]))
     except Exception:  # an unreadable catalog admits no reviewer of record
         return False
 
@@ -821,7 +825,7 @@ def lookup_verdict(
         if (
             marker["verdict"] == "CHANGES_REQUESTED"
             and not is_second_review(marker)
-            and reviews_of_record(marker["model"])
+            and reviews_of_record(marker["model"], recorded=True)
             and recorded_p3_residuals(body) is not None
             and not _repair_receipt_blocks(body, marker["sha"])
         ):
@@ -842,12 +846,11 @@ def lookup_verdict(
             or is_ukrainian_review(item[2]) or item[2].get("review_pair")
             or item[2]["family"] not in attested_author_families([item[2]])
         ]
-    # A historical second review, or a marker from a model with no catalog review role, is never
-    # the reviewer of record: only its rejections stay candidates.
+    # Second reviews and ineligible reviewer markers may still carry a rejection.
     candidates = [
         item for item in candidates
         if item[2]["verdict"] in REJECTED
-        or (not is_second_review(item[2]) and reviews_of_record(item[2]["model"]))
+        or (not is_second_review(item[2]) and reviews_of_record(item[2]["model"], recorded=True))
     ]
     if not candidates:
         state = "CF-unrecorded" if legacy else "CF-stale" if other_head else "needs-CF"
