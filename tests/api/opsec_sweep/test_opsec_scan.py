@@ -145,6 +145,9 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("file:///etc/fixture.conf,file://fixture-host/home/fixture-user/x", "file://fixture-host/home/fixture-user/x"),
         ("file:///etc/fixture.conf?u=file:///home/fixture-user/x", "file:///home/fixture-user/x"),
         ("[fixture](file://fixture-host./home)", "file://fixture-host./home"),
+        ("Read `file://fixture-host/home`.", "file://fixture-host/home"),
+        ("[local](file:///home/fixture-user/x),[docs](/api/health)", "file:///home/fixture-user/x"),
+        ("/api/fixture?source=/home/fixture-user/x&view=page#/details", "/home/fixture-user/x"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:

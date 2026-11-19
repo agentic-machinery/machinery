@@ -63,12 +63,18 @@ _ISO_DURATION_RE = re.compile(
 # subtly different IP parser.  Bracketed addresses keep an optional port as a
 # single candidate.  Unbracketed IPv4:port is handled by the same parser.
 _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{1,5})?|[0-9A-Fa-f:.]+)(?![A-Za-z0-9])")
+# Path text stops at whitespace, quotes, angle brackets, backticks, list and
+# Markdown closers, and query or fragment separators, so a path finding never
+# swallows a neighbouring value, link, URL or later query parameter.
+_PATH_STOP = r"\s\"'<>`,;|&#)\]}"
+_PATH_TEXT = "[^" + _PATH_STOP + "]"
+_PATH_TRAILING_PUNCTUATION = ".,;:!?)]}"
 # A bare root must not follow a slash, so URL authorities such as
 # "https://tmp.example.org" stay unflagged.
 _FILESYSTEM_PATH_RE = re.compile(
     rf"(?<![A-Za-z0-9/])/(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
     r"(?![A-Za-z0-9_-])"
-    r"(?P<tail>/[^\s\"'<>]*)?"
+    "(?P<tail>/" + _PATH_TEXT + "*)?"
 )
 # A file URI carries its path after the scheme's slashes and optional
 # authority ("file:///home/...", "file://host/home/...", "file:////home/...",
@@ -77,13 +83,17 @@ _FILESYSTEM_PATH_RE = re.compile(
 # so a host such as "home.example" is never re-read as a path.  Only a letter
 # or digit before "file:" makes it another scheme's suffix ("profile:");
 # punctuation ("...file:", a diff's "+file:") does not.  Each scheme start is
-# found on its own, so a rejected URI never hides a later one; the head match
-# stops at the first segment and the token runs to the end of its path run.
+# found on its own, so a rejected URI never hides a later one, and the head
+# match reads no further than the first path segment.
 _FILE_SCHEME_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):")
-_FILE_URI_HEAD_RE = re.compile(r"(?://[^/\s\"'<>?#]*|(?!//))(?P<path>/+)(?P<segment>[^/?#\s\"'<>]*)")
-_PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
-_PATH_TRAILING_PUNCTUATION = ".,;:!?)]}"
+# The authority keeps RFC 3986 sub-delimiters and IP-literal brackets
+# ("file://[::1]/..."); only the path uses the stricter path-text stops.
+_FILE_URI_HEAD_RE = re.compile(
+    r"(?://[^/?#\s\"'<>`]*|(?!//))(?P<path>/+)(?P<segment>[^/?" + _PATH_STOP + "]*)"
+)
+_PATH_TEXT_RE = re.compile(_PATH_TEXT + "*")
 _BOUNDED_ROOT_NAMES = frozenset(root[1:] for root in BOUNDED_FILESYSTEM_ROOTS)
+_MAX_ROOT_NAME_LENGTH = max(map(len, _BOUNDED_ROOT_NAMES))
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
@@ -347,27 +357,44 @@ def _trim_path_token(match: re.Match[str]) -> tuple[int, int, str]:
     return match.start(), end, token
 
 
+def _trim_end(text: str, start: int, end: int) -> int:
+    """Return ``end`` moved back over trailing prose punctuation, never past ``start``."""
+    while end > start and text[end - 1] in _PATH_TRAILING_PUNCTUATION:
+        end -= 1
+    return end
+
+
 def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
     """Return flagged file URIs and the path start of every file URI.
 
-    A URI is flagged whole when its first path segment, after trailing prose
-    or Markdown punctuation is trimmed from the token, is exactly a bounded
-    root ("file:///tmp.backup/..." and "file:///tmp./x" are not under /tmp).
+    A URI is flagged whole when its first path segment is exactly a bounded
+    root ("file:///tmp.backup/..." and "file:///tmp./x" are not under /tmp);
+    a final segment is compared without its trailing prose punctuation
+    ("file:///home." is). The path is read once, and only for a flagged URI;
+    a later scheme inside a flagged URI is already covered by it, so every
+    character is scanned a bounded number of times.
     """
     candidates: list[_Candidate] = []
     path_starts: set[int] = set()
-    runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
-    run_starts = [start for start, _ in runs]
+    covered = 0
     for scheme in _FILE_SCHEME_RE.finditer(text):
         head = _FILE_URI_HEAD_RE.match(text, scheme.end())
         if head is None:
             continue
         path_starts.add(head.start("path"))
-        run_end = runs[bisect.bisect_right(run_starts, scheme.start()) - 1][1]
-        token = text[scheme.start() : run_end].rstrip(_PATH_TRAILING_PUNCTUATION)
-        end = scheme.start() + len(token)
-        if text[head.start("segment") : min(head.end("segment"), end)] in _BOUNDED_ROOT_NAMES:
-            candidates.append(_Candidate(scheme.start(), end, "filesystem-root", token, 80))
+        if scheme.start() < covered:
+            continue
+        segment_start, segment_end = head.span("segment")
+        if segment_end == len(text) or text[segment_end] not in "/?":
+            segment_end = _trim_end(text, segment_start, segment_end)
+        if segment_end - segment_start > _MAX_ROOT_NAME_LENGTH:
+            continue
+        if text[segment_start:segment_end] not in _BOUNDED_ROOT_NAMES:
+            continue
+        path = _PATH_TEXT_RE.match(text, head.start("path"))
+        end = _trim_end(text, scheme.start(), path.end() if path is not None else head.end())
+        candidates.append(_Candidate(scheme.start(), end, "filesystem-root", text[scheme.start() : end], 80))
+        covered = end
     return candidates, path_starts
 
 
@@ -388,11 +415,18 @@ def _select_candidates(candidates: Iterable[_Candidate]) -> list[_Candidate]:
         unique.values(),
         key=lambda item: (-item.priority, item.start, -(item.end - item.start), item.kind),
     )
+    # Selected spans are disjoint and kept in start order, so only the nearest
+    # neighbour on each side can overlap a new candidate.
+    starts: list[int] = []
     selected: list[_Candidate] = []
     for candidate in ordered:
-        if any(candidate.start < item.end and item.start < candidate.end for item in selected):
+        index = bisect.bisect_right(starts, candidate.start)
+        if index and selected[index - 1].end > candidate.start:
             continue
-        selected.append(candidate)
+        if index < len(selected) and selected[index].start < candidate.end:
+            continue
+        starts.insert(index, candidate.start)
+        selected.insert(index, candidate)
     return sorted(selected, key=lambda item: (item.start, item.end, item.kind))
 
 
