@@ -164,16 +164,17 @@ def _preserve_attributes(prefix, cwd, env, timeout):
     including redefinitions of binary; the built-in binary only unsets
     diff/merge/text and does not transform storage. Inspect both attribute views.
     """
-    paths = subprocess.run(
-        [*prefix, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=False,
-        timeout=timeout,
-        check=False,
-    )
-    if paths.returncode:
+    if (
+        paths := subprocess.run(
+            [*prefix, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+            check=False,
+        )
+    ).returncode:
         return paths
     for source in ([], ["--cached"]):
         attrs = subprocess.run(
