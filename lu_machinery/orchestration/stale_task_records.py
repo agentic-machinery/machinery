@@ -25,8 +25,10 @@ into ``batch_state/tasks/archive/`` with their ``.result`` and read-only
 snapshot sidecars. A record stays hot while its checkout path (``worktree_path``,
 else a ``cwd`` that is not a primary checkout) exists at all, with or without a
 ``.git`` file, or while any ``acp_runtime_paths`` entry exists. A relative
-recorded path (legacy records) is read under the primary checkout, as dispatch
-resolves ``--worktree``, never under the caller's cwd. The
+recorded path (legacy records) is read under the checkout of the fleet
+repository the record names, as dispatch resolved it, never under the caller's
+cwd. A path whose repository is unknown, or whose state cannot be read
+(``ELOOP``, ``EACCES``, an invalid value), keeps the record hot. The
 branch-holder release reads the hot record as the ownership proof. ``restore`` moves an archived record back. Which readers see
 the archive is documented in :mod:`scripts.orchestration.task_record_store`.
 
@@ -770,7 +772,11 @@ def _classify_one(candidate: Candidate, facts: RepoFacts | None) -> None:
         return
 
     worktree = Path(worktree_raw) if worktree_raw else None
-    worktree_exists = worktree is not None and os.path.lexists(worktree)
+    worktree_state = _path_state(worktree_raw) if worktree_raw else False
+    if worktree_state is None:
+        candidate.klass, candidate.skip_reason = "D", "worktree path evidence unavailable"
+        return
+    worktree_exists = worktree_state
     dirty = worktree_claims.worktree_is_dirty(worktree) if worktree is not None and worktree_exists else False
     on_origin = branch in facts.remote_heads
     matching_remote = sorted(name for name in facts.remote_heads if name == branch or candidate.task_id in name)
@@ -838,11 +844,10 @@ def _unrecoverable_work(candidate: Candidate, facts: RepoFacts) -> bool:
     for raw in paths:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        try:
-            os.lstat(raw)
-        except FileNotFoundError:
+        state = _path_state(raw)
+        if state is False:
             continue
-        except (OSError, ValueError):
+        if state is None:
             return False
         candidate.evidence.setdefault("surviving_paths", []).append(raw)
         candidate.skip_reason = "work survives at " + raw
@@ -1232,11 +1237,10 @@ def _close_abandoned(candidate: Candidate, facts: RepoFacts, index: PullIndex) -
     for raw in paths:
         if not isinstance(raw, str) or not raw.strip():
             continue
-        try:
-            os.lstat(raw)
-        except FileNotFoundError:
+        state = _path_state(raw)
+        if state is False:
             continue
-        except (OSError, ValueError):
+        if state is None:
             candidate.skip_reason = "worktree or runtime path evidence unavailable"
             return
         candidate.evidence.setdefault("surviving_paths", []).append(raw)
@@ -1444,7 +1448,7 @@ def apply_settlement(
                 candidate.action, candidate.skip_reason = "skipped", "record no longer needs_finalize"
                 return
             worktree_raw = candidate.evidence.get("worktree_path")
-            if isinstance(worktree_raw, str) and os.path.lexists(worktree_raw):
+            if isinstance(worktree_raw, str) and _path_state(worktree_raw) is not False:
                 candidate.action, candidate.skip_reason = "skipped", "worktree path reappeared since classification"
                 return
             if candidate.unrecoverable:
@@ -1615,18 +1619,53 @@ def sidecar_paths(record_path: Path) -> list[Path]:
     return [path for path in candidates if path.exists()]
 
 
-def _anchored(raw: str) -> str:
-    """A recorded path as dispatch resolves ``--worktree``: a relative one sits under the primary checkout.
+def _anchored(raw: str, record: Mapping[str, Any]) -> str:
+    """A recorded path as dispatch resolved it: a relative one sits under its repository's checkout.
 
-    Legacy records name their checkout repo-relative (``.worktrees/dispatch/...``).
-    Read as written, such a path depends on the caller's cwd, and its lock refuses
-    it as not absolute. Symlinks are not resolved here, so a dangling link still
-    counts as present; the lock canonicalizes the path itself. ``~`` is not
-    expanded: dispatch records absolute paths and legacy records repo-relative
-    ones, and expanding would make the answer depend on ``HOME``.
+    Legacy records name their checkout relative to the checkout of the fleet
+    repository in their ``repository`` field (``.worktrees/dispatch/...``). Read
+    as written, such a path depends on the caller's cwd, and its lock refuses it
+    as not absolute. A relative path whose repository is missing, unknown or has
+    no local checkout is returned unchanged: it stays relative, so every reader
+    treats it as unknown (:func:`_path_state`) and its lock refuses it. Symlinks
+    are not resolved and ``~`` is not expanded, so the answer never depends on
+    ``HOME``.
     """
-    path = Path(raw)
-    return str(path if path.is_absolute() else state_root() / path)
+    if Path(raw).is_absolute():
+        return raw
+    slug = record.get("repository")
+    try:
+        checkout = default_repo_checkouts().get(slug) if isinstance(slug, str) else None
+    except fleet_repos.FleetRepoError:
+        checkout = None
+    return raw if checkout is None else str(checkout / raw)
+
+
+def _path_state(path: str) -> bool | None:
+    """Whether a recorded path exists: ``True``, ``False``, or ``None`` when that is unknown.
+
+    A dangling symlink counts as present. A spelling that is absent, such as
+    ``missing/../tree``, is also checked as the canonical path its lock takes,
+    since that checkout may still exist. A relative (unattributed) path, an
+    invalid value and any failure other than "not found" (``ELOOP``, ``EACCES``,
+    ``ENOTDIR``) are unknown, never absent.
+    """
+    if not os.path.isabs(path):
+        return None
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return None
+    try:
+        os.lstat(Path(path).resolve())
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return True
 
 
 def _owned_checkout(record: Mapping[str, Any]) -> str | None:
@@ -1638,19 +1677,21 @@ def _owned_checkout(record: Mapping[str, Any]) -> str | None:
     """
     raw = record.get("worktree_path")
     if isinstance(raw, str) and raw.strip():
-        return _anchored(raw)
+        return _anchored(raw, record)
     cwd = record.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
-        checkout = _anchored(cwd)
-        if not (Path(checkout) / ".git").is_dir():
+        checkout = _anchored(cwd, record)
+        if not (os.path.isabs(checkout) and (Path(checkout) / ".git").is_dir()):
             return checkout
     return None
 
 
 def _acp_runtime_paths(record: Mapping[str, Any]) -> list[str]:
-    """The record's non-empty ``acp_runtime_paths`` entries, :func:`_anchored`."""
+    """The record's non-blank string ``acp_runtime_paths`` entries, :func:`_anchored`."""
     paths = record.get("acp_runtime_paths")
-    return [_anchored(str(item)) for item in paths if item] if isinstance(paths, list) else []
+    if not isinstance(paths, list):
+        return []
+    return [_anchored(item, record) for item in paths if isinstance(item, str) and item.strip()]
 
 
 def keep_hot_reason(record: Mapping[str, Any]) -> str | None:
@@ -1659,13 +1700,16 @@ def keep_hot_reason(record: Mapping[str, Any]) -> str | None:
     The branch-holder release reads the hot record as the ownership proof for
     its checkout, and a task's ACP runtime worktrees are found only through
     ``acp_runtime_paths`` in the hot record. A path that still exists keeps the record hot whether or not it holds a
-    ``.git`` file.
+    ``.git`` file, and so does a path whose state is unknown (:func:`_path_state`).
     """
     checkout = _owned_checkout(record)
-    if checkout is not None and os.path.lexists(checkout):
-        return "worktree path still exists"
-    if any(os.path.lexists(item) for item in _acp_runtime_paths(record)):
+    if checkout is not None and (state := _path_state(checkout)) is not False:
+        return "worktree path still exists" if state else "worktree path state unknown"
+    states = {_path_state(item) for item in _acp_runtime_paths(record)}
+    if True in states:
         return "ACP runtime path still exists"
+    if None in states:
+        return "ACP runtime path state unknown"
     return None
 
 
@@ -2154,8 +2198,9 @@ def _build_parser() -> argparse.ArgumentParser:
             "Move terminal records (done, failed, no_deliverable, timeout, rate_limited, cancelled, crashed,\n"
             "dry_run, reaped) older than --min-age-days, with their .result and .snapshots sidecars, into\n"
             "batch_state/tasks/archive/. A record stays in place while its checkout path or any\n"
-            "acp_runtime_paths entry still exists; a relative path is read under the primary checkout.\n"
-            "Each move holds the record's lock and re-checks its mtime and status first."
+            "acp_runtime_paths entry still exists or cannot be checked; a relative path is read under the\n"
+            "checkout of the repository the record names. Each move holds the record's lock and re-checks\n"
+            "its mtime and status first."
         ),
         epilog=(
             "Examples:\n"

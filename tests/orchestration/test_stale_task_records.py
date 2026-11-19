@@ -1218,19 +1218,38 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
 
     Its lock refused it as not absolute ("worktree lock unavailable"), so archive
     skipped every such record while live tasks ran, and its keep-hot check looked
-    in the wrong directory. Dispatch resolves ``--worktree`` against the primary
-    checkout, and so must archive: from any cwd, with another task's claim held.
+    in the wrong directory. A relative path belongs to the checkout of the
+    repository its record names, from any cwd, with another task's claim held. A
+    path whose repository is unknown, or whose state cannot be read, keeps the
+    record hot rather than counting as gone.
     """
+    public, sibling_slug = "learn-ukrainian/learn-ukrainian.github.io", "learn-ukrainian/machinery"
     primary = configured_roots.primary
-    live = primary / ".worktrees" / "dispatch" / "codex" / "live"
+    sibling = tmp_path / "sibling"
+    monkeypatch.setattr(str_mod, "default_repo_checkouts", lambda: {public: primary, sibling_slug: sibling})
+    codex = Path(".worktrees") / "dispatch" / "codex"
+    live = primary / codex / "live"
     live.mkdir(parents=True)
-    (primary / ".worktrees" / "dispatch" / "codex" / "kept").mkdir()
-    _terminal(tasks_dir, "live-task", status="running", age_days=0, worktree_path=str(live))
-    _terminal(tasks_dir, "old-gone", status="failed", worktree_path=".worktrees/dispatch/codex/gone")
-    _terminal(tasks_dir, "old-kept", status="failed", worktree_path=".worktrees/dispatch/codex/kept")
-    # The caller's cwd holds the gone path and lacks the kept one: neither may decide.
+    (primary / codex / "kept").mkdir()
+    (sibling / codex / "sibling-kept").mkdir(parents=True)
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    _terminal(tasks_dir, "live-task", status="running", age_days=0, repository=public, worktree_path=str(live))
+    old = {"status": "failed", "repository": public}
+    _terminal(tasks_dir, "old-gone", **old, worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-kept", **old, worktree_path=str(codex / "kept"))
+    _terminal(tasks_dir, "old-canonical-kept", **old, worktree_path=str(codex / "missing" / ".." / "kept"))
+    _terminal(tasks_dir, "old-sibling-kept", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "sibling-kept"))
+    _terminal(tasks_dir, "old-unattributed", status="failed", repository="owner/elsewhere",
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-loop", **old, worktree_path=str(tmp_path / "loop" / "gone"))
+    _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[str(tmp_path / "acp\x00gone")])
+    _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"), acp_runtime_paths=[42, " ", "", None])
+    # The caller's cwd holds the gone path and the junk names and lacks the kept one: none may decide.
     elsewhere = tmp_path / "elsewhere"
-    (elsewhere / ".worktrees" / "dispatch" / "codex" / "gone").mkdir(parents=True)
+    for name in (codex / "gone", Path("42"), Path(" ")):
+        (elsewhere / name).mkdir(parents=True)
     monkeypatch.chdir(elsewhere)
     held, release = threading.Event(), threading.Event()
 
@@ -1252,11 +1271,24 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
         thread.join()
 
     assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
-        "old-gone.json": ("archived", None)
+        "old-gone.json": ("archived", None),
+        "old-acp-junk.json": ("archived", None),
     }
-    assert report["kept_hot"] == {"worktree path still exists": 1}
+    assert report["kept_hot"] == {
+        "worktree path still exists": 3,
+        "worktree path state unknown": 2,
+        "ACP runtime path state unknown": 1,
+    }
     assert live_still_held == worktree_claims.LOCK_BUSY
-    assert sorted(path.name for path in tasks_dir.glob("*.json")) == ["live-task.json", "old-kept.json"]
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "live-task.json",
+        "old-acp-nul.json",
+        "old-canonical-kept.json",
+        "old-kept.json",
+        "old-loop.json",
+        "old-sibling-kept.json",
+        "old-unattributed.json",
+    ]
     assert (tasks_dir / "archive" / "old-gone.json").is_file()
 
 
