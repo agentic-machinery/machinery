@@ -820,6 +820,7 @@ tests/helpers/claude_account_fixtures.py
 tests/helpers/codex_exec_stream.py
 tests/helpers/github_command_boundary.py
 tests/helpers/github_transport.py
+tests/helpers/host_env.py
 tests/helpers/interrupted_checkout.py
 tests/helpers/monitor.py
 tests/helpers/product_tree.py

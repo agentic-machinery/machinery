@@ -23,31 +23,12 @@ from lu_machinery.dispatcher import checks, cli, git, store, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.review.render_contract import trusted_core_context
 from tests.helpers import current_sol
+from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
-
-
-@pytest.fixture(autouse=True)
-def isolated_git(tmp_path_factory, monkeypatch):
-    """Every Git call here (fixture setup and the dispatcher's own) reads no caller, global or system config.
-
-    Autouse, so it applies before ``configured_roots`` initializes its repository. It drops every inherited
-    ``GIT_*`` variable (``GIT_CONFIG_COUNT`` and its indexed keys and values, ``GIT_CONFIG_PARAMETERS``,
-    ``GIT_DIR`` and the rest) and points the global config at a test-owned file that also disables the default
-    ignore and attributes files Git would otherwise read from the caller's home.
-    """
-    import os
-
-    for name in [name for name in os.environ if name.startswith("GIT_")]:
-        monkeypatch.delenv(name)
-    config = tmp_path_factory.mktemp("git-config") / "gitconfig"
-    # Unset, these two fall back to files under $XDG_CONFIG_HOME or $HOME (git/ignore, git/attributes).
-    config.write_text(f"[core]\n\texcludesFile = {os.devnull}\n\tattributesFile = {os.devnull}\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 
 @pytest.fixture
@@ -286,7 +267,7 @@ def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
     (prompts / "lexical-review.md.j2").write_text("Review {{ items }}\n")
     monkeypatch.setattr(review_mcp, "review_server_checkout", lambda: checkout)
 
-    # Git configuration is isolated by the module's autouse ``isolated_git`` fixture.
+    # Git configuration is isolated by the autouse ``host_isolated_env`` fixture (tests/helpers/host_env.py).
     # The dispatch commit: one public candidate file the manifest pins.
     inputs = (tmp_path / "inputs").resolve()
     inputs.mkdir()
