@@ -1016,7 +1016,9 @@ async def _cached_detached_orient_section(
 
     # Product sections may use their own TTL (including zero). Last-good is a
     # stale fallback, never another freshness window: it keeps its own
-    # ``generated_at`` and is labelled ``stale`` while its refresh runs or fails.
+    # ``generated_at``. With a positive TTL a current value is in the cache, so
+    # a last-good value read here is always stale. A zero-TTL value is current
+    # only when the refresh this read waited for has just published it.
     if last_good is not None and (ttl > 0 or _orient_clock() - last_good[2] < _ZERO_TTL_LAST_GOOD_MAX_AGE_S):
         value, generated_at, _stored_at = last_good
         meta: dict[str, Any] = {
@@ -1024,7 +1026,7 @@ async def _cached_detached_orient_section(
             "stale_after_s": ttl,
             "source": source,
             "cache": "miss",
-            "stale": refreshing or last_error is not None,
+            "stale": ttl > 0 or refreshing or last_error is not None,
             "refreshing": refreshing,
         }
         if last_error is not None:
