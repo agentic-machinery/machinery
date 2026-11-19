@@ -107,7 +107,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from lu_machinery.common.flake_quarantine import TIMEOUT_PATTERN, load_registry, rerun_node_ids
 from lu_machinery.common.repo_root import configured_primary_root, main_checkout_root
 from tests import sparse_trees
-from tests.helpers.host_env import CONTROLLER_PID_KEY
+from tests.helpers.host_env import LAUNCH_KEY, launch_record
 from tests.helpers.monitor import UNREACHABLE_MONITOR_URL, UNREACHABLE_TOOL_TIMING_URL
 
 pytest_plugins = [
@@ -2956,8 +2956,8 @@ def pytest_configure_node(node: Any) -> None:
     """
     node.workerinput[_XDIST_PUBLISHED_CREDENTIALS_KEY] = _published_credential_env()
     node.workerinput[_XDIST_REDACTION_SECRETS_KEY] = dict(_IMPORT_STRIPPED_SECRETS)
-    # tests/helpers/host_env.py reads the caller's environment from this process; a worker checks it is its parent.
-    node.workerinput[CONTROLLER_PID_KEY] = os.getpid()
+    # tests/helpers/host_env.py: what this process published and the worker's --tx env settings.
+    node.workerinput[LAUNCH_KEY] = launch_record(node.gateway.spec.env)
 
 
 def pytest_configure(config: pytest.Config) -> None:
