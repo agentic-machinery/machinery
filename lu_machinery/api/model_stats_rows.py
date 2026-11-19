@@ -9,8 +9,14 @@ window back to the first record.
 Writers: the dispatcher appends a row each time it writes a settled record (``record_settled``; the last row
 of a task id wins, so the final update decides), and ``backfill`` adds a row for every settled record that has
 none. Both hold ``rows.lock``; neither ever changes a task record. Rows carry labels, counts, timestamps, PR
-numbers and commit SHAs only, plus, for an unparsed review reply, its typed ``unparsed_reason`` and up to 200
+numbers and commit SHAs only, plus, for a structured review, a 16-hex digest of each blocking finding's file path
+(``blocking_paths``, never the path), and for an unparsed review reply, its typed ``unparsed_reason`` and up to 200
 escaped characters of that reply: no prompt, parsed body, error text, account identity or host path.
+
+Beside the rows, ``publications.jsonl`` is the published-verdict ledger (#902): one line per verdict the recorder
+published on a PR (task id, repository, PR, head, verdict, GitHub's comment time). Its one writer is
+``record_cf_verdict`` under the same ``rows.lock``; the statistics count a review's verdict only when the ledger
+names it.
 """
 
 from __future__ import annotations
@@ -28,19 +34,24 @@ import sys
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_credentials import repository_registry
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
-from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
+from lu_machinery.fleet_comms.review_publication import (
+    BLOCKING_PRIORITIES,
+    ReviewPublicationError,
+    normalize_verdict,
+)
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.orchestration.task_record_store import iter_task_records
@@ -76,6 +87,7 @@ _FIELD_CONTRACT_ERRORS = (
     "review_envelope_invalid_verdict:",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_PATH_DIGEST = re.compile(r"[0-9a-f]{16}\Z")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -484,8 +496,17 @@ def _recorded_review(verdict: object) -> dict[str, Any] | None:
         return None
 
 
+def path_digest(path: str) -> str:
+    """The stored form of a finding's repository-relative path: equal paths compare equal, the path never shows."""
+    return hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
 def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
-    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause."""
+    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause.
+
+    A ``code-review-findings.v1`` reply also keeps the path digest of each blocking (P0-P1) finding's location, so
+    the statistics can tell whether the author's next commits touched that file.
+    """
     def fail(reason: str) -> dict[str, Any]:
         return _unparsed(reason, _sample(raw) if allow_sample else None)
 
@@ -504,7 +525,10 @@ def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
-            return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
+            # The schema the payload just passed requires every finding's priority and location path.
+            paths = sorted(path_digest(finding["location"]["path"]) for finding in payload["findings"]
+                           if finding["priority"] in BLOCKING_PRIORITIES)
+            return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts), "blocking_paths": paths}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
             recorded = _recorded_review(payload["verdict"])
             return recorded if recorded is not None else fail("bad_fields")
@@ -668,24 +692,28 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
+def _append_line(path: Path, line: Mapping[str, Any]) -> None:
+    """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
+    fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+    try:
+        size = os.fstat(fd).st_size
+        open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
+        _write_all(fd, (b"\n" if open_fragment else b"") + _line(line))
+    finally:
+        os.close(fd)
+
+
 def append_row(batch_state_dir: Path, row: Mapping[str, Any] | Callable[[], Mapping[str, Any] | None],
                wait_s: float | None = None) -> None:
-    """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line.
+    """Append one whole row line under ``rows.lock``.
 
     ``row`` may be a function, called under the lock: the sidecar it reads is then never older than a row another
     writer has already stored.
     """
     with _locked(batch_state_dir, wait_s) as path:
         line = row() if callable(row) else row
-        if line is None:
-            return
-        fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
-        try:
-            size = os.fstat(fd).st_size
-            open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
-            _write_all(fd, (b"\n" if open_fragment else b"") + _line(line))
-        finally:
-            os.close(fd)
+        if line is not None:
+            _append_line(path, line)
 
 
 def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path, source_mtime_ns: int) -> None:
@@ -697,6 +725,122 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
         append_row(batch_state_dir, lambda: summary_row(path, record, source_mtime_ns), SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
+
+
+# The published-verdict ledger (#902): one line per verdict the recorder published on a PR as the review of record,
+# in ``<batch_state>/model-stats/publications.jsonl``. Its one writer is ``record_cf_verdict`` (each ``record`` and
+# the one-shot ``import-publications``); the statistics read it and never reach GitHub. A review without a line is
+# of unknown publication.
+PUBLICATION_SCHEMA = "review-publication.v1"
+PUBLICATIONS_FILE = "publications.jsonl"
+PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
+_PUBLICATION_KEYS = frozenset({"schema", "task_id", "repository", "pr", "head", "verdict", "published_at"})
+REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
+
+
+def _publication_ok(entry: object) -> bool:
+    if not isinstance(entry, dict) or entry.keys() != _PUBLICATION_KEYS:
+        return False
+    pr, repository = entry["pr"], entry["repository"]
+    return (entry["schema"] == PUBLICATION_SCHEMA and valid_task_id(entry["task_id"])
+            and isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) is not None
+            and _count_value(pr) and pr > 0 and _sha(entry["head"])
+            and isinstance(entry["verdict"], str) and entry["verdict"] in PUBLISHED_VERDICTS
+            and timestamp(entry["published_at"]) is not None)
+
+
+def publication(*, task_id: str, repository: str, pr: int, head: str, verdict: str,
+                published_at: object) -> dict[str, Any]:
+    """One ledger line: which review task's verdict was published on which PR head, and when GitHub stored it.
+
+    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted). Raises
+    ValueError when a field has the wrong shape, so a malformed line is never written.
+    """
+    entry = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr, "head": head,
+             "verdict": verdict, "published_at": published_at}
+    if not _publication_ok(entry):
+        raise ValueError("publication field has the wrong shape")
+    return entry
+
+
+def _publication_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]:
+    try:
+        fd = _open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        counts["missing"] += 1
+        return []
+    entries = []
+    with os.fdopen(fd, "rb") as stream:
+        for line in stream:
+            try:
+                entry = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+            except (ValueError, RecursionError):
+                entry = None
+            if not _publication_ok(entry):
+                counts["malformed_lines"] += 1
+                continue
+            entries.append(entry)
+    counts["lines"] = len(entries)
+    return entries
+
+
+def publication_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
+    """What makes two ledger lines the same publication: the task, the head and the verdict."""
+    return (entry["task_id"], entry["head"], entry["verdict"])
+
+
+def publication_keys(batch_state_dir: Path) -> set[tuple[str, str, str]]:
+    """The keys of every well-formed ledger line."""
+    return {publication_key(e) for e in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, Counter())}
+
+
+def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, Any]],
+                        wait_s: float | None = None) -> int:
+    """Append, under ``rows.lock``, each entry the ledger does not hold yet (by ``publication_key``); the count added.
+
+    Every entry is checked before anything is written: one malformed entry raises ValueError and writes nothing.
+    TimeoutError when ``wait_s`` passes before the lock is free; OSError when the ledger cannot be written.
+    """
+    checked = [dict(entry) for entry in entries]
+    if not all(_publication_ok(entry) for entry in checked):
+        raise ValueError("publication field has the wrong shape")
+    with _locked(batch_state_dir, wait_s) as rows_file:
+        path = rows_file.with_name(PUBLICATIONS_FILE)
+        present = {publication_key(e) for e in _publication_lines(path, Counter())}
+        added = 0
+        for entry in checked:
+            if (key := publication_key(entry)) not in present:
+                _append_line(path, entry)
+                present.add(key)
+                added += 1
+        return added
+
+
+def read_publications(batch_state_dir: Path) -> tuple[dict[str, dict[str, Any]], Counter[str]]:
+    """Each review task's latest published verdict by GitHub's comment time (a later line breaks a tie, so a history
+    import appended after a newer publication never supersedes it), and read counts. A missing ledger gives no
+    entries: every review is then of unknown publication."""
+    counts: Counter[str] = Counter()
+    latest: dict[str, dict[str, Any]] = {}
+    for entry in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, counts):
+        current = latest.get(entry["task_id"])
+        if current is None or cast(datetime, timestamp(entry["published_at"])) >= cast(
+                datetime, timestamp(current["published_at"])):
+            latest[entry["task_id"]] = entry
+    counts["tasks"] = len(latest)
+    return latest, counts
+
+
+def repository_keys() -> dict[str, str]:
+    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``), read from
+    the file now: the registry cache is cleared first, so a catalog that was unreadable, or valid, at an earlier
+    reading is never reused. Empty when the catalog cannot be read, so no publication matches a row in that reading."""
+    repository_registry.cache_clear()
+    try:
+        repos = load_fleet_repos()
+    except Exception:  # fail closed: an unreadable catalog matches no publication
+        return {}
+    return {repo.github.lower(): key for key, repo in repos.items()}
 
 
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")
@@ -770,6 +914,11 @@ def _review_ok(review: object, *, role: object, status: object, repo: object, da
         return False
     if review.keys() == {"verdict", "priorities"}:
         return True
+    if review.keys() == {"verdict", "priorities", "blocking_paths"}:
+        paths = review["blocking_paths"]
+        return (verdict != "unparsed" and isinstance(priorities, dict) and isinstance(paths, list)
+                and all(isinstance(p, str) and _PATH_DIGEST.fullmatch(p) for p in paths)
+                and len(paths) == sum(priorities.get(p, 0) for p in BLOCKING_PRIORITIES))
     if verdict != "unparsed" or priorities is not None or review.keys() != {
         "verdict", "priorities", "unparsed_reason", "unparsed_sample",
     }:
