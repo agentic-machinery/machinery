@@ -6,7 +6,7 @@ from dataclasses import replace
 import sys
 import pytest
 from lu_machinery.dispatcher import environment, worker, write_boundary
-from lu_machinery.dispatcher.types import Invocation, TaskSpec
+from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from tests.helpers.product_tree import configured_roots as configured_roots
 import contextlib
 import json
@@ -197,6 +197,57 @@ def test_read_only_agy_run_needs_a_verified_boundary_receipt(sandbox, monkeypatc
     else:
         assert result["status"] == "failed" and "sources_mcp_call_count" not in result
         assert result["error"].startswith("agy_read_only_boundary: ")
+    assert result.get("never_started_reason") is None  # The provider ran, even when its boundary receipt was invalid.
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("agent", ["codex", "agy"])
+@pytest.mark.parametrize("boundary_status", ["refused", "interrupted", None])
+def test_boundary_exit_125_needs_a_pre_launch_receipt(tmp_path, monkeypatch, agent, boundary_status):
+    """Exit 125 can mean a boundary refusal, a failed running boundary or the provider's own exit."""
+    from types import SimpleNamespace
+
+    tasks = tmp_path / "tasks"
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(worker, "_reap_settled", lambda *_a, **_kw: None)
+    monkeypatch.setattr(worker, "create_dispatch_lease", lambda *_a: None)
+    monkeypatch.setattr(worker, "_discard_read_only_scratch", lambda *_a: None)
+    monkeypatch.setattr(git, "pin_settlement_registry", lambda: None)
+    monkeypatch.setattr(git, "snapshot_delivery", lambda *_a: {})
+    monkeypatch.setattr(worker.headroom, "check_plan", lambda *_a, **_kw: None)
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_a, **_kw: None)
+    monkeypatch.setattr(agy_sandbox, "unavailable", lambda: None)
+    marker = tasks / "provider-ran"
+    argv = [sys.executable, "-c", "raise SystemExit(125)"]
+    if boundary_status != "refused":
+        argv = [sys.executable, "-c", "from pathlib import Path; import sys; Path(sys.argv[1]).touch(); sys.exit(125)",
+                str(marker)]
+    provider = SimpleNamespace(parse=lambda *_a: ParsedResult(None, None, "fixture exit 125"))
+    monkeypatch.setattr(worker.providers, "load", lambda _agent: provider)
+    monkeypatch.setattr(worker.runtime_context, "build", lambda _s, env: Invocation(argv, None, env, None))
+    monkeypatch.setattr(write_boundary, "launcher", lambda _spec, invocation, _task: invocation.argv)
+    spec = TaskSpec("boundary-ro", agent, "echo", None, "read-only", tmp_path,
+                    tmp_path / "prompt", tasks / "boundary-ro.result")
+    spec.prompt_file.write_text("Fixture prompt")
+    record = store.new_record(spec, {"key": "public", "github": "fixture/repo"}, "main", "1" * 40,
+                              {"research_owned_path": []})
+    record["prompt_file"] = str(tasks / "boundary-ro.prompt")
+    path = store.create(record, b"Fixture prompt")
+    (tasks / "logs").mkdir()
+    if boundary_status:
+        boundary = write_boundary if agent == "codex" else agy_sandbox
+        receipt_base = path if agent == "codex" else spec.final_file
+        boundary.receipt_file(receipt_base).write_text(json.dumps({
+            "schema": boundary.SCHEMA, "task_id": spec.task_id, "status": boundary_status, "mode": "read-only",
+            "reason": "fixture boundary", "canary": {"passed": False},
+        }))
+
+    worker.supervise(path, {}, 10)
+
+    result = store.read(spec.task_id)
+    assert (result["status"], result["returncode"], result["usage"]) == ("failed", 125, None)
+    assert result.get("never_started_reason") == ("boundary_refusal" if boundary_status == "refused" else None)
+    assert marker.exists() == (boundary_status != "refused")
 
 
 @pytest.mark.usefixtures('configured_roots')

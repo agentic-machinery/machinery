@@ -19,6 +19,16 @@ from tests.helpers import current_sol
 CURRENT_SOL = current_sol()
 
 
+def _assert_pre_start_refusal(record, cause, *, status="failed"):
+    assert record["status"] == status
+    assert record["never_started_reason"] == cause
+    assert record.get("provider_pgid") is None and record["usage"] is None
+    assert "admission_hold" not in record
+
+
+def _admission_refusal(task_id):
+    [refusal] = [record for record in store.list_tasks() if record.get("requested_task_id") == task_id]
+    return refusal
 
 
 
@@ -38,7 +48,7 @@ CURRENT_SOL = current_sol()
         (["--agent", "codex", "--claude-account", "szb"], "claude_account_seat_unsupported"),
     ],
 )
-def test_dispatch_refuses_claude_account_before_any_side_effect(tmp_path, monkeypatch, capsys, extra, code):
+def test_dispatch_records_claude_account_refusal_before_worktree_or_slot(tmp_path, monkeypatch, capsys, extra, code):
     from lu_machinery.dispatcher import cli
 
     tasks = tmp_path / "tasks"
@@ -53,7 +63,9 @@ def test_dispatch_refuses_claude_account_before_any_side_effect(tmp_path, monkey
     err = capsys.readouterr().err
     assert f"CLAUDE_ACCOUNT_REFUSED: {code}\n" in err
     assert "fixture-ambient" not in err
-    assert not tasks.exists()
+    refusal = _admission_refusal("claude-account-refused")
+    _assert_pre_start_refusal(refusal, "account_check")
+    assert {path.name for path in tasks.iterdir()} == {f"{refusal['task_id']}.json", f"{refusal['task_id']}.json.lock"}
 
 
 @pytest.mark.parametrize("mode", ["read-only", "workspace-write"])
@@ -198,7 +210,7 @@ def test_dispatch_ambiguous_scope_start_marks_task_failed(tmp_path, monkeypatch)
         worker.start(spec, record, b"prompt", 60)
 
     state = json.loads(path.read_text())
-    assert state["status"] == "failed"
+    _assert_pre_start_refusal(state, "worker_placement")
     assert state["pid"] is None
     assert state["error"].startswith("dispatch_isolation_failed: ")
     assert "will not be relaunched" in state["error"]
@@ -224,7 +236,7 @@ def test_dispatch_fallback_refusal_records_no_worker_started(tmp_path, monkeypat
     spawn.assert_called_once()
     popen.assert_not_called()
     state = json.loads(path.read_text())
-    assert state["status"] == "failed"
+    _assert_pre_start_refusal(state, "worker_placement")
     assert state["pid"] is None
     assert state["error"].startswith("dispatch_fallback_refused: ")
     assert refusal in state["error"]
@@ -248,7 +260,7 @@ def test_dispatch_popen_failure_records_worktree_head(tmp_path, monkeypatch) -> 
         worker.start(spec, record, b"prompt", 60)
 
     state = json.loads(path.read_text())
-    assert state["status"] == "failed"
+    _assert_pre_start_refusal(state, "worker_placement")
     assert state["pid"] is None
     assert state["error"] == "worker_spawn_failed: Popen failed: FileNotFoundError: no such file"
     assert state["head_sha"] == "a" * 40
@@ -357,6 +369,55 @@ def test_read_only_dispatch_is_exempt(admission_dispatch, monkeypatch, capsys):
     assert "admission" not in store.read("adm-worker")
 
 
+@pytest.mark.parametrize("gate,cause,rc", [
+    ("boundary", "boundary_refusal", 2),
+    ("headroom", "headroom", 3),
+])
+def test_pre_start_checks_do_not_reserve_a_worker(tmp_path, monkeypatch, gate, cause, rc):
+    """A missing boundary or exhausted runtime meter used to be caught after reserving a worker."""
+    from lu_machinery.dispatcher import admission, agy_sandbox, cli, headroom, host_admission
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("admission allocated a hold or worktree for a refused task")
+
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(git, "resolve_repo", lambda _repo: (tmp_path, {"key": "public", "github": "fixture/repo"}))
+    monkeypatch.setattr(git, "worktree_plan", lambda *_a, **_kw: (tmp_path / "planned", "fixture", "1" * 40))
+    monkeypatch.setattr(admission, "codex_account", lambda *_a: {"codex_account": "sub"})
+    monkeypatch.setattr(headroom, "check_plan", lambda *_a, **_kw: None)
+    monkeypatch.setattr(host_admission, "check_credit", lambda *_a: None)
+    monkeypatch.setattr(host_admission, "check", lambda *_a, **_kw: None)
+    monkeypatch.setattr(host_admission, "reserve", forbidden)
+    monkeypatch.setattr(git, "create_worktree", forbidden)
+    monkeypatch.setattr(worker, "start", forbidden)
+    if gate == "boundary":
+        monkeypatch.setattr(agy_sandbox, "native_unavailable", lambda: "fixture boundary is unavailable")
+    else:
+        def refused(agent, model, *, codex_account):
+            assert codex_account == "sub"
+            raise headroom.RateLimitedError(agent, model, "fixture headroom exhausted")
+
+        monkeypatch.setattr(headroom, "check_runtime", refused)
+    args = ["dispatch", "--agent", "codex", "--model", CURRENT_SOL, "--mode", "read-only",
+            "--task-id", "adm-worker", "--prompt", "Fixture prompt"]
+    assert cli.main(args) == rc
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), cause)
+    assert store.read("adm-worker", missing_ok=True) is None
+    assert not (tmp_path / "planned").exists()
+    # A later invocation with the same id can reach reservation when its original gate clears.
+    monkeypatch.setattr(agy_sandbox, "native_unavailable", lambda: None)
+    monkeypatch.setattr(headroom, "check_runtime", lambda *_a, **_kw: None)
+    calls = []
+
+    def reached_reservation(task_id, *_args, **_kwargs):
+        calls.append(task_id)
+        raise host_admission.Refused("fixture reservation reached", 3)
+
+    monkeypatch.setattr(host_admission, "reserve", reached_reservation)
+    assert cli.main(args) == 3
+    assert calls == ["adm-worker"]
+
+
 def test_full_shared_pool_refuses_a_write_worker(admission_dispatch, tmp_path, monkeypatch, capsys):
     """Ported from tests/test_dispatch_admission.py::test_full_shared_pool_refuses_a_write_worker."""
 
@@ -367,7 +428,7 @@ def test_full_shared_pool_refuses_a_write_worker(admission_dispatch, tmp_path, m
             "(DISPATCH_WORKER_MEM_RESERVE_GIB=2.5)") in capsys.readouterr().err
     assert not admission_dispatch.spawned
     assert not (admission_dispatch.box.repo / ".worktrees").exists()
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "admission_capacity")
 
 
 def test_file_cache_does_not_count_against_the_pool(admission_dispatch, tmp_path, monkeypatch, capsys):
@@ -406,7 +467,7 @@ def test_locked_recheck_refuses_a_dispatch_that_lost_the_race(admission_dispatch
     assert len(calls) == 2
     assert "live write workers 1/1 reached the cap" in capsys.readouterr().err
     assert not admission_dispatch.spawned
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "admission_capacity")
     assert dispatch_admission.scan_task_records(admission_dispatch.box.tasks).live_task_ids == ("competitor",)
 
 
@@ -440,7 +501,7 @@ def test_admitted_dispatch_holds_its_slot_while_the_worktree_is_created(admissio
 
 
 @pytest.mark.parametrize("handed_off", [False, True])
-def test_dispatch_that_stops_after_admission_drops_only_its_setup_hold(admission_dispatch, monkeypatch, capsys, handed_off):
+def test_dispatch_that_stops_after_admission_settles_only_its_setup_hold(admission_dispatch, monkeypatch, capsys, handed_off):
     """An unused hold is released, but a published task must survive a PID-less handoff fault (#490)."""
     def disappear(*_args, **_kwargs):
         assert store.read("adm-worker")["admission_hold"]
@@ -466,6 +527,7 @@ def test_dispatch_that_stops_after_admission_drops_only_its_setup_hold(admission
         assert record["worktree_branch"] == "codex/adm-worker"
     else:
         assert record is None
+        _assert_pre_start_refusal(_admission_refusal("adm-worker"), "setup_refusal")
 
 
 def test_admission_marks_a_record_whose_dispatcher_died_crashed(admission_dispatch):
@@ -586,8 +648,8 @@ site_deps.provision = _provision
 
 @pytest.mark.parametrize("mode", ["workspace-write", "read-only"])
 @pytest.mark.parametrize("stage", ["attributed", "mkdir", "add", "sparse", "reset", "creator", "provision", "record"])
-def test_creation_exception_releases_hold_only_after_verified_absence(admission_dispatch, monkeypatch, mode, stage):
-    """An unwound creation must keep its reservation when any tree survives (#490)."""
+def test_creation_exception_settles_hold_and_preserves_worktree_attribution(admission_dispatch, monkeypatch, mode, stage):
+    """An unwound creation must keep its attribution when any tree survives (#490)."""
     from pathlib import Path
     from lu_machinery.orchestration import worktree_claims
 
@@ -630,11 +692,12 @@ def test_creation_exception_releases_hold_only_after_verified_absence(admission_
     if stage == "attributed":
         assert not tree.exists()
         assert record is None
+        _assert_pre_start_refusal(_admission_refusal("adm-worker"), "setup_refusal")
     else:
+        _assert_pre_start_refusal(record, "setup_refusal")
         assert tree.exists()
         assert record["worktree_path"] == str(tree)
         assert record["worktree_branch"] == "codex/adm-worker"
-        assert record["admission_hold"]["run_nonce"] == record["run_nonce"]
 
 
 @pytest.mark.parametrize("state", ["absent", "dangling", "unreadable"])
@@ -677,7 +740,7 @@ def test_admission_refuses_off_allowlist_model_on_credit_balance_lane(admission_
     assert "credit_lanes.yaml" in err
     assert not admission_dispatch.spawned
     assert not (admission_dispatch.box.repo / ".worktrees").exists()
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "headroom")
 
 
 @pytest.mark.parametrize("model", [CURRENT_SOL, "gpt-6-luna", "codex:gpt-6-luna", CURRENT_SOL.upper(), None])
@@ -737,7 +800,7 @@ def test_live_forced_dispatch_on_a_full_disk_stops_at_the_first_gate(admission_d
     assert disk["alerts"]
     assert "--force-admission cannot override a full disk" in capsys.readouterr().err
     assert not admission_dispatch.spawned
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "admission_capacity")
     assert not (admission_dispatch.box.repo / ".worktrees").exists()
 
 
@@ -750,7 +813,7 @@ def test_locked_recheck_holds_a_disk_refusal_against_a_force_reason(admission_di
     err = capsys.readouterr().err
     assert "disk 90.0% used" in err and "--force-admission cannot override a full disk" in err
     assert not admission_dispatch.spawned
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "admission_capacity")
 
 
 def test_force_admission_skips_the_early_refusal(admission_dispatch, monkeypatch, capsys):
@@ -805,7 +868,7 @@ def test_spawn_setup_failure_never_strands_published_record(tmp_path, monkeypatc
     with pytest.raises(expected):
         worker.start(spec, record, b"submitted prompt", 60)
     state = store.read(spec.task_id)
-    assert state["status"] == "failed"
+    _assert_pre_start_refusal(state, "setup_refusal")
     assert state["returncode_reason"] == "spawn_setup_failed"
     assert state["pid"] is None
     assert state["finished_at"]
@@ -1060,7 +1123,7 @@ def test_cto_safe_mode_refuses_a_cto_write_dispatch(admission_dispatch, tmp_path
     assert "CTO_SAFE_MODE: write dispatch refused" in err
     assert str(path) in err and "two fast deaths" in err and "out-7" in err
     assert not admission_dispatch.spawned
-    assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
+    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "route_eligibility")
 
 
 @pytest.mark.parametrize("directory_mode", [None, 0o300], ids=["no-directory", "cleared-traverse-only-directory"])

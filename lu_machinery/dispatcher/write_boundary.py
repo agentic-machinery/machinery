@@ -1307,9 +1307,7 @@ class _Boundary:
         except ReviewIsolationError as exc:
             raise Refused("bubblewrap is unavailable") from exc
         # The private HOME layer uses bubblewrap overlays (--overlay-src, bubblewrap 0.10 and later).
-        usage = subprocess.run([str(bwrap), "--help"], capture_output=True, text=True, timeout=30, check=False,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                               stdin=subprocess.DEVNULL)
-        if "--overlay-src" not in usage.stdout + usage.stderr:
+        if not agy_sandbox.supports_overlay(bwrap):
             raise Refused("bubblewrap 0.10 or later is required (--overlay-src)")
         command = self.args.command[1:] if self.args.command[:1] == ["--"] else self.args.command
         if not command or not Path(command[0]).is_absolute():

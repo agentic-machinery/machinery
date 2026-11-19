@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
-from lu_machinery.dispatcher.types import ReviewAttempt
+from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
     TaskIdentityMismatch,
     is_identical_copy,
@@ -143,7 +143,7 @@ def new_record(
 ) -> dict:
     record = dict(pid=None, process_start=None, finished_at=None, duration_s=None, returncode=None)
     record.update(result_sha256=None, usage=None, head_sha=None, remote_head_sha=None, commits_ahead=None)
-    record.update(worktree_dirty_on_exit=None, error=None)
+    record.update(worktree_dirty_on_exit=None, error=None, never_started_reason=None)
     record["owned_paths"] = list(metadata.get("owned_path") or [])
     record["worktree_base_ref"] = metadata.get("base") or "origin/main"
     from lu_machinery.dispatcher.git import canonical_origins, verification_origin
@@ -335,6 +335,54 @@ def create(record: dict, prompt: bytes) -> Path:
     with open(record["prompt_file"], "xb", opener=lambda p, f: os.open(p, f, 0o600)) as stream:
         stream.write(prompt)
     return path
+
+
+def record_admission_refusal(
+    requested_task_id: str | None, agent: str, metadata: dict, reason: StartRefusal, *, hold: dict | None = None,
+) -> None:
+    """Record the refusal without consuming the requested id or losing an attributed worktree."""
+    when = now()
+    refusal_id = uuid.uuid4().hex
+    record = {name: metadata.get(name) for name in (
+        "model", "effort", "mode", "repo", "pr", "pinned_head", "research_task_family", "data_class",
+    )}
+    record.update(
+        schema_version=2, task_id=refusal_id, requested_task_id=requested_task_id,
+        agent=agent, run_nonce=uuid.uuid4().hex, status="failed", never_started_reason=reason,
+        started_at=when, finished_at=when, duration_s=0, pid=None, provider_pgid=None, usage=None, error=reason,
+        review_profile=metadata.get("review_profile"), review_risk=metadata.get("risk"),
+        review_author_model=metadata.get("review_author_model"),
+    )
+    if hold is not None:
+        task_id = hold["task_id"]
+        path = record_path(task_id)
+        with task_state_lock(path):
+            current = read(task_id, missing_ok=True)
+            if not (current is not None and current.get("run_nonce") == hold["run_nonce"]
+                    and current.get("admission_hold") == hold["admission_hold"]
+                    and current.get("status") == "spawning" and "prompt_file" not in current):
+                return  # A caller cannot settle another run or a hold already handed to a supervisor.
+            record["started_at"] = hold["started_at"]
+            elapsed = datetime.fromisoformat(when) - datetime.fromisoformat(hold["started_at"])
+            record["duration_s"] = max(0, elapsed.total_seconds())
+            if _worktree_may_exist(current.get("worktree_path")):
+                current.update(record, task_id=task_id, run_nonce=hold["run_nonce"], repo=current["repo"])
+                _write(path, current)  # Its worktree can still need cleanup under the original id.
+                return
+    # With no tree, reserve() releases its hold as before. The refused attempt has its own id.
+    _write(record_path(refusal_id), record, exclusive=True)
+
+
+def _worktree_may_exist(path: str | None) -> bool:
+    if not path:
+        return False
+    try:
+        Path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass  # Keep ownership if the check could not prove absence.
+    return True
 
 
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:

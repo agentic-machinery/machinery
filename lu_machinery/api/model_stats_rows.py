@@ -39,6 +39,7 @@ from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCO
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
+from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
@@ -93,6 +94,62 @@ POOLS = frozenset({*(f"claude:{label}" for label in CLAUDE_SUBSCRIPTION_ACCOUNT_
                    "codex:a", "codex:b", "agy_claude", "gemini", "cursor"})
 
 _log = logging.getLogger(__name__)
+
+_REFUSAL_CODES = frozenset(StartRefusal)
+_PRE_START_ERRORS = {
+    "CLAUDE_ACCOUNT_REFUSED": StartRefusal.ACCOUNT,
+    "fallback_adoption_unavailable": StartRefusal.PLACEMENT,
+    "settlement_registry_unavailable": StartRefusal.SETUP,
+    "task_scratch_unavailable": StartRefusal.SETUP,
+    "read_only_scratch_unavailable": StartRefusal.SETUP,
+    "output schema binding invalid": StartRefusal.SETUP,
+    "read_only_unenforceable": StartRefusal.BOUNDARY,
+    "write_boundary_refused": StartRefusal.BOUNDARY,  # no wrapper PID and no exit code: launcher construction
+    "review_attempt_refused": StartRefusal.REVIEW_SETUP,
+    "MODEL_PAUSED": StartRefusal.HEADROOM,
+    "MODEL_HEADROOM": StartRefusal.HEADROOM,
+    "MODEL_HEADROOM_USAGE_UNKNOWN": StartRefusal.HEADROOM,
+    "MODEL_HEADROOM_MONITOR_UNAVAILABLE": StartRefusal.HEADROOM,
+    "MODEL_ROLE_BANNED": StartRefusal.ELIGIBILITY,
+    "MODEL_ROLE_REQUIRED": StartRefusal.ELIGIBILITY,
+    "MODEL_ROLE_POLICY_INVALID": StartRefusal.ELIGIBILITY,
+    "MODEL_ROLE_TRIAL_SHADOW_REQUIRED": StartRefusal.ELIGIBILITY,
+}
+
+
+def start_refusal(record: Mapping[str, Any]) -> str | None:
+    """Use the typed dispatcher reason, or require pre-start evidence from a legacy record."""
+    status = record.get("status")
+    if status not in ("failed", "rate_limited", "crashed") or any(tokens(record.get("usage"))):
+        return None
+    if "never_started_reason" in record:
+        # A modern settlement can rule out a refusal even when its last launch exited 125.
+        reason = record["never_started_reason"]
+        return reason if isinstance(reason, str) and reason in _REFUSAL_CODES else None
+    if status != "failed" or record.get("result_sha256") or record.get("resolved_model_known") is True:
+        return None
+
+    error = record.get("error")
+    code = error.partition(":")[0] if isinstance(error, str) else None
+    exit_code = record.get("returncode")
+    if exit_code == 125:
+        # 125 can also be the provider's exit or a boundary interrupted after launch.
+        boundary = record.get("write_boundary" if code == "write_boundary_refused" else "read_only_boundary")
+        if (code in ("write_boundary_refused", "agy_read_only_boundary")
+                and isinstance(boundary, Mapping) and boundary.get("status") == "refused"):
+            return StartRefusal.BOUNDARY
+    if code == "agy_model_unavailable":
+        return StartRefusal.MODEL_UNAVAILABLE  # the AGY parser proved a clean, zero-turn model selection error
+    if exit_code is not None or record.get("provider_pgid") is not None:
+        return None
+    launch_code = record.get("returncode_reason")
+    if launch_code in ("dispatch_fallback_refused", "dispatch_isolation_failed", "worker_spawn_failed"):
+        return StartRefusal.PLACEMENT
+    if launch_code == "spawn_setup_failed":
+        return StartRefusal.SETUP
+    if isinstance(error, str) and error.startswith("formal attempt filesystem boundary refused: prepare:"):
+        return StartRefusal.BOUNDARY
+    return _PRE_START_ERRORS.get(code) if code is not None else None
 
 
 def label(value: object, default: str = "unknown") -> str:
@@ -519,6 +576,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     status = record.get("status")
     if not valid_task_id(task_id) or not isinstance(status, str) or status in ACTIVE:
         return None
+    refusal = start_refusal(record)
     options = _options(record)
     role = role_of(record)
     if role == "review":
@@ -541,12 +599,13 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "effort": effective_effort(record),
         "role": role,
         "class": task_class,
-        "status": label(status, "other"),
+        "status": NEVER_STARTED if refusal else label(status, "other"),
+        "never_started_reason": refusal,
         "started_at": _iso(record.get("started_at")),
         "finished_at": _iso(record.get("finished_at")),
         "duration_s": _number(record.get("duration_s")),
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
-        "allowance": _allowance(record),
+        "allowance": None if refusal else _allowance(record),
         "review": _review(path, record) if role == "review" and status == "done" else None,
         "repo": repo,
         "data_class": None if raw_class is None else label(raw_class),
@@ -735,6 +794,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
     return all((
         all(_optional(row.get(name), lambda v: timestamp(v) is not None) for name in ("started_at", "finished_at")),
         _optional(row.get("duration_s"), _measure),
+        _optional(row.get("never_started_reason"), lambda v: isinstance(v, str) and v in _REFUSAL_CODES
+                  and row.get("status") == NEVER_STARTED),
         isinstance(tokens_, dict) and tokens_.keys() == {"fresh_input", "cached_input", "output"}
         and all(_count_value(v) for v in tokens_.values()),
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
@@ -812,7 +873,9 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     source = candidate["source_mtime_ns"]
     if not isinstance(stored, int) or stored < source:
         return True
-    return stored == source and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
+    return stored == source and any(present.get(key) != candidate[key] for key in (
+        "review", "effort", "pinned_head", "never_started_reason",
+    ))
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:

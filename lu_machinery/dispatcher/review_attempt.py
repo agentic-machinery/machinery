@@ -31,6 +31,7 @@ import yaml
 
 from lu_machinery.common import json_depth
 from lu_machinery.dispatcher import store
+from lu_machinery.dispatcher.types import StartRefusal
 
 
 def admit(args: Any, prompt: bytes, binding: dict, repo: Path, sha: str) -> dict:
@@ -105,6 +106,7 @@ class Outcome:
     sources_calls: int | None
     identity: dict
     trace: list = field(default_factory=list)
+    start_refusal: StartRefusal | None = None
 
 
 def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int]) -> Outcome:
@@ -120,8 +122,12 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
         AgentRuntimeError,
         AgentStalledError,
         AgentTimeoutError,
+        AgentUnavailableError,
         RateLimitedError,
+        RulesCoreDeliveryError,
+        RulesCoreMissingError,
     )
+    from lu_machinery.agent_runtime.result import AgyTelemetry
     from lu_machinery.agent_runtime.review_mcp import prepare_review_attempt, review_attempt_tool_config
     from lu_machinery.review.isolation import ReviewIsolationError
     from lu_machinery.review.product_hooks import attempt_hooks
@@ -164,7 +170,8 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
             base_tool_config=_route(spec, record),
         )
     except (OSError, ValueError, ReviewIsolationError) as exc:
-        return Outcome("failed", f"review_attempt_refused: {exc}"[:500], None, None, unknown)
+        return Outcome("failed", f"review_attempt_refused: {exc}"[:500], None, None, unknown,
+                       start_refusal=StartRefusal.REVIEW_SETUP)
     hard, silence, initial = deadlines
     egress_evidence: dict = {}
     try:
@@ -180,6 +187,15 @@ def run(spec: Any, record: dict, prompt: str, deadlines: tuple[float, int, int])
         return Outcome("timeout", str(exc)[:500], None, _ledger_count(ledger, plan.ledger_path), unknown)
     except RateLimitedError as exc:
         return Outcome("rate_limited", str(exc)[:500], None, _ledger_count(ledger, plan.ledger_path), unknown)
+    except (AgentUnavailableError, RulesCoreDeliveryError, RulesCoreMissingError) as exc:
+        # The runner can retry AGY after a provider fault even for a bound attempt.
+        telemetry = getattr(exc, "agy_telemetry", None)
+        reason: StartRefusal | None = StartRefusal.BOUNDARY if str(exc).startswith("formal attempt filesystem boundary refused:") else (
+            StartRefusal.REVIEW_SETUP)
+        if spec.agent == "agy" and (not isinstance(telemetry, AgyTelemetry) or telemetry.attempts):
+            reason = None
+        return Outcome("failed", str(exc)[:500], None, _ledger_count(ledger, plan.ledger_path), unknown,
+                       start_refusal=reason)
     except AgentRuntimeError as exc:
         return Outcome("failed", str(exc)[:500], None, _ledger_count(ledger, plan.ledger_path), unknown)
     finally:
