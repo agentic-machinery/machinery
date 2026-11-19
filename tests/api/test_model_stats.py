@@ -110,7 +110,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert write["tasks"] == 3 and write["low_sample"] is True
     assert write["status"]["done"] == 2 and write["status"]["no_deliverable"] == 1
     assert write["landed"] == 1 and write["landed_rate"] == {"value": 0.333, "n": 3, "low_sample": True}
-    assert write["wall_seconds"] == {"median": 1200.0, "p90": 1800.0, "total_hours": 1.0, "total_seconds": 3600.0, "n": 3}
+    assert write["wall_seconds"] == {"p25": 600.0, "median": 1200.0, "p75": 1800.0, "p90": 1800.0,
+                                     "total_hours": 1.0, "total_seconds": 3600.0, "n": 3}
     assert write["wall_hours_per_landed"]["value"] == 1.0
     assert write["tokens"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
     assert write["output_tokens_per_landed"]["value"] == 300
@@ -246,7 +247,8 @@ def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
     """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
-    launch or settlement on an unready Monitor, or the wrong window recorded as the weekly allowance."""
+    launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, or overlapping
+    tasks on one pool each charged the pool's whole drop."""
     readings = iter([None, 35.0])
     monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
@@ -286,10 +288,24 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
     rows.backfill(tasks, batch_state)
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
     assert stored["half"]["allowance"]["start"] == "unknown"
-    window = _window(batch_state, stats.Landing(task_ids={"both", "half"}))
-    assert window["allowance"] == [{"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1,
-                                    "landed": 1, "reset_crossed": 0, "low_sample": True, "pct_points_spent": 5.5,
-                                    "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}}]
+    _record(tasks, "overlap-a", model="gemini-4-hydrogen", effort="medium",
+            started_at=(NOW - timedelta(hours=3)).isoformat(),
+            finished_at=(NOW - timedelta(hours=1)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 60.0}})
+    _record(tasks, "overlap-b", model="gemini-4-hydrogen", effort="medium",
+            started_at=(NOW - timedelta(hours=3) + timedelta(minutes=3)).isoformat(),
+            finished_at=(NOW - timedelta(hours=2)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    rows.backfill(tasks, batch_state)
+    window = _window(batch_state, stats.Landing(task_ids={"both", "half", "overlap-a", "overlap-b"}))
+    assert window["allowance"] == [
+        {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
+         "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
+        {"pool": "gemini", "model": "gemini-4-hydrogen", "effort": "medium", "tasks": 2, "landed": 2,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": 20.0,
+         "pct_points_per_landed": {"value": 10.0, "n": 2, "low_sample": True}},
+    ]
     assert _row(window, "gpt-6.1-sol", "write")["allowance_pct_points_per_landed"]["value"] == 5.5
 
 
@@ -308,6 +324,15 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "context": dict(agent="claude", model="claude-opus-5-5[1m]", effort="not-exposed"),
         "unknown-version": dict(agent="claude", model="claude-opus-5-6", effort="High"),
         "free-effort": dict(agent="codex", model="gpt-6.1-sol", effort="request-0", research_task_family="docs"),
+        "cursor-display": dict(agent="cursor", model="Grok 4.7 256K High", resolved_model="Grok 4.7 256K High",
+                               resolved_model_known=True, effort=None),
+        "cursor-fast": dict(agent="cursor", model="Grok 4.7 256K High Fast",
+                            resolved_model="Grok 4.7 256K High Fast", resolved_model_known=True, effort=None),
+        "composer": dict(agent="cursor", model="Composer 2.5", resolved_model="Composer 2.5",
+                         resolved_model_known=True, effort=None),
+        "kimi-slash": dict(agent="kimi", model="kimi-code/k3-256k", effort=None),
+        "kimi-alias": dict(agent="kimi", model="k3-256k", effort=None),
+        "deepseek-prefix": dict(agent="deepseek", model="deepseek-direct/deepseek-v4-flash", effort=None),
     }
     for task_id, fields in cases.items():
         _record(tasks, task_id, **fields)
@@ -326,6 +351,12 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "context": ("claude-opus-5-5", "not-exposed"),
         "unknown-version": ("claude-opus-5-6", "high"),
         "free-effort": ("gpt-6.1-sol", "request-0"),
+        "cursor-display": ("grok-4.7", "unset"),
+        "cursor-fast": ("unknown", "unset"),
+        "composer": ("composer-2.5", "unset"),
+        "kimi-slash": ("kimi-code/k3-256k", "unset"),
+        "kimi-alias": ("kimi-code/k3-256k", "unset"),
+        "deepseek-prefix": ("deepseek-v4-flash", "unset"),
     }
     flash = _row(window, "gemini-3.8-flash-high", "write")
     assert flash["effort"] == "all" and [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [
@@ -334,10 +365,17 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     sol = _row(window, "gpt-6.1-sol", "write")
     assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("request-0", ["docs"])]
     # /metrics keeps finite label sets: values outside the catalog's known set export as "other".
-    metrics = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())["metrics"]["windows"]["all"]
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    assert "24h" in snapshot["windows"] and "24h" not in snapshot["metrics"]["windows"]
+    metrics = snapshot["metrics"]["windows"]["all"]
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
     assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
+    page = stats.page_window(snapshot["windows"]["all"])
+    assert all("by_class" not in model and "by_class" not in effort
+               for model in page["models"] for effort in model["by_effort"])
+    html = (Path(__file__).parents[2] / "lu_machinery/api/dashboards/model-stats.html").read_text()
+    assert "view=page" in html and "not enough data yet" in html and "Best value" in html
 
 
 def _at(hours: float) -> str:
@@ -404,6 +442,9 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     (author,) = window["authors"]
     assert (author["prs"], author["rounds_per_pr"]["value"], author["first_round_approved"]["value"]) == (1, 1.0, 1.0)
     assert author["after_blocked_first_round"]["blocked"] == 0
+    neon_chart = window["charts"]["neon"]
+    assert neon_chart["enough"] is False
+    assert {arm["effort"]: arm["review_results"] for arm in neon_chart["arms"]} == {"medium": 1, "high": 1}
 
 
 def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):
