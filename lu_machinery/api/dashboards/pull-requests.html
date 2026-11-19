@@ -49,12 +49,15 @@ function renderPrs(prs, prState = null) {
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
   const unavailable = prState === "unavailable" || allUnknown;
-  const expired = !unavailable && (prState === "expired" || prState === true);
+  const ageUnknown = !unavailable && prState === "unknown";
+  const expired = !unavailable && !ageUnknown && (prState === "expired" || prState === true);
   const stateNote = unavailable
     ? '<p class="warn">All repositories are unavailable; open pull request and merge queue counts are unknown.</p>'
     : expired
       ? '<p class="warn">PR snapshot is expired; showing cached observations (CI rollup, review status, and queue positions may be out of date).</p>'
-      : "";
+      : ageUnknown
+        ? '<p class="warn">Snapshot age unknown. CI, review, and queue positions are not confirmed as current.</p>'
+        : "";
   return stateNote + repos.map(repo => {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
     if (repo.status !== "ok") return title + unknown(repo.reason);

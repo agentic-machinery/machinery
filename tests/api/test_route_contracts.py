@@ -343,10 +343,19 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   assert.match(aheadHtml, /queued 1/, 'F1: +240s browser clock offset still keeps queued 1');
 
   const now = Date.now();
-  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now - 30000).toISOString()}, age: null, bound: 210, state: 'fresh', receivedAt: now}, now), true);
-  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now - 240000).toISOString()}, age: Number.NaN, bound: 210, state: 'stale', receivedAt: now}, now), false);
-  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: null}, age: null, bound: 210, state: 'fresh', receivedAt: now}, now), false);
-  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now).toISOString()}, age: 200, bound: 210, state: 'fresh', receivedAt: now - 20000}, now), false);
+  const readable = {status: 'ok', repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: []}]};
+  const skewed = new Date(now + 90000).toISOString();
+  // A missing, empty, or non-numeric age header is unknown. observed_at does not fill it in, and Number('') is not 0.
+  for (const ageHeader of [null, '', ' ', 'unknown']) {
+    const reading = {data: {...readable, observed_at: skewed}, ageHeader, boundHeader: '210', state: 'fresh', receivedAt: now};
+    assert.equal(M.panelAgeSeconds(reading, now), null, `age header ${JSON.stringify(ageHeader)}`);
+    assert.equal(prSnapshotFresh(reading, now), false);
+    assert.equal(M.prSnapshotExpired(reading, now), false);
+    assert.match(M.headingAge([reading], false, now, undefined, now).text, /source age unknown/);
+    assert.doesNotMatch(M.headingAge([reading], false, now, undefined, now).text, /source age 0s/);
+  }
+  assert.equal(prSnapshotFresh({data: {...readable, observed_at: skewed}, ageHeader: '30', boundHeader: '210', state: 'fresh', receivedAt: now}, now), true);
+  assert.equal(prSnapshotFresh({data: {...readable, observed_at: new Date(now).toISOString()}, ageHeader: '200', bound: 210, state: 'fresh', receivedAt: now - 20000}, now), false);
 
   mode = 'fresh_partial';
   await fleetRunner.refreshAll();
@@ -457,27 +466,35 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     assert.match(document.getElementById('prs-content').innerHTML, /PR snapshot is expired \(cached\)/);
     Date.now = origNowFn;
 
-    // F7: Missing or invalid X-Snapshot-Age-S with X-Snapshot-State: stale on fully readable response and -120s clock skew.
-    for (const badAge of [null, Number.NaN]) {
-      const f7Reading = {
-        url: '/api/git/pull-requests', age: badAge, bound: 210, state: 'stale', receivedAt: fakeNow,
-        data: {status: 'ok', observed_at: new Date(fakeNow - 120000).toISOString(), repositories: [
-          {name: 'machinery', status: 'ok', open_total: 0, pull_requests: []},
-        ]},
-      };
-      assert.equal(M.prSnapshotFresh(f7Reading, fakeNow), false, `F7: fleetFresh false when age=${badAge}`);
-      assert.equal(M.prSnapshotExpired(f7Reading, fakeNow), true, `F7: overviewExpired true when age=${badAge}`);
-      assert.match(M.headingAge([f7Reading], false, fakeNow, undefined, fakeNow).text, /STALE/);
-      // With an unreadable sibling, stale may reflect partial coverage so age fallback stays active.
-      const f7Partial = {
-        ...f7Reading,
-        data: {status: 'ok', observed_at: new Date(fakeNow - 30000).toISOString(), repositories: [
-          {name: 'machinery', status: 'ok', open_total: 1, pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', queue: {position: 1}}]},
-          {name: 'infra-private', status: 'unknown', reason: 'not_readable', open_total: null, pull_requests: []},
-        ]},
-      };
-      assert.equal(M.prSnapshotFresh(f7Partial, fakeNow), true, 'F7: partial coverage keeps fresh readable rows via observed_at fallback');
-      assert.equal(M.prSnapshotExpired(f7Partial, fakeNow), false, 'F7: partial coverage stays non-expired when observed_at is 30s');
+    // Missing and empty X-Snapshot-Age-S stay unknown. A skewed observed_at must not expire or freshen them.
+    for (const ageHeader of [null, '']) {
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        headers: {get: name => {
+          if (name === 'X-Snapshot-Age-S') return ageHeader;
+          return {'X-Snapshot-Stale-After-S': '210', 'X-Snapshot-State': 'stale'}[name] ?? null;
+        }},
+        text: async () => JSON.stringify({
+          status: 'ok',
+          observed_at: new Date(fakeNow + 90000).toISOString(),
+          repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: []}],
+        }),
+      });
+      const reading = await M.fetchJson('/api/git/pull-requests');
+      const state = M.prSnapshotState(reading, fakeNow);
+      assert.equal(state.status, 'unknown', `header ${JSON.stringify(ageHeader)}`);
+      assert.equal(state.expired, false);
+      assert.equal(M.panelAgeSeconds(reading, fakeNow), null);
+      assert.match(M.headingAge([reading], false, fakeNow, undefined, fakeNow).text, /freshness unknown Â· source age unknown/);
+      assert.doesNotMatch(M.headingAge([reading], false, fakeNow, undefined, fakeNow).text, /source age 0s/);
+      const html = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn renderQueueSummary;')(M)(reading.data, state.status);
+      assert.match(html, /Snapshot age unknown/);
+      assert.doesNotMatch(html, /currently in the merge queue/);
+      assert.doesNotMatch(html, /expired \(cached\)/);
+      const prHtml = new Function('Machinery', extractScript('pull-requests.html', '\nrunner.start();') + '\nreturn renderPrs;')(M)(reading.data, state.status);
+      assert.match(prHtml, /Snapshot age unknown/);
+      assert.doesNotMatch(prHtml, /cached/);
     }
 
     // F8: status: ok with every repository unknown and X-Snapshot-State: unavailable renders unknown counts (never cached zeros) while retaining repo failures.

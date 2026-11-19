@@ -160,7 +160,8 @@ function renderQueueSummary(prs, prState = null) {
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
   const unavailable = prState === "unavailable" || allUnknown;
-  const expired = !unavailable && (prState === "expired" || prState === true);
+  const ageUnknown = !unavailable && prState === "unknown";
+  const expired = !unavailable && !ageUnknown && (prState === "expired" || prState === true);
   let totalOpen = 0, totalRed = 0, unknownRepos = 0, truncatedRepos = 0;
   const queuedRows = [];
   const repoRows = [];
@@ -200,7 +201,11 @@ function renderQueueSummary(prs, prState = null) {
     }
   }
   const incomplete = repos.length === 0 || unknownRepos > 0 || truncatedRepos > 0;
-  const expiredNote = expired ? '<p class="warn">PR snapshot is expired; counts and queue positions below are cached observations.</p>' : "";
+  const expiredNote = expired
+    ? '<p class="warn">PR snapshot is expired; counts and queue positions below are cached observations.</p>'
+    : ageUnknown
+      ? '<p class="warn">Snapshot age unknown. Counts and queue positions below are not confirmed as current.</p>'
+      : "";
   const stats = unavailable
     ? [
         "<span><b>?</b> open PRs</span>",
@@ -216,7 +221,9 @@ function renderQueueSummary(prs, prState = null) {
       ].filter(Boolean);
   const queueQualifier = expired
     ? (incomplete ? " (cached — snapshot expired, coverage incomplete)" : " (cached — snapshot expired)")
-    : (incomplete ? " (observed — coverage incomplete)" : "");
+    : ageUnknown
+      ? " (age unknown)"
+      : (incomplete ? " (observed — coverage incomplete)" : "");
   const queueBlock = queuedRows.length
     ? `<h3>In merge queue${queueQualifier}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
     : !repos.length
@@ -225,9 +232,11 @@ function renderQueueSummary(prs, prState = null) {
         ? '<p class="warn">All repositories are unavailable; merge queue status is unknown.</p>'
         : expired
           ? '<p class="warn">PR snapshot is expired (cached); current merge queue status is unknown.</p>'
-          : incomplete
-            ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
-            : '<p class="muted">No PRs currently in the merge queue.</p>';
+          : ageUnknown
+            ? '<p class="warn">Snapshot age unknown; current merge queue status is not confirmed.</p>'
+            : incomplete
+              ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
+              : '<p class="muted">No PRs currently in the merge queue.</p>';
   return expiredNote
     + `<div class="summary-stats">${stats.join("")}</div>`
     + queueBlock

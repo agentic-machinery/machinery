@@ -487,68 +487,66 @@ assert.doesNotMatch(clear, /unknown|chip bad|chip warn/);
     )
 
 
-def test_home_freshness_is_read_from_the_payload_so_heading_and_rows_agree():
-    """Defect class: a heading judged from transport headers (stripped or rewritten in transit) says fresh or unavailable while the payload and its rows say stale or populated."""
+def test_panel_age_is_the_snapshot_header_plus_elapsed():
+    """Defect class: client-side age from observed_at, or Number('') becoming 0, disagrees with the server snapshot age."""
     subs_script = _page_script("subscriptions.html", until="\nconst PANELS = [")
     _node(_DOM + _machinery_js_prelude() + subs_script + r"""
-const {headingAge} = Machinery;
+const {headingAge, panelAgeSeconds} = Machinery;
 const now = Date.now();
-const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false);
-// The body says stale at 817 s while rewritten headers claim a young, fresh reading: the body wins.
-const milestones = {url: '/api/milestones', age: 40, bound: 420, state: 'fresh', data: {status: 'ok', age_seconds: 817, stale: true}};
-assert.match(line(milestones).text, /· STALE · source age 817s · bound unknown$/);
-assert.equal(line(milestones).bad, true);
-// With every header stripped, the same body still judges itself.
-assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false}}).text, /· fresh · source age 12s · bound unknown$/);
-// Subscriptions: the heading and each row come from the same reading, with no header at all.
-const claudeRow = age => ({account: 'Claude a', reading: {status: 'fresh', age_s: age, read_at: '2030-01-01T00:00:00Z'}, plan: {status: 'ok'}});
-for (const [age, heading, row] of [[51, /fresh · source age 51s · bound 900s/, /fresh, 51s old/], [1800, /STALE · source age 1800s · bound 900s/, /STALE, 30m old/]]) {
-  const subs = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(age)]}]};
-  assert.match(line({url: '/api/runtime/subscriptions', data: subs}).text, heading);
-  assert.match(subscriptionRows(subs, null).groups, row);
+const skewed = new Date(now + 120000).toISOString();
+const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false, null, undefined, now);
+// A present header wins over a body age and a future observed_at.
+assert.match(line({url: '/api/milestones', age: 40, bound: 420, state: 'fresh',
+  data: {status: 'ok', age_seconds: 817, stale: true, observed_at: skewed}}).text, /· fresh · source age 40s · bound 420s$/);
+assert.equal(panelAgeSeconds({ageHeader: '200', receivedAt: now - 11000, data: {observed_at: skewed}}, now), 211);
+assert.equal(panelAgeSeconds({ageHeader: '30', receivedAt: now + 5000}, now), 30);
+assert.equal(panelAgeSeconds({ageHeader: '30', receivedAt: now}, Number.NaN), null);
+// Missing, empty, whitespace, and non-decimal headers are unknown, never 0.
+for (const raw of [undefined, null, '', ' ', '\t', 'unknown', '-1', '1e2', '0x10', '+5']) {
+  const reading = {ageHeader: raw, boundHeader: '210', state: 'fresh', receivedAt: now,
+    data: {status: 'ok', observed_at: skewed, age_seconds: 12, stale: true}};
+  assert.equal(panelAgeSeconds(reading, now), null, JSON.stringify(raw));
+  assert.match(line(reading).text, /source age unknown/);
+  assert.doesNotMatch(line(reading).text, /source age 0s/);
 }
-// A source whose payload has no age falls back to its headers; with neither it is unjudged, never "unavailable".
-assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text, /· fresh · source age 27s · bound 60s$/);
-assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text, /· freshness unknown · source age unknown · bound unknown$/);
+// A real zero stays fresh under a positive bound. Age past the bound is stale.
+assert.match(line({ageHeader: '0', boundHeader: '60', state: 'fresh', receivedAt: now, data: {status: 'ok'}}).text,
+  /· fresh · source age 0s · bound 60s$/);
+assert.match(line({ageHeader: '0.000', boundHeader: '60.000', state: 'fresh', receivedAt: now, data: {status: 'ok'}}).text,
+  /· fresh · source age 0s · bound 60s$/);
+assert.match(line({age: 240, bound: 210, state: 'fresh', receivedAt: now, data: {status: 'ok', observed_at: skewed}}).text,
+  /· STALE · source age 240s · bound 210s$/);
+assert.equal(line({age: 240, bound: 210, state: 'fresh', receivedAt: now, data: {status: 'ok'}}).bad, true);
+// Server state stale (partial coverage) keeps the heading stale at the header age, without observed_at.
+assert.match(line({age: 30, bound: 210, state: 'stale', receivedAt: now, url: '/api/git/pull-requests',
+  data: {status: 'ok', observed_at: skewed, repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text,
+  /· STALE · source age 30s · bound 210s$/);
+assert.match(line({ageHeader: '30', boundHeader: ' 210 ', state: ' STALE ', receivedAt: now, url: '/api/git/pull-requests?limit=1',
+  data: {status: 'ok', observed_at: skewed, repositories: [{status: 'ok'}]}}).text,
+  /· STALE · source age 30s · bound 210s$/);
+assert.match(line({ageHeader: '5', boundHeader: '210', state: ' Unavailable ', receivedAt: now, url: '/api/git/pull-requests',
+  data: {status: 'ok', repositories: [{status: 'ok'}]}}).text, /· unavailable · source age 5s/);
+// No header at all is unknown, including when the body carries its own age.
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text,
+  /· freshness unknown · source age unknown · bound unknown$/);
+assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false, observed_at: skewed}}).text,
+  /· freshness unknown · source age unknown/);
 assert.match(line({data: null, age: null, snapshot: false}).text, /· unavailable · source age unknown/);
-// A failed collection stamped with the attempt time stays unavailable; its age does not make it healthy.
 assert.match(line({url: '/api/ops/v1/alerts', age: 0, bound: 60, state: 'unavailable',
-  data: {status: 'unknown', reason_code: 'alertmanager_unreachable', observed_at: new Date(now).toISOString(), stale_after_s: 60}}).text, /· unavailable · source age 0s/);
-// One account with no reading keeps the aggregate from reading fresh, as its row says NO READING.
+  data: {status: 'unknown', observed_at: skewed, stale_after_s: 60}}).text, /· unavailable · source age 0s/);
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text,
+  /· fresh · source age 27s · bound 60s$/);
+// Account rows still show the server's age_s. That number is not the panel age.
+const claudeRow = age => ({account: 'Claude a', reading: {status: 'fresh', age_s: age, read_at: '2030-01-01T00:00:00Z'}, plan: {status: 'ok'}});
+const subs = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51)]}]};
+assert.match(line({url: '/api/runtime/subscriptions', data: subs}).text, /source age unknown/);
+assert.match(subscriptionRows(subs, null).groups, /fresh, 51s old/);
+assert.match(subscriptionRows({stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(1800)]}]}, null).groups, /STALE, 30m old/);
 const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51),
   {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
-assert.match(line({url: '/api/runtime/subscriptions', data: partial}).text, /· STALE · source age 51s · bound 900s$/);
 assert.match(subscriptionRows(partial, null).groups, /NO READING/);
-// Other failed or degraded payloads keep their own verdict over a young header, even with no age to show.
-const young = {age: 5, bound: 900, state: 'fresh'};
-assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'unknown', read_at: new Date(now).toISOString()}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/git/pull-requests', data: {status: 'ok', observed_at: new Date(now).toISOString(),
-  repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text, /· STALE ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_seconds: null, stale: true}}).text, /· STALE ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
-// Populated but degraded data reads partial, and a body with no observation yet reads unavailable, whatever the header says.
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'ok'}, {status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound unknown$/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 0, stale: false,
-  repositories: [{status: 'unknown'}, {status: 'unknown'}]}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'pending', accounts: []}}).text, /· unavailable ·/);
-// Populated partial data is not unavailable, and a rewritten header bound never loosens a payload that owns its age.
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'partial', milestones: [{number: 1}]}, {status: 'unknown', milestones: []}]}}).text, /· partial data ·/);
-const oldLogins = {url: '/api/runtime/logins', age: 1200, bound: 9999, state: 'stale',
-  data: {state: 'ok', read_at: new Date(now - 1200000).toISOString()}};
-assert.match(line(oldLogins).text, /· freshness unknown · source age 1200s · bound unknown$/);
-assert.doesNotMatch(line({...oldLogins, url: '/api/git/pull-requests', data: {status: 'ok', repositories: [],
-  observed_at: new Date(now - 1200000).toISOString()}}).text, /· fresh ·/);
-// An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
-const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
-assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 12s · bound 900s$/);
-assert.match(line(budget({data_age_s: 5, stale: false, stale_threshold_s: 900}, {x: {freshness: 'unavailable', age_s: null}})).text, /· STALE ·/);
-// Alerts carry their own bound in the body.
-const observed = new Date(now - 5000).toISOString();
-assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);
 """)
+
 
 
 def _swr_app(monkeypatch, tmp_path, handler_factory, *, ttl: float = 10.0, vary: tuple[str, ...] = ()):
