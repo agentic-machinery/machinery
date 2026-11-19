@@ -360,6 +360,84 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed �
   assert.doesNotMatch(afterFailure, /CI green/);
   assert.doesNotMatch(afterFailure, /queued 1/);
   assert.match(afterFailure, /#42/);
+
+  // F1 local-clock expiry + F6 on Overview and Pull requests (no extra API request on tick).
+  let fakeNow = Date.now();
+  const realDateNow = Date.now;
+  let prFetchCount = 0;
+  let queuedInResponse = true;
+  let customAgeS = 200;
+  let customOffsetS = 0;
+  let customPartial = false;
+  Date.now = () => fakeNow;
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/api/git/pull-requests')) {
+        prFetchCount += 1;
+        const observedAt = new Date(fakeNow - (customAgeS + customOffsetS) * 1000).toISOString();
+        const repos = [
+          {
+            name: 'machinery',
+            status: 'ok',
+            open_total: 1,
+            pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', review: 'success', queue: queuedInResponse ? {position: 1, state: 'queued'} : null, task_reference: 't1'}],
+          },
+          ...(customPartial ? [{name: 'infra-private', status: 'unknown', reason: 'not_readable', open_total: null, pull_requests: []}] : []),
+        ];
+        const headers = {'X-Snapshot-Age-S': String(customAgeS), 'X-Snapshot-Stale-After-S': '210', 'X-Snapshot-State': customAgeS > 210 || customPartial ? 'stale' : 'fresh'};
+        return {ok: true, status: 200, headers: {get: name => headers[name] ?? null}, text: async () => JSON.stringify({status: 'ok', observed_at: observedAt, repositories: repos})};
+      }
+      return {ok: true, status: 200, headers: {get: () => null}, text: async () => JSON.stringify({
+        status: 'ok', heartbeat: true, alerts: [], providers: [],
+        tasks: [{task_id: 't1', agent: 'codex', model: 'gpt-6.2-sol', age_s: 10, delivery_pr: '#42'}],
+        deliveries: {queued: 0}, jobs: {queued: 0}, store: {reachable: true},
+      })};
+    };
+
+    const fleetClock = new Function('Machinery', fleetBody + '\nreturn {runner, PANELS};')(M);
+    await fleetClock.runner.refreshAll();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(prFetchCount, 1);
+    assert.match(document.getElementById('workers-content').innerHTML, /CI green/);
+    fakeNow += 11000;
+    fleetClock.PANELS[0].onTick();
+    assert.equal(prFetchCount, 1, 'F1: local-clock expiry makes no API request');
+    const tickedFleet = document.getElementById('workers-content').innerHTML;
+    assert.doesNotMatch(tickedFleet, /CI green/, 'F1: local clock clears CI green once 210s bound passes');
+    assert.doesNotMatch(tickedFleet, /queued 1/, 'F1: local clock clears queued 1 once 210s bound passes');
+    assert.match(tickedFleet, /#42/);
+
+    // F6 Overview: 240s server age with -120s browser clock and empty queue must not say "No PRs currently in the merge queue."
+    customAgeS = 240; customOffsetS = -120; queuedInResponse = false; customPartial = false;
+    const overviewClock = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn {runner, PANELS};')(M);
+    await overviewClock.runner.refreshAll();
+    assert.match(document.getElementById('prs-age').textContent, /STALE · source age 240s · bound 210s/);
+    const ovExpiredEmpty = document.getElementById('prs-content').innerHTML;
+    assert.doesNotMatch(ovExpiredEmpty, /No PRs currently in the merge queue/);
+    assert.match(ovExpiredEmpty, /PR snapshot is expired \(cached\)/);
+    assert.match(document.getElementById('chips').innerHTML, /cached/);
+
+    // F6 Pull requests: 240s server age with -120s browser clock qualifies queued rows as cached.
+    queuedInResponse = true;
+    const prsClock = new Function('Machinery', extractScript('pull-requests.html', '\nrunner.start();') + '\nreturn {runner, PANELS};')(M);
+    await prsClock.runner.refreshAll();
+    assert.match(document.getElementById('prs-age').textContent, /STALE · source age 240s · bound 210s/);
+    const prExpiredHtml = document.getElementById('prs-content').innerHTML;
+    assert.match(prExpiredHtml, /PR snapshot is expired; showing cached observations/);
+    assert.match(prExpiredHtml, /position 1 · queued \(cached\)/);
+    assert.match(document.getElementById('chips').innerHTML, /cached/);
+
+    // F6 Coverage separation: 30s snapshot with +240s clock offset and unreadable sibling still shows readable rows as non-expired.
+    customAgeS = 30; customOffsetS = 240; customPartial = true;
+    await overviewClock.runner.refreshAll();
+    assert.match(document.getElementById('prs-content').innerHTML, /In merge queue \(observed — coverage incomplete\)/);
+    assert.doesNotMatch(document.getElementById('prs-content').innerHTML, /snapshot is expired/);
+    await prsClock.runner.refreshAll();
+    assert.doesNotMatch(document.getElementById('prs-content').innerHTML, /snapshot is expired/);
+    assert.match(document.getElementById('prs-content').innerHTML, /<td class="ok">position 1 · queued<\/td>/);
+  } finally {
+    Date.now = realDateNow;
+  }
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(

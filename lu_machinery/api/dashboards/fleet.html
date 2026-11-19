@@ -48,41 +48,15 @@
 <script>
 "use strict";
 const {
-  escapeHtml, fetchJson, toDate, span, relative, table, td, text, unknown, chip,
-  ciLabel, prLink, createPanelRunner,
+  escapeHtml, fetchJson, span, relative, table, td, text, unknown, chip,
+  ciLabel, prLink, prSnapshotFresh, createPanelRunner,
 } = Machinery;
 
 const ACTIVE = new Set(["spawning", "running", "settling", "needs_finalize"]);
 const CLAUDE_ACCOUNTS = {a: "Claude a", b: "Claude b"};
 const CODEX_ACCOUNTS = {sub: "Codex a", "b-sub": "Codex b", api: "Codex API", "b-api": "Codex b API"};
-const PULL_REQUESTS_BOUND_S = 210;
 
 let latestPrsReading = null;
-
-// Judge PR snapshot freshness by server observation age (`X-Snapshot-Age-S` + elapsed time since receipt)
-// against the route's 210 s bound (or tighter header bound), falling back to `observed_at` only when
-// `reading.age` is absent or invalid; independent of aggregate sibling-repo coverage.
-function prSnapshotFresh(reading, now = Date.now()) {
-  if (!reading || !reading.data || reading.data.status !== "ok") return false;
-  if (reading.state === "unavailable") return false;
-  if (typeof now !== "number" || !Number.isFinite(now)) return false;
-  let age = null;
-  if (typeof reading.age === "number" && Number.isFinite(reading.age) && reading.age >= 0) {
-    const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
-      ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
-    age = reading.age + elapsed;
-  } else {
-    const observed = toDate(reading.data.observed_at);
-    if (observed) {
-      age = Math.max(0, (now - observed.getTime()) / 1000);
-    }
-  }
-  if (age === null) return false;
-  const headerBound = typeof reading.bound === "number" && Number.isFinite(reading.bound) && reading.bound > 0
-    ? reading.bound : null;
-  const bound = headerBound !== null ? Math.min(headerBound, PULL_REQUESTS_BOUND_S) : PULL_REQUESTS_BOUND_S;
-  return age <= bound;
-}
 
 function currentPrs() {
   return latestPrsReading && prSnapshotFresh(latestPrsReading) ? latestPrsReading.data : null;
@@ -223,8 +197,15 @@ function enrichWorkerPrs() {
   });
 }
 
+function expireWorkerPrsIfStale() {
+  if (latestPrsReading && !prSnapshotFresh(latestPrsReading)) {
+    latestPrsReading = null;
+    repaintWorkers();
+  }
+}
+
 const PANELS = [
-  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onError: () => { latestPrsReading = null; }},
+  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
 ];

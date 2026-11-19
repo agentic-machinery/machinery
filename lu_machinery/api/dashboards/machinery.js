@@ -355,7 +355,7 @@
       ? Math.max(repo.open_total, list.length) : list.length;
   }
 
-  function prChips(prs, href = "/pull-requests") {
+  function prChips(prs, href = "/pull-requests", expired = false) {
     if (!prs) return [];
     if (prs.status !== "ok") return [chip(href, "?", "PRs unknown", "warn")];
     const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
@@ -364,6 +364,7 @@
     const partial = repos.some(repo => repo.status !== "ok");
     const truncated = repos.some(repo => repo.status === "ok" && repoCoverageIncomplete(repo));
     const notes = [];
+    if (expired) notes.push("cached");
     if (partial) notes.push("a repository is unknown");
     if (truncated) notes.push("coverage truncated");
     const openText = notes.length ? "open PRs observed" : "open PRs";
@@ -377,8 +378,47 @@
   // The panel heading and the rows below it both come from the payload fields the API returns.
   // The X-Snapshot-* headers are only the fallback for a payload that carries no age of its own
   // (a gateway or cache between the page and the API can strip or rewrite headers, never the body).
+  // Exception: /api/git/pull-requests carries a server-computed X-Snapshot-Age-S and 210 s display bound
+  // alongside observed_at; prefer valid X-Snapshot-Age-S to stay immune to browser-vs-API clock skew.
 
+  const PULL_REQUESTS_BOUND_S = 210;
   const finiteAge = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+  function prReadingAge(reading, now = Date.now()) {
+    if (!reading || typeof now !== "number" || !Number.isFinite(now)) return null;
+    const headerAge = finiteAge(reading.age);
+    if (headerAge !== null) {
+      const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
+        ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
+      return headerAge + elapsed;
+    }
+    const observed = toDate(reading.data?.observed_at);
+    return observed ? Math.max(0, (now - observed.getTime()) / 1000) : null;
+  }
+
+  function prReadingBound(reading) {
+    const headerBound = typeof reading?.bound === "number" && Number.isFinite(reading.bound) && reading.bound > 0
+      ? reading.bound : null;
+    return headerBound !== null ? Math.min(headerBound, PULL_REQUESTS_BOUND_S) : PULL_REQUESTS_BOUND_S;
+  }
+
+  function prSnapshotFresh(reading, now = Date.now()) {
+    if (!reading || !reading.data || reading.data.status !== "ok") return false;
+    if (reading.state === "unavailable") return false;
+    const age = prReadingAge(reading, now);
+    return age !== null && age <= prReadingBound(reading);
+  }
+
+  function prSnapshotExpired(reading, now = Date.now()) {
+    if (!reading || !reading.data || reading.data.status !== "ok") return true;
+    if (reading.state === "unavailable") return true;
+    if (typeof now !== "number" || !Number.isFinite(now)) return true;
+    const fresh = freshnessOf(reading);
+    if (fresh.unavailable || fresh.age === null || fresh.bound === null) return true;
+    const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
+      ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
+    return fresh.age + elapsed > fresh.bound;
+  }
 
   function rowsFreshness(rows, bound) {
     const ages = rows.map(row => finiteAge(row.age)).filter(age => age !== null);
@@ -436,6 +476,12 @@
     if (!reading || !reading.data) return {age: null, bound: null, flag: null, unavailable: true};
     const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
     const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
+    if (reading.url === "/api/git/pull-requests" && own) {
+      const age = finiteAge(reading.age) ?? own.age;
+      const bound = prReadingBound(reading);
+      const unavailable = own.unavailable || reading.state === "unavailable";
+      return {...own, age, bound, unavailable};
+    }
     if (own && (own.age !== null || own.flag !== null || own.unavailable)) return own;
     const flag = reading.state === "stale" ? "stale" : null;
     return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
@@ -591,12 +637,13 @@
       try {
         const readings = await Promise.all(panel.urls.map(readSource));
         const data = readings.map(reading => reading.data);
-        if (content) content.innerHTML = panel.render(...data);
+        panel.readings = readings;
+        const renderArgs = panel.withReadings ? [...data, readings] : data;
+        if (content) content.innerHTML = panel.render(...renderArgs);
         latest[panel.id] = data[0];
-        if (typeof panel.onData === "function") panel.onData(data, latest);
+        if (typeof panel.onData === "function") panel.onData(data, latest, readings);
         if (onAfterLoad) onAfterLoad(panel, data, latest);
         const ageLine = headingAge(readings, false, panel.attemptedAt, panel.sourceLabels);
-        panel.readings = readings;
         if (age) {
           age.textContent = ageLine.text;
           age.className = ageLine.bad ? "age bad" : ageLine.caution ? "age warn" : "age";
@@ -667,7 +714,10 @@
       refreshAll();
       setInterval(refreshAll, REFRESH_MS);
       // This clock advances even if a refresh stalls or the network disappears. It makes no requests.
-      setInterval(() => panels.filter(panel => panel.ok !== undefined).forEach(updatePanelAge), 1000);
+      setInterval(() => panels.filter(panel => panel.ok !== undefined).forEach(panel => {
+        updatePanelAge(panel);
+        if (typeof panel.onTick === "function") panel.onTick(panel, latest, updateChips);
+      }), 1000);
     }
 
     return {panels, latest, loadPanel, retryPanel, refreshAll, start};
@@ -678,6 +728,7 @@
     REFRESH_MS,
     OPTIONAL_WAIT_MS,
     RETRY_LIMIT,
+    PULL_REQUESTS_BOUND_S,
     CHANGELOG_URL,
     NAV_PAGES,
     SITE_LINKS,
@@ -724,6 +775,10 @@
     repoOpenCount,
     prChips,
     finiteAge,
+    prReadingAge,
+    prReadingBound,
+    prSnapshotFresh,
+    prSnapshotExpired,
     rowsFreshness,
     payloadAge,
     payloadFreshness,

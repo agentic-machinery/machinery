@@ -54,7 +54,7 @@ const {
   escapeHtml, toDate, ageSpan, table, td, text, unknown, chip,
   readingState, windowLeft, paceCell, readingCell, signInCell,
   liveAccounts, summarizeSubscriptions, subscriptionChips,
-  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, repoOpenCount, prChips, createPanelRunner,
+  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, repoOpenCount, prChips, prSnapshotExpired, createPanelRunner,
 } = Machinery;
 
 function alertIdentity(alert) {
@@ -155,7 +155,7 @@ function renderCapacitySummary(subs, logins) {
     + body + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("");
 }
 
-function renderQueueSummary(prs) {
+function renderQueueSummary(prs, expired = false) {
   if (prs.status !== "ok") return unknown(prs.reason);
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
   let totalOpen = 0, totalRed = 0, unknownRepos = 0, truncatedRepos = 0;
@@ -191,27 +191,34 @@ function renderQueueSummary(prs) {
         td(prLink(repo.name, pr)),
         text(ci, ciClass),
         text(review, reviewClass),
-        text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}`, "ok"),
+        text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok"),
         text(ageSpan(pr.created_at), "num"),
       ]);
     }
   }
   const incomplete = repos.length === 0 || unknownRepos > 0 || truncatedRepos > 0;
+  const expiredNote = expired ? '<p class="warn">PR snapshot is expired; counts and queue positions below are cached observations.</p>' : "";
   const stats = [
-    `<span><b>${totalOpen}</b> ${unknownRepos || truncatedRepos ? "open PRs observed" : "open PRs"}</span>`,
-    `<span class="${queuedRows.length ? "ok" : incomplete ? "warn" : "muted"}"><b>${queuedRows.length}</b> ${incomplete ? "queued observed" : "queued"}</span>`,
-    totalRed ? `<span class="bad"><b>${totalRed}</b> ${incomplete ? "CI red observed" : "CI red"}</span>` : "",
+    `<span><b>${totalOpen}</b> ${expired ? "open PRs (cached)" : unknownRepos || truncatedRepos ? "open PRs observed" : "open PRs"}</span>`,
+    `<span class="${expired ? "warn" : queuedRows.length ? "ok" : incomplete ? "warn" : "muted"}"><b>${queuedRows.length}</b> ${expired ? "queued (cached)" : incomplete ? "queued observed" : "queued"}</span>`,
+    totalRed ? `<span class="bad"><b>${totalRed}</b> ${expired ? "CI red (cached)" : incomplete ? "CI red observed" : "CI red"}</span>` : "",
     unknownRepos ? `<span class="warn"><b>${unknownRepos}</b> repo unknown</span>` : "",
     truncatedRepos ? `<span class="warn"><b>${truncatedRepos}</b> repo truncated</span>` : "",
   ].filter(Boolean);
+  const queueQualifier = expired
+    ? (incomplete ? " (cached — snapshot expired, coverage incomplete)" : " (cached — snapshot expired)")
+    : (incomplete ? " (observed — coverage incomplete)" : "");
   const queueBlock = queuedRows.length
-    ? `<h3>In merge queue${incomplete ? " (observed — coverage incomplete)" : ""}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
+    ? `<h3>In merge queue${queueQualifier}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
     : !repos.length
       ? '<p class="warn">No repositories reported; merge queue status is unknown.</p>'
-      : incomplete
-        ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
-        : '<p class="muted">No PRs currently in the merge queue.</p>';
-  return `<div class="summary-stats">${stats.join("")}</div>`
+      : expired
+        ? '<p class="warn">PR snapshot is expired (cached); current merge queue status is unknown.</p>'
+        : incomplete
+          ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
+          : '<p class="muted">No PRs currently in the merge queue.</p>';
+  return expiredNote
+    + `<div class="summary-stats">${stats.join("")}</div>`
     + queueBlock
     + "<h3>By repository</h3>"
     + table(["Repository", "Open", "Queued", "CI red", "Status"], repoRows);
@@ -225,7 +232,7 @@ function renderChips(latest) {
     out.push(chip("#alerts", firing, "alerts firing", critical ? "bad" : firing ? "warn" : ""));
   } else if (latest.alerts) out.push(chip("#alerts", "?", "alerts unknown", "bad"));
   out.push(...subscriptionChips(latest.usage, latest.logins, "/subscriptions"));
-  out.push(...prChips(latest.prs, "/pull-requests"));
+  out.push(...prChips(latest.prs, "/pull-requests", Boolean(latest.prsExpired)));
   return out.join("");
 }
 
@@ -241,7 +248,24 @@ const PANELS = [
     onError: latest => { latest.logins = null; },
     retry: (subs, logins) => !logins || logins.state === "pending",
   },
-  {id: "prs", label: "Merge queue", urls: ["/api/git/pull-requests"], render: renderQueueSummary},
+  {
+    id: "prs",
+    label: "Merge queue",
+    urls: ["/api/git/pull-requests"],
+    withReadings: true,
+    render: (prs, readings) => renderQueueSummary(prs, prSnapshotExpired(readings?.[0])),
+    onData: (_data, latest, readings) => { latest.prsExpired = prSnapshotExpired(readings?.[0]); },
+    onError: latest => { latest.prsExpired = false; },
+    onTick: (panel, latest, updateChips) => {
+      if (!panel.ok || latest.prsExpired) return;
+      const reading = panel.readings?.[0];
+      if (!reading || !prSnapshotExpired(reading)) return;
+      latest.prsExpired = true;
+      const box = document.getElementById("prs-content");
+      if (box) box.innerHTML = renderQueueSummary(reading.data, true);
+      updateChips();
+    },
+  },
 ];
 
 const runner = createPanelRunner({panels: PANELS, renderChips});
