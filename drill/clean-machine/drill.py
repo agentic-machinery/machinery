@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Clean-machine release drill for lu-machinery: install, run every consumer row, roll back, rerun.
 
-Run it with a plain CPython 3.12+ on Linux, with no machinery checkout anywhere on the machine:
+Run it with a plain CPython 3.12+ on Linux, with no machinery checkout anywhere on the machine.
+``--version`` and ``--rollback-to`` are required; there is no default release:
 
-    python3 -I drill.py all --workdir /path/to/empty/dir --version 0.1.28 --rollback-to 0.1.27
+    python3 -I drill.py all --version <release> --rollback-to <previous-release>
+
+Replace the placeholders with version numbers, without angle brackets.
 
 Steps (``all``):
   1. setup     download both release wheels and SHA256SUMS from GitHub, check the sums,
@@ -1852,11 +1855,10 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Keep the venv, mock world, wheels and every trace (default: keep only out/)",
     )
+    parser.add_argument("--version", help="Forward release (required)")
     parser.add_argument(
-        "--version", default="0.1.28", help="Forward release (default 0.1.28)"
-    )
-    parser.add_argument(
-        "--rollback-to", default="0.1.27", help="Previous release (default 0.1.27)"
+        "--rollback-to",
+        help="Previous release (required for all; the internal phase command does not use it)",
     )
     parser.add_argument(
         "--wheel-dir",
@@ -1897,6 +1899,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--phase", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    missing = []
+    if args.version is None or not args.version.strip():
+        missing.append("--version")
+    if args.command == "all" and (
+        args.rollback_to is None or not args.rollback_to.strip()
+    ):
+        missing.append("--rollback-to")
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
     if args.command == "phase":
         try:
             return phase_main(args)
