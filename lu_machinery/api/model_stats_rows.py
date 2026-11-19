@@ -35,9 +35,11 @@ from typing import Any
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
+from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
-from lu_machinery.review.review_contract import ContractError, parse_reviewer_json
+from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
+from lu_machinery.review.verdict_parser import checked_findings_payload
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
 _JSON_MAX_DEPTH = 128
@@ -49,6 +51,7 @@ LOCK_FILE = "rows.lock"
 MAX_RESULT_BYTES = 4 * 1024 * 1024
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
+_RECORDED_VERDICTS = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
@@ -152,20 +155,27 @@ def _options(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return options if isinstance(options, Mapping) else {}
 
 
-def effective_effort(record: Mapping[str, Any]) -> str:
-    """The recorded effort; else the effort suffix of a requested variant id (``grok-4.7-high``); else ``unset``.
+def variant_effort(raw: object) -> str | None:
+    """The suffix of a catalog model selector, such as ``gemini-4-neon-medium``."""
+    spelling = _spelling(raw).lower()
+    match = _EFFORT_SUFFIX.search(spelling)
+    if match and model_id(spelling) not in {spelling, "unknown"}:
+        return match.group(1)
+    return None
 
-    A suffix counts only when the spelling extends its catalog id, so a catalog id that merely ends in an effort
-    word (``gemini-3.8-flash-high``) and a model with no recorded effort are ``unset``, never a default.
-    """
+
+def effective_effort(record: Mapping[str, Any]) -> str:
+    """Use the runtime selector when observed, then the requested selector or recorded effort."""
+    observed = _spelling(record.get("resolved_model")) if record.get("resolved_model_known") is True else ""
+    requested = record.get("model")
+    if level := variant_effort(observed):
+        return level
+    if model_id(observed) in {"unknown", model_id(requested)} and (level := variant_effort(requested)):
+        return level
     options = _options(record)
     for value in (record.get("effort"), options.get("effort")):
         if isinstance(value, str) and value.strip():
             return label(value.strip().lower())
-    spelling = _spelling(record.get("model")).lower()
-    match = _EFFORT_SUFFIX.search(spelling)
-    if match and model_id(spelling).lower() != spelling:
-        return match.group(1)
     return UNSET
 
 
@@ -199,16 +209,29 @@ def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
     return review_summary(raw)
 
 
-def review_summary(raw: bytes) -> dict[str, Any]:
-    """Verdict and finding priorities of a reviewer reply, read with the review contract's own parser.
+def _recorded_review(verdict: object) -> dict[str, Any]:
+    """A structured verdict record does not attest a findings count."""
+    try:
+        return {"verdict": _RECORDED_VERDICTS[normalize_verdict(verdict)], "priorities": None}
+    except ReviewPublicationError:
+        return {"verdict": "unparsed", "priorities": None}
 
-    Bare JSON, one fenced JSON object and the ``VERDICT:``/``SCORE:`` envelope are read; anything else, including a
-    findings container that is not a list, is ``unparsed`` with no priorities and never raises.
-    """
+
+def review_summary(raw: bytes) -> dict[str, Any]:
+    """Read structured review output through the review contract, retaining only counts and the verdict."""
     unparsed: dict[str, Any] = {"verdict": "unparsed", "priorities": {}}
     try:
         payload = parse_reviewer_json(raw.decode("utf-8"))
-    except (ContractError, UnicodeDecodeError, ValueError, RecursionError, TypeError, KeyError):
+        if payload.get("schema_version") == SCHEMA_VERSION:
+            decision, evidence = checked_findings_payload(payload)
+            counts = Counter(finding.priority for finding in evidence.findings)
+            return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
+        if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
+            return _recorded_review(payload["verdict"])
+    except (ContractError, ReviewPublicationError, UnicodeDecodeError, ValueError, RecursionError, TypeError, KeyError):
+        return unparsed
+    # Older dispatches also recorded the unversioned correctness and priority fields.
+    if "schema_version" in payload:
         return unparsed
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
@@ -219,6 +242,13 @@ def review_summary(raw: bytes) -> dict[str, Any]:
         finding["priority"] for finding in findings
         if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
     return {"verdict": verdict, "priorities": dict(sorted(priorities.items()))}
+
+
+def _review(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    reply = _result(path, record)
+    if reply and reply["verdict"] != "unparsed":
+        return reply
+    return _recorded_review(record.get("verdict"))
 
 
 def _reading(value: object) -> dict[str, float] | str:
@@ -275,7 +305,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     else:
         task_class = label(record.get("research_task_family"), "unclassified")
     pr = record.get("pr", options.get("pr"))
-    head = record.get("pinned_head") or options.get("pinned_head")
+    head = record.get("pinned_head") or options.get("pinned_head") or record.get("worktree_base_ref")
     author = record.get("review_author_model") or options.get("review_author_model")
     fresh, cached, output = tokens(record.get("usage"))
     return {
@@ -292,8 +322,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "duration_s": _number(record.get("duration_s")),
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
         "allowance": _allowance(record),
-        "review": (_result(path, record) or {"verdict": "unparsed", "priorities": {}})
-        if role == "review" and status == "done" else None,
+        "review": _review(path, record) if role == "review" and status == "done" else None,
         "repo": label(record.get("repo") or options.get("repo"), "public"),
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
@@ -439,8 +468,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
         _optional(review, lambda r: isinstance(r, dict) and r.keys() == {"verdict", "priorities"}
                   and isinstance(r["verdict"], str) and r["verdict"] in VERDICTS
-                  and isinstance(r["priorities"], dict)
-                  and all(p in PRIORITIES and _count_value(n) for p, n in r["priorities"].items())),
+                  and _optional(r["priorities"], lambda priorities: isinstance(priorities, dict)
+                                and all(p in PRIORITIES and _count_value(n) for p, n in priorities.items()))),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -500,18 +529,28 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
 
 
 def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> bool:
-    """Whether ``candidate`` should supersede the stored row: none stored, or one from an older record version."""
+    """Refresh missing or older rows, or reprocess a review whose retained evidence yields a better summary."""
     if present is None:
         return True
     stored = present.get("source_mtime_ns")
-    return not isinstance(stored, int) or stored < candidate["source_mtime_ns"]
+    source = candidate["source_mtime_ns"]
+    if not isinstance(stored, int) or stored < source:
+        return True
+    review = candidate["review"]
+    old_review = present.get("review")
+    return (
+        stored == source
+        and review is not None and review["verdict"] != "unparsed"
+        and (review["priorities"] is not None or old_review is None or old_review["priorities"] is None
+             or old_review["verdict"] == "unparsed")
+        and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
+    )
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
     """Add a row for every settled record without a current one; idempotent. Records are read outside the lock.
 
-    A stored row from an older version of the record (a settlement row whose later rewrite failed to append its
-    own) is superseded by a new last line, never edited; a row from the same or a newer version is kept.
+    A new last line supersedes an older record version or a review summary improved by retained evidence.
     """
     counts: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
@@ -564,7 +603,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="python -m lu_machinery.api.model_stats_rows",
         description=(
             "Backfill the durable model-stats summary rows (#581) from every dispatch task record, hot and archived.\n"
-            "Run once on the host after the release that adds the rows; rerunning adds only missing rows. "
+            "Rerun after an update to recover review evidence from retained task results. "
             "Not for live statistics: the Monitor route /api/fleet/model-stats reads the rows."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
