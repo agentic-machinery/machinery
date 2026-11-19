@@ -302,8 +302,9 @@ encoded value so the sanitizer can remove it.
   boundary. A dot after a root still counts, as in `/tmp.backup`. A file URI
   may contain an authority, an empty authority or extra slashes.
 - A valid non-file URI authority is outside the path. A root-shaped host or
-  an ordinary remote path can appear in a URL-valued parameter. A malformed
-  authority keeps the conservative local path checks.
+  an ordinary remote path can appear in a URL-valued parameter. The remote
+  path exemption ends at a raw value separator or punctuation that starts a
+  separate path. A malformed authority keeps the conservative local path checks.
 - Dot-relative paths use whole root segments. `../home/x` counts.
   `../home.md`, `./docs/x` and `../guide.md` stay clear. An absolute path
   uses whole segments after a `.` or `..` segment as well.

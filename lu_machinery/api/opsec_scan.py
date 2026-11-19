@@ -71,11 +71,15 @@ _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{
 # bytes behind.
 _PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
 _PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
-# Delimit scan parts independently of the wider redaction span. A comma or
-# semicolon can join references in prose as well as form part of a path.
+# Delimit scan parts independently of the wider redaction span. Raw value
+# separators and punctuation introducing another path also end a remote
+# authority, so its path exemption cannot extend to that next part.
 _MARKUP_RE = re.compile(r"`+|(?<!\\)\]\(|[()]")
-_PART_END_RE = re.compile(r"[?#&=]|[,;](?=\.{0,2}/)|(?<![A-Za-z0-9])(?=(?i:file):)")
-_AUTHORITY_END_RE = re.compile(r"[/#?`]|[,;](?=(?i:file):)")
+_VALUE_SEPARATOR = r"[?#&=]"
+_JOINED_PATH_SEPARATOR = r"[!,;()](?=(?:\.|%2[eE]){0,2}(?:/|%2[fF])|(?i:file):)"
+_PART_END_RE = re.compile(rf"{_VALUE_SEPARATOR}|{_JOINED_PATH_SEPARATOR}|(?<![A-Za-z0-9])(?=(?i:file):)")
+_AUTHORITY_END_RE = re.compile(rf"[/`]|{_VALUE_SEPARATOR}|{_JOINED_PATH_SEPARATOR}")
+_FILE_AUTHORITY_END_RE = re.compile(r"[/#?`]|[,;](?=(?i:file):)")
 _SCHEME_RE = re.compile(r"[.!+\[:]*(?P<name>[A-Za-z][A-Za-z0-9+.-]*):")
 _AUTHORITY_RE = re.compile(
     r"(?:[A-Za-z0-9._~!$%&'()*+,;=:-]*@)?"
@@ -504,7 +508,8 @@ def _path_root_in_part(
         has_authority = scheme is not None and text.startswith("//", path_start, end)
         if has_authority:
             authority_start = path_start + 2
-            authority_end = _AUTHORITY_END_RE.search(text, authority_start, end)
+            authority_boundary = _FILE_AUTHORITY_END_RE if file_uri else _AUTHORITY_END_RE
+            authority_end = authority_boundary.search(text, authority_start, end)
             path_start = authority_end.start() if authority_end else end
             remote = not file_uri and _valid_authority(
                 text, authority_start, path_start
