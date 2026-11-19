@@ -63,20 +63,22 @@ _ISO_DURATION_RE = re.compile(
 # single candidate.  Unbracketed IPv4:port is handled by the same parser.
 _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{1,5})?|[0-9A-Fa-f:.]+)(?![A-Za-z0-9])")
 # A bare root must not follow a slash, so URL authorities such as
-# "https://tmp.example.org" stay unflagged.  A file URI is the exception: its
-# slashes and optional authority ("file:///home/...", "file://host/home/...",
-# "file:////home/...") belong to the path, and the whole URI is the token so a
-# redaction also removes the authority.  "//" after the scheme always opens an
-# authority (RFC 8089), so a host such as "file://home.example/..." is never
-# re-read as a path, and the URI's first path segment must be the whole root
-# ("file:///tmp.backup/..." is not under /tmp).
-_FILE_URI_PREFIX = r"(?<![A-Za-z0-9+.-])(?i:file):(?://[^/\s\"'<>?#]*|(?!//))/*"
+# "https://tmp.example.org" stay unflagged.
 _FILESYSTEM_PATH_RE = re.compile(
-    rf"(?:(?P<uri>{_FILE_URI_PREFIX})|(?<![A-Za-z0-9/]))"
-    rf"(?P<slash>/)(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
-    r"(?(uri)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])|(?![A-Za-z0-9_-]))"
+    rf"(?<![A-Za-z0-9/])/(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
+    r"(?![A-Za-z0-9_-])"
     r"(?P<tail>/[^\s\"'<>]*)?"
 )
+# A file URI carries its path after the scheme's slashes and optional
+# authority ("file:///home/...", "file://host/home/...", "file:////home/...",
+# "file:/home/..."), which the bare rule above cannot see.  "//" after the
+# scheme always opens an authority (RFC 8089), and the authority excludes "/",
+# so a host such as "home.example" is never re-read as a path.  Only a letter
+# or digit before "file:" makes it another scheme's suffix ("profile:");
+# punctuation ("...file:", a diff's "+file:") does not.
+_FILE_URI_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):(?://[^/\s\"'<>?#]*|(?!//))(?P<path>/[^\s\"'<>]*)")
+_FILE_URI_SEGMENT_RE = re.compile(r"/*(?P<segment>[^/?#]*)")
+_BOUNDED_ROOT_NAMES = frozenset(root[1:] for root in BOUNDED_FILESYSTEM_ROOTS)
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
@@ -383,13 +385,24 @@ def scan_text(
         for match in re.finditer(re.escape(canary), text):
             candidates.append(_Candidate(match.start(), match.end(), "canary", match.group(0), 100))
 
+    # A file URI is flagged whole when its first path segment is exactly a
+    # bounded root ("file:///tmp.backup/..." is not under /tmp).  The bare rule
+    # never re-reads that first segment, whatever the verdict on the URI.
+    file_uri_paths: set[int] = set()
+    for match in _FILE_URI_RE.finditer(text):
+        file_uri_paths.add(match.start("path"))
+        segment = _FILE_URI_SEGMENT_RE.match(match.group("path"))
+        if segment is not None and segment.group("segment") in _BOUNDED_ROOT_NAMES:
+            start, end, token = _trim_path_token(match)
+            candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
+
     # Only a bare hash route ("#/home") exempts a path, and only when it covers
     # the root itself.  A SHA, timestamp or duration in the tail, or an /api
     # route whose query or authority carries the path, never does.
     hash_routes = tuple((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
     for match in _FILESYSTEM_PATH_RE.finditer(text):
         start, end, token = _trim_path_token(match)
-        if token and not _overlaps(match.start("slash"), match.end("root"), hash_routes):
+        if token and start not in file_uri_paths and not _overlaps(start, match.end("root"), hash_routes):
             candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
 
     for match in _USER_AT_HOST_RE.finditer(text):
