@@ -1211,36 +1211,45 @@ def test_cli_defaults_to_dry_run_json(tasks_dir, capsys):
     assert str_mod.main(["archive", "--tasks-dir", str(tasks_dir / "missing")]) == str_mod.EXIT_USAGE
 
 
-def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_claim(
-    tasks_dir, tmp_path, configured_roots, monkeypatch
-):
+def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_claim(tasks_dir, tmp_path, monkeypatch):
     """Defect class: a legacy repo-relative ``worktree_path`` read relative to the caller's cwd.
 
     Its lock refused it as not absolute ("worktree lock unavailable"), so archive
     skipped every such record while live tasks ran, and its keep-hot check looked
-    in the wrong directory. A relative path belongs to the checkout of the
+    in the wrong directory. A relative path belongs to the checkout of the fleet
     repository its record names, from any cwd, with another task's claim held. A
-    path whose repository is unknown, or whose state cannot be read, keeps the
-    record hot rather than counting as gone.
+    path whose repository has no usable checkout, or whose state cannot be read,
+    keeps the record hot rather than counting as gone.
     """
-    public, sibling_slug = "learn-ukrainian/learn-ukrainian.github.io", "learn-ukrainian/machinery"
-    primary = configured_roots.primary
-    sibling = tmp_path / "sibling"
-    monkeypatch.setattr(str_mod, "default_repo_checkouts", lambda: {public: primary, sibling_slug: sibling})
+    public, sibling_slug, looped_slug = (
+        "learn-ukrainian/learn-ukrainian.github.io",
+        "learn-ukrainian/machinery",
+        "learn-ukrainian/ukrainian-llm-eval",
+    )
+    fleet = tmp_path / "fleet"
+    primary, sibling = fleet / "learn-ukrainian", fleet / "machinery"
+    for checkout in (primary, sibling):
+        (checkout / ".git").mkdir(parents=True)
+    (fleet / "ukrainian-llm-eval").symlink_to(fleet / "ukrainian-llm-eval")  # a sibling that cannot resolve
+    monkeypatch.setattr(str_mod, "state_root", lambda: primary)
     codex = Path(".worktrees") / "dispatch" / "codex"
     live = primary / codex / "live"
     live.mkdir(parents=True)
     (primary / codex / "kept").mkdir()
     (sibling / codex / "sibling-kept").mkdir(parents=True)
     (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    (tmp_path / "dangling").symlink_to(tmp_path / "no-target")
     _terminal(tasks_dir, "live-task", status="running", age_days=0, repository=public, worktree_path=str(live))
     old = {"status": "failed", "repository": public}
     _terminal(tasks_dir, "old-gone", **old, worktree_path=str(codex / "gone"))
     _terminal(tasks_dir, "old-kept", **old, worktree_path=str(codex / "kept"))
     _terminal(tasks_dir, "old-canonical-kept", **old, worktree_path=str(codex / "missing" / ".." / "kept"))
+    _terminal(tasks_dir, "old-dangling-slash", **old, worktree_path=f"{tmp_path / 'dangling'}/")
     _terminal(tasks_dir, "old-sibling-kept", status="failed", repository=sibling_slug,
               worktree_path=str(codex / "sibling-kept"))
     _terminal(tasks_dir, "old-unattributed", status="failed", repository="owner/elsewhere",
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-looped-sibling", status="failed", repository=looped_slug,
               worktree_path=str(codex / "gone"))
     _terminal(tasks_dir, "old-loop", **old, worktree_path=str(tmp_path / "loop" / "gone"))
     _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
@@ -1275,8 +1284,8 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
         "old-acp-junk.json": ("archived", None),
     }
     assert report["kept_hot"] == {
-        "worktree path still exists": 3,
-        "worktree path state unknown": 2,
+        "worktree path still exists": 4,
+        "worktree path state unknown": 3,
         "ACP runtime path state unknown": 1,
     }
     assert live_still_held == worktree_claims.LOCK_BUSY
@@ -1284,8 +1293,10 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
         "live-task.json",
         "old-acp-nul.json",
         "old-canonical-kept.json",
+        "old-dangling-slash.json",
         "old-kept.json",
         "old-loop.json",
+        "old-looped-sibling.json",
         "old-sibling-kept.json",
         "old-unattributed.json",
     ]
