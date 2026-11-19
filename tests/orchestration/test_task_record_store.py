@@ -124,7 +124,7 @@ def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_pat
 
 def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch):
     from lu_machinery.dispatcher import store as dispatch_store
-    from lu_machinery.orchestration import orchestrator_control
+    from lu_machinery.orchestration import orchestrator_control, stale_task_records
 
     tasks = tmp_path / "tasks"
     archived = store.archived_task_record_path(tasks, "old")
@@ -157,6 +157,18 @@ def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch
 
     stamped_reply.unlink()
     assert store.relocated_result_file(stamped, hot_result) == str(stamped_reply)
+    stamped_reply.write_text("second run's reply", encoding="utf-8")
+    (tasks / "old.json").write_text(json.dumps({"task_id": "old", "run_nonce": "third", "result_file": hot_result}))
+    Path(hot_result).write_text("third run's reply", encoding="utf-8")
+
+    assert stale_task_records.restore_archived(tasks, [stamped.name], apply=True)["actions"] == {"restored": 1}
+
+    restored = tasks / stamped.name
+    assert store.relocated_result_file(restored, str(stamped_reply)) == str(restored.with_suffix(".result"))
+
+    states = dispatch_store.list_tasks(include_archive=True, strict=True)
+    by_nonce = {state["run_nonce"]: Path(state["result_file"]).read_text() for state in states}
+    assert by_nonce == {"first": "reply", "second": "second run's reply", "third": "third run's reply"}
 
 
 def test_v2_record_under_another_name_raises_identity_mismatch_with_its_content(tmp_path):

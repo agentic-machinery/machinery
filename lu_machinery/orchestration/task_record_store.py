@@ -335,20 +335,21 @@ def relocated_result_file(record_path: Path, result_file: str | None) -> str | N
     """Return where ``result_file`` lives now for the record at ``record_path``.
 
     A record keeps the hot-directory ``result_file`` path it was written with.
-    Archiving moves the ``.result`` sidecar next to the archived record. A
-    stamped archive name also stamps its reply. Even if that reply is missing,
-    the old basename cannot be used because it may name a different run.
+    Archive and restore keep a stamped record beside its stamped reply. Even
+    if that reply is missing, the old basename may name a different run.
     """
-    if record_path.parent.name != ARCHIVE_DIR_NAME or not isinstance(result_file, str) or not result_file:
+    if not isinstance(result_file, str) or not result_file:
         return result_file
     result = Path(result_file)
     reply = record_path.with_suffix(".result")
     if (
         result.suffix == ".result"
-        and result.name != reply.name
+        and _REDISPATCH_ARCHIVED_STEM_RE.fullmatch(record_path.stem)
         and candidate_task_record_names(result.stem, (record_path.name,))
     ):
         return str(reply)
+    if record_path.parent.name != ARCHIVE_DIR_NAME:
+        return result_file
     moved = record_path.with_name(result.name)
     return str(moved) if moved.is_file() else result_file
 
