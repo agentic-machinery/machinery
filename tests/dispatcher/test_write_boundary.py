@@ -1047,3 +1047,22 @@ def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypa
     assert receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
     assert receipt["import"]["status"] == "refused" and "left out" in receipt["import"]["reason"]
     assert not patch.exists() and not local(omitted)
+
+
+def test_savant_write_draft_checks_only_the_new_paths_in_a_wide_directory(primary, monkeypatch, tmp_path):
+    """Defect class (#898, review of #913 round 3): the draft's path check lists a wide directory's unrelated
+    children and refuses a valid owned addition at the listing cap."""
+    repo, worktree, _ = primary
+    (repo / "docs").mkdir()
+    for index in range(40):
+        (repo / "docs" / f"sibling-{index:02d}.md").write_text("sibling\n")
+    (repo / "docs" / "guide.md").write_text("old\n")
+    _git(repo, "add", "docs")
+    _git(repo, "commit", "-qm", "fixture")
+    _git(worktree, "merge", "-q", "--ff-only", "main")
+    # The 40 siblings' entries (about 2.6 KB) would exceed this cap; one exact entry per path stays far below it.
+    monkeypatch.setattr(write_boundary, "MAX_TREE_LISTING_BYTES", 1024)
+    _code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, "printf 'new\\n' > docs/new.md", "docs",
+                                          read_path="docs/guide.md")
+    assert receipt["import"]["status"] == "drafted" and receipt["import"]["paths"] == ["docs/new.md"], receipt["import"]
+    assert patch.exists()

@@ -2120,22 +2120,25 @@ class _Boundary:
         new = {path for path in edits if path not in self.manifest}
         prefixes = sorted({str(parent) for path in new for parent in (PurePosixPath(path), *PurePosixPath(path).parents)
                            if str(parent) != "."})
-        # Tree entries only, never a blob, so nothing is fetched: ls-tree of an exact path lists a non-tree entry
-        # itself and a tree's children.
+        # Tree entries only, never a blob, so nothing is fetched. ls-tree lists each exact path as its own entry
+        # unless the same call also names something below it (then it lists the tree's children), so each call
+        # names paths of one depth only.
         kinds: dict[str, bytes] = {}
-        for start in range(0, len(prefixes), 512):
-            listing = _plain_git_bounded(self.repository, "ls-tree", "-z", "--full-tree", self.tip, "--",
-                                         *prefixes[start:start + 512], max_bytes=MAX_TREE_LISTING_BYTES,
-                                         env=_NO_LAZY_FETCH, refusal=refusal)
-            for record in listing.split(b"\0"):
-                if record:
-                    meta, _, name = record.partition(b"\t")
-                    kinds[os.fsdecode(name)] = meta.split()[1]
-        # A new path must be absent (not listed, and no tree there listing children); a parent may only be a
-        # directory, never a file, link or submodule the view left out.
-        below, parents = tuple(f"{path}/" for path in new), set(prefixes)
-        if any(name in new or name.startswith(below) or (name in parents and kind != b"tree")
-               for name, kind in kinds.items()):
+        by_depth: dict[int, list[str]] = {}
+        for prefix in prefixes:
+            by_depth.setdefault(prefix.count("/"), []).append(prefix)
+        for group in by_depth.values():
+            for start in range(0, len(group), 512):
+                listing = _plain_git_bounded(self.repository, "ls-tree", "-z", "--full-tree", self.tip, "--",
+                                             *group[start:start + 512], max_bytes=MAX_TREE_LISTING_BYTES,
+                                             env=_NO_LAZY_FETCH, refusal=refusal)
+                for record in listing.split(b"\0"):
+                    if record:
+                        meta, _, name = record.partition(b"\t")
+                        kinds[os.fsdecode(name)] = meta.split()[1]
+        # A new path must be absent; a parent may only be a directory, never a file, link or submodule the view
+        # left out.
+        if any(name in new or kind != b"tree" for name, kind in kinds.items()):
             raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
         changed = sorted(path for path in edits if path in self.manifest)
         originals = _cat_blobs(self.repository, [self.manifest[path][1] for path in changed], refusal)
