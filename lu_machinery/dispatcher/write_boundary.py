@@ -163,6 +163,8 @@ MAX_SNAPSHOT_FILES = 20_000
 # A write run's view nests at most this deep; the draft reopens each directory from the root one component at a
 # time, so this keeps the host's work after the run linear in the entry count.
 MAX_VIEW_DEPTH = 64
+# A write run's view holds at most this many files and directories, at snapshot time and when its draft is read.
+MAX_VIEW_ENTRIES = 2 * MAX_SNAPSHOT_FILES
 # The recursive tree listing, excluded and skipped entries included, is read up to this size (about 16 times what
 # MAX_SNAPSHOT_FILES records of ordinary paths need), so the launcher's memory before the caps apply is bounded too.
 MAX_TREE_LISTING_BYTES = 16 * 1024 * 1024
@@ -810,6 +812,24 @@ def _plain_git_bounded(repository: Path, *args: str, max_bytes: int, env: dict[s
     return bytes(output)
 
 
+def _cat_blobs(repository: Path, oids: list[str], refusal: str) -> list[bytes]:
+    """The named blobs' bytes, in order, from one read-only ``cat-file --batch`` (each header is checked)."""
+    if not oids:
+        return []
+    output = _plain_git(repository, "cat-file", "--batch", data="".join(f"{oid}\n" for oid in oids).encode(),
+                        refusal=refusal)
+    blobs, offset = [], 0
+    for oid in oids:
+        end = output.find(b"\n", offset)
+        header = output[offset:end].split(b" ") if end >= 0 else []
+        if len(header) != 3 or header[0] != oid.encode() or header[1] != b"blob" or not header[2].isdigit():
+            raise Refused(f"{refusal}: git cat-file returned another object")
+        size = int(header[2])
+        blobs.append(output[end + 1:end + 1 + size])
+        offset = end + 2 + size
+    return blobs
+
+
 def _public_origin(repository: Path) -> str:
     """The primary origin's GitHub slug, refused unless it names a registered repository with a public role."""
     match = _GITHUB_REMOTE.fullmatch(_git(repository, "remote", "get-url", "origin").strip())
@@ -964,6 +984,12 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         files += 1
     if not files:
         raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
+    if manifest is not None:
+        # The draft reads files and directories within one budget; a view already past it could never deliver.
+        directories = {"/".join(path.split("/")[:depth]) for path in manifest for depth in range(1, path.count("/") + 1)}
+        if len(manifest) + len(directories) > MAX_VIEW_ENTRIES:
+            raise Refused(f"savant_snapshot_refused: the view would hold more than {MAX_VIEW_ENTRIES} files and "
+                          "directories; name the task's files or directories with --read-path")
     return {"commit": commit, "files": files, "bytes": total, "left_out": left_out, "read_paths": len(paths)}
 
 
@@ -1654,7 +1680,8 @@ class _Boundary:
                 # Nothing inside may still write to the view while the host reads it.
                 if not select.select([init], [], [], _CANARY_TIMEOUT)[0]:
                     raise Refused("savant_draft_refused: the sandbox's processes did not stop")
-                self.receipt["import"].update(self._draft(boundary / Path(SNAPSHOT_INSIDE).name))
+                if returncode == 0:  # a failed provider keeps its own failure; its partial edits are not drafted
+                    self.receipt["import"].update(self._draft(boundary / Path(SNAPSHOT_INSIDE).name))
             except Refused as exc:
                 self.receipt["import"].update(status="refused", reason=str(exc))
             finally:
@@ -1985,7 +2012,7 @@ class _Boundary:
 
         Each component is opened with ``O_NOFOLLOW`` relative to its parent's descriptor, so no entry a sandbox
         process plants can lead outside the view. An entry that is not a directory or a single-link regular file,
-        an excluded, unprintable or screened name, more than ``2 * MAX_SNAPSHOT_FILES`` entries or more than
+        an excluded, unprintable or screened name, more than ``MAX_VIEW_ENTRIES`` entries or more than
         ``--snapshot-bytes`` bytes refuse the draft; the listing is read lazily, so memory stays within those
         bounds. Refusals never name the entry: names are the model's.
         """
@@ -2016,8 +2043,8 @@ class _Boundary:
                     with os.scandir(directory) as listing:
                         for entry in listing:
                             entries += 1
-                            if entries > 2 * MAX_SNAPSHOT_FILES:
-                                raise Refused(f"{refusal}: the view holds more than {2 * MAX_SNAPSHOT_FILES} entries")
+                            if entries > MAX_VIEW_ENTRIES:
+                                raise Refused(f"{refusal}: the view holds more than {MAX_VIEW_ENTRIES} entries")
                             relative = prefix + entry.name
                             if (not relative.isprintable() or _sensitive(os.fsencode(relative), needles, accounts)
                                     or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in relative.split("/"))):
@@ -2058,9 +2085,9 @@ class _Boundary:
         ``run`` calls it only after the run's init has exited (``_sandbox_init``). Each file is read once
         (``_read_view``), and Git gets those bytes, never the view's paths. An edit outside ``--owned-path``,
         a new file whose path or any of its parents names something of the start commit that the view left out,
-        and edited bytes the view's own screen would refuse (``_sensitive``) refuse the draft. Git runs in a
-        private bare repository whose only link to the primary is read-only alternates, and the tree delta it
-        computes must be exactly the validated paths. Settlement checks the paths again. An empty dict means
+        and edited bytes the view's own screen would refuse (``_sensitive``) refuse the draft. The primary is only
+        read (``cat-file``); Git builds the before and after trees of the changed paths in a private bare
+        repository that shares nothing with it, and the tree delta must be exactly the validated paths. Settlement checks the paths again. An empty dict means
         nothing changed.
         """
         from pathlib import PurePosixPath
@@ -2083,21 +2110,13 @@ class _Boundary:
             raise Refused(f"{refusal}: {len(outside)} edited path(s) lie outside the owned paths")
         if any(_sensitive(files[path], needles, accounts) for path, mode in edits.items() if mode is not None):
             raise Refused(f"{refusal}: an edit holds a private key, a token, a configured secret or a host name")
-        work = self.base / "draft"
-        work.mkdir(mode=0o700)
-        draft = work / "draft.git"
-        object_format = "sha256" if len(self.tip) == 64 else "sha1"
-        _plain_git(work, "init", "--bare", "-q", "--template=", f"--object-format={object_format}", str(draft),
-                   refusal=refusal)
-        (draft / "objects" / "info").mkdir(parents=True, exist_ok=True)
-        _write_private(draft / "objects" / "info" / "alternates", f"{self.common / 'objects'}\n".encode(), 0o600)
-        env = {"GIT_INDEX_FILE": str(work / "index")}
         # A new file must not name, below or at any of its parents, a path of the start commit: the view left
-        # that one out (its name, content or --read-path), and Git would replace what the run never read.
+        # that one out (its name, content or --read-path), and Git would replace what the run never read. The
+        # primary is only read here and below (cat-file), never written: no object of the draft is written there.
         new = {path for path in edits if path not in self.manifest}
         prefixes = sorted({str(parent) for path in new for parent in (PurePosixPath(path), *PurePosixPath(path).parents)
                            if str(parent) != "."})
-        listed = _plain_git(draft, "cat-file", "--batch-check", refusal=refusal,
+        listed = _plain_git(self.repository, "cat-file", "--batch-check", refusal=refusal,
                             data="".join(f"{self.tip}:{prefix}\n" for prefix in prefixes).encode()).decode()
         lines = listed.splitlines()
         if len(lines) != len(prefixes):
@@ -2106,24 +2125,37 @@ class _Boundary:
             # The new path itself must be absent; a parent may only be a directory the view also had.
             if not line.endswith(" missing") and (prefix in new or line.split(" ")[1:2] != ["tree"]):
                 raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
-        _plain_git(draft, "read-tree", self.tip, env=env, refusal=refusal)
-        index = []
-        for path, mode in edits.items():
-            if mode is None:
-                index.append(f"0 {'0' * len(self.tip)}\t{path}\0")
-                continue
-            oid = _plain_git(draft, "hash-object", "-w", "--no-filters", "--stdin", data=files[path],
-                             refusal=refusal).decode().strip()
-            index.append(f"{mode} {oid}\t{path}\0")
-        _plain_git(draft, "update-index", "-z", "--index-info", data="".join(index).encode(), env=env,
+        changed = sorted(path for path in edits if path in self.manifest)
+        originals = _cat_blobs(self.repository, [self.manifest[path][1] for path in changed], refusal)
+        # The draft's own repository holds just the changed paths before and after; it shares nothing with the
+        # primary, so no Git step can write or freshen the primary's objects.
+        work = self.base / "draft"
+        work.mkdir(mode=0o700)
+        draft = work / "draft.git"
+        object_format = "sha256" if len(self.tip) == 64 else "sha1"
+        _plain_git(work, "init", "--bare", "-q", "--template=", f"--object-format={object_format}", str(draft),
                    refusal=refusal)
-        tree = _plain_git(draft, "write-tree", env=env, refusal=refusal).decode().strip()
-        delta = _plain_git(draft, "diff-tree", "-r", "-z", "--name-only", "--no-renames", self.tip, tree,
+        env = {"GIT_INDEX_FILE": str(work / "index")}
+
+        def blob(data: bytes) -> str:
+            return _plain_git(draft, "hash-object", "-w", "--no-filters", "--stdin", data=data,
+                              refusal=refusal).decode().strip()
+
+        def tree(entries: list[str]) -> str:
+            _plain_git(draft, "update-index", "-z", "--index-info", data="".join(entries).encode(), env=env,
+                       refusal=refusal)
+            return _plain_git(draft, "write-tree", env=env, refusal=refusal).decode().strip()
+
+        before = tree([f"{self.manifest[path][0]} {blob(data)}\t{path}\0"
+                       for path, data in zip(changed, originals, strict=True)])
+        after = tree([f"0 {'0' * len(self.tip)}\t{path}\0" if mode is None else f"{mode} {blob(files[path])}\t{path}\0"
+                      for path, mode in edits.items()])
+        delta = _plain_git(draft, "diff-tree", "-r", "-z", "--name-only", "--no-renames", before, after,
                            refusal=refusal)
         if {os.fsdecode(name) for name in delta.split(b"\0") if name} != set(edits):
             raise Refused(f"{refusal}: Git's tree change differs from the validated edits")
         patch = _plain_git_bounded(draft, "diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames",
-                                   "--no-ext-diff", "--no-textconv", self.tip, tree, max_bytes=4 * limit,
+                                   "--no-ext-diff", "--no-textconv", before, after, max_bytes=4 * limit,
                                    refusal=refusal)
         _write_private(Path(self.args.draft_patch), patch, 0o600)
         return {"status": "drafted", "patch": self.args.draft_patch, "patch_sha256": hashlib.sha256(patch).hexdigest(),

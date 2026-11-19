@@ -908,10 +908,12 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     _git(worktree, "merge", "-q", "--ff-only", "main")
     tip = _git(repo, "rev-parse", "HEAD")
     objects, status = _git(repo, "count-objects", "-v"), _git(repo, "status", "--porcelain")
+    # Every primary object file's mtime: Git freshens an existing object it is asked to write (review of #913).
+    stamps = {path: path.stat().st_mtime_ns for path in (repo / ".git" / "objects").rglob("*") if path.is_file()}
     host_tmp = tmp_path / "outside-written"
     script = (
         # Owned edits of its own view: change, add and delete.
-        "printf 'new text\\n' > docs/guide.md; printf 'added\\n' > docs/new.md; rm gone.txt;"
+        "printf 'new text\\n' > docs/guide.md; printf 'primary\\n' > docs/new.md; rm gone.txt;"
         # Every other write path fails or lands in the private, discarded HOME and TMPDIR.
         f"echo x > {worktree}/a.txt; echo x > {repo}/a.txt; echo x > {repo}/.git/HEAD; echo x > {host_tmp};"
         f"git -C {repo} commit -q --allow-empty -m evil; git -C {worktree} status;"
@@ -931,12 +933,36 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     # Nothing outside the patch changed: the worktree, the primary's files, refs and objects, the host.
     assert _git(worktree, "status", "--porcelain") == "" and _git(repo, "status", "--porcelain") == status
     assert _git(repo, "rev-parse", "HEAD") == tip and _git(repo, "count-objects", "-v") == objects
+    # docs/new.md's bytes equal a.txt's blob, which the primary already holds: its file was not touched either.
+    assert {path: path.stat().st_mtime_ns for path in (repo / ".git" / "objects").rglob("*") if path.is_file()} == stamps
     assert not host_tmp.exists() and not (tmp_path / "home" / "home-file").exists()
     assert not write_boundary.scratch("wb-test").exists()
     # A normal worker applies the patch to the start commit and gets exactly the run's edits.
     _git(worktree, "apply", "--index", str(patch))
     assert (worktree / "docs" / "guide.md").read_text() == "new text\n"
-    assert (worktree / "docs" / "new.md").read_text() == "added\n" and not (worktree / "gone.txt").exists()
+    assert (worktree / "docs" / "new.md").read_text() == "primary\n" and not (worktree / "gone.txt").exists()
+
+
+def test_savant_write_run_drafts_nothing_after_a_failed_provider_or_from_an_oversized_view(primary, monkeypatch,
+                                                                                          tmp_path):
+    """Defect class (#898, review of #913): a failed provider's partial edits become a deliverable patch, or a
+    view already past the draft's entry budget starts a run that can never deliver."""
+    repo, worktree, _ = primary
+    (repo / "docs").mkdir()
+    (repo / "docs" / "guide.md").write_text("old\n")
+    _git(repo, "add", "docs")
+    _git(repo, "commit", "-qm", "fixture")
+    _git(worktree, "merge", "-q", "--ff-only", "main")
+    code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, "printf 'x\\n' > docs/guide.md; exit 3",
+                                         "docs")
+    assert code == 3 and receipt["status"] == "ran" and receipt["import"]["status"] == "unchanged"
+    assert not patch.exists()
+    # a.txt, docs/ and docs/guide.md are three entries; a budget of two refuses before the provider starts.
+    monkeypatch.setattr(write_boundary, "MAX_VIEW_ENTRIES", 2)
+    marker = tmp_path / "started"
+    code, receipt, patch = _savant_write(primary, monkeypatch, tmp_path, f"touch {marker}", "docs")
+    assert code == write_boundary.REFUSED and "would hold more than 2 files and directories" in receipt["reason"]
+    assert not marker.exists() and not patch.exists()
 
 
 @pytest.mark.parametrize(("case", "script", "reason"), [

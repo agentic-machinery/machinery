@@ -46,10 +46,10 @@ fails with `write_boundary_import_failed: refused: savant_draft_refused: ...`, w
 - a path has an excluded or unprintable name;
 - a new file names a path the start commit already holds (one the view left out);
 - an edited file holds a private key, a known token format, a configured secret or a host name;
-- the edited view exceeds the snapshot cap.
+- the edited view exceeds the snapshot cap, the entry budget or the depth bound.
 
-The patch is built with a private object directory and index, so nothing is written to the
-repository or the worktree. Settlement then checks the patch's paths against the owned paths
+The primary is only read. The patch is built in a private bare repository that holds just the
+changed paths before and after, so nothing is written to the repository or the worktree. Settlement then checks the patch's paths against the owned paths
 again and records the run `done`. The task record's `write_boundary.import` holds `patch`,
 `patch_sha256` and `paths`. An unchanged view settles `no_deliverable` (`no_commits_or_unknown`).
 
@@ -58,13 +58,18 @@ again and records the run `done`. The task record's `write_boundary.import` hold
 Savant does not publish. A driver hands the patch to a normal write worker:
 
 1. Copy `<savant-task>.patch` into the landing task's inputs,
-   `batch_state/tasks/<landing-task>.inputs/`, and record the Savant task id and `patch_sha256`
-   in the brief.
+   `batch_state/tasks/<landing-task>.inputs/`. In the brief, record the Savant task id, the
+   `patch_sha256`, and the start commit the patch was taken against (`write_boundary.import.before`).
 2. Dispatch the landing worker from `--base origin/main` with the same owned paths.
-3. The worker checks the digest, runs `git apply --check` and then `git apply --index`,
-   runs the affected tests and lands the change with `full-send`.
+3. The worker checks the digest. It applies the patch with `git apply --3way --index`: the patch
+   carries the start commit's full blob ids, so a main that has moved since is merged rather than
+   refused. It then runs the affected tests and lands the change with `full-send`. If the
+   three-way apply conflicts, the draft is stale: report it, do not hand-merge it.
 4. The landing commits carry the landing worker's `X-Agent` trailer. The PR body names the Savant
    task as the draft's author, and the reviewer of record comes from outside both families.
+
+A provider that exits non-zero leaves no draft (`import.status` stays `unchanged`), and its own
+failure settles the task.
 
 ## Dispatch example
 
