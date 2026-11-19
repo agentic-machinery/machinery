@@ -130,12 +130,23 @@
 
   // ---- Fetch & formatting ----
 
+  // performance.now() does not follow wall-clock steps. Panel age uses it so a
+  // jumped or rolled-back Date.now() cannot freshen or expire a snapshot.
+  function monotonicNow() {
+    const perf = typeof performance === "object" && performance && typeof performance.now === "function"
+      ? performance.now() : NaN;
+    return typeof perf === "number" && Number.isFinite(perf) ? perf : null;
+  }
+
   async function fetchJson(url) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
     try {
       const response = await fetch(url, {signal: controller.signal, headers: {Accept: "application/json"}});
       if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+      // Stamp when the response arrives, not when the request starts, and not after the body is parsed.
+      const receivedAt = Date.now();
+      const receivedMono = monotonicNow();
       let data;
       try { data = JSON.parse(await response.text()); } catch { throw new Error(`${url}: Invalid JSON`); }
       if (data === null || typeof data !== "object" || Array.isArray(data)) throw new Error(`${url}: Invalid JSON shape`);
@@ -148,7 +159,8 @@
         boundHeader: headers ? headers.get("X-Snapshot-Stale-After-S") : null,
         state,
         snapshot: true,
-        receivedAt: Date.now(),
+        receivedAt,
+        ...(receivedMono === null ? {} : {receivedMono}),
         url,
       };
     } finally {
@@ -375,6 +387,7 @@
     if (unavailable) return [chip(href, "?", "PRs unknown", "warn")];
     const expired = prState === "expired" || prState === true;
     const ageUnknown = prState === "unknown";
+    const unbounded = prState === "unbounded";
     const open = repos.reduce((sum, repo) => sum + repoOpenCount(repo), 0);
     const queued = repos.reduce((sum, repo) => sum + (repo.status === "ok" ? (repo.pull_requests || []).filter(pr => pr.queue).length : 0), 0);
     const partial = repos.some(repo => repo.status !== "ok");
@@ -382,6 +395,7 @@
     const notes = [];
     if (expired) notes.push("cached");
     if (ageUnknown) notes.push("age unknown");
+    if (unbounded) notes.push("freshness unknown");
     if (partial) notes.push("a repository is unknown");
     if (truncated) notes.push("coverage truncated");
     const openText = notes.length ? "open PRs observed" : "open PRs";
@@ -416,8 +430,21 @@
     if (headerAge === null) return null;
     if (typeof now !== "number" || !Number.isFinite(now)) return null;
     const received = reading && reading.receivedAt;
-    const elapsed = typeof received === "number" && Number.isFinite(received)
-      ? Math.max(0, (now - received) / 1000) : 0;
+    // A non-finite receipt is a broken clock, not "just arrived". Missing receipt stays elapsed 0
+    // so a fixture that only carries the header still shows that header.
+    if (typeof received === "number" && !Number.isFinite(received)) return null;
+    const receivedMono = reading && reading.receivedMono;
+    if (typeof receivedMono === "number") {
+      if (!Number.isFinite(receivedMono)) return null;
+      const monoNow = monotonicNow();
+      if (monoNow === null) return null;
+      const elapsed = Math.max(0, (monoNow - receivedMono) / 1000);
+      const prior = reading._elapsedS;
+      const stable = typeof prior === "number" && Number.isFinite(prior) ? Math.max(prior, elapsed) : elapsed;
+      reading._elapsedS = stable;
+      return headerAge + stable;
+    }
+    const elapsed = typeof received === "number" ? Math.max(0, (now - received) / 1000) : 0;
     return headerAge + elapsed;
   }
 
@@ -457,7 +484,10 @@
     }
     const age = panelAgeSeconds(reading, now);
     const bound = panelBoundSeconds(reading);
-    if (age === null || bound === null) return {status: "unknown", expired: false, unavailable: false};
+    // Missing age and a missing bound are different. The body must not say the age is unknown
+    // when the header age was measured and only the bound is unusable.
+    if (age === null) return {status: "unknown", reason: "age", expired: false, unavailable: false};
+    if (bound === null) return {status: "unbounded", reason: "bound", expired: false, unavailable: false};
     const expired = age > bound;
     return {status: expired ? "expired" : "fresh", expired, unavailable: false};
   }

@@ -161,14 +161,18 @@ function renderQueueSummary(prs, prState = null) {
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
   const unavailable = prState === "unavailable" || allUnknown;
   const ageUnknown = !unavailable && prState === "unknown";
-  const expired = !unavailable && !ageUnknown && (prState === "expired" || prState === true);
+  const unbounded = !unavailable && prState === "unbounded";
+  const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);
   let totalOpen = 0, totalRed = 0, unknownRepos = 0, truncatedRepos = 0;
   const queuedRows = [];
   const repoRows = [];
   for (const repo of repos) {
-    if (repo.status !== "ok") {
-      unknownRepos += 1;
-      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(repo.reason ? String(repo.reason).replaceAll("_", " ") : "unknown", "warn")]);
+    if (unavailable || repo.status !== "ok") {
+      if (repo.status !== "ok") unknownRepos += 1;
+      const reason = repo.status !== "ok"
+        ? (repo.reason ? String(repo.reason).replaceAll("_", " ") : "unknown")
+        : "snapshot unavailable";
+      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason, "warn")]);
       continue;
     }
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
@@ -205,7 +209,9 @@ function renderQueueSummary(prs, prState = null) {
     ? '<p class="warn">PR snapshot is expired; counts and queue positions below are cached observations.</p>'
     : ageUnknown
       ? '<p class="warn">Snapshot age unknown. Counts and queue positions below are not confirmed as current.</p>'
-      : "";
+      : unbounded
+        ? '<p class="warn">Freshness unknown. The snapshot age is known, and the freshness bound is not, so counts and queue positions are not confirmed as current.</p>'
+        : "";
   const stats = unavailable
     ? [
         "<span><b>?</b> open PRs</span>",
@@ -223,7 +229,9 @@ function renderQueueSummary(prs, prState = null) {
     ? (incomplete ? " (cached — snapshot expired, coverage incomplete)" : " (cached — snapshot expired)")
     : ageUnknown
       ? " (age unknown)"
-      : (incomplete ? " (observed — coverage incomplete)" : "");
+      : unbounded
+        ? " (freshness unknown)"
+        : (incomplete ? " (observed — coverage incomplete)" : "");
   const queueBlock = queuedRows.length
     ? `<h3>In merge queue${queueQualifier}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
     : !repos.length
@@ -234,7 +242,9 @@ function renderQueueSummary(prs, prState = null) {
           ? '<p class="warn">PR snapshot is expired (cached); current merge queue status is unknown.</p>'
           : ageUnknown
             ? '<p class="warn">Snapshot age unknown; current merge queue status is not confirmed.</p>'
-            : incomplete
+            : unbounded
+              ? '<p class="warn">Freshness unknown; current merge queue status is not confirmed.</p>'
+              : incomplete
               ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
               : '<p class="muted">No PRs currently in the merge queue.</p>';
   return expiredNote
@@ -277,13 +287,13 @@ const PANELS = [
     onData: (_data, latest, readings, now) => { latest.prsStatus = prSnapshotState(readings?.[0], now).status; },
     onError: latest => { latest.prsStatus = null; },
     onTick: (panel, latest, updateChips, now) => {
-      if (!panel.ok || latest.prsStatus !== "fresh") return;
+      if (!panel.ok) return;
       const reading = panel.readings?.[0];
       const next = prSnapshotState(reading, now);
-      if (!next.expired) return;
+      if (next.status === latest.prsStatus) return;
       latest.prsStatus = next.status;
       const box = document.getElementById("prs-content");
-      if (box) box.innerHTML = renderQueueSummary(reading.data, next.status);
+      if (box && reading && reading.data) box.innerHTML = renderQueueSummary(reading.data, next.status);
       updateChips();
     },
   },

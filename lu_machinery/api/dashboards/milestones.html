@@ -46,7 +46,7 @@ function renderMilestones(data) {
   const repos = Array.isArray(data.repositories) ? data.repositories : [];
   const age = value => Number.isFinite(value) ? `${Math.ceil(value)}s` : "unknown";
   const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
-  const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}GitHub data age ${age(data.age_seconds)}. ${escapeHtml(data.freshness)} Private repositories show counts only.</p>`];
+  const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}${escapeHtml(data.freshness || "")} Private repositories show counts only.</p>`];
   for (const repo of repos) {
     out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
     if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);

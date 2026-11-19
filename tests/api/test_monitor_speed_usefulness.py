@@ -545,6 +545,22 @@ assert.match(subscriptionRows({stale_after_s: 900, providers: [{provider: 'claud
 const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51),
   {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
 assert.match(subscriptionRows(partial, null).groups, /NO READING/);
+// A wall-clock jump does not change an age stamped with the monotonic clock, and a backward step does not shrink it.
+const realPerf = performance.now.bind(performance);
+let mono = realPerf();
+performance.now = () => mono;
+try {
+  const stamped = {ageHeader: '200', boundHeader: '210', state: 'fresh', receivedAt: now, receivedMono: mono, data: {status: 'ok'}};
+  assert.equal(panelAgeSeconds(stamped, now + 60000), 200);
+  mono += 11000;
+  assert.equal(panelAgeSeconds(stamped, now), 211);
+  mono -= 20000;
+  assert.equal(panelAgeSeconds(stamped, now - 60000), 211);
+  assert.equal(panelAgeSeconds({ageHeader: '0', receivedAt: Number.NaN, data: {status: 'ok'}}, now), null);
+  assert.equal(panelAgeSeconds({ageHeader: '0', receivedAt: now, receivedMono: Number.NaN, data: {status: 'ok'}}, now), null);
+} finally {
+  performance.now = realPerf;
+}
 """)
 
 

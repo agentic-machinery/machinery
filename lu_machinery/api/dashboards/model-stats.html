@@ -695,6 +695,20 @@ function renderCharts() {
 
 let current = null;
 let loadGeneration = 0;
+let snapshotClock = null;
+function stopSnapshotClock() {
+  if (snapshotClock !== null) {
+    clearInterval(snapshotClock);
+    snapshotClock = null;
+  }
+}
+function paintModelAge(records, label, reading) {
+  const snapshotAge = Machinery.panelAgeSeconds(reading);
+  const collected = snapshotAge === null
+    ? "Snapshot age unknown."
+    : `The snapshot was collected ${Math.floor(snapshotAge)} seconds ago.`;
+  $("age").textContent = `${num(records)} settled tasks across all models in ${label}. ${collected}`;
+}
 function render() {
   if (!current) return;
   const data = current.data, charts = data.charts || {}, label = current.label;
@@ -805,20 +819,25 @@ async function load() {
   const generation = ++loadGeneration;
   const name = $("window").value;
   const samplesPromise = loadSamples(name);
+  stopSnapshotClock();
   let data, retry = 1, snapshotReading = null;
   try {
-    const receivedAt = Date.now();
     const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}&view=page`, {cache: "no-store"});
+    const receivedAt = Date.now();
+    const mono = typeof performance === "object" && performance && typeof performance.now === "function"
+      ? performance.now() : NaN;
     data = await response.json();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     snapshotReading = {
       ageHeader: response.headers.get("X-Snapshot-Age-S"),
       boundHeader: response.headers.get("X-Snapshot-Stale-After-S"),
       receivedAt,
+      ...(typeof mono === "number" && Number.isFinite(mono) ? {receivedMono: mono} : {}),
     };
     retry = Math.max(1, Number(response.headers.get("Retry-After")) || 1);
   } catch (err) {
     if (generation !== loadGeneration) return;
+    stopSnapshotClock();
     $("age").innerHTML = `<span class="error">unavailable: ${esc(err.message)}</span>`;
     return;
   }
@@ -830,11 +849,12 @@ async function load() {
   }
   const since = data.window.since.slice(0, 16).replace("T", " ");
   const label = `${name === "all" ? "all history" : name} from ${since} UTC`;
-  const snapshotAge = Machinery.panelAgeSeconds(snapshotReading, Date.now());
-  const collected = snapshotAge === null
-    ? "Snapshot age unknown."
-    : `The snapshot was collected ${Math.floor(snapshotAge)} seconds ago.`;
-  $("age").textContent = `${num(data.records)} settled tasks across all models in ${label}. ${collected}`;
+  paintModelAge(data.records, label, snapshotReading);
+  const painted = snapshotReading;
+  snapshotClock = setInterval(() => {
+    if (generation !== loadGeneration) return;
+    paintModelAge(data.records, label, painted);
+  }, 1000);
   renderCoverage(data);
   const select = $("model"), previous = select.value;
   const names = pickerModels(data);

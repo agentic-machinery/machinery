@@ -50,14 +50,23 @@ function renderPrs(prs, prState = null) {
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
   const unavailable = prState === "unavailable" || allUnknown;
   const ageUnknown = !unavailable && prState === "unknown";
-  const expired = !unavailable && !ageUnknown && (prState === "expired" || prState === true);
+  const unbounded = !unavailable && prState === "unbounded";
+  const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);
   const stateNote = unavailable
     ? '<p class="warn">All repositories are unavailable; open pull request and merge queue counts are unknown.</p>'
     : expired
       ? '<p class="warn">PR snapshot is expired; showing cached observations (CI rollup, review status, and queue positions may be out of date).</p>'
       : ageUnknown
         ? '<p class="warn">Snapshot age unknown. CI, review, and queue positions are not confirmed as current.</p>'
-        : "";
+        : unbounded
+          ? '<p class="warn">Freshness unknown. The snapshot age is known, and the freshness bound is not, so CI, review, and queue positions are not confirmed as current.</p>'
+          : "";
+  if (unavailable) {
+    return stateNote + repos.map(repo => {
+      const reason = repo && repo.status !== "ok" ? repo.reason : "snapshot unavailable";
+      return `<h3>${escapeHtml(repo && repo.name || "")}</h3>` + unknown(reason);
+    }).join("");
+  }
   return stateNote + repos.map(repo => {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
     if (repo.status !== "ok") return title + unknown(repo.reason);
@@ -96,13 +105,13 @@ const PANELS = [
     onData: (_data, latest, readings, now) => { latest.prsStatus = prSnapshotState(readings?.[0], now).status; },
     onError: latest => { latest.prsStatus = null; },
     onTick: (panel, latest, updateChips, now) => {
-      if (!panel.ok || latest.prsStatus !== "fresh") return;
+      if (!panel.ok) return;
       const reading = panel.readings?.[0];
       const next = prSnapshotState(reading, now);
-      if (!next.expired) return;
+      if (next.status === latest.prsStatus) return;
       latest.prsStatus = next.status;
       const box = document.getElementById("prs-content");
-      if (box) box.innerHTML = renderPrs(reading.data, next.status);
+      if (box && reading && reading.data) box.innerHTML = renderPrs(reading.data, next.status);
       updateChips();
     },
   },

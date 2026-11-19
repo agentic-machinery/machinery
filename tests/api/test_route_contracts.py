@@ -265,7 +265,11 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   globalThis.document = {
     querySelectorAll() { return []; },
     getElementById(id) {
-      if (!elements.has(id)) elements.set(id, {textContent: '', innerHTML: '', className: '', hidden: true, setAttribute() {}, dataset: {}});
+      if (!elements.has(id)) elements.set(id, {
+        textContent: '', innerHTML: '', className: '', hidden: true, value: '', options: [],
+        childElementCount: 0, dataset: {},
+        setAttribute() {}, addEventListener() {}, querySelector() { return null; },
+      });
       return elements.get(id);
     },
   };
@@ -373,12 +377,15 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   // F1 local-clock expiry + F6 on Overview and Pull requests (no extra API request on tick).
   let fakeNow = Date.now();
   const realDateNow = Date.now;
+  const realPerfNow = performance.now.bind(performance);
+  let monoNow = realPerfNow();
   let prFetchCount = 0;
   let queuedInResponse = true;
   let customAgeS = 200;
   let customOffsetS = 0;
   let customPartial = false;
   Date.now = () => fakeNow;
+  performance.now = () => monoNow;
   try {
     globalThis.fetch = async (url) => {
       if (String(url).includes('/api/git/pull-requests')) {
@@ -410,11 +417,20 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     assert.match(document.getElementById('workers-content').innerHTML, /CI green/);
     fakeNow += 11000;
     fleetClock.PANELS[0].onTick();
-    assert.equal(prFetchCount, 1, 'F1: local-clock expiry makes no API request');
+    assert.equal(prFetchCount, 1, 'F1: a wall-clock step makes no API request');
+    assert.match(document.getElementById('workers-content').innerHTML, /CI green/, 'F1: a wall-clock step does not expire the snapshot');
+    monoNow += 11000;
+    fleetClock.PANELS[0].onTick();
+    assert.equal(prFetchCount, 1, 'F1: monotonic expiry makes no API request');
     const tickedFleet = document.getElementById('workers-content').innerHTML;
-    assert.doesNotMatch(tickedFleet, /CI green/, 'F1: local clock clears CI green once 210s bound passes');
-    assert.doesNotMatch(tickedFleet, /queued 1/, 'F1: local clock clears queued 1 once 210s bound passes');
+    assert.doesNotMatch(tickedFleet, /CI green/, 'F1: monotonic elapsed clears CI green once 210s bound passes');
+    assert.doesNotMatch(tickedFleet, /queued 1/, 'F1: monotonic elapsed clears queued 1 once 210s bound passes');
     assert.match(tickedFleet, /#42/);
+    monoNow -= 20000;
+    fleetClock.PANELS[0].onTick();
+    const rolledFleet = document.getElementById('workers-content').innerHTML;
+    assert.doesNotMatch(rolledFleet, /CI green/, 'F1: rolling the monotonic clock back does not freshen an expired snapshot');
+    assert.doesNotMatch(rolledFleet, /queued 1/);
 
     // F6 Overview: 240s server age with -120s browser clock and empty queue must not say "No PRs currently in the merge queue."
     customAgeS = 240; customOffsetS = -120; queuedInResponse = false; customPartial = false;
@@ -465,6 +481,27 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     assert.equal(raceLatest.prsStatus, 'expired');
     assert.match(document.getElementById('prs-content').innerHTML, /PR snapshot is expired \(cached\)/);
     Date.now = origNowFn;
+
+    // A non-finite tick repaints a fresh body and chip to age unknown. It does not leave the previous fresh copy.
+    customAgeS = 30; customOffsetS = 0; queuedInResponse = false; customPartial = false;
+    await overviewClock.runner.refreshAll();
+    assert.match(document.getElementById('prs-content').innerHTML, /No PRs currently in the merge queue/);
+    overviewClock.PANELS[2].onTick(
+      overviewClock.PANELS[2],
+      overviewClock.runner.latest,
+      () => {
+        const status = overviewClock.runner.latest.prsStatus;
+        document.getElementById('chips').innerHTML = M.prChips(overviewClock.runner.latest.prs, '/pull-requests', status).join('');
+      },
+      Number.NaN,
+    );
+    assert.equal(overviewClock.runner.latest.prsStatus, 'unknown');
+    assert.match(document.getElementById('prs-content').innerHTML, /Snapshot age unknown/);
+    assert.match(document.getElementById('chips').innerHTML, /age unknown/);
+    await prsClock.runner.refreshAll();
+    prsClock.PANELS[0].onTick(prsClock.PANELS[0], prsClock.runner.latest, () => {}, Number.NaN);
+    assert.equal(prsClock.runner.latest.prsStatus, 'unknown');
+    assert.match(document.getElementById('prs-content').innerHTML, /Snapshot age unknown/);
 
     // Missing and empty X-Snapshot-Age-S stay unknown. A skewed observed_at must not expire or freshen them.
     for (const ageHeader of [null, '']) {
@@ -520,8 +557,75 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     assert.match(prF8, /All repositories are unavailable/);
     assert.match(prF8, /github timeout/);
     assert.doesNotMatch(prF8, /cached/);
+
+    // Unavailable snapshot state keeps a retained ok row from showing a numeric zero.
+    const retained = {
+      url: '/api/git/pull-requests', state: 'unavailable', receivedAt: fakeNow,
+      data: {status: 'ok', repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: [{number: 9, queue: {position: 1, state: 'queued'}}]}]},
+    };
+    const retainedHtml = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn renderQueueSummary;')(M)(retained.data, 'unavailable');
+    assert.match(retainedHtml, /<b>\?<\/b> open PRs/);
+    assert.match(retainedHtml, /snapshot unavailable/);
+    assert.doesNotMatch(retainedHtml, /0 open|position 1/);
+    const retainedPr = new Function('Machinery', extractScript('pull-requests.html', '\nrunner.start();') + '\nreturn renderPrs;')(M)(retained.data, 'unavailable');
+    assert.match(retainedPr, /snapshot unavailable/);
+    assert.doesNotMatch(retainedPr, /0 open|position 1/);
+
+    // A known age with a missing, empty, or zero bound is freshness unknown, not age unknown.
+    for (const boundHeader of [null, '', '0']) {
+      const reading = {
+        url: '/api/git/pull-requests', ageHeader: '30', boundHeader, state: 'fresh', receivedAt: fakeNow,
+        data: {status: 'ok', repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: []}]},
+      };
+      const state = M.prSnapshotState(reading, fakeNow);
+      assert.equal(state.status, 'unbounded', `bound ${JSON.stringify(boundHeader)}`);
+      assert.match(M.headingAge([reading], false, fakeNow, undefined, fakeNow).text, /freshness unknown Â· source age 30s Â· bound unknown/);
+      const html = new Function('Machinery', extractScript('index.html', '\nrunner.start();') + '\nreturn renderQueueSummary;')(M)(reading.data, state.status);
+      assert.match(html, /Freshness unknown/);
+      assert.doesNotMatch(html, /Snapshot age unknown/);
+      assert.doesNotMatch(html, /currently in the merge queue/);
+      const prHtml = new Function('Machinery', extractScript('pull-requests.html', '\nrunner.start();') + '\nreturn renderPrs;')(M)(reading.data, state.status);
+      assert.match(prHtml, /Freshness unknown/);
+      assert.doesNotMatch(prHtml, /Snapshot age unknown/);
+      assert.match(M.prChips(reading.data, '/pull-requests', state.status).join(''), /freshness unknown/);
+      assert.doesNotMatch(M.prChips(reading.data, '/pull-requests', state.status).join(''), /age unknown/);
+    }
+
+    // Model statistics stamps the age when the response arrives, then keeps the sentence moving.
+    const savedInterval = globalThis.setInterval;
+    const clocks = [];
+    globalThis.setInterval = (fn) => { clocks.push(fn); return clocks.length; };
+    try {
+      const statsScript = extractScript('model-stats.html', '\n$("window").addEventListener');
+      const stats = new Function('Machinery', statsScript + '\nreturn {load};')(M);
+      const wallBefore = fakeNow;
+      const monoBefore = monoNow;
+      globalThis.fetch = async (url) => {
+        const page = String(url).includes('view=page');
+        if (page) { fakeNow += 5000; monoNow += 5000; }
+        return {
+          ok: true,
+          status: 200,
+          headers: {get: name => page && name === 'X-Snapshot-Age-S' ? '0.000' : null},
+          json: async () => page
+            ? {status: 'ok', records: 3, window: {since: '2026-01-01T00:00:00Z', name: '24h', until: '2026-01-02T00:00:00Z'}, models: [], review_levels: [], charts: {}, authors: [], author_risks: [], allowance: []}
+            : {status: 'ok', models: []},
+        };
+      };
+      let statsError = null;
+      try { await stats.load(); } catch (err) { statsError = err; }
+      assert.match(document.getElementById('age').textContent, /collected 0 seconds ago/, statsError && statsError.stack);
+      assert.ok(fakeNow > wallBefore && monoNow > monoBefore);
+      monoNow += 4000;
+      assert.equal(clocks.length > 0, true);
+      clocks[clocks.length - 1]();
+      assert.match(document.getElementById('age').textContent, /collected 4 seconds ago/);
+    } finally {
+      globalThis.setInterval = savedInterval;
+    }
   } finally {
     Date.now = realDateNow;
+    performance.now = realPerfNow;
   }
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
