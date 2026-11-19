@@ -1042,10 +1042,12 @@ unknown or undeclared classes.
 
 With `public-code` or `public-docs`, Savant may also use OpenCode's read-only
 `read`, `grep`, `glob` and `list` tools. The write boundary limits them to a
-read-only snapshot of the published start commit. The dispatch refuses a
-start commit that no branch of the public remote contains. The snapshot holds
-regular files only. It leaves out Git metadata, environment files, key and
-credential stores, symlinks and the instruction files OpenCode loads by itself.
+read-only snapshot of the published start commit, and the run's view holds no
+checkout, worktree or Git metadata. The dispatch refuses a start commit that no
+branch of the registered public remote contains now. The snapshot holds the
+commit's regular files only. It leaves out Git metadata, environment files, key
+and credential stores, symlinks, the instruction files OpenCode loads by itself,
+and any file whose content holds a private key or a known token format.
 The whole tree is the default. Name the task's paths with `--read-path`; a
 snapshot over 64 MiB is refused. The boundary cuts a run that tries to send
 more than 16 MiB upstream. With a private class, every tool stays disabled.

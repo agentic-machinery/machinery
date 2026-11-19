@@ -452,7 +452,11 @@ def _dispatch(args) -> int:
             args.effort = SAVANT_DEFAULT_EFFORT
         args.max_tokens = savant_token_cap(args.max_tokens)
         if args.read_path:
+            from lu_machinery.dispatcher.providers.opencode import savant_tools
             from lu_machinery.dispatcher.write_boundary import MAX_READ_PATHS, read_path
+
+            if not savant_tools(args.data_class):
+                raise ValueError("savant_read_path_refused: --read-path needs --data-class public-code or public-docs")
 
             if len(args.read_path) > MAX_READ_PATHS:
                 raise ValueError(f"savant_read_path_refused: at most {MAX_READ_PATHS} --read-path values")

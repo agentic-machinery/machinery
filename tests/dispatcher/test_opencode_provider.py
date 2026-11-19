@@ -209,6 +209,10 @@ def test_savant_refuses_secrets_or_unknown_data_before_spawn(dispatch, capsys):
         assert "savant_data_class_refused" in capsys.readouterr().err
     dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--repo", "infra-private", expected=2)
     assert "savant_repository_refused" in capsys.readouterr().err
+    # A private class reads no files, so naming paths is refused at dispatch, before any record exists.
+    dispatch(*SAVANT_FLAGS, "--data-class", "private-code", "--repo", "infra-private", "--read-path", "docs",
+             expected=2)
+    assert "savant_read_path_refused" in capsys.readouterr().err
 
 
 def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
@@ -251,7 +255,7 @@ def _published_repository(tmp_path, files, links=()):
     return repository, commit, run
 
 
-def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
+def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatch):
     """Defect class: a public Savant run's tools reach Git metadata, secrets, links or unpublished work (C2, C4)."""
     secret = b"EXCLUDED-CONTENT"
     files = {
@@ -259,12 +263,17 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
         ".env": secret, "config/.env.local": secret, "keys/id_ed25519": secret, "keys/server.pem": secret,
         "secrets/token.txt": secret, "app/credentials.json": secret, ".ssh/config": secret, "deploy/site.key": secret,
         "AGENTS.md": secret, "nested/CLAUDE.md": secret, "opencode.json": secret, ".opencode/agent.md": secret,
-        "docs/CONTEXT.md": secret, "home/auth.json": secret,
+        "docs/CONTEXT.md": secret, "home/auth.json": secret, "home/.credentials.json": secret, "prod.env": secret,
+        ".gitconfig": secret, ".mcp.json": secret,
         "docs/notes.txt": b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + secret,
         "src/token.py": b"TOKEN = 'ghp_" + b"A" * 36 + b"'\n" + secret,
     }
     repository, commit, run = _published_repository(tmp_path, files, links=[("link.py", "src/allowed.py"),
                                                                              ("outside", "/etc")])
+    # Only a registered public origin is trusted; the fixture's bare remote stands in for it.
+    with pytest.raises(write_boundary.Refused, match="origin is not a registered public repository"):
+        write_boundary._snapshot(repository, commit, [], tmp_path / "unregistered", 1024)
+    monkeypatch.setattr(write_boundary, "_public_origin", lambda _repository: (tmp_path / "remote.git").as_uri())
     target = tmp_path / "snapshot"
     info = write_boundary._snapshot(repository, commit, [], target, 1024)
     written = {path.relative_to(target).as_posix(): path for path in target.rglob("*") if path.is_file()}
@@ -272,8 +281,8 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
     assert not any(path.is_symlink() for path in target.rglob("*"))
     assert all(secret not in path.read_bytes() for path in written.values())
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in written.values())
-    # 14 excluded names and 2 links leave before reading; 2 files leave for their key or token content.
-    assert info["files"] == 2 and info["left_out"] == 18 and info["commit"] == commit
+    # 18 excluded names and 2 links leave before reading; 2 files leave for their key or token content.
+    assert info["files"] == 2 and info["left_out"] == 22 and info["commit"] == commit
     # --read-path narrows it to the named directory.
     narrowed = write_boundary._snapshot(repository, commit, ["docs"], tmp_path / "narrow", 1024)
     assert narrowed["files"] == 1 and (tmp_path / "narrow" / "docs" / "guide.md").is_file()

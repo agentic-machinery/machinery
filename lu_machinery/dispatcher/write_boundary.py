@@ -146,8 +146,8 @@ _SOURCES_MCP_INSIDE = "/run/lu-write-boundary/sources-mcp.json"
 # environment file, a key or credential store, or an instruction or config file OpenCode loads by itself.
 SNAPSHOT_INSIDE = "/run/lu-write-boundary/snapshot"
 _SNAPSHOT_EXCLUDED = re.compile(
-    r"\.git|\.env.*|\.?secrets?(\..*)?|\.ssh|\.gnupg|\.aws|\.docker|\.kube|\.netrc|\.npmrc|\.pypirc"
-    r"|\.git-credentials|credentials(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\..*)?"
+    r"\.git|\.gitconfig|\.env.*|.*\.env|\.?secrets?(\..*)?|\.ssh|\.gnupg|\.aws|\.docker|\.kube|\.netrc"
+    r"|\.npmrc|\.pypirc|\.mcp\.json|\.git-credentials|\.?credentials(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\..*)?"
     r"|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc)|auth\.json|agents\.md|claude\.md|context\.md"
     r"|opencode\.jsonc?|\.opencode",
     re.IGNORECASE)
@@ -732,10 +732,19 @@ def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes
     return result.stdout
 
 
+def _public_origin(repository: Path) -> str:
+    """The primary's origin URL, refused unless it names a registered repository with a public role."""
+    url = _git(repository, "remote", "get-url", "origin").strip()
+    match = _GITHUB_REMOTE.fullmatch(url)
+    if not (match and agy_sandbox.public_repository(match.group(1))):
+        raise Refused("savant_snapshot_refused: origin is not a registered public repository")
+    return url
+
+
 def _published(repository: Path, commit: str) -> None:
     """Refuse unless origin advertises now a branch whose tip is ``commit``, or whose main branch contains it."""
+    url = _public_origin(repository)
     try:
-        url = _git(repository, "remote", "get-url", "origin").strip()
         listing = _git(repository, "ls-remote", url, "refs/heads/*", network=True)
     except Refused:
         raise Refused("savant_snapshot_refused: the public remote's branches could not be read") from None
@@ -1296,7 +1305,11 @@ class _Boundary:
         from lu_machinery.dispatcher.runtime_context import shared_root, task_reads
 
         product = _product_checkout()
-        checkouts = [repository, *([product] if product is not None and product != repository else [])]
+        # A snapshot run sees no checkout, worktree or Git metadata at all: its tools read the snapshot only,
+        # and the OS view, not just OpenCode's permission rules, keeps everything else out of reach.
+        snapshot_only = self.args.snapshot_bytes is not None
+        checkouts = [] if snapshot_only else [repository, *([product] if product is not None and product != repository
+                                                            else [])]
         toolchain = _toolchain(home, command[0], self.args.provider_env)
         data = list(dict.fromkeys(found for root in _DATA_ROOTS if (found := _resolved(root)) is not None
                                   and found.is_dir() and found != Path("/")))
@@ -1310,7 +1323,8 @@ class _Boundary:
         # never their siblings or the rest of the task store.
         shared = _resolved(shared_root())
         projected_reads = [shared] if shared is not None and shared.is_dir() and _under(shared, _MASKED_ROOTS) else []
-        restores = [*base_restores, *own, self.worktree, *outputs, *credentials, tmp, boundary, *projected_reads]
+        restores = [*base_restores, *own, *([] if snapshot_only else [self.worktree]), *outputs, *credentials, tmp,
+                    boundary, *projected_reads]
         if self.args.runtime is not None:
             restores.append(Path(self.args.runtime))
         if self.args.codex_auth is not None:
@@ -1333,7 +1347,7 @@ class _Boundary:
         sockets = [path for path in _listening_socket_paths()
                    if not _hidden(path, masks, restores) and os.path.lexists(path)]
         nonce = uuid.uuid4().hex
-        probes = self._probes(repository, common, sockets, outputs, tmp, nonce)
+        probes = self._probes(repository, common, sockets, outputs, tmp, nonce, snapshot_only)
         probes += self._view_probes(home, data, masks, restores, private, credentials, own, nonce)
         for path in projected_reads:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
@@ -1359,11 +1373,12 @@ class _Boundary:
             argv += ["--bind", str(login[0]), str(login[1])]
         for path in (*own, *login_reads):
             argv += ["--ro-bind", str(path), str(path)]
-        argv += ["--ro-bind", str(common), str(common)]
-        for name in self.protected:
-            argv += ["--ro-bind", str(common / name), str(common / name)]
-        argv += ["--ro-bind", str(self.worktree), str(self.worktree),
-                 "--ro-bind", str(dot_git), str(dot_git)]
+        if not snapshot_only:
+            argv += ["--ro-bind", str(common), str(common)]
+            for name in self.protected:
+                argv += ["--ro-bind", str(common / name), str(common / name)]
+            argv += ["--ro-bind", str(self.worktree), str(self.worktree),
+                     "--ro-bind", str(dot_git), str(dot_git)]
         for path in credentials:
             argv += ["--bind", str(path), str(path)]
         for path in outputs:
@@ -1422,7 +1437,7 @@ class _Boundary:
                 name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ})
         except Exception as exc:  # Sources is optional; containment does not depend on it
             self.receipt["sources"] = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"[:200]}
-        argv += ["--cap-drop", "ALL", "--chdir", str(self.worktree)]
+        argv += ["--cap-drop", "ALL", "--chdir", SNAPSHOT_INSIDE if snapshot_only else str(self.worktree)]
 
         self.egress = AttemptEgress(boundary / "egress.sock", refused_domains=GITHUB_DOMAINS,
                                     refused_networks=github_networks(), upload_ceiling=self.args.upload_ceiling)
@@ -1612,13 +1627,21 @@ class _Boundary:
         return config
 
     def _probes(self, repository: Path, common: Path, sockets: list[Path], outputs: list[Path], tmp: Path,
-                nonce: str) -> list[dict]:
+                nonce: str, snapshot_only: bool = False) -> list[dict]:
         probes: list[dict] = []
         mount_refusal = ("EROFS", "EBUSY")
 
         def expect(op: str, path: Path | str, *outcomes: str, port: int | None = None) -> None:
             probes.append({"op": op, "path": str(path), "expect_any": list(outcomes), **({"port": port} if port else {})})
 
+        if snapshot_only:
+            # Absent, not merely read-only: the worktree, the primary's tracked files and its Git metadata.
+            expect("stat", self.worktree, "ENOENT")
+            expect("stat", common / "HEAD", "ENOENT")
+            if (tracked := _writable_tracked_file(repository)) is not None:
+                expect("stat", tracked, "ENOENT")
+            expect("create", Path(SNAPSHOT_INSIDE) / f".write-boundary-canary-{nonce}", "EROFS")
+            return self._common_probes(probes, expect, sockets, outputs, tmp, nonce)
         absent = repository / f".write-boundary-canary-{nonce}"
         if (tracked := _writable_tracked_file(repository)) is not None:
             expect("write_open", tracked, "EROFS")
@@ -1639,6 +1662,11 @@ class _Boundary:
         # The worktree and Git stay read-only; HOME and TMPDIR are positive writable controls.
         for directory in (self.worktree, common / "objects"):
             expect("create", directory / f".write-boundary-canary-{nonce}", "EROFS")
+        return self._common_probes(probes, expect, sockets, outputs, tmp, nonce)
+
+    def _common_probes(self, probes: list[dict], expect: Callable, sockets: list[Path], outputs: list[Path],
+                       tmp: Path, nonce: str) -> list[dict]:
+        """Probes every view shares: writable HOME and TMPDIR, declared outputs, no loopback, bus or host socket."""
         for directory in (Path(os.environ.get("HOME") or Path.home()), tmp):
             expect("scratch_cycle", directory / f".write-boundary-canary-{nonce}", "OK")
         for path in outputs:
