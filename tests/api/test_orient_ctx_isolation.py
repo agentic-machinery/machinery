@@ -106,35 +106,50 @@ def test_product_zero_ttl_refreshes_without_a_second_cache_and_isolates_roots(tm
     from lu_machinery.api.state_helpers import cache_get_stored
 
     calls = {}
+    release = threading.Event()
 
     async def collect(context):
         root = context.roots.project_root.name
         calls[root] = calls.get(root, 0) + 1
-        return {"summary": {"root": root, "revision": calls[root]}}
+        mine = calls[root]
+        if mine > 1:
+            assert await asyncio.to_thread(release.wait, 5)
+        return {"summary": {"root": root, "revision": mine}}
 
     first, second = fixture_context(tmp_path / "first"), fixture_context(tmp_path / "second")
     a = TestClient(api_main.create_app(first, product=_product(collect)))
     b = TestClient(api_main.create_app(second, product=_product(collect)))
     try:
-        assert a.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {
-            "root": "first", "revision": 1,
-        }
+        cold = a.get("/api/orient?sections=pipeline").json()
+        assert cold["pipeline"]["summary"] == {"root": "first", "revision": 1}
+        assert cold["meta"]["pipeline"]["stale"] is False
+        # A zero TTL gives the stored value no freshness window: the next read
+        # gets it labelled stale with its own generated_at, and refreshes it.
         data = a.get("/api/orient?sections=pipeline").json()
-        assert data["pipeline"]["summary"] == {"root": "first", "revision": 2}
+        assert data["pipeline"]["summary"] == {"root": "first", "revision": 1}
         assert data["meta"]["pipeline"]["stale_after_s"] == 0
         assert data["meta"]["pipeline"]["source"] == "test-product"
-        assert data["meta"]["pipeline"]["stale"] is False
+        assert data["meta"]["pipeline"]["stale"] is True
+        assert data["meta"]["pipeline"]["generated_at"] == cold["meta"]["pipeline"]["generated_at"]
+        assert data["meta"]["pipeline"]["refreshing"] is True
+        release.set()
+        _join_refresh(first)
+        release.clear()
+        assert a.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {
+            "root": "first", "revision": 2,
+        }
         assert cache_get_stored(f"orient_pipeline{api_main._ctx_cache_scope(first)}") is None
         assert b.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {
             "root": "second", "revision": 1,
         }
     finally:
+        release.set()
         _join_refresh(first)
         _join_refresh(second)
 
 
-def test_expired_product_snapshot_is_stale_during_refresh_and_eventually_unavailable(monkeypatch, tmp_path):
-    """Expiry must refresh real data and never label an old fallback as fresh or retain it forever."""
+def test_expired_product_snapshot_is_stale_during_refresh_however_old(monkeypatch, tmp_path):
+    """Expiry must refresh real data, never label an old value as fresh, and never drop it for an empty fallback."""
     from lu_machinery.api import state_helpers as cache
 
     now = [0.0]
@@ -165,12 +180,129 @@ def test_expired_product_snapshot_is_stale_during_refresh_and_eventually_unavail
         assert stale["meta"]["pipeline"]["generated_at"] == original["meta"]["pipeline"]["generated_at"]
         release.set()
         _join_refresh(ctx)
-        assert client.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {"revision": 2}
+        refreshed = client.get("/api/orient?sections=pipeline").json()
+        assert refreshed["pipeline"]["summary"] == {"revision": 2}
 
-        now[0] = 132
+        # Minutes later, past every TTL: a sparse reader still gets the last
+        # value with its own generated_at, labelled stale, not an empty fallback.
+        now[0] = 1000
         release.clear()
+        entered.clear()
         expired = client.get("/api/orient?sections=pipeline").json()
-        assert expired["pipeline"] == {"summary": {}, "error": "refreshing"}
+        assert entered.wait(5)
+        assert expired["pipeline"] == {"summary": {"revision": 2}}
+        assert expired["meta"]["pipeline"]["stale"] is True
+        assert expired["meta"]["pipeline"]["refreshing"] is True
+        assert expired["meta"]["pipeline"]["generated_at"] == refreshed["meta"]["pipeline"]["generated_at"]
+    finally:
+        release.set()
+        _join_refresh(ctx)
+
+
+def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_it(monkeypatch, tmp_path):
+    """Defect class: a reader minutes apart paid an inline collection (or a join) on every read.
+
+    An inline section with a last value is served at once, labelled stale, while
+    one worker refreshes it; ``fresh=true`` still waits for a new collection.
+    """
+    from lu_machinery.api import state_helpers as cache
+
+    now = [0.0]
+    monkeypatch.setattr(cache, "_ttl_clock", lambda: now[0])
+    monkeypatch.setattr(api_main, "_orient_clock", lambda: now[0])
+    # A request that joined the refresh would outlive the blocked collector.
+    monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 30.0)
+    monkeypatch.setattr(api_main, "ORIENT_SECTION_HARD_TIMEOUT_S", 30.0)
+    entered, release = threading.Event(), threading.Event()
+    calls: list[str] = []
+
+    def collect(context):
+        calls.append(threading.current_thread().name)
+        if len(calls) == 2:
+            entered.set()
+            assert release.wait(10)
+        return {"revision": len(calls)}
+
+    monkeypatch.setattr(api_main, "_collect_session_hints_orient_data", collect)
+    ctx = fixture_context(tmp_path)
+    key = f"orient_session_hints{api_main._ctx_cache_scope(ctx)}"
+    client = TestClient(api_main.create_app(ctx))
+    try:
+        first = client.get("/api/orient?sections=session_hints").json()
+        assert first["session_hints"] == {"revision": 1}
+        assert first["meta"]["session_hints"]["stale"] is False
+
+        now[0] = 1000
+        sparse = client.get("/api/orient?sections=session_hints").json()
+        assert entered.wait(5)
+        assert api_main._detached_orient_threads[key].is_alive()
+        assert sparse["session_hints"] == {"revision": 1}
+        assert sparse["meta"]["session_hints"]["stale"] is True
+        assert sparse["meta"]["session_hints"]["refreshing"] is True
+        assert sparse["meta"]["session_hints"]["generated_at"] == first["meta"]["session_hints"]["generated_at"]
+        release.set()
+        api_main._detached_orient_threads[key].join(timeout=5)
+        assert client.get("/api/orient?sections=session_hints").json()["session_hints"] == {"revision": 2}
+
+        now[0] = 2000
+        fresh = client.get("/api/orient?sections=session_hints&fresh=true").json()
+        assert fresh["session_hints"] == {"revision": 3}
+        assert fresh["meta"]["session_hints"]["stale"] is False
+        assert len(calls) == 3
+    finally:
+        release.set()
+        thread = api_main._detached_orient_threads.get(key)
+        if thread is not None:
+            thread.join(timeout=5)
+
+
+def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_value(monkeypatch, tmp_path):
+    """Defect class: an older collection that finished last replaced a newer value, so the section went backwards.
+
+    A fresh read collects for itself while an older background refresh is still
+    running, and neither waits for nor cancels the other. When the older refresh
+    finishes last it publishes nothing, and later reads keep the fresh value.
+    """
+    from lu_machinery.api import state_helpers as cache
+
+    now = [0.0]
+    monkeypatch.setattr(cache, "_ttl_clock", lambda: now[0])
+    monkeypatch.setattr(api_main, "_orient_clock", lambda: now[0])
+    monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 10.0)
+    entered, release = threading.Event(), threading.Event()
+    revision = [0]
+
+    async def collect(context):
+        revision[0] += 1
+        mine = revision[0]
+        if mine == 2:
+            entered.set()
+            assert await asyncio.to_thread(release.wait, 10)
+        return {"summary": {"revision": mine}}
+
+    ctx = fixture_context(tmp_path)
+    client = TestClient(api_main.create_app(ctx, product=_product(collect, ttl=10.0)))
+    key = f"orient_pipeline{api_main._ctx_cache_scope(ctx)}"
+    try:
+        assert client.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {"revision": 1}
+
+        now[0] = 11
+        stale = client.get("/api/orient?sections=pipeline").json()
+        assert entered.wait(5)
+        assert stale["pipeline"]["summary"] == {"revision": 1}
+        assert stale["meta"]["pipeline"]["stale"] is True
+
+        now[0] = 12
+        fresh = client.get("/api/orient?sections=pipeline&fresh=true").json()
+        assert fresh["pipeline"]["summary"] == {"revision": 3}
+        assert fresh["meta"]["pipeline"]["stale"] is False
+        assert api_main._detached_orient_threads[key].is_alive(), "the fresh read waited for the older refresh"
+
+        release.set()
+        _join_refresh(ctx)
+        later = client.get("/api/orient?sections=pipeline").json()
+        assert later["pipeline"]["summary"] == {"revision": 3}
+        assert later["meta"]["pipeline"]["generated_at"] == fresh["meta"]["pipeline"]["generated_at"]
     finally:
         release.set()
         _join_refresh(ctx)
