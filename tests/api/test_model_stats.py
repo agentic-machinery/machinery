@@ -1241,6 +1241,8 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     _findings_review(tasks, "p12b-review", "correct", [], pinned_head=h2, **approved)
     # PR 13: the ledger names the task in another repository than the row's: of unknown publication.
     _findings_review(tasks, "p13a-review", "incorrect", [("P1", "src/a.py")], pr=13, pinned_head=h1, **blocked)
+    # A rejection dispatched by branch alone with no publication: of unknown publication too.
+    _findings_review(tasks, "p14a-review", "incorrect", [("P1", "src/a.py")], pinned_head=h1, **blocked)
     rows.backfill(tasks, batch_state)
     assert "src/a.py" not in rows.rows_path(batch_state).read_text()
     blocked_by, approved_by = "CHANGES_REQUESTED", "APPROVED"
@@ -1269,7 +1271,7 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
     assert snapshot["coverage"]["publications"] == {"lines": 22, "tasks": 22}
     opus = {
-        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 3,
+        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 4,
         "reviews_without_paths": 0, "blocking_findings": 8, "fixed": 2, "dismissed": 1, "open": 4, "unknown": 1,
         "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
     }
@@ -1300,7 +1302,8 @@ def test_author_results_split_by_risk_tier(tmp_path):
     """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
     critical work looks worse than its peers, that take a later round for the first when a window starts mid-PR, or
     that read a reply instead of the published verdict (a P3-only rejection published as an approval, an unpublished
-    run taken for the first round). Every expected figure below is counted by hand."""
+    run taken for the first round, its window or its author, a published review whose reply is unparsed left out).
+    Every expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     grok, sol = {"review_author_model": "grok-4.7"}, {"review_author_model": "gpt-6.1-sol"}
     critical = {"review_profile": "infra", "review_risk": "critical"}
@@ -1315,39 +1318,57 @@ def test_author_results_split_by_risk_tier(tmp_path):
     _review(tasks, "r15b-review", "correct", [], pr=15, pinned_head="2" * 40, **grok)
     # PR 16: a reply with only a P3 finding, published as an approval: a first-round approval.
     _review(tasks, "r16-review", "incorrect", ["P3"], pr=16, pinned_head="3" * 40, review_risk="low", **grok)
-    # PR 17: an unpublished high-risk run came first; the first review of record is the medium approval.
-    _review(tasks, "r17a-review", "incorrect", ["P1"], pr=17, pinned_head="4" * 40, review_risk="high", **grok)
+    # PR 17: an unpublished high-risk run by another author's PR came first; the first review of record is the medium
+    # approval, and its author is the published review's alone.
+    _review(tasks, "r17a-review", "incorrect", ["P1"], pr=17, pinned_head="4" * 40, review_risk="high", **sol)
     _review(tasks, "r17b-review", "correct", [], pr=17, pinned_head="5" * 40, **grok)
     # PR 18: no review of it was published: left out of the tiers and counted.
     _review(tasks, "r18-review", "correct", [], pr=18, pinned_head="6" * 40, **grok)
+    # PR 19: an unpublished high-risk run 8 days ago, then a published medium approval inside the week: the PR is in
+    # the week's tiers, from its first published review.
+    _review(tasks, "r19a-review", "incorrect", ["P1"], pr=19, pinned_head="7" * 40, review_risk="high",
+            started_at=(NOW - timedelta(days=8, hours=1)).isoformat(),
+            finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
+    _review(tasks, "r19b-review", "correct", [], pr=19, pinned_head="8" * 40, **grok)
+    # PR 20: its only review was published as an approval, but its reply is not parsed: counted, findings unknown.
+    _review(tasks, "r20-review", "correct", [], pr=20, pinned_head="9" * 40, review_risk="low", **grok)
+    (tasks / "r20-review.result").unlink()
     rows.backfill(tasks, batch_state)
     approved, blocked = "APPROVED", "CHANGES_REQUESTED"
     assert _publish(batch_state, ("r10-review", 10, "a" * 40, approved), ("r11-review", 11, "b" * 40, blocked),
                     ("r12-review", 12, "c" * 40, approved), ("r13-review", 13, "d" * 40, blocked),
                     ("r14-review", 14, "f" * 40, approved), ("r15a-review", 15, "1" * 40, blocked),
                     ("r15b-review", 15, "2" * 40, approved), ("r16-review", 16, "3" * 40, approved),
-                    ("r17b-review", 17, "5" * 40, approved),
-                    repository="learn-ukrainian/learn-ukrainian.github.io") == 9
+                    ("r17b-review", 17, "5" * 40, approved), ("r19b-review", 19, "8" * 40, approved),
+                    ("r20-review", 20, "9" * 40, approved),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 11
 
     snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
 
-    def tiers(window: str, author: str) -> list[tuple]:
-        (found,) = [a for a in snapshot["windows"][window]["authors"] if a["model"] == author]
+    def tiers(window: str, author: str, view: str = "windows") -> list[tuple]:
+        (found,) = [a for a in snapshot[view][window]["author_risks"] if a["model"] == author]
         return [(r["risk"], r["prs"], r["first_round_approved"]["value"], r["blocking_per_pr"]["value"],
                  r["p0_p2_per_pr"]["value"], r["low_sample"]) for r in found["by_risk"]]
 
-    week = [("critical", 2, 0.5, 0.5, 1.0, True), ("medium", 2, 0.5, 1.0, 1.0, True), ("low", 2, 1.0, 0.0, 0.0, True)]
-    assert tiers("7d", "grok-4.7") == week
+    # Medium: r13 blocked (P0, P1), r17b and r19b approved without findings. Low: r12, r16 and r20 approved; r20's
+    # findings are unknown, so the per-PR findings rates count r12 and r16 only.
+    week = [("critical", 2, 0.5, 0.5, 1.0, True),
+            ("medium", 3, stats._rate(2, 3)["value"], stats._rate(2, 3, 2)["value"],
+             stats._rate(2, 3, 2)["value"], True),
+            ("low", 3, 1.0, 0.0, 0.0, True)]
+    assert tiers("7d", "grok-4.7") == week == tiers("7d", "grok-4.7", "page_windows")
     assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), *week[1:]]
+    # Sol authored only the unpublished r17a and the published r14.
     assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
-    (grok_row,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
-    assert grok_row["by_risk_without_review_of_record"] == 1
+    without = {a["model"]: a["prs_without_review_of_record"] for a in snapshot["windows"]["7d"]["author_risks"]}
+    assert without == {"grok-4.7": 1, "gpt-6.1-sol": 0}
 
 
-def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path):
+def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
     """Defect class: a malformed publication is written, or a damaged ledger line is trusted, so a review counts as
     published without proof; a missing ledger reads as anything but "no publication known"; or an older publication
-    appended later (a history import) supersedes a newer one."""
+    appended later (a history import) supersedes a newer one; or a catalog that was unreadable once stays unreadable
+    to the collector."""
     from collections import Counter
 
     import pytest
@@ -1373,6 +1394,14 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert rows.record_publications(batch_state, [later, good]) == 1
     assert rows.read_publications(batch_state) == (
         {"t-review": later}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
+    # A catalog that cannot be read matches nothing, and is read again the next time.
+    def unreadable():
+        raise OSError("catalog unreadable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(rows, "load_fleet_repos", unreadable)
+        assert rows.repository_keys() == {}
+    assert rows.repository_keys()["learn-ukrainian/machinery"] == "machinery"
     # An import appends an older publication after the newer one: the newer one still stands.
     older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
     assert rows.record_publications(batch_state, [older]) == 1

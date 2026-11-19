@@ -544,8 +544,8 @@ function risks(authors) {
   const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}</td>`
     + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
     + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
-  const without = authors.filter((a) => a.by_risk_without_review_of_record)
-    .map((a) => `${named(a)}: ${num(a.by_risk_without_review_of_record)}`);
+  const without = authors.filter((a) => a.prs_without_review_of_record)
+    .map((a) => `${named(a)}: ${num(a.prs_without_review_of_record)}`);
   const note = without.length
     ? `<p class="note"><strong class="warn">PRs with no published review, left out:</strong> ${without.join(", ")}</p>` : "";
   return (rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
@@ -699,7 +699,7 @@ function render() {
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
   $("risk-meta").textContent = $("author-meta").textContent;
-  $("risk").innerHTML = risks(authors);
+  $("risk").innerHTML = risks((data.author_risks || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked()))));
   $("accuracy-meta").textContent = label;
   $("accuracy").innerHTML = accuracy(data);
   const allowance = (data.allowance || []).filter((a) => keepModel(a.model));
