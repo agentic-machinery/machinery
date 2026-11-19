@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet — Machinery</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header>
+  <div class="header-top">
+    <div class="title">
+      <h1>Fleet</h1>
+      <p class="purpose">Live agent workers, recently finished dispatches, and Fleet Comms backlog.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  <section class="wide" id="fleet">
+    <h2>Agent fleet <span class="age" id="workers-age">Loading…</span></h2>
+    <p id="workers-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="workers-content">Loading…</div>
+    <h3>Recently finished <span class="age muted" id="recent-age">Loading…</span></h3>
+    <p id="recent-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="recent-content">Loading…</div>
+  </section>
+  <section class="wide" id="comms">
+    <h2>Fleet Comms <span class="age" id="comms-age">Loading…</span></h2>
+    <p id="comms-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="comms-content">Loading…</div>
+  </section>
+</main>
+<script src="/machinery.js"></script>
+<script>
+"use strict";
+const {
+  escapeHtml, fetchJson, span, relative, table, td, text, unknown, chip,
+  ciLabel, prLink, prSnapshotFresh, createPanelRunner,
+} = Machinery;
+
+const ACTIVE = new Set(["spawning", "running", "settling", "needs_finalize"]);
+const CLAUDE_ACCOUNTS = {a: "Claude a", b: "Claude b"};
+const CODEX_ACCOUNTS = {sub: "Codex a", "b-sub": "Codex b", api: "Codex API", "b-api": "Codex b API"};
+
+let latestPrsReading = null;
+
+function currentPrs(now = Date.now()) {
+  return latestPrsReading && prSnapshotFresh(latestPrsReading, now) ? latestPrsReading.data : null;
+}
+
+function account(task) {
+  if (task.claude_account) return Object.hasOwn(CLAUDE_ACCOUNTS, task.claude_account) ? CLAUDE_ACCOUNTS[task.claude_account] : "Claude, other account";
+  if (task.codex_account) return Object.hasOwn(CODEX_ACCOUNTS, task.codex_account) ? CODEX_ACCOUNTS[task.codex_account] : "Codex, other account";
+  return task.agent === "agy" ? "AGY" : null;
+}
+
+function modelOf(task) {
+  return task.observed_model || task.model || null;
+}
+
+function prIndex(prs) {
+  const index = [];
+  if (!prs || prs.status !== "ok") return index;
+  for (const repo of Array.isArray(prs.repositories) ? prs.repositories : []) {
+    if (repo.status !== "ok") continue;
+    for (const pr of Array.isArray(repo.pull_requests) ? repo.pull_requests : []) {
+      if (pr.task_reference) index.push({repo: repo.name, ...pr});
+    }
+  }
+  return index;
+}
+
+function ownPr(task, index) {
+  const id = String(task.task_id || "");
+  return id ? index.find(pr => pr.task_reference === id) || null : null;
+}
+
+function taskPrCell(task, index) {
+  let open = ownPr(task, index);
+  // A recorded delivery PR is authoritative; a different open PR never replaces it.
+  if (open && task.delivery_pr && task.delivery_pr !== `#${open.number}`) open = null;
+  if (open) {
+    const [label, cls] = ciLabel(open.ci);
+    return td(`${prLink(open.repo, open)} <span class="${cls}">${escapeHtml(label)}</span>`
+      + (open.queue ? ` <span class="ok">queued ${escapeHtml(open.queue.position ?? "")}</span>` : ""));
+  }
+  return text(task.delivery_pr || null, task.delivery_pr ? "" : "muted");
+}
+
+function doing(task) {
+  const review = /-review-(\d+)-r(\d+)$/.exec(task.task_id || "");
+  const role = review ? `reviewing PR ${review[1]}, round ${review[2]}` : task.research_role || task.status;
+  const progress = typeof task.commits_ahead === "number" ? `${task.commits_ahead} commits ahead` : null;
+  const touched = task.updated_at ? `record updated ${relative(task.updated_at)}` : null;
+  return [role, progress, task.push_state && task.push_state !== "unknown" ? task.push_state : null, touched]
+    .filter(Boolean).join(" · ");
+}
+
+function renderWorkers(active, prs = currentPrs()) {
+  const tasks = Array.isArray(active.tasks) ? active.tasks : [];
+  const index = prIndex(prs);
+  return table(["Task", "Model", "Account", "Running", "Doing", "PR"], tasks.map(task => [
+    text(task.task_id),
+    text(modelOf(task) || task.agent),
+    text(account(task)),
+    text(span(task.age_s), task.age_s > 3 * 3600 ? "num bad" : task.age_s > 2 * 3600 ? "num warn" : "num"),
+    text(doing(task)),
+    taskPrCell(task, index),
+  ]));
+}
+
+const OUTCOME_CLASS = {
+  done: "ok", failed: "bad", crashed: "bad", timeout: "bad",
+  no_deliverable: "warn", cancelled: "muted", rate_limited: "warn",
+};
+
+function renderRecent(list) {
+  const tasks = (Array.isArray(list.tasks) ? list.tasks : []).filter(task => !ACTIVE.has(task.status));
+  const attention = list.needs_attention || {};
+  const pending = Array.isArray(attention.tasks) ? attention.tasks : [];
+  const attentionHtml = attention.total ? `<details><summary class="warn">${escapeHtml(attention.total)} unfinished task records need a keep/close decision. Showing up to ${pending.length}.</summary>`
+    + table(["Task", "Model", "State"], pending.map(task => [text(task.task_id),
+      text(modelOf(task) || task.agent), text(task.status, "bad")])) + "</details>" : "";
+  return table(["Task", "Model", "Outcome", "Finished", "Took", "PR"], tasks.map(task => [
+    text(task.task_id),
+    text(modelOf(task) || task.agent),
+    text(task.status, OUTCOME_CLASS[task.status] || "bad"),
+    text(task.finished_at ? relative(task.finished_at) : null, "num"),
+    text(span(task.duration_s), "num"),
+    text(task.delivery_pr || null, task.delivery_pr ? "" : "muted"),
+  ])) + attentionHtml;
+}
+
+function renderComms(metrics) {
+  if (metrics.db_error || metrics.db_missing) return unknown("Fleet Comms is unavailable");
+  const deliveries = metrics.deliveries || {}, jobs = metrics.jobs || {};
+  const reachable = metrics.store?.reachable;
+  const windows = metrics.failure_windows || {}, lifetime = metrics.failure_lifetime || {};
+  const rows = [
+    [text("Store"), text(reachable ? `${metrics.source || "plane"} reachable` : "UNREACHABLE", reachable ? "ok" : "bad"), text(""), text(""), text("")],
+    [text("Deliveries queued"), text(deliveries.queued, "num"), text(""), text(""), text("")],
+    [text("Jobs queued"), text(jobs.queued, "num"), text(""), text(""), text("")],
+  ];
+  for (const [key, label] of [["dead_letters", "Dead letters"], ["failed_deliveries", "Deliveries failed"], ["failed_jobs", "Jobs failed"]]) {
+    const day = windows["24h"]?.[key], week = windows["7d"]?.[key];
+    rows.push([text(label), text(""), text(day?.total ?? "?", day?.total ? "num warn" : "num"), text(week?.total ?? "?", week?.total ? "num warn" : "num"), text(lifetime[key] ?? "?", "num")]);
+    const recipients = new Set([...Object.keys(day?.by_recipient || {}), ...Object.keys(week?.by_recipient || {})]);
+    for (const recipient of [...recipients].sort()) rows.push([text(`  ${recipient}`), text(""), text(day?.by_recipient?.[recipient] ?? 0, "num"), text(week?.by_recipient?.[recipient] ?? 0, "num"), text("")]);
+  }
+  return table(["Measure", "Current", "24 h", "7 d", "Lifetime"], rows);
+}
+
+function renderChips(latest) {
+  const out = [];
+  if (latest.workers) out.push(chip("#fleet", (latest.workers.tasks || []).length, "live workers"));
+  if (latest.comms) {
+    const dead = latest.comms.failure_windows?.["24h"]?.dead_letters?.total;
+    out.push(chip("#comms", dead ?? "?", "dead letters / 24 h", dead ? "warn" : ""));
+  }
+  return out.join("");
+}
+
+// Optional non-blocking enrichment so the PR column of active workers shows CI and queue state.
+// Clears enrichment and repaints workers whenever the optional fetch fails or returns an expired/unusable snapshot.
+let prsInFlight = false;
+function repaintWorkers(now = Date.now()) {
+  if (!runner.latest.workers) return;
+  const box = document.getElementById("workers-content");
+  if (box) box.innerHTML = renderWorkers(runner.latest.workers, currentPrs(now));
+}
+
+function enrichWorkerPrs() {
+  if (prsInFlight) return;
+  prsInFlight = true;
+  fetchJson("/api/git/pull-requests").then(reading => {
+    const now = Date.now();
+    latestPrsReading = prSnapshotFresh(reading, now) ? reading : null;
+    repaintWorkers(now);
+  }).catch(() => {
+    latestPrsReading = null;
+    repaintWorkers();
+  }).finally(() => {
+    prsInFlight = false;
+  });
+}
+
+function expireWorkerPrsIfStale(_panel, _latest, _updateChips, now = Date.now()) {
+  if (latestPrsReading && !prSnapshotFresh(latestPrsReading, now)) {
+    latestPrsReading = null;
+    repaintWorkers(now);
+  }
+}
+
+const PANELS = [
+  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
+  {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
+  {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
+];
+
+const runner = createPanelRunner({panels: PANELS, renderChips});
+runner.start();
+</script>
+</body>
+</html>
