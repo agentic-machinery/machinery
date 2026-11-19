@@ -879,9 +879,9 @@ seats rotate — operator wording; the catalog-refresh contract §above owns nam
 | Ukrainian language & pedagogy | Opus · Sol (sanctioned language seats ONLY). Gemini joins only as task-level content reviewer under a fixed brief, never for planning or advice on new design (operator decision 2026-10-03, #9584) | LANGUAGE-LANES RULE binds |
 | Architecture & process design | Sol (designer) · Opus (counter-reader); designated approval needs the non-author's approval when Opus or Sol authored the proposal, both otherwise | fleet topology §above |
 | Code & infrastructure review | Opus 5.5 · GPT-6.2 Sol | Historical Terra review arcs on #5896/#5925/#5926/#5931 (defect-finding record) |
-| Security-sensitive changes | Sol · Opus · Neon for supplemental review | #5931 review evidence for the authority seats. Neon outcomes under measurement |
-| Debugging & forensics | Sol · Opus · Neon for hard-problem advice | Historical: retired Grok found the #5932 root cause (#5950 workaround); GLM: operator statement, #5933 comment 2026-07-28 |
-| Long-context sweeps & harness infra | Gemini for sweeps and recon · Neon for hard-problem advice | Model catalog and [Gemini 4 Neon advisory routing](#gemini-4-neon-advisory-routing) |
+| Security-sensitive changes | Sol · Opus · Neon and Savant for supplemental review | #5931 review evidence for the authority seats. Measure both trial seats against real reviews. |
+| Debugging & forensics | Sol · Opus · Neon and Savant for hard-problem advice | Historical: retired Grok found the #5932 root cause (#5950 workaround); GLM: operator statement, #5933 comment 2026-07-28 |
+| Long-context sweeps & harness infra | Gemini for sweeps and recon · Neon and Savant for hard-problem advice | [Neon](#gemini-4-neon-advisory-routing) and [Savant](#subq-savant-test-routing) routing |
 
 Historical Terra findings support the evidence record, not a current routing choice.
 The ordinary Codex advisor-panel participant is GPT-6.2 Sol. Routine Codex code review
@@ -1063,8 +1063,9 @@ verifies any proposed correction and owns authoring and formal review.
 Pass `--agent opencode --provider subq --model subq-savant-1.4 --mode read-only`,
 with `--data-class public-code`, `public-docs`, `private-code`, or `private-docs`.
 Use `--research-role advisory` for counsel and supplemental review and
-`--research-role test` for proposed patches and Ukrainian checks. Put the
-question and its evidence in the prompt. Treat unreleased
+`--research-role test` for proposed patches and Ukrainian checks. Describe
+the language check in the prompt because `--language-lane` invokes formal
+review admission. Put the question and its evidence in the prompt. Treat unreleased
 curriculum and private infrastructure as private material. The model receives
 the prompt with its tools disabled. A private repository requires a private
 data class. Dispatch refuses secrets, credentials, and unknown or undeclared

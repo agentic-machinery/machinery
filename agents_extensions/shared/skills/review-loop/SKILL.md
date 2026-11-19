@@ -137,12 +137,12 @@ interpreter does not select the primary checkout's Python modules.
    or the schema file, so include the schema from the merge-base in the prompt. Do not send
    secrets or unknown-class inputs. Record an unavailable seat as such.
 
-   Check the reported findings against the pinned head and compare confirmed and missed
-   defects with the review of record. Record each trial's model, effort,
-   verdict, [score](../drive-epic/references/decision-report.md#council-optional-independent-panel)
-   and finding dispositions in the PR body. The settled task supplies the verdict and finding
-   counts to model stats, which joins it to the PR by exact head. The trial score and verdict
-   carry no landing authority. Fix any independently confirmed blocker through the review loop.
+   Check each trial's findings against the pinned head and compare them with the review of
+   record. Apply the [council score rubric](../drive-epic/references/decision-report.md#council-optional-independent-panel)
+   to the confirmed findings. Record each trial's model, effort, verdict, score and finding
+   dispositions in the PR body. Model stats reads structured results from settled tasks and
+   joins them to the PR by exact head. The trial score and verdict carry no landing authority.
+   Fix any independently confirmed blocker through the review loop.
 
 4. **Wait on that task and nonce.** Never re-dispatch.
 
