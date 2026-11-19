@@ -297,12 +297,39 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
             started_at=(NOW - timedelta(hours=3) + timedelta(minutes=3)).isoformat(),
             finished_at=(NOW - timedelta(hours=2)).isoformat(),
             allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "shared-a", model="grok-4.7",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "cursor", "start": {"remaining_pct": 100.0}, "finish": {"remaining_pct": 88.0}})
+    _record(tasks, "shared-b", model="composer-2.5",
+            started_at=(NOW - timedelta(hours=8) + timedelta(minutes=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "cursor", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 82.0}})
+    _record(tasks, "reset-a", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "codex:b", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "reset-b", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8) + timedelta(minutes=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "codex:b", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 70.0}})
     rows.backfill(tasks, batch_state)
-    window = _window(batch_state, stats.Landing(task_ids={"both", "half", "overlap-a", "overlap-b"}))
+    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b"}
+    window = _window(batch_state, stats.Landing(task_ids=landed))
+    unknown = {"value": None, "n": 1, "low_sample": True}
     assert window["allowance"] == [
         {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
          "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
+        {"pool": "codex:b", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "cursor", "model": "composer-2.5", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "cursor", "model": "grok-4.7", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
         {"pool": "gemini", "model": "gemini-4-hydrogen", "effort": "medium", "tasks": 2, "landed": 2,
          "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": 20.0,
          "pct_points_per_landed": {"value": 10.0, "n": 2, "low_sample": True}},
@@ -334,6 +361,13 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "kimi-slash": dict(agent="kimi", model="kimi-code/k3-256k", effort=None),
         "kimi-alias": dict(agent="kimi", model="k3-256k", effort=None),
         "deepseek-prefix": dict(agent="deepseek", model="deepseek-direct/deepseek-v4-flash", effort=None),
+        "attested-over-auto": dict(agent="cursor", model="auto", resolved_model="Grok 4.7 256K High",
+                                   resolved_model_known=True, effort=None),
+        "attested-fast-over-request": dict(agent="cursor", model="grok-4.7",
+                                           resolved_model="Grok 4.7 256K High Fast",
+                                           resolved_model_known=True, effort=None),
+        "attested-kimi-over-request": dict(agent="kimi", model="k3", resolved_model="kimi-code/k3-256k",
+                                           resolved_model_known=True, effort=None),
     }
     for task_id, fields in cases.items():
         _record(tasks, task_id, **fields)
@@ -358,6 +392,9 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "kimi-slash": ("kimi-code/k3-256k", "unset"),
         "kimi-alias": ("kimi-code/k3-256k", "unset"),
         "deepseek-prefix": ("deepseek-v4-flash", "unset"),
+        "attested-over-auto": ("grok-4.7", "unset"),
+        "attested-fast-over-request": ("unknown", "unset"),
+        "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
     flash = _row(window, "gemini-3.8-flash-high", "write")
     assert flash["effort"] == "all" and [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [
@@ -373,10 +410,37 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
     page = stats.page_window(snapshot["windows"]["all"])
-    assert all("by_class" not in model and "by_class" not in effort
-               for model in page["models"] for effort in model["by_effort"])
+    dropped = ("by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed")
+    assert all(key not in model and key not in effort
+               for model in page["models"] for effort in model["by_effort"] for key in dropped)
     html = machinery_path("api/dashboards/model-stats.html").read_text()
     assert "view=page" in html and "not enough data yet" in html and "Best value" in html
+    assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
+    # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
+    rank_root = tmp_path / "value"
+    rank_tasks = rank_root / "tasks"
+    rank_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3)
+        _review(rank_tasks, f"short-review-{index}", "correct", [], pr=100 + index,
+                review_author_model="gpt-6.2-sol")
+        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600)
+        _review(rank_tasks, f"long-review-{index}", "correct" if index < 5 else "incorrect", [], pr=200 + index,
+                review_author_model="gpt-6.1-sol")
+    rows.backfill(rank_tasks, rank_root)
+    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(
+        task_ids={f"short-{index}" for index in range(10)} | {f"long-{index}" for index in range(10)}))
+    recommendation = ranked["windows"]["7d"]["charts"]["recommendation"]
+    assert recommendation["model"] == "gpt-6.2-sol"
+    assert recommendation["approvals"] == 10
+    classes = []
+    for index in range(9):
+        classes.append({"role": "write", "model": "gpt-6.1-sol", "identity": "catalog", "tasks": 11, "landed": 11,
+                        "landed_rate": {"value": 1.0, "n": 11, "low_sample": False}, "status": {"done": 11},
+                        "wall_seconds": {"n": 0, "total_seconds": 0},
+                        "by_class": [{"class": f"job-{index}", "tasks": 11, "landed": 11,
+                                      "landed_rate": {"value": 1.0}}]})
+    assert len(stats._charts(classes, [], [])["jobs"]) == 9
 
 
 def _at(hours: float) -> str:

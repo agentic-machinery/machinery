@@ -148,14 +148,14 @@ const timedOf = (r) => r.wall_seconds.n === r.tasks ? "" : ` <span class="low" t
 function writeRow(r, kind) {
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(r.status.done)}`
     + `${cell(pct(r.no_deliverable))}${cell(pct(r.not_done))}${cell(r.landed)}${cell(pct(r.landed_rate))}`
-    + `${cell(hoursOf(r))}${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}`
-    + `${cell(r.output_tokens_per_landed.value === null ? "—" : num(r.output_tokens_per_landed.value / 1000) + "k")}</tr>`;
+    + `${cell(hoursOf(r))}${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
 }
 function reviewRow(r, kind) {
   const v = r.verdicts;
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
-    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(num(v.unparsed))}${cell(pct(r.approve_rate))}`
-    + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}`
+    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(num(v.unparsed))}`
+    + `${cell(pct(r.approve_rate) + ` (n=${r.approve_rate.n})`)}`
+    + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review) + ` (n=${r.p0_p2_per_review.n})`)}`
     + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
 }
 function withClasses(models, role, render, width) {
@@ -167,9 +167,10 @@ function keepModel(name) { return !picked() || name === picked(); }
 
 function recommend(rec) {
   if (!rec || !rec.model) return `<span class="banner">Not enough data yet for a best-value model. ${esc(rec && rec.rule)}</span>`;
-  return `<span class="banner"><b>Best value in this window: ${esc(rec.model)}</b> — first-round approval ${num(rec.approval * 100)}% `
-    + `(n=${rec.approval_n}, interval ${ciText(rec.approval_ci)}), ${num(rec.hours, 2)} wall hours per landed task `
-    + `(${rec.landed} landed). Score ${num(rec.score, 2)} approval points per wall hour. `
+  return `<span class="banner"><b>Best value in this window: ${esc(rec.model)}</b> — ${rec.approvals} first-round approvals `
+    + `in ${num(rec.recorded_hours, 2)} recorded wall hours (approval ${num(rec.approval * 100)}%, n=${rec.approval_n}, `
+    + `interval ${ciText(rec.approval_ci)}), ${num(rec.hours, 2)} wall hours per landed task `
+    + `(${rec.landed} landed). Score ${num(rec.score, 2)} approvals per recorded wall hour. `
     + `<a href="#jobs">The per-class board</a> is the comparison that holds the job still. ${esc(rec.rule)}</span>`;
 }
 function wasteList(items) {
@@ -282,10 +283,10 @@ function neon(data) {
   return table(["Effort", "Write tasks", "Landed", "Review results", "Approval", "Interval", "Median min", ""], rows);
 }
 function strictness(items) {
-  const shown = (items || []).filter((item) => item.approve !== null && keepModel(item.model));
-  if (!shown.length) return '<p class="muted">No parsed review in this window.</p>';
+  const shown = (items || []).filter((item) => item.approve !== null && item.p0_p2 !== null && keepModel(item.model));
+  if (!shown.length) return '<p class="muted">No review in this window has both an approval rate and a findings count.</p>';
   const W = 680, H = 300, L = 52, R = 16, T = 16, B = 40;
-  const xmax = Math.max(1, ...shown.map((item) => item.p0_p2 || 0)) * 1.25;
+  const xmax = Math.max(1, ...shown.map((item) => item.p0_p2)) * 1.25;
   const sx = (x) => L + (x / xmax) * (W - L - R);
   const sy = (y) => T + (1 - y) * (H - T - B);
   const grid = [0, 0.5, 1].map((y) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${sy(y)}" y2="${sy(y)}"/>`
@@ -294,9 +295,9 @@ function strictness(items) {
     const y0 = item.approve_ci ? sy(item.approve_ci[1]) : sy(item.approve);
     const y1 = item.approve_ci ? sy(item.approve_ci[0]) : sy(item.approve);
     return `<g><title>${esc(item.model)}: approves ${num(item.approve * 100)}% of ${item.approve_n}; ${num(item.p0_p2, 2)} P0–P2 per review with findings (n=${item.findings_n})</title>`
-      + `<line x1="${sx(item.p0_p2 || 0)}" x2="${sx(item.p0_p2 || 0)}" y1="${y0}" y2="${y1}" stroke="${colorOf(item.model)}"/>`
-      + `<circle cx="${sx(item.p0_p2 || 0)}" cy="${sy(item.approve)}" r="5" fill="${item.low_sample ? "var(--card)" : colorOf(item.model)}" stroke="${colorOf(item.model)}" stroke-width="2"/>`
-      + `<text class="label" x="${sx(item.p0_p2 || 0) + 8}" y="${sy(item.approve) - 6}">${esc(item.model)}</text></g>`;
+      + `<line x1="${sx(item.p0_p2)}" x2="${sx(item.p0_p2)}" y1="${y0}" y2="${y1}" stroke="${colorOf(item.model)}"/>`
+      + `<circle cx="${sx(item.p0_p2)}" cy="${sy(item.approve)}" r="5" fill="${item.low_sample ? "var(--card)" : colorOf(item.model)}" stroke="${colorOf(item.model)}" stroke-width="2"/>`
+      + `<text class="label" x="${sx(item.p0_p2) + 8}" y="${sy(item.approve) - 6}">${esc(item.model)}</text></g>`;
   }).join("");
   return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="Approval rate against P0 to P2 findings per review">${grid}${dots}`
     + `<text x="${(L + W - R) / 2}" y="${H - 4}" text-anchor="middle">P0–P2 findings per review</text>`
@@ -404,7 +405,7 @@ function render() {
   const total = (rows) => rows.filter((r) => keepModel(r.model)).reduce((s, r) => s + r.tasks, 0);
   $("write-meta").textContent = `${label}; n = ${total(writes)} tasks`;
   $("write").innerHTML = table(["Model / effort", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
-    "Wall h per landed", "Median min", "p90 min", "Output tokens per landed"], withClasses(data.models, "write", writeRow, 11));
+    "Wall h per landed", "Median min", "p90 min"], withClasses(data.models, "write", writeRow, 10));
   $("reviews-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
   $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approved / changes / blocked", "Missing verdict",
     "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 10));

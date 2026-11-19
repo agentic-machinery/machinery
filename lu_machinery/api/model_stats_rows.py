@@ -164,9 +164,14 @@ def model_id(raw: object) -> str:
 
 
 def concrete_model(record: Mapping[str, Any]) -> str:
-    """The provider-observed model when the runtime attested one, else the requested model's catalog id."""
-    if record.get("resolved_model_known") is True and label(_spelling(record.get("resolved_model"))) != "unknown":
-        return model_id(record["resolved_model"])
+    """The provider-observed model when the runtime attested one, else the requested model's catalog id.
+
+    The attested spelling goes through ``model_id`` directly. A display name the label grammar would reject
+    (a space, or one slash) is still a catalog id when the map admits it, and stays ``unknown`` when it does not.
+    The requested model is not a fallback for an attestation the catalog does not name.
+    """
+    if record.get("resolved_model_known") is True:
+        return model_id(record.get("resolved_model"))
     return model_id(record.get("model"))
 
 
