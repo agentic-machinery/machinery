@@ -922,8 +922,9 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         parts = PurePosixPath(name).parts
         if not parts or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
             raise Refused("savant_snapshot_refused: the tree names a path outside itself")
+        # A name is screened like content: the run would see it, and a draft screens every name it exports.
         if (kind != b"blob" or mode not in (b"100644", b"100755") or not name.isprintable()
-                or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts)):
+                or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts) or _sensitive(raw, needles, accounts)):
             left_out += 1
             continue
         total += int(size_field)
@@ -1670,9 +1671,9 @@ class _Boundary:
             chunk = os.read(descriptor, 4096)
             buffer += chunk
             try:
-                document, _end = json.JSONDecoder().raw_decode(buffer.decode("utf-8").lstrip())
+                document, _end = json_depth.raw_decode(buffer.decode("utf-8").lstrip(), max_depth=4)
                 break
-            except ValueError:
+            except (ValueError, RecursionError):
                 if not chunk or len(buffer) > 65536:
                     raise Refused("the sandbox's init report is unreadable") from None
         pid = document.get("child-pid") if isinstance(document, dict) else None

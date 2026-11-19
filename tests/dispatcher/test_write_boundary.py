@@ -897,6 +897,8 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     (repo / "docs").mkdir()
     (repo / "docs" / "guide.md").write_text("old\n")
     (repo / "gone.txt").write_text("remove me\n")
+    # A tracked name the screen refuses never enters the view, so it cannot refuse an unrelated owned edit.
+    (repo / "docs" / ("ghp_" + "A" * 36 + ".md")).write_text("public\n")
     _git(repo, "add", "docs", "gone.txt")
     _git(repo, "commit", "-qm", "fixture")
     _git(worktree, "merge", "-q", "--ff-only", "main")
