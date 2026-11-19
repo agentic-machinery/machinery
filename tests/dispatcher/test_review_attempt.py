@@ -113,6 +113,12 @@ def test_bound_attempt_cannot_spend_an_exhausted_branch_pr_budget(attempt, tmp_p
     budget.assert_called_once()
     launch.assert_not_called()
     git.create_worktree.assert_not_called()
+    # Since machinery #892 the refused budget dispatch leaves one typed never-started record; earlier records stay.
+    after = {path.name: path.read_bytes() for path in tasks.iterdir()}
+    assert {name: after[name] for name in before} == before
+    added = [json.loads(after[name]) for name in after.keys() - before.keys() if name.endswith(".json")]
+    assert [(record["status"], record["never_started_reason"], record["pid"]) for record in added] == [
+        ("failed", "review_setup_refusal", None)]
 
     budget.reset_mock()
     assert invoke(attempt, "--pinned-head", "a" * 40, "--review-profile", "infra") == 0
@@ -233,92 +239,91 @@ def test_concurrent_admissions_claim_one_pair_for_different_tasks(attempt, tmp_p
     assert len(store.list_tasks()) == 1
 
 
-@pytest.mark.parametrize(("name", "invalid", "reason"), [
-    ("output_schema", "override.json", "attempt_output_schema_unsupported"),
-    ("review_profile", "code", "lexical_review_identity_required"),
-    ("review_author_model", None, "lexical_review_identity_required"),
-    ("effort", "low", "lexical_review_identity_required"),
-])
-def test_lexical_attempt_admission_refuses_a_changed_identity_or_schema(tmp_path, monkeypatch, name, invalid, reason):
-    """Defect class: a lexical attempt is admitted off the Ukrainian profile, without its author or at low effort.
+def test_lexical_render_admission_rejects_tampering(tmp_path, monkeypatch):
+    """Defect class: lexical admission refuses valid renders or accepts altered prompts, identity or schema.
 
-    Adapted from ``test_lexical_render_admission_rejects_tampering``: the product renders the prompt and checks
-    it (``check_review_contract``, ``attempt_hooks().check_prompt``), so both are planted as passing here. The
-    identity and schema checks after them are machinery's.
-    """
-    from lu_machinery.agent_runtime import review_mcp
-    from lu_machinery.dispatcher import review_attempt
-    from lu_machinery.orchestration import worktree_claims
-    from lu_machinery.review import product_hooks
-
-    manifest = tmp_path / "lexical.yaml"
-    manifest.write_text("kind: lexical\ninputs: {}\n")
-    prompt_file = tmp_path / "lexical.prompt"
-    prompt_file.write_text("Rendered\n")
-    contract = dict(server_checkout=str(tmp_path), render_checkout=str(tmp_path), recorded_files_read=[],
-                    recorded_template_sha256={}, recorded_templates=["lexical-review.md.j2"],
-                    machinery_dependencies={})
-    monkeypatch.setattr(review_mcp, "check_review_contract", lambda *a, **k: contract)
-    monkeypatch.setattr(review_mcp, "check_review_tool_requirements", lambda *a: None)
-    monkeypatch.setattr(worktree_claims, "required_review_input_root", lambda _: str(tmp_path))
-    hooks = SimpleNamespace(check_prompt=lambda *a, **k: SimpleNamespace(passed=True, errors=[]),
-                            pinned_entries=lambda _: [])
-    monkeypatch.setattr(product_hooks, "attempt_hooks", lambda **_: hooks)
-    args = SimpleNamespace(review_access="isolated", full_checkout=False, output_schema=None, codex_account=None,
-                           prompt_file=str(prompt_file), review_attempt=str(manifest), review_profile="ukrainian",
-                           review_author_model=CURRENT_SOL, effort="high")
-    binding = dict(review_id="review", attempt_id="attempt")
-    assert review_attempt.admit(args, b"Rendered\n", binding, tmp_path, "a" * 40) is contract
-    setattr(args, name, invalid)
-    with pytest.raises(ValueError, match=reason):
-        review_attempt.admit(args, b"Rendered\n", binding, tmp_path, "a" * 40)
-
-
-def test_render_record_refuses_an_altered_prompt_or_another_attempt(tmp_path):
-    """Defect class: a prompt edited after rendering, or rendered for another attempt, passes admission (#9163).
-
-    Adapted from ``test_lexical_render_admission_rejects_tampering``: the product renderer writes the render
-    record, so this one is written by hand. The prompt and attempt checks run before any server-code check.
+    Restored with the real machinery contract check (``review_mcp.check_review_contract``) on a render record
+    built by machinery's own ``render_record``. Only the product hooks (the prompt checker, pins and receipt
+    tools) and the Sources server location are planted, at their boundaries.
     """
     import hashlib
+    import subprocess
 
-    from lu_machinery.review.render_contract import (
-        RENDER_RECORD_KEY,
-        RENDER_RECORD_VERSION,
-        ReviewContractError,
-        check_render_contract,
-        render_record_path,
+    import yaml
+
+    from lu_machinery.agent_runtime import attempt_boundary, review_mcp
+    from lu_machinery.dispatcher import review_attempt
+    from lu_machinery.review import product_hooks
+    from lu_machinery.review.render_contract import RENDER_RECORD_KEY, render_record, render_record_path
+
+    # The render checkout: a Sources server, its lock and the lexical template.
+    checkout = (tmp_path / "render").resolve()
+    (checkout / ".mcp/servers/sources").mkdir(parents=True)
+    (checkout / ".mcp/servers/sources/server.py").write_text("import json\n")
+    (checkout / "requirements-lock.txt").write_text("fixture==1.0\n")
+    prompts = checkout / "scripts/review/prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "lexical-review.md.j2").write_text("Review {{ items }}\n")
+    monkeypatch.setattr(review_mcp, "review_server_checkout", lambda: checkout)
+
+    # The dispatch commit: one public candidate file the manifest pins.
+    inputs = (tmp_path / "inputs").resolve()
+    inputs.mkdir()
+    candidate = b"candidate words\n"
+    (inputs / "candidates.txt").write_bytes(candidate)
+    for command in (["git", "init", "-q"], ["git", "add", "candidates.txt"],
+                    ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                     "commit", "-qm", "Public candidate fixture"]):
+        subprocess.run(command, cwd=inputs, check=True, capture_output=True, timeout=30)
+    sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=inputs, timeout=30).decode().strip()
+    pin = {"path": "candidates.txt", "sha256": hashlib.sha256(candidate).hexdigest()}
+    manifest = {"kind": "lexical", "inputs": {"candidates": pin}}
+    manifest_path = tmp_path / "lexical.yaml"
+    manifest_path.write_text(yaml.safe_dump(manifest))
+
+    tools = frozenset({"verify_words"})
+    ledger = SimpleNamespace(REVIEW_TOOLS=tools, review_tools=lambda access="isolated", server_path=None: tools)
+    hooks = SimpleNamespace(
+        check_prompt=lambda *a, **k: SimpleNamespace(passed=True, errors=[]),
+        pinned_entries=lambda loaded: [("inputs.candidates", loaded["inputs"]["candidates"])],
+        pin_refusals=lambda *a: [], ledger=lambda: ledger,
     )
+    for module in (product_hooks, review_mcp):  # review_mcp binds the hook at import
+        monkeypatch.setattr(module, "attempt_hooks", lambda **_: hooks)
 
     prefix, dependency = trusted_core_context()
     prompt = prefix + "Rendered lexical review\nattempt: review/attempt\n"
     prompt_file = tmp_path / "lexical.prompt"
     prompt_file.write_text(prompt, encoding="utf-8")
-    digest = "0" * 64
-    record = dict(
-        version=RENDER_RECORD_VERSION, render_checkout=str(tmp_path), input_root=str(tmp_path),
-        prompts_dir=str(tmp_path), template_digest=digest, server_digest=digest,
-        prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), templates={"lexical-review.md.j2": digest},
-        server_components={"server.py": digest}, machinery_dependencies={"rules_core": dependency},
-        review_id="review", attempt_id="attempt",
-    )
+    template = {"lexical-review.md.j2": hashlib.sha256((prompts / "lexical-review.md.j2").read_bytes()).hexdigest()}
+    record = render_record(checkout, prompts, template, hashlib.sha256(prompt.encode()).hexdigest(),
+                           review_id="review", attempt_id="attempt", input_root=inputs,
+                           machinery_dependencies={"rules_core": dependency})
     render_record_path(prompt_file).write_text(json.dumps({RENDER_RECORD_KEY: record, "files_read": []}))
+    args = cli.build_parser().parse_args([
+        "dispatch", "--agent", "agy", "--model", "gemini-4-neon-high", "--effort", "high",
+        "--mode", "read-only", "--review-profile", "ukrainian", "--review-author-model", CURRENT_SOL,
+        "--review-id", "review", "--attempt-id", "attempt", "--review-attempt", str(manifest_path),
+        "--prompt-file", str(prompt_file), "--review-access", "isolated",
+    ])
+    binding = dict(review_id="review", attempt_id="attempt")
 
-    def refusal(text, attempt_id="attempt"):
-        try:
-            check_render_contract(prompt_file, text, tmp_path, review_id="review", attempt_id=attempt_id)
-        except (ReviewContractError, OSError, ValueError) as exc:
-            return str(exc)
-        return ""
-
-    tamper_codes = ("review_render_record_stale", "review_render_record_attempt_mismatch", "review_rules_core")
-    # The prompt as rendered passes every tamper check; whatever stops it later is about the server code.
-    assert not any(code in refusal(prompt) for code in tamper_codes)
-    assert "review_render_record_stale" in refusal(prompt + "altered")
-    prompt_file.write_text(prompt + "altered", encoding="utf-8")  # the file and the text agree; the record does not
-    assert "review_render_record_stale" in refusal(prompt + "altered")
-    prompt_file.write_text(prompt, encoding="utf-8")
-    assert "review_render_record_attempt_mismatch" in refusal(prompt, attempt_id="other")
+    contract = review_attempt.admit(args, prompt.encode(), binding, inputs, sha)
+    assert contract["templates"] == ["lexical-review.md.j2"]
+    assert contract["prompt_sha256"] == record["prompt_sha256"]
+    assert attempt_boundary.authorized_closure(manifest, inputs) == {"candidates.txt": candidate}
+    with pytest.raises(ValueError, match="review_render_record_stale"):
+        review_attempt.admit(args, (prompt + "altered").encode(), binding, inputs, sha)
+    with pytest.raises(ValueError, match="review_render_record_attempt_mismatch"):
+        review_attempt.admit(args, prompt.encode(), dict(binding, attempt_id="other"), inputs, sha)
+    for name, invalid in (("review_profile", "code"), ("review_author_model", None), ("effort", "low"),
+                          ("output_schema", "override.json")):
+        original = getattr(args, name)
+        setattr(args, name, invalid)
+        reason = "attempt_output_schema_unsupported" if name == "output_schema" else "lexical_review_identity_required"
+        with pytest.raises(ValueError, match=reason):
+            review_attempt.admit(args, prompt.encode(), binding, inputs, sha)
+        setattr(args, name, original)
 
 
 def _ledger_hook(monkeypatch):
@@ -448,7 +453,12 @@ def test_manifest_bound_ukrainian_review_fabricated_quote_dropped_and_counted(at
     assert done["claims_unsupported"] == 2
     assert done["unknown_items"] == 0
     assert len(done["dropped_claims"]) == 2
+    assert done["dropped_claims"][1]["claim"] == {"sources": "VESUM"}
+    assert done["dropped_claims"][1]["reason"] == "claim_not_in_captured_output"
+    assert done["dropped_claims"][1]["captured_event_ids"] == []
+    assert done["dropped_claims"][0]["reason"] == "quote_not_in_result"
     assert "fabricated quote never returned" not in final_text
+    assert "_approval_void" in final_text
 
 
 def test_manifest_bound_ukrainian_review_foreign_attempt_receipt_dropped(attempt, tmp_path, monkeypatch):
@@ -483,6 +493,7 @@ def test_manifest_bound_ukrainian_review_unknown_item_leaves_denominator_incompl
     chunk = judge_item_reply(packet, final_text, stated="APPROVED", ukrainian=True)
     assert chunk.denominator == ("card-1", "card-2")
     assert chunk.coverage == ("card-1",)
+    assert "card-2" not in chunk.coverage
 
 
 def test_manifest_bound_ukrainian_review_yaml_fabricated_quote_dropped_and_counted(attempt, tmp_path, monkeypatch):
@@ -523,6 +534,7 @@ def test_manifest_bound_ukrainian_review_two_items_one_void_preserves_valid_item
     chunk = judge_item_reply(packet, final_text, stated="APPROVED", ukrainian=True)
     assert chunk.denominator == ("card-1", "card-2")
     assert chunk.coverage == ("card-1",)
+    assert "card-2" not in chunk.coverage
     assert chunk.void is None
 
 

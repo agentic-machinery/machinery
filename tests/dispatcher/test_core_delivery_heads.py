@@ -13,6 +13,7 @@ contributor-mode request reaches an agent that cannot honour it.
 
 import json
 import os
+import shlex
 import signal
 from pathlib import Path
 
@@ -201,3 +202,61 @@ def test_contributor_mode_refuses_non_muse_agents_without_side_effects(sandbox, 
     assert result.stderr == "dispatcher: --contributor-mode is only supported with --agent muse\n"
     assert not sandbox.tasks.exists()
     assert run_git(sandbox.repo, "branch", "--list") == before
+
+
+@pytest.mark.parametrize("contributor", ["on", "off", None])
+def test_muse_cli_forces_contributor_mode_off_and_keeps_the_request_auditable(sandbox, contributor):
+    """A Muse dispatch always runs with contributor mode off and records what was asked for.
+
+    Adapted from ``test_muse_cli_forwards_contributor_mode_and_keeps_auditable_record``: machinery #558 reversed
+    forwarding (Muse confinement), so the request is kept only as ``requested_contributor_mode``. The model is
+    ``muse-spark-1.3``, which the catalog holds (``lifecycle: hold``) rather than retires.
+    Defect classes: an explicit contributor request reaches the provider; the request leaves no audit record.
+    """
+    args = ["dispatch", "--agent", "muse", "--model", "muse-spark-1.3", "--prompt", "public input"]
+    if contributor is not None:
+        args += ["--contributor-mode", contributor]
+    plan = json.loads(sandbox.cli(*args, "--dry-run").stdout)
+    argv = plan["argv"]
+    assert argv[argv.index("--contributor-mode") + 1] == "off"
+    assert not sandbox.tasks.exists()
+    assert not Path(plan["worktree"]).exists()
+
+    # Keep the real file transport, sandbox and parser; only the paid executable is replaced. The sandbox runs
+    # the versioned native binary behind the ``muse`` wrapper and permits no host writes, so the stub reports
+    # through its exit status: 9 when the provider sees contributor mode on, 8 when the prompt lacks the core.
+    binary_dir = sandbox.repo.parent / "bin"
+    binary_dir.mkdir(exist_ok=True)
+    version = "0.0.0-R1"
+    (binary_dir / ".muse-version").write_text(version)
+    executable = binary_dir / "muse"
+    executable.write_text(f'#!/bin/sh\nexec "$(dirname "$0")/muse-bin-{version}" "$@"\n')
+    native = binary_dir / f"muse-bin-{version}"
+    event = json.dumps({"payload_type": "run.terminal.completed", "payload": {"text": "Finished."}})
+    native.write_text(r'''#!/bin/sh
+set -eu
+mode=""
+prompt=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --contributor-mode) shift; mode="$1" ;;
+        --prompt-file) shift; prompt=$(cat "$1") ;;
+    esac
+    shift
+done
+[ "$mode" = off ] || exit 9
+case "$prompt" in
+    '<rules-core seat="core"'*'</rules-core>'*'public input') ;;
+    *) exit 8 ;;
+esac
+''' + f"printf '%s\\n' {shlex.quote(event)}\n")
+    for path in (executable, native):
+        path.chmod(0o755)
+    home = sandbox.repo.parent / "synthetic-home"
+    home.mkdir(exist_ok=True)
+    sandbox.env.update(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"))
+    sandbox.env["PATH"] = str(binary_dir) + os.pathsep + os.defpath
+    task = sandbox.cli(*args).stdout.splitlines()
+    record = sandbox.settle(task)
+    assert record["status"] == "done", record.get("error")
+    assert (record["contributor_mode"], record["requested_contributor_mode"]) == ("off", contributor or "off")
