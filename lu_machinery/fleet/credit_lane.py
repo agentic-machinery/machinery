@@ -1351,15 +1351,14 @@ def routing_facts(
 def read_routing_budget(*, timeout: float = 8.0) -> dict[str, Any] | None:
     """Read Monitor's routing budget, retrying its typed warming response once within the read budget."""
     base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
-    url = f"{base}/api/state/routing-budget?fresh_codexbar=true"
     deadline = time.monotonic() + timeout
     try:
         for attempt in range(2):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
                 return None
             try:
-                with urllib.request.urlopen(url, timeout=remaining) as resp:
+                with urllib.request.urlopen(f"{base}/api/state/routing-budget?fresh_codexbar=true", timeout=timeout) as resp:
                     payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
                 return payload if isinstance(payload, dict) else None
             except urllib.error.HTTPError as exc:
