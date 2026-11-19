@@ -446,6 +446,55 @@ def test_pr_reviewed_for_two_author_models_exports_other_on_metrics(tmp_path, mo
     assert "claude-sonnet-5-5+gpt-6.1-sol" not in metrics
 
 
+def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
+    """Defect class: grammar-valid hostnames relayed as page labels or aliased into duplicate buckets."""
+    batch_state, tasks = _state(tmp_path)
+    model, effort, task_class = "worker.example.invalid", "effort.example.invalid", "class.example.invalid"
+    author, reviewer, risk = "author.example.invalid", "reviewer.example.invalid", "risk.example.invalid"
+    repo = "repository.example.invalid"
+    for i in range(10):
+        _record(tasks, f"w{i}", resolved_model=model, resolved_model_known=True, effort=effort,
+                research_task_family=task_class, duration_s=3600)
+    _record(tasks, "w10", model="second-worker.example.invalid", effort="second-effort.example.invalid",
+            research_task_family="second-class.example.invalid", duration_s=3600)
+    _record(tasks, "known", research_task_family="code", duration_s=3600)
+    _review(tasks, "r1-review", "correct", [], pr=1, repo=repo, review_author_model=author,
+            resolved_model=reviewer, effort=effort, review_risk=risk)
+    _review(tasks, "r2-review", "incorrect", [], pr=2, repo="public", review_author_model="gpt-6.1-sol")
+    rows.backfill(tasks, batch_state)
+    landing = stats.Landing(task_ids={"w0", "w10", "known"})
+    landing.by_repository.update({"public": 1, repo: 2, "second-repository.example.invalid": 3})
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=batch_state,
+                                                live_repo_root=tmp_path))
+    monkeypatch.setattr(stats, "_compute", lambda _ctx: lambda: snapshot)
+    app = FastAPI()
+    app.include_router(stats.router, prefix="/api/fleet/model-stats")
+    app.dependency_overrides[get_ctx] = lambda: ctx
+    with TestClient(app) as client:
+        full = client.get("/api/fleet/model-stats?view=full")
+        page = client.get("/api/fleet/model-stats?view=page")
+
+    assert full.status_code == page.status_code == 200
+    assert all(label in full.text for label in (model, effort, task_class, author, reviewer, risk, repo))
+    assert ".example.invalid" not in page.text
+    payload = page.json()
+    assert _row(payload, "other", "write")["tasks"] == 11
+    assert [(e["effort"], e["tasks"]) for e in _row(payload, "other", "write")["by_effort"]] == [("other", 11)]
+    assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 1
+    assert [(a["model"], a["prs"]) for a in payload["authors"]] == [("gpt-6.1-sol", 1), ("other", 1)]
+    assert {(c["author"], c["reviewer"], c["class"]) for c in payload["first_round_matrix"]} == {
+        ("other", "other", "all"), ("other", "other", "other"),
+        ("gpt-6.1-sol", "claude-opus-5-5", "all"), ("gpt-6.1-sol", "claude-opus-5-5", "code/medium"),
+    }
+    assert [(r["model"], [level["effort"] for level in r["levels"]])
+            for r in payload["review_levels"] if r["model"] == "other"] == [("other", ["other"])]
+    assert [(job["class"], job["tasks"], job["models"][0]["model"]) for job in payload["charts"]["jobs"]] == [
+        ("other", 11, "other"),
+    ]
+    assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
+
+
 def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
     """Defect class: a missing duration read as zero wall time, understating wall hours per landed task."""
     batch_state, tasks = _state(tmp_path)
