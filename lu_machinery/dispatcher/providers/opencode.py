@@ -58,8 +58,9 @@ _SAVANT_OPENCODE_VERSION = "1.19.6"
 # Public classes give Savant OpenCode's read-only file tools on the write boundary's snapshot of the published
 # start commit; private classes keep every tool disabled and the prompt as the only input (designated approval,
 # conditions C1-C4). The snapshot cap and the run's upstream byte ceiling bound what reaches SubQ. A public write
-# run (#898) also gets the ``edit`` permission (OpenCode's edit, write and patch tools) on its own copy of that
-# view; the boundary turns its edits into a patch once it exits.
+# run (#898) also gets the ``edit`` permission on its own copy of that view; the boundary turns its edits into a
+# patch once it exits. OpenCode 1.19.6 offers this model its edit and write tools, which change and add files;
+# none of its tools deletes or renames one (docs/runbooks/savant.md).
 _SAVANT_TOOL_CLASSES = frozenset({"public-code", "public-docs"})
 # OpenCode 1.19.6 has no ``list`` tool: ``read`` lists a directory under the ``read`` permission.
 _SAVANT_READ_TOOLS = ("read", "grep", "glob")

@@ -411,7 +411,8 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
     summary = {key: receipt.get(key) for key in (
         "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker")}
     canary = receipt.get("canary")
-    summary["canary_passed"] = isinstance(canary, dict) and bool(canary.get("passed"))
+    # Only the launcher's Boolean true proves containment; any other value, however truthy, does not.
+    summary["canary_passed"] = isinstance(canary, dict) and canary.get("passed") is True
     if receipt.get("schema") != SCHEMA or receipt.get("task_id") != task_id:
         return summary, "write_boundary_unproven: the receipt names another run"
     if receipt.get("mode") != mode:

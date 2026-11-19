@@ -921,7 +921,8 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     stamps = {path: path.stat().st_mtime_ns for path in (repo / ".git" / "objects").rglob("*") if path.is_file()}
     host_tmp = tmp_path / "outside-written"
     script = (
-        # Owned edits of its own view: change, add and delete.
+        # Owned edits of its own view: change, add and delete. The shell stands in for the provider and proves
+        # the boundary's draft of each kind; Savant's own OpenCode tools change and add files only.
         "printf 'new text\\n' > docs/guide.md; printf 'primary\\n' > docs/new.md; rm gone.txt;"
         # Every other write path fails or lands in the private, discarded HOME and TMPDIR.
         f"echo x > {worktree}/a.txt; echo x > {repo}/a.txt; echo x > {repo}/.git/HEAD; echo x > {host_tmp};"

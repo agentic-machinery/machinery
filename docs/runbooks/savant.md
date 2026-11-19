@@ -17,6 +17,11 @@ Admission refuses every other combination with a typed reason before anything st
 `savant_repository_refused` (private repository with a public class), `savant_data_class_refused`.
 Savant holds no review of record, approval, driver or Ukrainian-authoring role.
 
+The `edit` permission gives a write run OpenCode's edit and write tools (OpenCode 1.19.6), which
+change existing files and add new ones. None of its tools deletes or renames a file, so a fix that
+needs a deletion or a rename is not a Savant task: give it to a normal write worker. The boundary's
+own draft step handles deletions (it would draft one), but a Savant run cannot make one.
+
 ## What a write run can touch
 
 Every Savant run starts inside the write boundary (`lu_machinery/dispatcher/write_boundary.py`),
