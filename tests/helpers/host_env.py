@@ -21,8 +21,10 @@ The allowlist has two parts.
 ``PATH`` holds the suite's stub directories, taken from the fixtures that create them (the ``claude doctor``
 stub of ``tests/dispatcher/conftest.py``, and the failing ``gh`` and the fake Cursor of ``tests/conftest.py``
 and ``tests/cursor_process_guard.py``), then this interpreter's directory, then the platform default
-``os.defpath``. No caller entry, agent shim included, remains. The ``claude_doctor`` dependency ties the fixture
-to modules under ``tests/dispatcher``; any other module that imports it fails at setup with a missing fixture.
+``os.defpath``. No caller entry, agent shim included, remains. A stub or interpreter path that contains
+``os.pathsep`` (a ``--basetemp`` with a colon) would split into other entries, so the test fails at setup
+instead. The ``claude_doctor`` dependency ties the fixture to modules under ``tests/dispatcher``; any other
+module that imports it fails at setup with a missing fixture.
 
 The suite's cursor tripwire (``tests/cursor_exec_tripwire.py``) adds its ``PYTHONPATH`` entry and session token to
 each child's environment when the child is spawned, so neither is kept here. ``monkeypatch`` restores the
@@ -82,13 +84,18 @@ def host_isolated_env(
     fake_cursor_bin: Path,
 ) -> None:
     """Empty the environment but for the suite's settings and this fixture's own values."""
-    stubs = [claude_doctor.parent, _fake_github_bin, fake_cursor_bin]
+    entries = [str(claude_doctor.parent), str(_fake_github_bin), str(fake_cursor_bin), str(Path(sys.executable).parent)]
+    if split := [entry for entry in entries if os.pathsep in entry]:
+        pytest.fail(
+            f"host_isolated_env: {os.pathsep!r} in {', '.join(split)} would split PATH into other entries; "
+            f"run pytest with a --basetemp and an interpreter whose paths have no {os.pathsep!r}"
+        )
     for name in [name for name in os.environ if name not in SUITE_SETTINGS]:
         monkeypatch.delenv(name)
     own = {
         "HOME": str(tmp_path_factory.mktemp("home")),
         "TMPDIR": str(tmp_path_factory.mktemp("tmpdir")),
-        "PATH": os.pathsep.join([*map(str, stubs), str(Path(sys.executable).parent), os.defpath]),
+        "PATH": os.pathsep.join([*entries, os.defpath]),
         "GIT_CONFIG_NOSYSTEM": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "LEARN_UKRAINIAN_PYTHON": sys.executable,
