@@ -14,4 +14,5 @@ build/
 dist/
 # Dispatch worktrees and local tool state, anchored at the repository root.
 /.worktrees/
+/.agent/
 /batch_state/
