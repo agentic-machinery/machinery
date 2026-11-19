@@ -77,6 +77,19 @@ class RoutingGuardError(RuntimeError):
     """A model invocation violates routing policy."""
 
 
+def savant_request_store(data_class: str | None) -> bool:
+    """Resolve an explicitly admitted class to its per-request storage policy."""
+    from lu_machinery.review.model_catalog import load_model_catalog
+
+    classes = load_model_catalog()["models"][SAVANT_MODEL].get("data_classes")
+    store = classes.get(data_class) if isinstance(classes, dict) and data_class is not None else None
+    if not isinstance(store, bool):
+        raise RoutingGuardError(
+            "savant_data_class_refused: declare public-code, public-docs, private-code, or private-docs"
+        )
+    return store
+
+
 def assert_model_routing_allowed(
     model: str | None, *, context: str, transport: str | None = None, data_class: str | None = None,
 ) -> None:
@@ -98,9 +111,10 @@ def assert_model_routing_allowed(
     if canonical_model_id(text, catalog) == SAVANT_MODEL:
         if transport != f"opencode/{SAVANT_PROVIDER}" or text != SAVANT_MODEL:
             raise RoutingGuardError(f"{context}: savant_transport_refused: use the pinned native OpenCode SubQ route")
-        classes = catalog["models"][SAVANT_MODEL].get("data_classes")
-        if not isinstance(classes, list) or data_class is None or data_class not in classes:
-            raise RoutingGuardError(f"{context}: savant_data_class_refused: declare public-code or public-docs")
+        try:
+            savant_request_store(data_class)
+        except RoutingGuardError as exc:
+            raise RoutingGuardError(f"{context}: {exc}") from None
     if os.environ.get(_OVERRIDE_ENV) == "1":
         return
     if not text:

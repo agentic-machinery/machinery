@@ -106,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("max-budget-usd", None, "Spend cap in USD for a Claude API-key account, at most its configured amount "
          "(default: that amount)"),
         ("provider", None, "Explicit upstream, e.g. openrouter (default: native)"),
-        ("data-class", None, "Savant input class: public-code or public-docs (required on the SubQ route)"),
+        ("data-class", None, "Savant input class: public-code, public-docs, private-code, or private-docs (required)"),
         ("max-tokens", None, "Savant generation cap including reasoning (default: 64000)"),
         ("output-schema", None, "Codex, AGY, or Claude JSON object schema: repo-relative or absolute readable file "
          "(default: the review findings schema for a code or infra --require-review-verdict on those agents, otherwise none)"),

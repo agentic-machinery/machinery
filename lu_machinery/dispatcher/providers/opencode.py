@@ -10,7 +10,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_MODEL, SAVANT_PROVIDER
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_MODEL, SAVANT_PROVIDER, savant_request_store
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.safe_open import safe_open_below
@@ -161,6 +161,7 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
 
     prompt = spec.prompt_file.read_bytes()
     check_model_admission(spec.agent, spec.model, spec.mode, {**spec.options, "provider": spec.provider}, prompt)
+    store = savant_request_store(spec.options.get("data_class"))
     effort = savant_effort(spec.task_id)
     if spec.effort != effort:
         raise ValueError(f"savant_effort_refused: the route requires the recorded effort {effort}")
@@ -187,7 +188,7 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
                 "name": "SubQ Savant 1.4",
                 "reasoning": True,
                 "limit": {"context": _SAVANT_CONTEXT, "output": cap},
-                "options": {"store": False, "reasoningEffort": effort},
+                "options": {"reasoningEffort": effort, **({} if store else {"store": False})},
             }},
         }},
     }

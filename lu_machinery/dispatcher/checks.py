@@ -15,6 +15,7 @@ from lu_machinery.ai_agent_bridge.routing_guard import (
     SAVANT_PROVIDER,
     RoutingGuardError,
     assert_model_routing_allowed,
+    savant_request_store,
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
@@ -249,7 +250,7 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
 
 
 def _check_savant_route(agent: str, model: str, identity: str | None, options: dict) -> None:
-    """Savant is admitted only on its explicit public-data dispatch route."""
+    """Savant is admitted only on its explicit, classified trial route."""
     if identity != SAVANT_MODEL:
         raise ValueError(f"savant_model_refused: the SubQ endpoint requires {SAVANT_MODEL}")
     try:
@@ -345,23 +346,30 @@ def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     if spec.agent not in {"muse", "opencode"}:
         return
     repos = yaml.safe_load(machinery_path("config/fleet_repos.yaml").read_text())["repos"]
+    private_payload = False
     if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        private_payload = not savant_request_store(spec.options.get("data_class"))
         entry = repos.get(repo_key, {})
-        if entry.get("private") or not entry.get("role", "").startswith("public-"):
-            raise ValueError("savant_repository_refused: the target must be a registered public repository")
+        role = entry.get("role", "")
+        if not role.startswith(("public-", "private-")):
+            raise ValueError("savant_repository_refused: the target must be a registered repository with a known visibility")
+        if not private_payload and (entry.get("private") or role.startswith("private-")):
+            raise ValueError("savant_repository_refused: private repositories require a private data class")
     private = {
         key: item for key, item in repos.items() if item.get("private", False) or "private" in item.get("role", "")
     }
     roots = [git.resolve_repo(key)[0] for key in private]
-    if git.resolve_repo(repo_key)[0] in roots:
-        return _handle_private_input(spec, "private input is not permitted for this agent")
-    origin = spec.options.get("prompt_file")
-    if origin and origin != "-" and any(Path(origin).resolve().is_relative_to(root) for root in roots):
-        return _handle_private_input(spec, "private prompt file is not permitted for this agent")
+    if not private_payload:
+        if git.resolve_repo(repo_key)[0] in roots:
+            return _handle_private_input(spec, "private input is not permitted for this agent")
+        origin = spec.options.get("prompt_file")
+        if origin and origin != "-" and any(Path(origin).resolve().is_relative_to(root) for root in roots):
+            return _handle_private_input(spec, "private prompt file is not permitted for this agent")
     # The content contract is lexical: decode once, then compare without changing provider input.
     text = unquote(spec.prompt_file.read_text()).casefold()
     identifiers = [str(root) for root in roots]
-    identifiers.extend(item.get(field, "") for item in private.values() for field in ("local_name", "github"))
+    if not private_payload:
+        identifiers.extend(item.get(field, "") for item in private.values() for field in ("local_name", "github"))
     if any(identifier.casefold() in text for identifier in identifiers if identifier):
         _handle_private_input(spec, "private path input is not permitted for this agent")
 

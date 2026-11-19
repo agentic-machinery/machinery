@@ -99,7 +99,7 @@ def build(
         from lu_machinery.dispatcher.providers import opencode
 
         if launch_prompt is not None or conversation is not None:
-            raise ValueError("savant_public_input_refused: only the submitted public payload may be sent")
+            raise ValueError("savant_public_input_refused: only the explicitly classified payload may be sent")
         return opencode.build(spec, env)
     invocation = providers.load(spec.agent).build(spec, env)
     if conversation is not None:

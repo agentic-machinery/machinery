@@ -1045,27 +1045,27 @@ reported by AGY in the settled dispatch. Compare review outcomes by selector.
 
 ### SubQ Savant test routing
 
-Use the pinned `subq-savant-1.4` model through native OpenCode for public-code and
-public-docs trials. This includes supplemental review, hard-problem advice,
+Use the pinned `subq-savant-1.4` model through native OpenCode for classified data
+trials. This includes supplemental review, hard-problem advice,
 proposed patches and the independent round of non-Ukrainian councils. Savant's
 findings are advisory and carry no formal review, Ukrainian authoring or review,
 or designated approval authority.
 
 Pass `--agent opencode --provider subq --model subq-savant-1.4 --mode read-only`,
-with `--data-class public-code` or `--data-class public-docs`. Use `--research-role
+with `--data-class public-code`, `public-docs`, `private-code`, or `private-docs`. Use `--research-role
 advisory` for counsel and supplemental review and `--research-role test` for
-trials. Put the question and its published evidence in the prompt. The model
-receives the prompt in an empty sandbox directory with its tools disabled. The
-dispatch rejects private repositories and other data classes. Secrets and
-unreleased curriculum are outside the route's scope.
+trials. Put the question and its evidence in the prompt. Treat unreleased
+curriculum and private infrastructure as private material. The model receives
+the prompt with its tools disabled. A private repository requires a private
+data class. Dispatch refuses secrets, credentials, and unknown or undeclared
+classes.
 
 Use a stable `--task-id`. Dispatch assigns `low`, `high` or `max` by SHA-256 of
 that ID modulo three and records the effective effort for model stats. Compare
-results by effort on held-out real jobs. The Chat Completions route always sends
-`store: false` and defaults to 64,000 generated tokens, including reasoning.
-Set `--max-tokens` when a trial needs a different cap. The public-data boundary
-stays in force until the operator authorizes a change after obtaining a zero
-data retention agreement.
+results by effort on held-out real jobs. The Chat Completions route sends
+`store: false` for private requests and uses the provider's default storage
+for public requests. The generation cap defaults to 64,000 tokens, including
+reasoning. Set `--max-tokens` when a trial needs a different cap.
 
 ## Codex routing — GPT-6 driver, workers, reviewer, and advisor
 

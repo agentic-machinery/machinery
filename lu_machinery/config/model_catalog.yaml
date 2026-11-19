@@ -1212,12 +1212,18 @@ models:
     transports: [opencode]
     efforts: [low, high, max]
     modes: [read-only]
-    data_classes: [public-code, public-docs]
+    # True uses the provider's default. False sends store:false on this request.
+    data_classes:
+      public-code: true
+      public-docs: true
+      private-code: false
+      private-docs: false
     strengths: [four_million_token_context, function_calling, structured_outputs]
     weaknesses: [early_access, qualification_pending, no_zero_data_retention_agreement]
     notes: >-
-      SAVANT-EVERYTHING-1119 admits explicit tests and advisory dispatches on public
-      inputs through the first-party SubQ endpoint. No review-of-record, designated
+      Savant supports explicit test and advisory dispatches through the first-party
+      SubQ endpoint. An explicit public or private data class determines request
+      storage. No review-of-record, designated
       approval, or Ukrainian authoring or review seat. Qualify on held-out real jobs.
     sources:
       - https://docs.subq.ai/using-the-api/models/

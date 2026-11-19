@@ -72,7 +72,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   via Cursor, plus Gemini 4 Neon and SubQ Savant for non-Ukrainian questions. Seat Neon and
   Savant in the independent read-only dispatch round using the [Neon](../../../rules/model-assignment.md#gemini-4-neon-advisory-routing)
   and [Savant](../../../rules/model-assignment.md#subq-savant-test-routing) routing rules.
-  Savant requires public code or public docs. Record each model's exact ID with its
+  Savant requires an explicit public or private data class. Record each model's exact ID with its
   findings and score, and record Savant's resolved effort. On Ukrainian language, culture and heritage questions,
   Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment); its
   Ukrainian council answers are input in the council and the discussion only, never review
