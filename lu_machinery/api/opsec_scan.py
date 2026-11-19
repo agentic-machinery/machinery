@@ -347,11 +347,49 @@ def _ip_version(candidate: str) -> int | None:
         return None
 
 
-def _trim_path_token(match: re.Match[str]) -> tuple[int, int, str]:
-    raw = match.group(0)
-    token = raw.rstrip(_PATH_TRAILING_PUNCTUATION)
-    end = match.start() + len(token)
-    return match.start(), end, token
+class _PathRuns:
+    """Trimmed end of the path run holding a position; each run is trimmed once.
+
+    A path run is a whitespace-, quote- or angle-bracket-delimited stretch;
+    its trimmed end drops trailing prose punctuation and backticks.  This is
+    the end of every ``filesystem-root`` finding (the span contract).
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
+        self._starts = [start for start, _ in self._runs]
+        self._trimmed: dict[int, int] = {}
+
+    def end(self, position: int) -> int:
+        index = bisect.bisect_right(self._starts, position) - 1
+        if index not in self._trimmed:
+            start, end = self._runs[index]
+            self._trimmed[index] = _trim_end(self._text, start, end)
+        return self._trimmed[index]
+
+
+class _SpanSet:
+    """Membership in sorted, disjoint spans by bisect."""
+
+    def __init__(self, spans: Iterable[tuple[int, int]]) -> None:
+        self._spans = list(spans)
+        self._starts = [start for start, _ in self._spans]
+
+    def __contains__(self, position: int) -> bool:
+        index = bisect.bisect_right(self._starts, position) - 1
+        return index >= 0 and position < self._spans[index][1]
+
+
+def _api_route_paths(text: str) -> Iterable[tuple[int, int]]:
+    """Yield each /api route's path component; its query and fragment are not exempt."""
+    for match in _API_ROUTE_RE.finditer(text):
+        end = match.end()
+        for separator in "?#":
+            found = text.find(separator, match.start(), end)
+            if found >= 0:
+                end = found
+        yield match.start(), end
 
 
 def _trim_end(text: str, start: int, end: int) -> int:
@@ -361,21 +399,17 @@ def _trim_end(text: str, start: int, end: int) -> int:
     return end
 
 
-def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
+def _file_uri_candidates(text: str, path_runs: _PathRuns) -> tuple[list[_Candidate], set[int]]:
     """Return flagged file URIs and the path start of every file URI.
 
     A URI is flagged whole when its first path segment starts with a bounded
     root followed by a non-name character, the bare rule's boundary; like the
     bare rule this fails closed ("file:///tmp.backup/..." counts).  Every
     flagged URI is a candidate, also inside an earlier one, because selection
-    may drop that earlier one; each costs offsets only, and a run's trimmed
-    end is computed once.
+    may drop that earlier one; each costs offsets only.
     """
     candidates: list[_Candidate] = []
     path_starts: set[int] = set()
-    runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
-    run_starts = [start for start, _ in runs]
-    trimmed_ends: dict[int, int] = {}
     for scheme in _FILE_SCHEME_RE.finditer(text):
         head = _FILE_URI_HEAD_RE.match(text, scheme.end())
         if head is None:
@@ -384,11 +418,7 @@ def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
         root = _FILE_URI_ROOT_RE.match(text, head.end())
         if root is None:
             continue
-        run_index = bisect.bisect_right(run_starts, scheme.start()) - 1
-        if run_index not in trimmed_ends:
-            run_start, run_end = runs[run_index]
-            trimmed_ends[run_index] = _trim_end(text, run_start, run_end)
-        end = max(trimmed_ends[run_index], root.end())
+        end = max(path_runs.end(scheme.start()), root.end())
         candidates.append(_Candidate(scheme.start(), end, "filesystem-root", None, 80))
     return candidates, path_starts
 
@@ -462,17 +492,22 @@ def scan_text(
 
     # The bare rule never re-reads a file URI's first segment, whatever the
     # verdict on the URI.
-    file_uri_candidates, file_uri_paths = _file_uri_candidates(text)
+    path_runs = _PathRuns(text)
+    file_uri_candidates, file_uri_paths = _file_uri_candidates(text, path_runs)
     candidates.extend(file_uri_candidates)
 
-    # Only a bare hash route ("#/home") exempts a path, and only when it covers
-    # the root itself.  A SHA, timestamp or duration in the tail, or an /api
-    # route whose query or authority carries the path, never does.
-    hash_routes = tuple((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
+    # A bare root is exempt only inside a bare hash route ("#/home") or an /api
+    # route's path component ("/api/x/{id}/home/view").  A SHA, timestamp or
+    # duration in the path, or an /api query or fragment carrying the path,
+    # never exempts it.
+    hash_routes = _SpanSet((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
+    api_route_paths = _SpanSet(_api_route_paths(text))
     for match in _FILESYSTEM_PATH_RE.finditer(text):
-        start, end, token = _trim_path_token(match)
-        if token and start not in file_uri_paths and not _overlaps(start, match.end("root"), hash_routes):
-            candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
+        start = match.start()
+        if start in file_uri_paths or start in hash_routes or start in api_route_paths:
+            continue
+        end = max(path_runs.end(start), match.end("root"))
+        candidates.append(_Candidate(start, end, "filesystem-root", None, 80))
 
     for match in _USER_AT_HOST_RE.finditer(text):
         host = match.group("token").rsplit("@", 1)[-1].split(":", 1)[0]
