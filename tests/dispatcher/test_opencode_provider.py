@@ -14,6 +14,7 @@ from lu_machinery.api import model_stats_rows, subscription_usage as usage
 from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker, write_boundary
 from lu_machinery.dispatcher.providers import opencode
 from lu_machinery.dispatcher.types import TaskSpec
+from lu_machinery.orchestration import dispatch_isolation
 from lu_machinery.review.reviewer_resolver import REVIEW_CANDIDATES
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
@@ -211,6 +212,34 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     spec.prompt_file.write_text("Do not send fixture-key", encoding="utf-8")
     with pytest.raises(ValueError, match="savant_prompt_refused"):
         runtime_context.build(private_trial, {})
+
+
+def test_savant_uses_host_key_file_when_worker_has_no_override(spec, tmp_path, monkeypatch, dispatch):
+    key_file = tmp_path / "configured key"
+    key_file.write_text("fixture-key\n", encoding="ascii")
+    key_file.chmod(0o600)
+    monkeypatch.delenv("LU_SUBQ_API_KEY_FILE", raising=False)
+    monkeypatch.delenv("SUBQ_API_KEY", raising=False)
+    monkeypatch.setattr(opencode, "_savant_runtime_refusal", lambda env: None)
+    monkeypatch.setattr(dispatch_isolation, "user_manager_env", lambda env: env)
+    manager = Mock(return_value=SimpleNamespace(
+        returncode=0,
+        stdout=json.dumps({"type": "as", "data": [f"LU_SUBQ_API_KEY_FILE={key_file}"]}).encode(),
+    ))
+    monkeypatch.setattr(opencode, "subprocess", SimpleNamespace(**{**vars(opencode.subprocess), "run": manager}))
+
+    record = dispatch(*SAVANT_FLAGS, "--data-class", "public-code")
+    trial = replace(spec, provider=record["provider"], model=record["model"], options=record["options"])
+    invocation = runtime_context.build(trial, {})
+
+    assert invocation.env["SUBQ_API_KEY"] == "fixture-key"
+    assert "SUBQ_API_KEY" not in os.environ
+    assert b"fixture-key" not in invocation.stdin
+    assert "fixture-key" not in invocation.env["OPENCODE_CONFIG_CONTENT"]
+    record_bytes = store.record_path(record["task_id"]).read_bytes()
+    assert b"fixture-key" not in record_bytes
+    assert os.fsencode(key_file) not in record_bytes
+    assert manager.call_count == 2
 
 
 def test_savant_refuses_secrets_or_unknown_data_before_spawn(dispatch, capsys):

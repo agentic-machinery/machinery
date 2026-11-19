@@ -27,7 +27,7 @@ _CAPACITY_STATUSES = frozenset({"RESOURCE_EXHAUSTED", "UNAVAILABLE"})
 _CAPACITY_CODES = frozenset({429, 529})
 # Provider output is never copied into the record (#12408): provider text can hold any value, and no
 # redactor recognizes every secret form. Each field the record takes from AGY's output is a member of a
-# closed set below or a validated typed value; the full text stays in the task's retained stream.
+# closed set below or a validated typed value; retained_stream in the record points to the private logs.
 UNRECOGNIZED = "unrecognized"
 # Every terminal status seen in retained AGY streams; any other value records as unrecognized.
 _TERMINAL_STATUSES = frozenset({"SUCCESS", "ERROR"})

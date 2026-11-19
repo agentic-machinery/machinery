@@ -1,6 +1,6 @@
 """Subject-seat exclusion for formal reviewer selection.
 
-A change that governs a seat (its adapter, or that seat's reviewer hooks)
+A change that governs a seat (its adapter, reviewer hooks or runtime boundary)
 must not be formally reviewed by that seat. Callers name the seat or family
 directly, or pass owned paths. Unambiguous adapter and hook paths infer one
 seat. Shared or ambiguous paths leave the subject unknown without discarding
@@ -45,16 +45,21 @@ _SUBJECT_ALIASES: dict[str, str] = {
     "codex-desktop": "codex",
 }
 
-# Reviewer-hook paths that govern exactly one seat. Shared hooks are listed
-# separately so inference leaves them unknown instead of picking one consumer.
-_HOOK_SEATS: dict[str, str] = {
+# Boundary paths that govern exactly one seat. Include the retired Claude
+# shell while legacy checkouts can still list it in a diff.
+_BOUNDARY_SEATS: dict[str, str] = {
+    f"{_MACHINERY}/dispatcher/claude_review_shell": "claude",
+    f"{_MACHINERY}/agent_runtime/claude_acp_exec.sh": "claude",
+    f"{_MACHINERY}/agent_runtime/deepseek_admission.py": "deepseek",
     f"{_MACHINERY}/agent_runtime/grok_hook_bridge.py": "grok",
+    f"{_MACHINERY}/agent_runtime/grok_reviewer_permissions.py": "grok",
     f"{_MACHINERY}/hooks/apply_grok_hook_profile.py": "grok",
     f"{_MACHINERY}/agent_runtime/profiles/acpx-grok-read-only.md": "grok",
     f"{_MACHINERY}/agent_runtime/profiles/acpx-grok-sealed-review.md": "grok",
     f"{_MACHINERY}/agent_runtime/codex_hook_entry.sh": "codex",
     f"{_MACHINERY}/agent_runtime/codex_hook_policy.py": "codex",
     f"{_MACHINERY}/agent_runtime/codex_hook_probe.py": "codex",
+    f"{_MACHINERY}/agy_hooks/pending_orders_inject.sh": "agy",
     "agents_extensions/codex/hooks.json": "codex",
 }
 
@@ -189,16 +194,22 @@ class SubjectExclusion:
 
 
 def normalize_owned_path(path: str) -> str:
-    """Return a repo-relative posix path, keeping the adapter/hook suffix."""
+    """Normalize current and pre-extraction subject paths for all review callers."""
     text = str(path).strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
     text = text.rstrip("/")
+    if text.startswith("scripts/"):
+        relocated = f"{_MACHINERY}/{text.removeprefix('scripts/')}"
+        if relocated in _BOUNDARY_SEATS or relocated.startswith((_ADAPTER_PREFIX, _PROVIDER_PREFIX)):
+            return relocated
     for marker in (
         _ADAPTER_PREFIX,
         _PROVIDER_PREFIX,
         f"{_MACHINERY}/agent_runtime/",
         f"{_MACHINERY}/hooks/",
+        f"{_MACHINERY}/agy_hooks/",
+        f"{_MACHINERY}/dispatcher/claude_review_shell",
         "agents_extensions/",
     ):
         index = text.find(marker)
@@ -219,7 +230,7 @@ def canonical_subject_seat(registry_name: str) -> str:
 
 @lru_cache(maxsize=1)
 def adapter_subject_index() -> Mapping[str, frozenset[str]]:
-    """Map ``scripts/agent_runtime/adapters/<file>.py`` to the seats that own it.
+    """Map adapter and provider paths to the seats that own them.
 
     Built from the agent registry so a new per-seat adapter is classified
     without a second hand-written ladder. Single-seat companion modules the
@@ -249,9 +260,9 @@ def classify_owned_path(path: str) -> OwnedPathClassification:
     seat. Ambiguous paths must not be turned into a guess.
     """
     rel = normalize_owned_path(path)
-    hooked = _HOOK_SEATS.get(rel)
-    if hooked is not None:
-        return OwnedPathClassification("seat", frozenset({hooked}), hooked)
+    boundary_seat = _BOUNDARY_SEATS.get(rel)
+    if boundary_seat is not None:
+        return OwnedPathClassification("seat", frozenset({boundary_seat}), boundary_seat)
     if rel in _AMBIGUOUS_PATHS:
         return OwnedPathClassification("ambiguous", frozenset(), "shared reviewer-hook surface")
     if rel.startswith((_ADAPTER_PREFIX, _PROVIDER_PREFIX)) and rel.endswith(".py"):
@@ -261,7 +272,7 @@ def classify_owned_path(path: str) -> OwnedPathClassification:
             return OwnedPathClassification("ambiguous", frozenset(seats or ()), listed)
         seat = next(iter(seats))
         return OwnedPathClassification("seat", frozenset({seat}), seat)
-    return OwnedPathClassification("unrelated", frozenset(), "not a per-seat adapter or reviewer hook")
+    return OwnedPathClassification("unrelated", frozenset(), "not a per-seat review boundary")
 
 
 def normalize_subject_seat(raw: str) -> str:

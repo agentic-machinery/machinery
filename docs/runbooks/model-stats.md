@@ -4,7 +4,11 @@
 concrete model id, effective effort, role and task class, how much work a model does, how much it wastes and how
 slow it is (#581). `view=full` (default) includes per-class breakdowns (`by_class`), token counts and token rates,
 and ISO-week buckets (`weeks`). `view=page` (used by `/model-stats`) omits those fields and keeps model and effort
-totals plus `charts` series. The Monitor's `/metrics` exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
+totals plus `charts` series. The page groups model, author, reviewer, effort and class labels before calculating
+the figures. It admits the metrics model and effort vocabularies, the page's fixed model labels `auto` and
+`unrecognized`, the defined work and review classes, and configured repository keys in landing coverage.
+It groups other labels under `other`. The Monitor's `/metrics`
+exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
 and ISO weeks as gauges for Grafana. The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
 reports counts and model, effort, class, pool and repository labels, never prompts, bodies, paths, accounts or task
 ids.
@@ -95,7 +99,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   Each model carries an `identity`: `catalog`, or for a label that names no concrete model `alias` (version not
   observed), `harness_choice` (Cursor `auto`), `unreported` (`unknown`, `unrecognized`: the harness reported no
   model), `joint` (a PR reviewed for two author models) or `not_in_catalog` (any other spelling). The page lists
-  catalog models first and groups the rest under "Not a concrete model id" with that label.
+  catalog models first and groups the rest under "Not a concrete model id". The full view retains the recorded
+  model labels.
 - **Idle catalog models**: `idle_catalog_models` lists every catalog model the catalog still routes (lifecycle
   not `retired`) that ran no task in the window, so a routed model never silently drops off the page.
 - **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
@@ -193,8 +198,8 @@ is `other`; `effort` is a catalog effort word
 (`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `thinking`, `thinking-<level>`), `unset`, `not-exposed`,
 `unknown` or `all` (every effort of that model), and any other value is `other`; `role` is `write`, `review` or
 `author`; `status` is a terminal status other than `done` (`no_deliverable`, `failed`, `timeout`, `rate_limited`,
-`cancelled`, `crashed`, `never_started`, `other`). The `other` buckets are aggregated, not summed series; exact values stay in the
-rows and the route. No task ids, paths or accounts.
+`cancelled`, `crashed`, `never_started`, `other`). The collector calculates each `other` bucket from its grouped inputs. Exact
+values stay in the rows and `view=full`. No task ids, paths or accounts.
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |

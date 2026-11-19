@@ -31,7 +31,7 @@ import subprocess
 import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -44,8 +44,16 @@ from prometheus_client.core import GaugeMetricFamily
 from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
+from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
-from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
+from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
+from lu_machinery.review.model_catalog import (
+    MECHANICAL_FAMILIES,
+    VALID_REVIEW_PROFILES,
+    VALID_RISKS,
+    VARIANT_SUFFIX,
+    load_model_catalog,
+)
 
 from .model_stats_rows import (
     NATIVE_ALIASES,
@@ -1109,6 +1117,12 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
 OTHER = "other"
 ALL_CLASSES = "all"
 _KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
+_PAGE_CLASSES = frozenset({
+    *TASK_FAMILIES, *MECHANICAL_FAMILIES, *UKRAINIAN_TASK_FAMILIES,
+    "code", "infra", "docs", "difficulty-gate", "bounded", "bounded_implementation",
+    "review", "code-review", "review-routing", "unclassified",
+    *(f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES | {"ukrainian"} for risk in VALID_RISKS | {"unknown"}),
+})
 
 
 @lru_cache(maxsize=1)
@@ -1171,6 +1185,25 @@ def metric_effort(effort: str) -> str:
     return effort if effort in _KNOWN_EFFORTS or VARIANT_SUFFIX.fullmatch(effort) else OTHER
 
 
+def _page_model(model: str) -> str:
+    return model if model in _NOT_CONCRETE else metric_model(model)
+
+
+def _page_class(task_class: str) -> str:
+    return task_class if task_class in _PAGE_CLASSES else OTHER
+
+
+def _page_landing(landing: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
+        repos = {}
+    counts: Counter[str] = Counter()
+    for repo, count in landing["trailer_task_ids_by_repository"].items():
+        counts[repo if repo in repos else OTHER] += count
+    return {**landing, "trailer_task_ids_by_repository": dict(sorted(counts.items()))}
+
+
 def week_of(moment: datetime) -> str:
     year, week, _ = moment.isocalendar()
     return f"{year}-W{week:02d}"
@@ -1205,15 +1238,23 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     if landing is None:
         landing = scan_landing(primary_root, first)
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
-    windows, metric_windows = {}, {}
+    # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
+    page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
+                         task_class=_page_class(row.task_class)) for row in rows]
+    windows, metric_windows, page_windows = {}, {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         selected = [row for row in rows if since <= row.moment]
         fine, prs = _fine(selected), _prs(selected)
-        windows[name] = {
-            "window": {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
-                       "cohort": "finished_at, else started_at, in [since, until)"},
-            **summarize(selected, fine, prs, history=rows),
+        window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
+                  "cohort": "finished_at, else started_at, in [since, until)"}
+        windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows)}
+        # Bound the combined author id after deriving PR outcomes, so a joint author cannot become a known model.
+        page_prs = [{**pr, "author": _page_model(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
+                     "class": _page_class(pr["class"])} for pr in prs]
+        page_selected = [row for row in page_rows if since <= row.moment]
+        page_windows[name] = {
+            "window": window, **page_window(summarize(page_selected, prs=page_prs, history=page_rows)),
         }
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         # 24h stays off this label set.
@@ -1231,6 +1272,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "low_sample_below": LOW_SAMPLE,
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
+        "page_windows": page_windows,
         "weeks": _weeks(weeks),
         "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict()},
@@ -1328,10 +1370,14 @@ async def model_stats(
                                 headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
-    body = {name: value for name, value in snapshot.items() if name not in ("windows", "metrics")}
-    payload = {**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)}
+    body = {name: value for name, value in snapshot.items() if name not in ("windows", "page_windows", "metrics")}
+    window_key = "windows"
     if view == "page":
-        payload = page_window(payload)
+        window_key = "page_windows"
+        del body["weeks"]
+        coverage = body["coverage"]
+        body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
+    payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}
     return JSONResponse(payload, headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
 
 

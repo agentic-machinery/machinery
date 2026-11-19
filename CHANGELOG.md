@@ -9,6 +9,26 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.40"></a>
+## [0.1.40] - 2026-11-19
+
+### Added
+
+- Gemini 4 Neon reviews high-risk code after Sol and Opus ([#880](https://github.com/learn-ukrainian/machinery/pull/880))
+- Let public Savant runs read a published snapshot ([#883](https://github.com/learn-ukrainian/machinery/pull/883))
+
+### Changed
+
+- Record clean-machine rollout drill location ([#872](https://github.com/learn-ukrainian/machinery/pull/872))
+
+### Fixed
+
+- Avoid executor waits on cached SWR routes ([#861](https://github.com/learn-ukrainian/machinery/pull/861))
+- Read GitHub's address ranges with the dispatcher's gh login ([#865](https://github.com/learn-ukrainian/machinery/pull/865))
+- Require explicit clean-machine release versions ([#878](https://github.com/learn-ukrainian/machinery/pull/878))
+- Resolve product inputs from the Git index ([#881](https://github.com/learn-ukrainian/machinery/pull/881))
+- Split unparsed reviews by cause, with no evidence carried across rows ([#882](https://github.com/learn-ukrainian/machinery/pull/882))
+
 <a id="v0.1.39"></a>
 ## [0.1.39] - 2026-11-19
 
@@ -1017,7 +1037,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...HEAD
+[0.1.40]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...v0.1.40
 [0.1.39]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...v0.1.39
 [0.1.38]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...v0.1.38
 [0.1.37]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...v0.1.37
