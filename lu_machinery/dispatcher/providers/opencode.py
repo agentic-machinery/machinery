@@ -53,6 +53,13 @@ _SAVANT_DEFAULT_MAX_TOKENS = 64_000
 SAVANT_DEFAULT_EFFORT = "high"
 # Revalidate the full request body before widening the compatible OpenCode version.
 _SAVANT_OPENCODE_VERSION = "1.19.6"
+# Public classes give Savant OpenCode's read-only file tools on the write boundary's snapshot of the published
+# start commit; private classes keep every tool disabled and the prompt as the only input (designated approval,
+# conditions C1-C4). The snapshot cap and the run's upstream byte ceiling bound what reaches SubQ.
+_SAVANT_TOOL_CLASSES = frozenset({"public-code", "public-docs"})
+_SAVANT_READ_TOOLS = ("read", "grep", "glob", "list")
+SAVANT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+SAVANT_UPLOAD_MAX_BYTES = 16 * 1024 * 1024
 OPENROUTER_PROVIDERS = ("fireworks/us", "baseten/us", "inference-net/us")
 _OPENROUTER_MODEL_ID = MODELS["openrouter"].removeprefix("openrouter/")
 _ROUTING = {"only": list(OPENROUTER_PROVIDERS), "allow_fallbacks": False, "data_collection": "deny"}
@@ -126,6 +133,20 @@ def _savant_api_key() -> str:
     return key
 
 
+def savant_tools(data_class: str | None) -> bool:
+    """Whether a Savant run of this admitted class gets the read-only file tools."""
+    return data_class in _SAVANT_TOOL_CLASSES
+
+
+def savant_read_paths(options: dict[str, str]) -> list[str]:
+    """The ``--read-path`` values the task record carries, in order (none: the whole tree)."""
+    raw = options.get("read_paths")
+    paths = json_depth.loads(raw, max_depth=2) if raw else []
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ValueError("savant_read_path_refused: the task record's read paths are malformed")
+    return paths
+
+
 def _savant_runtime_refusal(env: dict[str, str]) -> str | None:
     # OpenCode merges managed Linux config after OPENCODE_CONFIG_CONTENT. It can
     # change the destination, request options, permissions, or system prompt.
@@ -167,13 +188,17 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     if key.encode("ascii") in prompt:
         raise ValueError("savant_prompt_refused: prompt contains the configured SubQ credential")
     route = MODELS[SAVANT_PROVIDER]
+    tools = savant_tools(spec.options.get("data_class"))
+    if not tools and savant_read_paths(spec.options):
+        raise ValueError("savant_read_path_refused: --read-path needs a public data class; private runs read no files")
     config = {
         "model": route,
         "small_model": route,
         "enabled_providers": [SAVANT_PROVIDER],
         "autoupdate": False,
         "share": "disabled",
-        "permission": {"*": "deny"},
+        "permission": {"*": "deny", **({"external_directory": "deny", **dict.fromkeys(_SAVANT_READ_TOOLS, "allow")}
+                                       if tools else {})},
         "provider": {SAVANT_PROVIDER: {
             "name": "SubQ",
             "npm": "@ai-sdk/openai-compatible",
@@ -202,7 +227,12 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         XDG_DATA_HOME="/tmp/savant/data",
         XDG_STATE_HOME="/tmp/savant/state",
     )
-    argv = ["opencode", "run", "--pure", "--dir", "/tmp", "--title", "Savant trial", "--model", route,
+    directory = "/tmp"  # private to the read-only boundary and empty
+    if tools:
+        from lu_machinery.dispatcher.write_boundary import SNAPSHOT_INSIDE
+
+        directory = SNAPSHOT_INSIDE
+    argv = ["opencode", "run", "--pure", "--dir", directory, "--title", "Savant trial", "--model", route,
             "--format", "json"]
     return Invocation(argv, prompt, child_env, None)
 

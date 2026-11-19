@@ -587,3 +587,63 @@ def test_sandbox_cleanup_preserves_egress_overflow_count(proxy, monkeypatch, tmp
     ]
     assert receipt["egress_overflow_count"] == 4
     assert not proxy.thread.is_alive()
+
+
+def test_upload_ceiling_cuts_the_tunnel_and_fails_the_run(monkeypatch, tmp_path):
+    """Defect class: a provider sends material upstream past the run's ceiling (Savant condition C3)."""
+    from pathlib import Path
+
+    from lu_machinery.dispatcher import write_boundary
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    received = bytearray()
+
+    def echo():
+        with listener.accept()[0] as connection:
+            connection.settimeout(LIVENESS_SECONDS)
+            while data := connection.recv(1024):  # until the proxy closes the tunnel
+                received.extend(data)
+                connection.sendall(data)
+
+    thread = threading.Thread(target=echo)
+    thread.start()
+
+    async def resolve(host):
+        return ["8.8.8.8"]
+
+    async def connect(addresses):
+        return await asyncio.open_connection(*listener.getsockname())
+
+    with tempfile.TemporaryDirectory(prefix="eg-", dir="/tmp") as directory:
+        egress = AttemptEgress(Path(directory) / "egress.sock", upload_ceiling=10)
+        try:
+            monkeypatch.setattr(egress, "_resolve", resolve)
+            monkeypatch.setattr(egress, "_connect", connect)
+            with socket.socket(socket.AF_UNIX) as client:
+                client.settimeout(LIVENESS_SECONDS)
+                client.connect(str(egress.endpoint))
+                client.sendall(b"CONNECT api.subq.ai:443 HTTP/1.1\r\nHost: api.subq.ai:443\r\n\r\n")
+                assert client.recv(1024).startswith(b"HTTP/1.1 200")
+                client.sendall(b"0123456789")  # exactly the ceiling is forwarded
+                assert client.recv(1024) == b"0123456789"
+                client.sendall(b"X")  # one byte past it is never forwarded: the tunnel is cut
+                assert client.recv(1024) == b""
+        finally:
+            egress.cleanup()
+            listener.close()
+            thread.join(LIVENESS_SECONDS)
+    assert bytes(received) == b"0123456789"
+    assert (egress.uploaded, egress.ceiling_reached) == (10, True)
+    assert egress.records[0]["upload_ceiling_reached"] is True
+    # The boundary receipt turns the cut into the run's typed failure.
+    task_file = tmp_path / "task.json"
+    write_boundary.receipt_file(task_file).write_text(json.dumps({
+        "schema": write_boundary.SCHEMA, "task_id": "ceiling-1", "mode": "read-only", "status": "ran",
+        "canary": {"passed": True}, "import": {"status": "unchanged"},
+        "upload_ceiling": {"limit": 10, "sent": egress.uploaded, "reached": egress.ceiling_reached},
+    }), encoding="utf-8")
+    summary, refusal = write_boundary.verify(task_file, "ceiling-1")
+    assert refusal is not None and refusal.startswith("savant_upload_ceiling: ")
+    assert summary["upload_ceiling"] == {"limit": 10, "sent": 10, "reached": True}
