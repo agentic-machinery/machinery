@@ -20,7 +20,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -430,8 +430,16 @@ ORIENT_REFRESH_INTERVAL_S = 10.0
 _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
-_detached_orient_last_good: dict[str, tuple[Any, str]] = {}
+# value, generated_at, and when it was stored (only a zero-TTL section ages out).
+_detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
 _detached_orient_last_error: dict[str, str] = {}
+# A zero-TTL section keeps no orient-layer cache; its last value is only a short
+# fallback while its own refresh runs, never another freshness window (#1309 B2).
+_ZERO_TTL_LAST_GOOD_MAX_AGE_S = 120.0
+# Bumped by every ``fresh`` invalidation. A result collected under an older
+# generation observed the checkout before that invalidation: it is dropped, so it
+# never reads as current nor replaces a newer value.
+_orient_generation = 0
 # Section cache keys whose refresh worker has not yet published. The worker
 # publishes its value and leaves this set in one critical section, so a reader's
 # snapshot never pairs a new value with "still refreshing" or an old one with "done".
@@ -842,10 +850,27 @@ def reset_detached_orient_state_for_tests() -> None:
     _integrity_verdicts.clear()
 
 
+def _invalidate_orient_cache() -> None:
+    """Drop every cached orient section and supersede every refresh already running."""
+    global _orient_generation
+    with _detached_orient_lock:
+        _orient_generation += 1
+        cache_invalidate("orient_")
+
+
 def _schedule_detached_orient_refresh(
-    key: str, collector: Callable[[], Any], cache_key: str | None = None, *, ttl: float | None = None,
+    key: str,
+    collector: Callable[[], Any],
+    cache_key: str | None = None,
+    *,
+    ttl: float | None = None,
+    collect_slot: bool = True,
 ) -> bool:
-    """Start a single-flight worker for ``key``. Return True if this call started it."""
+    """Start a single-flight worker for ``key``. Return True if this call started it.
+
+    ``collect_slot`` False keeps the worker off the shared collect slots: a hung
+    inline-section refresh must not stop every other section from refreshing.
+    """
     with _detached_orient_lock:
         state_key = cache_key or f"orient_{key}"
         thread = _detached_orient_threads.get(state_key)
@@ -853,7 +878,7 @@ def _schedule_detached_orient_refresh(
             return False
         worker = threading.Thread(
             target=_run_detached_orient_refresh,
-            args=(key, collector, state_key, ttl),
+            args=(key, collector, state_key, ttl, _orient_generation, collect_slot),
             daemon=True,
             name=f"orient-{key}-refresh",
         )
@@ -864,22 +889,30 @@ def _schedule_detached_orient_refresh(
 
 
 def _run_detached_orient_refresh(
-    key: str, collector: Callable[[], Any], cache_key: str, ttl: float | None = None,
+    key: str,
+    collector: Callable[[], Any],
+    cache_key: str,
+    ttl: float | None = None,
+    generation: int | None = None,
+    collect_slot: bool = True,
 ) -> None:
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
+    generation = _orient_generation if generation is None else generation
     try:
-        with _DETACHED_ORIENT_COLLECT_SLOTS:
+        with _DETACHED_ORIENT_COLLECT_SLOTS if collect_slot else nullcontext():
             value = collector()
         generated_at = _isoformat_z(datetime.now(UTC))
         with _detached_orient_lock:
-            if ttl > 0:
-                cache_set(cache_key, (value, generated_at))
-            _detached_orient_last_good[cache_key] = (value, generated_at)
-            _detached_orient_last_error.pop(cache_key, None)
+            if generation == _orient_generation:
+                if ttl > 0:
+                    cache_set(cache_key, (value, generated_at))
+                _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
+                _detached_orient_last_error.pop(cache_key, None)
             _detached_orient_pending.discard(cache_key)
     except Exception as exc:
         with _detached_orient_lock:
-            _detached_orient_last_error[cache_key] = str(exc)
+            if generation == _orient_generation:
+                _detached_orient_last_error[cache_key] = str(exc)
             _detached_orient_pending.discard(cache_key)
     finally:
         with _detached_orient_lock:
@@ -926,6 +959,7 @@ async def _cached_detached_orient_section(
     source: str | None = None,
     is_async: bool = False,
     fresh: bool = False,
+    collect_slot: bool = True,
 ) -> tuple[Any, dict]:
     """Cache-first section: never let a hung collector pin the gather.
 
@@ -957,7 +991,7 @@ async def _cached_detached_orient_section(
                 "cache": "hit",
             }
 
-    started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
+    started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl, collect_slot=collect_slot)
     thread = _detached_orient_threads.get(cache_key)
     if started and thread is not None and thread.is_alive() and (fresh or not _serves_last_good_at_once(cache_key, ttl)):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
@@ -983,8 +1017,8 @@ async def _cached_detached_orient_section(
     # Product sections may use their own TTL (including zero). Last-good is a
     # stale fallback, never another freshness window: it keeps its own
     # ``generated_at`` and is labelled ``stale`` while its refresh runs or fails.
-    if last_good is not None:
-        value, generated_at = last_good
+    if last_good is not None and (ttl > 0 or _orient_clock() - last_good[2] < _ZERO_TTL_LAST_GOOD_MAX_AGE_S):
+        value, generated_at, _stored_at = last_good
         meta: dict[str, Any] = {
             "generated_at": generated_at,
             "stale_after_s": ttl,
@@ -1473,19 +1507,18 @@ async def _cached_orient_section(
     # An inline section that already has a value is served like a detached
     # one: its last value at once while one worker refreshes it. Only its first
     # read, and a ``fresh`` read, collect on the request path.
-    if (
-        background
-        or key in DETACHED_ORIENT_SECTION_KEYS
-        or (not fresh and _serves_last_good_at_once(cache_key, ttl))
-    ):
+    detached = background or key in DETACHED_ORIENT_SECTION_KEYS
+    if detached or (not fresh and _serves_last_good_at_once(cache_key, ttl)):
         return await _cached_detached_orient_section(
             key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
+            collect_slot=detached,
         )  # type: ignore[arg-type]
 
     # ttl == 0 means "don't cache at the orient layer". Skip both the
     # cache read AND the cache write paths so callers never see stale
-    # data and no zombie entries linger in the dict.
-    if ttl > 0:
+    # data and no zombie entries linger in the dict. A ``fresh`` read always
+    # collects.
+    if ttl > 0 and not fresh:
         cached = cache_get(cache_key, ttl=ttl)
         if cached is not None:
             value, generated_at = cached  # type: ignore[misc]
@@ -1496,6 +1529,7 @@ async def _cached_orient_section(
                 "cache": "hit",
             }
 
+    generation = _orient_generation
     generated_at = _isoformat_z(datetime.now(UTC))
     meta: dict[str, Any] = {
         "generated_at": generated_at,
@@ -1537,9 +1571,10 @@ async def _cached_orient_section(
 
     if ttl > 0:
         with _detached_orient_lock:
-            cache_set(cache_key, (value, generated_at))
-            _detached_orient_last_good[cache_key] = (value, generated_at)
-            _detached_orient_last_error.pop(cache_key, None)
+            if generation == _orient_generation:
+                cache_set(cache_key, (value, generated_at))
+                _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
+                _detached_orient_last_error.pop(cache_key, None)
     return value, meta
 
 
@@ -1754,7 +1789,7 @@ async def orient(
             each other's pointers.
     """
     if fresh:
-        cache_invalidate("orient_")
+        _invalidate_orient_cache()
 
     layout = _orient_layout(request.app.state.product)
     selected = _parse_orient_sections(sections, lean=lean, layout=layout)
