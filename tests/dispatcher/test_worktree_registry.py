@@ -287,3 +287,167 @@ def test_a_home_relative_hooks_path_keeps_its_guards(sandbox, monkeypatch, tmp_p
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None, extra=None):
+    """Enroll the checkout in the installed agent deployment, with the Claude hooks its release makes mandatory.
+
+    The Claude source lives under a tree dispatch worktrees exclude by default (wiki), as a product may declare.
+    ``descriptor`` replaces the descriptor's bytes; the value ``"symlink"`` commits it as a dangling symlink.
+    ``extra`` maps further paths to the text committed there.
+    """
+    import os
+    from importlib import resources
+
+    inventory = json.loads(resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
+    settings = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        *parents, event = requirement["path"]
+        node = settings
+        for key in parents:
+            node = node.setdefault(key, {})
+        node.setdefault(event, []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    (primary / "agents_extensions/shared").mkdir(parents=True)
+    (primary / "agents_extensions/shared/README.md").write_text("shared\n")
+    claude = primary / "wiki/agents-claude"
+    claude.mkdir(parents=True)
+    (claude / "settings.json").write_text(json.dumps(settings))
+    target = primary / "agents_extensions/deployment.v1.json"
+    if descriptor == "symlink":
+        os.symlink("missing.json", target)
+    else:
+        target.write_text(descriptor or json.dumps({
+            "providers": ["claude"], "preserve": [],
+            "sources": {"shared": {"path": "agents_extensions/shared", "required": True},
+                        "claude": {"path": "wiki/agents-claude", "required": True}}}))
+    (primary / ".gitignore").write_text(ignored)
+    for name, text in (extra or {}).items():
+        (primary / name).parent.mkdir(parents=True, exist_ok=True)
+        (primary / name).write_text(text)
+    run_git(primary, "add", ".")
+    run_git(primary, "commit", "-m", "enroll")
+    return run_git(primary, "rev-parse", "HEAD"), settings
+
+
+@pytest.mark.parametrize("deploy_agents", [True, False])
+def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktree_does(
+        sandbox, monkeypatch, deploy_agents):
+    """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
+    Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
+    or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
+    Git status cannot see, reaching the guards; a borrowed tree written into, or launched with a deployment
+    that does not match its start commit; a deployed output the checkout tracks, which could enter the
+    worker's commit; and a read-only (review) worktree widened by settings the dispatch did not ask for."""
+    import sys
+
+    from lu_machinery.dispatcher import git
+
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    primary, _, _ = declared_repo(sandbox)
+    sha, settings = enroll(primary)
+    tree = primary / ".worktrees/dispatch/codex/enrolled"
+    git.create_worktree(primary, tree, "codex/enrolled", sha, deploy_agents=deploy_agents)
+    deployed = tree / ".claude/settings.json"
+    assert not (tree / "wiki").exists()  # the source stays hidden: the deployment reads the commit, not the tree
+    if not deploy_agents:
+        assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
+        # A write task borrowing (--cwd) this undeployed tree refuses; nothing is written into a borrowed tree.
+        with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
+            git.deploy_agent_extensions(tree, sha, apply=False)
+        assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
+        return
+    assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
+    # A borrowing write task verifies the deployment; the worker's own change is not a deployment output.
+    (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
+    assert git.deploy_agent_extensions(tree, sha, apply=False) is True
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
+    before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
+                                                             ".deploy-state/agent-deploy.v1.json")}
+    run_git(tree, "update-index", "--assume-unchanged", "agents_extensions/shared/README.md")
+    (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    assert git.deploy_agent_extensions(tree, sha) is True
+    assert {name: (tree / name).read_bytes() for name in before} == before
+    # A borrowed tree whose guard was removed refuses, and is left as it is.
+    deployed.unlink()
+    with pytest.raises(ValueError, match="^agent_deploy_failed: exit 1: deployment drift: "):
+        git.deploy_agent_extensions(tree, sha, apply=False)
+    assert not deployed.exists()
+    assert git.deploy_agent_extensions(tree, sha) is True
+    # The deployment is bound to the task's start: a checkout whose HEAD moved refuses before anything runs.
+    run_git(tree, "commit", "--allow-empty", "-m", "worker commit")
+    with pytest.raises(ValueError, match=f"^agent_deploy_failed: the checkout's HEAD [0-9a-f]{{12}} is not the "
+                                         f"task's start {sha[:12]}$"):
+        git.deploy_agent_extensions(tree, sha, apply=False)
+    sha = run_git(tree, "rev-parse", "HEAD")
+    # A tracked output refuses, however clean it is.
+    run_git(tree, "add", "--force", ".claude/README.md")
+    with pytest.raises(ValueError, match="^agent_deploy_outputs_not_ignored: the checkout does not ignore "
+                                         r"\.claude/README\.md$"):
+        git.deploy_agent_extensions(tree, sha, apply=False)
+
+
+@pytest.mark.parametrize("broken, global_excludes, reason", [
+    ({"descriptor": "{"}, False, "agent_deploy_failed: exit 2: invalid deployment: invalid JSON"),
+    ({"descriptor": "symlink"}, False, "agent_deploy_failed: exit 2: "),
+    ({"ignored": "/.deploy-state/\n"}, False, "agent_deploy_outputs_not_ignored: the checkout does not ignore .claude/"),
+    ({"ignored": "/.deploy-state/\n"}, True, "agent_deploy_outputs_not_ignored: the checkout does not ignore .claude/"),
+    # The product marker that selects prompt lint lies in a tree the sparse checkout hides.
+    ({"extra": {"curriculum/l2-uk-en/curriculum.yaml": "levels: {}\n",
+                "agents_extensions/shared/phases/research.md": "Write in the persona voice.\n"}}, False,
+     "agent_deploy_failed: exit 2: invalid deployment: prompt lint: PERSONA_IN_RESEARCH"),
+])
+def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
+        sandbox, tmp_path, broken, global_excludes, reason):
+    """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
+    checkout's agent deployment failed: a broken or dangling descriptor skipped, or outputs only the
+    dispatcher's own user-level excludes file hides, which the worker does not share, or a validation the
+    commit selects but the sparse checkout hid from the apply; or a write task borrowing (--cwd) an undeployed
+    tree launched, or deployed into. A read-only task of the same checkout is never deployed, so the same
+    breakage cannot refuse it."""
+    sandbox.env["LEARN_UKRAINIAN_PYTHON"] = sandbox.python
+    if global_excludes:
+        (tmp_path / "excludes").write_text("/.claude/\n")
+        (tmp_path / "gitconfig").write_text(f"[core]\n\texcludesFile = {tmp_path / 'excludes'}\n")
+        sandbox.env["GIT_CONFIG_GLOBAL"] = str(tmp_path / "gitconfig")
+    primary, _, _ = declared_repo(sandbox)
+    enroll(primary, **broken)
+    # A write task starts from an origin base that settlement can verify.
+    run_git(primary, "init", "--bare", "--initial-branch=main", str(tmp_path / "declared.git"))
+    run_git(primary, "remote", "add", "origin", str(tmp_path / "declared.git"))
+    run_git(primary, "push", "-u", "origin", "main")
+    refused = sandbox.cli("dispatch", "--agent", "sol", "--model", "echo", "--prompt", "never launched",
+                          "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
+                          "--task-id", "refused", expected=2)
+    assert refused.stderr.splitlines()[-1].startswith("dispatcher: " + reason), refused.stderr
+    # Never launched: the hold becomes a terminal setup refusal that keeps the surviving tree attributed (#490).
+    hold = json.loads((sandbox.tasks / "refused.json").read_text())
+    assert (hold["status"], hold["pid"], hold["never_started_reason"]) == ("failed", None, "setup_refusal")
+    record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--base", "origin/main", "--task-id", "read"))
+    assert (record["status"], record["mode"]) == ("done", "read-only")
+    # Settlement hands the refused tree to the guarded remover, which removes it and its branch, or keeps it with
+    # its disposition recorded (here only when a user-level excludes file the settlement shares hides outputs).
+    sandbox.sweep()
+    settled = json.loads((sandbox.tasks / "refused.json").read_text())
+    assert settled["status"] == "failed"
+    assert (primary / ".worktrees/dispatch/codex/refused").exists() == (settled["worktree_disposition"] != "removed")
+    if not global_excludes:
+        assert settled["worktree_disposition"] == "removed"
+        assert run_git(primary, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "main"
+    # A task borrowing (--cwd) a tree without the deployment: read-only runs as it is; a write task refuses
+    # before it starts, recorded as a setup refusal under its own id, and nothing is written into the tree.
+    tree = primary / ".worktrees/dispatch/codex/attached"
+    run_git(primary, "worktree", "add", "-b", "attached", str(tree), "main")
+    record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--cwd", str(tree), "--base", "origin/main",
+                                             "--task-id", "read-attached"))
+    assert (record["status"], record["mode"], (tree / ".claude").exists()) == ("done", "read-only", False)
+    attached = sandbox.cli("dispatch", "--agent", "sol", "--model", "echo", "--prompt", "never launched",
+                           "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
+                           "--cwd", str(tree), "--task-id", "attached", expected=2)
+    assert attached.stderr.splitlines()[-1].startswith("dispatcher: agent_deploy_failed: exit "), attached.stderr
+    refusals = [entry for entry in (json.loads(path.read_text()) for path in sandbox.tasks.glob("*.json"))
+                if entry.get("requested_task_id") == "attached"]
+    assert [(entry["status"], entry["never_started_reason"]) for entry in refusals] == [("failed", "setup_refusal")]
+    assert not (sandbox.tasks / "attached.json").exists() and not (tree / ".claude").exists()

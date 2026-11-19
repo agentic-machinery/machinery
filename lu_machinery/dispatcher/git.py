@@ -18,6 +18,9 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
 
+# A checkout that tracks DESCRIPTOR is enrolled in the installed agent deployment; STATE is its ownership manifest.
+from lu_machinery.agent_deploy.plan import DESCRIPTOR as AGENT_DEPLOY_DESCRIPTOR
+from lu_machinery.agent_deploy.plan import STATE as AGENT_DEPLOY_STATE
 from lu_machinery.common import git_credentials, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.git_credentials import canonical_origins as canonical_origins
@@ -27,6 +30,7 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     main_checkout_root,
     product_root,
+    project_interpreter,
     state_root,
 )
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
@@ -62,6 +66,9 @@ VERIFICATION_FETCH_TIMEOUT = 60
 # Committer-clock slack below the task start date. Speed depends on this value;
 # correctness does not, because _complete_since_task_base checks the fetched graph.
 HISTORY_SLACK_SECONDS = 86400
+# One apply measured 2.2 s on learn-ukrainian (947 outputs). It runs under the worktree lock, so the bound
+# also caps how long a hung deployer delays other creations and attachments.
+AGENT_DEPLOY_TIMEOUT = 120
 
 
 class VerificationFetchError(subprocess.CalledProcessError):
@@ -470,8 +477,12 @@ def worktree_lock(repo: Path, *, timeout: float | None = None):
 
 def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_checkout=False, sparse_include=(),
                     exact=False, registration: dict | None = None, creator_actor: str | None = None,
-                    on_reserved=None) -> None:
+                    on_reserved=None, deploy_agents: bool = False) -> None:
     """Create a task worktree; ``registration`` (see register_worktree) also keeps its registry entry true.
+
+    ``deploy_agents`` (write tasks) applies the checkout's agent deployment (``deploy_agent_extensions``) under
+    the same locks, so an attachment waits for it. A deployment that refuses raises, so the task never
+    launches; the tree it leaves stays attributed like any other failed creation's.
 
     The entry is written before the tree exists and confirmed after, all under the worktree lock that
     settlement removes (and archives) under, so a later dispatch to the same path cannot interleave.
@@ -509,6 +520,8 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             else:
                 run_git(path, "sparse-checkout", "set", "--no-cone", "--", "/*", *(f"!/{name}/" for name in excluded))
             run_git(path, "reset", "--hard", sha)
+            if deploy_agents:
+                deploy_agent_extensions(path, sha)
             from lu_machinery.orchestration.worktree_claims import new_helper_creator, publish_helper_creator
 
             receipt_path, receipt = new_helper_creator(
@@ -540,6 +553,83 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             raise
     # Outside the lock: a store miss runs one npm install, and other creations must not wait for it.
     site_deps.provision(repo, path)
+
+
+def _git_failure(step: str, exc: BaseException) -> ValueError:
+    """``agent_deploy_failed`` for a Git step of the deployment that could not run or failed."""
+    detail = (f"exit {exc.returncode}" if isinstance(exc, subprocess.CalledProcessError)
+              else "timed out" if isinstance(exc, subprocess.TimeoutExpired) else type(exc).__name__)
+    return ValueError(f"agent_deploy_failed: git {step} failed ({detail})")
+
+
+def _agent_deploy(root: Path, *args: str) -> str:
+    """Run the deployer on the checkout at ``root`` and return its stdout; any failure is ``agent_deploy_failed``."""
+    try:
+        interpreter = project_interpreter(env=os.environ)
+        # The interpreter is the configured project interpreter every worker hook runs (child_env), not task input.
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [str(interpreter), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(root), *args],  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+            timeout=AGENT_DEPLOY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"agent_deploy_failed: no result within {AGENT_DEPLOY_TIMEOUT} s") from None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"agent_deploy_failed: project interpreter unavailable ({type(exc).__name__})") from None
+    if result.returncode:
+        reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
+        raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
+    return result.stdout
+
+
+def deploy_agent_extensions(path: Path, commit: str, *, apply: bool = True) -> bool:
+    """Give a write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
+
+    Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
+    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
+    product's guards. Everything is bound to ``commit``, the task's admitted start: the checkout is enrolled
+    when that commit or its HEAD tracks the descriptor, whatever the working tree holds, and an enrolled
+    checkout whose HEAD is no longer that commit refuses. ``apply`` (a tree this creation just checked out)
+    runs the checkout's own apply contract (``agent_deploy --project-root``, as ``npm run agents:deploy`` or
+    ``agents_extensions/deploy.sh`` run it), under the project interpreter the worker's hooks use, composed
+    from the commit's objects (``--inputs-commit``), never from the checkout, so no working-tree edit or file
+    the sparse checkout hides changes the plan. Without ``apply`` (a tree a task borrows with ``--cwd``)
+    nothing is written into the tree: its existing deployment must already match the commit's plan. Either
+    way the deployer's own check verifies the outputs against that plan and prints its manifest, which names
+    the outputs checked here. A checkout that is not enrolled is left as it is (False). Each refusal is a
+    ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the deployment cannot be
+    applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is tracked or not
+    ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes file,
+    which the worker may not share), so the worker could commit it.
+    """
+    root = path.resolve()  # the deployer takes only the canonical checkout root
+    try:
+        head = _git(root, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
+        enrolled = any(_git(root, "--no-replace-objects", "ls-tree", "--name-only", tip, "--", AGENT_DEPLOY_DESCRIPTOR,
+                            isolate=True) for tip in dict.fromkeys((commit, head)))
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("enrollment read", exc) from None
+    if not enrolled:
+        return False
+    if head != commit:
+        raise ValueError(f"agent_deploy_failed: the checkout's HEAD {head[:12]} is not the task's start {commit[:12]}")
+    if apply:
+        _agent_deploy(root, "--inputs-commit", commit)
+    verified = _agent_deploy(root, "--check", "--print-manifest", "--inputs-commit", commit)
+    try:
+        outputs = [AGENT_DEPLOY_STATE, *(str(name) for name in json_depth.loads(verified, max_depth=16)["files"])]
+    except (ValueError, RecursionError, KeyError, TypeError):
+        raise ValueError("agent_deploy_failed: the verified manifest cannot be read") from None
+    # Only the deployment's own outputs are listed: an attached worktree may hold the worker's own changes.
+    try:
+        listed = _git(root, "-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--cached", "--others",
+                      "--exclude-standard", "--", *outputs, isolate=True, strip=False,
+                      env={"GIT_LITERAL_PATHSPECS": "1"}).split("\0")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("output listing", exc) from None
+    if names := [name for name in listed if name]:
+        raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {', '.join(names[:3])}")
+    return True
 
 
 def registry_path(repo: Path, repository: dict) -> Path | None:
