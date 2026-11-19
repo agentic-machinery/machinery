@@ -130,12 +130,14 @@
 
   // ---- Fetch & formatting ----
 
-  // performance.now() does not follow wall-clock steps. Panel age uses it so a
-  // jumped or rolled-back Date.now() cannot freshen or expire a snapshot.
-  function monotonicNow() {
-    const perf = typeof performance === "object" && performance && typeof performance.now === "function"
-      ? performance.now() : NaN;
-    return typeof perf === "number" && Number.isFinite(perf) ? perf : null;
+  // null: this runtime has no monotonic clock, so the caller keeps the wall-clock receipt.
+  // NaN: a monotonic clock exists but did not return a finite stamp. That receipt stays
+  // unknown. Dropping it would fall through to a wall clock that can jump back to fresh.
+  function snapshotClockStamp() {
+    const perf = typeof performance === "object" && performance ? performance : null;
+    if (!perf || typeof perf.now !== "function") return null;
+    const value = perf.now();
+    return typeof value === "number" && Number.isFinite(value) ? value : Number.NaN;
   }
 
   async function fetchJson(url) {
@@ -146,7 +148,7 @@
       if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
       // Stamp when the response arrives, not when the request starts, and not after the body is parsed.
       const receivedAt = Date.now();
-      const receivedMono = monotonicNow();
+      const receivedMono = snapshotClockStamp();
       let data;
       try { data = JSON.parse(await response.text()); } catch { throw new Error(`${url}: Invalid JSON`); }
       if (data === null || typeof data !== "object" || Array.isArray(data)) throw new Error(`${url}: Invalid JSON shape`);
@@ -425,6 +427,13 @@
     return Number.isFinite(value) && value >= 0 ? value : null;
   }
 
+  function heldElapsed(reading, elapsed) {
+    const prior = reading && reading._elapsedS;
+    const stable = typeof prior === "number" && Number.isFinite(prior) ? Math.max(prior, elapsed) : elapsed;
+    if (reading && typeof reading === "object") reading._elapsedS = stable;
+    return stable;
+  }
+
   function panelAgeSeconds(reading, now = Date.now()) {
     const headerAge = parseSnapshotSeconds(headerRaw(reading, "ageHeader", "age"));
     if (headerAge === null) return null;
@@ -436,16 +445,12 @@
     const receivedMono = reading && reading.receivedMono;
     if (typeof receivedMono === "number") {
       if (!Number.isFinite(receivedMono)) return null;
-      const monoNow = monotonicNow();
-      if (monoNow === null) return null;
-      const elapsed = Math.max(0, (monoNow - receivedMono) / 1000);
-      const prior = reading._elapsedS;
-      const stable = typeof prior === "number" && Number.isFinite(prior) ? Math.max(prior, elapsed) : elapsed;
-      reading._elapsedS = stable;
-      return headerAge + stable;
+      const monoNow = snapshotClockStamp();
+      if (typeof monoNow !== "number" || !Number.isFinite(monoNow)) return null;
+      return headerAge + heldElapsed(reading, Math.max(0, (monoNow - receivedMono) / 1000));
     }
     const elapsed = typeof received === "number" ? Math.max(0, (now - received) / 1000) : 0;
-    return headerAge + elapsed;
+    return headerAge + heldElapsed(reading, elapsed);
   }
 
   function panelBoundSeconds(reading) {
@@ -774,6 +779,7 @@
     repoCoverageIncomplete,
     repoOpenCount,
     prChips,
+    snapshotClockStamp,
     panelAgeSeconds,
     panelBoundSeconds,
     prSnapshotState,

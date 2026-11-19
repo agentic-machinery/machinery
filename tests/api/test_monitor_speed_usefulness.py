@@ -545,6 +545,14 @@ assert.match(subscriptionRows({stale_after_s: 900, providers: [{provider: 'claud
 const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51),
   {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
 assert.match(subscriptionRows(partial, null).groups, /NO READING/);
+// Without a monotonic stamp, elapsed still never shrinks: a rollback cannot make an expired snapshot fresh.
+const wall = {ageHeader: '0', boundHeader: '10', state: 'fresh', receivedAt: now, data: {status: 'ok'}};
+assert.equal(panelAgeSeconds(wall, now + 11000), 11);
+assert.equal(panelAgeSeconds(wall, now - 20000), 11);
+const clock = performance.now;
+performance.now = undefined;
+assert.equal(Machinery.snapshotClockStamp(), null);
+performance.now = clock;
 // A wall-clock jump does not change an age stamped with the monotonic clock, and a backward step does not shrink it.
 const realPerf = performance.now.bind(performance);
 let mono = realPerf();

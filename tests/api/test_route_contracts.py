@@ -591,6 +591,21 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       assert.doesNotMatch(M.prChips(reading.data, '/pull-requests', state.status).join(''), /age unknown/);
     }
 
+    // A monotonic clock that returns a non-finite stamp stays unknown. It is not treated as a missing clock.
+    const finitePerf = performance.now;
+    performance.now = () => Number.NaN;
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {get: name => name === 'X-Snapshot-Age-S' ? '0' : (name === 'X-Snapshot-Stale-After-S' ? '10' : 'fresh')},
+      text: async () => JSON.stringify({status: 'ok', repositories: [{name: 'machinery', status: 'ok', open_total: 0, pull_requests: []}]}),
+    });
+    const badStamp = await M.fetchJson('/api/git/pull-requests');
+    performance.now = finitePerf;
+    assert.equal(Number.isNaN(badStamp.receivedMono), true);
+    assert.equal(M.panelAgeSeconds(badStamp, fakeNow), null);
+    assert.equal(M.prSnapshotState(badStamp, fakeNow).status, 'unknown');
+
     // Model statistics stamps the age when the response arrives, then keeps the sentence moving.
     const savedInterval = globalThis.setInterval;
     const clocks = [];
@@ -620,6 +635,29 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
       assert.equal(clocks.length > 0, true);
       clocks[clocks.length - 1]();
       assert.match(document.getElementById('age').textContent, /collected 4 seconds ago/);
+      // A window change that has not returned keeps the displayed snapshot's age moving.
+      let releaseSecond;
+      const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+      const shown = clocks[clocks.length - 1];
+      globalThis.fetch = async (url) => {
+        const page = String(url).includes('view=page');
+        if (page) await secondGate;
+        return {
+          ok: true,
+          status: 200,
+          headers: {get: name => page && name === 'X-Snapshot-Age-S' ? '0.000' : null},
+          json: async () => page
+            ? {status: 'ok', records: 4, window: {since: '2026-01-01T00:00:00Z', name: '24h', until: '2026-01-02T00:00:00Z'}, models: [], review_levels: [], charts: {}, authors: [], author_risks: [], allowance: []}
+            : {status: 'ok', models: []},
+        };
+      };
+      const second = stats.load();
+      monoNow += 45000;
+      shown();
+      assert.match(document.getElementById('age').textContent, /collected 49 seconds ago/);
+      releaseSecond();
+      try { await second; } catch { /* the page render is outside this age check */ }
+      assert.match(document.getElementById('age').textContent, /collected 0 seconds ago/);
     } finally {
       globalThis.setInterval = savedInterval;
     }
