@@ -15,7 +15,11 @@ import importlib.util
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from email.message import Message
+from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -33,6 +37,7 @@ NOW = datetime(2026, 10, 2, 17, 0, tzinfo=UTC)
 POLICY = credit_lane.load_policy()
 # conftest replaces the runtime-records reader per test; keep the real one.
 REAL_RATE_LIMIT_READER = credit_lane.read_recent_rate_limits
+REAL_ROUTING_BUDGET_READER = credit_lane.read_routing_budget
 
 
 def _codex(**overrides) -> dict:
@@ -1026,6 +1031,52 @@ def test_allowlist_gate_table(snapshot, monkeypatch, tmp_path, scenario, lane, m
 
 
 # --- the gate on the real dispatch path --------------------------------------
+
+
+@pytest.mark.parametrize("warming", [False, True], ids=["unreadable", "warming-then-ready"])
+def test_dispatch_gate_fails_closed_and_retries_typed_snapshot_warming(monkeypatch, warming):
+    """Defect class: an unreadable snapshot admitted off-allowlist dispatches after one read."""
+    waits = []
+    timeouts = []
+    if warming:
+        headers = Message()
+        headers["Retry-After"] = "2"
+        headers["X-Snapshot-Age-S"] = "unknown"
+        responses = [
+            HTTPError(
+                "http://monitor.invalid", 503, "Service Unavailable", headers,
+                BytesIO(b'{"detail":"routing budget warming"}'),
+            ),
+            BytesIO(json.dumps(_budget({"status": "cool", "remaining_pct": 60.0})).encode("utf-8")),
+        ]
+    else:
+        responses = [URLError("Monitor unavailable")]
+    responses = iter(responses)
+
+    def read(url, *, timeout):
+        assert url == "http://monitor.invalid/api/state/routing-budget?fresh_codexbar=true"
+        timeouts.append(timeout)
+        response = next(responses)
+        if isinstance(response, OSError):
+            raise response
+        return response
+
+    monkeypatch.setattr(credit_lane, "read_routing_budget", REAL_ROUTING_BUDGET_READER)
+    monkeypatch.setenv("DELEGATE_MONITOR_API", "http://monitor.invalid")
+    monkeypatch.setattr(credit_lane.urllib.request, "urlopen", read)
+    monkeypatch.setattr(credit_lane, "time", SimpleNamespace(monotonic=lambda: sum(waits), sleep=waits.append), raising=False)
+
+    refusal = credit_lane.dispatch_refusal("codex", _OFF_ALLOWLIST, policy=POLICY)
+
+    if warming:
+        assert refusal is None
+        assert waits == [2]
+        assert timeouts == [8.0, 6.0]
+    else:
+        assert refusal.startswith("CREDIT_PERIOD_MODEL_REFUSED: lane codex is routing_snapshot_unavailable")
+        assert "retry when Monitor can serve the routing-budget snapshot" in refusal
+        assert waits == []
+        assert timeouts == [8.0]
 
 
 # --- #9517: explicit usage directory and published-state re-check -----------

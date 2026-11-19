@@ -1656,7 +1656,7 @@ def _hermetic_dispatch_admission_host(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _hermetic_credit_lane_snapshot(monkeypatch):
-    """Credit-period state sees no live Monitor snapshot or runtime usage records (#9518).
+    """Credit-period state uses a healthy plan snapshot and no rate limits (#9518).
 
     The live Monitor on a developer box can report a credit balance and refuse
     the off-allowlist dispatches other tests make, and the live runtime usage
@@ -1665,7 +1665,14 @@ def _hermetic_credit_lane_snapshot(monkeypatch):
     """
     from lu_machinery.fleet import credit_lane
 
-    monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        credit_lane,
+        "read_routing_budget",
+        lambda **_kwargs: {
+            "agents": {"codex": {"status": "cool", "remaining_pct": 100.0}},
+            "diagnostics": {"stale": False},
+        },
+    )
     monkeypatch.setattr(
         credit_lane,
         "read_recent_rate_limits",
