@@ -355,6 +355,8 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
             effort="not-exposed", resolved_model="gemini-4-neon-medium", resolved_model_known=True,
             options={"pinned_head": "1" * 40}, duration_s=120,
             allowance={"pool": "gemini", "start": {"remaining_pct": 98}, "finish": {"remaining_pct": 96}})
+    _record(tasks, "neon-rate-limited-review", mode="read-only", agent="agy", model="gemini-4-neon-medium",
+            options={"pinned_head": "1" * 40}, status="rate_limited", started_at=_at(4), duration_s=60)
     _record(tasks, "neon-later-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
             options={"pinned_head": "2" * 40}, duration_s=180, verdict="APPROVED")
     _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
@@ -394,9 +396,9 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     assert levels["high"]["first_round_approved"]["n"] == 0
     assert levels["high"]["findings"] is None
     assert levels["medium"] == {
-        "effort": "medium", "tasks": 1, "results": 1, "findings": 1, "findings_n": 1, "first_round_missing": 0,
-        "first_round_approved": {"value": 1.0, "n": 1, "low_sample": True}, "median_seconds": 120.0,
-        "wall_minutes_per_landed": {"value": 2.0, "n": 1, "low_sample": True},
+        "effort": "medium", "tasks": 2, "results": 1, "findings": 1, "findings_n": 1, "first_round_missing": 0,
+        "first_round_approved": {"value": 1.0, "n": 1, "low_sample": True}, "median_seconds": 90.0,
+        "wall_minutes_per_landed": {"value": 3.0, "n": 1, "low_sample": True},
         "allowance_per_landed": [{"pool": "gemini", "value": 2.0, "n": 1, "low_sample": True}],
     }
     (author,) = window["authors"]

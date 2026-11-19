@@ -100,8 +100,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
   unknown. The author figures and first-round matrix use **reviews of record**, which name the PR and the
   author's model.
-- **Reviewer levels** use the runtime model selector where available. First-round approval uses the earliest
-  review for that level on the PR's first reviewed head. A supplemental review without a PR number can join
+- **Reviewer levels** use the runtime model selector where available. First-round approval uses the first
+  parsed verdict for that level on the PR's first review head. A supplemental review without a PR number can join
   a PR through an exact head match in the same repository. The time per landed PR divides time across PR-linked
   reviews by linked PRs with recorded merges. Quota uses valid readings and counts landed PRs once per pool.
   Levels with fewer than 10 parsed verdicts show “not enough data yet.”

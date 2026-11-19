@@ -68,7 +68,7 @@
   <section><h2>Compare reviewer levels</h2>
     <label>Reviewer model <select id="level-model"></select></label>
     <div id="levels">Loading…</div>
-    <p class="note">First-round approval uses the first reviewed PR head. Supplemental reviews match by repository and exact head. Per-landed figures divide PR-linked review time and weekly allowance by PRs with a recorded merge. Quota uses available readings by pool and may include concurrent usage.</p>
+    <p class="note">First-round approval uses the first parsed verdict per level on the PR's first review head. Supplemental reviews match by repository and exact head. Per-landed figures divide PR-linked review time and weekly allowance by PRs with a recorded merge. Quota uses available readings by pool and may include concurrent usage.</p>
   </section>
   <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2>
     <p class="muted">Rounds are the distinct heads a parsed review of record judged. After a first round that did not approve, a later round approved a new head (the author changed the code), approved the same head (no change), or nothing approved it yet in this window.</p>

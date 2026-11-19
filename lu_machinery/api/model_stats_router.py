@@ -515,6 +515,11 @@ def _review_order(row: _Row) -> tuple[datetime, str]:
     return (row.started or row.moment, row.task_id)
 
 
+def _verdict_order(row: _Row) -> tuple[bool, datetime, str]:
+    """Prefer a parsed verdict on the same head, then the earliest attempt."""
+    return (row.review is None or row.review[0] == "unparsed", *_review_order(row))
+
+
 def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list[_Row]) -> list[dict[str, Any]]:
     """Compare reviews of the same first round and match supplemental results by their exact head."""
     first: dict[_PrKey, _Row] = {}
@@ -566,7 +571,7 @@ def _review_level(level: str, observed: Mapping[str, Any] | None, linked: list[t
         initial = first[pr]
         head = initial.raw.get("pinned_head")
         if (row is initial or (head is not None and row.raw.get("pinned_head") == head)) and (
-            pr not in first_by_pr or _review_order(row) < _review_order(first_by_pr[pr])
+            pr not in first_by_pr or _verdict_order(row) < _verdict_order(first_by_pr[pr])
         ):
             first_by_pr[pr] = row
         if pr in landed:
