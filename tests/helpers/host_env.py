@@ -27,7 +27,9 @@ A module opts in by importing the fixture; it is autouse, so it runs before the 
 
 An exported setting is one whose current value is the caller's: the environment this process started with
 (``/proc/self/environ``) or, in an xdist worker, the one its controller started with (the worker's own start
-environment already holds what the controller published, such as ``PYTHONDONTWRITEBYTECODE``). The
+environment already holds what the controller published, such as ``PYTHONDONTWRITEBYTECODE``). A worker is known by
+its pytest ``workerinput``, never by an environment variable a nested run inherits, and it reads its controller only
+after checking that its parent is the controller ``tests/conftest.py`` names there (``CONTROLLER_PID_KEY``). The
 values the suite publishes itself, such as the telemetry redirect, scratch root and task store, differ from the
 inherited ones and stay, so a child never loses a redirect and writes to production. Equal values cannot show who
 set a variable, so the names in ``SUITE_PUBLISHED`` are never dropped: the suite publishes each of them for every
@@ -67,16 +69,26 @@ SUITE_PUBLISHED = frozenset({
     "PYTHONDONTWRITEBYTECODE",
 })
 SEARCH_PATH_VARIABLE = "PYTHONPATH"
+CONTROLLER_PID_KEY = "lu_host_env_controller_pid"
 INTERPRETER_VARIABLE = "LEARN_UKRAINIAN_PYTHON"
 
 
-def inherited_environment() -> dict[str, str]:
+def inherited_environment(workerinput: dict[str, object] | None = None) -> dict[str, str]:
     """The caller's environment, before the suite or a test changed ``os.environ``.
 
-    That is this process's start environment, or for an xdist worker (``PYTEST_XDIST_WORKER``) its controller's,
-    the process that started it. Fails the test rather than guessing when it cannot be read.
+    That is this process's start environment or, for an xdist worker (its ``workerinput``), the start environment of
+    the controller that started it. Fails the test rather than guessing when the worker's parent is not the
+    controller the workerinput names, or when the environment cannot be read.
     """
-    source = f"/proc/{os.getppid()}/environ" if os.environ.get("PYTEST_XDIST_WORKER") else "/proc/self/environ"
+    source = "/proc/self/environ"
+    if workerinput is not None:
+        controller = workerinput.get(CONTROLLER_PID_KEY)
+        if type(controller) is not int or controller != os.getppid():
+            pytest.fail(
+                f"host_isolated_env: this xdist worker's parent ({os.getppid()}) is not the controller its workerinput "
+                f"names ({controller!r}), so the caller's environment is unknown"
+            )
+        source = f"/proc/{controller}/environ"
     try:
         raw = Path(source).read_bytes()
     except OSError as exc:
@@ -119,9 +131,11 @@ def without_shims(search_path: str) -> str:
 
 
 @pytest.fixture(autouse=True)
-def host_isolated_env(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+def host_isolated_env(
+    request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     """Drop the caller's Git, user-config, exported, Python, shim and temp settings; return the test's private home."""
-    inherited = inherited_environment()
+    inherited = inherited_environment(getattr(request.config, "workerinput", None))
     for name, value in list(os.environ.items()):
         if name.startswith((GIT_PREFIX, XDG_PREFIX)) or caller_exported(name, value, inherited):
             monkeypatch.delenv(name)
