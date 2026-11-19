@@ -1412,7 +1412,7 @@ def test_sol_authored_gemini_approval_passes_and_gemini_author_needs_sol(monkeyp
     _tasks, comments, _calls = setup_record(monkeypatch, gemini_root, families={"google"})
     body = recorder.build_comment(
         sha=SHA, task_id="review-gemini", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gemini-3.8-flash-high", family="google", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model="gemini-4-neon-high", family="google", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3,
         author_models=("gemini-3.8-flash-high",),
     )
@@ -1455,12 +1455,12 @@ def test_a_blank_author_beside_an_attested_marker_still_needs_both_seats():
 
     bare = recorder.build_comment(
         sha=SHA, task_id="review-bare", started="2026-09-23T12:00:00.000001+00:00",
-        verdict="APPROVED", model="gemini-3.8-flash-high", family="google", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model="gemini-4-neon-high", family="google", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3,
     )
     named = recorder.build_comment(
         sha=SHA, task_id="review-named", started="2026-09-23T12:00:01.000001+00:00",
-        verdict="APPROVED", model="gemini-3.8-flash-high", family="google", reply="VERDICT: APPROVE",
+        verdict="APPROVED", model="gemini-4-neon-high", family="google", reply="VERDICT: APPROVE",
         review_profile="ukrainian", sources_mcp_call_count=3, author_models=(CURRENT_SOL,),
     )
     alone = sweep.lookup_verdict([comment(bare, 1)], SHA, "fleet")
