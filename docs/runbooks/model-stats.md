@@ -284,27 +284,50 @@ blocked first round, 81% of Opus 5.5 PRs were approved on a new head and 1.5% on
 Approval rate and findings per review say how strict a reviewer is, not whether it is right. `reviewer_accuracy`
 adds two measures.
 
-**Finding precision** (`reviewer_accuracy.findings`). For each blocking review of record (parsed verdict
-`incorrect`), each P0-P1 finding waits for the same reviewer's first approval of that PR at another head that
-finished after the blocking review finished:
+**Finding precision** (`reviewer_accuracy.findings`). A blocking review of record is a review whose
+`CHANGES_REQUESTED` verdict the verdict recorder published on the PR at the row's head, as the
+[publication ledger](#publication-ledger) records it. Each of its P0-P1 findings waits for the same reviewer's
+first published approval of that PR at another head that finished after the blocking review finished:
 
 - `fixed`: the approved head differs from the blocked head in the finding's file (the author changed it);
 - `dismissed`: the approved head left that file unchanged (the reviewer accepted the author's answer);
-- `open`: no such approval yet. Another reviewer's approval does not settle the finding, and neither does an
-  approval of the blocked head itself: the verdict recorder refuses an APPROVE at a head with a recorded rejection
+- `open`: no such approval yet. Another reviewer's approval does not settle the finding, nor does an unpublished
+  approval, nor an approval of the blocked head itself: the verdict recorder refuses an APPROVE at a head with a recorded rejection
   (`require_no_same_head_rejection`), so that reply is never a verdict of record;
 - `unknown`: the row keeps no finding paths (a reply in the older unversioned format, or a row not yet
   backfilled), or a head is missing from the row or from the repository's local checkout.
 
-Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. The summary
-rows do not record whether a verdict was published: that lives only in the PR's `cf-verdict` comment, which the
-Monitor does not read, and no local record tells a published formal review from an unpublished one (both carry
-`review_mode: cross_family` and `require_review_verdict`). Measured on 2026-11-19 against the PR comments of
-the machinery and public repositories over 30 days: every one of the 234 settling approvals had a recorded
-verdict, while 34 of the 234 blocking reviews whose findings they settled had none (rounds whose verdict was
-never recorded, for example because the head moved first). Those findings still count; as in every author
-figure, a review of record here means a parsed formal review that names the PR and the author's model. A local
-record of each published verdict, written by the recorder, would close this gap.
+A parsed blocking reply (verdict `incorrect`) that the ledger does not name at its PR and head is of unknown
+publication: it counts in `reviews_unknown_publication` (the page's "Blocking replies of unknown publication"
+column) and in nothing else, so it never enters the denominator. Before the ledger, nothing local could tell the
+two apart: published and unpublished formal runs carry the same task-record fields. Measured on 2026-11-19
+against the PR comments of the machinery and public repositories over 30 days, 34 of 234 blocking reviews whose
+findings a later approval settled had no published verdict (rounds whose head moved before recording, for
+example). Findings settle on the reviewer ids as recorded; the page groups labels (`other`) only after that. As
+in every author figure, a review here must name the PR and the author's model.
+
+### Publication ledger
+
+`batch_state/model-stats/publications.jsonl` (schema `review-publication.v1`) holds one line per verdict the
+recorder published: task id, repository, PR, head, verdict and GitHub's comment time. Its one writer is
+`lu_machinery/review/record_cf_verdict.py`, under the rows lock: `record` stores the line after it posts the
+verdict or finds it already posted, and reports `publication_marker` (`stored`, or `failed: <reason>; rerun
+record to store it`; a failure never undoes the publication, and the rerun finds the posted comment and stores
+the line). The statistics read the ledger; the Monitor never reads GitHub. A line that does not have the writer's
+shape is skipped and counted in `coverage.publications.malformed_lines`; the last line of a task id wins.
+
+History: verdicts published before the ledger existed are imported once, after the release installs, by the same
+module from the PRs' `cf-verdict` comments. It keeps only the markers the recorder itself would trust (the
+current identity, an owner, member or collaborator association, never edited) and adds what the ledger lacks:
+
+```
+.venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --dry-run
+.venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --days 30
+```
+
+It reads each PR of the review rows that finished in the last `--days` days once (about 180 PRs for 30 days).
+Rerunning it is safe; it exits 1 when a PR could not be read. Reviews older than the import stay of unknown
+publication.
 
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one

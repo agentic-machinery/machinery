@@ -61,6 +61,7 @@ from .model_stats_rows import (
     UNPARSED_REASONS,
     VERDICTS,
     path_digest,
+    read_publications,
     read_rows,
     timestamp,
     variant_effort,
@@ -317,6 +318,9 @@ class _Row:
     author: str | None
     allowance: tuple[str, float] | None
     raw: Mapping[str, Any]
+    # The verdict the recorder published for this review at this row's PR and head (the publication ledger), or
+    # None when no publication of it is recorded: its publication is unknown.
+    published: str | None = None
 
     @property
     def landed(self) -> bool:
@@ -379,8 +383,18 @@ def alias_resolver(raw_rows: Iterable[Mapping[str, Any]]) -> Callable[[str, date
     return resolve
 
 
+def _published(raw: Mapping[str, Any], publications: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """The verdict published for a review row, when the ledger names its task at the row's own PR and head."""
+    entry = publications.get(raw["task_id"])
+    if entry is None or raw.get("role") != "review" or entry["pr"] != raw.get("pr") or entry["head"] != raw.get(
+            "pinned_head"):
+        return None
+    return str(entry["verdict"])
+
+
 def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
-          resolve: Callable[[str, datetime], str] = lambda model, _moment: model) -> Iterator[_Row]:
+          resolve: Callable[[str, datetime], str] = lambda model, _moment: model,
+          publications: Mapping[str, Mapping[str, Any]] | None = None) -> Iterator[_Row]:
     for raw in raw_rows:
         moment = _moment(raw)
         if moment is None:
@@ -418,6 +432,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             author=resolve(str(author), moment) if author else None,
             allowance=_allowance(raw.get("allowance")),
             raw=raw,
+            published=_published(raw, publications or {}),
         )
 
 
@@ -690,19 +705,20 @@ PLANTED_DEFECT_RECALL = {
 
 
 def _blocking_reviews(rows: Iterable[_Row]) -> Iterator[tuple[_Row, list[_Row], list[str] | None, int | None]]:
-    """Each parsed blocking review of record, the same PR's parsed reviews of record that finished after it (in
-    finish order), the path digests of its P0-P1 findings (None when the row has none) and its P0-P1 count (None
-    when unknown). A review counts by its finish (``moment``): a review that started later can finish first."""
+    """Each blocking review of record (a review whose CHANGES_REQUESTED verdict the recorder published at its head,
+    by the publication ledger), the same PR's published reviews that finished after it (in finish order), the path
+    digests of its P0-P1 findings (None when the row has none) and its P0-P1 count (None when unknown). A review
+    counts by its finish (``moment``): a review that started later can finish first."""
     prs: dict[tuple[str, str], list[_Row]] = defaultdict(list)
     for row in rows:
-        if row.review is not None and row.review[0] != "unparsed" and row.author is not None:
+        if row.review is not None and row.published is not None and row.author is not None:
             prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))].append(row)
     for reviews in prs.values():
         reviews.sort(key=lambda r: (r.moment, r.task_id))
         for row in reviews:
-            verdict, priorities, _, _ = cast(tuple[str, Counter[str] | None, str | None, str | None], row.review)
-            if verdict != "incorrect":
+            if row.published != "CHANGES_REQUESTED":
                 continue
+            priorities = cast(tuple[str, Counter[str] | None, str | None, str | None], row.review)[1]
             stored = row.raw["review"].get("blocking_paths") if isinstance(row.raw.get("review"), Mapping) else None
             count = None if priorities is None else sum(priorities[p] for p in BLOCKING)
             later = [other for other in reviews if other.moment > row.moment]
@@ -710,14 +726,12 @@ def _blocking_reviews(rows: Iterable[_Row]) -> Iterator[tuple[_Row, list[_Row], 
 
 
 def _resolution(row: _Row, later: list[_Row]) -> _Row | None:
-    """The same reviewer's first later approval of the PR at another head: the reviewer's own word that its findings
-    are settled. An approval of the blocked head itself never settles them: the verdict recorder refuses an APPROVE
-    at a head with a recorded rejection (``record_cf_verdict.require_no_same_head_rejection``), so such a reply is
-    never a verdict of record."""
+    """The same reviewer's first later published approval of the PR at another head: the reviewer's own word that its
+    findings are settled. An approval of the blocked head itself never settles them: the verdict recorder refuses an
+    APPROVE at a head with a recorded rejection (``record_cf_verdict.require_no_same_head_rejection``)."""
     blocked = row.raw.get("pinned_head")
-    return next((other for other in later if other.model == row.model and other.review is not None
-                 and other.review[0] == "correct"
-                 and (blocked is None or other.raw.get("pinned_head") != blocked)), None)
+    return next((other for other in later if other.model == row.model and other.published == "APPROVED"
+                 and other.raw.get("pinned_head") != blocked), None)
 
 
 def head_pairs(rows: Iterable[_Row]) -> set[_HeadPair]:
@@ -739,13 +753,19 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
                       name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Per reviewer model: what became of each P0-P1 finding of its blocking reviews of record.
 
-    The outcome waits for the same reviewer's later approval of the PR at another head. ``fixed``: that head changed
+    Only published verdicts count. A parsed blocking reply with no publication recorded (an unpublished run, or one
+    from before the ledger) is of unknown publication: it adds to ``reviews_unknown_publication`` and to nothing
+    else. The outcome waits for the same reviewer's later approval of the PR at another head. ``fixed``: that head changed
     the finding's file. ``dismissed``: it left the file unchanged. ``open``: no such approval yet. ``unknown``: the
     row keeps no finding paths, or a head is missing from the row or the local checkout. Precision is fixed over
     fixed plus dismissed. Findings settle on the reviewer ids as recorded; ``name`` (the page's label bucket) applies
     only when the counts are grouped, so one reviewer's approval never settles another's finding.
     """
+    rows = list(rows)
     counts: dict[str, Counter[str]] = defaultdict(Counter)
+    for row in rows:
+        if row.published is None and row.author is not None and row.review is not None and row.review[0] == "incorrect":
+            counts[name(row.model)]["unknown_publication"] += 1
     for row, later, paths, count in _blocking_reviews(rows):
         tally = counts[name(row.model)]
         tally["reviews"] += 1
@@ -768,6 +788,7 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
         decided = tally["fixed"] + tally["dismissed"]
         out.append({
             "model": model, "identity": identity(model), "blocking_reviews": tally["reviews"],
+            "reviews_unknown_publication": tally["unknown_publication"],
             "reviews_without_paths": tally["reviews_without_paths"],
             "blocking_findings": sum(tally[outcome] for outcome in FINDING_OUTCOMES),
             **{outcome: tally[outcome] for outcome in FINDING_OUTCOMES},
@@ -1292,8 +1313,9 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             "precision": "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
                          "later head changed its file before the same reviewer approved, else dismissed; a file "
                          "changed for another reason (another finding, a merge of main) still counts as fixed, and "
-                         "a fix made in a different file counts as dismissed. Whether a blocking verdict was "
-                         "published is not recorded locally, so an unpublished formal review still counts.",
+                         "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
+                         "count; a blocking reply with no recorded publication (an unpublished run, or one from "
+                         "before the publication ledger and not imported) is of unknown publication and left out.",
             "recall": "No planted-defect result is recorded in the summary rows.",
             "savant": "No Savant model is in the catalog, and no row names one.",
             "links": "This snapshot does not include task ids.",
@@ -1456,15 +1478,16 @@ def _weeks(groups: _Weeks) -> list[dict[str, Any]]:
 
 def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = None, *,
             landing: Landing | None = None) -> dict[str, Any]:
-    """One snapshot: every window and the ISO-week buckets, from the summary rows, one landing scan and one read of
-    the files changed between blocked and approved review heads."""
+    """One snapshot: every window and the ISO-week buckets, from the summary rows, the publication ledger, one landing
+    scan and one read of the files changed between blocked and approved review heads."""
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
+    publications, publication_counts = read_publications(batch_state_dir)
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     if landing is None:
         landing = scan_landing(primary_root, first)
-    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
+    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications) if row.moment < until]
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs)
     all_prs = _prs(rows)
@@ -1510,6 +1533,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "weeks": _weeks(weeks),
         "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
+                     "publications": dict(sorted(publication_counts.items())),
                      # Blocked-to-approved head pairs whose changed files were read from a local checkout.
                      "finding_heads": {"pairs": len(pairs), "read": len(touched)}},
     }

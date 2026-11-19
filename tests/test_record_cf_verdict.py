@@ -668,6 +668,112 @@ def test_clean_publication_bytes_unchanged(scanned_recorder, tmp_path):
     assert result["score"] == 8 and sweep.parse_marker(expected)["verdict"] == "APPROVED"
 
 
+def _ledger(tmp_path):
+    path = tmp_path / "model-stats" / "publications.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+@pytest.mark.parametrize("verdict", ["APPROVED", "CHANGES_REQUESTED"])
+def test_published_verdict_stores_one_local_publication_marker(monkeypatch, tmp_path, verdict):
+    """Defect class: a verdict published on the PR leaves no local marker, so the model statistics cannot tell it
+    from an unpublished run (#902), or a recorder rerun stores it twice."""
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply=f"VERDICT: {verdict}\nOrdinary reviewer text.\n")
+    first = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    second = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert (first["comment"], second["comment"]) == ("posted", "existing") and calls["posts"] == 1
+    assert first["publication_marker"] == second["publication_marker"] == "stored"
+    assert _ledger(tmp_path) == [{
+        "schema": "review-publication.v1", "task_id": "review-one", "repository": "owner/repo", "pr": 42,
+        "head": SHA, "verdict": verdict, "published_at": comments[0]["created_at"],
+    }]
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_unwritable_publication_marker_never_undoes_the_publication(monkeypatch, tmp_path):
+    """Defect class: a marker write failure hides the posted verdict, retries the post, or passes silently; the
+    receipt must name the failure, and a rerun must store the marker without posting again."""
+    from lu_machinery.api import model_stats_rows
+
+    tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
+    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n")
+    real = model_stats_rows.record_publications
+
+    def busy(*_args, **_kwargs):
+        raise TimeoutError("the model-stats rows lock is busy")
+
+    monkeypatch.setattr(model_stats_rows, "record_publications", busy)
+    first = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert first["comment"] == "posted" and first["status"] == "posted"
+    assert first["publication_marker"] == "failed: TimeoutError; rerun record to store it"
+    assert _ledger(tmp_path) == []
+    monkeypatch.setattr(model_stats_rows, "record_publications", real)
+    second = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert second["comment"] == "existing" and second["publication_marker"] == "stored" and calls["posts"] == 1
+    assert [entry["verdict"] for entry in _ledger(tmp_path)] == ["APPROVED"]
+
+
+def test_import_publications_keeps_only_trusted_unedited_verdicts_of_record(tmp_path, monkeypatch):
+    """Defect class: the history import counts a verdict the recorder would not trust (another login, an outside
+    association, an edited comment), reads PRs outside the window or of write tasks, or writes on a dry run."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.api import model_stats_rows
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+    from tests.review.record_support import REPOSITORY, recorded_verdict
+
+    now = datetime(2026, 9, 30, tzinfo=UTC)
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    base = {"schema": model_stats_rows.ROW_SCHEMA, "harness": "codex", "model": "gpt-6.2-sol", "effort": "high",
+            "role": "review", "class": "code/medium", "status": "done", "never_started_reason": None,
+            "duration_s": None, "tokens": {"fresh_input": 0, "cached_input": 0, "output": 0}, "allowance": None,
+            "review": None, "repo": "unit", "data_class": None, "pinned_head": None, "author_model": None,
+            "landing": None, "source_mtime_ns": 1, "started_at": None}
+    for task_id, pr, finished in (("fresh-review", 42, "2026-09-29T00:00:00+00:00"),
+                                  ("old-review", 7, "2026-08-01T00:00:00+00:00"),
+                                  ("write-task", 8, "2026-09-29T00:00:00+00:00")):
+        model_stats_rows.append_row(tmp_path, {**base, "task_id": task_id, "pr": pr, "finished_at": finished,
+                                               **({"role": "write", "class": "unclassified"}
+                                                  if task_id == "write-task" else {})})
+    other_head = "c" * 40
+    comments = [
+        recorded_verdict(SHA, "CHANGES_REQUESTED", task_id="fresh-review"),
+        recorded_verdict(other_head, "APPROVED", task_id="later-review"),
+        {**recorded_verdict(SHA, "APPROVED", task_id="stranger-review"), "user": {"login": "someone"}},
+        {**recorded_verdict(SHA, "APPROVED", task_id="outside-review"), "author_association": "NONE"},
+        recorded_verdict(SHA, "APPROVED", task_id="edited-review", edited=True),
+        {"body": "an ordinary comment", "user": {"login": "fleet"}, "author_association": "MEMBER"},
+    ]
+    read = []
+
+    class Adapter:
+        def identity(self):
+            return "fleet"
+
+        def comments(self, repository, number):
+            read.append((repository, number))
+            return comments
+
+    catalog = {"unit": FleetRepo("unit", REPOSITORY, "unit", "test")}
+    monkeypatch.setattr(recorder, "load_fleet_repos", lambda: catalog)
+    dry = recorder.import_publications(days=30, dry_run=True, task_root=tasks, now=now, adapter=Adapter())
+    assert _ledger(tmp_path) == [] and read == [(REPOSITORY, 42)]
+    assert dry == {"prs": 1, "prs_unreadable": 0, "markers": 2, "markers_untrusted": 3, "markers_skipped": 0,
+                   "rows_unregistered_repo": 0, "would_add": 2}
+    done = recorder.import_publications(days=30, dry_run=False, task_root=tasks, now=now, adapter=Adapter())
+    assert done["added"] == 2
+    assert [(e["task_id"], e["pr"], e["head"], e["verdict"], e["published_at"]) for e in _ledger(tmp_path)] == [
+        ("fresh-review", 42, SHA, "CHANGES_REQUESTED", "2026-09-23T11:30:00Z"),
+        ("later-review", 42, other_head, "APPROVED", "2026-09-23T11:30:00Z"),
+    ]
+    again = recorder.import_publications(days=30, dry_run=False, task_root=tasks, now=now, adapter=Adapter())
+    assert again["added"] == 0 and len(_ledger(tmp_path)) == 2
+
+
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_skeleton_scanner_rejection_has_no_write(scanned_recorder, tmp_path, monkeypatch, synthetic_opsec):
