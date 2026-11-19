@@ -464,15 +464,10 @@ SESSION_IDENTITY_ENV_VARS = (
     "CLAUDE_ENV_FILE",
 )
 
-# The caller's choice of host test-slot pool, size and wait. The session's dispatch cap reads them when it starts
-# (``_INHERITED_ENV`` keeps them for that); a test that exercises a pool sets its own (#917 R2 F8: a caller's pool
-# otherwise reaches dispatch admission and sandbox children).
-TEST_SLOT_POOL_ENV_VARS = ("LU_TEST_SLOTS_DIR", "LU_TEST_SLOTS_COUNT", "LU_TEST_SLOTS_WAIT_S")
-
 
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, object, object]:
-    """Run every test without the launching agent session's identity (#8778) or the caller's test-slot pool.
+    """Run every test without the launching agent session's identity (#8778).
 
     The outermost wrapper around setup, call, and teardown, so no fixture of
     any scope sees the identity. Tests that need a variable set it themselves;
@@ -482,7 +477,7 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
     Variables published later by the suite remain available to its tests.
     """
     with pytest.MonkeyPatch.context() as patch:
-        for name in (*SESSION_IDENTITY_ENV_VARS, *TEST_SLOT_POOL_ENV_VARS):
+        for name in SESSION_IDENTITY_ENV_VARS:
             # Recorded even when absent (the usual case: the list at import dropped it), so a value the test
             # writes is gone after teardown.
             patch.setenv(name, "")
@@ -2967,6 +2962,9 @@ def pytest_configure_node(node: Any) -> None:
     again at import and ``pytest_configure`` puts this copy back.
     """
     node.workerinput[_XDIST_PUBLISHED_CREDENTIALS_KEY] = _published_credential_env()
+    node.workerinput[_XDIST_CONTROLLER_ENV_KEY] = {
+        name: os.environ.get(name) for name in _INHERITED_ENV - _WORKER_OWN_ENV
+    }
     node.workerinput[_XDIST_REDACTION_SECRETS_KEY] = dict(_IMPORT_STRIPPED_SECRETS)
 
 
@@ -2975,6 +2973,19 @@ def pytest_configure(config: pytest.Config) -> None:
     # runs; the caller's home was dropped at import. Git's global configuration, its default ignore and attributes
     # files, the XDG directories and the CODEX_HOME default resolve inside it, and so does the CLAUDE_CONFIG_DIR
     # default wherever pytest_scratch has not set one (xdist workers). Git reads no system configuration.
+    workerinput = getattr(config, "workerinput", None)
+    if isinstance(workerinput, dict):
+        # A worker runs inside its controller's scratch run and environment; a ``--tx env:`` value that replaces a
+        # kept name (TMPDIR, PATH, ...) would move it out of both.
+        controller = workerinput.get(_XDIST_CONTROLLER_ENV_KEY)
+        if not isinstance(controller, dict):
+            raise pytest.UsageError("xdist worker: the controller sent no environment to check against")
+        differ = sorted(name for name in _INHERITED_ENV - _WORKER_OWN_ENV if os.environ.get(name) != controller.get(name))
+        if differ:
+            raise pytest.UsageError(f"xdist worker: environment differs from its controller in {', '.join(differ)}")
+    if os.pathsep in str(config.option.basetemp or ""):
+        # Fixtures prepend directories under it to PATH (the gh, claude and Cursor stubs); one would split there.
+        raise pytest.UsageError(f"the base temp {config.option.basetemp} contains {os.pathsep!r}, which splits PATH")
     home = tempfile.TemporaryDirectory(prefix="home-")
     config.add_cleanup(home.cleanup)
     home_env = pytest.MonkeyPatch()
@@ -4210,8 +4221,21 @@ _INHERITED_ENV = frozenset({
     "CI",
     "GITHUB_EVENT_NAME",
     "GITHUB_STEP_SUMMARY",
-    # pytest's and xdist's own; a worker sets its PYTEST_XDIST_* names before it imports this module.
+    # pytest's and its installed plugins' own inputs (pytest, xdist, execnet, pytest-timeout), read after this module
+    # is imported; a worker sets its PYTEST_XDIST_* names before it imports this module.
     "PYTEST_ADDOPTS",
+    "PYTEST_TIMEOUT",
+    "PYTEST_DEBUG",
+    "PYTEST_DEBUG_TEMPROOT",
+    "PYTEST_THEME",
+    "PYTEST_THEME_MODE",
+    "PY_COLORS",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "COLUMNS",
+    "BUILD_NUMBER",
+    "PY_IGNORE_IMPORTMISMATCH",
+    "EXECNET_DEBUG",
     "PYTEST_PLUGINS",
     "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
     "PYTEST_CURRENT_TEST",
@@ -4234,8 +4258,8 @@ _INHERITED_ENV = frozenset({
     "LU_LIVE_CLAUDE_PERMISSIONS",
     "LU_OPSEC_TEST_TOOLING",
     # The host test-slot pool and dispatch cap (lu_machinery.ci.pytest_dispatch_cap), read as the session and each
-    # xdist worker start, before ``pytest_configure``; each test runs without the pool settings (TEST_SLOT_POOL_ENV_VARS)
-    # and without the dispatch task id (SESSION_IDENTITY_ENV_VARS).
+    # xdist worker start, before ``pytest_configure``, and by a pytest a test starts inside the session's hold. Each test
+    # runs without the dispatch task id (SESSION_IDENTITY_ENV_VARS).
     "LU_TEST_SLOTS",
     "LU_TEST_SLOTS_COUNT",
     "LU_TEST_SLOTS_WAIT_S",
@@ -4250,34 +4274,84 @@ _INHERITED_ENV = frozenset({
     "LU_TEST_PROTECTED_STORES",
 })
 _INHERITED_ENV_APPLIED = "_lu_inherited_env_applied"
+# Set only on the restart below, so the restarted process never restarts again.
+_INHERITED_ENV_RESTARTED = "LU_TEST_INHERITED_ENV_RESTARTED"
+# The names whose values a worker may hold apart from its controller.
+_WORKER_OWN_ENV = frozenset({"PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST"})
+_XDIST_CONTROLLER_ENV_KEY = "lu_suite_controller_inherited_env"
 
 
-def _keep_only_inherited_env() -> None:
-    """Delete every inherited variable not in ``_INHERITED_ENV``, then set the values the suite owns.
+def _keeps_path_entry(entry: str) -> bool:
+    """An absolute PATH entry whose destination is not an agent-runtime shim directory (aliases and links included)."""
+    return os.path.isabs(entry) and Path(os.path.realpath(entry)).parts[-2:] != ("agent_runtime", "shims")
 
-    It runs after the snapshots above that must see the caller's environment to protect the host (the real ``gh``
-    the guard refuses, the task store the write guard protects), and once per process. Set here:
+
+def _inherited_env_target() -> dict[str, str]:
+    """The environment this process keeps: the listed names, PATH without shims, and the values the suite owns.
 
     - ``PYTHONDONTWRITEBYTECODE``: no child writes bytecode.
     - ``LEARN_UKRAINIAN_PYTHON``: child launchers resolve this interpreter.
     - ``PYTHONPATH``: this checkout, only when the ``lu_machinery`` this process imported is this checkout's, so a
       child imports the same code the tests do; otherwise (CI's installed wheel) none.
-
-    ``pytest_configure`` then gives each process its own ``HOME``.
     """
+    target = {name: value for name, value in os.environ.items() if name in _INHERITED_ENV}
+    kept = [entry for entry in target.get("PATH", os.defpath).split(os.pathsep) if _keeps_path_entry(entry)]
+    target["PATH"] = os.pathsep.join(kept) or os.defpath
+    target["PYTHONDONTWRITEBYTECODE"] = "1"
+    target["LEARN_UKRAINIAN_PYTHON"] = sys.executable
+    imported = sys.modules["lu_machinery"].__file__
+    if imported is not None and Path(imported).resolve().parent.parent == _REPO_ROOT:
+        target["PYTHONPATH"] = str(_REPO_ROOT)
+    return target
+
+
+def _started_as_pytest() -> bool:
+    """This process is a pytest command (``python -m pytest`` or a pytest script), not a program calling pytest."""
+    spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    return getattr(spec, "name", None) == "pytest.__main__" or Path(sys.argv[0]).name in {"pytest", "py.test"}
+
+
+# The kept environment a pytest command restarts in (``pytest_cmdline_main``), or None.
+_RESTART_ENV: dict[str, str] | None = None
+
+
+def _keep_only_inherited_env() -> None:
+    """Give this process only the environment ``_inherited_env_target`` keeps, once.
+
+    It runs after the snapshots above that must see the caller's environment for their guards (the real ``gh`` the
+    guard refuses, the task store the write guard protects), and replaces the environment in place. A pytest command
+    whose environment differed is then restarted once, before its session (``pytest_cmdline_main``), with the same
+    interpreter and arguments in the kept environment, so that the interpreter's start (``sys.path``,
+    ``PYTHONSAFEPATH``, locale) and the plugins pytest loads before this module see only it. An xdist worker (its
+    controller restarted; ``pytest_configure`` checks it against the controller) and a program that calls
+    ``pytest.main`` itself keep the in-place replacement. ``pytest_configure`` then gives each process its own HOME.
+    """
+    global _RESTART_ENV
     if getattr(sys, _INHERITED_ENV_APPLIED, False):
         return
     setattr(sys, _INHERITED_ENV_APPLIED, True)
-    for name in [name for name in os.environ if name not in _INHERITED_ENV]:
-        del os.environ[name]
-    entries = os.environ.get("PATH", os.defpath).split(os.pathsep)
-    kept = [entry for entry in entries if os.path.isabs(entry) and Path(entry).parts[-2:] != ("agent_runtime", "shims")]
-    os.environ["PATH"] = os.pathsep.join(kept) or os.defpath
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-    os.environ["LEARN_UKRAINIAN_PYTHON"] = sys.executable
-    imported = sys.modules["lu_machinery"].__file__
-    if imported is not None and Path(imported).resolve().parent.parent == _REPO_ROOT:
-        os.environ["PYTHONPATH"] = str(_REPO_ROOT)
+    restarted = os.environ.pop(_INHERITED_ENV_RESTARTED, None) == "1"
+    target = _inherited_env_target()
+    if target != dict(os.environ) and not restarted and "PYTEST_XDIST_WORKER" not in os.environ and _started_as_pytest():
+        _RESTART_ENV = {**target, _INHERITED_ENV_RESTARTED: "1"}
+    os.environ.clear()
+    os.environ.update(target)
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_cmdline_main(config: pytest.Config) -> Generator[None, object, object]:
+    """Restart a pytest command in its kept environment before anything of the session exists.
+
+    The outermost wrapper, so no other plugin's session work has started; pytest has suspended its global output
+    capture after loading the initial conftests, so the restarted process writes to the original streams.
+    """
+    global _RESTART_ENV
+    restart, _RESTART_ENV = _RESTART_ENV, None
+    if restart is not None and not hasattr(config, "workerinput"):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], restart)
+    return (yield)
 
 
 _keep_only_inherited_env()
