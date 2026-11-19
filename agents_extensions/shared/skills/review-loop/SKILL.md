@@ -133,8 +133,10 @@ interpreter does not select the primary checkout's Python modules.
    Use `--research-role advisory` and `--pinned-head "$HEAD_SHA"`. Put the PR number in the
    prompt. Omit `--pr` and formal review flags so the dispatch stays supplemental. For Savant,
    classify the prompt, inline the exact-head diff and relevant evidence, and ask for the
-   same canonical findings JSON as the reviewer of record. Savant cannot open the checkout
-   or the schema file, so include the schema from the merge-base in the prompt. Do not send
+   same canonical findings JSON as the reviewer of record. With a public data class Savant
+   reads only a read-only snapshot of the published start commit, never the checkout; with a
+   private class its tools stay off. Either way include the schema from the merge-base in the
+   prompt. Do not send
    secrets or unknown-class inputs. Record an unavailable seat as such.
 
    Check each trial's findings against the pinned head and compare them with the review of
