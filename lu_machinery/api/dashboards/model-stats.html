@@ -153,7 +153,7 @@
     <label>Reviewer model <select id="level-model"></select></label>
     <div id="levels">Loading…</div></section>
   <section><h2>Reviewed PRs <span class="meta" id="author-meta"></span></h2>
-    <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show whether approval followed a new head, the same head, or was still outstanding.</p>
+    <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show approval on a new head, approval on the same head, or no approval in the window.</p>
     <div id="author">Loading…</div></section>
   <section><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
@@ -578,7 +578,7 @@ function renderCoverage(data) {
   if (repositories) {
     const read = repositories.read || 0;
     const total = Object.values(repositories).reduce((sum, count) => sum + count, 0);
-    coverage = read < total
+    coverage = !total ? ' <strong class="warn">No repository check was recorded.</strong>' : read < total
       ? ` <strong class="warn">Checked ${num(read)} of ${num(total)} repositories. Some merges may be missing.</strong>`
       : ` <strong class="good">Checked all ${num(total)} repositories.</strong>`;
   }
@@ -632,7 +632,7 @@ function render() {
   const authors = (data.authors || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
   $("author-meta").textContent = `${label} · ${num(authors.reduce((s, a) => s + a.prs, 0))} PRs`;
   $("author").innerHTML = table(["Author model", "PRs", "Rounds / PR", "Approved eventually", "Approved first round",
-    "Blocked first round", "New head", "Same head", "Still open", "Blocking / PR", "P0–P2 / PR"],
+    "Blocked first round", "New head", "Same head", "No approval", "Blocking / PR", "P0–P2 / PR"],
     grouped(authors, (a) => [`<tr><td>${named(a)}</td>${cell(nOf({n: a.prs, low_sample: a.low_sample}))}${cell(rate(a.rounds_per_pr))}`
       + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}${cell(a.after_blocked_first_round.blocked)}`
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
