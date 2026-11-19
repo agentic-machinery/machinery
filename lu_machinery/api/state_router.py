@@ -2304,19 +2304,10 @@ def _tasks_content_token(tasks_dir: Path) -> str:
         directory = os.stat(tasks_dir)
     except OSError:
         return "missing"
-    newest = directory.st_mtime_ns
-    files = []
     try:
-        with os.scandir(tasks_dir) as entries:
-            for entry in entries:
-                if not entry.name.endswith(".json"):
-                    continue
-                file_stat = entry.stat()
-                files.append((entry.name, file_stat))
-                newest = max(newest, file_stat.st_mtime_ns)
+        return delegate_api.task_inventory_token(tasks_dir, directory.st_mtime_ns)
     except OSError:
         return f"unreadable:{directory.st_mtime_ns}"
-    return delegate_api._task_generation_token(newest, files)
 
 
 @dataclass

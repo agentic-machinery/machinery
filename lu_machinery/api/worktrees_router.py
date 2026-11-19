@@ -72,7 +72,7 @@ def _run(cmd: list[str], cwd: Path, timeout_s: float = _GIT_TIMEOUT_S) -> tuple[
         return 127, "", f"{type(exc).__name__}: {exc}"
 
 
-def _parse_worktree_list(porcelain: str) -> list[dict[str, Any]]:
+def parse_worktree_list(porcelain: str) -> list[dict[str, Any]]:
     """Parse ``git worktree list --porcelain`` output.
 
     Format (blank-line separated, one record per worktree):
@@ -86,16 +86,14 @@ def _parse_worktree_list(porcelain: str) -> list[dict[str, Any]]:
     """
     records: list[dict[str, Any]] = []
     current: dict[str, Any] = {}
-    for line in porcelain.splitlines():
-        if not line.strip():
+    # Git terminates attributes with LF. Unicode separators can occur in paths.
+    for line in porcelain.split("\n"):
+        if not line:
             if current:
                 records.append(current)
                 current = {}
             continue
-        if " " in line:
-            key, _, value = line.partition(" ")
-        else:
-            key, value = line, ""
+        key, _, value = line.partition(" ")
         if key == "worktree":
             current["path"] = value
         elif key == "HEAD":
@@ -199,7 +197,7 @@ async def list_worktrees(ctx: MonitorContext = Depends(get_ctx)):
                 "error": stderr.strip() or "git worktree list failed",
             }
 
-        parsed = _parse_worktree_list(stdout)
+        parsed = parse_worktree_list(stdout)
         try:
             project_root_str = str(live_repo_root.resolve())
         except OSError:

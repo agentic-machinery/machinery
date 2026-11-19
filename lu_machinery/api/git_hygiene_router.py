@@ -40,6 +40,7 @@ from .state_helpers import (
     schedule_cache_refresh,
     swr_route,
 )
+from .worktrees_router import parse_worktree_list
 
 router = APIRouter(tags=["git"])
 _GIT_TIMEOUT_S = 2.0
@@ -183,34 +184,7 @@ def _list_local_branches(cwd: Path) -> list[dict[str, Any]]:
 
 def _list_worktrees(cwd: Path) -> list[dict[str, Any]]:
     code, stdout, _stderr = _run_git(["worktree", "list", "--porcelain"], cwd=cwd)
-    if code != 0:
-        return []
-
-    worktrees: list[dict[str, Any]] = []
-    current: dict[str, Any] = {}
-    for line in stdout.split("\n"):
-        if not line:
-            if current:
-                worktrees.append(current)
-                current = {}
-            continue
-
-        key, _, value = line.partition(" ")
-        if key == "worktree":
-            current["path"] = value
-        elif key == "HEAD":
-            current["head"] = value
-        elif key == "branch":
-            current["branch"] = value.removeprefix("refs/heads/")
-        elif key == "detached":
-            current["branch"] = "(detached HEAD)"
-            current["detached"] = True
-        elif key in {"locked", "prunable"}:
-            current[key] = value or True
-
-    if current:
-        worktrees.append(current)
-    return worktrees
+    return parse_worktree_list(stdout) if code == 0 else []
 
 
 # Parallel git processes for the per-branch and per-worktree probes.
@@ -537,7 +511,7 @@ def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
     checked_out_branches = {
         record["branch"]
         for record in worktrees
-        if record.get("branch") and record.get("branch") != "(detached HEAD)"
+        if record.get("branch")
     }
 
     branch_state: dict[str, dict[str, Any]] = {}

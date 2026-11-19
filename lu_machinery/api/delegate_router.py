@@ -558,11 +558,26 @@ def _task_file_fingerprint(name: str, st: os.stat_result) -> _TaskFileFingerprin
     return f"record-v3:{name}", st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino
 
 
-def _task_generation_token(newest_mtime_ns: int, files: list[tuple[str, os.stat_result]]) -> str:
-    """Fingerprint every observed file, including changes hidden by another file's mtime."""
-    stamps = sorted(_task_file_fingerprint(name, st) for name, st in files)
+def task_inventory_token(tasks_dir: Path, newest_mtime_ns: int, *, include_archive: bool = False) -> str:
+    """Fingerprint every JSON entry, including foreign records, without reading bodies."""
+    stamps = []
+    directories = (tasks_dir, tasks_dir / TASK_ARCHIVE_DIR_NAME) if include_archive else (tasks_dir,)
+    for directory in directories:
+        try:
+            entries = os.scandir(directory)
+        except FileNotFoundError:
+            if directory == tasks_dir:
+                raise
+            continue
+        with entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    file_stat = entry.stat()
+                    stamps.append(_task_file_fingerprint(entry.name, file_stat))
+                    newest_mtime_ns = max(newest_mtime_ns, file_stat.st_mtime_ns)
+    stamps.sort()
     digest = hashlib.sha256(repr(stamps).encode()).hexdigest()
-    return f"{len(files)}:{newest_mtime_ns}:{digest}"
+    return f"{len(stamps)}:{newest_mtime_ns}:{digest}"
 
 
 def _task_summary(path: Path, task: dict[str, Any]) -> dict[str, Any]:
@@ -685,30 +700,19 @@ def _delegate_task_rows_locked(
             task_generation.append("missing")
         return [_public_task_metadata(row) for row in rows]
 
-    # Routing's generation must describe the records this locked scan reads,
-    # including a task that disappears before the budget finishes computing.
-    newest_mtime_ns = os.stat(tasks_dir).st_mtime_ns if task_generation is not None else 0
-    task_files: list[tuple[str, os.stat_result]] = []
-    generation_observed = True
-
     is_active_query = statuses == ACTIVE_TASK_STATUSES
     include_archive = statuses is None or bool(statuses & RELEASED_TASK_STATUSES)
     scanned_dirs = {tasks_dir_str}
     if include_archive:
         scanned_dirs.add(os.path.join(tasks_dir_str, TASK_ARCHIVE_DIR_NAME))
 
+    # Take the same fingerprint the routing reader uses for revalidation,
+    # before reading task bodies. Withhold it if the scan cannot observe a record.
+    generation = None
     if task_generation is not None:
-        # Cache generations inventory names and stats, including foreign files;
-        # match state_router's cheap token without parsing JSON on warm requests.
-        for directory in scanned_dirs:
-            for path in Path(directory).glob("*.json"):
-                try:
-                    file_stat = path.stat()
-                except OSError:
-                    generation_observed = False
-                    continue
-                task_files.append((path.name, file_stat))
-                newest_mtime_ns = max(newest_mtime_ns, file_stat.st_mtime_ns)
+        newest_mtime_ns = os.stat(tasks_dir).st_mtime_ns
+        with contextlib.suppress(OSError):
+            generation = task_inventory_token(tasks_dir, newest_mtime_ns, include_archive=include_archive)
 
     dirty_records: list[tuple] = []
     seen_paths: set[str] = set()
@@ -721,7 +725,7 @@ def _delegate_task_rows_locked(
             file_stat = os.stat(path_str)
             fingerprint = _task_file_fingerprint(path.name, file_stat)
         except OSError:
-            generation_observed = False
+            generation = None
             continue
         cached = task_cache.get(path_str)
 
@@ -744,7 +748,7 @@ def _delegate_task_rows_locked(
                 # An I/O failure can recover without changing file metadata.
                 # Do not turn it into an indefinitely cached absence, and do
                 # not publish a generation that omits the unread record.
-                generation_observed = False
+                generation = None
                 continue
             if task is None:
                 # Foreign or damaged records are misses too. Otherwise every
@@ -809,8 +813,8 @@ def _delegate_task_rows_locked(
 
         rows.append(_task_summary_row(summary, derived_status, alive, file_stat.st_mtime))
 
-    if task_generation is not None and generation_observed:
-        task_generation.append(_task_generation_token(newest_mtime_ns, task_files))
+    if task_generation is not None and generation is not None:
+        task_generation.append(generation)
 
     if dirty_records and persist_cache:
         _save_task_cache_entries(tasks_dir_str, dirty_records, resolved)
