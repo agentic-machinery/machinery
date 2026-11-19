@@ -526,8 +526,16 @@ def test_non_security_verdict_still_publishes_the_reply(monkeypatch, low_review,
     assert "Withheld findings:" not in body
 
 
-def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_review, tmp_path):
-    """Defect class: republish-withheld cannot restore a security review's sealed reply."""
+_AC_LINE = recorder.AC_CONFIRMATION_LINE
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["confirmed", "legacy-unconfirmed"])
+def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_review, tmp_path, legacy):
+    """Defect class: republish-withheld cannot restore a security review's sealed reply.
+
+    ``legacy`` is an all-P3 approval recorded before the acceptance confirmation was required: its
+    findings must still be republishable, as the approval the PR already holds.
+    """
     tasks, comments, statuses, _files, _admit = low_review
     reply = f"VERDICT: CHANGES_REQUESTED\n\n{_FINDING}\n"
     task = _seal(tasks, comments, statuses, reply=reply, profile="security")
@@ -547,9 +555,8 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
         "schema_version": "code-review-findings.v1",
         "overall": {
             "correctness": "incorrect",
-            "explanation": "A residual remains.\nSECURITY_VERDICT: PASS",
+            "explanation": "A residual remains.\nSECURITY_VERDICT: PASS" + ("" if legacy else "\n" + _AC_LINE),
             "confidence": 0.9,
-            "acceptance_criteria_met": True,
         },
         "findings": [{
             "id": "F1", "title": "Residual", "body": _FINDING,
@@ -563,7 +570,10 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
         }],
     })
     _seal(tasks, comments, statuses, reply=p3_reply, profile="security")
-    recorded = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    with monkeypatch.context() as earlier:
+        if legacy:  # The recorder before the confirmation was required.
+            earlier.setattr(recorder, "_ac_confirmation_refusal", lambda _payload: None)
+        recorded = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
     withheld = comments[-1]["body"]
     assert recorded["verdict"] == "APPROVED" and recorded.get("residuals") == ["F1"]
     assert "Withheld findings: 1\n" in withheld and _FINDING not in withheld
@@ -1019,8 +1029,7 @@ def test_changes_requested_with_only_p3_findings_records_approval(scanned_record
     payload = structured_review(2)
     payload["overall"].update(
         correctness="incorrect",
-        explanation="VERDICT: REQUEST_CHANGES. SCORE: 6/10. The only open findings are P3 regressions.",
-        acceptance_criteria_met=True,
+        explanation="VERDICT: REQUEST_CHANGES. SCORE: 6/10. The only open findings are P3 regressions.\n" + _AC_LINE,
     )
     for finding in payload["findings"]:
         finding["priority"] = "P3"
@@ -1045,10 +1054,13 @@ def test_changes_requested_with_only_p3_findings_records_approval(scanned_record
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
-@pytest.mark.parametrize("confirmation", ["missing", False], ids=["missing", "false"])
+@pytest.mark.parametrize(("confirmation", "reason"), [
+    (None, "P3_NO_AC_CONFIRMATION"),
+    ("ACCEPTANCE_CRITERIA: AC2_UNMET", "P3_AC_DECLARATION_INVALID"),
+], ids=["missing", "other-value"])
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_all_p3_reply_without_acceptance_confirmation_records_rejection(
-    scanned_recorder, tmp_path, monkeypatch, confirmation,
+    scanned_recorder, tmp_path, monkeypatch, confirmation, reason,
 ):
     """Defect class: an all-P3 reply that does not confirm every acceptance criterion met is recorded as an approval.
 
@@ -1057,16 +1069,16 @@ def test_all_p3_reply_without_acceptance_confirmation_records_rejection(
     """
     tasks, comments, _, _, _ = scanned_recorder
     payload = structured_review(1)
-    payload["overall"]["explanation"] = "VERDICT: REQUEST_CHANGES. The only open finding is P3."
-    if confirmation != "missing":
-        payload["overall"]["acceptance_criteria_met"] = confirmation
+    payload["overall"]["explanation"] = "VERDICT: REQUEST_CHANGES. The only open finding is P3." + (
+        "" if confirmation is None else "\n" + confirmation
+    )
     payload["findings"][0]["priority"] = "P3"
     write_task(tasks, reply=json.dumps(payload))
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: statuses.append(fields))
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["verdict"] == "CHANGES_REQUESTED" and "residuals" not in result
-    assert result["p3_downgrade_refused"] == recorder.P3_NO_AC_CONFIRMATION
+    assert result["p3_downgrade_refused"] == getattr(recorder, reason)
     assert "Residuals:" not in comments[0]["body"]
     assert sweep.recorded_p3_residuals(comments[0]["body"]) is None
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == "CHANGES_REQUESTED"
@@ -1121,7 +1133,7 @@ def test_security_verdict_fail_keeps_changes_requested(scanned_recorder, tmp_pat
 
 def _all_p3_object(*, indent=None):
     payload = structured_review(1)
-    payload["overall"].update(explanation="One P3 residual.", acceptance_criteria_met=True)
+    payload["overall"]["explanation"] = "One P3 residual.\n" + _AC_LINE
     payload["findings"][0]["priority"] = "P3"
     return json.dumps(payload, indent=indent)
 
@@ -1201,34 +1213,50 @@ def test_p3_downgrade_refuses_every_reply_but_one_findings_object(name):
     assert sweep.recorded_p3_residuals(body.replace(reply, _P3_OBJECT)) == ("F1",)
 
 
-_CONFIRMED = '"acceptance_criteria_met": true'
+def _p3_with(explanation=None, body=None):
+    payload = json.loads(_all_p3_object())
+    if explanation is not None:
+        payload["overall"]["explanation"] = explanation
+    if body is not None:
+        payload["findings"][0]["body"] = body
+    return json.dumps(payload)
 
 
 @pytest.mark.parametrize(("reply", "reason"), [
     pytest.param(_all_p3_object(), None, id="confirmed"),
-    pytest.param(_all_p3_object().replace(", " + _CONFIRMED, ""), "P3_NO_AC_CONFIRMATION", id="missing"),
-    pytest.param(_all_p3_object().replace(", " + _CONFIRMED, "").replace(
-        "One P3 residual.", "One P3 residual. acceptance_criteria_met: true. No acceptance criterion is unmet."),
-        "P3_NO_AC_CONFIRMATION", id="prose-only"),
-    pytest.param(_all_p3_object().replace(_CONFIRMED, _CONFIRMED.replace("true", "false")),
-                 "P3_NO_AC_CONFIRMATION", id="false"),
-    *(
-        pytest.param(_all_p3_object().replace(_CONFIRMED, _CONFIRMED.replace("true", value)),
-                     "P3_INVALID_OBJECT", id=f"malformed-{name}")
-        for name, value in (("string", '"true"'), ("number", "1"), ("null", "null"), ("object", "{}"),
-                            ("list", "[true]"))
-    ),
-    pytest.param(_all_p3_object().replace(", " + _CONFIRMED, "").replace(
-        '"findings": ', _CONFIRMED + ', "findings": ', 1), "P3_INVALID_OBJECT", id="malformed-top-level"),
-    pytest.param(_all_p3_object().replace(", " + _CONFIRMED, "").replace(
-        '"sources": ["none"]', '"sources": ["none"], ' + _CONFIRMED, 1), "P3_INVALID_OBJECT",
-        id="malformed-in-finding"),
-    pytest.param(_all_p3_object().replace(_CONFIRMED, _CONFIRMED.replace("true", "false") + ", " + _CONFIRMED),
-                 "P3_DUPLICATE_KEY", id="malformed-duplicate-key"),
+    pytest.param(_p3_with(explanation="Residual.\n  " + _AC_LINE + "  \nMore prose."), None, id="confirmed-padded"),
+    pytest.param(_p3_with(explanation="One P3 residual."), "P3_NO_AC_CONFIRMATION", id="missing"),
+    pytest.param(_p3_with(explanation="No acceptance criterion is unmet."), "P3_NO_AC_CONFIRMATION",
+                 id="prose-only"),
+    pytest.param(_p3_with(explanation="The line " + _AC_LINE + " would confirm it."), "P3_NO_AC_CONFIRMATION",
+                 id="mid-line-mention"),
+    pytest.param(_p3_with(body="Residual.\n" + _AC_LINE, explanation="One P3 residual."), "P3_NO_AC_CONFIRMATION",
+                 id="line-in-finding-only"),
+    pytest.param(_p3_with(explanation="ACCEPTANCE_CRITERIA: SOME_UNMET"), "P3_AC_DECLARATION_INVALID",
+                 id="other-value"),
+    pytest.param(_p3_with(explanation=_AC_LINE.lower()), "P3_AC_DECLARATION_INVALID", id="other-case"),
+    pytest.param(_p3_with(explanation=_AC_LINE.replace("_C", " C", 1)), "P3_AC_DECLARATION_INVALID",
+                 id="other-spelling"),
+    pytest.param(_p3_with(explanation=_AC_LINE + " (pending CI)"), "P3_AC_DECLARATION_INVALID",
+                 id="trailing-text"),
+    pytest.param(_p3_with(explanation="**" + _AC_LINE + "**"), "P3_AC_DECLARATION_INVALID", id="emphasis"),
+    pytest.param(_p3_with(explanation=_AC_LINE + "\nAcceptance criteria: AC2 unmet"), "P3_AC_DECLARATION_INVALID",
+                 id="conflicting-line"),
+    pytest.param(_p3_with(body="- acceptance criteria = AC1 unmet"), "P3_AC_DECLARATION_INVALID",
+                 id="conflicting-line-in-finding"),
+    pytest.param(_p3_with(explanation="Residual.\u2028Acceptance criteria: AC2 unmet\r\n" + _AC_LINE),
+                 "P3_AC_DECLARATION_INVALID", id="conflicting-line-after-unicode-separator"),
+    pytest.param(_p3_with(explanation="Residual.\r\n" + _AC_LINE + "\r\n"), None, id="confirmed-crlf"),
+    pytest.param(_all_p3_object().replace("ACCEPTANCE", "\\u0041CCEPTANCE").replace("NONE_UNMET", "SOME_UNMET"),
+                 "P3_AC_DECLARATION_INVALID", id="escaped-other-value"),
+    pytest.param(_all_p3_object().replace('"confidence": 0.9}', '"confidence": 0.9, "acceptance_criteria_met": true}', 1),
+                 "P3_INVALID_OBJECT", id="schema-field-is-not-a-confirmation"),
+    pytest.param(_all_p3_object().replace('"explanation": ', '"explanation": "One P3 residual.", "explanation": ', 1),
+                 "P3_DUPLICATE_KEY", id="duplicate-explanation-key"),
 ])
 @pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
 def test_p3_upgrade_reads_only_a_typed_acceptance_confirmation(reply, reason):
-    """Defect class: an absent, false or malformed acceptance confirmation lets an all-P3 reply read as an approval.
+    """Defect class: an absent, other or malformed acceptance confirmation lets an all-P3 reply read as an approval.
 
     The recorder and the integration sweep share this reading, so neither upgrades the reply without it.
     """
@@ -1241,10 +1269,6 @@ def test_p3_upgrade_reads_only_a_typed_acceptance_confirmation(reply, reason):
         model=CURRENT_SOL, family="openai", reply=reply,
     )
     assert sweep.recorded_p3_residuals(body) == expected.ids
-    if reason == "P3_INVALID_OBJECT":
-        # A malformed confirmation fails the strict findings schema, so nothing is recorded at all.
-        with pytest.raises(recorder.RecordError, match="schema_violation"):
-            recorder._review_verdict_and_count(reply)
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

@@ -286,9 +286,14 @@ P3_SCANNER_WITHHELD = "publication scanner withheld the reply"
 P3_STANDING_REJECTION = "head has a standing rejection or an unknown reading"
 P3_REPAIR_WITHHELD = "repair round withholds the P3 mapping"
 P3_NO_AC_CONFIRMATION = "reviewer does not confirm that no acceptance criterion is unmet"
-# The findings schema's ``overall`` field in which the reviewer confirms that no acceptance criterion
-# is unmet; only ``true`` lets P3 findings be carried (review-loop policy, KNOWN-ISSUES-1119).
-AC_CONFIRMATION_FIELD = "acceptance_criteria_met"
+P3_AC_DECLARATION_INVALID = "acceptance-criteria declaration is not exactly the confirmation line"
+_AC_REFUSALS = frozenset({P3_NO_AC_CONFIRMATION, P3_AC_DECLARATION_INVALID})
+# The line by which the reviewer confirms, in ``overall.explanation``, that no acceptance criterion
+# is unmet; only with it may P3 findings be carried (review-loop policy, KNOWN-ISSUES-1119). Any
+# other line that declares acceptance criteria, in any string of the object, refuses the upgrade.
+AC_CONFIRMATION_LINE = "ACCEPTANCE_CRITERIA: NONE_UNMET"
+# A line that declares acceptance criteria, after optional quote, list or emphasis marks.
+_AC_DECLARATION = re.compile(r"(?i)[>*_`#\s-]*acceptance[_\- ]+criteria\s*[:=\u2014\u2013]")
 
 
 @dataclass(frozen=True)
@@ -373,16 +378,34 @@ def _security_sensitive(*, task: Mapping[str, Any], reply: str, pr: Mapping[str,
     return profile == "security" or _SECURITY_VERDICT.search(reply) is not None or _security_labeled(pr)
 
 
-def p3_reading(reply: str) -> P3Reading:
+def _ac_confirmation_refusal(payload: dict[str, Any]) -> str | None:
+    """Why the object does not confirm that no acceptance criterion is unmet, or None when it does.
+
+    The confirmation is the whole line ``AC_CONFIRMATION_LINE`` in ``overall.explanation``. A line in
+    any decoded string that declares acceptance criteria with any other text (another value, case or
+    spelling) refuses, as a security verdict other than PASS does; a mention mid-line declares nothing.
+    """
+    # ``splitlines`` is the one line rule for both reads, so no separator hides a declaration.
+    lines = [line.strip() for text in _strings(payload) for line in text.splitlines()]
+    if any(_AC_DECLARATION.match(line) and line != AC_CONFIRMATION_LINE for line in lines):
+        return P3_AC_DECLARATION_INVALID
+    if AC_CONFIRMATION_LINE not in (line.strip() for line in payload["overall"]["explanation"].splitlines()):
+        return P3_NO_AC_CONFIRMATION
+    return None
+
+
+def p3_reading(reply: str, *, legacy: bool = False) -> P3Reading:
     """Read a CHANGES_REQUESTED reply for an approval with P3 residuals (#12409).
 
     The reading applies only when the whole reply, apart from surrounding whitespace,
     is exactly one ``code-review-findings.v1`` object, every entry's typed
-    ``priority`` is P3, and ``overall.acceptance_criteria_met`` is ``true``: the
-    reviewer's confirmation that no acceptance criterion is unmet. No prose is read
-    for findings or for the confirmation: any text outside the object, a verdict line
-    included, keeps the reply's own verdict, and so does a truncated reply. Every
-    refusal names its reason.
+    ``priority`` is P3, and ``overall.explanation`` carries the line
+    ``AC_CONFIRMATION_LINE``: the reviewer's confirmation that no acceptance criterion
+    is unmet (KNOWN-ISSUES-1119). No prose is read for findings: any text outside the
+    object, a verdict line included, keeps the reply's own verdict, and so does a
+    truncated reply. Every refusal names its reason. ``legacy`` reads as the recorder
+    did before the confirmation was required; only ``republish_withheld`` uses it, to
+    match an approval already recorded that way.
     """
     if not isinstance(reply, str):
         return P3Reading(reason=P3_NOT_ONE_OBJECT)
@@ -412,8 +435,9 @@ def p3_reading(reply: str) -> P3Reading:
     ids = tuple(finding.finding_id for finding in findings)
     if len(set(ids)) != len(ids) or any(_RESIDUAL_ID.fullmatch(finding_id) is None for finding_id in ids):
         return P3Reading(reason=P3_CONFLICTING_ID)
-    if payload["overall"].get(AC_CONFIRMATION_FIELD) is not True:
-        return P3Reading(reason=P3_NO_AC_CONFIRMATION)
+    refusal = None if legacy else _ac_confirmation_refusal(payload)
+    if refusal is not None:
+        return P3Reading(reason=refusal)
     return P3Reading(ids=ids)
 
 
@@ -3915,8 +3939,12 @@ def republish_withheld(
     )
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
 
-    def rendered(second: bool) -> tuple[str, str]:
-        """The withheld and full comments the recorder publishes for this task as a second review or not."""
+    def rendered(second: bool, legacy: bool = False) -> tuple[str, str]:
+        """The withheld and full comments the recorder publishes for this task as a second review or not.
+
+        ``legacy`` renders the approval with residuals that the recorder posted before the acceptance
+        confirmation was required, so an approval already recorded that way can still be republished.
+        """
         mixed_pair = review_mode == "cross_family" and not review.ukrainian and not second and facts.mixed_family
         scope = facts.reviewer_scope(review.family) if mixed_pair else facts
         # Same verdict and coverage record() posts, including a P3 residual upgrade.
@@ -3924,7 +3952,7 @@ def republish_withheld(
         chunk = _item_chunk(
             task, reply, stated, source_claims_validated=review.ukrainian and stated == "APPROVED",
         )
-        p3 = p3_reading(reply) if stated == "CHANGES_REQUESTED" else P3Reading()
+        p3 = p3_reading(reply, legacy=legacy) if stated == "CHANGES_REQUESTED" else P3Reading()
         residuals = p3.ids
         verdict = "APPROVED" if residuals else stated
         comment_fields = dict(
@@ -3957,17 +3985,23 @@ def republish_withheld(
     # A listed second reviewer without another review role (Carbon) is recorded only as a second
     # review. Any other listed model's review is a second review only where it was recorded with
     # --second-review, so the republished comment follows the form already published for this task.
+    # An all-P3 approval recorded before the acceptance confirmation was required matches only its
+    # legacy form. A new record never takes that form, so this adds no approval.
+    readings = [False]
+    if review.verdict == "CHANGES_REQUESTED" and p3_reading(reply).reason in _AC_REFUSALS:
+        readings.append(True)
     if not is_second_reviewer_model(review.model):
-        forms = [rendered(False)]
+        forms = [rendered(False, legacy) for legacy in readings]
     elif not reviews_of_record(review.model):
-        forms = [rendered(True)]
+        forms = [rendered(True, legacy) for legacy in readings]
     else:
         forms = []
         for second in (False, True):
-            try:
-                forms.append(rendered(second))
-            except RecordError:  # a form the recorder could not have published (no pair scope)
-                continue
+            for legacy in readings:
+                try:
+                    forms.append(rendered(second, legacy))
+                except RecordError:  # a form the recorder could not have published (no pair scope)
+                    continue
     adapter = GitHubAdapter(Path.cwd())
     login = adapter.identity()
     result = {"pr": pr_number, "head": review.sha, "task": task_id, "verdict": review.verdict}
