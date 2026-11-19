@@ -1043,6 +1043,24 @@ class SessionStreamStore:
         app_proof: VerifiedAppLifecycleProof | None = None,
     ) -> Lease:
         """Renew an exact holder's TTL; an expired holder may revive only itself."""
+        renewed, _projection_state, _session_state = self.heartbeat_with_session_state(
+            lease, now=now, app_proof=app_proof
+        )
+        return renewed
+
+    def heartbeat_with_session_state(
+        self,
+        lease: Lease,
+        *,
+        now: datetime | None = None,
+        app_proof: VerifiedAppLifecycleProof | None = None,
+    ) -> tuple[Lease, str, str]:
+        """Renew a lease and return its projection state and session state.
+
+        Both come from the write transaction. A later read connection only to
+        recover them repeats connection setup, and each setup statement yields
+        the GIL (#935, the same fan-out as #12627).
+        """
         current_time = now or utc_now()
         self._require_app_proof(
             app_proof,
@@ -1058,6 +1076,8 @@ class SessionStreamStore:
         timestamp = isoformat_z(current_time)
         with self._transaction(now=current_time) as connection:
             row = self._require_current_lease(connection, lease)
+            projection_state = str(row["state"])
+            session_state = str(row["session_state"])
             if current_time < parse_timestamp(str(row["heartbeat_at"])):
                 raise LeaseConflictError("heartbeat time cannot move backwards")
             if (
@@ -1077,7 +1097,7 @@ class SessionStreamStore:
                 ).fetchone()
                 is not None
             ):
-                return self._lease_from_row(row)
+                return self._lease_from_row(row), projection_state, session_state
             expires_at = isoformat_z(current_time + timedelta(seconds=int(row["ttl_seconds"])))
             event_id = self._insert_lease_event_from_row(
                 connection,
@@ -1093,17 +1113,21 @@ class SessionStreamStore:
                 "WHERE stream_id = ?",
                 (timestamp, expires_at, version, event_id, lease.stream_id),
             )
-        return Lease(
-            stream_id=lease.stream_id,
-            session_id=lease.session_id,
-            lease_id=lease.lease_id,
-            generation=lease.generation,
-            fencing_token=lease.fencing_token,
-            holder=lease.holder,
-            heartbeat_at=timestamp,
-            expires_at=expires_at,
-            ttl_seconds=lease.ttl_seconds,
-            version=version,
+        return (
+            Lease(
+                stream_id=lease.stream_id,
+                session_id=lease.session_id,
+                lease_id=lease.lease_id,
+                generation=lease.generation,
+                fencing_token=lease.fencing_token,
+                holder=lease.holder,
+                heartbeat_at=timestamp,
+                expires_at=expires_at,
+                ttl_seconds=lease.ttl_seconds,
+                version=version,
+            ),
+            projection_state,
+            session_state,
         )
 
     def transition_session(

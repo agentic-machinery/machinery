@@ -13,11 +13,12 @@ from fastapi.testclient import TestClient
 from lu_machinery.api import epics_router
 from lu_machinery.api.config import LIVE_REPO_ROOT
 from lu_machinery.api.monitor_context import fixture_context
-from lu_machinery.session_streams.store import LifecycleError
+from lu_machinery.session_streams.model import SessionState
+from lu_machinery.session_streams.store import LifecycleError, SessionStreamStore
 from tests.epics_monitor_stub import epics_app_for_store
 
 
-def _client(tmp_path: Path, monkeypatch) -> TestClient:
+def _client_and_store(tmp_path: Path, monkeypatch) -> tuple[TestClient, SessionStreamStore]:
     del monkeypatch
     live = Path(LIVE_REPO_ROOT)
     ctx_root = tmp_path / "ctx"
@@ -27,7 +28,12 @@ def _client(tmp_path: Path, monkeypatch) -> TestClient:
     assert store is not None
     epics_router.seed_manifest_inventory(live, store=store, handoff_root=live)
     app = epics_app_for_store(store, ctx_root, live_repo_root=live)
-    return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 8765))
+    return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 8765)), store
+
+
+def _client(tmp_path: Path, monkeypatch) -> TestClient:
+    client, _store = _client_and_store(tmp_path, monkeypatch)
+    return client
 
 
 def _claim(
@@ -79,6 +85,45 @@ def test_router_claim_heartbeat_handoff_release_round_trip(tmp_path: Path, monke
     assert (
         client.post("/api/epics/v1/epic:7178/release", json=exact).status_code == 200
     )  # allow-hardcoded-epic: remote lifecycle route fixture
+
+
+def test_router_heartbeat_reads_session_state_on_the_write_connection(tmp_path: Path, monkeypatch) -> None:
+    """Defect class: per-request connection fan-out on heartbeat (#935).
+
+    The handler opened a second connection to re-read state and session_state
+    the write transaction already had. Each connection repeats its setup, and
+    every setup statement yields the GIL, so the route stalled for seconds
+    while the API process was busy.
+    """
+    client, store = _client_and_store(tmp_path, monkeypatch)
+    lease = _claim(client)["lease"]
+    opened: list[bool] = []
+    real_connect = store.database.connect
+
+    def counting_connect(*args, **kwargs):
+        opened.append(bool(kwargs.get("read_only", False)))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(store.database, "connect", counting_connect)
+    heartbeat = client.post("/api/epics/v1/epic:7178/heartbeat", json=lease)
+    assert heartbeat.status_code == 200, heartbeat.text
+    body = heartbeat.json()["lease"]
+    assert body["state"] == "active"
+    assert body["session_state"] == SessionState.OPEN.value
+    assert opened == [False]
+
+    renewed = epics_router._lease_from_payload(body)
+    assert (
+        store.transition_session(renewed, to_state=SessionState.ROLLING, reason="bridge")
+        == SessionState.ROLLING
+    )
+    opened.clear()
+    rolling = client.post("/api/epics/v1/epic:7178/heartbeat", json=body)
+    assert rolling.status_code == 200, rolling.text
+    rolled = rolling.json()["lease"]
+    assert rolled["state"] == "active"
+    assert rolled["session_state"] == SessionState.ROLLING.value
+    assert opened == [False]
 
 
 def test_router_handoff_accepts_idempotency_key_header_alias(tmp_path: Path, monkeypatch) -> None:
