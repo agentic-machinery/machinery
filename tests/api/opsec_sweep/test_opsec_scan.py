@@ -129,6 +129,37 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
 
 
 @pytest.mark.parametrize(
+    ("text", "token"),
+    [
+        ("read file:///home/fixture-user/notes.md.", "file:///home/fixture-user/notes.md"),
+        ("FILE:///Users/fixture-user/notes.md", "FILE:///Users/fixture-user/notes.md"),
+        ("file://fixture-host/home/fixture-user/x", "file://fixture-host/home/fixture-user/x"),
+        ("file:////home/fixture-user/x", "file:////home/fixture-user/x"),
+        ("file:/home/fixture-user/x", "file:/home/fixture-user/x"),
+        ("/home/fixture-user/" + "ab" * 20 + "/x", "/home/fixture-user/" + "ab" * 20 + "/x"),
+        ("/home/fixture-user/run-2026-08-24T19:12:43Z/x", "/home/fixture-user/run-2026-08-24T19:12:43Z/x"),
+    ],
+)
+def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
+    """Defect class: a slash before the root, or a SHA/timestamp in the tail, hid a home path (#909)."""
+    findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
+    assert [(finding.kind, finding.token) for finding in findings] == [("filesystem-root", token)], text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see docs/home/fixture-user/readme.md",
+        "file:docs/home/fixture-user/readme.md",
+        "https://tmp.example.org/home/page",
+        "file:///etc/fixture.conf",
+    ],
+)
+def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
+    assert scan_text(text, operation="GET /api/opsec", field_path="body.value") == [], text
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "/home/fixture/repository",
