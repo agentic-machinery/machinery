@@ -7,19 +7,19 @@ import os
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
+
 from lu_machinery.api import subscription_usage as usage
-from lu_machinery.dispatcher import checks, cli, git, store, worker
+from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker
 from lu_machinery.dispatcher.providers import opencode
 from lu_machinery.dispatcher.types import TaskSpec
+from lu_machinery.review.reviewer_resolver import REVIEW_CANDIDATES
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 OPENROUTER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
 US_PROVIDERS = ["fireworks/us", "baseten/us", "inference-net/us"]  # CTO allow-list, model-assignment.md
+SAVANT_FLAGS = ("--agent", "opencode", "--model", "subq-savant-1.4", "--provider", "subq", "--research-role", "test")
 
 
 @pytest.fixture
@@ -59,15 +59,15 @@ def dispatch(tmp_path, monkeypatch):
     ))
     monkeypatch.setattr(worker, "start", start)
 
-    def invoke(*flags, expected=0):
-        assert cli.main(["dispatch", "--agent", "deepseek", "--model", "deepseek-v4.1-flash", "--task-id", "oc",
+    def invoke(*flags, expected=0, task_id="oc"):
+        assert cli.main(["dispatch", "--agent", "deepseek", "--model", "deepseek-v4.1-flash", "--task-id", task_id,
                          "--mode", "read-only", "--prompt", "Reply with exactly: ready", *flags]) == expected
         if expected:
             start.assert_not_called()
             git.create_worktree.assert_not_called()
             assert not (tmp_path / "tasks").exists()
             return None
-        return store.read("oc")
+        return store.read(task_id)
 
     return invoke
 
@@ -136,6 +136,59 @@ def test_endpoint_absent_private_binding_refuses_without_credential_fallback(mon
     assert opencode.endpoint_refusal(provider) == (
         f"opencode_endpoint_balance_unknown: {provider} balance could not be read"
     )
+
+
+def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch, tmp_path):
+    key_file = tmp_path / "test.key"
+    key_file.write_text("fixture-key\n", encoding="ascii")
+    key_file.chmod(0o600)
+    monkeypatch.setenv("LU_SUBQ_API_KEY_FILE", str(key_file))
+    monkeypatch.setattr(opencode, "_savant_runtime_refusal", lambda env: None)
+    record = dispatch(*SAVANT_FLAGS, "--data-class", "public-code")
+    assert (record["provider"], record["model"], record["effort"]) == ("subq", "subq-savant-1.4", "high")
+    trial = replace(spec, provider=record["provider"], model=record["model"], effort=record["effort"],
+                    options=record["options"])
+    invocation = runtime_context.build(trial, {"DEEPSEEK_API_KEY": "other-fixture-key"})
+    config = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])
+    assert config["model"] == config["small_model"] == "subq/subq-savant-1.4"
+    assert config["enabled_providers"] == ["subq"]
+    assert config["permission"] == {"*": "deny"}
+    provider = config["provider"]["subq"]
+    assert provider["env"] == ["SUBQ_API_KEY"]
+    assert provider["options"] == {"baseURL": "https://api.subq.ai/v1"}
+    model = provider["models"]["subq-savant-1.4"]
+    assert model["options"] == {"reasoningEffort": "high"}
+    assert model["limit"] == {"context": 4_000_000, "output": 64_000}
+    assert invocation.env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "64000"
+    assert "DEEPSEEK_API_KEY" not in invocation.env
+    assert "fixture-key" not in invocation.env["OPENCODE_CONFIG_CONTENT"]
+    assert invocation.stdin == b"Reply with exactly: ready\n"
+    assert all("ready" not in arg for arg in invocation.argv)
+    override = opencode.build(replace(trial, options={**trial.options, "max_tokens": "12345"}), {})
+    assert override.env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "12345"
+    private = dispatch(*SAVANT_FLAGS, "--data-class", "private-code", "--repo", "infra-private", task_id="oc-private")
+    private_trial = replace(trial, task_id="oc-private", effort=private["effort"], options=private["options"])
+    invocation = runtime_context.build(private_trial, {})
+    model = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])["provider"]["subq"]["models"]["subq-savant-1.4"]
+    assert model["options"] == {"store": False, "reasoningEffort": private["effort"]}
+    assert invocation.stdin == b"Reply with exactly: ready\n"
+    spec.prompt_file.write_text("Do not send fixture-key", encoding="utf-8")
+    with pytest.raises(ValueError, match="savant_prompt_refused"):
+        runtime_context.build(private_trial, {})
+
+
+def test_savant_refuses_secrets_or_unknown_data_before_spawn(dispatch, capsys):
+    for flags in (("--data-class", "secret"), ("--data-class", "credentials"), ("--data-class", "unknown"), ()):
+        dispatch(*SAVANT_FLAGS, *flags, expected=2)
+        assert "savant_data_class_refused" in capsys.readouterr().err
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--repo", "infra-private", expected=2)
+    assert "savant_repository_refused" in capsys.readouterr().err
+
+
+def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
+    assert all(candidate.concrete_model != "subq-savant-1.4" for candidate in REVIEW_CANDIDATES.values())
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--risk", "high", "--require-review-verdict", expected=2)
+    assert "holds no review, critique or approval role" in capsys.readouterr().err
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

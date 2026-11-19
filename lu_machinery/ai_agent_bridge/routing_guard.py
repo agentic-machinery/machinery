@@ -14,8 +14,8 @@ Rules that lived only in memory/prose leaked twice with real money attached:
 This module makes both rules load-bearing at every model-invocation choke
 point (opencode bridge, reviewer/bakeoff transport, delegate dispatch).
 
-Escape hatch: set ``LU_ROUTING_GUARD_OVERRIDE=1`` for a deliberate,
-user-authorized exception; the guard error message names it.
+The Savant data and transport restriction applies even when the spend
+override is set.
 """
 
 from __future__ import annotations
@@ -69,13 +69,30 @@ _OX_ALPHA_RETIRED_RE = re.compile(
     re.IGNORECASE,
 )
 _OVERRIDE_ENV = "LU_ROUTING_GUARD_OVERRIDE"
+SAVANT_MODEL = "subq-savant-1.4"
+SAVANT_PROVIDER = "subq"
 
 
 class RoutingGuardError(RuntimeError):
-    """A model invocation violates a standing user spend order."""
+    """A model invocation violates routing policy."""
 
 
-def assert_model_routing_allowed(model: str | None, *, context: str) -> None:
+def savant_request_store(data_class: str | None) -> bool:
+    """Resolve an explicitly admitted class to its per-request storage policy."""
+    from lu_machinery.review.model_catalog import load_model_catalog
+
+    classes = load_model_catalog()["models"][SAVANT_MODEL].get("data_classes")
+    store = classes.get(data_class) if isinstance(classes, dict) and data_class is not None else None
+    if not isinstance(store, bool):
+        raise RoutingGuardError(
+            "savant_data_class_refused: declare public-code, public-docs, private-code, or private-docs"
+        )
+    return store
+
+
+def assert_model_routing_allowed(
+    model: str | None, *, context: str, transport: str | None = None, data_class: str | None = None,
+) -> None:
     """Raise :class:`RoutingGuardError` for forbidden model routings.
 
     ``context`` names the call site for the error message (and telemetry).
@@ -87,9 +104,17 @@ def assert_model_routing_allowed(model: str | None, *, context: str) -> None:
         unknown_model_refusal,
     )
 
-    if refusal := retired_model_refusal(model):
+    catalog = load_model_catalog()
+    if refusal := retired_model_refusal(model, catalog):
         raise RoutingGuardError(f"{context}: {refusal}")
     text = str(model or "").strip()
+    if canonical_model_id(text, catalog) == SAVANT_MODEL:
+        if transport != f"opencode/{SAVANT_PROVIDER}" or text != SAVANT_MODEL:
+            raise RoutingGuardError(f"{context}: savant_transport_refused: use the pinned native OpenCode SubQ route")
+        try:
+            savant_request_store(data_class)
+        except RoutingGuardError as exc:
+            raise RoutingGuardError(f"{context}: {exc}") from None
     if os.environ.get(_OVERRIDE_ENV) == "1":
         return
     if not text:
@@ -160,7 +185,6 @@ def assert_model_routing_allowed(model: str | None, *, context: str) -> None:
     if ais_prefix:
         # Fail closed (C-4967): google-ais carries only a Gemma model the catalog names and whose
         # catalog row admits routing. The catalog row decides; no model id is hard-coded here.
-        catalog = load_model_catalog()
         identity = canonical_model_id(text, catalog)
         if identity is None:
             raise RoutingGuardError(f"{context}: {unknown_model_refusal(text)}")

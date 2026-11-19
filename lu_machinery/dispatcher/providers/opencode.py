@@ -1,14 +1,19 @@
-"""DeepSeek V4.1 Flash through OpenCode, on the direct DeepSeek API (default) or OpenRouter."""
+"""Native OpenCode routes for DeepSeek V4.1 Flash and SubQ Savant trials."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import stat
 import subprocess
 from pathlib import Path
 
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_MODEL, SAVANT_PROVIDER, savant_request_store
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
+from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 
 # OpenCode allows edits and every shell command by default and has no OS sandbox, so read-only
@@ -37,7 +42,18 @@ _READ_ONLY_PERMISSION = json.dumps(
 # switches it. Both run V4.1 Flash only (core P2). The OpenRouter route is pinned to the V4.1 Flash
 # line and to the US provider allow-list in model-assignment.md, with no provider fallback.
 DEFAULT_ENDPOINT = "deepseek"
-MODELS = {"deepseek": "deepseek/deepseek-flash", "openrouter": "openrouter/deepseek/deepseek-v4.1-flash"}
+MODELS = {
+    "deepseek": "deepseek/deepseek-flash",
+    "openrouter": "openrouter/deepseek/deepseek-v4.1-flash",
+    SAVANT_PROVIDER: f"{SAVANT_PROVIDER}/{SAVANT_MODEL}",
+}
+_SAVANT_API = "https://api.subq.ai/v1"
+_SAVANT_KEY_FILE_ENV = "LU_SUBQ_API_KEY_FILE"
+_SAVANT_CONTEXT = 4_000_000
+_SAVANT_DEFAULT_MAX_TOKENS = 64_000
+_SAVANT_EFFORTS = ("low", "high", "max")
+# Revalidate the full request body before widening the compatible OpenCode version.
+_SAVANT_OPENCODE_VERSION = "1.19.6"
 OPENROUTER_PROVIDERS = ("fireworks/us", "baseten/us", "inference-net/us")
 _OPENROUTER_MODEL_ID = MODELS["openrouter"].removeprefix("openrouter/")
 _ROUTING = {"only": list(OPENROUTER_PROVIDERS), "allow_fallbacks": False, "data_collection": "deny"}
@@ -76,6 +92,124 @@ def endpoint(provider: str | None) -> str:
     if selected not in MODELS:
         raise ValueError(f"opencode_endpoint_unknown: --provider {provider!r}; use one of {', '.join(MODELS)}")
     return selected
+
+
+def savant_effort(task_id: str) -> str:
+    """Assign a stable one-third split for comparative trial scoring."""
+    digest = hashlib.sha256(task_id.encode("utf-8")).digest()
+    return _SAVANT_EFFORTS[int.from_bytes(digest, "big") % len(_SAVANT_EFFORTS)]
+
+
+def savant_token_cap(raw: str | None) -> int:
+    if raw is None:
+        return _SAVANT_DEFAULT_MAX_TOKENS
+    if raw.isascii() and raw.isdecimal() and len(raw) <= len(str(_SAVANT_CONTEXT)):
+        cap = int(raw)
+        if 0 < cap < _SAVANT_CONTEXT:
+            return cap
+    raise ValueError("savant_token_cap_refused: --max-tokens must be an integer from 1 to 3999999")
+
+
+def _savant_api_key() -> str:
+    """Read the operator's file. Keep the path and value out of diagnostics and task records."""
+    path = Path(os.environ.get(_SAVANT_KEY_FILE_ENV, ""))
+    if not path.is_absolute():
+        raise ValueError(f"savant_key_unavailable: configure {_SAVANT_KEY_FILE_ENV} with an absolute path")
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fd = safe_open_below(directory, path.name, os.O_RDONLY)
+        finally:
+            os.close(directory)
+        with os.fdopen(fd, "rb") as stream:
+            if stat.S_IMODE(os.fstat(stream.fileno()).st_mode) != 0o600:
+                raise ValueError
+            raw = stream.read(4097)
+        key = raw.removesuffix(b"\n").removesuffix(b"\r").decode("ascii")
+        if len(raw) > 4096 or not key or any(not 33 <= ord(char) <= 126 for char in key):
+            raise ValueError
+    except (OSError, ValueError):
+        raise ValueError("savant_key_unavailable: expected an owned mode-600 file with one raw key") from None
+    return key
+
+
+def _savant_runtime_refusal(env: dict[str, str]) -> str | None:
+    # OpenCode merges managed Linux config after OPENCODE_CONFIG_CONTENT. It can
+    # change the destination, request options, permissions, or system prompt.
+    try:
+        Path("/etc/opencode").lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "savant_runtime_refused: cannot verify that managed OpenCode configuration is absent"
+    else:
+        return "savant_runtime_refused: managed OpenCode configuration is present"
+    try:
+        result = subprocess.run(
+            ["opencode", "--version"], env={"PATH": env.get("PATH", os.defpath)},
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S, check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return "savant_runtime_refused: OpenCode version probe failed"
+    if result.returncode or result.stdout.strip() != _SAVANT_OPENCODE_VERSION:
+        return f"savant_runtime_refused: OpenCode {_SAVANT_OPENCODE_VERSION} is required by the verified SubQ route"
+    return None
+
+
+def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
+    from lu_machinery.dispatcher.checks import check_model_admission
+
+    prompt = spec.prompt_file.read_bytes()
+    check_model_admission(spec.agent, spec.model, spec.mode, {**spec.options, "provider": spec.provider}, prompt)
+    store = savant_request_store(spec.options.get("data_class"))
+    effort = savant_effort(spec.task_id)
+    if spec.effort != effort:
+        raise ValueError(f"savant_effort_refused: the route requires the recorded effort {effort}")
+    cap = savant_token_cap(spec.options.get("max_tokens"))
+    if refusal := _savant_runtime_refusal(env):
+        raise ValueError(refusal)
+    key = _savant_api_key()
+    if key.encode("ascii") in prompt:
+        raise ValueError("savant_prompt_refused: prompt contains the configured SubQ credential")
+    route = MODELS[SAVANT_PROVIDER]
+    config = {
+        "model": route,
+        "small_model": route,
+        "enabled_providers": [SAVANT_PROVIDER],
+        "autoupdate": False,
+        "share": "disabled",
+        "permission": {"*": "deny"},
+        "provider": {SAVANT_PROVIDER: {
+            "name": "SubQ",
+            "npm": "@ai-sdk/openai-compatible",
+            "env": ["SUBQ_API_KEY"],
+            "options": {"baseURL": _SAVANT_API},
+            "models": {SAVANT_MODEL: {
+                "name": "SubQ Savant 1.4",
+                "reasoning": True,
+                "limit": {"context": _SAVANT_CONTEXT, "output": cap},
+                "options": {"reasoningEffort": effort, **({} if store else {"store": False})},
+            }},
+        }},
+    }
+    child_env = {name: value for name, value in env.items() if name != "DEEPSEEK_API_KEY"}
+    child_env.update(
+        SUBQ_API_KEY=key,
+        OPENCODE_CONFIG_CONTENT=json.dumps(config, separators=(",", ":")),
+        OPENCODE_DISABLE_PROJECT_CONFIG="1",
+        OPENCODE_DISABLE_CLAUDE_CODE="1",
+        OPENCODE_DISABLE_DEFAULT_PLUGINS="1",
+        OPENCODE_DISABLE_MODELS_FETCH="1",
+        OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=str(cap),
+        # /tmp is private to the read-only boundary. Isolate CLI auth, history and config from the host.
+        XDG_CACHE_HOME="/tmp/savant/cache",
+        XDG_CONFIG_HOME="/tmp/savant/config",
+        XDG_DATA_HOME="/tmp/savant/data",
+        XDG_STATE_HOME="/tmp/savant/state",
+    )
+    argv = ["opencode", "run", "--pure", "--dir", "/tmp", "--title", "Savant trial", "--model", route,
+            "--format", "json"]
+    return Invocation(argv, prompt, child_env, None)
 
 
 def _remaining_usd(selected: str, key: str) -> float | None:
@@ -158,11 +292,19 @@ def endpoint_refusal(
     endpoint is also refused when the checkout carries OpenCode config or the resolved config
     could still route a call off the pinned model or provider allow-list.
     """
+    selected = endpoint(provider)
+    if selected == SAVANT_PROVIDER:
+        if refusal := _savant_runtime_refusal(env or {}):
+            return refusal
+        try:
+            _savant_api_key()
+        except ValueError as exc:
+            return str(exc)
+        return None
     import yaml
 
     from lu_machinery.api import subscription_usage as usage
 
-    selected = endpoint(provider)
     module = usage._private_usage()
     if module is None:
         return f"opencode_endpoint_balance_unknown: {selected} balance could not be read"
@@ -187,6 +329,8 @@ def endpoint_refusal(
 
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     selected = endpoint(spec.provider)
+    if selected == SAVANT_PROVIDER:
+        return _savant_build(spec, env)
     argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", "high"]
     child_env = env.copy()
     if selected == "openrouter":
