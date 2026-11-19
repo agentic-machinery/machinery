@@ -64,12 +64,20 @@ dpkg_with_lock_wait() {
 apt_install() {
   local cap="$1" lock_wait="$2" rc=0
   shift 2
+  # The runner owns the log under RUNNER_TEMP.
+  # shellcheck disable=SC2024
   sudo timeout --kill-after=5 "$cap" env LC_ALL=C apt-get "${apt_opts[@]}" \
-    -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-install-recommends -- "$@" || rc=$?
+    -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-install-recommends -- "$@" \
+    >"$install_log" 2>&1 || rc=$?
+  cat "$install_log" || return "$?"
   if [ "$rc" -ne 0 ]; then
     echo "apt-get install failed (exit ${rc})" >&2
   fi
   return "$rc"
+}
+
+apt_reports_interrupted_dpkg() {
+  grep -Fq 'E: dpkg was interrupted' "$install_log"
 }
 
 missing=()
@@ -110,21 +118,36 @@ if [ "${#missing[@]}" -gt 0 ]; then
     /var/lib/apt/lists/*chrome* /var/lib/apt/lists/*google*
   echo "Installing missing native packages: ${missing[*]}"
   apt_opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
-  # With 5 s kill grace per command, the longest path is 95 s for the first
-  # install plus 15 s to recover dpkg, 40 s to refresh lists and 45 s to retry.
-  # The pinned download takes at most 36 s, leaving the 240 s wait intact.
+  # Keep 60 s for refreshing lists and 50 s for installing on fallback
+  # mirrors. With 5 s kill grace per command, that path takes at most
+  # 60 + 15 + 65 + 55 = 195 s. The pinned download adds at most 36 s.
+  apt_deadline=$((SECONDS + 195))
   install_log="${RUNNER_TEMP}/bwrap-apt-install.log"
   install_rc=0
-  apt_install 90 70 "${missing[@]}" >"$install_log" 2>&1 || install_rc=$?
-  cat "$install_log"
+  apt_install 55 40 "${missing[@]}" || install_rc=$?
+  if [ "$install_rc" -ne 0 ] && ! apt_reports_interrupted_dpkg &&
+    apt_failure_is_dpkg_lock "$install_rc" "$install_log"; then
+    echo 'Retrying apt install after dpkg lock contention'
+    install_rc=0
+    apt_install 115 100 "${missing[@]}" || install_rc=$?
+    # Apt checks the journal only after it acquires the lock. A lock retry
+    # can therefore be the first attempt to report an interrupted journal.
+    if [ "$install_rc" -ne 0 ] && ! apt_reports_interrupted_dpkg; then
+      exit "$install_rc"
+    fi
+  fi
   if [ "$install_rc" -ne 0 ]; then
-    if grep -Fq 'E: dpkg was interrupted' "$install_log"; then
+    if apt_reports_interrupted_dpkg; then
+      # Reserve 15 s for configure and 5 s kill grace per remaining command.
+      retry_cap=$((apt_deadline - SECONDS - 25))
+      if [ "$retry_cap" -lt 3 ]; then
+        echo 'apt install ran out of time for interrupted dpkg recovery' >&2
+        exit "$install_rc"
+      fi
+      [ "$retry_cap" -le 70 ] || retry_cap=70
       echo 'Repairing the interrupted dpkg transaction before retrying apt install'
       dpkg_with_lock_wait 15 --configure -a
-      apt_install 70 50 "${missing[@]}"
-    elif apt_failure_is_dpkg_lock "$install_rc" "$install_log"; then
-      echo 'Retrying apt install after dpkg lock contention'
-      apt_install 80 60 "${missing[@]}"
+      apt_install "$retry_cap" "$((retry_cap / 2))" "${missing[@]}"
     else
       # During the 2026-11-11 Canonical *.ubuntu.com DNS outage (status.canonical.com),
       # azure.archive.ubuntu.com, archive.ubuntu.com and security.ubuntu.com all failed to
@@ -148,8 +171,8 @@ if [ "${#missing[@]}" -gt 0 ]; then
           '/^[[:space:]]*#/! s@https?://([a-z0-9.-]+\.)?ubuntu\.com/ubuntu/?([[:space:]]|$)@mirror+file:/etc/apt/apt-mirrors.txt\2@g' \
           /etc/apt/sources.list
       fi
-      sudo timeout --kill-after=5 35 apt-get "${apt_opts[@]}" update -qq
-      apt_install 40 20 "${missing[@]}"
+      sudo timeout --kill-after=5 60 apt-get "${apt_opts[@]}" update -qq
+      apt_install 50 30 "${missing[@]}"
     fi
   fi
 fi
