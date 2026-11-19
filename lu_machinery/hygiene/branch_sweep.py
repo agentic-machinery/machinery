@@ -40,7 +40,7 @@ from lu_machinery.common.jsonl import jsonl_lines, physical_lines
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.orchestration import worktree_git as reaper
 from lu_machinery.orchestration.task_family.git_safety import remote_protected_branches
-from lu_machinery.orchestration.task_record_store import read_task_record
+from lu_machinery.orchestration.task_record_store import parse_task_record, read_task_record_bytes, task_archive_lock
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.storage import topology as storage_topology
 
@@ -341,16 +341,15 @@ def _valid(name: str, repo: Path) -> bool:
 def _task_records(repo: Path) -> list[tuple[Path, dict[str, object]]]:
     task_dir = reaper.control_plane_root(repo) / "batch_state" / "tasks"
     records: list[tuple[Path, dict[str, object]]] = []
-    for path in task_dir.glob("*.json"):
-        try:
-            state = read_task_record(path)
-            if state is None:
-                continue
-        except (OSError, ValueError) as exc:
-            raise RuntimeError(f"cannot inspect task state {path.name}: {exc}") from exc
-        if not isinstance(state, dict):
-            raise RuntimeError(f"cannot inspect task state {path.name}: not an object")
-        records.append((path, state))
+    with task_archive_lock(task_dir):
+        for path in task_dir.glob("*.json"):
+            try:
+                path, raw = read_task_record_bytes(path, tasks_dir=task_dir)
+                state = parse_task_record(path, raw)
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"cannot inspect task state {path.name}: {exc}") from exc
+            if state is not None:
+                records.append((path, state))
     return records
 
 

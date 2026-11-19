@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -91,3 +92,27 @@ def test_inventory_backed_creator_with_settled_reuser_is_resolved(hermetic_repo,
     matches = output.matching_worktree_records(tree, tasks, repo_root=repo, publish_cache=False)
 
     assert output.reused_worktree_creator(matches, tree, repo_root=repo, tasks_dir=tasks) == (path, state)
+
+
+def test_worktree_inventory_follows_an_archive_move_without_restarting(tmp_path, monkeypatch, capsys):
+    """Defect class: a record moved mid-inventory forces a complete task rescan."""
+    tasks = tmp_path / "tasks"
+    task_id = "codex-creator-r1"
+    tree = tmp_path / "checkout"
+    tree.mkdir()
+    hot = task_record_path(tasks, task_id)
+    archived = archived_task_record_path(tasks, task_id)
+    archived.parent.mkdir(parents=True)
+    state = {"task_id": task_id, "status": "done", "worktree_path": str(tree)}
+    hot.write_text(json.dumps(state))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert output.matching_worktree_records(tree, tasks, repo_root=tmp_path, publish_cache=False) == [(archived, state)]
+    assert "retrying complete inventory" not in capsys.readouterr().err

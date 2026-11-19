@@ -39,7 +39,9 @@ first renames the record to a private staging name, verifies that the file it
 took is the one it checked, and puts it back if a writer replaced it in
 between. No move ever replaces a file: archive, put-back and ``restore`` place
 each file with ``os.link`` (which fails if the name is taken) before unlinking
-the source, so a writer that created the destination first keeps its file. A
+the source, so a writer that created the destination first keeps its file.
+Strict readers share a task-directory lock with the archive group move so
+they cannot see the private staging name or a record without its moved reply. A
 snapshot directory moves whole with one ``os.rename``, which fails if the
 destination is a non-empty directory; it is never split between hot and
 archive. A staged file that cannot be archived goes back to its hot name, or, if a writer
@@ -1832,7 +1834,8 @@ def _archive_one(
             elif (reason := keep_hot_reason(current)) is not None:
                 row["action"], row["skip_reason"] = "skipped", reason
             else:
-                row["moved"], problems = _move_group(path, archive_dir, stamp, checked=stat)
+                with task_record_store.task_archive_lock(path.parent, moving=True):
+                    row["moved"], problems = _move_group(path, archive_dir, stamp, checked=stat)
                 row["action"] = "error" if problems else "archived"
                 if problems:
                     row["error"] = "record archived; " + "; ".join(problems)

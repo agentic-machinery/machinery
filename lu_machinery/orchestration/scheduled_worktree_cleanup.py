@@ -51,7 +51,8 @@ from lu_machinery.orchestration import backup_failure_alert, disk_watermark_aler
 from lu_machinery.orchestration.execution_safe_git import GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
 from lu_machinery.orchestration.pool_headroom import _read_limit
-from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
+from lu_machinery.orchestration.task_record_store import iter_task_records
+from lu_machinery.orchestration.task_record_store import read_listed_task_record as read_task_record
 from lu_machinery.orchestration.tmp_leak_sweep import sweep_tmp_leaks
 from lu_machinery.review.isolation import sweep_review_temp_orphans
 

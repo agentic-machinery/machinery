@@ -51,6 +51,7 @@ from lu_machinery.orchestration.task_record_store import (
     is_identical_copy,
     misnamed_record_refusal,
     parse_task_record,
+    read_task_record_bytes,
     task_record_path,
 )
 from lu_machinery.path_safety import assert_delete_target
@@ -443,7 +444,7 @@ def active_worktree_claim_refusal(
         if is_superseded_record(state_file):
             continue
         try:
-            raw = state_file.read_bytes()
+            state_file, raw = read_task_record_bytes(state_file, tasks_dir=tasks_dir)
         except FileNotFoundError:
             # Removed between glob and read: it no longer claims anything.
             continue

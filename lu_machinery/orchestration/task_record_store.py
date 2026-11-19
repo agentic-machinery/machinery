@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import stat
 import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -246,11 +247,70 @@ def archived_task_record_path(tasks_dir: Path, task_id: str) -> Path:
 
 
 def locate_task_record(tasks_dir: Path, task_id: str) -> Path | None:
-    """Return ``task_id``'s record in the hot directory, else in the archive, else ``None``."""
-    for path in (task_record_path(tasks_dir, task_id), archived_task_record_path(tasks_dir, task_id)):
-        if path.is_file():
-            return path
-    return None
+    """Find the hot record, or the most recently written archived copy of that id."""
+    hot = task_record_path(tasks_dir, task_id)
+    if hot.is_file():
+        return hot
+    archive = tasks_dir / ARCHIVE_DIR_NAME
+    try:
+        with os.scandir(archive) as entries:
+            names = candidate_task_record_names(task_id, (entry.name for entry in entries))
+    except FileNotFoundError:
+        return None
+    candidates = []
+    for name in names:
+        path = archive / name
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            candidates.append((info.st_mtime_ns, name))
+    newest = max(candidates, default=None)
+    return archive / newest[1] if newest is not None else None
+
+
+def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]:
+    """Read a record and return its actual path, following a completed archive move."""
+    try:
+        return path, path.read_bytes()
+    except FileNotFoundError:
+        if path.parent != tasks_dir:
+            raise
+        with task_archive_lock(tasks_dir):
+            relocated = locate_task_record(tasks_dir, path.stem) if task_record_path(tasks_dir, path.stem) == path else None
+            if relocated is None:
+                raise
+            return relocated, relocated.read_bytes()
+
+
+def read_listed_task_record(path: Path, *, tasks_dir: Path | None = None) -> dict[str, Any] | None:
+    """Parse a listed record even if it moved from the hot directory to the archive."""
+    if tasks_dir is None:
+        tasks_dir = path.parent.parent if path.parent.name == ARCHIVE_DIR_NAME else path.parent
+    path, raw = read_task_record_bytes(path, tasks_dir=tasks_dir)
+    return parse_task_record(path, raw)
+
+
+@contextmanager
+def task_archive_lock(tasks_dir: Path, *, moving: bool = False) -> Iterator[None]:
+    """Keep strict task scans and record/reply reads outside an archive group move.
+
+    The tasks directory itself is the stable lock anchor, so read-only callers
+    create no files. When a caller needs a worktree lock, it acquires it first.
+    """
+    try:
+        fd = os.open(tasks_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        if moving:
+            raise
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if moving else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
 
 
 def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Path]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -76,6 +77,28 @@ def test_locate_prefers_the_hot_record(tmp_path):
     hot.mkdir()
     assert store.candidate_task_record_names("codex/task", [hot.name]) == (hot.name,)
     assert store.candidate_task_record_names("other", names) == ()
+
+
+def test_read_follows_the_newest_copy_when_the_archive_name_collides(tmp_path, monkeypatch):
+    """Defect class: a moved record is replaced by an older run's archive copy."""
+    hot = tmp_path / "review.json"
+    old = store.archived_task_record_path(tmp_path, "review")
+    old.parent.mkdir()
+    old.write_bytes(b'{"task_id": "review", "run_nonce": "old"}')
+    os.utime(old, ns=(1, 1))
+    newest = old.with_name("review.20261119T140000Z.archived.json")
+    expected = b'{"task_id": "review", "run_nonce": "new"}'
+    hot.write_bytes(expected)
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(newest)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (newest, expected)
 
 
 def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):

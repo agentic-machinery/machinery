@@ -13,6 +13,7 @@ import os
 import subprocess
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dead_worker_state, task_record_store, worktree_claims
 from lu_machinery.orchestration import stale_task_records as str_mod
+from lu_machinery.review import record_cf_verdict
 from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -998,6 +1000,50 @@ def test_archive_round_trip_moves_record_with_sidecars(tasks_dir):
     after = {key: value[0] for key, value in _snapshot(tasks_dir).items() if not key.endswith(".lock")}
     assert after == {key: value[0] for key, value in before.items()}
     assert task_record_store.locate_task_record(tasks_dir, "old-done") == tasks_dir / "old-done.json"
+
+
+def test_recorder_reads_a_complete_archive_group(tasks_dir, monkeypatch):
+    """Defect class: publishing a record before its reply refuses verdict recording."""
+    hot = _terminal(tasks_dir, "review", worktree_branch="codex/topic")
+    reply = hot.with_suffix(".result")
+    reply.write_text("VERDICT: APPROVE")
+    staged = threading.Event()
+    reader_entered = threading.Event()
+    finish_move = threading.Event()
+    stage = str_mod._stage
+    flock = fcntl.flock
+
+    def pause_with_reply_staged(path, staging_dir):
+        staged_path = stage(path, staging_dir)
+        if path == reply:
+            staged.set()
+            assert finish_move.wait(timeout=10)
+        return staged_path
+
+    def observe_reader_lock(descriptor, operation):
+        if operation == fcntl.LOCK_SH:
+            reader_entered.set()
+        return flock(descriptor, operation)
+
+    monkeypatch.setattr(str_mod, "_stage", pause_with_reply_staged)
+    monkeypatch.setattr(fcntl, "flock", observe_reader_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        archive = pool.submit(str_mod.archive_terminal, tasks_dir, now=NOW, apply=True)
+        try:
+            assert staged.wait(timeout=10)
+            archived = tasks_dir / "archive" / hot.name
+            # The final record rename has already happened. Neither public reply path exists yet.
+            assert archived.is_file() and not hot.exists()
+            assert not reply.exists() and not archived.with_suffix(".result").exists()
+            read = pool.submit(record_cf_verdict._task, "review", tasks_dir)
+            read.add_done_callback(lambda _: reader_entered.set())
+            assert reader_entered.wait(timeout=10)
+        finally:
+            finish_move.set()
+        assert archive.result(timeout=10)["actions"] == {"archived": 1}
+        record, response = read.result(timeout=10)
+    assert record["task_id"] == "review"
+    assert response == "VERDICT: APPROVE"
 
 
 def test_archive_preserves_stable_lock_anchors(tasks_dir):

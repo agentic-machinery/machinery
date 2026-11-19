@@ -25,6 +25,49 @@ from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 
+def test_historical_admission_read_survives_a_listed_record_moving(tmp_path, monkeypatch):
+    """Defect class: archiving a listed record refuses the recorder's historical scan."""
+    hot = tmp_path / "retired.json"
+    archived = tmp_path / "archive" / hot.name
+    archived.parent.mkdir()
+    hot.write_text(json.dumps({"task_id": "retired", "schema_version": 2, "status": "done"}))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert recorder.admitted_unknown_history(
+        repository="org/repo", branch="codex/topic", head_sha=SHA, task_root=tmp_path, repo_root=tmp_path,
+    ) == ()
+    assert archived.is_file()
+
+
+def test_in_flight_guard_survives_a_listed_terminal_review_moving(tmp_path, monkeypatch):
+    """Defect class: a terminal review moving to archive looks like an unavailable in-flight ledger."""
+    hot = tmp_path / "retired.json"
+    archived = tmp_path / "archive" / hot.name
+    archived.parent.mkdir()
+    hot.write_text(json.dumps({
+        "task_id": "retired", "schema_version": 2, "status": "done", "review": True,
+        "repository": "org/repo", "pinned_head": SHA,
+    }))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    recorder.require_no_outside_review_in_flight(tmp_path, "org/repo", SHA)
+    assert archived.is_file()
+
+
 def test_repair_receipts_stay_private_on_admission_and_consumption(tmp_path, monkeypatch):
     """Defect class: receipt replacement leaks evidence, leaves partial files or fails on stale PID temps."""
     receipt = {
