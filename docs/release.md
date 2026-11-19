@@ -72,6 +72,10 @@ GitHub release is not a pre-release. A withdrawn pre-release, or a tag with no
 release, shipped nothing, so the PRs it held are listed again under the next
 version. `<full>` is the previous tag unless that tag was withdrawn.
 
+The release notes must also list every issue with the `known-issue` label that
+the release fixed or that is still open (`gh issue list --label known-issue
+--state all`). Review policy opens these issues, one per carried P3 finding.
+
 The `/machinery` page links the installed version to
 `CHANGELOG.md#v<version>` on `main`, so the anchor line is required.
 
