@@ -336,9 +336,12 @@ def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp
                    verdict="CHANGES_REQUESTED")
     (tasks / "kept-counts-review.result").write_text(
         json.dumps({"overall": {"correctness": "incorrect"}, "findings": [{"id": "F1", "priority": "P2"}]}))
-    store.replace(kept, tasks / "kept-counts-review.json")
+    kept_path = tasks / "kept-counts-review.json"
+    os.utime(kept_path, ns=(1_000_000_000, 1_000_000_000))  # an older record version, no sleep needed
+    first = rows.summary_row(kept_path, kept, 1_000_000_000)
+    assert first is not None and first["review"]["priorities"] == {"P2": 1}
+    rows.append_row(batch_state, first)
     (tasks / "kept-counts-review.result").unlink()
-    time.sleep(0.05)
     store.replace({**kept, "duration_s": 90}, tasks / "kept-counts-review.json")
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
     assert stored["kept-counts-review"]["duration_s"] == 90.0

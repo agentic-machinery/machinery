@@ -881,7 +881,7 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any], reje
     if review is None:
         return False
     if rejected:  # the record's sidecar fails verification: nothing retained from it stands
-        return old_review != review
+        return bool(old_review != review)
     if review["verdict"] != "unparsed":
         return (
             (review["priorities"] is not None or old_review is None or old_review["priorities"] is None
