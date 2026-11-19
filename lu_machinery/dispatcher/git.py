@@ -586,14 +586,15 @@ def agent_deploy_enrolled(path: Path, commit: str) -> bool:
     """Whether the checkout at ``path`` is enrolled in the installed agent deployment.
 
     It is when ``commit`` (the task's admitted start) or the checkout's HEAD tracks the descriptor, whatever
-    the working tree holds; read from the objects (``--no-replace-objects``). A Git step that fails is
-    ``agent_deploy_failed``.
+    the working tree holds; read from the objects (``--no-replace-objects``) with root-relative paths
+    (``--full-tree``), so no replace ref or worktree prefix the checkout's own configuration sets can hide it.
+    A Git step that fails is ``agent_deploy_failed``.
     """
     root = path.resolve()
     head = _checkout_head(root)
     try:
-        return any(_git(root, "--no-replace-objects", "ls-tree", "--name-only", tip, "--", AGENT_DEPLOY_DESCRIPTOR,
-                        isolate=True) for tip in dict.fromkeys((commit, head)))
+        return any(_git(root, "--no-replace-objects", "ls-tree", "--full-tree", "--name-only", tip, "--",
+                        AGENT_DEPLOY_DESCRIPTOR, isolate=True) for tip in dict.fromkeys((commit, head)))
     except (OSError, subprocess.SubprocessError) as exc:
         raise _git_failure("enrollment read", exc) from None
 
