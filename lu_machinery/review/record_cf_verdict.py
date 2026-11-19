@@ -285,6 +285,10 @@ P3_TRUNCATED = "reply is truncated in the record"
 P3_SCANNER_WITHHELD = "publication scanner withheld the reply"
 P3_STANDING_REJECTION = "head has a standing rejection or an unknown reading"
 P3_REPAIR_WITHHELD = "repair round withholds the P3 mapping"
+P3_NO_AC_CONFIRMATION = "reviewer does not confirm that no acceptance criterion is unmet"
+# The findings schema's ``overall`` field in which the reviewer confirms that no acceptance criterion
+# is unmet; only ``true`` lets P3 findings be carried (review-loop policy, KNOWN-ISSUES-1119).
+AC_CONFIRMATION_FIELD = "acceptance_criteria_met"
 
 
 @dataclass(frozen=True)
@@ -373,10 +377,12 @@ def p3_reading(reply: str) -> P3Reading:
     """Read a CHANGES_REQUESTED reply for an approval with P3 residuals (#12409).
 
     The reading applies only when the whole reply, apart from surrounding whitespace,
-    is exactly one ``code-review-findings.v1`` object and every entry's typed
-    ``priority`` is P3. No prose is read for findings: any text outside the object,
-    a verdict line included, keeps the reply's own verdict, and so does a truncated
-    reply. Every refusal names its reason.
+    is exactly one ``code-review-findings.v1`` object, every entry's typed
+    ``priority`` is P3, and ``overall.acceptance_criteria_met`` is ``true``: the
+    reviewer's confirmation that no acceptance criterion is unmet. No prose is read
+    for findings or for the confirmation: any text outside the object, a verdict line
+    included, keeps the reply's own verdict, and so does a truncated reply. Every
+    refusal names its reason.
     """
     if not isinstance(reply, str):
         return P3Reading(reason=P3_NOT_ONE_OBJECT)
@@ -406,6 +412,8 @@ def p3_reading(reply: str) -> P3Reading:
     ids = tuple(finding.finding_id for finding in findings)
     if len(set(ids)) != len(ids) or any(_RESIDUAL_ID.fullmatch(finding_id) is None for finding_id in ids):
         return P3Reading(reason=P3_CONFLICTING_ID)
+    if payload["overall"].get(AC_CONFIRMATION_FIELD) is not True:
+        return P3Reading(reason=P3_NO_AC_CONFIRMATION)
     return P3Reading(ids=ids)
 
 
@@ -3006,7 +3014,8 @@ def publication_of(repository: str, number: int, comment: Mapping[str, Any]) -> 
     """The publication-ledger entry a posted verdict comment proves, read as the verdict reader reads it (#902).
 
     Returns (entry, "") or (None, reason). A voided chunk, a second review and a marker of a model that cannot
-    supply a review of record are no review of record. A ``CHANGES_REQUESTED`` body whose open findings are all P3,
+    supply a review of record are no review of record. A ``CHANGES_REQUESTED`` body that ``p3_reading`` upgrades
+    (all P3, acceptance criteria confirmed met),
     and that no repair receipt holds back, is an approval, exactly as ``integration_sweep.lookup_verdict`` reads it.
     The caller decides whether the comment's author is trusted.
     """
@@ -3403,8 +3412,9 @@ def record(
     login = adapter.identity()
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
     chunk = _item_chunk(task, reply, stated, source_claims_validated=ukrainian and stated == "APPROVED")
-    # The reply stays REQUEST_CHANGES. A pure findings object whose entries are all P3 is an
-    # approval with residuals; any other reply keeps its verdict and names why (#12409).
+    # The reply stays REQUEST_CHANGES. A pure findings object whose entries are all P3, with the
+    # reviewer's confirmation that no acceptance criterion is unmet, is an approval with residuals;
+    # any other reply keeps its verdict and names why (#12409, KNOWN-ISSUES-1119).
     p3 = p3_reading(reply) if stated == "CHANGES_REQUESTED" else P3Reading()
     residuals, p3_refused = p3.ids, p3.reason
     verdict = "APPROVED" if residuals else stated
