@@ -427,6 +427,9 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         reason = f": {imported['reason']}" if isinstance(imported.get("reason"), str) else ""
         return summary, f"write_boundary_import_failed: {imported.get('status')}{reason}"
     ceiling = receipt.get("upload_ceiling")
+    if mode == "workspace-write" and not isinstance(ceiling, dict):
+        # A write run always runs under a ceiling (its parser refuses one without it): no evidence is no proof.
+        return summary, "write_boundary_unproven: the write run's receipt has no upload ceiling"
     if isinstance(ceiling, dict):
         summary["upload_ceiling"] = ceiling
         if ceiling.get("reached") is not False:
@@ -2404,11 +2407,11 @@ def main(argv: list[str]) -> int:
         parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
     write = args.mode == "workspace-write"
     if write != (args.draft_patch_fd is not None) or write != bool(args.owned_path) or (
-            write and (args.snapshot_bytes is None or not args.no_github_relays or not args.no_sources_relay
-                       or args.sources_mcp is not None)):
+            write and (args.snapshot_bytes is None or args.upload_ceiling is None or not args.no_github_relays
+                       or not args.no_sources_relay or args.sources_mcp is not None)):
         parser.error("--mode workspace-write needs --draft-patch-fd, --owned-path, --snapshot-bytes, "
-                     "--no-github-relays and --no-sources-relay, without --sources-mcp; --draft-patch-fd and "
-                     "--owned-path need it")
+                     "--upload-ceiling, --no-github-relays and --no-sources-relay, without --sources-mcp; "
+                     "--draft-patch-fd and --owned-path need it")
     if write:
         try:
             info = os.fstat(args.draft_patch_fd)

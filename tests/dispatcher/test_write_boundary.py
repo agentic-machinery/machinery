@@ -939,6 +939,10 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     assert imported["status"] == "drafted" and imported["paths"] == ["docs/guide.md", "docs/new.md", "gone.txt"]
     assert imported["patch_sha256"] == hashlib.sha256(patch.read_bytes()).hexdigest()
     assert _verify(tmp_path, "workspace-write") is None
+    # Only the launcher's Boolean true proves containment: any other canary value is refused (review of #926).
+    altered = {**receipt, "canary": {**receipt["canary"], "passed": "yes"}}
+    (tmp_path / "receipt.json").write_text(json.dumps(altered))
+    assert _verify(tmp_path, "workspace-write") == "write_boundary_refused: ran"
     assert _verify(tmp_path, "read-only") == "write_boundary_unproven: the receipt names another mode"
     # Nothing outside the patch changed: the worktree, the primary's files, refs and objects, the host.
     assert _git(worktree, "status", "--porcelain") == "" and _git(repo, "status", "--porcelain") == status
@@ -1018,12 +1022,13 @@ def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path,
 
 
 def test_savant_write_run_needs_its_bounds(primary, tmp_path):
-    """Defect class (#898): a write run starts without the view, the patch target, its owned paths or with a
-    GitHub or Sources relay or Sources MCP."""
+    """Defect class (#898): a write run starts without the view, the patch target, its owned paths, its upload
+    ceiling, or with a GitHub or Sources relay or Sources MCP."""
     descriptor = os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
-    full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--no-github-relays", "--no-sources-relay",
-            "--draft-patch-fd", str(descriptor), "--owned-path", "docs"]
-    for drop in ("--snapshot-bytes", "--no-github-relays", "--no-sources-relay", "--draft-patch-fd", "--owned-path"):
+    full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--upload-ceiling", "65536", "--no-github-relays",
+            "--no-sources-relay", "--draft-patch-fd", str(descriptor), "--owned-path", "docs"]
+    for drop in ("--snapshot-bytes", "--upload-ceiling", "--no-github-relays", "--no-sources-relay", "--draft-patch-fd",
+                 "--owned-path"):
         index = full.index(drop)
         argv = full[:index] + full[index + (1 if drop.startswith("--no-") else 2):]
         with pytest.raises(SystemExit):
