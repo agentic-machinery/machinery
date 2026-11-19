@@ -158,7 +158,7 @@ function reasonCell(count, sample) {
   return `<td class="num"${title}>${num(count || 0)}</td>`;
 }
 function reviewRow(r, kind) {
-  const v = r.verdicts, u = r.unparsed_reasons || {}, samples = r.unparsed_samples || {};
+  const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : (r.unparsed_samples || {});
   const notDone = pct(r.not_done) + (u.not_done ? ` <span class="muted">(${num(u.not_done)})</span>` : "");
   const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(notDone)}`

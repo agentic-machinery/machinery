@@ -389,7 +389,7 @@ class _Group:
         self.points += other.points
         return self
 
-    def to_dict(self, role: str) -> dict[str, Any]:
+    def to_dict(self, role: str, *, include_samples: bool = False) -> dict[str, Any]:
         tasks = sum(self.status.values())
         seconds = sum(self.durations)
         hours = seconds / 3600
@@ -427,14 +427,17 @@ class _Group:
             out.update(
                 verdicts={name: self.verdicts[name] for name in VERDICTS},
                 unparsed_reasons={name: self.unparsed_reasons[name] for name in UNPARSED_REASON_KEYS},
-                unparsed_samples={name: self.unparsed_samples[name][1]
-                                  for name in UNPARSED_REASONS if name in self.unparsed_samples},
                 findings=sum(self.priorities.values()) if self.findings_n else None,
                 findings_n=self.findings_n,
                 approve_rate=_rate(self.verdicts["correct"], parsed),
                 blocking_per_review=_rate(sum(self.priorities[p] for p in BLOCKING), self.findings_n),
                 p0_p2_per_review=_rate(sum(self.priorities[p] for p in P0_P2), self.findings_n),
             )
+            if include_samples:
+                out["unparsed_samples"] = {
+                    name: self.unparsed_samples[name][1]
+                    for name in UNPARSED_REASONS if name in self.unparsed_samples
+                }
         return out
 
 
@@ -461,7 +464,7 @@ def _bounded(fine: _Fine) -> _Fine:
     return bounded
 
 
-def _models(fine: _Fine) -> list[dict[str, Any]]:
+def _models(fine: _Fine, *, include_samples: bool = True) -> list[dict[str, Any]]:
     """Per (model, role): the totals over every effort and their class split, then per effort with its own classes."""
     totals: dict[tuple[str, str], _Group] = defaultdict(_Group)
     classes: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
@@ -478,7 +481,8 @@ def _models(fine: _Fine) -> list[dict[str, Any]]:
         return [{"class": name, **group.to_dict(role)} for name, group in _ordered(groups)]
 
     return [
-        {"model": model, "identity": identity(model), "role": role, "effort": ALL_EFFORTS, **group.to_dict(role),
+        {"model": model, "identity": identity(model), "role": role, "effort": ALL_EFFORTS,
+         **group.to_dict(role, include_samples=include_samples),
          "by_effort": [{"effort": effort, **cls.to_dict(role),
                         "by_class": by_class(effort_classes[(model, role, effort)], role)}
                        for effort, cls in _ordered(efforts[(model, role)])],
@@ -1205,7 +1209,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         # 24h stays off this label set.
         if name in METRIC_WINDOWS:
-            metric_models = _models(_bounded(fine))
+            metric_models = _models(_bounded(fine), include_samples=False)
             _stamp_allowance(metric_models, selected, model_of=metric_model, effort_of=metric_effort)
             metric_windows[name] = {"models": metric_models, "authors": _authors(prs, metric_model)}
     weeks = _week_groups(rows)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -36,14 +37,17 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
+from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
 from lu_machinery.model_families import canonical_cursor_model
+from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
 from lu_machinery.review.verdict_parser import checked_findings_payload
+from lu_machinery.secret_redactor import redact_text
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
 _JSON_MAX_DEPTH = 128
@@ -61,13 +65,16 @@ _RECORDED_VERDICTS = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "
 PRIORITIES = ("P0", "P1", "P2", "P3")
 _ESCAPE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 _NAMED_ESCAPES = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
-_ENVELOPE_FIELD_ERRORS = (
+_FIELD_CONTRACT_ERRORS = (
+    "review_root_must_be_object",
     "schema_violation:",
     "duplicate_finding_ids",
     "invalid_line_range:",
     "review_envelope_verdict_mismatch",
     "review_envelope_invalid_verdict:",
 )
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_ATTEMPT_KEYS = ("role", "status", "model", "repo", "started_at", "finished_at", "pr", "pinned_head")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -224,6 +231,30 @@ def role_of(record: Mapping[str, Any]) -> str:
     return "review" if mode == "read-only" or "review" in str(record.get("task_id", "")) else "write"
 
 
+@lru_cache(maxsize=1)
+def _public_repo_keys() -> frozenset[str]:
+    try:
+        return frozenset(key for key, repo in load_fleet_repos().items() if repo.role.startswith("public-"))
+    except Exception:  # fail closed: an unreadable repo catalog admits no reply samples
+        return frozenset()
+
+
+def _repo_is_public(repo: object) -> bool:
+    return isinstance(repo, str) and repo in _public_repo_keys()
+
+
+def _record_allows_sample(record: Mapping[str, Any]) -> bool:
+    """Whether a failing reply from ``record`` is eligible for a bounded stats sample (public repos/data only)."""
+    options = _options(record)
+    repo = label(record.get("repo") or options.get("repo"), "public")
+    if not _repo_is_public(repo):
+        return False
+    data_class = record.get("data_class")
+    if data_class is None:
+        data_class = options.get("data_class")
+    return data_class is None or (isinstance(data_class, str) and data_class.strip().lower().startswith("public"))
+
+
 def _needs_escape(ch: str) -> bool:
     return ch in _NAMED_ESCAPES or unicodedata.category(ch) in _ESCAPE_CATEGORIES
 
@@ -239,10 +270,7 @@ def _escape_char(ch: str) -> str:
     return f"\\U{code:08x}"
 
 
-def _sample(raw: bytes) -> str:
-    """First ``MAX_SAMPLE_CHARS`` characters of a failing reply, with control/format characters escaped."""
-    # At most 4 UTF-8 bytes per character; read a bounded prefix so a 4 MB+ reply is never decoded whole.
-    prefix = raw[: MAX_SAMPLE_CHARS * 4].decode("utf-8", errors="replace")[:MAX_SAMPLE_CHARS]
+def _escape_sample(prefix: str) -> str:
     parts: list[str] = []
     used = 0
     for ch in prefix:
@@ -254,18 +282,47 @@ def _sample(raw: bytes) -> str:
     return "".join(parts)
 
 
+def _sample_text_cleared(text: str) -> bool:
+    """Reject samples carrying OPSEC tokens (paths, IPs, emails, SSH) or secret/credential patterns."""
+    return not scan_text(text) and redact_text(text) == text
+
+
+def _sample(raw: bytes) -> str | None:
+    """First ``MAX_SAMPLE_CHARS`` escaped characters of a failing reply when cleared for stats, else None."""
+    # At most 4 UTF-8 bytes per character; read a bounded prefix so a 4 MB+ reply is never decoded whole.
+    prefix = raw[: MAX_SAMPLE_CHARS * 4].decode("utf-8", errors="replace")[:MAX_SAMPLE_CHARS]
+    escaped = _escape_sample(prefix)
+    if not _sample_text_cleared(prefix) or not _sample_text_cleared(escaped):
+        return None
+    return escaped
+
+
 def _unparsed(reason: str, sample: str | None = None) -> dict[str, Any]:
     return {"verdict": "unparsed", "priorities": None, "unparsed_reason": reason, "unparsed_sample": sample}
 
 
-def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
-    """Verdict and finding priorities from the record's adjacent ``.result`` sidecar, or a typed unparsed cause."""
+def _sidecar_path(path: Path, record: Mapping[str, Any]) -> Path | None:
+    """Resolve the ``.result`` sidecar bound to ``path``, preserving stamped archive renames."""
+    task_id = record.get("task_id")
+    if isinstance(task_id, str) and path.stem != task_id:
+        return path.with_name(f"{path.stem}.result")
     declared = record.get("result_file")
     name = Path(declared).name if isinstance(declared, str) and declared else f"{path.stem}.result"
     if not name.endswith(".result"):
+        return None
+    return path.with_name(name)
+
+
+def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Verdict and finding priorities from the record's bound ``.result`` sidecar, or a typed unparsed cause."""
+    sidecar = _sidecar_path(path, record)
+    if sidecar is None:
+        return _unparsed("missing_result")
+    expected = record.get("result_sha256")
+    if expected is not None and (not isinstance(expected, str) or not _SHA256.fullmatch(expected)):
         return _unparsed("missing_result")
     try:
-        fd = os.open(path.with_name(name), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
         return _unparsed("missing_result")
     try:
@@ -277,9 +334,14 @@ def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
         return _unparsed("missing_result")
     finally:
         os.close(fd)
+    allow_sample = _record_allows_sample(record)
     if len(raw) > MAX_RESULT_BYTES:
-        return _unparsed("too_big", _sample(raw))
-    return review_summary(raw)
+        # Withhold the sample when the recorded digest cannot be verified within the read budget.
+        sample = _sample(raw) if allow_sample and expected is None else None
+        return _unparsed("too_big", sample)
+    if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
+        return _unparsed("missing_result")
+    return review_summary(raw, allow_sample=allow_sample)
 
 
 def _recorded_review(verdict: object) -> dict[str, Any] | None:
@@ -290,19 +352,22 @@ def _recorded_review(verdict: object) -> dict[str, Any] | None:
         return None
 
 
-def review_summary(raw: bytes) -> dict[str, Any]:
+def review_summary(raw: bytes, *, allow_sample: bool = True) -> dict[str, Any]:
     """Read structured review output through the review contract, retaining only counts, verdict, or parse cause."""
+    def fail(reason: str) -> dict[str, Any]:
+        return _unparsed(reason, _sample(raw) if allow_sample else None)
+
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return _unparsed("bad_format", _sample(raw))
+        return fail("bad_format")
     try:
         payload = parse_reviewer_json(text)
     except ContractError as exc:
-        reason = "bad_fields" if str(exc).startswith(_ENVELOPE_FIELD_ERRORS) else "bad_format"
-        return _unparsed(reason, _sample(raw))
+        reason = "bad_fields" if str(exc).startswith(_FIELD_CONTRACT_ERRORS) else "bad_format"
+        return fail(reason)
     except (ValueError, RecursionError, TypeError):
-        return _unparsed("bad_format", _sample(raw))
+        return fail("bad_format")
     try:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
@@ -310,17 +375,17 @@ def review_summary(raw: bytes) -> dict[str, Any]:
             return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
             recorded = _recorded_review(payload["verdict"])
-            return recorded if recorded is not None else _unparsed("bad_fields", _sample(raw))
+            return recorded if recorded is not None else fail("bad_fields")
     except (ContractError, ReviewPublicationError, ValueError, RecursionError, TypeError, KeyError):
-        return _unparsed("bad_fields", _sample(raw))
+        return fail("bad_fields")
     # Older dispatches also recorded the unversioned correctness and priority fields.
     if "schema_version" in payload:
-        return _unparsed("bad_fields", _sample(raw))
+        return fail("bad_fields")
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
     findings = payload.get("findings", [])
     if verdict not in VERDICTS[:3] or not isinstance(findings, list):
-        return _unparsed("bad_fields", _sample(raw))
+        return fail("bad_fields")
     priorities: Counter[str] = Counter(
         finding["priority"] for finding in findings
         if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
@@ -543,11 +608,14 @@ def _sample_ok(value: object) -> bool:
         isinstance(value, str)
         and len(value) <= MAX_SAMPLE_CHARS
         and not any(_needs_escape(ch) for ch in value)
+        and _sample_text_cleared(value)
     )
 
 
-def _review_ok(review: object) -> bool:
-    if not isinstance(review, dict):
+def _review_ok(review: object, *, role: object, status: object, repo: object) -> bool:
+    if review is None:
+        return True
+    if role != "review" or status != "done" or not isinstance(review, dict):
         return False
     verdict = review.get("verdict")
     if not isinstance(verdict, str) or verdict not in VERDICTS:
@@ -558,13 +626,15 @@ def _review_ok(review: object) -> bool:
         return False
     if review.keys() == {"verdict", "priorities"}:
         return True
-    if verdict != "unparsed" or review.keys() != {"verdict", "priorities", "unparsed_reason", "unparsed_sample"}:
+    if verdict != "unparsed" or priorities is not None or review.keys() != {
+        "verdict", "priorities", "unparsed_reason", "unparsed_sample",
+    }:
         return False
     reason = review["unparsed_reason"]
     sample = review["unparsed_sample"]
     if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
         return False
-    if reason == "missing_result":
+    if reason == "missing_result" or not _repo_is_public(repo):
         return sample is None
     return _optional(sample, _sample_ok)
 
@@ -583,7 +653,7 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
-        _optional(review, _review_ok),
+        _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo")),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -678,6 +748,33 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     )
 
 
+def _same_review_attempt(present: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
+    return (
+        candidate.get("role") == "review"
+        and candidate.get("status") == "done"
+        and all(present.get(key) == candidate.get(key) for key in _ATTEMPT_KEYS)
+    )
+
+
+def _preserve_review_evidence(present: Mapping[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
+    """Keep earlier retained review evidence when a newer version of the same attempt lost its sidecar."""
+    if present is None or not _same_review_attempt(present, candidate):
+        return candidate
+    old_review = present.get("review")
+    new_review = candidate.get("review")
+    if not isinstance(old_review, Mapping) or not isinstance(new_review, Mapping):
+        return candidate
+    if new_review.get("verdict") != "unparsed" or new_review.get("unparsed_reason") != "missing_result":
+        return candidate
+    has_richer_old = (
+        old_review.get("verdict") != "unparsed"
+        or old_review.get("unparsed_reason") in ("too_big", "bad_format", "bad_fields")
+    )
+    if not has_richer_old:
+        return candidate
+    return {**candidate, "review": dict(old_review)}
+
+
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
     """Add a row for every settled record without a current one; idempotent. Records are read outside the lock.
 
@@ -694,13 +791,15 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
     counts["settled_records"] = len(candidates)
     if dry_run:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        counts["would_add"] = sum(row["task_id"] not in present for row in candidates)
+        merged = [_preserve_review_evidence(present.get(row["task_id"]), row) for row in candidates]
+        counts["would_add"] = sum(row["task_id"] not in present for row in merged)
         counts["would_refresh"] = sum(row["task_id"] in present and _stale(present[row["task_id"]], row)
-                                      for row in candidates)
+                                      for row in merged)
         return dict(sorted(counts.items()))
     with _locked(batch_state_dir) as path:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        written = [row for row in candidates if _stale(present.get(row["task_id"]), row)]
+        merged = [_preserve_review_evidence(present.get(row["task_id"]), row) for row in candidates]
+        written = [row for row in merged if _stale(present.get(row["task_id"]), row)]
         counts["added"] = sum(row["task_id"] not in present for row in written)
         counts["refreshed"] = len(written) - counts["added"]
         counts["already_present"] = len(candidates) - len(written)
