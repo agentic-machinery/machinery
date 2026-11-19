@@ -7,8 +7,10 @@ One read-only collector joins two durable sources:
 * ``X-Agent: <harness>/<task>`` lines on each registered repository's local ``origin/main`` (the landing join),
   together with the merged delivery a task recorded itself.
 
-One refresh computes every window (7, 30, 90 days and all) and the ISO-week buckets; the route serves a window
-of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``. Every figure
+One refresh computes every window (24 hours, 7, 30, 90 days and all) and the ISO-week buckets; the route serves a
+window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``.
+``/metrics`` keeps the four longer windows, so a 24-hour series does not add a label value. ``view=page`` serves
+the same figures without the per-class tree. Every figure
 splits by the concrete model id and the effective effort (``unset`` when none was recorded); a bare Claude alias
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
 CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
@@ -54,7 +56,11 @@ FRESHNESS_BOUND_SECONDS = 420.0
 COLD_WAIT_SECONDS = 15.0
 LOW_SAMPLE = 10
 GIT_TIMEOUT_SECONDS = 30.0
-WINDOWS: dict[str, int | None] = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+WINDOWS: dict[str, int | None] = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "all": None}
+# Grafana's window label set stays these four. ``24h`` is a page window only.
+METRIC_WINDOWS = ("7d", "30d", "90d", "all")
+PAGE_DROP = frozenset({
+    "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed")
 ALL_EFFORTS = "all"
 # Review policy blocks on P0 and P1 (fleet_comms.review_publication.BLOCKING_PRIORITIES); the
@@ -147,11 +153,38 @@ def _rate(numerator: float, denominator: int, digits: int = 3) -> dict[str, Any]
             "low_sample": denominator < LOW_SAMPLE}
 
 
-def _p90(values: list[float]) -> float | None:
+def _percentile(values: list[float], quantile: float) -> float | None:
+    """The smallest value at or above ``quantile``, the same rank ``p90`` has always used."""
     if not values:
         return None
     ordered = sorted(values)
-    return ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+    return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
+def _wilson(successes: int, total: int) -> list[float] | None:
+    """A 95% Wilson interval for ``successes`` out of ``total``. None when there is no trial."""
+    if total <= 0:
+        return None
+    z = 1.96
+    proportion = successes / total
+    z2 = z * z
+    denom = 1 + z2 / total
+    center = (proportion + z2 / (2 * total)) / denom
+    margin = z * math.sqrt(proportion * (1 - proportion) / total + z2 / (4 * total * total)) / denom
+    return [round(max(0.0, center - margin), 3), round(min(1.0, center + margin), 3)]
+
+
+def _timing_shown(tasks: int, untimed: int) -> bool:
+    """Whether the recorded hours are enough of the tasks to show, instead of a blank.
+
+    One missing duration in a large model blanks the strict rate. Showing the recorded hours is honest when the
+    gap is at most one task in ten or more, or at most one percent. A larger gap stays blank.
+    """
+    if untimed <= 0:
+        return True
+    if tasks <= 0:
+        return False
+    return untimed / tasks <= 0.01 or (untimed == 1 and tasks >= 10)
 
 
 def _median(values: list[float]) -> float | None:
@@ -323,20 +356,28 @@ class _Group:
         hours = seconds / 3600
         # A task with no recorded duration makes the total, and so the cost per landed task, unknown, never zero.
         timed = len(self.durations) == tasks
+        untimed = tasks - len(self.durations)
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
             "status": {name: self.status[name] for name in (*STATUSES, "other")},
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
-            "wall_seconds": {"median": _median(self.durations), "p90": _p90(self.durations),
+            "wall_seconds": {"p25": _percentile(self.durations, 0.25), "median": _median(self.durations),
+                             "p75": _percentile(self.durations, 0.75), "p90": _percentile(self.durations, 0.9),
                              "total_hours": round(hours, 2), "total_seconds": round(seconds, 1),
                              "n": len(self.durations)},
             "tokens": dict(zip(("fresh_input", "cached_input", "output"), self.tokens, strict=True)),
         }
         if role == "write":
+            # The strict rate stays unknown when any duration is missing, so a gap is never stored as zero.
+            # The observed rate uses the recorded hours and says how many tasks were left out.
+            observed = round(hours / self.landed, 2) if self.landed and self.durations else None
             out.update(
                 landed=self.landed, landed_rate=_rate(self.landed, tasks),
                 wall_hours_per_landed={**_rate(hours, self.landed, 2), **({} if timed else {"value": None})},
+                wall_hours_observed={"value": observed if _timing_shown(tasks, untimed) else None,
+                                     "n": self.landed, "timed_tasks": len(self.durations),
+                                     "untimed_tasks": untimed},
                 output_tokens_per_landed=_rate(self.tokens[2], self.landed, 0),
                 fresh_input_tokens_per_landed=_rate(self.tokens[0], self.landed, 0),
                 allowance_pct_points_per_landed=_rate(self.points, self.allowance["landed"], 2),
@@ -418,12 +459,12 @@ def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
         entry = prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))]
         entry["authors"].add(row.author)
         entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
-            (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class))
+            (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class, row.moment))
     outcomes = []
     for entry in prs.values():
         heads = sorted((sorted(reviews, key=lambda r: r[:2]) for reviews in entry["heads"].values()),
                        key=lambda reviews: reviews[0][:2])
-        _, _, verdict, _, reviewer, review_class = heads[0][0]
+        _, _, verdict, _, reviewer, review_class, first_moment = heads[0][0]
         after_block = None
         if verdict != "correct":
             after_block = ("approved_on_same_head" if any(r[2] == "correct" for r in heads[0][1:])
@@ -431,7 +472,7 @@ def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
                            else "not_approved")
         outcomes.append({
             "author": "+".join(sorted(entry["authors"])), "rounds": len(heads), "first": verdict,
-            "reviewer": reviewer, "class": review_class, "after_block": after_block,
+            "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "after_block": after_block,
             "approved": any(r[2] == "correct" for h in heads for r in h),
             # Findings of each round: the head's first review.
             "blocking": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in BLOCKING),
@@ -488,19 +529,191 @@ def _matrix(prs: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
             for (author, reviewer, review_class), (approved, n) in sorted(cells.items())]
 
 
+@dataclass(frozen=True)
+class _Meter:
+    """One pool reading on a write task: the remaining percentage at start and at finish."""
+    start: datetime
+    end: datetime
+    start_pct: float
+    finish_pct: float
+    landed: bool
+
+
+def _meter(row: _Row) -> _Meter | None:
+    """The task's pool interval, or None when a reading is missing.
+
+    A finish above the start is a reset. The interval still joins a cluster, so a task running inside another
+    one can show that the meter reset during the outer task.
+    """
+    block = row.raw.get("allowance")
+    if not isinstance(block, Mapping):
+        return None
+    ends = []
+    for side in ("start", "finish"):
+        reading = block.get(side)
+        value = reading.get("remaining_pct") if isinstance(reading, Mapping) else None
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            return None
+        ends.append(float(value))
+    start = row.started or row.moment
+    end = row.moment if row.moment >= start else start
+    return _Meter(start, end, ends[0], ends[1], row.landed)
+
+
+@dataclass(frozen=True)
+class _Cluster:
+    """Overlapping write tasks on one pool, charged once when the meter stays readable."""
+    pool: str
+    rows: tuple[_Row, ...]
+    points: float | None
+
+
+def _clusters(rows: list[_Row]) -> list[_Cluster]:
+    """One cluster per overlapping run, built once per pool across every model.
+
+    A later pool reading above an earlier one, including a rise between two tasks, means the weekly window
+    reset inside the cluster. Readings that share a timestamp and disagree have no order, so that cluster's
+    points stay unknown too. A cluster shared by more than one model, effort or class cannot be split from
+    these rows, so a subgroup that only partly owns it is unknown too.
+    """
+    by_pool: dict[str, list[tuple[_Meter, _Row]]] = defaultdict(list)
+    for row in rows:
+        if row.role != "write" or row.allowance is None:
+            continue
+        meter = _meter(row)
+        if meter is not None:
+            by_pool[row.allowance[0]].append((meter, row))
+    built: list[_Cluster] = []
+    for pool, timed in by_pool.items():
+        timed.sort(key=lambda item: (item[0].start, item[0].end, item[1].task_id))
+        groups: list[list[tuple[_Meter, _Row]]] = []
+        cluster_end: datetime | None = None
+        for meter, row in timed:
+            if cluster_end is not None and meter.start <= cluster_end:
+                groups[-1].append((meter, row))
+                if meter.end > cluster_end:
+                    cluster_end = meter.end
+                continue
+            groups.append([(meter, row)])
+            cluster_end = meter.end
+        for group in groups:
+            meters = [meter for meter, _row in group]
+            members = tuple(row for _meter, row in group)
+            earliest = min(meters, key=lambda meter: (meter.start, meter.end))
+            latest = max(meters, key=lambda meter: meter.end)
+            events = [(meter.start, meter.start_pct) for meter in meters]
+            events.extend((meter.end, meter.finish_pct) for meter in meters)
+            by_time: dict[datetime, set[float]] = defaultdict(set)
+            for at, pct in events:
+                by_time[at].add(pct)
+            # A tie has no order: the higher reading may be the later one, which is a reset.
+            unordered = any(len(pcts) > 1 for pcts in by_time.values())
+            # A later reading above an earlier one is a reset, including a rise between two tasks.
+            reset = unordered or any(later_pct > earlier_pct for earlier_at, earlier_pct in events
+                                     for later_at, later_pct in events if later_at > earlier_at) or any(
+                                         meter.finish_pct > meter.start_pct for meter in meters)
+            net = earliest.start_pct - latest.finish_pct
+            built.append(_Cluster(pool, members, None if reset or net < 0 else net))
+    return built
+
+
+def _facts_for(clusters: list[_Cluster], selected: set[int], resets: int) -> dict[str, Any]:
+    """Points for the selected tasks. A cluster that is not entirely selected, or not readable, makes them unknown."""
+    points = 0.0
+    known = True
+    tasks = landed = overlapped = 0
+    for cluster in clusters:
+        members = [row for row in cluster.rows if id(row) in selected]
+        if not members:
+            continue
+        tasks += len(members)
+        landed += sum(row.landed for row in members)
+        if len(cluster.rows) > 1:
+            overlapped += len(members)
+        if len(members) != len(cluster.rows) or cluster.points is None:
+            known = False
+        else:
+            points += cluster.points
+    return {"points": round(points, 2) if known else None, "tasks": tasks, "landed": landed,
+            "reset_crossed": resets, "overlapped_tasks": overlapped}
+
+
+def _apply_allowance(entry: dict[str, Any], facts: dict[str, Any]) -> None:
+    points = facts["points"]
+    entry["allowance_pct_points_per_landed"] = (
+        _rate(points, facts["landed"], 2) if points is not None else {"value": None, "n": facts["landed"],
+                                                                      "low_sample": facts["landed"] < LOW_SAMPLE})
+    entry["allowance_overlapped_tasks"] = facts["overlapped_tasks"]
+
+
+def _selected(rows: list[_Row], predicate: Callable[[_Row], bool]) -> tuple[set[int], int]:
+    """Ids the predicate admits. A reset stays in the set, so its effort still touches the cluster."""
+    chosen: set[int] = set()
+    resets = 0
+    for row in rows:
+        if row.role != "write" or row.allowance is None or not predicate(row):
+            continue
+        if row.allowance[1] < 0:
+            resets += 1
+        chosen.add(id(row))
+    return chosen, resets
+
+
+def _stamp_allowance(models: list[dict[str, Any]], rows: list[_Row], *,
+                     model_of: Callable[[str], str] = lambda model: model,
+                     effort_of: Callable[[str], str] = lambda effort: effort) -> None:
+    """Replace the summed per-task allowance with one net drop per overlapping cluster."""
+    clusters = _clusters(rows)
+
+    def pick(name: str, effort_name: str | None = None, class_name: str | None = None) -> tuple[set[int], int]:
+        def predicate(row: _Row) -> bool:
+            if model_of(row.model) != name:
+                return False
+            if effort_name is not None and effort_of(row.effort) != effort_name:
+                return False
+            return class_name is None or row.task_class == class_name
+        return _selected(rows, predicate)
+
+    for model in models:
+        if model["role"] != "write":
+            continue
+        name = model["model"]
+        _apply_allowance(model, _facts_for(clusters, *pick(name)))
+        for effort in model["by_effort"]:
+            _apply_allowance(effort, _facts_for(clusters, *pick(name, effort["effort"])))
+            for task_class in effort.get("by_class", []):
+                _apply_allowance(task_class, _facts_for(clusters, *pick(name, effort["effort"], task_class["class"])))
+        for task_class in model.get("by_class", []):
+            _apply_allowance(task_class, _facts_for(clusters, *pick(name, None, task_class["class"])))
+
+
 def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
-    """Weekly allowance spent per landed write task per pool, model and effort; unknown readings are excluded."""
-    groups: dict[tuple[str, str, str], _Group] = defaultdict(_Group)
+    """Weekly allowance spent per landed write task per pool, model and effort.
+
+    A cluster that also contains another model or effort is not split: those rows stay unknown.
+    """
+    clusters = _clusters(rows)
+    grouped: dict[tuple[str, str, str], list[_Row]] = defaultdict(list)
     for row in rows:
         if row.role == "write" and row.allowance is not None:
-            groups[(row.allowance[0], row.model, row.effort)].add(row)
-    return [
-        {"pool": pool, "model": model, "effort": effort, "tasks": g.allowance["tasks"],
-         "landed": g.allowance["landed"], "reset_crossed": g.allowance["reset_crossed"],
-         "low_sample": g.allowance["tasks"] < LOW_SAMPLE, "pct_points_spent": round(g.points, 2),
-         "pct_points_per_landed": _rate(g.points, g.allowance["landed"], 2)}
-        for (pool, model, effort), g in sorted(groups.items())
-    ]
+            grouped[(row.allowance[0], row.model, row.effort)].append(row)
+    table = []
+    for (pool, model, effort), grouped_rows in sorted(grouped.items()):
+        def in_pool(row: _Row, pool: str = pool) -> bool:
+            return row.allowance is not None and row.allowance[0] == pool
+
+        chosen, resets = _selected(grouped_rows, in_pool)
+        facts = _facts_for([cluster for cluster in clusters if cluster.pool == pool], chosen, resets)
+        points = facts["points"]
+        table.append({
+            "pool": pool, "model": model, "effort": effort, "tasks": facts["tasks"], "landed": facts["landed"],
+            "reset_crossed": facts["reset_crossed"], "low_sample": facts["tasks"] < LOW_SAMPLE,
+            "overlapped_tasks": facts["overlapped_tasks"],
+            "pct_points_spent": points if points is not None else None,
+            "pct_points_per_landed": _rate(points, facts["landed"], 2) if points is not None else {
+                "value": None, "n": facts["landed"], "low_sample": facts["landed"] < LOW_SAMPLE},
+        })
+    return table
 
 
 _PrKey = tuple[str, int]
@@ -605,6 +818,217 @@ def _review_level(level: str, observed: Mapping[str, Any] | None, linked: list[t
     }
 
 
+def _observed_hours(model: Mapping[str, Any]) -> float | None:
+    observed = model.get("wall_hours_observed") or {}
+    seconds = model.get("wall_seconds")
+    total = _number(seconds.get("total_seconds") if isinstance(seconds, Mapping) else None)
+    landed = _number(model.get("landed"))
+    if observed.get("value") is None or total is None or not landed:
+        return None
+    return total / 3600 / landed
+
+
+def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[_Row]) -> dict[str, Any]:
+    """The page's chart series. Counts only: no task id, prompt, path or account."""
+    writes = [model for model in models if model["role"] == "write"]
+    reviews = [model for model in models if model["role"] == "review"]
+    by_name = {model["model"]: model for model in writes}
+    approved: Counter[str] = Counter()
+    reviewed: Counter[str] = Counter()
+    for pr in prs:
+        approved[pr["author"]] += pr["first"] == "correct"
+        reviewed[pr["author"]] += 1
+
+    # total_seconds on the model is rounded to one decimal. Ranking uses the unrounded durations.
+    raw_seconds: dict[str, float] = defaultdict(float)
+    for row in rows:
+        if row.role == "write" and row.duration is not None:
+            raw_seconds[row.model] += row.duration
+    pareto = []
+    for model in writes:
+        name = model["model"]
+        total = raw_seconds.get(name)
+        observed = model.get("wall_hours_observed") or {}
+        trials = reviewed[name]
+        # Rank on the raw counts. Rounding the per-landing hours first drops a short task and
+        # scales the rate by landings per reviewed PR.
+        if observed.get("value") is None or total is None or total <= 0 or trials <= 0 or not model.get("landed"):
+            continue
+        successes = approved[name]
+        recorded = total / 3600
+        per_landed = recorded / model["landed"]
+        pareto.append({
+            "model": name, "identity": model["identity"], "approval_raw": successes / trials,
+            "approval": round(successes / trials, 3), "approval_n": trials, "approvals": successes,
+            "approval_ci": _wilson(successes, trials), "hours_raw": per_landed,
+            "hours": round(per_landed, 2), "recorded_hours": recorded,
+            "landed": model["landed"], "prs": trials,
+            "low_sample": model["landed"] < LOW_SAMPLE or trials < LOW_SAMPLE,
+        })
+    # A low sample can sit anywhere and must not draw the frontier. The line is only models with 10 landed and 10 PRs.
+    for point in pareto:
+        point["frontier"] = not point["low_sample"] and not any(
+            not other["low_sample"] and other is not point
+            and other["approval_raw"] >= point["approval_raw"] and other["hours_raw"] <= point["hours_raw"]
+            and (other["approval_raw"] > point["approval_raw"] or other["hours_raw"] < point["hours_raw"])
+            for other in pareto)
+    eligible = [point for point in pareto if point["identity"] == "catalog" and not point["low_sample"]
+                and point["recorded_hours"] > 0]
+    rule = ("most first-round approvals per recorded wall hour, among catalog models "
+            "with at least 10 landed tasks and 10 reviewed PRs")
+    if eligible:
+        best = max(eligible, key=lambda point: (
+            point["approvals"] / point["recorded_hours"], point["approval_raw"], point["model"]))
+        recommendation = {"model": best["model"], "approval": best["approval"], "approval_n": best["approval_n"],
+                          "approvals": best["approvals"], "approval_ci": best["approval_ci"],
+                          "hours": best["hours"], "recorded_hours": round(best["recorded_hours"], 4),
+                          "landed": best["landed"], "score": round(best["approvals"] / best["recorded_hours"], 3),
+                          "rule": rule, "reason": None}
+    else:
+        recommendation = {"model": None, "reason": "not enough data yet", "rule": rule}
+    for point in pareto:
+        del point["approval_raw"], point["hours_raw"], point["recorded_hours"], point["approvals"]
+
+    waste = []
+    for model in writes:
+        rate = model["landed_rate"]
+        if model["tasks"] < LOW_SAMPLE or rate["value"] is None or rate["value"] >= 0.15:
+            continue
+        waste.append({"model": model["model"], "tasks": model["tasks"], "landed": model["landed"],
+                      "rate": rate["value"], "ci": _wilson(model["landed"], model["tasks"]),
+                      "low_sample": False})
+    waste.sort(key=lambda item: (-item["tasks"], item["model"]))
+
+    class_models: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    class_tasks: Counter[str] = Counter()
+    for model in writes:
+        for task_class in model.get("by_class", []):
+            class_tasks[task_class["class"]] += task_class["tasks"]
+            hours = _observed_hours(task_class) if task_class.get("landed") else None
+            class_models[task_class["class"]].append({
+                "model": model["model"], "tasks": task_class["tasks"], "landed": task_class["landed"],
+                "rate": task_class["landed_rate"]["value"],
+                "ci": _wilson(task_class["landed"], task_class["tasks"]),
+                "hours": round(hours, 2) if hours is not None else None,
+                "low_sample": task_class["tasks"] < LOW_SAMPLE,
+            })
+    ranked = sorted((name for name, count in class_tasks.items() if count >= LOW_SAMPLE),
+                    key=lambda name: (-class_tasks[name], name))
+    jobs = [{"class": name, "tasks": class_tasks[name],
+             "models": sorted(class_models[name], key=lambda item: (-(item["rate"] or -1), -item["tasks"], item["model"]))}
+            for name in ranked]
+
+    failures = []
+    for model in sorted(writes, key=lambda item: (-item["tasks"], item["model"]))[:8]:
+        failures.append({"model": model["model"], "tasks": model["tasks"], "status": model["status"]})
+
+    week_write: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    busy = {model["model"] for model in writes if model["tasks"] >= LOW_SAMPLE}
+    for row in rows:
+        if row.role == "write" and row.model in busy:
+            slot = week_write[(week_of(row.moment), row.model)]
+            slot[0] += 1
+            slot[1] += row.landed
+    week_review: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for pr in prs:
+        if pr["author"] in busy:
+            slot = week_review[(pr["week"], pr["author"])]
+            slot[0] += 1
+            slot[1] += pr["first"] == "correct"
+    weeks = sorted(set(week_write) | set(week_review))
+    trends = [{"week": week, "model": model, "tasks": week_write[(week, model)][0],
+               "landed": week_write[(week, model)][1], "prs": week_review[(week, model)][0],
+               "first_approved": week_review[(week, model)][1]}
+              for week, model in weeks if week_write[(week, model)][0] or week_review[(week, model)][0]]
+
+    reviewers = []
+    for model in reviews:
+        rate = model["approve_rate"]
+        findings = model["p0_p2_per_review"]
+        reviewers.append({
+            "model": model["model"], "identity": model["identity"], "approve": rate["value"], "approve_n": rate["n"],
+            "approve_ci": _wilson(model["verdicts"]["correct"], rate["n"]),
+            "p0_p2": findings["value"], "findings_n": model["findings_n"], "tasks": model["tasks"],
+            "low_sample": rate["n"] < LOW_SAMPLE or model["findings_n"] < LOW_SAMPLE,
+        })
+
+    durations = [{"model": model["model"], "n": model["wall_seconds"]["n"],
+                  "p25": model["wall_seconds"]["p25"], "median": model["wall_seconds"]["median"],
+                  "p75": model["wall_seconds"]["p75"], "p90": model["wall_seconds"]["p90"],
+                  "low_sample": model["wall_seconds"]["n"] < LOW_SAMPLE}
+                 for model in writes if model["wall_seconds"]["n"]]
+
+    def _arm(name: str, effort: str) -> dict[str, Any]:
+        write = next((model for model in writes if model["model"] == name), None)
+        review = next((model for model in reviews if model["model"] == name), None)
+        write_effort = next((item for item in (write or {}).get("by_effort", []) if item["effort"] == effort), None)
+        review_effort = next((item for item in (review or {}).get("by_effort", []) if item["effort"] == effort), None)
+        approval = (review_effort or {}).get("approve_rate") or {"value": None, "n": 0}
+        return {
+            "effort": effort,
+            "write_tasks": write_effort["tasks"] if write_effort else 0,
+            "write_landed": write_effort["landed"] if write_effort else 0,
+            "review_results": approval["n"],
+            "approval": approval["value"],
+            "approval_ci": _wilson(review_effort["verdicts"]["correct"], approval["n"]) if review_effort else None,
+            "median_seconds": (review_effort or write_effort or {}).get("wall_seconds", {}).get("median"),
+            "low_sample": approval["n"] < LOW_SAMPLE and (write_effort["tasks"] if write_effort else 0) < LOW_SAMPLE,
+        }
+
+    neon_arms = [_arm("gemini-4-neon", effort) for effort in ("medium", "high")]
+    hydrogen = by_name.get("gemini-4-hydrogen")
+    ukrainian = []
+    for model in (*writes, *reviews):
+        for task_class in model.get("by_class", []):
+            if "ukrainian" not in task_class["class"].casefold():
+                continue
+            ukrainian.append({
+                "model": model["model"], "role": model["role"], "class": task_class["class"],
+                "tasks": task_class["tasks"],
+                "landed": task_class.get("landed"),
+                "rate": (task_class.get("landed_rate") or {}).get("value"),
+                "approve": (task_class.get("approve_rate") or {}).get("value"),
+                "approve_n": (task_class.get("approve_rate") or {}).get("n"),
+                "low_sample": task_class["tasks"] < LOW_SAMPLE,
+            })
+    return {
+        "recommendation": recommendation,
+        "waste": waste,
+        "pareto": pareto,
+        "jobs": jobs,
+        "jobs_low_n": sum(1 for count in class_tasks.values() if count < LOW_SAMPLE),
+        "failures": failures,
+        "trends": trends,
+        "reviewers": reviewers,
+        "durations": durations,
+        "neon": {"model": "gemini-4-neon", "arms": neon_arms,
+                 "enough": all(arm["review_results"] >= LOW_SAMPLE for arm in neon_arms)
+                 or all(arm["write_tasks"] >= LOW_SAMPLE for arm in neon_arms)},
+        "hydrogen": None if hydrogen is None else {
+            "tasks": hydrogen["tasks"], "landed": hydrogen["landed"],
+            "efforts": [{"effort": item["effort"], "tasks": item["tasks"], "landed": item["landed"]}
+                        for item in hydrogen["by_effort"]],
+        },
+        "ukrainian": ukrainian,
+        "limits": {
+            "precision": "Confirmed and refuted findings are not stored. A review row keeps a verdict and "
+                         "priority counts only, and a finding id does not stay the same across rounds.",
+            "savant": "No Savant model is in the catalog, and no row names one.",
+            "links": "This snapshot does not include task ids.",
+            "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
+                     "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
+                     "contains a reset or two readings at one timestamp that disagree, stays unknown. "
+                     "It is never reported as zero.",
+            "difficulty": "There is no difficulty weight. Compare models inside one task class.",
+            "wall_hours": "Wall hours per landed stay blank when any task has no duration. The observed figure "
+                          "uses the recorded hours when at most one task, or one percent, is untimed.",
+            "attribution": "auto is Cursor Auto: the harness chose the model. A Cursor display name maps only "
+                           "where the shared cursor map admits it. A harness prefix resolves to its catalog id. "
+                           "Stored rows keep the old label until backfill.",
+        },
+    }
+
+
 def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
               prs: list[dict[str, Any]] | None = None, *, history: list[_Row] | None = None) -> dict[str, Any]:
     """Every figure of one window's rows."""
@@ -612,11 +1036,12 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
     fine = _fine(selected) if fine is None else fine
     prs = _prs(selected) if prs is None else prs
     models = _models(fine)
+    _stamp_allowance(models, selected)
     used = {model for model, *_ in fine}
     return {
         "models": models, "authors": _authors(prs), "first_round_matrix": _matrix(prs),
         "review_levels": _review_levels(selected, models, selected if history is None else history),
-        "allowance": _allowance_rows(selected), "records": len(selected),
+        "allowance": _allowance_rows(selected), "charts": _charts(models, prs, selected), "records": len(selected),
         # Every model the catalog still routes (not retired) that ran no task in this window.
         "idle_catalog_models": sorted(_routed_models() - used),
         # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
@@ -736,7 +1161,11 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
             **summarize(selected, fine, prs, history=rows),
         }
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
-        metric_windows[name] = {"models": _models(_bounded(fine)), "authors": _authors(prs, metric_model)}
+        # 24h stays off this label set.
+        if name in METRIC_WINDOWS:
+            metric_models = _models(_bounded(fine))
+            _stamp_allowance(metric_models, selected, model_of=metric_model, effort_of=metric_effort)
+            metric_windows[name] = {"models": metric_models, "authors": _authors(prs, metric_model)}
     weeks = _week_groups(rows)
     bounded_weeks: _Weeks = defaultdict(_Group)
     for (week, model, effort, role), group in weeks.items():
@@ -799,9 +1228,23 @@ def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
+def page_window(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The dashboard projection: model and effort totals plus chart series, without the class tree or week dump."""
+    models = []
+    for model in payload.get("models", []):
+        slim = {key: value for key, value in model.items() if key not in PAGE_DROP}
+        slim["by_effort"] = [{key: value for key, value in effort.items() if key not in PAGE_DROP}
+                             for effort in model.get("by_effort", [])]
+        models.append(slim)
+    return {key: value for key, value in {**payload, "models": models}.items() if key != "weeks"}
+
+
 @router.get("")
 async def model_stats(
-    window: Literal["7d", "30d", "90d", "all"] = Query(default="7d", description="Window: 7d, 30d, 90d or all"),
+    window: Literal["24h", "7d", "30d", "90d", "all"] = Query(
+        default="7d", description="Window: 24h, 7d, 30d, 90d or all"),
+    view: Literal["full", "page"] = Query(
+        default="full", description="full keeps every class; page is the dashboard projection"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
     """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
@@ -831,8 +1274,10 @@ async def model_stats(
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
     body = {name: value for name, value in snapshot.items() if name not in ("windows", "metrics")}
-    return JSONResponse({**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)},
-                        headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
+    payload = {**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)}
+    if view == "page":
+        payload = page_window(payload)
+    return JSONResponse(payload, headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
 
 
 # Grafana's contract (docs/runbooks/model-stats.md): names and label sets change only with that runbook.
