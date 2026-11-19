@@ -301,11 +301,14 @@ class CommitInputs:
         return found
 
     def lookup(self, path: str) -> tuple[bytes, str] | None:
-        """``(mode, ID)`` of the entry at ``path`` in the commit's tree; ``None`` when there is none."""
+        """``(mode, ID)`` of the entry at ``path`` in the commit's tree; ``None`` when there is none.
+
+        A path below a non-directory entry is refused, as the checkout ``Tree`` refuses it, never read as absent.
+        """
         mode, oid, walked = self.TREE_MODE, self.root, ""
         for part in relative(path).split("/"):
             if mode != self.TREE_MODE:
-                return None
+                raise Invalid("non-directory deployment path: " + path)
             entry = self.listings([oid], [walked or "."])[0].get(part)
             if entry is None:
                 return None
