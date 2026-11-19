@@ -36,6 +36,7 @@ from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCO
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
+from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
@@ -58,6 +59,10 @@ UNSET = "unset"
 # statistics map one to a catalog id only where the rows make it unambiguous).
 NATIVE_ALIASES = ("opus", "sonnet", "haiku", "fable")
 _LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}\Z")
+# A catalog id may contain one slash (``kimi-code/k3-256k``). Two slashes, a leading slash or ``..`` still fail,
+# so a path cannot pass as a model name.
+_MODEL_LABEL = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._:\-]{0,63})?\Z")
 _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 # The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
@@ -71,6 +76,13 @@ _log = logging.getLogger(__name__)
 
 def label(value: object, default: str = "unknown") -> str:
     if isinstance(value, str) and _LABEL.fullmatch(value) and ".." not in value:
+        return value
+    return default
+
+
+def model_label(value: object, default: str = "unknown") -> str:
+    """A model id, including a catalog id that contains one slash."""
+    if isinstance(value, str) and _MODEL_LABEL.fullmatch(value) and ".." not in value:
         return value
     return default
 
@@ -134,13 +146,21 @@ def _spelling(raw: object) -> str:
 def model_id(raw: object) -> str:
     """The catalog id a spelling names, else the spelling itself; never a family or a guessed version.
 
-    A bare harness alias (``opus``) names no version, so it stays ``opus``.
+    A bare harness alias (``opus``) names no version, so it stays ``opus``. A Cursor display name maps through
+    ``canonical_cursor_model`` first, and only for the spellings that function admits. The catalog match runs on
+    the raw spelling: a harness prefix (``deepseek-direct/deepseek-v4-flash``) or a catalog id that itself
+    contains a slash (``kimi-code/k3-256k``) used to die in the label grammar and be stored as ``unknown``.
     """
-    spelling = label(_spelling(raw))
+    spelling = _spelling(raw)
+    if not spelling:
+        return "unknown"
+    displayed = canonical_cursor_model(spelling)
+    if displayed:
+        spelling = displayed
     catalog = _catalog()
-    if spelling == "unknown" or catalog is None:
-        return spelling
-    return label(canonical_model_id(spelling, catalog) or spelling)
+    if catalog is not None and (matched := canonical_model_id(spelling, catalog)):
+        return model_label(matched)
+    return model_label(spelling)
 
 
 def concrete_model(record: Mapping[str, Any]) -> str:
@@ -415,12 +435,14 @@ def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
     """A row as read, with every label revalidated, so a damaged file never puts free text in a label."""
     for name in _LABEL_FIELDS:
         value = row.get(name)
-        if name == "class" and isinstance(value, str) and value.count("/") == 1:
+        if name == "model":
+            row[name] = model_label(value)
+        elif name == "class" and isinstance(value, str) and value.count("/") == 1:
             row[name] = "/".join(label(part) for part in value.split("/"))
         else:
             row[name] = label(value)
     author = row.get("author_model")
-    row["author_model"] = label(author) if author is not None else None
+    row["author_model"] = model_label(author) if author is not None else None
     return row
 
 
