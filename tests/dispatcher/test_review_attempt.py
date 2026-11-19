@@ -36,14 +36,16 @@ def isolated_git(tmp_path_factory, monkeypatch):
 
     Autouse, so it applies before ``configured_roots`` initializes its repository. It drops every inherited
     ``GIT_*`` variable (``GIT_CONFIG_COUNT`` and its indexed keys and values, ``GIT_CONFIG_PARAMETERS``,
-    ``GIT_DIR`` and the rest) and points the global config at an empty test-owned file.
+    ``GIT_DIR`` and the rest) and points the global config at a test-owned file that also disables the default
+    ignore and attributes files Git would otherwise read from the caller's home.
     """
     import os
 
     for name in [name for name in os.environ if name.startswith("GIT_")]:
         monkeypatch.delenv(name)
     config = tmp_path_factory.mktemp("git-config") / "gitconfig"
-    config.write_text("")
+    # Unset, these two fall back to files under $XDG_CONFIG_HOME or $HOME (git/ignore, git/attributes).
+    config.write_text(f"[core]\n\texcludesFile = {os.devnull}\n\tattributesFile = {os.devnull}\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
