@@ -9,6 +9,20 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.42"></a>
+## [0.1.42] - 2026-11-19
+
+### Changed
+
+- Add CodeQL alert 41 triage row ([#916](https://github.com/learn-ukrainian/machinery/pull/916))
+
+### Fixed
+
+- Retire Gemini 3.8 Flash ([#900](https://github.com/learn-ukrainian/machinery/pull/900))
+- Make model value charts readable ([#903](https://github.com/learn-ukrainian/machinery/pull/903))
+- Apply the agent deployment in write worktrees; refuse --cwd write attaches to enrolled trees (#884) ([#901](https://github.com/learn-ukrainian/machinery/pull/901))
+- Isolate active task refresh from history writes ([#912](https://github.com/learn-ukrainian/machinery/pull/912))
+
 <a id="v0.1.41"></a>
 ## [0.1.41] - 2026-11-19
 
@@ -1049,7 +1063,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...HEAD
+[0.1.42]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...v0.1.42
 [0.1.41]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...v0.1.41
 [0.1.40]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...v0.1.40
 [0.1.39]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...v0.1.39
