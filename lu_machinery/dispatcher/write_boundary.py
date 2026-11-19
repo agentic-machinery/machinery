@@ -812,12 +812,16 @@ def _plain_git_bounded(repository: Path, *args: str, max_bytes: int, env: dict[s
     return bytes(output)
 
 
+# Post-run reads of the primary never fetch: a partial clone's missing object refuses instead of being downloaded.
+_NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
+
+
 def _cat_blobs(repository: Path, oids: list[str], refusal: str) -> list[bytes]:
-    """The named blobs' bytes, in order, from one read-only ``cat-file --batch`` (each header is checked)."""
+    """The named local blobs' bytes, in order, from one read-only ``cat-file --batch`` (each header is checked)."""
     if not oids:
         return []
     output = _plain_git(repository, "cat-file", "--batch", data="".join(f"{oid}\n" for oid in oids).encode(),
-                        refusal=refusal)
+                        env=_NO_LAZY_FETCH, refusal=refusal)
     blobs, offset = [], 0
     for oid in oids:
         end = output.find(b"\n", offset)
@@ -2112,19 +2116,27 @@ class _Boundary:
             raise Refused(f"{refusal}: an edit holds a private key, a token, a configured secret or a host name")
         # A new file must not name, below or at any of its parents, a path of the start commit: the view left
         # that one out (its name, content or --read-path), and Git would replace what the run never read. The
-        # primary is only read here and below (cat-file), never written: no object of the draft is written there.
+        # primary is only read here and below (ls-tree, cat-file, never fetching), and nothing is written there.
         new = {path for path in edits if path not in self.manifest}
         prefixes = sorted({str(parent) for path in new for parent in (PurePosixPath(path), *PurePosixPath(path).parents)
                            if str(parent) != "."})
-        listed = _plain_git(self.repository, "cat-file", "--batch-check", refusal=refusal,
-                            data="".join(f"{self.tip}:{prefix}\n" for prefix in prefixes).encode()).decode()
-        lines = listed.splitlines()
-        if len(lines) != len(prefixes):
-            raise Refused(f"{refusal}: git cat-file answered {len(lines)} of {len(prefixes)} paths")
-        for prefix, line in zip(prefixes, lines, strict=True):
-            # The new path itself must be absent; a parent may only be a directory the view also had.
-            if not line.endswith(" missing") and (prefix in new or line.split(" ")[1:2] != ["tree"]):
-                raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
+        # Tree entries only, never a blob, so nothing is fetched: ls-tree of an exact path lists a non-tree entry
+        # itself and a tree's children.
+        kinds: dict[str, bytes] = {}
+        for start in range(0, len(prefixes), 512):
+            listing = _plain_git_bounded(self.repository, "ls-tree", "-z", "--full-tree", self.tip, "--",
+                                         *prefixes[start:start + 512], max_bytes=MAX_TREE_LISTING_BYTES,
+                                         env=_NO_LAZY_FETCH, refusal=refusal)
+            for record in listing.split(b"\0"):
+                if record:
+                    meta, _, name = record.partition(b"\t")
+                    kinds[os.fsdecode(name)] = meta.split()[1]
+        # A new path must be absent (not listed, and no tree there listing children); a parent may only be a
+        # directory, never a file, link or submodule the view left out.
+        below, parents = tuple(f"{path}/" for path in new), set(prefixes)
+        if any(name in new or name.startswith(below) or (name in parents and kind != b"tree")
+               for name, kind in kinds.items()):
+            raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
         changed = sorted(path for path in edits if path in self.manifest)
         originals = _cat_blobs(self.repository, [self.manifest[path][1] for path in changed], refusal)
         # The draft's own repository holds just the changed paths before and after; it shares nothing with the

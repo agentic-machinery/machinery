@@ -863,7 +863,8 @@ def test_write_dispatch_launches_the_provider_directly_with_its_own_login(sandbo
     assert write_boundary.BROKER_ENV not in seen
 
 
-def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str) -> tuple[int, dict, Path]:
+def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str,
+                  read_path: str | None = None) -> tuple[int, dict, Path]:
     """Run ``script`` as a Savant write run's provider over the view of the primary's published commit."""
     repo = primary[0]
     tip = _git(repo, "rev-parse", "HEAD")
@@ -878,7 +879,8 @@ def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str) -> t
     patch = tmp_path / "wb-test.patch"
     code, data = _run(primary, script, "--mode", "workspace-write", "--snapshot-bytes", "65536", "--no-github-relays",
                       "--no-sources-relay", "--upload-ceiling", "65536", "--draft-patch", str(patch),
-                      *(arg for path in owned for arg in ("--owned-path", path)))
+                      *(arg for path in owned for arg in ("--owned-path", path)),
+                      *(("--read-path", read_path) if read_path else ()))
     return code, data, patch
 
 
@@ -1012,3 +1014,36 @@ def test_savant_write_run_needs_its_bounds(primary, tmp_path):
     for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):
         with pytest.raises(SystemExit):
             _run(primary, "true", *full, *extra)
+
+
+def test_savant_write_draft_never_fetches_into_a_partial_clone(primary, monkeypatch, tmp_path):
+    """Defect class (#898, review of #913): the draft's checks of a refused edit download a blob the view left out
+    into a partial-clone primary (host network and a primary write after the run)."""
+    source = tmp_path / "source"
+    (source / "docs").mkdir(parents=True)
+    _git(source, "init", "-q", "-b", "main")
+    for key, value in (("user.email", "probe@example.invalid"), ("user.name", "Probe"),
+                       ("uploadpack.allowFilter", "true"), ("uploadpack.allowAnySHA1InWant", "true")):
+        _git(source, "config", key, value)
+    (source / "docs" / "guide.md").write_text("old\n")
+    (source / "docs" / "omitted.md").write_text("never read by the run\n")
+    _git(source, "add", "docs")
+    _git(source, "commit", "-qm", "fixture")
+    omitted = _git(source, "rev-parse", "HEAD:docs/omitted.md")
+    repo = tmp_path / "partial"
+    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", source.as_uri(), str(repo)],
+                   check=True, capture_output=True)
+    worktree = repo / ".worktrees" / "task"
+    _git(repo, "worktree", "add", "-q", "--no-checkout", "-b", "task", str(worktree), "main")
+
+    def local(oid: str) -> bool:
+        return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", oid], capture_output=True,
+                              env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}).returncode == 0
+
+    assert not local(omitted)
+    partial = (repo, worktree, tmp_path / "receipt.json")
+    code, receipt, patch = _savant_write(partial, monkeypatch, tmp_path, "printf 'x\\n' > docs/omitted.md",
+                                         "docs", read_path="docs/guide.md")
+    assert receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
+    assert receipt["import"]["status"] == "refused" and "left out" in receipt["import"]["reason"]
+    assert not patch.exists() and not local(omitted)
