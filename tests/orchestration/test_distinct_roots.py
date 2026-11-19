@@ -497,6 +497,28 @@ def test_unset_configuration_reexecs_with_this_interpreter(clean_env, monkeypatc
     assert call == [sys.executable, sys.executable, "-I", str(runtime_primary / "lu_machinery/dispatch.py"), "list"]
 
 
+@pytest.mark.parametrize("metadata", [b"gitdir: /nonexistent/metadata\n", b"gitdir: \xff\n", b"gitdir: /a\0b\n"])
+def test_linked_worktree_entry_refuses_an_unresolvable_primary(
+    clean_env, monkeypatch, tmp_path: Path, capsys, metadata: bytes
+) -> None:
+    """A linked worktree whose Git metadata names no primary refuses instead of running its own dispatcher.
+
+    Restored from learn-ukrainian ``tests/dispatcher/test_core_worktree_entry.py`` at 5aba2adb (machinery #904).
+    Defect class: an unresolvable, undecodable or NUL-bearing gitdir lets a stale worktree supervise tasks (FR-43).
+    """
+    _, tree = _linked_worktree(tmp_path)
+    (tree / ".git").write_bytes(metadata)
+    calls: list[tuple] = []
+    monkeypatch.setattr(dispatcher_primary, "in_tree_source", lambda: True)
+    monkeypatch.setattr(dispatcher_primary, "machinery_path", lambda relative: tree / "lu_machinery" / relative)
+    monkeypatch.setattr(dispatcher_primary.os, "execv", lambda *args: calls.append(args))
+    with pytest.raises(SystemExit) as refused:
+        dispatcher_primary.exec_primary(["list"])
+    assert refused.value.code == 2
+    assert "cannot resolve the primary checkout of linked worktree" in capsys.readouterr().err
+    assert calls == []
+
+
 def test_unset_configuration_keeps_todays_systemd_exec_start() -> None:
     unit = _unit_lines()
     assert unit["ExecStart"] == [
