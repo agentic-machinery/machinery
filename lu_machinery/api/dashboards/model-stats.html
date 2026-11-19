@@ -63,8 +63,13 @@
     <p class="muted">Landed: the task's whole-line <code>X-Agent</code> trailer is on a registered <code>main</code> outside a code fence, or the task recorded its own merged PR. The trailer is found by a line scan, not a Markdown parser: a trailer-shaped line inside inline code that runs across lines still counts, and a fence left open earlier in a commit message hides the trailers after it (see the runbook's landing source).</p>
     <div id="write">Loading…</div></section>
   <section><h2>Reviews (as reviewer) <span class="meta" id="review-meta"></span></h2>
-    <p class="muted">Tasks, status and time count every read-only task. Verdicts, approval and findings count only reviews of record (the review names its PR and the author's model); advice, critics and canaries enter no verdict figure, and an unparsed reply is shown but enters no rate.</p>
+    <p class="muted">Structured results count for every reviewer, including supplemental reviews. Every review task without a readable verdict appears in the missing column. Findings rates use results with recorded findings counts.</p>
     <div id="review">Loading…</div></section>
+  <section><h2>Compare reviewer levels</h2>
+    <label>Reviewer model <select id="level-model"></select></label>
+    <div id="levels">Loading…</div>
+    <p class="note">First-round approval uses the first parsed verdict per level on the PR's first review head. Supplemental reviews match by repository and exact head. Per-landed figures divide PR-linked review time and weekly allowance by PRs with a recorded merge. Quota uses available readings by pool and may include concurrent usage.</p>
+  </section>
   <section><h2>Reviewed PRs (as author) <span class="meta" id="author-meta"></span></h2>
     <p class="muted">Rounds are the distinct heads a parsed review of record judged. After a first round that did not approve, a later round approved a new head (the author changed the code), approved the same head (no change), or nothing approved it yet in this window.</p>
     <div id="author">Loading…</div>
@@ -114,9 +119,29 @@ function writeRow(r, kind) {
 function reviewRow(r, kind) {
   const v = r.verdicts;
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(n({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
-    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain} / ${v.unparsed}`)}${cell(pct(r.approve_rate))}`
-    + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}${cell(n(r.approve_rate))}`
+    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(num(v.unparsed))}${cell(pct(r.approve_rate))}`
+    + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review))}${cell(n(r.approve_rate))}${cell(n(r.p0_p2_per_review))}`
     + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
+}
+
+function renderLevels() {
+  const {data} = current;
+  const selected = data.review_levels.find((entry) => entry.model === $("level-model").value);
+  if (!selected) {
+    $("levels").textContent = "No review tasks in this window.";
+    return;
+  }
+  const rows = selected.levels.map((r) => {
+    const approval = r.first_round_approved;
+    const quota = r.allowance_per_landed.map((a) =>
+      `${esc(a.pool)} ${rate(a)} (n=${a.n})`).join("<br>") || "—";
+    return `<tr><td>${esc(r.effort)}${r.results < data.low_sample_below ? ' <span class="low">not enough data yet</span>' : ""}</td>`
+      + `${cell(`${num(r.results)} / ${num(r.tasks)}`)}${cell(`${pct(approval)} (n=${approval.n}, ${r.first_round_missing} missing)`)}`
+      + `${cell(`${num(r.findings)} (n=${r.findings_n})`)}${cell(mins(r.median_seconds))}`
+      + `${cell(`${rate(r.wall_minutes_per_landed, 1)} (n=${r.wall_minutes_per_landed.n})`)}${cell(quota)}</tr>`;
+  });
+  $("levels").innerHTML = table(["Runtime level", "Results (n) / tasks", "First-round approval", "Findings",
+    "Median min", "Min per landed", "Quota points per landed"], rows);
 }
 
 function withClasses(models, role, render, width) {
@@ -231,14 +256,18 @@ async function load() {
   current = {data, label};
   matrixClasses(data);
   renderMatrix();
+  const levelModel = $("level-model"), previousModel = levelModel.value;
+  levelModel.innerHTML = data.review_levels.map(({model}) => `<option value="${esc(model)}">${esc(model)}</option>`).join("");
+  if (data.review_levels.some(({model}) => model === previousModel)) levelModel.value = previousModel;
+  renderLevels();
   $("write-meta").textContent = `${label}; n = ${total(writes)} tasks`;
   $("write").innerHTML = table(["Model / class", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
     "Wall h per landed", "Median min", "p90 min", "Output tokens per landed"], withClasses(data.models, "write", writeRow, 11));
   $("review-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
   $("review").innerHTML = table(["Model / profile/risk", "Tasks", "Not done",
-    "Reviews of record: correct / incorrect / uncertain / unparsed", "Approve %", "Blocking (P0–P1) per review",
-    "P0–P2 per review", "Parsed reviews of record", "Median min", "p90 min"],
-    withClasses(data.models, "review", reviewRow, 10));
+    "Approved / changes requested / blocked", "Missing verdict", "Approve %", "Blocking (P0–P1) per review",
+    "P0–P2 per review", "Parsed verdicts", "Findings results", "Median min", "p90 min"],
+    withClasses(data.models, "review", reviewRow, 12));
   $("author-meta").textContent = `${label}; n = ${data.authors.reduce((s, a) => s + a.prs, 0)} PRs`;
   const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
   $("author").innerHTML = table(["Author model", "PRs", "Rounds per PR", "Approved eventually", "First-round approved",
@@ -257,6 +286,7 @@ async function load() {
 }
 $("window").addEventListener("change", load);
 $("matrix-class").addEventListener("change", renderMatrix);
+$("level-model").addEventListener("change", renderLevels);
 load();
 </script>
 </body>

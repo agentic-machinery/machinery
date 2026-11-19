@@ -6359,11 +6359,6 @@
     },
     {
       "path": "lu_machinery/orchestration/execution_safe_git.py",
-      "code": "attr-defined",
-      "message": "\"SafeGitContext\" has no attribute \"source_git_dir\""
-    },
-    {
-      "path": "lu_machinery/orchestration/execution_safe_git.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"CompletedProcess[Any]\""
     },
@@ -6376,16 +6371,6 @@
       "path": "lu_machinery/orchestration/execution_safe_git.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"CompletedProcess[Any]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/execution_safe_git.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None\" has no attribute \"st_atime_ns\""
-    },
-    {
-      "path": "lu_machinery/orchestration/execution_safe_git.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None\" has no attribute \"st_mtime_ns\""
     },
     {
       "path": "lu_machinery/orchestration/install_preserved_retention_timer.py",
@@ -6714,18 +6699,8 @@
     },
     {
       "path": "lu_machinery/orchestration/safe_git_context.py",
-      "code": "attr-defined",
-      "message": "\"SafeGitContext\" has no attribute \"source_git_dir\""
-    },
-    {
-      "path": "lu_machinery/orchestration/safe_git_context.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/safe_git_context.py",
-      "code": "var-annotated",
-      "message": "Need type annotation for \"pointers\" (hint: \"pointers: dict[<type>, <type>] = ...\")"
     },
     {
       "path": "lu_machinery/orchestration/scheduled_worktree_cleanup.py",
@@ -8394,18 +8369,8 @@
     },
     {
       "path": "lu_machinery/verify_review.py",
-      "code": "misc",
-      "message": "Need more than 2 values to unpack (3 expected)"
-    },
-    {
-      "path": "lu_machinery/verify_review.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/verify_review.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"tuple[dict[Any, Any], str, str]\", expected \"tuple[dict[Any, Any], str]\")"
     },
     {
       "path": "lu_machinery/work/attention.py",

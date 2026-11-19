@@ -1203,7 +1203,35 @@ models:
       - https://api-docs.deepseek.com/news/news260424/
       - https://api-docs.deepseek.com/quick_start/pricing
       - https://arena.ai/leaderboard/code
-  # Poolside Laguna family (exact vendor IDs — do not invent "laguna-s2" / "laguna.m1"):
+  subq-savant-1.4:
+    family: subquadratic
+    tier: frontier_practical
+    lifecycle: active
+    aliases: [subq-savant-latest]
+    roles: [advisory, test]
+    transports: [opencode]
+    efforts: [low, high, max]
+    modes: [read-only]
+    # True uses the provider's default. False sends store:false on this request.
+    data_classes:
+      public-code: true
+      public-docs: true
+      private-code: false
+      private-docs: false
+    strengths: [four_million_token_context, function_calling, structured_outputs]
+    weaknesses: [early_access, qualification_pending, no_zero_data_retention_agreement]
+    notes: >-
+      Read-only trial for supplemental PR review, non-Ukrainian councils and
+      hard-problem advice, proposed code patches, and Ukrainian checks against
+      verified Sources evidence. Dispatch defaults to high. Request max only
+      for jobs that justify it. An explicit public or private data class
+      determines request storage. Review of record, designated approval and
+      Ukrainian authoring stay with qualified seats. Measure on held-out real jobs.
+    sources:
+      - https://docs.subq.ai/using-the-api/models/
+      - https://docs.subq.ai/endpoints/chat-completions-api/
+      - https://docs.subq.ai/using-the-api/data-retention/
+  # Poolside Laguna family (exact vendor IDs — do not invent "laguna-s2" / "laguna-m1"):
   #   Gen-1:  laguna-m.1   (prior; technical report M.1 / XS.2 era)
   #   Gen-2:  laguna-s-2.1 (strongest current — pool formal/volume default)
   #           laguna-xs-2.1 (light/fast 2nd gen — rapid iteration / cheap volume)

@@ -10,6 +10,13 @@ from urllib.parse import unquote
 import yaml
 
 from lu_machinery.agent_runtime import bounded_advisory as advisory
+from lu_machinery.ai_agent_bridge.routing_guard import (
+    SAVANT_MODEL,
+    SAVANT_PROVIDER,
+    RoutingGuardError,
+    assert_model_routing_allowed,
+    savant_request_store,
+)
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import git, store
@@ -219,6 +226,10 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         reviewed = identity is not None and "review" in dispatch_roles(typed)
         if reviewed and (refusal := activity_role_refusal(identity, REVIEW_ACTIVITY, catalog)):
             raise ValueError(refusal)
+        if identity == SAVANT_MODEL or options.get("provider") == SAVANT_PROVIDER:
+            _check_savant_route(agent, model, identity, options)
+        elif any(options.get(field) is not None for field in ("data_class", "max_tokens")):
+            raise ValueError("--data-class and --max-tokens apply only to the Savant test route")
         return
     context = {key: options.get(key) for key in ("review_mode", "review_profile", "requested_role")}
     context.update(author_model=options.get("review_author_model"),
@@ -236,6 +247,21 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
             or options.get("risk") not in {"low", "medium"}
             or not re.search(rb"\bred[-_ ]team\b", prompt, re.IGNORECASE)):
         raise ValueError("Temporary reviewer exception requires a fresh, branch-pinned red-team code review, with no other role (#10437)")
+
+
+def _check_savant_route(agent: str, model: str, identity: str | None, options: dict) -> None:
+    """Savant is admitted only on its explicit, classified trial route."""
+    if identity != SAVANT_MODEL:
+        raise ValueError(f"savant_model_refused: the SubQ endpoint requires {SAVANT_MODEL}")
+    try:
+        assert_model_routing_allowed(
+            model, context="dispatch", transport=f"{agent}/{options.get('provider')}",
+            data_class=options.get("data_class"),
+        )
+    except RoutingGuardError as exc:
+        raise ValueError(str(exc)) from None
+    if options.get("research_role") not in {"advisory", "test"} or options.get("advisory_role"):
+        raise ValueError("savant_role_refused: use --research-role advisory or test")
 
 
 def advisory_binding(args, prompt: bytes) -> tuple[dict, str, str]:
@@ -320,19 +346,30 @@ def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     if spec.agent not in {"muse", "opencode"}:
         return
     repos = yaml.safe_load(machinery_path("config/fleet_repos.yaml").read_text())["repos"]
+    private_payload = False
+    if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        private_payload = not savant_request_store(spec.options.get("data_class"))
+        entry = repos.get(repo_key, {})
+        role = entry.get("role", "")
+        if not role.startswith(("public-", "private-")):
+            raise ValueError("savant_repository_refused: the target must be a registered repository with a known visibility")
+        if not private_payload and (entry.get("private") or role.startswith("private-")):
+            raise ValueError("savant_repository_refused: private repositories require a private data class")
     private = {
         key: item for key, item in repos.items() if item.get("private", False) or "private" in item.get("role", "")
     }
     roots = [git.resolve_repo(key)[0] for key in private]
-    if git.resolve_repo(repo_key)[0] in roots:
-        return _handle_private_input(spec, "private input is not permitted for this agent")
-    origin = spec.options.get("prompt_file")
-    if origin and origin != "-" and any(Path(origin).resolve().is_relative_to(root) for root in roots):
-        return _handle_private_input(spec, "private prompt file is not permitted for this agent")
+    if not private_payload:
+        if git.resolve_repo(repo_key)[0] in roots:
+            return _handle_private_input(spec, "private input is not permitted for this agent")
+        origin = spec.options.get("prompt_file")
+        if origin and origin != "-" and any(Path(origin).resolve().is_relative_to(root) for root in roots):
+            return _handle_private_input(spec, "private prompt file is not permitted for this agent")
     # The content contract is lexical: decode once, then compare without changing provider input.
     text = unquote(spec.prompt_file.read_text()).casefold()
     identifiers = [str(root) for root in roots]
-    identifiers.extend(item.get(field, "") for item in private.values() for field in ("local_name", "github"))
+    if not private_payload:
+        identifiers.extend(item.get(field, "") for item in private.values() for field in ("local_name", "github"))
     if any(identifier.casefold() in text for identifier in identifiers if identifier):
         _handle_private_input(spec, "private path input is not permitted for this agent")
 

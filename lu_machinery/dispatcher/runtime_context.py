@@ -5,6 +5,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth
 from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.common.task_store_paths import tasks_dir
@@ -94,6 +95,12 @@ def build(
     """Prepare the worker at the common launch boundary, preserving each CLI's wire format."""
     # Read before adapter construction, which may write a schema or context file.
     core = rules_core.core_block(rules_core.resolve_seat())
+    if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        from lu_machinery.dispatcher.providers import opencode
+
+        if launch_prompt is not None or conversation is not None:
+            raise ValueError("savant_public_input_refused: only the explicitly classified payload may be sent")
+        return opencode.build(spec, env)
     invocation = providers.load(spec.agent).build(spec, env)
     if conversation is not None:
         if spec.agent != "agy" or launch_prompt is not None:

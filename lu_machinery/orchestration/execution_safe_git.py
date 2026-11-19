@@ -23,11 +23,8 @@ commands pin upload-pack, SSH and credential controls; custom VCS helpers and
 ext transport are refused. Neither commit signing nor SSH signing-key commands
 are admitted. Local-only commands cannot reach any transport.
 GUI, email and CVS commands are excluded, so guitool.*.cmd, sendemail.*Cmd
-and gitcvs.dbDriver are unreachable. Scoped finalization admits add and trailer
-commit only in a fresh driver-configured repository, without importing source
-configuration or hooks. Thus trailer.*.cmd/command cannot run there either.
-Missing promisor objects cannot
-start a fetch (--no-lazy-fetch); automatic gc/maintenance is disabled, so
+and gitcvs.dbDriver are unreachable. Missing promisor objects cannot start a
+fetch (--no-lazy-fetch); automatic gc/maintenance is disabled, so
 gc.recentObjectsHook cannot be reached either. Only file/HTTPS/SSH protocols are
 admitted for explicit remote proofs; other profiles deny all protocols.
 Local/system/global config is not a trusted execution source.
@@ -52,7 +49,6 @@ import yaml
 
 from lu_machinery.common.git_credentials import verification_credentials
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
-from lu_machinery.orchestration.safe_git_context import SafeGitContext, SnapshotRefusal
 
 GIT = shutil.which("git", path=os.defpath) or "/usr/bin/git"
 LOCAL_COMMANDS = frozenset(
@@ -158,7 +154,7 @@ def primary_repository(cwd: Path) -> Path:
     return common.parent
 
 
-def _preserve_attributes(prefix, cwd, env, timeout, *, scoped_paths=None):
+def _preserve_attributes(prefix, cwd, env, timeout):
     """Refuse transformations in current or staged attributes before add.
 
     A disabled clean filter cannot reproduce filtered storage. The same applies
@@ -168,8 +164,8 @@ def _preserve_attributes(prefix, cwd, env, timeout, *, scoped_paths=None):
     including redefinitions of binary; the built-in binary only unsets
     diff/merge/text and does not transform storage. Inspect both attribute views.
     """
-    if scoped_paths is None:
-        paths = subprocess.run(
+    if (
+        paths := subprocess.run(
             [*prefix, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
             cwd=cwd,
             env=env,
@@ -178,9 +174,7 @@ def _preserve_attributes(prefix, cwd, env, timeout, *, scoped_paths=None):
             timeout=timeout,
             check=False,
         )
-    else:
-        paths = subprocess.CompletedProcess([], 0, os.fsencode("\0".join(scoped_paths) + "\0"), b"")
-    if paths.returncode:
+    ).returncode:
         return paths
     for source in ([], ["--cached"]):
         attrs = subprocess.run(
@@ -246,140 +240,6 @@ class SafeGitRunner:
     """The only permitted runner injection: an absolute Git executable."""
 
     executable: str = GIT
-
-
-@dataclass(frozen=True)
-class ScopedCommitResult:
-    step: str
-    process: subprocess.CompletedProcess
-    head: str | None = None
-
-
-def prepare_scoped_commit(
-    context: SafeGitContext,
-    *,
-    worktree: Path,
-    branch: str,
-    expected_head: str,
-    paths: tuple[str, ...],
-    subject: str,
-    body: str,
-    trailer: str,
-    identity: dict[str, str],
-) -> ScopedCommitResult:
-    """Prepare one scoped commit with no source-configured execution.
-
-    Borrow source objects and an index snapshot, never source config or hooks.
-    Write new objects to source storage so a refused push retains the commit.
-    Install the resulting index and branch only if both still match the inputs.
-    The only source-side Git mutation is a hook-disabled compare-and-swap ref
-    update. Publication must separately run the trusted pre-push gate.
-    """
-    if (
-        not paths
-        or not re.fullmatch(r"[0-9a-f]{40}", expected_head)
-        or branch.startswith("-")
-        or any(
-            path in {"", ".", "./"} or Path(path).is_absolute() or ".." in Path(path).parts or "\0" in path
-            for path in paths
-        )
-        or not re.fullmatch(r"X-Agent: [a-z0-9_-]+/[a-zA-Z0-9_.-]+", trailer)
-        or "\n" in subject
-        or re.search(r"(?im)^X-Agent:", subject + "\n" + body)
-        or set(identity) != {"GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
-    ):
-        raise ValueError("unsupported scoped preparation operation")
-    ref = f"refs/heads/{branch}"
-    if context.run("check-ref-format", ref).returncode:
-        raise ValueError("unsupported scoped preparation branch")
-    source = context.source_git_dir
-    source_index = source / "index"
-    # Stat before reading: a concurrent rewrite leaves an older stamp, which
-    # only makes Git re-hash more entries, and the final compare refuses it.
-    source_stat = source_index.stat() if source_index.exists() else None
-    original_index = source_index.read_bytes() if source_stat is not None else None
-    if original_index is not None:
-        # Git re-hashes entries whose mtime is not older than the index file
-        # mtime (racy-git). Keep the source stamp so a same-size edit made in
-        # the index's second is still seen; copy no other metadata.
-        (context.root / "index").write_bytes(original_index)
-        os.utime(context.root / "index", ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
-    else:
-        context.checked("read-tree", expected_head)
-    context.checked("update-ref", ref, expected_head)
-    context.checked("symbolic-ref", "HEAD", ref)
-    context.checked("config", "core.bare", "false")
-    # No source includes, info/attributes, trailer commands or execution config.
-    prefix = [GIT, "--literal-pathspecs", "-c", f"core.worktree={worktree}"]
-    for setting in (*_SETTINGS, *_COMMIT_SETTINGS, f"core.attributesFile={os.devnull}"):
-        prefix.extend(["-c", setting])
-    env = {
-        **context.env,
-        **identity,
-        "GIT_OBJECT_DIRECTORY": str(context.objects),
-        "GIT_WORK_TREE": str(worktree),
-    }
-    failure = _preserve_attributes(prefix, context.root, env, 30, scoped_paths=paths)
-    if failure is not None:
-        return ScopedCommitResult(
-            "add",
-            subprocess.CompletedProcess(
-                failure.args,
-                failure.returncode,
-                failure.stdout.decode("utf-8", "replace"),
-                failure.stderr.decode("utf-8", "replace"),
-            ),
-        )
-    scoped = ["--pathspec-from-file=-", "--pathspec-file-nul"]
-    for step, args in (
-        ("add", ["add", "-A", *scoped]),
-        ("commit", ["commit", "--only", *scoped, "-m", subject, "-m", body, "--trailer", trailer]),
-    ):
-        result = subprocess.run(
-            [*prefix, *args],
-            cwd=context.root,
-            env=env,
-            input="\0".join(paths),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-        if result.returncode:
-            return ScopedCommitResult(step, result)
-        current = context.read_source_ref(source, "HEAD")
-        name = context.read_source_ref(source, "HEAD", symbolic=True)
-        if (
-            current.returncode
-            or current.stdout.strip() != expected_head
-            or name.returncode
-            or name.stdout.strip() != ref
-        ):
-            raise SnapshotRefusal("auto_finalize_head_moved")
-    head = context.checked("rev-parse", "HEAD")
-    lock = source_index.with_name("index.lock")
-    # Coordinate with ordinary source Git writers. Failure retains their
-    # index/ref and the new objects, without publishing anything.
-    with lock.open("xb") as stream:
-        try:
-            current_index = source_index.read_bytes() if source_index.exists() else None
-            if current_index != original_index:
-                raise SnapshotRefusal("auto_finalize_head_moved")
-            stream.write((context.root / "index").read_bytes())
-            stream.flush()
-            result = run_git(
-                ["update-ref", ref, head, expected_head],
-                cwd=worktree,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode:
-                raise SnapshotRefusal("auto_finalize_head_moved")
-            os.replace(lock, source_index)
-        finally:
-            lock.unlink(missing_ok=True)
-    return ScopedCommitResult("commit", result, head)
 
 
 class GitRefusal(subprocess.CompletedProcess):

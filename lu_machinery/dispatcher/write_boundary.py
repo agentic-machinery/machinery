@@ -33,6 +33,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, main_checkout_root
 from lu_machinery.common.scratch import ensure_scratch_root
@@ -299,8 +300,9 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
     ]
     for path in declared_outputs(spec, invocation):
         argv += ["--output", str(path)]
-    for path in credential_files(spec.agent, invocation.env):
-        argv += ["--credential", str(path)]
+    if not (spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER):
+        for path in credential_files(spec.agent, invocation.env):
+            argv += ["--credential", str(path)]
     if spec.agent == "claude":
         # The selected login (a labelled account's verified directory, set by ``admission.claude_launch``).
         home = Path(invocation.env.get("HOME") or Path.home())

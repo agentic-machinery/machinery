@@ -200,9 +200,13 @@ async def resilience_middleware(request: Request, call_next):
         )
 
     start = time.perf_counter()
+    deadline = asyncio.timeout(request_timeout_s())
     try:
-        response = await asyncio.wait_for(call_next(request), timeout=request_timeout_s())
+        async with deadline:
+            response = await call_next(request)
     except TimeoutError:
+        if not deadline.expired():
+            raise  # the handler's own TimeoutError (socket.timeout too) is a 500, not a 504
         elapsed_ms = (time.perf_counter() - start) * 1000
         _record_timeout(str(request.url.path), request.method, elapsed_ms)
         return JSONResponse(

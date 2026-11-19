@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import get_args
 
 from lu_machinery import cto_safe_mode
+from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.dispatcher import (
     admission,
@@ -93,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("task-id", None, "Unique safe task ID (default: random UUID)"),
         ("prompt-file", None, "UTF-8 prompt path; '-' reads stdin (one source required)"),
         ("prompt", None, "Literal prompt; '-' reads stdin (one source required)"),
-        ("effort", None, "Provider effort, e.g. high (default: provider default)"),
+        ("effort", None, "Provider effort, e.g. high (default: high for Savant, otherwise provider default)"),
         ("repo", None, "fleet_repos.yaml key (default: public primary)"),
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
@@ -105,6 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("max-budget-usd", None, "Spend cap in USD for a Claude API-key account, at most its configured amount "
          "(default: that amount)"),
         ("provider", None, "Explicit upstream, e.g. openrouter (default: native)"),
+        ("data-class", None, "Savant input class: public-code, public-docs, private-code, or private-docs (required)"),
+        ("max-tokens", None, "Savant generation cap including reasoning (default: 64000)"),
         ("output-schema", None, "Codex, AGY, or Claude JSON object schema: repo-relative or absolute readable file "
          "(default: the review findings schema for a code or infra --require-review-verdict on those agents, otherwise none)"),
         ("research-role", None, "Research role metadata (default: none)"),
@@ -434,6 +437,12 @@ def _dispatch(args) -> int:
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
     repo, info = git.resolve_repo(args.repo)
+    if agent == "opencode" and args.provider == SAVANT_PROVIDER:
+        from lu_machinery.dispatcher.providers.opencode import SAVANT_DEFAULT_EFFORT, savant_token_cap
+
+        if args.effort is None:
+            args.effort = SAVANT_DEFAULT_EFFORT
+        args.max_tokens = savant_token_cap(args.max_tokens)
     # Work that cannot land yet, or that collides with a live worker, is caught before anything is spent (#583).
     if args.allow_open_dependency and not args.task_card:
         raise ValueError("--allow-open-dependency requires --task-card")
@@ -596,6 +605,9 @@ def _dispatch(args) -> int:
         # The real run re-checks child_env after worktree creation in worker.py.
         invocation = runtime_context.build(spec, child_env(spec))
         plan = dict(worktree=str(worktree), start_sha=sha, argv=invocation.argv, record_path=str(path), **gate_fields)
+        if spec.provider == SAVANT_PROVIDER:
+            plan.update(provider=spec.provider, model=spec.model, effort=spec.effort, data_class=args.data_class,
+                        max_tokens=args.max_tokens)
         if binding:
             plan.update(review_attempt=binding, review_access=args.review_access or "isolated")
         print(json.dumps(plan, indent=2))

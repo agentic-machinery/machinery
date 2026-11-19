@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import yaml
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_identity import normalize_seat, seat_read_aliases
@@ -57,6 +57,7 @@ from .codexbar_usage import (
 from .lane_health import LaneHealthScan, scan_lane_health
 from .monitor_context import MonitorContext, get_ctx
 from .project_state_store import REPORT_TTL_SECONDS, get_freshest_lane_usage
+from .resilience import request_timeout_s
 from .rules_router import rules_hash
 from .runtime_router import summarize_runtime_usage
 from .session_router import session_hash
@@ -124,6 +125,15 @@ ROUTING_BUDGET_TTL_S = 15.0
 # Past this age a stored snapshot must not authorize a lane. Same bound the
 # payload already publishes as diagnostics.stale_threshold_s.
 ROUTING_BUDGET_MAX_AGE_S = 900.0
+# A read with nothing stored waits this long while the startup warmup's first
+# routing-budget attempt runs, then answers the typed warming 503 (#829, #832).
+# Short, so request setup and delivery under startup load still fit the 2 s
+# client timeout of the dispatch pool selector.
+ROUTING_BUDGET_STARTUP_COLD_WAIT_S = 0.5
+# On a running server a cold read waits for its computation until this long
+# before the request timeout, so its typed 503 is never cut off by the 504.
+ROUTING_BUDGET_RESPONSE_RESERVE_S = 3.0
+ROUTING_BUDGET_WARMING_RETRY_AFTER_S = 2
 
 
 def _ctx_cache_key(ctx: MonitorContext, *parts: object) -> str:
@@ -2526,8 +2536,31 @@ async def routing_budget(
             claude_fields=claude_fields,
         ))
         return _routing_budget_response(payload)
-    observed, value = await cache_get_or_compute_async(cache_key, ROUTING_BUDGET_TTL_S, _compute)
-    claude_fields = await revalidated_routing_budget_fields()
+    # Nothing stored yet. One deadline bounds the whole cold path, the account
+    # read included, so the request timeout's 504 cannot fire. The shared
+    # computation keeps running past it and stores its value for the next read.
+    deadline = asyncio.timeout(_routing_budget_cold_wait_s(ctx))
+    try:
+        async with deadline:
+            observed, value = await cache_get_or_compute_async(cache_key, ROUTING_BUDGET_TTL_S, _compute)
+            claude_fields = await revalidated_routing_budget_fields()
+    except TimeoutError:
+        if not deadline.expired():
+            raise  # the computation's own TimeoutError is a failure, not warming
+        # A TimeoutError delivered to this request before its deadline is a
+        # failure (500), never warming. One that settles in its worker thread
+        # just before the deadline but reaches the event loop after it is
+        # indistinguishable from a later one and answers warming: the failed
+        # flight has left the in-flight map, so the Retry-After retry
+        # recomputes and a persistent failure then answers 500 (#840 F10).
+        raise HTTPException(
+            status_code=503, detail="routing budget warming",
+            headers={
+                "X-Snapshot-Age-S": "unknown",
+                "Retry-After": str(ROUTING_BUDGET_WARMING_RETRY_AFTER_S),
+                "Cache-Control": "no-store",
+            },
+        ) from None
     payload = _public_routing_budget(_aged_routing_budget(
         value,
         state_helpers._ttl_clock() - observed.started_at,
@@ -2546,10 +2579,33 @@ def _routing_budget_response(payload: dict[str, Any]) -> JSONResponse:
 
 _state_scan_warm_lock = threading.Lock()
 _state_scan_warm_thread: threading.Thread | None = None
+# The context whose startup warmup thread has not finished its first
+# routing-budget attempt (by identity: another context with the same root that
+# reused the thread is not starting); guarded by ``_state_scan_warm_lock``.
+_routing_budget_startup_owner: MonitorContext | None = None
+
+
+def _routing_budget_cold_wait_s(ctx: MonitorContext) -> float:
+    """How long a routing-budget read with nothing stored may take before its typed warming 503.
+
+    While this context's startup warmup runs its first routing-budget attempt,
+    :data:`ROUTING_BUDGET_STARTUP_COLD_WAIT_S`. Otherwise (a running server,
+    including one whose startup attempt failed) a key read for the first time
+    (``?fresh_codexbar=true`` for credit-lane admission, ``?transport=acp``)
+    waits for its computation as on a warm server. Either way the wait ends
+    :data:`ROUTING_BUDGET_RESPONSE_RESERVE_S` before the request timeout, and
+    never below zero: a request timeout too short for the reserve answers the
+    typed 503 at once rather than the 504.
+    """
+    with _state_scan_warm_lock:
+        starting = _routing_budget_startup_owner is ctx
+    bound = max(0.0, request_timeout_s() - ROUTING_BUDGET_RESPONSE_RESERVE_S)
+    return min(ROUTING_BUDGET_STARTUP_COLD_WAIT_S, bound) if starting else bound
 
 
 def _run_state_scan_warmup(ctx: MonitorContext, follow_ups: tuple[Callable[[MonitorContext], None], ...] = ()) -> None:
     """Warm the routing-budget cache after process start, then run the product scan warms in order."""
+    global _routing_budget_startup_owner
     try:
         # First: a dispatch launch right after a restart reads this key (#12512).
         cache_get_or_compute(
@@ -2559,6 +2615,10 @@ def _run_state_scan_warmup(ctx: MonitorContext, follow_ups: tuple[Callable[[Moni
         )
     except Exception as exc:
         logging.getLogger("state_router").warning("Routing-budget warmup failed: %s", exc)
+    finally:
+        with _state_scan_warm_lock:  # the startup phase ends with this first attempt, either way
+            if _routing_budget_startup_owner is ctx:
+                _routing_budget_startup_owner = None
     for follow_up in follow_ups:
         follow_up(ctx)
 
@@ -2572,7 +2632,7 @@ def schedule_state_scan_warmup(
     from an earlier call (which may belong to a different ctx) — so callers can
     join it instead of polling for effects (#8570).
     """
-    global _state_scan_warm_thread
+    global _state_scan_warm_thread, _routing_budget_startup_owner
     with _state_scan_warm_lock:
         if _state_scan_warm_thread is not None and _state_scan_warm_thread.is_alive():
             return _state_scan_warm_thread
@@ -2582,8 +2642,13 @@ def schedule_state_scan_warmup(
             name="state-scan-warmup",
             daemon=True,
         )
+        _routing_budget_startup_owner = ctx
+        try:
+            worker.start()
+        except BaseException:
+            _routing_budget_startup_owner = None
+            raise
         _state_scan_warm_thread = worker
-        worker.start()
         return worker
 
 

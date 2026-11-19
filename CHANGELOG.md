@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.36"></a>
+## [0.1.36] - 2026-11-19
+
+### Added
+
+- Replace Gemini 4 Carbon with Neon for advisory work ([#833](https://github.com/learn-ukrainian/machinery/pull/833))
+
+### Fixed
+
+- Verify delivered commits at settlement ([#827](https://github.com/learn-ukrainian/machinery/pull/827))
+- Check inbox retirement by release version ([#836](https://github.com/learn-ukrainian/machinery/pull/836))
+
 <a id="v0.1.35"></a>
 ## [0.1.35] - 2026-11-18
 
@@ -955,7 +967,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...HEAD
+[0.1.36]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...v0.1.34
 [0.1.33]: https://github.com/learn-ukrainian/machinery/compare/v0.1.32...v0.1.33

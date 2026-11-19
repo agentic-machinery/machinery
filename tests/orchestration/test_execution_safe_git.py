@@ -487,41 +487,6 @@ def install_full_markers(repo, tree, root, scope):
     return markers
 
 
-@pytest.mark.parametrize("scope", ["common", "worker", "both"])
-def test_scoped_preparation_never_imports_execution_inventory(boundary_tree, tmp_path, scope):
-    from lu_machinery.lib.git_identity import git_identity_env
-    from lu_machinery.orchestration import execution_safe_git as safe
-    from lu_machinery.orchestration.safe_git_context import SafeGitContext
-
-    repo, tree, _tasks, _record = boundary_tree
-    head = _git(tree, "rev-parse", "HEAD")
-    (tree / "payload.bin").write_bytes(b"owned\r\n\x00")
-    markers = install_full_markers(repo, tree, tmp_path, scope)
-    admin = Path((tree / ".git").read_text().strip().removeprefix("gitdir: "))
-    with SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, origin=str(repo), local_remote=True) as context:
-        context.source_git_dir = admin
-        result = safe.prepare_scoped_commit(
-            context,
-            worktree=tree,
-            branch="codex/boundary",
-            expected_head=head,
-            paths=("payload.bin",),
-            subject="scoped preparation",
-            body="Refs #10931",
-            trailer="X-Agent: codex/scoped",
-            identity=git_identity_env("codex"),
-        )
-    assert result.process.returncode == 0, result.process.stderr
-    assert result.head != head
-    assert not any(marker.exists() for marker in markers)
-    assert (
-        safe.run_git(["cat-file", "blob", f"{result.head}:payload.bin"], cwd=tree, capture_output=True).stdout
-        == b"owned\r\n\x00"
-    )
-    message = safe.run_git(["cat-file", "commit", result.head], cwd=tree, capture_output=True, text=True).stdout
-    assert message.count("X-Agent:") == 1 and "X-Agent: codex/scoped" in message
-
-
 PROOF_CALLERS = ["closeout-fetch"]
 
 

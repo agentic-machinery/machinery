@@ -118,8 +118,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
 
     review = _row(payload, "claude-opus-5-5", "review")
     assert review["tasks"] == 3 and "landed" not in review
-    # r3 names no PR, so it is a review task but no review of record: its verdict enters no figure.
-    assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 0}
+    # r3's malformed reply is visible in the missing-verdict count, despite having no PR.
+    assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 1}
     assert review["blocking_per_review"]["value"] == 1.0 and review["p0_p2_per_review"]["value"] == 1.5
     assert review["by_class"][0]["class"] == "code/medium"
 
@@ -344,24 +344,63 @@ def _at(hours: float) -> str:
     return (NOW - timedelta(hours=hours)).isoformat()
 
 
-def test_only_parsed_reviews_of_record_enter_verdict_figures(tmp_path):
-    """Defect class: an unparsed reply, or a review that is not of record (advice, critic, canary), counted as a
-    verdict, which lowers every author's first-round approval and every reviewer's approve rate."""
+def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_outcomes(tmp_path):
+    """Defect class: supplemental reviews dropped from reviewer totals or attributed to the wrong PR round."""
     batch_state, tasks = _state(tmp_path)
     _review(tasks, "u-review", "incorrect", [], pr=9, review_author_model="gpt-6.1-sol", pinned_head="1" * 40,
             started_at=_at(3))
     (tasks / "u-review.result").write_text("Looks fine to me.")  # no verdict the review contract reads
     _review(tasks, "p-review", "correct", [], pr=9, review_author_model="gpt-6.1-sol", pinned_head="2" * 40)
-    _review(tasks, "canary-review", "incorrect", ["P0"])  # names no PR or author model: not a review of record
+    _record(tasks, "neon-initial-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
+            effort="not-exposed", resolved_model="gemini-4-neon-medium", resolved_model_known=True,
+            options={"pinned_head": "1" * 40}, duration_s=120,
+            allowance={"pool": "gemini", "start": {"remaining_pct": 98}, "finish": {"remaining_pct": 96}})
+    _record(tasks, "neon-rate-limited-review", mode="read-only", agent="agy", model="gemini-4-neon-medium",
+            options={"pinned_head": "1" * 40}, status="rate_limited", started_at=_at(4), duration_s=60)
+    _record(tasks, "neon-later-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
+            options={"pinned_head": "2" * 40}, duration_s=180, verdict="APPROVED")
+    _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
+            status="failed")
+    _record(tasks, "landed", delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)
     rows.backfill(tasks, batch_state)
+    # A retained structured result can repair an existing summary even when its task record did not change.
+    (tasks / "neon-initial-review.result").write_text(json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": "The linked change passed its targeted checks.",
+                    "confidence": 0.95},
+        "findings": [{
+            "id": "F1", "priority": "P3", "category": "docs", "confidence": 0.95,
+            "title": "Name the denominator", "body": "The count label omits its denominator.",
+            "location": {"path": "page.html", "start_line": 7, "end_line": 7, "claim_type": "present"},
+            "verbatim": "Total", "why_wrong": "The label is ambiguous.",
+            "smallest_fix": "Name the denominator in the label.", "sources": ["none"],
+        }],
+    }))
+    assert rows.backfill(tasks, batch_state, dry_run=True)["would_refresh"] == 1
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 1
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 0
 
     window = _window(batch_state, stats.Landing())
 
     review = _row(window, "claude-opus-5-5", "review")
-    assert review["tasks"] == 3
+    assert review["tasks"] == 2
     assert review["verdicts"] == {"correct": 1, "incorrect": 0, "uncertain": 0, "unparsed": 1}
     assert review["approve_rate"] == {"value": 1.0, "n": 1, "low_sample": True}
     assert review["blocking_per_review"]["value"] == 0.0
+    assert _row(window, "grok-4.7", "review")["verdicts"]["unparsed"] == 1
+    neon = _row(window, "gemini-4-neon", "review")
+    assert (neon["approve_rate"]["n"], neon["findings"], neon["findings_n"]) == (2, 1, 1)
+    levels = {level["effort"]: level for model in window["review_levels"] if model["model"] == "gemini-4-neon"
+              for level in model["levels"]}
+    assert (levels["high"]["results"], levels["low"]["results"]) == (1, 0)
+    assert levels["high"]["first_round_approved"]["n"] == 0
+    assert levels["high"]["findings"] is None
+    assert levels["medium"] == {
+        "effort": "medium", "tasks": 2, "results": 1, "findings": 1, "findings_n": 1, "first_round_missing": 0,
+        "first_round_approved": {"value": 1.0, "n": 1, "low_sample": True}, "median_seconds": 90.0,
+        "wall_minutes_per_landed": {"value": 3.0, "n": 1, "low_sample": True},
+        "allowance_per_landed": [{"pool": "gemini", "value": 2.0, "n": 1, "low_sample": True}],
+    }
     (author,) = window["authors"]
     assert (author["prs"], author["rounds_per_pr"]["value"], author["first_round_approved"]["value"]) == (1, 1.0, 1.0)
     assert author["after_blocked_first_round"]["blocked"] == 0
