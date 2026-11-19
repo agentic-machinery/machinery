@@ -670,7 +670,7 @@ def _dispatch(args) -> int:
             attribution = store.worktree_attribution(spec, info, branch, sha)
             git.create_worktree(repo, worktree, branch, sha, full_checkout=args.full_checkout,
                                 sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
-                                **exact_start,
+                                **exact_start, deploy_agents=args.mode == "workspace-write",
                                 on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
         record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
         # A task dispatched from inside another task's run names that run, whose settlement then names it while

@@ -27,6 +27,7 @@ from lu_machinery.common.repo_root import (
     machinery_path,
     main_checkout_root,
     product_root,
+    project_interpreter,
     state_root,
 )
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
@@ -62,6 +63,10 @@ VERIFICATION_FETCH_TIMEOUT = 60
 # Committer-clock slack below the task start date. Speed depends on this value;
 # correctness does not, because _complete_since_task_base checks the fetched graph.
 HISTORY_SLACK_SECONDS = 86400
+# A checkout that tracks this descriptor is enrolled in the installed agent deployment (lu_machinery.agent_deploy).
+AGENT_DEPLOY_DESCRIPTOR = "agents_extensions/deployment.v1.json"
+# One apply measured 2.2 s on learn-ukrainian (947 outputs); the bound only stops a hung deployer.
+AGENT_DEPLOY_TIMEOUT = 120
 
 
 class VerificationFetchError(subprocess.CalledProcessError):
@@ -470,8 +475,11 @@ def worktree_lock(repo: Path, *, timeout: float | None = None):
 
 def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_checkout=False, sparse_include=(),
                     exact=False, registration: dict | None = None, creator_actor: str | None = None,
-                    on_reserved=None) -> None:
+                    on_reserved=None, deploy_agents: bool = False) -> None:
     """Create a task worktree; ``registration`` (see register_worktree) also keeps its registry entry true.
+
+    ``deploy_agents`` (write tasks) applies the checkout's agent deployment (``deploy_agent_extensions``) before
+    any dependency install; a deployment that cannot be applied raises, so the task never launches.
 
     The entry is written before the tree exists and confirmed after, all under the worktree lock that
     settlement removes (and archives) under, so a later dispatch to the same path cannot interleave.
@@ -538,8 +546,45 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
                             "worktree registry reconcile failed: %s", f"{type(again).__name__}: {again}"[:300]
                         )
             raise
+    # Outside the lock, like the install below. A refusal leaves the tree attributed, as any later launch failure does.
+    if deploy_agents:
+        deploy_agent_extensions(path)
     # Outside the lock: a store miss runs one npm install, and other creations must not wait for it.
     site_deps.provision(repo, path)
+
+
+def deploy_agent_extensions(path: Path) -> None:
+    """Give a new write worktree of an enrolled checkout its product's agent extensions (hooks, settings, rules).
+
+    Provider CLIs load project settings from the worktree they run in, never from the primary checkout, and an
+    enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
+    product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
+    ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
+    worker's hooks use, composed from the worktree's own sources. A checkout without the descriptor is not
+    enrolled and is left as it is. Each refusal is a ``ValueError`` whose first word is its typed reason:
+    ``agent_deploy_failed`` when the deployment cannot be applied, ``agent_deploy_outputs_not_ignored`` when
+    an output would show as a change the worker could commit.
+    """
+    if not (path / AGENT_DEPLOY_DESCRIPTOR).is_file():
+        return
+    try:
+        interpreter = project_interpreter(env=os.environ)
+        result = subprocess.run(
+            [str(interpreter), "-I", "-m", "lu_machinery.agent_deploy", "--project-root", str(path)],
+            cwd=path, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+            timeout=AGENT_DEPLOY_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"agent_deploy_failed: no result within {AGENT_DEPLOY_TIMEOUT} s") from None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"agent_deploy_failed: project interpreter unavailable ({type(exc).__name__})") from None
+    if result.returncode:
+        reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
+        raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
+    changed = _git(path, "status", "--porcelain", "--untracked-files=all", isolate=True, strip=False).splitlines()
+    if changed:
+        listed = ", ".join(line[3:] for line in changed[:3])
+        raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {listed}")
 
 
 def registry_path(repo: Path, repository: dict) -> Path | None:

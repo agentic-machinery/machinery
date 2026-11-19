@@ -287,3 +287,69 @@ def test_a_home_relative_hooks_path_keeps_its_guards(sandbox, monkeypatch, tmp_p
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+def enroll(primary, *, ignored="/.claude/\n/.deploy-state/\n", descriptor=None):
+    """Enroll the checkout in the installed agent deployment, with the Claude hooks its release makes mandatory."""
+    from importlib import resources
+
+    inventory = json.loads(resources.files("lu_machinery.agent_deploy").joinpath("release.v1.json").read_bytes())
+    settings = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        *parents, event = requirement["path"]
+        node = settings
+        for key in parents:
+            node = node.setdefault(key, {})
+        node.setdefault(event, []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    shared = primary / "agents_extensions/shared"
+    shared.mkdir(parents=True)
+    (shared / "settings.json").write_text(json.dumps(settings))
+    (primary / "agents_extensions/deployment.v1.json").write_text(descriptor or json.dumps({
+        "providers": ["claude"], "sources": {"shared": {"path": "agents_extensions/shared", "required": True}},
+        "preserve": []}))
+    (primary / ".gitignore").write_text(ignored)
+    run_git(primary, "add", ".")
+    run_git(primary, "commit", "-m", "enroll")
+    return run_git(primary, "rev-parse", "HEAD"), settings
+
+
+@pytest.mark.parametrize("deploy_agents", [True, False])
+def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktree_does(
+        sandbox, monkeypatch, deploy_agents):
+    """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
+    Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them;
+    and a read-only (review) worktree widened by settings the dispatch did not ask for."""
+    import sys
+
+    from lu_machinery.dispatcher import git
+
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    primary, _, _ = declared_repo(sandbox)
+    sha, settings = enroll(primary)
+    tree = primary / ".worktrees/dispatch/codex/enrolled"
+    git.create_worktree(primary, tree, "codex/enrolled", sha, deploy_agents=deploy_agents)
+    deployed = tree / ".claude/settings.json"
+    if deploy_agents:
+        assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
+    else:
+        assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+@pytest.mark.parametrize("broken, reason", [
+    ({"descriptor": "{"}, "agent_deploy_failed: exit 2: invalid deployment: invalid JSON"),
+    ({"ignored": "/.deploy-state/\n"}, "agent_deploy_outputs_not_ignored: the checkout does not ignore .claude/"),
+])
+def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(sandbox, monkeypatch, broken, reason):
+    """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
+    checkout's agent deployment failed."""
+    import sys
+
+    from lu_machinery.dispatcher import git
+
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    primary, _, _ = declared_repo(sandbox)
+    sha, _ = enroll(primary, **broken)
+    with pytest.raises(ValueError, match="^" + reason):
+        git.create_worktree(primary, primary / ".worktrees/dispatch/codex/refused", "codex/refused", sha,
+                            deploy_agents=True)
