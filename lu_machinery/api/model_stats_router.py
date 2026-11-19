@@ -10,15 +10,16 @@ One read-only collector joins two durable sources:
 One refresh computes every window (24 hours, 7, 30, 90 days and all) and the ISO-week buckets; the route serves a
 window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``.
 ``/metrics`` keeps the four longer windows, so a 24-hour series does not add a label value. ``view=page`` serves
-the same figures without the per-class tree. Every figure
+the same figures without the per-class tree and without reply text. ``view=samples`` serves that reply text
+alone, and the page asks for it on its own. Every figure
 splits by the concrete model id and the effective effort (``unset`` when none was recorded); a bare Claude alias
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
 CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
 otherwise a write. Reviewer totals include structured results from every lane. Author figures use reviews of
 record (reviews that name a PR and the author's model). Only counts and model, effort, class, pool and repository
-labels leave this module, plus, on the HTTP route only, the per-reason breakdown and up to 200 escaped characters
-of the first failing reply per model and reason: never prompts, parsed bodies, paths, accounts or task ids, and
-never any sample on ``/metrics``.
+labels leave ``view=page``. The per-reason counts stay on every HTTP view. Up to 200 escaped characters of the
+first failing reply per model and reason leave only on ``view=full`` and ``view=samples``: never prompts, parsed
+bodies, paths, accounts or task ids, and never any sample on ``view=page`` or ``/metrics``.
 """
 
 from __future__ import annotations
@@ -84,7 +85,10 @@ WINDOWS: dict[str, int | None] = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "all"
 # Grafana's window label set stays these four. ``24h`` is a page window only.
 METRIC_WINDOWS = ("7d", "30d", "90d", "all")
 PAGE_DROP = frozenset({
-    "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed"})
+    "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed",
+    "unparsed_samples"})
+# Snapshot sides the route never spreads into a response. ``sample_windows`` is served only by ``view=samples``.
+_UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
 START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
@@ -1571,7 +1575,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
     page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
                          task_class=_page_class(row.task_class)) for row in rows]
-    windows, metric_windows, page_windows = {}, {}, {}
+    windows, metric_windows, page_windows, sample_windows = {}, {}, {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         selected = [row for row in rows if since <= row.moment]
@@ -1589,12 +1593,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
               "class": _page_class(pr["class"])} for pr in cohort]
             for cohort in (prs, record_prs))
         page_selected = [row for row in page_rows if since <= row.moment]
-        page_windows[name] = {
-            "window": window,
-            **page_window(summarize(page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
-                                    touched=touched,
-                                    accuracy_rows=selected, reviewer_name=_page_model)),
-        }
+        page_summary = summarize(page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
+                                 touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
+        sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
+        page_windows[name] = {"window": window, **page_window(page_summary)}
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         # 24h stays off this label set.
         if name in METRIC_WINDOWS:
@@ -1612,6 +1614,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
         "page_windows": page_windows,
+        "sample_windows": sample_windows,
         "weeks": _weeks(weeks),
         "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
@@ -1667,8 +1670,19 @@ def cached_snapshot(ctx: MonitorContext) -> tuple[dict[str, Any], float] | None:
     return None if stored is None else (cast(dict[str, Any], stored[0]), stored[1])
 
 
+def _sample_models(models: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Reply text for ``view=samples``: one row per model that has any. Empty mappings are omitted."""
+    found = []
+    for model in models:
+        samples = model.get("unparsed_samples")
+        if samples:
+            found.append({"model": model["model"], "role": model["role"], "unparsed_samples": samples})
+    return found
+
+
 def page_window(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """The dashboard projection: model and effort totals plus chart series, without the class tree or week dump."""
+    """The dashboard projection: model and effort totals plus chart series, without the class tree, week dump or
+    reply text. ``PAGE_DROP`` is the only omission list."""
     models = []
     for model in payload.get("models", []):
         slim = {key: value for key, value in model.items() if key not in PAGE_DROP}
@@ -1682,8 +1696,10 @@ def page_window(payload: Mapping[str, Any]) -> dict[str, Any]:
 async def model_stats(
     window: Literal["24h", "7d", "30d", "90d", "all"] = Query(
         default="7d", description="Window: 24h, 7d, 30d, 90d or all"),
-    view: Literal["full", "page"] = Query(
-        default="full", description="full keeps every class; page is the dashboard projection"),
+    view: Literal["full", "page", "samples"] = Query(
+        default="full",
+        description="full keeps every class; page is the dashboard projection without reply text; "
+                    "samples is that reply text alone"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
     """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
@@ -1712,7 +1728,18 @@ async def model_stats(
                                 headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
-    body = {name: value for name, value in snapshot.items() if name not in ("windows", "page_windows", "metrics")}
+    headers = snapshot_headers(age, FRESHNESS_BOUND_SECONDS)
+    if view == "samples":
+        samples = snapshot.get("sample_windows")
+        window_samples = samples.get(window) if isinstance(samples, Mapping) else None
+        if not isinstance(window_samples, Mapping):
+            return JSONResponse({"status": "unavailable", "schema_version": SCHEMA_VERSION,
+                                 "error": "samples_unavailable"}, status_code=503,
+                                headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
+        payload = {"schema_version": snapshot["schema_version"], "status": "ok",
+                   "age_seconds": round(age, 1), **window_samples}
+        return JSONResponse(payload, headers=headers)
+    body = {name: value for name, value in snapshot.items() if name not in _UNSERVED}
     window_key = "windows"
     if view == "page":
         window_key = "page_windows"
@@ -1720,7 +1747,7 @@ async def model_stats(
         coverage = body["coverage"]
         body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
     payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}
-    return JSONResponse(payload, headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
+    return JSONResponse(payload, headers=headers)
 
 
 # Grafana's contract (docs/runbooks/model-stats.md): names and label sets change only with that runbook.

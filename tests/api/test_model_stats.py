@@ -307,9 +307,11 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert fmt_stored.startswith(r"first\n\t\x1b[31m\u202e<script>B")
     assert "TAIL-BEYOND-200" not in fmt_stored and len(fmt_stored) <= rows.MAX_SAMPLE_CHARS
     assert u_review["unparsed_samples"]["bad_fields"] == '{"overall": {"correctness": "maybe"}, "findings": []}'
-    page_u = _row(stats.page_window(u_window), "claude-opus-5-5", "review")
+    page = stats.page_window(u_window)
+    page_u = _row(page, "claude-opus-5-5", "review")
     assert page_u["unparsed_reasons"] == u_review["unparsed_reasons"]
-    assert page_u["unparsed_samples"] == u_review["unparsed_samples"]
+    assert "unparsed_samples" not in page_u
+    assert "stamped archive reply" not in json.dumps(page)
     assert all("unparsed_samples" not in e for e in page_u["by_effort"])
     # Fail-closed cross-field validation rejects writer-impossible rows.
     base_row = stored_u["u-legacy-review"]
@@ -580,6 +582,147 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     assert stats._page_author(f"{author}+{model}") == "other"
 
 
+# Prose a failing reply can carry. It is not a label, a timestamp, a week or one of the page's fixed sentences.
+_LEAK = "The reviewer wrote prose that is not a closed label."
+_PAGE_SENTENCES = frozenset({
+    "finished_at, else started_at, in [since, until)",
+    "most first-round approvals per recorded wall hour, among catalog models "
+    "with at least 10 landed tasks and 10 reviewed PRs",
+    "not enough data yet",
+    "No finding outcome is recorded. A blocking finding counts as fixed when the author's "
+    "later head changed its file before the same reviewer approved, else dismissed; a file "
+    "changed for another reason (another finding, a merge of main) still counts as fixed, and "
+    "a fix made in a different file counts as dismissed. Only verdicts the recorder published "
+    "count; a blocking reply with no recorded publication (an unpublished run, or one from "
+    "before the publication ledger and not imported) is of unknown publication and left out.",
+    "No planted-defect result is recorded in the summary rows.",
+    "No Savant model is in the catalog, and no row names one.",
+    "This snapshot does not include task ids.",
+    "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
+    "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
+    "contains a reset or two readings at one timestamp that disagree, stays unknown. "
+    "It is never reported as zero.",
+    "There is no difficulty weight. Compare models inside one task class.",
+    "Wall hours per landed stay blank when any task has no duration. The observed figure "
+    "uses the recorded hours when at most one task, or one percent, is untimed.",
+    "auto is Cursor Auto: the harness chose the model. A Cursor display name maps only "
+    "where the shared cursor map admits it. A harness prefix resolves to its catalog id. "
+    "Stored rows keep the old label until backfill.",
+    "planted-defect results per reviewer: the summary rows record none. A review-eval run "
+    "(lu_machinery/bakeoff/review_eval.py over docs/review-eval) writes per-seat recall to its "
+    "own output directory, which this route does not read.",
+})
+_SCHEMA_KEY = re.compile(r"[a-z][a-z0-9_]*\Z")
+_PAGE_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z")
+_PAGE_WEEK = re.compile(r"\d{4}-W\d{2}\Z")
+
+
+def _leaky_snapshot(tmp_path: Path) -> dict:
+    batch_state, tasks = _state(tmp_path)
+    _record(tasks, "write-one", duration_s=3600)
+    _record(tasks, "odd-host", resolved_model="worker.example.invalid", resolved_model_known=True,
+            effort="effort.example.invalid", research_task_family="class.example.invalid", duration_s=10)
+    _review(tasks, "leaky-review", "correct", [], pr=1)
+    (tasks / "leaky-review.result").write_text(_LEAK)
+    rows.backfill(tasks, batch_state)
+    return stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+
+
+def _serve(snapshot: dict, tmp_path: Path, monkeypatch) -> TestClient:
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=tmp_path / "batch_state",
+                                                live_repo_root=tmp_path))
+    monkeypatch.setattr(stats, "_compute", lambda _ctx: lambda: snapshot)
+    app = FastAPI()
+    app.include_router(stats.router, prefix="/api/fleet/model-stats")
+    app.dependency_overrides[get_ctx] = lambda: ctx
+    return TestClient(app)
+
+
+def _page_label_ok(text: str, labels: set[str], models: set[str]) -> bool:
+    if text in labels or text in models or text in _PAGE_SENTENCES:
+        return True
+    if stats.VARIANT_SUFFIX.fullmatch(text):
+        return True
+    if "+" in text:
+        return all(part in models for part in text.split("+"))
+    return False
+
+
+def _page_strings(node: object, path: str = "$"):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield f"{path}.{key}<key>", key
+            yield from _page_strings(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from _page_strings(value, f"{path}[{index}]")
+    elif isinstance(node, str):
+        yield path, node
+
+
+def test_samples_view_returns_the_reply_text_view_page_omits(tmp_path, monkeypatch):
+    """Defect class: view=page relaying reviewer reply text that view=samples is supposed to carry alone."""
+    snapshot = _leaky_snapshot(tmp_path)
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        page = client.get("/api/fleet/model-stats?window=7d&view=page")
+        samples = client.get("/api/fleet/model-stats?window=7d&view=samples")
+        full = client.get("/api/fleet/model-stats?window=7d&view=full")
+    assert page.status_code == samples.status_code == full.status_code == 200
+    assert _LEAK not in page.text
+    assert "unparsed_samples" not in page.text
+    body = samples.json()
+    assert body["status"] == "ok" and set(body) == {"schema_version", "status", "age_seconds", "window", "models"}
+    found = [model for model in body["models"] if model["model"] == "claude-opus-5-5" and model["role"] == "review"]
+    assert found == [{"model": "claude-opus-5-5", "role": "review",
+                      "unparsed_samples": {"bad_format": _LEAK}}]
+    assert _LEAK in full.text
+    review = _row(page.json(), "claude-opus-5-5", "review")
+    assert review["unparsed_reasons"]["bad_format"] == 1
+
+
+def test_page_view_string_leaves_stay_closed_for_every_window(tmp_path, monkeypatch):
+    """Defect class: a free-text leaf on view=page, for any of the five windows, other than a closed label, a
+    timestamp or week, or one of the page's fixed sentences."""
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+
+    snapshot = _leaky_snapshot(tmp_path)
+    try:
+        repo_keys = set(load_fleet_repos())
+    except FleetRepoError:
+        repo_keys = set()
+    models = set(stats._known_models()) | set(stats._NOT_CONCRETE) | {stats.OTHER}
+    labels = {
+        *stats.WINDOWS, stats.SCHEMA_VERSION, "ok", *stats.STATUSES, "other", *rows.VERDICTS,
+        *stats.UNPARSED_REASON_KEYS, *stats._PAGE_CLASSES, stats.ALL_CLASSES, *stats._KNOWN_EFFORTS,
+        stats.ALL_EFFORTS, *rows.POOLS, *stats.FINDING_OUTCOMES, *stats.AFTER_BLOCK, *stats._RISK_ORDER,
+        *stats.VALID_RISKS, "unknown", *stats.START_REFUSAL_CODES, *{value for value in stats._NOT_CONCRETE.values()},
+        "catalog", "joint", "not_in_catalog", "write", "review", *repo_keys, "read", "unavailable",
+        "registry_unavailable",
+    }
+    assert not _page_label_ok(_LEAK, labels, models)
+    assert not _page_label_ok("worker.example.invalid", labels, models)
+    assert not _page_label_ok("file:///home/fixture/reply.txt", labels, models)
+    assert not _page_label_ok("/home/fixture/reply.txt", labels, models)
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        payloads = []
+        for name in stats.WINDOWS:
+            response = client.get(f"/api/fleet/model-stats?window={name}&view=page")
+            assert response.status_code == 200, name
+            assert _LEAK not in response.text and "example.invalid" not in response.text, name
+            payloads.append((name, response.json()))
+    offenders = []
+    for name, payload in payloads:
+        for path, text in _page_strings(payload):
+            if path.endswith("<key>"):
+                allowed = _SCHEMA_KEY.fullmatch(text) is not None or _page_label_ok(text, labels, models)
+            else:
+                allowed = (_page_label_ok(text, labels, models) or _PAGE_TIMESTAMP.fullmatch(text) is not None
+                           or _PAGE_WEEK.fullmatch(text) is not None)
+            if not allowed:
+                offenders.append((name, path, text))
+    assert not offenders, offenders[:8]
+
+
 def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
     """Defect class: a missing duration read as zero wall time, understating wall hours per landed task."""
     batch_state, tasks = _state(tmp_path)
@@ -846,11 +989,12 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
     page = stats.page_window(snapshot["windows"]["all"])
-    dropped = ("by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed")
+    dropped = ("by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed",
+               "unparsed_samples")
     assert all(key not in model and key not in effort
                for model in page["models"] for effort in model["by_effort"] for key in dropped)
     html = machinery_path("api/dashboards/model-stats.html").read_text()
-    assert "view=page" in html and "Best value needs more data" in html and "Low sample" in html
+    assert "view=page" in html and "view=samples" in html and "Best value needs more data" in html and "Low sample" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.

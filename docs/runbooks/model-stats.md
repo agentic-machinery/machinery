@@ -1,17 +1,21 @@
 # Model value statistics
 
-`GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=full|page` and the page at `/model-stats` show, per
+`GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=full|page|samples` and the page at `/model-stats` show, per
 concrete model id, effective effort, role and task class, how much work a model does, how much it wastes and how
 slow it is (#581). `view=full` (default) includes per-class breakdowns (`by_class`), token counts and token rates,
-and ISO-week buckets (`weeks`). `view=page` (used by `/model-stats`) omits those fields and keeps model and effort
-totals plus `charts` series. The page groups model, author, reviewer, effort and class labels before calculating
+ISO-week buckets (`weeks`) and the reply samples below. `view=page` (the figures `/model-stats` reads) omits those
+fields, including every `unparsed_samples` leaf, and keeps model and effort totals plus `charts` series. Its string
+values are closed-vocabulary labels, timestamps or ISO weeks, and the fixed sentences in `window.cohort`,
+`charts.recommendation` and `charts.limits`. `view=samples` returns only the reply samples for that window.
+`/model-stats` fetches it on its own and leaves the failing-reply section empty when that fetch is refused.
+The page groups model, author, reviewer, effort and class labels before calculating
 the figures. It admits the metrics model and effort vocabularies, the page's fixed model labels `auto` and
 `unrecognized`, the defined work and review classes, and configured repository keys in landing coverage.
 It groups other labels under `other`. The Monitor's `/metrics`
 exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
 and ISO weeks as gauges for Grafana. The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
-reports counts and model, effort, class, pool and repository labels, never prompts, bodies, paths, accounts or task
-ids.
+`view=page` and `/metrics` report counts and model, effort, class, pool and repository labels, never prompts,
+bodies, paths, accounts, task ids or reply text.
 
 ## History store
 
@@ -150,10 +154,12 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   (no result file bound to the record: absent, not a regular file, unreadable, or not matching the record's
   `result_sha256`), `too_big` (over 4 MB, not read whole), `bad_format` (not UTF-8 or no review JSON),
   `bad_fields` (review JSON that breaks the review contract), `not_done` (the task did not finish `done`) and
-  `unknown` (a row written before the split). The HTTP route also gives, per model and reason, the first 200
-  escaped characters of the earliest failing reply (`unparsed_samples`): only for public repositories and data
-  classes, only for a reply of at most 16 KiB, and only when no OPSEC or secret match in the whole reply starts
-  inside those characters. `missing_result` and `too_big` have no sample, and `/metrics` never carries one.
+  `unknown` (a row written before the split). `view=full` and `view=samples` also give, per model and reason, the
+  first 200 escaped characters of the earliest failing reply (`unparsed_samples`): only for public repositories and
+  data classes, only for a reply of at most 16 KiB, and only when no OPSEC or secret match in the whole reply
+  starts inside those characters. `missing_result` and `too_big` have no sample. `view=page` and `/metrics` never
+  carry one. The page reads samples from `view=samples` and shows no failing-reply section when that response is
+  not ok.
   The approval rate uses parsed verdicts,
   while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
   unknown. The author figures and first-round matrix use **reviews of record**, which name the PR and the
