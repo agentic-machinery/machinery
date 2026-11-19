@@ -457,12 +457,15 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
                 research_task_family=task_class, duration_s=3600)
     _record(tasks, "w10", model="second-worker.example.invalid", effort="second-effort.example.invalid",
             research_task_family="second-class.example.invalid", duration_s=3600)
-    _record(tasks, "known", research_task_family="code", duration_s=3600)
+    for i in range(10):
+        _record(tasks, f"known{i}", research_task_family="bounded", duration_s=3600)
+    _record(tasks, "cursor-auto", agent="cursor", model="auto")
+    _record(tasks, "agy-unreported", agent="agy", resolved_model="unrecognized", resolved_model_known=True)
     _review(tasks, "r1-review", "correct", [], pr=1, repo=repo, review_author_model=author,
             resolved_model=reviewer, effort=effort, review_risk=risk)
     _review(tasks, "r2-review", "incorrect", [], pr=2, repo="public", review_author_model="gpt-6.1-sol")
     rows.backfill(tasks, batch_state)
-    landing = stats.Landing(task_ids={"w0", "w10", "known"})
+    landing = stats.Landing(task_ids={"w0", "w10", "known0"})
     landing.by_repository.update({"public": 1, repo: 2, "second-repository.example.invalid": 3})
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
     ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=batch_state,
@@ -481,7 +484,9 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     payload = page.json()
     assert _row(payload, "other", "write")["tasks"] == 11
     assert [(e["effort"], e["tasks"]) for e in _row(payload, "other", "write")["by_effort"]] == [("other", 11)]
-    assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 1
+    assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 10
+    assert _row(payload, "auto", "write")["identity"] == "harness_choice"
+    assert _row(payload, "unrecognized", "write")["identity"] == "unreported"
     assert [(a["model"], a["prs"]) for a in payload["authors"]] == [("gpt-6.1-sol", 1), ("other", 1)]
     assert {(c["author"], c["reviewer"], c["class"]) for c in payload["first_round_matrix"]} == {
         ("other", "other", "all"), ("other", "other", "other"),
@@ -490,7 +495,7 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     assert [(r["model"], [level["effort"] for level in r["levels"]])
             for r in payload["review_levels"] if r["model"] == "other"] == [("other", ["other"])]
     assert [(job["class"], job["tasks"], job["models"][0]["model"]) for job in payload["charts"]["jobs"]] == [
-        ("other", 11, "other"),
+        ("other", 11, "other"), ("bounded", 10, "gpt-6.1-sol"),
     ]
     assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
 

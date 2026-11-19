@@ -1110,7 +1110,8 @@ ALL_CLASSES = "all"
 _KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
 _PAGE_CLASSES = frozenset({
     *TASK_FAMILIES, *MECHANICAL_FAMILIES, *UKRAINIAN_TASK_FAMILIES,
-    "code", "infra", "docs", "difficulty-gate", "bounded_implementation", "unclassified",
+    "code", "infra", "docs", "difficulty-gate", "bounded", "bounded_implementation",
+    "review", "code-review", "review-routing", "unclassified",
     *(f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES | {"ukrainian"} for risk in VALID_RISKS | {"unknown"}),
 })
 
@@ -1175,6 +1176,10 @@ def metric_effort(effort: str) -> str:
     return effort if effort in _KNOWN_EFFORTS or VARIANT_SUFFIX.fullmatch(effort) else OTHER
 
 
+def _page_model(model: str) -> str:
+    return model if model in _NOT_CONCRETE else metric_model(model)
+
+
 def _page_class(task_class: str) -> str:
     return task_class if task_class in _PAGE_CLASSES else OTHER
 
@@ -1225,7 +1230,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         landing = scan_landing(primary_root, first)
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
-    page_rows = [replace(row, model=metric_model(row.model), effort=metric_effort(row.effort),
+    page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
                          task_class=_page_class(row.task_class)) for row in rows]
     windows, metric_windows, page_windows = {}, {}, {}
     for name, days in WINDOWS.items():
@@ -1236,7 +1241,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                   "cohort": "finished_at, else started_at, in [since, until)"}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows)}
         # Bound the combined author id after deriving PR outcomes, so a joint author cannot become a known model.
-        page_prs = [{**pr, "author": metric_model(pr["author"]), "reviewer": metric_model(pr["reviewer"]),
+        page_prs = [{**pr, "author": _page_model(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
                      "class": _page_class(pr["class"])} for pr in prs]
         page_selected = [row for row in page_rows if since <= row.moment]
         page_windows[name] = {

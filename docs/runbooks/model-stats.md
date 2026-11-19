@@ -5,8 +5,9 @@ concrete model id, effective effort, role and task class, how much work a model 
 slow it is (#581). `view=full` (default) includes per-class breakdowns (`by_class`), token counts and token rates,
 and ISO-week buckets (`weeks`). `view=page` (used by `/model-stats`) omits those fields and keeps model and effort
 totals plus `charts` series. The page groups model, author, reviewer, effort and class labels before calculating
-the figures. It admits the metrics model and effort vocabularies, the defined work and review classes, and
-configured repository keys in landing coverage. It groups other labels under `other`. The Monitor's `/metrics`
+the figures. It admits the metrics model and effort vocabularies, the page's fixed model labels `auto` and
+`unrecognized`, the defined work and review classes, and configured repository keys in landing coverage.
+It groups other labels under `other`. The Monitor's `/metrics`
 exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
 and ISO weeks as gauges for Grafana. The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
 reports counts and model, effort, class, pool and repository labels, never prompts, bodies, paths, accounts or task
