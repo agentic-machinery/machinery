@@ -853,13 +853,18 @@ async def fleet_overview(
     resolved_ctx = resolve_context(ctx)
     roots = repr(resolved_ctx.roots)
     scope_name = f"swr-key-scope:fleet-overview:{roots}"
-    scope: str | None = resolved_ctx.runtime._derived.get(scope_name)
-    if scope is None:
-        scope = await asyncio.to_thread(
-            resolved_ctx.runtime.get_or_create_derived,
-            scope_name,
-            lambda: ctx_scoped_ttl_key(resolved_ctx, "swr", "fleet-overview", roots),
+    cached_scope = resolved_ctx.runtime._derived.get(scope_name)
+    scope: str = (
+        cached_scope
+        if isinstance(cached_scope, str)
+        else str(
+            await asyncio.to_thread(
+                resolved_ctx.runtime.get_or_create_derived,
+                scope_name,
+                lambda: ctx_scoped_ttl_key(resolved_ctx, "swr", "fleet-overview", roots),
+            )
         )
+    )
     value, age, stored = await cache_read_swr(
         _overview_cache_key(scope),
         FACADE_TTL_S,
@@ -868,6 +873,52 @@ async def fleet_overview(
     )
     response.headers.update(snapshot_headers(age, FACADE_TTL_S, unavailable=not stored))
     return value
+
+
+_SQLITE_OVERVIEW_BASE_TABLES = frozenset(
+    {"requests", "comms_messages", "formal_review_jobs", "authority_jobs", "acp_conversations"}
+)
+_SQLITE_OVERVIEW_AUTHORITY_TABLES = _SQLITE_OVERVIEW_BASE_TABLES | {"authority_dead_letters"}
+_SQLITE_OVERVIEW_LEGACY_TABLES = _SQLITE_OVERVIEW_BASE_TABLES | {"dead_letters"}
+
+_SQLITE_OVERVIEW_AUTHORITY_SQL = """
+SELECT
+    (SELECT json_group_array(json_array(state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM requests GROUP BY state ORDER BY state)),
+    (SELECT json_group_array(json_array(kind, cnt))
+     FROM (SELECT kind, COUNT(*) AS cnt FROM comms_messages GROUP BY kind ORDER BY kind)),
+    (SELECT json_group_array(json_array(state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM formal_review_jobs GROUP BY state ORDER BY state)),
+    (SELECT json_group_array(json_array(job_kind, state, cnt))
+     FROM (SELECT job_kind, state, COUNT(*) AS cnt FROM authority_jobs
+           GROUP BY job_kind, state ORDER BY state, job_kind)),
+    (SELECT json_array(
+        COUNT(*),
+        COALESCE(SUM(CASE WHEN created_at >= ? AND reason_code <> ? THEN 1 ELSE 0 END), 0)
+     ) FROM authority_dead_letters),
+    (SELECT COUNT(*) FROM acp_conversations),
+    (SELECT json_group_array(json_array(state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs
+           WHERE updated_at >= ? GROUP BY state ORDER BY state)),
+    (SELECT COUNT(*) FROM authority_jobs
+     WHERE state IN ('queued', 'running') AND deadline_at IS NOT NULL AND deadline_at < ?)
+"""
+
+_SQLITE_OVERVIEW_LEGACY_SQL = """
+SELECT
+    (SELECT json_group_array(json_array(state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM requests GROUP BY state ORDER BY state)),
+    (SELECT json_group_array(json_array(kind, cnt))
+     FROM (SELECT kind, COUNT(*) AS cnt FROM comms_messages GROUP BY kind ORDER BY kind)),
+    (SELECT json_group_array(json_array(state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM formal_review_jobs GROUP BY state ORDER BY state)),
+    (SELECT json_group_array(json_array(NULL, state, cnt))
+     FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs GROUP BY state ORDER BY state)),
+    (SELECT json_array(COUNT(*), 0) FROM dead_letters),
+    (SELECT COUNT(*) FROM acp_conversations),
+    NULL,
+    0
+"""
 
 
 def _populate_fleet_overview(
@@ -883,7 +934,9 @@ def _populate_fleet_overview(
             return result
         if is_sqlite_connection(connection):
             try:
-                return _populate_fleet_overview_sqlite(connection, result, status)
+                populated = _populate_fleet_overview_sqlite(connection, result, status)
+                if populated is not None:
+                    return populated
             except sqlite3.Error:
                 # Preserve exact per-table fallback behavior for partial/corrupt schemas.
                 pass
@@ -894,113 +947,38 @@ def _populate_fleet_overview_sqlite(
     connection: Any,
     result: dict[str, Any],
     status: dict[str, Any],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Collect SQLite overview counts in two single-row queries.
 
     Multi-row ``fetchall()`` loops release and re-acquire the GIL on every
     ``sqlite3_step`` (130+ rows on ``comms_messages`` alone), amplifying a
     ~25 ms scan into multi-second stalls under Monitor background load.
+    Returns ``None`` when any expected table is absent so the caller falls
+    back to the per-table helper path.
     """
-    observed_at = datetime.now(UTC)
-    since = (observed_at - timedelta(hours=AUTHORITY_HEALTH_WINDOW_HOURS)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
-    until = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
     raw_tables = connection.execute(
         "SELECT json_group_array(name) FROM sqlite_master WHERE type = 'table'"
     ).fetchone()[0]
     tables = set(json_depth.loads(raw_tables, max_depth=16)) if raw_tables else set()
 
     is_auth = status["mode"] == "authority"
-    dead_letter_table = "authority_dead_letters" if is_auth else "dead_letters"
+    required = _SQLITE_OVERVIEW_AUTHORITY_TABLES if is_auth else _SQLITE_OVERVIEW_LEGACY_TABLES
+    if not required.issubset(tables):
+        return None
 
-    columns: list[tuple[str, tuple[Any, ...]]] = [
-        (
-            "(SELECT json_group_array(json_array(state, cnt)) "
-            "FROM (SELECT state, COUNT(*) AS cnt FROM requests GROUP BY state ORDER BY state))"
-            if "requests" in tables
-            else "'[]'",
-            (),
-        ),
-        (
-            "(SELECT json_group_array(json_array(kind, cnt)) "
-            "FROM (SELECT kind, COUNT(*) AS cnt FROM comms_messages GROUP BY kind ORDER BY kind))"
-            if "comms_messages" in tables
-            else "'[]'",
-            (),
-        ),
-        (
-            "(SELECT json_group_array(json_array(state, cnt)) "
-            "FROM (SELECT state, COUNT(*) AS cnt FROM formal_review_jobs GROUP BY state ORDER BY state))"
-            if "formal_review_jobs" in tables
-            else "'[]'",
-            (),
-        ),
-    ]
-    if "authority_jobs" in tables:
-        if is_auth:
-            columns.append(
-                (
-                    "(SELECT json_group_array(json_array(job_kind, state, cnt)) "
-                    "FROM (SELECT job_kind, state, COUNT(*) AS cnt FROM authority_jobs "
-                    "GROUP BY job_kind, state ORDER BY state, job_kind))",
-                    (),
-                )
-            )
-        else:
-            columns.append(
-                (
-                    "(SELECT json_group_array(json_array(NULL, state, cnt)) "
-                    "FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs GROUP BY state ORDER BY state))",
-                    (),
-                )
-            )
-    else:
-        columns.append(("'[]'", ()))
-
-    if dead_letter_table in tables:
-        if is_auth:
-            columns.append(
-                (
-                    "(SELECT json_array(COUNT(*), COALESCE(SUM(CASE WHEN created_at >= ? "
-                    "AND reason_code <> ? THEN 1 ELSE 0 END), 0)) FROM authority_dead_letters)",
-                    (since, "expired_by_cleanup"),
-                )
-            )
-        else:
-            columns.append((f"(SELECT json_array(COUNT(*), 0) FROM {dead_letter_table})", ()))
-    else:
-        columns.append(("'[0, 0]'", ()))
-
-    columns.append(
-        (
-            "(SELECT COUNT(*) FROM acp_conversations)" if "acp_conversations" in tables else "0",
-            (),
-        )
+    observed_at = datetime.now(UTC)
+    since = (observed_at - timedelta(hours=AUTHORITY_HEALTH_WINDOW_HOURS)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
     )
-    if is_auth and "authority_jobs" in tables:
-        columns.append(
-            (
-                "(SELECT json_group_array(json_array(state, cnt)) "
-                "FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs "
-                "WHERE updated_at >= ? GROUP BY state ORDER BY state))",
-                (since,),
-            )
-        )
-        columns.append(
-            (
-                "(SELECT COUNT(*) FROM authority_jobs WHERE state IN ('queued', 'running') "
-                "AND deadline_at IS NOT NULL AND deadline_at < ?)",
-                (until,),
-            )
-        )
-    else:
-        columns.append(("NULL", ()))
-        columns.append(("0", ()))
-
-    sql = "SELECT " + ", ".join(expr for expr, _ in columns)
-    params = [param for _, expr_params in columns for param in expr_params]
-    row = connection.execute(sql, params).fetchone()
+    until = observed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = (
+        connection.execute(
+            _SQLITE_OVERVIEW_AUTHORITY_SQL,
+            (since, "expired_by_cleanup", since, until),
+        ).fetchone()
+        if is_auth
+        else connection.execute(_SQLITE_OVERVIEW_LEGACY_SQL).fetchone()
+    )
 
     counts = {key: dict(value) for key, value in result["counts"].items()}
     legacy_request_states = _json_pairs_to_counts(row[0])
@@ -1054,23 +1032,12 @@ def _populate_fleet_overview_sqlite(
             "since": since,
             "until": until,
         }
-        if "authority_jobs" not in tables:
-            result["authority_health"] = {
-                "state": "unavailable",
-                "ok": False,
-                "availability": "schema_read_failed",
-                "window": window,
-                "jobs": {"total": 0, "by_state": {}},
-                "overdue_nonterminal": 0,
-                "dead_letters": 0,
-            }
-        else:
-            result["authority_health"] = _format_authority_health(
-                _json_pairs_to_counts(row[6]),
-                int(row[7] or 0),
-                int(dl_pair[1]),
-                window,
-            )
+        result["authority_health"] = _format_authority_health(
+            _json_pairs_to_counts(row[6]),
+            int(row[7] or 0),
+            int(dl_pair[1]),
+            window,
+        )
     else:
         result["authority_health"] = None
     return result

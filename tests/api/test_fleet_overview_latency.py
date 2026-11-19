@@ -142,6 +142,7 @@ def test_sqlite_single_row_overview_matches_granular_queries(
     with fleet_router._read_connection(ctx, pg_supported=True, plane_root=plane) as (conn, avail):
         assert conn is not None and avail == "available"
         fast = fleet_router._populate_fleet_overview_sqlite(conn, _overview_skeleton(status), status)
+        assert fast is not None
         granular = fleet_router._populate_fleet_overview_queries(conn, _overview_skeleton(status), status)
 
     if mode == "authority":
