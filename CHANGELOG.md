@@ -9,6 +9,19 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.39"></a>
+## [0.1.39] - 2026-11-19
+
+### Added
+
+- Move live Gemini seats to Neon and Hydrogen ([#854](https://github.com/learn-ukrainian/machinery/pull/854))
+
+### Changed
+
+- Align model-stats runbook and route contracts with #849 ([#855](https://github.com/learn-ukrainian/machinery/pull/855))
+- Reset detached orient state between cases ([#857](https://github.com/learn-ukrainian/machinery/pull/857))
+- One stored value per orient section, served at once and published by compare-and-set ([#858](https://github.com/learn-ukrainian/machinery/pull/858))
+
 <a id="v0.1.38"></a>
 ## [0.1.38] - 2026-11-19
 
@@ -1004,7 +1017,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...HEAD
+[0.1.39]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...v0.1.39
 [0.1.38]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...v0.1.38
 [0.1.37]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...v0.1.37
 [0.1.36]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...v0.1.36
