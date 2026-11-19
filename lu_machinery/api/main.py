@@ -405,16 +405,6 @@ LEAN_ORIENT_SECTIONS: tuple[str, ...] = (
     "session_hints",
 )
 
-# Orient sync collectors use a dedicated executor instead of the loop's
-# shared default pool. This isolates cheap orient reads from unrelated
-# ``asyncio.to_thread()`` backlog elsewhere in the process, which was
-# causing false ``section_timeout_0.1s`` fallbacks for ``runtime`` under
-# the hard-timeout test path on loaded CI runners.
-_ORIENT_SYNC_EXECUTOR = ThreadPoolExecutor(
-    max_workers=8,
-    thread_name_prefix="orient-sync",
-)
-
 # Lean ``capacity``, ``health``, ``delegate``, ``rollovers`` and the full
 # orient's ``issues`` are cache-first and detached: CodexBar, integrity
 # canaries, GitHub, and hung delegate/rollover collectors must not pin
@@ -432,9 +422,11 @@ _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
 # value, generated_at, and when it was stored (only a zero-TTL section ages out).
-# value, generated_at, when it was stored (only a zero-TTL value ages out), and
-# the publish event (``_orient_epoch``) that stored it.
-_detached_orient_last_good: dict[str, tuple[Any, str, float, int]] = {}
+# value, generated_at, when it was stored (only a zero-TTL value ages out), the
+# publish event (``_orient_epoch``) that stored it, and the worker that published it.
+_detached_orient_last_good: dict[str, tuple[Any, str, float, int, threading.Thread]] = {}
+# The epoch each section's latest worker started under.
+_detached_orient_thread_epoch: dict[str, int] = {}
 _detached_orient_last_error: dict[str, str] = {}
 # A zero-TTL section keeps no orient-layer cache; its last value is only a short
 # fallback while its own refresh runs, never another freshness window (#1309 B2).
@@ -853,6 +845,7 @@ def reset_detached_orient_state_for_tests() -> None:
     _detached_orient_last_error.clear()
     _detached_orient_pending.clear()
     _orient_epoch.clear()
+    _detached_orient_thread_epoch.clear()
     _orient_demand.clear()
     _integrity_verdicts.clear()
 
@@ -865,15 +858,6 @@ def _invalidate_orient_cache(cache_keys: Iterable[str]) -> None:
         cache_invalidate("orient_")
 
 
-def _publish_orient_section(cache_key: str, value: Any, generated_at: str, ttl: float) -> None:
-    """Store a collection as the section's current value. The caller holds ``_detached_orient_lock``."""
-    published = _orient_epoch[cache_key] = next(_orient_events)
-    if ttl > 0:
-        cache_set(cache_key, (value, generated_at))
-    _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock(), published)
-    _detached_orient_last_error.pop(cache_key, None)
-
-
 def _schedule_detached_orient_refresh(
     key: str,
     collector: Callable[[], Any],
@@ -881,21 +865,22 @@ def _schedule_detached_orient_refresh(
     *,
     ttl: float | None = None,
     collect_slot: bool = True,
-) -> int | None:
-    """Start a single-flight worker for ``key``.
+) -> tuple[threading.Thread | None, int, bool]:
+    """Start or join the section's single collection for its current epoch.
 
-    Returns the section's epoch the worker started under, or None when a worker
-    was already running.
-
-    ``collect_slot`` False keeps the worker off the shared collect slots: a hung
-    inline-section refresh must not stop every other section from refreshing.
+    Returns ``(worker, epoch, started)``. ``worker`` is None while a collection
+    from before the latest fresh read of its app still runs: that one publishes
+    nothing, and the next call after it ends starts a current one.
+    ``collect_slot`` False keeps the worker off the shared collect slots, so a
+    hung collection of a formerly inline section never stops the others.
     """
     with _detached_orient_lock:
         state_key = cache_key or f"orient_{key}"
+        epoch = _orient_epoch.get(state_key, 0)
         thread = _detached_orient_threads.get(state_key)
         if thread is not None and thread.is_alive():
-            return None
-        epoch = _orient_epoch.get(state_key, 0)
+            current = _detached_orient_thread_epoch.get(state_key) == epoch
+            return (thread if current else None), epoch, False
         worker = threading.Thread(
             target=_run_detached_orient_refresh,
             args=(key, collector, state_key, ttl, epoch, collect_slot),
@@ -903,9 +888,10 @@ def _schedule_detached_orient_refresh(
             name=f"orient-{key}-refresh",
         )
         _detached_orient_threads[state_key] = worker
+        _detached_orient_thread_epoch[state_key] = epoch
         _detached_orient_pending.add(state_key)
         worker.start()
-        return epoch
+        return worker, epoch, True
 
 
 def _run_detached_orient_refresh(
@@ -916,6 +902,7 @@ def _run_detached_orient_refresh(
     epoch: int,
     collect_slot: bool = True,
 ) -> None:
+    """Collect once; publish only if no event happened for the section since ``epoch``."""
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     try:
         with _DETACHED_ORIENT_COLLECT_SLOTS if collect_slot else nullcontext():
@@ -923,12 +910,19 @@ def _run_detached_orient_refresh(
         generated_at = _isoformat_z(datetime.now(UTC))
         with _detached_orient_lock:
             if _orient_epoch.get(cache_key, 0) == epoch:
-                _publish_orient_section(cache_key, value, generated_at, ttl)
+                published = _orient_epoch[cache_key] = next(_orient_events)
+                if ttl > 0:
+                    cache_set(cache_key, (value, generated_at))
+                _detached_orient_last_good[cache_key] = (
+                    value, generated_at, _orient_clock(), published, threading.current_thread(),
+                )
+                _detached_orient_last_error.pop(cache_key, None)
             _detached_orient_pending.discard(cache_key)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
+        # A collector that cancels itself is a failed collection, not a cancelled request.
         with _detached_orient_lock:
             if _orient_epoch.get(cache_key, 0) == epoch:
-                _detached_orient_last_error[cache_key] = str(exc)
+                _detached_orient_last_error[cache_key] = str(exc) or type(exc).__name__
             _detached_orient_pending.discard(cache_key)
     finally:
         with _detached_orient_lock:
@@ -942,9 +936,8 @@ async def _await_thread(thread: threading.Thread, timeout: float) -> None:
     """Wait up to ``timeout`` for ``thread`` without holding a pool thread.
 
     A full orient waits on up to a dozen detached sections at once. Joining each
-    on ``_ORIENT_SYNC_EXECUTOR`` filled its eight workers with waiters, so the
-    section collectors that run there (git, runtime) queued behind a second wave
-    of waits and a cold read took twice the wait.
+    on a pool thread filled the pool with waiters, so a cold read took twice
+    the wait.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -952,17 +945,41 @@ async def _await_thread(thread: threading.Thread, timeout: float) -> None:
         await asyncio.sleep(min(_THREAD_WAIT_POLL_S, remaining))
 
 
-def _serves_last_good_at_once(cache_key: str, ttl: float) -> bool:
-    """True when an expired section has a last value to serve while it refreshes.
+async def _join_current_orient_refresh(
+    key: str, compute: Callable[[], Any], cache_key: str, ttl: float, collect_slot: bool, wait_s: float,
+) -> tuple[threading.Thread | None, int | None]:
+    """Wait up to ``wait_s`` for a collection that may publish; return the one this read started.
 
-    That read gets the last value at once, labelled ``stale`` and
-    ``refreshing`` with its own ``generated_at``, instead of waiting out the
-    join for a collector that usually outlasts it. This holds however old the
-    value is: the host's orient readers come minutes apart, after every section
-    has expired, and the join returned an empty fallback for every slow
-    section on every such read. A zero TTL never takes this shortcut.
+    A superseded collection still running is waited out first, then a current
+    one is started, all within the same budget.
     """
-    return ttl > 0 and cache_key in _detached_orient_last_good
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait_s
+    mine: threading.Thread | None = None
+    mine_epoch: int | None = None
+    while True:
+        worker, epoch, started = _schedule_detached_orient_refresh(
+            key, compute, cache_key, ttl=ttl, collect_slot=collect_slot,
+        )
+        if started:
+            mine, mine_epoch = worker, epoch
+        waiting_on = worker or _detached_orient_threads.get(cache_key)
+        if waiting_on is not None:
+            await _await_thread(waiting_on, max(0.0, deadline - loop.time()))
+        if worker is not None or deadline - loop.time() <= 0:
+            return mine, mine_epoch
+
+
+def _orient_section_snapshot(cache_key: str, ttl: float) -> tuple[Any, Any, str | None, bool, int]:
+    """The cached value, last value, last error, pending refresh and epoch, under the publish lock."""
+    with _detached_orient_lock:
+        return (
+            cache_get(cache_key, ttl=ttl) if ttl > 0 else None,
+            _detached_orient_last_good.get(cache_key),
+            _detached_orient_last_error.get(cache_key),
+            cache_key in _detached_orient_pending,
+            _orient_epoch.get(cache_key, 0),
+        )
 
 
 async def _cached_detached_orient_section(
@@ -976,93 +993,61 @@ async def _cached_detached_orient_section(
     is_async: bool = False,
     fresh: bool = False,
     collect_slot: bool = True,
+    wait_s: float | None = None,
 ) -> tuple[Any, dict]:
-    """Cache-first section: never let a hung collector pin the gather.
+    """Serve one orient section; one worker per section is its only writer.
 
-    On a miss, one detached worker runs the collector. This request waits
-    up to ``DETACHED_ORIENT_INLINE_WAIT_S`` only if *this* call started
-    that worker (so cheap test doubles still populate the same response),
-    except a section that has a last value (``_serves_last_good_at_once``),
-    which serves last-good at once. A ``fresh`` request never takes that
-    shortcut, and it too waits only for a worker it started: a worker started
-    before its invalidation may hold older data, which must not read as current.
-    Overlapping requests and live hangs return last-good or fallback with
-    honest ``meta.error``.
+    A value within its TTL is a cache hit. An expired positive-TTL section with
+    a last value answers at once with that value, labelled ``stale`` with its own
+    ``generated_at``, and starts its refresh. Otherwise (no last value yet, a
+    zero TTL, or ``fresh``) the read waits up to ``wait_s`` for a collection that
+    may publish. A zero-TTL value is current only when the worker this read
+    started published it and nothing happened since. A hung collector never
+    pins the gather; the read then gets last-good or the fallback with an honest
+    ``meta.error``.
     """
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
+    wait_s = DETACHED_ORIENT_INLINE_WAIT_S if wait_s is None else wait_s
 
     def compute() -> Any:
         return asyncio.run(collector(ctx)) if is_async else collector(ctx)
 
     cache_key = f"orient_{key}{_ctx_cache_scope(ctx)}"
-    if ttl > 0:
-        cached = cache_get(cache_key, ttl=ttl)
-        if cached is not None:
-            value, generated_at = cached  # type: ignore[misc]
-            return value, {
-                "generated_at": generated_at,
-                "stale_after_s": ttl,
-                "source": source,
-                "cache": "hit",
-            }
+    meta: dict[str, Any] = {"stale_after_s": ttl, "source": source, "cache": "miss"}
+    # Taken before the refresh starts: an expired read answers with what it found.
+    cached, last_good, last_error, refreshing, epoch_now = _orient_section_snapshot(cache_key, ttl)
+    if cached is not None and not fresh:
+        value, generated_at = cached
+        return value, {**meta, "generated_at": generated_at, "cache": "hit"}
 
-    epoch = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl, collect_slot=collect_slot)
-    started = epoch is not None
-    thread = _detached_orient_threads.get(cache_key)
-    if started and thread is not None and thread.is_alive() and (fresh or not _serves_last_good_at_once(cache_key, ttl)):
-        await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
-
-    # One snapshot under the lock the worker publishes under: the value, its
-    # error and whether a refresh is still pending always describe the same
-    # moment, so an expired value is never labelled current nor a new one stale.
-    with _detached_orient_lock:
-        cached = cache_get(cache_key, ttl=ttl) if ttl > 0 else None
-        last_good = _detached_orient_last_good.get(cache_key)
-        last_error = _detached_orient_last_error.get(cache_key)
+    mine: threading.Thread | None = None
+    mine_epoch: int | None = None
+    if not fresh and ttl > 0 and last_good is not None:
+        _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl, collect_slot=collect_slot)
         refreshing = cache_key in _detached_orient_pending
-        epoch_now = _orient_epoch.get(cache_key, 0)
-
-    if cached is not None:
-        value, generated_at = cached  # type: ignore[misc]
-        return value, {
-            "generated_at": generated_at,
-            "stale_after_s": ttl,
-            "source": source,
-            "cache": "miss",
-        }
+    else:
+        mine, mine_epoch = await _join_current_orient_refresh(key, compute, cache_key, ttl, collect_slot, wait_s)
+        cached, last_good, last_error, refreshing, epoch_now = _orient_section_snapshot(cache_key, ttl)
+        if cached is not None:
+            value, generated_at = cached
+            return value, {**meta, "generated_at": generated_at}
 
     # Product sections may use their own TTL (including zero). Last-good is a
     # stale fallback, never another freshness window: it keeps its own
-    # ``generated_at``. With a positive TTL a current value is in the cache, so
-    # a last-good value read here is always stale. A zero-TTL value is current
-    # only when the refresh this read started published it and nothing (another
-    # publish, or a fresh read) has happened since.
+    # ``generated_at``, and a zero-TTL one ages out.
     if last_good is not None and (ttl > 0 or _orient_clock() - last_good[2] < _ZERO_TTL_LAST_GOOD_MAX_AGE_S):
-        value, generated_at, _stored_at, published = last_good
-        current = ttl <= 0 and started and published == epoch_now and epoch_now != epoch
-        meta: dict[str, Any] = {
-            "generated_at": generated_at,
-            "stale_after_s": ttl,
-            "source": source,
-            "cache": "miss",
-            "stale": not current,
-            "refreshing": refreshing,
-        }
+        value, generated_at, _stored_at, published, publisher = last_good
+        current = ttl <= 0 and mine is not None and publisher is mine and published == epoch_now
+        meta.update(generated_at=generated_at, stale=not current, refreshing=refreshing)
         if last_error is not None:
             meta["error"] = last_error
         return value, meta
 
-    # A refresh this read started that a fresh read superseded stored nothing.
-    short_err = last_error or ("refresh_superseded" if started and epoch_now != epoch else "refreshing")
-    meta = {
-        "generated_at": _isoformat_z(datetime.now(UTC)),
-        "stale_after_s": ttl,
-        "source": source,
-        "cache": "miss",
-        "refreshing": refreshing,
-        "error": short_err,
-    }
+    # A collection this read started that a fresh read superseded stored nothing.
+    superseded = mine_epoch is not None and epoch_now != mine_epoch
+    short_err = "refresh_superseded" if superseded else (last_error or "refreshing")
+    meta.update(generated_at=_isoformat_z(datetime.now(UTC)), refreshing=refreshing, error=short_err)
     if isinstance(fallback, dict):
         return {**fallback, "error": short_err}, meta
     return fallback, meta
@@ -1509,94 +1494,29 @@ async def _cached_orient_section(
     background: bool = False,
     fresh: bool = False,
 ) -> tuple[Any, dict]:
-    """Run one orient collector with TTL cache + hard timeout + fallback.
+    """Run one orient collector through the section cache (``_cached_detached_orient_section``).
 
     Returns (value, meta). Meta always includes ``generated_at``,
     ``stale_after_s``, ``source``, and ``cache`` ("hit" / "miss"); it
     adds ``error`` on failure so callers can tell a populated section
-    from a degraded one.
+    from a degraded one. Errors are not cached; the next read retries.
 
-    Errors are NOT cached — the next call retries. This is intentional:
-    a transient git/gh hiccup shouldn't poison a 2-minute TTL window.
+    Detached sections (``DETACHED_ORIENT_SECTION_KEYS`` and product sections)
+    wait at most ``DETACHED_ORIENT_INLINE_WAIT_S`` and share the collect slots.
+    The others (git, runtime, session_hints) wait up to
+    ``ORIENT_SECTION_HARD_TIMEOUT_S`` for their first or ``fresh`` value, as
+    their inline collection did, and keep off the slots.
 
     ``ttl`` and ``source`` come from a product section; a machinery section
     takes them from ``ORIENT_SECTION_TTLS`` and ``ORIENT_SECTION_SOURCES``.
     """
     if key == "idle_prs":
         return _cached_idle_pr_section(collector, fallback, ctx=ctx)  # type: ignore[arg-type]
-    ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
-    source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
-    cache_key = f"orient_{key}{_ctx_cache_scope(ctx)}"
-    # An inline section that already has a value is served like a detached
-    # one: its last value at once while one worker refreshes it. Only its first
-    # read, and a ``fresh`` read, collect on the request path.
     detached = background or key in DETACHED_ORIENT_SECTION_KEYS
-    if detached or (not fresh and _serves_last_good_at_once(cache_key, ttl)):
-        return await _cached_detached_orient_section(
-            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
-            collect_slot=detached,
-        )  # type: ignore[arg-type]
-
-    # ttl == 0 means "don't cache at the orient layer". Skip both the
-    # cache read AND the cache write paths so callers never see stale
-    # data and no zombie entries linger in the dict. A ``fresh`` read always
-    # collects.
-    if ttl > 0 and not fresh:
-        cached = cache_get(cache_key, ttl=ttl)
-        if cached is not None:
-            value, generated_at = cached  # type: ignore[misc]
-            return value, {
-                "generated_at": generated_at,
-                "stale_after_s": ttl,
-                "source": source,
-                "cache": "hit",
-            }
-
-    epoch = _orient_epoch.get(cache_key, 0)
-    generated_at = _isoformat_z(datetime.now(UTC))
-    meta: dict[str, Any] = {
-        "generated_at": generated_at,
-        "stale_after_s": ttl,
-        "source": source,
-        "cache": "miss",
-    }
-
-    try:
-        if is_async:
-            value = await asyncio.wait_for(
-                collector(ctx),  # type: ignore[misc]
-                timeout=ORIENT_SECTION_HARD_TIMEOUT_S,
-            )
-        else:
-            loop = asyncio.get_running_loop()
-            value = await asyncio.wait_for(
-                loop.run_in_executor(
-                    _ORIENT_SYNC_EXECUTOR,
-                    functools.partial(collector, ctx),  # type: ignore[arg-type]
-                ),
-                timeout=ORIENT_SECTION_HARD_TIMEOUT_S,
-            )
-    except TimeoutError:
-        # Short, machine-readable code in the value; richer detail in meta.
-        short_err = f"section_timeout_{ORIENT_SECTION_HARD_TIMEOUT_S}s"
-        meta["error"] = short_err
-        if isinstance(fallback, dict):
-            return {**fallback, "error": short_err}, meta
-        return fallback, meta
-    except Exception as exc:
-        # Preserve original API contract: value error = str(exc). Meta
-        # gets the richer "TypeName: msg" form for debugging.
-        short_err = str(exc)
-        meta["error"] = f"{type(exc).__name__}: {exc}"
-        if isinstance(fallback, dict):
-            return {**fallback, "error": short_err}, meta
-        return fallback, meta
-
-    if ttl > 0:
-        with _detached_orient_lock:
-            if _orient_epoch.get(cache_key, 0) == epoch:
-                _publish_orient_section(cache_key, value, generated_at, ttl)
-    return value, meta
+    return await _cached_detached_orient_section(
+        key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
+        collect_slot=detached, wait_s=DETACHED_ORIENT_INLINE_WAIT_S if detached else ORIENT_SECTION_HARD_TIMEOUT_S,
+    )  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)

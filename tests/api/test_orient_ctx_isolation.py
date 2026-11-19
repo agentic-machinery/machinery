@@ -188,7 +188,7 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
     """Defect class: a reader minutes apart paid an inline collection (or a join) on every read.
 
     An inline section with a last value is served at once, labelled stale, while
-    one worker refreshes it; ``fresh=true`` still collects it on the request path.
+    one worker refreshes it; ``fresh=true`` still waits for a new collection.
     """
     from lu_machinery.api import state_helpers as cache
 
@@ -197,6 +197,7 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
     monkeypatch.setattr(api_main, "_orient_clock", lambda: now[0])
     # A request that joined the refresh would outlive the blocked collector.
     monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 30.0)
+    monkeypatch.setattr(api_main, "ORIENT_SECTION_HARD_TIMEOUT_S", 30.0)
     entered, release = threading.Event(), threading.Event()
     calls: list[str] = []
 
@@ -232,7 +233,7 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
         fresh = client.get("/api/orient?sections=session_hints&fresh=true").json()
         assert fresh["session_hints"] == {"revision": 3}
         assert "stale" not in fresh["meta"]["session_hints"]
-        assert calls[2].startswith("orient-sync")
+        assert len(calls) == 3
     finally:
         release.set()
         thread = api_main._detached_orient_threads.get(key)
