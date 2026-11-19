@@ -57,7 +57,10 @@ SAVANT_DEFAULT_EFFORT = "high"
 _SAVANT_OPENCODE_VERSION = "1.19.6"
 # Public classes give Savant OpenCode's read-only file tools on the write boundary's snapshot of the published
 # start commit; private classes keep every tool disabled and the prompt as the only input (designated approval,
-# conditions C1-C4). The snapshot cap and the run's upstream byte ceiling bound what reaches SubQ.
+# conditions C1-C4). The snapshot cap and the run's upstream byte ceiling bound what reaches SubQ. A public write
+# run (#898) also gets the ``edit`` permission on its own copy of that view; the boundary turns its edits into a
+# patch once it exits. OpenCode 1.19.6 offers this model its edit and write tools, which change and add files;
+# none of its tools deletes or renames one (docs/runbooks/savant.md).
 _SAVANT_TOOL_CLASSES = frozenset({"public-code", "public-docs"})
 # OpenCode 1.19.6 has no ``list`` tool: ``read`` lists a directory under the ``read`` permission.
 _SAVANT_READ_TOOLS = ("read", "grep", "glob")
@@ -228,14 +231,20 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     tools = savant_tools(spec.options.get("data_class"))
     if not tools and savant_read_paths(spec.options):
         raise ValueError("savant_read_path_refused: --read-path needs a public data class; private runs read no files")
+    write = spec.mode == "workspace-write"
+    if write and not tools:
+        raise ValueError("savant_write_refused: a write run needs --data-class public-code or public-docs")
     config = {
         "model": route,
         "small_model": route,
         "enabled_providers": [SAVANT_PROVIDER],
         "autoupdate": False,
         "share": "disabled",
-        "permission": {"*": "deny", **({"external_directory": "deny", **dict.fromkeys(_SAVANT_READ_TOOLS, "allow")}
-                                       if tools else {})},
+        # No formatter rewrites an edit and no language server starts or downloads: the draft is the model's edits.
+        "formatter": False,
+        "lsp": False,
+        "permission": {"*": "deny", **({"external_directory": "deny", **dict.fromkeys(_SAVANT_READ_TOOLS, "allow"),
+                                        **({"edit": "allow"} if write else {})} if tools else {})},
         "provider": {SAVANT_PROVIDER: {
             "name": "SubQ",
             "npm": "@ai-sdk/openai-compatible",

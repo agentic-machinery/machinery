@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -262,7 +263,7 @@ def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
     assert "holds no review, critique or approval role" in capsys.readouterr().err
     dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--mode", "workspace-write", expected=2,
              refusal="route_eligibility")
-    assert "does not run in mode 'workspace-write'" in capsys.readouterr().err
+    assert "savant_role_refused: a write run needs --research-role implementation" in capsys.readouterr().err
     dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--effort", "medium", expected=2,
              refusal="route_eligibility")
     assert "does not offer effort 'medium'" in capsys.readouterr().err
@@ -378,8 +379,131 @@ def test_savant_launch_builds_the_snapshot_and_ceiling_only_for_public_classes(t
                                       tmp_path / "task.json")
     private = private[:private.index("--")]
     assert "--upload-ceiling" in private and "--snapshot-bytes" not in private and "--read-path" not in private
-    # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process).
-    assert "--no-github-relays" in public and "--no-github-relays" in private
+    # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process) or a Sources relay (#898).
+    assert all(flag in argv for flag in ("--no-github-relays", "--no-sources-relay") for argv in (public, private))
     # A malformed record's paths are refused, never read as the whole tree.
     with pytest.raises(ValueError, match="savant_read_path_refused"):
         opencode.savant_read_paths({"read_paths": "{}"})
+
+
+WRITE_FLAGS = (*SAVANT_FLAGS[:-1], "implementation", "--mode", "workspace-write")
+
+
+def test_savant_write_run_is_admitted_only_public_implementation_with_owned_paths(spec, dispatch, monkeypatch,
+                                                                                  tmp_path, capsys):
+    """Defect class (#898): a Savant write run starts for a private repository or class, another role, without
+    owned paths, or with tools beyond editing its own view; or a read-only run takes the implementation role."""
+    key_file = tmp_path / "test.key"
+    key_file.write_text("fixture-key\n", encoding="ascii")
+    key_file.chmod(0o600)
+    monkeypatch.setenv("LU_SUBQ_API_KEY_FILE", str(key_file))
+    monkeypatch.setattr(opencode, "_savant_runtime_refusal", lambda env: None)
+    # The fixture checkout stands in for the registered public repository's canonical origin.
+    monkeypatch.setattr(git, "verification_origin", lambda path: "https://github.com/example/public.git")
+    monkeypatch.setattr(git, "canonical_origins", lambda info: {"https://github.com/example/public.git"})
+    for flags, reason in (
+        (("--research-role", "test", "--data-class", "public-code", "--owned-path", "docs"),
+         "a write run needs --research-role implementation"),
+        (("--data-class", "private-code", "--repo", "infra-private", "--owned-path", "docs"),
+         "savant_write_refused: a write run needs --data-class public-code or public-docs"),
+        (("--data-class", "public-code", "--repo", "infra-private", "--owned-path", "docs"),
+         "savant_repository_refused: private repositories require a private data class"),
+        (("--data-class", "public-code"), "savant_write_refused: a write run needs --owned-path"),
+    ):
+        dispatch(*WRITE_FLAGS, *flags, expected=2, refusal="route_eligibility", task_id="oc-write-refused")
+        assert reason in capsys.readouterr().err
+    dispatch(*SAVANT_FLAGS[:-1], "implementation", "--data-class", "public-code", expected=2,
+             refusal="route_eligibility", task_id="oc-read-implementation")
+    assert "use --research-role advisory or test" in capsys.readouterr().err
+    record = dispatch(*WRITE_FLAGS, "--data-class", "public-code", "--owned-path", "docs", "--read-path", "docs",
+                      task_id="oc-write")
+    assert (record["mode"], record["owned_paths"], record["options"]["research_role"]) == (
+        "workspace-write", ["docs"], "implementation")
+    trial = replace(spec, task_id="oc-write", mode="workspace-write", provider=record["provider"],
+                    model=record["model"], effort=record["effort"], options=record["options"])
+    invocation = runtime_context.build(trial, {})
+    config = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])
+    # Editing its own copy of the view is the only tool beyond the read-only ones; no shell, task or web tool.
+    assert config["permission"] == {"*": "deny", "external_directory": "deny", "read": "allow", "grep": "allow",
+                                    "glob": "allow", "edit": "allow"}
+    # No formatter rewrites the model's edits and no language server starts inside.
+    assert config["formatter"] is False and config["lsp"] is False
+    assert invocation.argv[invocation.argv.index("--dir") + 1] == write_boundary.SNAPSHOT_INSIDE
+    # It always runs inside the boundary, with the patch target and the record's owned paths, and no relay.
+    assert worker._in_boundary(trial) and not worker._in_boundary(replace(trial, provider="deepseek"))
+    monkeypatch.setattr(write_boundary.shutil, "which", lambda *args, **kwargs: os.devnull)
+    task_file = store.record_path("oc-write")
+    with pytest.raises(ValueError, match="needs its patch descriptor"):
+        write_boundary.launcher(trial, invocation, task_file)
+    argv = write_boundary.launcher(trial, invocation, task_file, draft_fd=7)
+    argv = argv[:argv.index("--")]
+    assert argv[argv.index("--mode") + 1] == "workspace-write"
+    # The launcher only stages the patch; settlement keeps it as <task>.patch for a done run.
+    assert argv[argv.index("--draft-patch-fd") + 1] == "7"
+    assert argv[argv.index("--owned-path") + 1] == "docs" and argv[argv.index("--read-path") + 1] == "docs"
+    assert "--no-github-relays" in argv and "--no-sources-relay" in argv and "--snapshot-bytes" in argv
+    assert "--sources-mcp" not in argv
+    store.replace({**record, "owned_paths": []})
+    with pytest.raises(ValueError, match="a Savant write run needs owned paths"):
+        write_boundary.launcher(trial, invocation, task_file, draft_fd=7)
+    with pytest.raises(ValueError, match="savant_write_refused"):
+        opencode.build(replace(trial, options={**trial.options, "data_class": "private-code"}), {})
+
+
+@pytest.mark.parametrize(("change", "status", "cause"), [
+    ({}, "done", None),
+    ({"paths": ["docs/a.md", "src/b.py"]}, "no_deliverable", "outside_owned_paths: src/b.py"),
+    ({"paths": []}, "no_deliverable", "savant_draft_unowned_or_empty"),
+    ({"dirty": True}, "no_deliverable", "savant_draft_worktree_changed_or_unknown"),
+    ({"commits": 1}, "no_deliverable", "savant_draft_worktree_changed_or_unknown"),
+    ({"provider": "deepseek"}, "no_deliverable", "no_commits_or_unknown"),
+    # A malformed path list is refused whole, never read as its well-formed part (review of #919).
+    ({"paths": ["docs/a.md", 7]}, "no_deliverable", "savant_draft_unowned_or_empty"),
+    # A Savant write delivers only its draft: commits found elsewhere never make it done (review of #919).
+    ({"draft": "unchanged", "commits": 1}, "no_deliverable", "savant_draft_missing"),
+])
+def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause):
+    """Defect class (#898): settlement rejects a Savant write run's owned-path patch, accepts one with another
+    path or a changed worktree, or accepts a draft receipt on any other route."""
+    record = {
+        "task_id": "oc-write", "agent": "opencode", "provider": change.get("provider", "subq"),
+        "mode": "workspace-write", "status": "done", "owned_paths": ["docs"],
+        "commits_ahead": change.get("commits", 0), "worktree_dirty_on_exit": change.get("dirty", False),
+        "write_boundary": {"import": {"status": change.get("draft", "drafted"), "paths": change.get("paths", ["docs/a.md"])}},
+    }
+    worker._enforce_delivery(record)
+    assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
+
+
+@pytest.mark.parametrize(("case", "status", "cause"), [
+    ("kept", "done", None),
+    ("missing", "no_deliverable", "savant_draft_patch_missing_or_changed"),
+    ("changed", "no_deliverable", "savant_draft_patch_missing_or_changed"),
+    ("failed-run", "failed", None),
+])
+def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path):
+    """Defect class (#898, review of #919): a refused run names its patch, or a run settles done with its patch
+    missing or different from the one its receipt names."""
+    task_file = tmp_path / "oc-write.json"
+    patch = b"diff --git a/docs/a.md b/docs/a.md\n"
+    # The supervisor's unnamed file, as the launcher left it.
+    descriptor = None if case == "missing" else os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
+    if descriptor is not None:
+        os.write(descriptor, patch + (b"tampered\n" if case == "changed" else b""))
+    record = {
+        "task_id": "oc-write", "agent": "opencode", "provider": "subq", "mode": "workspace-write",
+        "status": "failed" if case == "failed-run" else "done",
+        "write_boundary": {"import": {"status": "drafted", "paths": ["docs/a.md"], "bytes": len(patch),
+                                      "patch_sha256": hashlib.sha256(patch).hexdigest()}},
+    }
+    try:
+        worker._settle_savant_patch(record, task_file, descriptor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    assert (record["status"], record.get("no_deliverable_reason")) == (status, cause)
+    kept = write_boundary.draft_patch(task_file)
+    assert kept.exists() == (status == "done") and sorted(path.name for path in tmp_path.iterdir()) == (
+        ["oc-write.patch"] if status == "done" else [])
+    if status == "done":
+        assert kept.read_bytes() == patch and record["write_boundary"]["import"]["patch"] == str(kept)
