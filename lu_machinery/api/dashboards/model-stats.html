@@ -44,6 +44,7 @@
   svg .grid { stroke: var(--line); stroke-width: 1; }
   .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
   .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+  td.sample { white-space: normal; word-break: break-word; max-width: 48rem; font: 12px/1.35 ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -97,7 +98,8 @@
   <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
     <div id="write">Loading…</div></section>
   <section><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
-    <div id="review">Loading…</div></section>
+    <div id="review">Loading…</div>
+    <div id="unparsed-samples"></div></section>
   <section><h2>Compare reviewer levels</h2>
     <label>Reviewer model <select id="level-model"></select></label>
     <div id="levels">Loading…</div></section>
@@ -150,13 +152,36 @@ function writeRow(r, kind) {
     + `${cell(pct(r.no_deliverable))}${cell(pct(r.not_done))}${cell(r.landed)}${cell(pct(r.landed_rate))}`
     + `${cell(hoursOf(r))}${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
 }
+const UNPARSED_REASONS = ["missing_result", "too_big", "bad_format", "bad_fields"];
+function reasonCell(count, sample) {
+  const title = sample !== undefined && sample !== null ? ` title="${esc(sample)}"` : "";
+  return `<td class="num"${title}>${num(count || 0)}</td>`;
+}
 function reviewRow(r, kind) {
-  const v = r.verdicts;
-  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(pct(r.not_done))}`
-    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(num(v.unparsed))}`
+  const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : (r.unparsed_samples || {});
+  const notDone = pct(r.not_done) + (u.not_done ? ` <span class="muted">(${num(u.not_done)})</span>` : "");
+  const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
+  return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(notDone)}`
+    + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(totalUnparsed)}`
+    + `${reasonCell(u.missing_result)}${reasonCell(u.too_big)}`
+    + `${reasonCell(u.bad_format, samples.bad_format)}${reasonCell(u.bad_fields, samples.bad_fields)}`
     + `${cell(pct(r.approve_rate) + ` (n=${r.approve_rate.n})`)}`
     + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review) + ` (n=${r.p0_p2_per_review.n})`)}`
     + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
+}
+function unparsedSamples(reviews) {
+  const items = [];
+  for (const m of (reviews || []).filter((r) => keepModel(r.model))) {
+    const u = m.unparsed_reasons || {}, samples = m.unparsed_samples || {};
+    for (const reason of UNPARSED_REASONS) {
+      if (samples[reason] !== undefined && samples[reason] !== null) {
+        items.push(`<tr><td><b>${esc(m.model)}</b></td><td>${esc(reason)}</td>${cell(num(u[reason] || 0))}<td class="sample">${esc(samples[reason])}</td></tr>`);
+      }
+    }
+  }
+  if (!items.length) return "";
+  return `<details style="margin-top:8px"><summary>First failing reply samples (${items.length} model/reason pairs, first 200 chars)</summary>`
+    + table(["Model", "Reason", "Count", "First failing reply (escaped)"], items) + "</details>";
 }
 function withClasses(models, role, render, width) {
   return grouped(models.filter((m) => m.role === role && (!picked() || m.model === picked() || role === "keep")), (m) =>
@@ -407,8 +432,10 @@ function render() {
   $("write").innerHTML = table(["Model / effort", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
     "Wall h per landed", "Median min", "p90 min"], withClasses(data.models, "write", writeRow, 10));
   $("reviews-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
-  $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approved / changes / blocked", "Missing verdict",
-    "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 10));
+  $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approved / changes / blocked", "Unparsed",
+    "Missing result", "Too big", "Bad format", "Bad fields",
+    "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 14));
+  $("unparsed-samples").innerHTML = unparsedSamples(reviews);
   $("author-meta").textContent = `${label}; n = ${(data.authors || []).reduce((s, a) => s + a.prs, 0)} PRs`;
   const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
   const authors = (data.authors || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
