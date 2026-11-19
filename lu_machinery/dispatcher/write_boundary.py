@@ -926,8 +926,10 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         if not parts or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
             raise Refused("savant_snapshot_refused: the tree names a path outside itself")
         # A name is screened like content: the run would see it, and a draft screens every name it exports.
+        # A write run's view also keeps to the draft's depth bound, so an unchanged deep file cannot refuse it.
         if (kind != b"blob" or mode not in (b"100644", b"100755") or not name.isprintable()
-                or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts) or _sensitive(raw, needles, accounts)):
+                or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts) or _sensitive(raw, needles, accounts)
+                or (manifest is not None and len(parts) > MAX_VIEW_DEPTH)):
             left_out += 1
             continue
         total += int(size_field)

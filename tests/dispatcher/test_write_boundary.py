@@ -899,7 +899,11 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     (repo / "gone.txt").write_text("remove me\n")
     # A tracked name the screen refuses never enters the view, so it cannot refuse an unrelated owned edit.
     (repo / "docs" / ("ghp_" + "A" * 36 + ".md")).write_text("public\n")
-    _git(repo, "add", "docs", "gone.txt")
+    # So does a tracked file nested deeper than the draft's bound (review round 3).
+    deep = repo.joinpath("deep", *["d"] * write_boundary.MAX_VIEW_DEPTH)
+    deep.mkdir(parents=True)
+    (deep / "f.txt").write_text("deep\n")
+    _git(repo, "add", "docs", "gone.txt", "deep")
     _git(repo, "commit", "-qm", "fixture")
     _git(worktree, "merge", "-q", "--ff-only", "main")
     tip = _git(repo, "rev-parse", "HEAD")
