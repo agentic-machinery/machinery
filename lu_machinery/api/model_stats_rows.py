@@ -9,7 +9,8 @@ window back to the first record.
 Writers: the dispatcher appends a row each time it writes a settled record (``record_settled``; the last row
 of a task id wins, so the final update decides), and ``backfill`` adds a row for every settled record that has
 none. Both hold ``rows.lock``; neither ever changes a task record. Rows carry labels, counts, timestamps, PR
-numbers and commit SHAs only, plus, for an unparsed review reply, its typed ``unparsed_reason`` and up to 200
+numbers and commit SHAs only, plus, for a structured review, a 16-hex digest of each blocking finding's file path
+(``blocking_paths``, never the path), and for an unparsed review reply, its typed ``unparsed_reason`` and up to 200
 escaped characters of that reply: no prompt, parsed body, error text, account identity or host path.
 """
 
@@ -40,7 +41,11 @@ from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
-from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
+from lu_machinery.fleet_comms.review_publication import (
+    BLOCKING_PRIORITIES,
+    ReviewPublicationError,
+    normalize_verdict,
+)
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.orchestration.task_record_store import iter_task_records
@@ -76,6 +81,7 @@ _FIELD_CONTRACT_ERRORS = (
     "review_envelope_invalid_verdict:",
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_PATH_DIGEST = re.compile(r"[0-9a-f]{16}\Z")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -484,8 +490,17 @@ def _recorded_review(verdict: object) -> dict[str, Any] | None:
         return None
 
 
+def path_digest(path: str) -> str:
+    """The stored form of a finding's repository-relative path: equal paths compare equal, the path never shows."""
+    return hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
 def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
-    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause."""
+    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause.
+
+    A ``code-review-findings.v1`` reply also keeps the path digest of each blocking (P0-P1) finding's location, so
+    the statistics can tell whether the author's next commits touched that file.
+    """
     def fail(reason: str) -> dict[str, Any]:
         return _unparsed(reason, _sample(raw) if allow_sample else None)
 
@@ -504,7 +519,10 @@ def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
-            return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
+            # The schema the payload just passed requires every finding's priority and location path.
+            paths = sorted(path_digest(finding["location"]["path"]) for finding in payload["findings"]
+                           if finding["priority"] in BLOCKING_PRIORITIES)
+            return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts), "blocking_paths": paths}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
             recorded = _recorded_review(payload["verdict"])
             return recorded if recorded is not None else fail("bad_fields")
@@ -770,6 +788,11 @@ def _review_ok(review: object, *, role: object, status: object, repo: object, da
         return False
     if review.keys() == {"verdict", "priorities"}:
         return True
+    if review.keys() == {"verdict", "priorities", "blocking_paths"}:
+        paths = review["blocking_paths"]
+        return (verdict != "unparsed" and isinstance(priorities, dict) and isinstance(paths, list)
+                and all(isinstance(p, str) and _PATH_DIGEST.fullmatch(p) for p in paths)
+                and len(paths) == sum(priorities.get(p, 0) for p in BLOCKING_PRIORITIES))
     if verdict != "unparsed" or priorities is not None or review.keys() != {
         "verdict", "priorities", "unparsed_reason", "unparsed_sample",
     }:
