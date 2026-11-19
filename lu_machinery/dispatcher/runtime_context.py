@@ -95,11 +95,13 @@ def build(
     """Prepare the worker at the common launch boundary, preserving each CLI's wire format."""
     # Read before adapter construction, which may write a schema or context file.
     core = rules_core.core_block(rules_core.resolve_seat())
-    invocation = providers.load(spec.agent).build(spec, env)
     if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        from lu_machinery.dispatcher.providers import opencode
+
         if launch_prompt is not None or conversation is not None:
             raise ValueError("savant_public_input_refused: only the submitted public payload may be sent")
-        return invocation
+        return opencode.build(spec, env)
+    invocation = providers.load(spec.agent).build(spec, env)
     if conversation is not None:
         if spec.agent != "agy" or launch_prompt is not None:
             raise ValueError("only AGY can continue an existing conversation")

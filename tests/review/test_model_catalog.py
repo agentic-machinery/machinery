@@ -1141,6 +1141,9 @@ def assert_frozen_surfaces(actual, *, surfaces):
             neon = value["models"].pop("gemini-4-neon")
             assert hashlib.sha256(encode(neon)).hexdigest() == "85226fcdf9424a3c5a2ade95790677438d942c9f646fa52bfa44a232c19c47a8"
             expected["models"].pop("gemini-4-carbon")
+            # Savant adds a test route and leaves the formal reviewer receipts intact.
+            savant = value["models"].pop("subq-savant-1.4")
+            assert hashlib.sha256(encode(savant)).hexdigest() == "733c1036ed9cdaea4ee770c73d389872e2639638b83e62dcc54d3e5330f4b817"
         assert value == expected, f"current surface differs: {surface}"
 
 
