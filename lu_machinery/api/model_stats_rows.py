@@ -28,7 +28,7 @@ import sys
 import time
 import unicodedata
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -346,13 +346,18 @@ def _sample_text_cleared(text: str) -> bool:
 
 
 def _sample(raw: bytes) -> str | None:
-    """First ``MAX_SAMPLE_CHARS`` escaped characters of a failing reply when cleared for stats, else None."""
-    # At most 4 UTF-8 bytes per character; read a bounded prefix so a 4 MB+ reply is never decoded whole.
-    prefix = raw[: MAX_SAMPLE_CHARS * 4].decode("utf-8", errors="replace")[:MAX_SAMPLE_CHARS]
-    escaped = _escape_sample(prefix)
-    if not _sample_text_cleared(prefix) or not _sample_text_cleared(escaped):
+    """First ``MAX_SAMPLE_CHARS`` escaped characters of a failing reply when cleared for stats, else None.
+
+    The scans run over the whole reply as read, never the cut prefix alone: a credential or host detail that starts
+    in the prefix and ends past the cut is found in full, and any match that starts in the prefix withholds it.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    prefix = text[:MAX_SAMPLE_CHARS]
+    redacted = redact_text(text) or ""
+    if any(finding.start < len(prefix) for finding in scan_text(text)) or redacted[:len(prefix)] != prefix:
         return None
-    return escaped
+    escaped = _escape_sample(prefix)
+    return escaped if _sample_text_cleared(prefix) and _sample_text_cleared(escaped) else None
 
 
 def _unparsed(reason: str, sample: str | None = None) -> dict[str, Any]:
@@ -465,11 +470,10 @@ def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
     findings = payload.get("findings", [])
-    if verdict not in VERDICTS[:3] or not isinstance(findings, list):
+    if verdict not in VERDICTS[:3] or not isinstance(findings, list) or not all(
+            isinstance(finding, dict) and finding.get("priority") in PRIORITIES for finding in findings):
         return fail("bad_fields")
-    priorities: Counter[str] = Counter(
-        finding["priority"] for finding in findings
-        if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
+    priorities = Counter(finding["priority"] for finding in findings)
     return {"verdict": verdict, "priorities": dict(sorted(priorities.items()))}
 
 
@@ -538,6 +542,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     author = record.get("review_author_model") or options.get("review_author_model")
     raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
+    raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
     fresh, cached, output = tokens(record.get("usage"))
     return {
         "schema": ROW_SCHEMA,
@@ -555,6 +560,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "allowance": _allowance(record),
         "review": _review(path, record) if role == "review" and status == "done" else None,
         "repo": repo,
+        "data_class": None if raw_class is None else label(raw_class),
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
         "author_model": model_id(author) if author else None,
@@ -614,14 +620,22 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def append_row(batch_state_dir: Path, row: Mapping[str, Any], wait_s: float | None = None) -> None:
-    """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
+def append_row(batch_state_dir: Path, row: Mapping[str, Any] | Callable[[], Mapping[str, Any] | None],
+               wait_s: float | None = None) -> None:
+    """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line.
+
+    ``row`` may be a function, called under the lock: the sidecar it reads is then never older than a row another
+    writer has already stored.
+    """
     with _locked(batch_state_dir, wait_s) as path:
+        line = row() if callable(row) else row
+        if line is None:
+            return
         fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
         try:
             size = os.fstat(fd).st_size
             open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
-            _write_all(fd, (b"\n" if open_fragment else b"") + _line(row))
+            _write_all(fd, (b"\n" if open_fragment else b"") + _line(line))
         finally:
             os.close(fd)
 
@@ -632,9 +646,7 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
     ``source_mtime_ns`` is the modification time of the file the writer renamed into place (its content's version).
     """
     try:
-        row = summary_row(path, record, source_mtime_ns)
-        if row is not None:
-            append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
+        append_row(batch_state_dir, lambda: summary_row(path, record, source_mtime_ns), SETTLEMENT_LOCK_WAIT_S)
     except Exception as exc:
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
 
@@ -654,6 +666,8 @@ def _sanitised(row: dict[str, Any]) -> dict[str, Any]:
             row[name] = label(value)
     author = row.get("author_model")
     row["author_model"] = model_label(author) if author is not None else None
+    data_class = row.get("data_class")
+    row["data_class"] = label(data_class) if data_class is not None else None
     return row
 
 
@@ -694,7 +708,7 @@ def _sample_ok(value: object) -> bool:
     )
 
 
-def _review_ok(review: object, *, role: object, status: object, repo: object) -> bool:
+def _review_ok(review: object, *, role: object, status: object, repo: object, data_class: object) -> bool:
     if review is None:
         return True
     if role != "review" or status != "done" or not isinstance(review, dict):
@@ -716,7 +730,9 @@ def _review_ok(review: object, *, role: object, status: object, repo: object) ->
     sample = review["unparsed_sample"]
     if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
         return False
-    if reason == "missing_result" or not _repo_is_public(repo):
+    # The writer's eligibility rule again: a public repository, and a catalogued public data class when one is named.
+    if reason == "missing_result" or not _repo_is_public(repo) or (
+            data_class is not None and data_class not in _public_data_classes()):
         return sample is None
     return _optional(sample, _sample_ok)
 
@@ -735,7 +751,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
-        _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo")),
+        _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo"),
+                   data_class=row.get("data_class")),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -815,23 +832,30 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
     A new last line supersedes an older record version, or a row whose review its record's sidecar no longer gives.
     """
     counts: Counter[str] = Counter()
-    candidates: list[dict[str, Any]] = []
+    candidates: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
     for path, record, mtime_ns in _settled_records(tasks_dir, counts):
         row = summary_row(path, record, mtime_ns)
         if row is None:
             counts["active_or_foreign"] += 1
             continue
-        candidates.append(row)
+        candidates.append((path, record, row))
     counts["settled_records"] = len(candidates)
     if dry_run:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        counts["would_add"] = sum(row["task_id"] not in present for row in candidates)
+        counts["would_add"] = sum(row["task_id"] not in present for _, _, row in candidates)
         counts["would_refresh"] = sum(row["task_id"] in present and _stale(present[row["task_id"]], row)
-                                      for row in candidates)
+                                      for _, _, row in candidates)
         return dict(sorted(counts.items()))
     with _locked(batch_state_dir) as path:
         present = {row["task_id"]: row for row in read_rows(batch_state_dir)[0]}
-        written = [row for row in candidates if _stale(present.get(row["task_id"]), row)]
+        written = []
+        for source, record, row in candidates:
+            stored = present.get(row["task_id"])
+            if stored is not None and stored.get("source_mtime_ns") == row["source_mtime_ns"] and _stale(stored, row):
+                # The stored row may come from a reading newer than this run's: read the sidecar again, under the lock.
+                row = summary_row(source, record, row["source_mtime_ns"]) or row  # the same record gives a row again
+            if _stale(stored, row):
+                written.append(row)
         counts["added"] = sum(row["task_id"] not in present for row in written)
         counts["refreshed"] = len(written) - counts["added"]
         counts["already_present"] = len(candidates) - len(written)

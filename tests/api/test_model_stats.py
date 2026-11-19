@@ -169,6 +169,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     )
     # Valid JSON with a non-object root (bare or inside a valid envelope) classifies as bad_fields.
     assert rows.review_summary(b"[]")["unparsed_reason"] == "bad_fields"
+    assert rows.review_summary(b'{"overall": {"correctness": "correct"}, "findings": [null]}')["unparsed_reason"] == (
+        "bad_fields")
     assert rows.review_summary(b"VERDICT: APPROVE\nSCORE: 9/10\n\n```json\n[]\n```")["unparsed_reason"] == "bad_fields"
     # Stamped archive collision: renamed record pairs with its stamped sidecar, never an older unstamped basename.
     (u_tasks / "archive").mkdir()
@@ -245,6 +247,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
         {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "raw\nline"}},
         {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "bidi\u202e"}},
         {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "/home/ops/secret"}},
+        {**base_row, "data_class": "private-code"},
         {**base_row, "review": {"verdict": "correct", "priorities": {}, "unparsed_reason": "bad_format", "unparsed_sample": None}},
     ]
     assert all(not rows._well_formed(bad) for bad in bad_rows)
@@ -366,7 +369,8 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     batch_state, tasks = _state(tmp_path)
     secrets = ["PROMPT-TEXT-x1", "/home/leaky/worktree", "kk", "ERROR-DETAIL-x2", "EXPLANATION-x3",
                "finding body 0", "/srv/private/model", "../escape", "acct-identity@example.invalid",
-               "PRIVATE-BRIEF-x5", "INVALID-REPO-x6", "UNKNOWN-CLASS-x7", "AFTER-200-DIFF-TEXT-x9"]
+               "PRIVATE-BRIEF-x5", "INVALID-REPO-x6", "UNKNOWN-CLASS-x7", "AFTER-200-DIFF-TEXT-x9",
+               "STRADDLE-x8"]
     _record(tasks, "leaky", prompt="PROMPT-TEXT-x1", prompt_file="/home/leaky/worktree/prompt.md",
             worktree_path="/home/leaky/worktree", claude_account="kk", error="ERROR-DETAIL-x2",
             research_task_family="../escape", allowance={"pool": "claude:kk", "start": {"remaining_pct": 50},
@@ -392,6 +396,12 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
             repo="public", started_at=_at(3))
     (tasks / "unparsed-opsec-review.result").write_text(
         "failed for acct-identity@example.invalid in /home/leaky/worktree", encoding="utf-8",
+    )
+    # An identity that starts before the 200-character cut and ends after it withholds the whole sample.
+    _record(tasks, "unparsed-straddle-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="public", started_at=_at(2.5))
+    (tasks / "unparsed-straddle-review.result").write_text(
+        "STRADDLE-x8 " + "s" * 178 + " acct-identity@example.invalid", encoding="utf-8",
     )
     _record(tasks, "unparsed-public-review", mode="read-only", agent="claude", model="claude-opus-5-5",
             repo="public", data_class="public-code", started_at=_at(2))
