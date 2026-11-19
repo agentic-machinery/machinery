@@ -197,7 +197,7 @@ def test_read_only_agy_run_needs_a_verified_boundary_receipt(sandbox, monkeypatc
     else:
         assert result["status"] == "failed" and "sources_mcp_call_count" not in result
         assert result["error"].startswith("agy_read_only_boundary: ")
-    assert "never_started_reason" not in result  # The provider ran, even when its boundary receipt was invalid.
+    assert result.get("never_started_reason") is None  # The provider ran, even when its boundary receipt was invalid.
 
 
 @pytest.mark.usefixtures('configured_roots')

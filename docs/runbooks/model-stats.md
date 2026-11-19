@@ -112,6 +112,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   window and model. These rows have zero tokens, count toward total and not-done attempts and contribute no
   review verdict, unparsed reply or allowance spend. A sandbox launcher can have a process group while the
   provider it guards has yet to start.
+  Admission refusals without an attributed worktree have their own record ID. The requested task ID remains
+  available for a later invocation. If preparation leaves a worktree, its original task record retains custody.
 - **Legacy refusal evidence** comes from a retained task record with a known pre-start error and no provider
   start evidence, or a verified refusal receipt. For example, exit 125 and a matching `refused` boundary status
   identify the boundary refusal. A missing receipt or an `interrupted` boundary leaves the original status in

@@ -149,8 +149,17 @@ class Refused(RuntimeError):
     """The boundary cannot be proven; AGY does not start."""
 
 
-def unavailable(*, require_overlay: bool = False) -> str | None:
+def unavailable() -> str | None:
     """Why this host cannot start the boundary, or None. Admission checks this; the launch proves it."""
+    return _unavailable(require_overlay=False)
+
+
+def native_unavailable() -> str | None:
+    """The native boundary also needs writable overlays for its private HOME."""
+    return _unavailable(require_overlay=True)
+
+
+def _unavailable(*, require_overlay: bool) -> str | None:
     if platform.system() != "Linux":
         return "its bubblewrap read-only boundary runs on Linux only"
     from lu_machinery.review.isolation import ReviewIsolationError, _resolve_fixed_system_executable

@@ -59,13 +59,23 @@ def dispatch(tmp_path, monkeypatch):
     ))
     monkeypatch.setattr(worker, "start", start)
 
-    def invoke(*flags, expected=0, task_id="oc"):
+    def invoke(*flags, expected=0, task_id="oc", refusal=None):
+        before = {record["task_id"] for record in store.list_tasks()}
         assert cli.main(["dispatch", "--agent", "deepseek", "--model", "deepseek-v4.1-flash", "--task-id", task_id,
                          "--mode", "read-only", "--prompt", "Reply with exactly: ready", *flags]) == expected
         if expected:
             start.assert_not_called()
             git.create_worktree.assert_not_called()
-            assert not (tmp_path / "tasks").exists()
+            new = [record for record in store.list_tasks() if record["task_id"] not in before]
+            assert store.read(task_id, missing_ok=True) is None
+            if refusal is None:
+                assert new == []
+            else:
+                [record] = new
+                assert (record["requested_task_id"], record["status"], record["never_started_reason"]) == (
+                    task_id, "failed", refusal)
+                assert record["provider_pgid"] is None and record["usage"] is None
+                assert "admission_hold" not in record and "prompt_file" not in record
             return None
         return store.read(task_id)
 
@@ -101,7 +111,7 @@ def test_default_build_stays_direct_api(spec, funded, dispatch):
 @pytest.mark.parametrize("selected", ["deepseek", "openrouter"])
 def test_missing_endpoint_access_refused_before_spawn(funded, dispatch, capsys, selected):
     funded.keys[selected] = None
-    dispatch("--provider", selected, expected=2)
+    dispatch("--provider", selected, expected=2, refusal="route_eligibility")
     err = capsys.readouterr().err
     assert f"opencode_endpoint_no_access: {selected} has no configured API key" in err
     assert "stub-" not in err
@@ -111,7 +121,7 @@ def test_missing_endpoint_access_refused_before_spawn(funded, dispatch, capsys, 
 @pytest.mark.parametrize("balance", [0.99, None])
 def test_below_floor_refused_before_spawn(funded, dispatch, capsys, selected, balance):
     funded.balances[selected] = balance
-    dispatch("--provider", selected, expected=2)
+    dispatch("--provider", selected, expected=2, refusal="route_eligibility")
     err = capsys.readouterr().err
     if balance is None:
         assert f"opencode_endpoint_balance_unknown: {selected} balance could not be read" in err
@@ -205,9 +215,10 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
 
 def test_savant_refuses_secrets_or_unknown_data_before_spawn(dispatch, capsys):
     for flags in (("--data-class", "secret"), ("--data-class", "credentials"), ("--data-class", "unknown"), ()):
-        dispatch(*SAVANT_FLAGS, *flags, expected=2)
+        dispatch(*SAVANT_FLAGS, *flags, expected=2, refusal="route_eligibility")
         assert "savant_data_class_refused" in capsys.readouterr().err
-    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--repo", "infra-private", expected=2)
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--repo", "infra-private", expected=2,
+             refusal="route_eligibility")
     assert "savant_repository_refused" in capsys.readouterr().err
     # A private class reads no files, so naming paths is refused at dispatch, before any record exists.
     dispatch(*SAVANT_FLAGS, "--data-class", "private-code", "--repo", "infra-private", "--read-path", "docs",
@@ -217,11 +228,14 @@ def test_savant_refuses_secrets_or_unknown_data_before_spawn(dispatch, capsys):
 
 def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
     assert all(candidate.concrete_model != "subq-savant-1.4" for candidate in REVIEW_CANDIDATES.values())
-    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--risk", "high", "--require-review-verdict", expected=2)
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--risk", "high", "--require-review-verdict", expected=2,
+             refusal="route_eligibility")
     assert "holds no review, critique or approval role" in capsys.readouterr().err
-    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--mode", "workspace-write", expected=2)
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--mode", "workspace-write", expected=2,
+             refusal="route_eligibility")
     assert "does not run in mode 'workspace-write'" in capsys.readouterr().err
-    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--effort", "medium", expected=2)
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--effort", "medium", expected=2,
+             refusal="route_eligibility")
     assert "does not offer effort 'medium'" in capsys.readouterr().err
 
 

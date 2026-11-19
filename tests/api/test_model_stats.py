@@ -76,6 +76,7 @@ def test_never_started_refusals_survive_backfill_and_keep_failed_review_counts_s
         "review-setup": {"never_started_reason": "review_setup_refusal"},
         "model-selection": {"error": "agy_model_unavailable: unavailable"},
         "boundary-refused": {**boundary, "write_boundary": {"status": "refused"}},
+        "boundary-continuation": {**boundary, "write_boundary": {"status": "refused"}, "never_started_reason": None},
         "boundary-interrupted": {**boundary, "write_boundary": {"status": "interrupted"}},
         "boundary-missing": boundary,
         "model-ran": {"never_started_reason": "setup_refusal", "usage": {"input_tokens": 7, "cached_input_tokens": 0}},
@@ -92,7 +93,7 @@ def test_never_started_refusals_survive_backfill_and_keep_failed_review_counts_s
     assert rows.backfill(tasks, batch_state)["refreshed"] == 0
     payload = _row(_window(batch_state, stats.Landing()), "gpt-6.1-sol", "review")
     assert payload["status"]["never_started"] == 9
-    assert payload["status"]["failed"] == payload["verdicts"]["unparsed"] == 3
+    assert payload["status"]["failed"] == payload["verdicts"]["unparsed"] == 4
     assert payload["never_started_reasons"] == {
         "account_check": 1, "admission_capacity": 1, "boundary_refusal": 1, "headroom": 1,
         "model_unavailable": 1, "review_setup_refusal": 1, "route_eligibility": 1,

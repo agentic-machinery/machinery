@@ -122,8 +122,9 @@ def start_refusal(record: Mapping[str, Any]) -> str | None:
     status = record.get("status")
     if status not in ("failed", "rate_limited", "crashed") or any(tokens(record.get("usage"))):
         return None
-    reason = record.get("never_started_reason")
-    if reason is not None:
+    if "never_started_reason" in record:
+        # A modern settlement can rule out a refusal even when its last launch exited 125.
+        reason = record["never_started_reason"]
         return reason if isinstance(reason, str) and reason in _REFUSAL_CODES else None
     if status != "failed" or record.get("result_sha256") or record.get("resolved_model_known") is True:
         return None
@@ -146,7 +147,7 @@ def start_refusal(record: Mapping[str, Any]) -> str | None:
         return StartRefusal.PLACEMENT
     if launch_code == "spawn_setup_failed":
         return StartRefusal.SETUP
-    if code == "formal attempt filesystem boundary refused":
+    if isinstance(error, str) and error.startswith("formal attempt filesystem boundary refused: prepare:"):
         return StartRefusal.BOUNDARY
     return _PRE_START_ERRORS.get(code) if code is not None else None
 

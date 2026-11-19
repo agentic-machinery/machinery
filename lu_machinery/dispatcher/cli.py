@@ -603,7 +603,7 @@ def _dispatch(args) -> int:
         if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):
             raise ValueError(refusal)
         if (args.mode == "read-only" and not binding and agent not in {"agy", "muse"}
-                and (refusal := agy_sandbox.unavailable(require_overlay=True))):
+                and (refusal := agy_sandbox.native_unavailable())):
             raise ValueError(f"read_only_unenforceable: {refusal}")
     # A bound attempt is admitted before anything exists: its prompt is the exact render of its manifest
     # with these ids, its tools are granted and its pins are the commit's bytes (#12114).

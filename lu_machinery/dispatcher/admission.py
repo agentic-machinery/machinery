@@ -9,7 +9,6 @@ import functools
 import logging
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 
 from lu_machinery.common import test_slots
@@ -31,7 +30,7 @@ def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | Non
         if agent in providers.PROVIDERS and not (args.dry_run or args.print_advisory_binding):
             try:
                 store.record_admission_refusal(
-                    task_id or args.task_id or uuid.uuid4().hex, agent, vars(args), reason, hold=hold,
+                    task_id or args.task_id, agent, vars(args), reason, hold=hold,
                 )
             except (OSError, store.TaskRecordError) as exc:
                 logging.getLogger(__name__).warning("could not record pre-start refusal: %s", type(exc).__name__)
