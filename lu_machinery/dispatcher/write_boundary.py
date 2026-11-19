@@ -733,32 +733,59 @@ def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes
 
 
 def _public_origin(repository: Path) -> str:
-    """The primary's origin URL, refused unless it names a registered repository with a public role."""
-    url = _git(repository, "remote", "get-url", "origin").strip()
-    match = _GITHUB_REMOTE.fullmatch(url)
+    """The primary origin's GitHub slug, refused unless it names a registered repository with a public role."""
+    match = _GITHUB_REMOTE.fullmatch(_git(repository, "remote", "get-url", "origin").strip())
     if not (match and agy_sandbox.public_repository(match.group(1))):
         raise Refused("savant_snapshot_refused: origin is not a registered public repository")
-    return url
+    return match.group(1)
+
+
+def _remote_tips(slug: str) -> dict[str, str]:
+    """Branch tips GitHub serves anonymously for ``slug`` now: no login, credential helper or checkout config."""
+    env = {"PATH": os.defpath, "HOME": os.devnull, "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
+    for name in ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):  # the host's own route out, if it has one
+        if os.environ.get(name):
+            env[name] = os.environ[name]
+    try:
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            ["git", "-c", "credential.helper=", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
+             "ls-remote", "--", f"https://github.com/{slug}.git", "refs/heads/*"],
+            cwd="/", capture_output=True, text=True, timeout=_GIT_TIMEOUT, check=False, env=env)
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    if result is None or result.returncode:
+        raise Refused("savant_snapshot_refused: the public remote's branches could not be read anonymously")
+    tips: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        oid, tab, ref = line.partition("\t")
+        if tab and _OBJECT_ID.fullmatch(oid):
+            tips[ref] = oid
+    return tips
 
 
 def _published(repository: Path, commit: str) -> None:
-    """Refuse unless origin advertises now a branch whose tip is ``commit``, or whose main branch contains it."""
-    url = _public_origin(repository)
-    try:
-        listing = _git(repository, "ls-remote", url, "refs/heads/*", network=True)
-    except Refused:
-        raise Refused("savant_snapshot_refused: the public remote's branches could not be read") from None
-    tips = dict(reversed(line.split("\t", 1)) for line in listing.splitlines() if "\t" in line)
+    """Refuse unless GitHub serves publicly a branch whose tip is ``commit``, or whose main branch contains it.
+
+    Ancestry is read from local objects of the anonymously listed tip: object ids bind that history.
+    """
+    tips = _remote_tips(_public_origin(repository))
     if commit in tips.values():
         return
     main = tips.get("refs/heads/main", "")
-    if _OBJECT_ID.fullmatch(main):
+    if main:
         try:
             _git(repository, "merge-base", "--is-ancestor", commit, main)
             return
         except Refused:
             pass
     raise Refused("savant_snapshot_refused: no branch of the public remote contains the start commit now")
+
+
+def _known_secrets() -> tuple[bytes, ...]:
+    """Values of the launcher's own credential-named variables (the run's SubQ key among them), as needles."""
+    names = re.compile(r".*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL).*", re.IGNORECASE)
+    return tuple(value.encode() for name, value in os.environ.items() if names.fullmatch(name) and len(value) >= 16)
 
 
 def _sensitive(data: bytes, needles: tuple[bytes, ...]) -> bool:
@@ -785,13 +812,14 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         loaded = load_needles()
     except NeedlesError:
         raise Refused("savant_snapshot_refused: the host's OPSEC needles cannot be read") from None
-    needles = tuple(needle.encode() for needle in (*loaded.run_users, *loaded.home_dirs) if needle)
-    entries, left_out, total = [], 0, 0
+    needles = (*(needle.encode() for needle in (*loaded.run_users, *loaded.home_dirs) if needle), *_known_secrets())
+    entries: list[tuple[str, int, tuple[str, ...]]] = []
+    left_out = total = 0
     for record in _plain_git(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths).split(b"\0"):
         if not record:
             continue
         meta, _, raw = record.partition(b"\t")
-        mode, kind, oid, size = meta.split()
+        mode, kind, oid_field, size_field = meta.split()
         name = raw.decode("utf-8", "surrogateescape")
         parts = PurePosixPath(name).parts
         if not parts or name.startswith("/") or any(part in ("", ".", "..") for part in parts):
@@ -800,11 +828,11 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
                 or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts)):
             left_out += 1
             continue
-        total += int(size)
+        total += int(size_field)
         if total > limit or len(entries) >= MAX_SNAPSHOT_FILES:
             raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes or {MAX_SNAPSHOT_FILES} "
                           "files; name the task's files or directories with --read-path")
-        entries.append((oid.decode("ascii"), int(size), parts))
+        entries.append((oid_field.decode("ascii"), int(size_field), parts))
     names = ["/".join(parts) for _oid, _size, parts in entries]
     for path in paths:
         prefix = path.rstrip("/")
@@ -824,9 +852,9 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         if _sensitive(data, needles):
             left_out += 1
             continue
-        path = target.joinpath(*parts)
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _write_private(path, data, 0o400)
+        destination = target.joinpath(*parts)
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_private(destination, data, 0o400)
         files += 1
     if not files:
         raise Refused("savant_snapshot_refused: no readable file is left to snapshot")

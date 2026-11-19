@@ -264,7 +264,7 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
         "secrets/token.txt": secret, "app/credentials.json": secret, ".ssh/config": secret, "deploy/site.key": secret,
         "AGENTS.md": secret, "nested/CLAUDE.md": secret, "opencode.json": secret, ".opencode/agent.md": secret,
         "docs/CONTEXT.md": secret, "home/auth.json": secret, "home/.credentials.json": secret, "prod.env": secret,
-        ".gitconfig": secret, ".mcp.json": secret,
+        ".gitconfig": secret, ".mcp.json": secret, "config/settings.ini": b"api = opaque-fixture-value-0123456789\n",
         "docs/notes.txt": b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + secret,
         "src/token.py": b"TOKEN = 'ghp_" + b"A" * 36 + b"'\n" + secret,
     }
@@ -273,7 +273,12 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
     # Only a registered public origin is trusted; the fixture's bare remote stands in for it.
     with pytest.raises(write_boundary.Refused, match="origin is not a registered public repository"):
         write_boundary._snapshot(repository, commit, [], tmp_path / "unregistered", 1024)
-    monkeypatch.setattr(write_boundary, "_public_origin", lambda _repository: (tmp_path / "remote.git").as_uri())
+    # The fixture's bare remote stands in for GitHub's anonymous listing of a registered public repository.
+    monkeypatch.setattr(write_boundary, "_public_origin", lambda _repository: "example/public")
+    monkeypatch.setattr(write_boundary, "_remote_tips", lambda slug: {
+        ref: oid for oid, ref in (line.split("\t") for line in run("ls-remote", "origin", "refs/heads/*").splitlines())})
+    # An opaque credential the launcher holds (the run's SubQ key, for one) is screened by its exact value.
+    monkeypatch.setenv("FIXTURE_API_KEY", "opaque-fixture-value-0123456789")
     target = tmp_path / "snapshot"
     info = write_boundary._snapshot(repository, commit, [], target, 1024)
     written = {path.relative_to(target).as_posix(): path for path in target.rglob("*") if path.is_file()}
@@ -281,8 +286,8 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
     assert not any(path.is_symlink() for path in target.rglob("*"))
     assert all(secret not in path.read_bytes() for path in written.values())
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in written.values())
-    # 18 excluded names and 2 links leave before reading; 2 files leave for their key or token content.
-    assert info["files"] == 2 and info["left_out"] == 22 and info["commit"] == commit
+    # 18 excluded names and 2 links leave before reading; 3 files leave for a key, a token or a known secret.
+    assert info["files"] == 2 and info["left_out"] == 23 and info["commit"] == commit
     # --read-path narrows it to the named directory.
     narrowed = write_boundary._snapshot(repository, commit, ["docs"], tmp_path / "narrow", 1024)
     assert narrowed["files"] == 1 and (tmp_path / "narrow" / "docs" / "guide.md").is_file()
