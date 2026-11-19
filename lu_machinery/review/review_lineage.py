@@ -49,7 +49,9 @@ from lu_machinery.orchestration.task_record_store import (
     TaskIdentityMismatch,
     is_identical_copy,
     misnamed_record_refusal,
-    read_task_record,
+    parse_task_record,
+    read_task_record_bytes,
+    task_archive_lock,
 )
 from lu_machinery.review import capability_failure
 from lu_machinery.review import record_cf_verdict as recorder
@@ -176,13 +178,19 @@ def bound_published_run(
 def review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
     """Every hot and archived review task record of this repository, with its path."""
     try:
-        paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
+        with task_archive_lock(task_root):
+            return _review_records(task_root, repository=repository)
     except OSError as exc:
         raise LineageRefused(f"task ledger unavailable: {exc}") from None
+
+
+def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
+    paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
     records = []
     for path in paths:
         try:
-            record = read_task_record(path)
+            path, raw = read_task_record_bytes(path, tasks_dir=task_root)
+            record = parse_task_record(path, raw)
         except TaskIdentityMismatch as exc:
             # A copy (a worker's saved `dispatch.py wait` output) never joins the lineage, and only an
             # exact copy of the named record is skipped; any other misnamed file refuses.
@@ -222,14 +230,18 @@ def lineage_runs(
     one of them passes None for the other. ``records`` is the caller's own
     :func:`review_records` read, when it has one.
     """
-    if records is None:
-        records = review_records(task_root, repository=repository)
-    return [
-        _read_run(path, record)
-        for path, record in records
-        if (number is not None and record.get("pr") == number)
-        or (record.get("pr") is None and branch in _review_branches(record))
-    ]
+    try:
+        with task_archive_lock(task_root):
+            if records is None:
+                records = _review_records(task_root, repository=repository)
+            return [
+                _read_run(path, record)
+                for path, record in records
+                if (number is not None and record.get("pr") == number)
+                or (record.get("pr") is None and branch in _review_branches(record))
+            ]
+    except OSError as exc:
+        raise LineageRefused(f"task ledger unavailable: {exc}") from None
 
 
 def _trusted_markers(

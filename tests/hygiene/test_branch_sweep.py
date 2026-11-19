@@ -268,6 +268,27 @@ def test_unknown_pr_state_and_malformed_task_fail_closed(repo: Path) -> None:
         sweep.sweep(repo, apply=True, pr_lookup=lookup(), protected_lookup=lambda _repo: set())
 
 
+def test_branch_sweep_keeps_evidence_from_a_listed_record_moved_to_archive(tmp_path, monkeypatch):
+    """Defect class: an archive move aborts the branch sweep's task inventory."""
+    monkeypatch.setattr(sweep.reaper, "control_plane_root", lambda repo: repo)
+    tasks = tmp_path / "batch_state" / "tasks"
+    hot = tasks / "retired.json"
+    archived = tasks / "archive" / hot.name
+    archived.parent.mkdir(parents=True)
+    state = {"task_id": "retired", "status": "done", "worktree_branch": "codex/retired"}
+    hot.write_text(json.dumps(state))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert sweep._task_records(tmp_path) == [(archived, state)]
+
+
 def test_local_remote_tip_difference_is_report_only(repo: Path) -> None:
     branch(repo, "cursor/diverged")
     parent = git(repo, "rev-parse", "cursor/diverged")

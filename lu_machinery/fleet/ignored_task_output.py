@@ -33,7 +33,12 @@ from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.fleet.regenerable_output import committed_release_pins, is_regenerable_ignored_path
 from lu_machinery.orchestration import worktree_artifacts as artifacts
 from lu_machinery.orchestration.preparation_evidence import UniqueKeyLoader
-from lu_machinery.orchestration.task_record_store import parse_task_record, task_record_path
+from lu_machinery.orchestration.task_record_store import (
+    parse_task_record,
+    read_task_record_bytes,
+    task_archive_lock,
+    task_record_path,
+)
 
 # Deepest JSON this module reads (json_depth): its own identity cache.
 _JSON_MAX_DEPTH = 128
@@ -302,25 +307,26 @@ class _InventoryReadError(ValueError):
 def matching_worktree_records(
     worktree: Path, tasks_dir: Path, *, repo_root: Path, publish_cache: bool = True
 ) -> list[tuple[Path, dict[str, Any]]]:
-    """Retry one complete inventory after a concurrent record move or rewrite.
+    """Read coherent archive groups and retry once after a concurrent redispatch.
 
     Atomic replacement at the same name does not expose partial JSON, but
-    delegate's redispatch archive and stale_task_records' staging move can
-    remove a filename between glob and open. Never simply omit a failed read.
+    delegate's redispatch can remove a filename between glob and open. Never
+    simply omit a failed read.
     A vanished name needs a visible archive counterpart before retrying.
     ``publish_cache=False`` suppresses publication on both inventory attempts.
     """
-    try:
-        matches = _matching_worktree_records_once(worktree, tasks_dir, repo_root=repo_root, publish_cache=publish_cache)
-    except _InventoryReadError as exc:
-        print("Task identity inventory read failed; retrying complete inventory once", file=sys.stderr)
-        matches = _matching_worktree_records_once(
-            worktree,
-            tasks_dir,
-            repo_root=repo_root,
-            publish_cache=publish_cache,
-            missing_path=exc.path if exc.missing else None,
-        )
+    with task_archive_lock(tasks_dir):
+        try:
+            matches = _matching_worktree_records_once(worktree, tasks_dir, repo_root=repo_root, publish_cache=publish_cache)
+        except _InventoryReadError as exc:
+            print("Task identity inventory read failed; retrying complete inventory once", file=sys.stderr)
+            matches = _matching_worktree_records_once(
+                worktree,
+                tasks_dir,
+                repo_root=repo_root,
+                publish_cache=publish_cache,
+                missing_path=exc.path if exc.missing else None,
+            )
     # Retention and record-change checks need every claim, including history.
     # Only creator attribution may disregard proven force-new attempts.
     return matches
@@ -412,13 +418,15 @@ def _matching_worktree_records_once(
         for prefix, path in inventory
     ):
         raise _InventoryReadError(missing_path, missing=True)
-    for prefix, path in inventory:
+    for _, path in inventory:
         try:
-            raw = path.read_bytes()
+            path, raw = read_task_record_bytes(path, tasks_dir=tasks_dir)
         except OSError as exc:
             raise _InventoryReadError(path, missing=isinstance(exc, FileNotFoundError)) from None
         digest = hashlib.sha256(raw).hexdigest()
-        name = prefix + path.name
+        name = path.relative_to(tasks_dir).as_posix()
+        if name in identities:
+            continue
         entry = cached.get(name)
         hit = (
             isinstance(entry, dict)

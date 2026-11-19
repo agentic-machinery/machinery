@@ -39,7 +39,9 @@ first renames the record to a private staging name, verifies that the file it
 took is the one it checked, and puts it back if a writer replaced it in
 between. No move ever replaces a file: archive, put-back and ``restore`` place
 each file with ``os.link`` (which fails if the name is taken) before unlinking
-the source, so a writer that created the destination first keeps its file. A
+the source, so a writer that created the destination first keeps its file.
+Strict readers share a task-directory lock with archive and restore group
+moves so they cannot see the private staging name or a partly moved group. A
 snapshot directory moves whole with one ``os.rename``, which fails if the
 destination is a non-empty directory; it is never split between hot and
 archive. A staged file that cannot be archived goes back to its hot name, or, if a writer
@@ -1832,7 +1834,8 @@ def _archive_one(
             elif (reason := keep_hot_reason(current)) is not None:
                 row["action"], row["skip_reason"] = "skipped", reason
             else:
-                row["moved"], problems = _move_group(path, archive_dir, stamp, checked=stat)
+                with task_record_store.task_archive_lock(path.parent, moving=True):
+                    row["moved"], problems = _move_group(path, archive_dir, stamp, checked=stat)
                 row["action"] = "error" if problems else "archived"
                 if problems:
                     row["error"] = "record archived; " + "; ".join(problems)
@@ -1924,7 +1927,7 @@ def archive_terminal(
     }
 
 
-def _restore_group(group: list[Path], tasks_dir: Path, row: dict[str, Any]) -> None:
+def _restore_group(record_path: Path, tasks_dir: Path, row: dict[str, Any]) -> None:
     """Move an archived record, then its sidecars, back without replacing a hot file.
 
     The clash check before this is advisory: a writer can create the hot record
@@ -1936,24 +1939,23 @@ def _restore_group(group: list[Path], tasks_dir: Path, row: dict[str, Any]) -> N
     ``tasks/archive``. Without it, the sweep can write that name back after
     this move.
     """
-    record_path, *sidecars = group
-    try:
-        with task_state_lock(record_path):
-            _move_no_replace(record_path, tasks_dir / record_path.name)
-    except FileExistsError:
-        row["action"] = "skipped"
-        row["skip_reason"] = f"a writer created {record_path.name} in the hot directory first; archived copy kept"
-        return
-    except OSError as exc:
-        row["action"], row["error"] = "error", f"{type(exc).__name__}: {exc}"
-        return
     kept: list[str] = []
     try:
-        for sidecar in sidecars:
+        with task_state_lock(record_path), task_record_store.task_archive_lock(tasks_dir, moving=True):
+            # An archive move may have been publishing sidecars during the advisory listing.
+            sidecars = sidecar_paths(record_path)
+            row["files"] = [record_path.name, *(sidecar.name for sidecar in sidecars)]
             try:
-                _move_no_replace(sidecar, tasks_dir / sidecar.name)
+                _move_no_replace(record_path, tasks_dir / record_path.name)
             except FileExistsError:
-                kept.append(str(sidecar))
+                row["action"] = "skipped"
+                row["skip_reason"] = f"a writer created {record_path.name} in the hot directory first; archived copy kept"
+                return
+            for sidecar in sidecars:
+                try:
+                    _move_no_replace(sidecar, tasks_dir / sidecar.name)
+                except FileExistsError:
+                    kept.append(str(sidecar))
     except OSError as exc:
         row["action"], row["error"] = "error", f"{type(exc).__name__}: {exc}"
         return
@@ -1979,14 +1981,14 @@ def restore_archived(tasks_dir: Path, names: Iterable[str], *, apply: bool = Fal
             row["action"], row["skip_reason"] = "skipped", "not in archive"
         else:
             group = [record_path, *sidecar_paths(record_path)]
+            row["files"] = [path.name for path in group]
             clashes = [path.name for path in group if (tasks_dir / path.name).exists()]
             if clashes:
                 row["action"], row["skip_reason"] = "skipped", f"hot directory already holds {', '.join(clashes)}"
             elif not apply:
                 row["action"] = "would_restore"
             else:
-                _restore_group(group, tasks_dir, row)
-            row["files"] = [path.name for path in group]
+                _restore_group(record_path, tasks_dir, row)
         rows.append(row)
     return {
         "command": "restore",

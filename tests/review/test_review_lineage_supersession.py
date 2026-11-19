@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from lu_machinery.review import record_cf_verdict as recorder
@@ -81,6 +84,31 @@ def report(*pairs, exclude_head=None):
 
 
 ORPHAN_REJECTION = "VERDICT: REQUEST_CHANGES\nF1 [P1] scripts/unit.py:1 the guard drops a case."
+
+
+def test_lineage_keeps_the_reply_when_a_listed_review_moves_to_archive(tmp_path, monkeypatch):
+    """Defect class: moving a listed review to the archive refuses lineage admission."""
+    branch = "codex/reviewed"
+    repository = "org/repo"
+    hot = tmp_path / "review.json"
+    archived = tmp_path / "archive" / hot.name
+    archived.parent.mkdir()
+    run, _ = review(hot.stem, APPROVED, "VERDICT: APPROVE", minute=2, publish=False)
+    hot.write_text(json.dumps({**run.record, "repository": repository, "review_branch": branch}))
+    hot.with_suffix(".result").write_text(run.reply)
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+            hot.with_suffix(".result").rename(archived.with_suffix(".result"))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    runs = lineage_runs(tmp_path, repository=repository, number=None, branch=branch)
+
+    assert [(entry.task_id, entry.reply) for entry in runs] == [("review", "VERDICT: APPROVE")]
 
 
 def test_a_later_same_seat_approve_supersedes_an_unpublished_rejection_and_keeps_it_listed():

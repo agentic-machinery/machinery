@@ -253,6 +253,54 @@ def locate_task_record(tasks_dir: Path, task_id: str) -> Path | None:
     return None
 
 
+def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]:
+    """Follow the observed file to its exact counterpart if an archive move removes its name."""
+    observed = path.stat()
+    try:
+        return path, path.read_bytes()
+    except FileNotFoundError:
+        archive = tasks_dir / ARCHIVE_DIR_NAME
+        if path.parent == tasks_dir:
+            counterpart = archive / path.name
+        elif path.parent == archive:
+            counterpart = tasks_dir / path.name
+        else:
+            raise
+        with task_archive_lock(tasks_dir), counterpart.open("rb") as moved:
+            if not os.path.samestat(observed, os.fstat(moved.fileno())):
+                raise
+            return counterpart, moved.read()
+
+
+def read_listed_task_record(path: Path, *, tasks_dir: Path | None = None) -> dict[str, Any] | None:
+    """Parse a listed record across a move between the hot directory and archive."""
+    if tasks_dir is None:
+        tasks_dir = path.parent.parent if path.parent.name == ARCHIVE_DIR_NAME else path.parent
+    path, raw = read_task_record_bytes(path, tasks_dir=tasks_dir)
+    return parse_task_record(path, raw)
+
+
+@contextmanager
+def task_archive_lock(tasks_dir: Path, *, moving: bool = False) -> Iterator[None]:
+    """Keep strict scans and record/reply reads outside archive and restore group moves.
+
+    The tasks directory itself is the stable lock anchor, so read-only callers
+    create no files. A caller acquires any worktree or task-state lock first.
+    """
+    try:
+        fd = os.open(tasks_dir, os.O_RDONLY | os.O_DIRECTORY)
+    except FileNotFoundError:
+        if moving:
+            raise
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if moving else fcntl.LOCK_SH)
+        yield
+    finally:
+        os.close(fd)
+
+
 def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Path]:
     """Yield candidate JSON paths: the hot directory sorted by name, then the archive.
 
@@ -287,13 +335,22 @@ def relocated_result_file(record_path: Path, result_file: str | None) -> str | N
     """Return where ``result_file`` lives now for the record at ``record_path``.
 
     A record keeps the hot-directory ``result_file`` path it was written with.
-    Archiving moves the ``.result`` sidecar next to the archived record, so an
-    archived record's sidecar is looked up beside it; any other path is returned
-    unchanged.
+    Archive and restore keep a stamped record beside its stamped reply. Even
+    if that reply is missing, the old basename may name a different run.
     """
-    if record_path.parent.name != ARCHIVE_DIR_NAME or not isinstance(result_file, str) or not result_file:
+    if not isinstance(result_file, str) or not result_file:
         return result_file
-    moved = record_path.with_name(Path(result_file).name)
+    result = Path(result_file)
+    reply = record_path.with_suffix(".result")
+    if (
+        result.suffix == ".result"
+        and _REDISPATCH_ARCHIVED_STEM_RE.fullmatch(record_path.stem)
+        and candidate_task_record_names(result.stem, (record_path.name,))
+    ):
+        return str(reply)
+    if record_path.parent.name != ARCHIVE_DIR_NAME:
+        return result_file
+    moved = record_path.with_name(result.name)
     return str(moved) if moved.is_file() else result_file
 
 

@@ -76,6 +76,29 @@ def _remove(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, s
     return code, captured.out, captured.err
 
 
+def test_archive_move_does_not_hide_a_damaged_worktree_claim(tmp_path, monkeypatch):
+    """Defect class: a listed record moved to the archive is skipped even if damaged."""
+    primary = _primary(tmp_path)
+    worktree = _linked(primary, "codex/archive-claim")
+    _record(primary, "archived-claim", status="done")
+    hot = primary / "batch_state" / "tasks" / "archived-claim.json"
+    archived = hot.parent / "archive" / hot.name
+    archived.parent.mkdir()
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+            archived.write_bytes(b'{"task_id": "archived-claim",')
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert worktree_claims.active_worktree_claim_refusal(
+        worktree, tasks_dir=hot.parent, repo_root=primary,
+    ) == f"task record {archived} unreadable; refusing worktree removal"
+
+
 def test_removes_an_unclaimed_linked_worktree_and_keeps_its_branch(tmp_path, capsys):
     primary = _primary(tmp_path)
     worktree = _linked(primary, "codex/impl-1")

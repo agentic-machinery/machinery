@@ -51,7 +51,8 @@ from lu_machinery.orchestration import backup_failure_alert, disk_watermark_aler
 from lu_machinery.orchestration.execution_safe_git import GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
 from lu_machinery.orchestration.pool_headroom import _read_limit
-from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
+from lu_machinery.orchestration.task_record_store import iter_task_records, task_archive_lock
+from lu_machinery.orchestration.task_record_store import read_listed_task_record as read_task_record
 from lu_machinery.orchestration.tmp_leak_sweep import sweep_tmp_leaks
 from lu_machinery.review.isolation import sweep_review_temp_orphans
 
@@ -537,57 +538,58 @@ def report_terminal_worktrees(repo_root: Path) -> dict[str, Any]:
     root = repo_root.resolve()
     tasks_dir = worktree_git.control_plane_root(root) / "batch_state" / "tasks"
     now = datetime.now(UTC)
-    for path in iter_task_records(tasks_dir, include_archive=True):
-        row = {"task_id": path.stem, "action": "error"}
-        try:
-            record = read_task_record(path)
-            if record is None:
-                continue
-            if not isinstance(record, dict):
-                raise ValueError("invalid task record")
-            if record.get("status") not in worktree_git._TERMINAL_DISPATCH_STATUSES:
-                continue
-            raw_path = record.get("worktree_path")
-            if raw_path is None:
-                continue
-            if not isinstance(raw_path, str):
-                raise ValueError("invalid worktree path")
-            worktree = (root / raw_path).resolve()
-            if not worktree.is_relative_to(root):
-                continue
+    with task_archive_lock(tasks_dir):
+        for path in iter_task_records(tasks_dir, include_archive=True):
+            row = {"task_id": path.stem, "action": "error"}
             try:
-                worktree.stat()
-            except FileNotFoundError:
-                continue
-            finished = datetime.fromisoformat(str(record.get("finished_at")).replace("Z", "+00:00"))
-            age_seconds = (now - finished).total_seconds()
-            if age_seconds < 6 * 3600:
-                continue
-            row["task_id"] = record.get("task_id") or path.stem
-            row["worktree_path"] = worktree.relative_to(root).as_posix()
-            hold = retention_hold_disposition(record, tasks_root=tasks_dir)
-            if hold is not None:
-                if hold["worktree_disposition_reason"] == "task_record_damaged":
-                    raise ValueError(hold["worktree_disposition_detail"])
-                continue
+                record = read_task_record(path)
+                if record is None:
+                    continue
+                if not isinstance(record, dict):
+                    raise ValueError("invalid task record")
+                if record.get("status") not in worktree_git._TERMINAL_DISPATCH_STATUSES:
+                    continue
+                raw_path = record.get("worktree_path")
+                if raw_path is None:
+                    continue
+                if not isinstance(raw_path, str):
+                    raise ValueError("invalid worktree path")
+                worktree = (root / raw_path).resolve()
+                if not worktree.is_relative_to(root):
+                    continue
+                try:
+                    worktree.stat()
+                except FileNotFoundError:
+                    continue
+                finished = datetime.fromisoformat(str(record.get("finished_at")).replace("Z", "+00:00"))
+                age_seconds = (now - finished).total_seconds()
+                if age_seconds < 6 * 3600:
+                    continue
+                row["task_id"] = record.get("task_id") or path.stem
+                row["worktree_path"] = worktree.relative_to(root).as_posix()
+                hold = retention_hold_disposition(record, tasks_root=tasks_dir)
+                if hold is not None:
+                    if hold["worktree_disposition_reason"] == "task_record_damaged":
+                        raise ValueError(hold["worktree_disposition_detail"])
+                    continue
 
-            dirty = len(
-                _inspect_terminal_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
-            )
-            # F3 follow-up: a squash-merged branch can count as unpushed until its remote ref is gone.
-            unpushed = int(_inspect_terminal_git(worktree, "rev-list", "--count", "HEAD", "--not", "--remotes=origin"))
-            if dirty or unpushed:
-                row.update(
-                    action="report",
-                    branch=_inspect_terminal_git(worktree, "rev-parse", "--abbrev-ref", "HEAD"),
-                    dirty=dirty,
-                    unpushed=unpushed,
-                    age_seconds=int(age_seconds),
+                dirty = len(
+                    _inspect_terminal_git(worktree, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
                 )
+                # F3 follow-up: a squash-merged branch can count as unpushed until its remote ref is gone.
+                unpushed = int(_inspect_terminal_git(worktree, "rev-list", "--count", "HEAD", "--not", "--remotes=origin"))
+                if dirty or unpushed:
+                    row.update(
+                        action="report",
+                        branch=_inspect_terminal_git(worktree, "rev-parse", "--abbrev-ref", "HEAD"),
+                        dirty=dirty,
+                        unpushed=unpushed,
+                        age_seconds=int(age_seconds),
+                    )
+                    rows.append(row)
+            except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError) as exc:
+                row["error"] = f"terminal worktree inspection failed ({type(exc).__name__})"
                 rows.append(row)
-        except (OSError, ValueError, TypeError, RecursionError, subprocess.SubprocessError) as exc:
-            row["error"] = f"terminal worktree inspection failed ({type(exc).__name__})"
-            rows.append(row)
     return {"summary": {"candidate": sum(row["action"] == "report" for row in rows)}, "tasks": rows}
 
 
@@ -684,23 +686,25 @@ def settle_terminal_worktrees(repo_root: Path, *, apply: bool, github: GitHubRea
     # The hot record set iter_task_records yields, read here so that a directory or record that
     # cannot be listed or read marks the scan incomplete instead of disappearing from it.
     try:
-        names = sorted(entry.name for entry in os.scandir(root) if entry.name.endswith(".json"))
+        with task_archive_lock(root):
+            with os.scandir(root) as entries:
+                names = sorted(entry.name for entry in entries if entry.name.endswith(".json"))
+            for name in names:
+                try:
+                    record = read_task_record(root / name)
+                    if record is None:
+                        continue
+                except IsADirectoryError:
+                    continue
+                except (OSError, ValueError):
+                    complete = False
+                    unreadable.append(name)
+                    continue
+                if isinstance(record, dict):  # a JSON value that is not an object is no task record
+                    records.append(record)
     except OSError:
-        complete, names = False, []
+        complete = False
         unreadable.append(root.name)
-    for name in names:
-        try:
-            record = read_task_record(root / name)
-            if record is None:
-                continue
-        except IsADirectoryError:
-            continue
-        except (OSError, ValueError):
-            complete = False
-            unreadable.append(name)
-            continue
-        if isinstance(record, dict):  # a JSON value that is not an object is no task record
-            records.append(record)
     trees: list[dict[str, Any]] = []
     # The same record set settlement reads (dispatch v2); legacy records name trees it never settles.
     for record in records:

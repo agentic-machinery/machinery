@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -78,7 +79,53 @@ def test_locate_prefers_the_hot_record(tmp_path):
     assert store.candidate_task_record_names("other", names) == ()
 
 
-def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
+def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_path, monkeypatch):
+    """Defect class: recovery of a moved file reads another run with the same task ID."""
+    canonical = store.archived_task_record_path(tmp_path, "review")
+    canonical.parent.mkdir()
+    canonical.write_bytes(b'{"task_id": "review", "run_nonce": "canonical"}')
+    archived = canonical.with_name("review.20261119T140000Z.archived.json")
+    hot = tmp_path / archived.name
+    legacy = b'{"task_id": "review", "run_nonce": "legacy"}'
+    hot.write_bytes(legacy)
+    for path in (canonical, hot):
+        os.utime(path, ns=(1, 1))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot:
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (archived, legacy)
+    assert store.locate_task_record(tmp_path, "review") == canonical
+
+    def restore_before_read(path):
+        if path == archived:
+            archived.rename(hot)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", restore_before_read)
+    assert store.read_task_record_bytes(archived, tasks_dir=tmp_path) == (hot, legacy)
+
+    hot_canonical = tmp_path / canonical.name
+    hot_canonical.write_bytes(b'{"task_id": "review", "run_nonce": "replacement"}')
+
+    def collide_before_read(path):
+        if path == hot_canonical:
+            hot_canonical.rename(archived.with_name("review.20261119T150000Z.archived.json"))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", collide_before_read)
+    with pytest.raises(FileNotFoundError):
+        store.read_task_record_bytes(hot_canonical, tasks_dir=tmp_path)
+
+
+def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch):
+    from lu_machinery.dispatcher import store as dispatch_store
+    from lu_machinery.orchestration import orchestrator_control, stale_task_records
+
     tasks = tmp_path / "tasks"
     archived = store.archived_task_record_path(tasks, "old")
     archived.parent.mkdir(parents=True)
@@ -90,6 +137,38 @@ def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
     # Hot records and empty values are never rewritten.
     assert store.relocated_result_file(tasks / "old.json", hot_result) == hot_result
     assert store.relocated_result_file(archived, None) is None
+
+    archived.write_text(json.dumps({"task_id": "old", "run_nonce": "first", "result_file": hot_result}))
+    os.utime(archived, ns=(1, 1))
+    stamped = archived.with_name("old.20261119T140000Z.archived.json")
+    stamped.write_text(json.dumps({"task_id": "old", "run_nonce": "second", "result_file": hot_result}))
+    stamped_reply = stamped.with_suffix(".result")
+    stamped_reply.write_text("second run's reply", encoding="utf-8")
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+
+    for state in (dispatch_store.read("old", tasks_root=tasks), orchestrator_control.load_task_state(tasks, "old")):
+        assert state["run_nonce"] == "first"
+        assert Path(state["result_file"]).read_text() == "reply"
+
+    states = dispatch_store.list_tasks(include_archive=True, strict=True)
+    assert [(state["run_nonce"], Path(state["result_file"]).read_text()) for state in states] == [
+        ("second", "second run's reply"), ("first", "reply"),
+    ]
+
+    stamped_reply.unlink()
+    assert store.relocated_result_file(stamped, hot_result) == str(stamped_reply)
+    stamped_reply.write_text("second run's reply", encoding="utf-8")
+    (tasks / "old.json").write_text(json.dumps({"task_id": "old", "run_nonce": "third", "result_file": hot_result}))
+    Path(hot_result).write_text("third run's reply", encoding="utf-8")
+
+    assert stale_task_records.restore_archived(tasks, [stamped.name], apply=True)["actions"] == {"restored": 1}
+
+    restored = tasks / stamped.name
+    assert store.relocated_result_file(restored, str(stamped_reply)) == str(restored.with_suffix(".result"))
+
+    states = dispatch_store.list_tasks(include_archive=True, strict=True)
+    by_nonce = {state["run_nonce"]: Path(state["result_file"]).read_text() for state in states}
+    assert by_nonce == {"first": "reply", "second": "second run's reply", "third": "third run's reply"}
 
 
 def test_v2_record_under_another_name_raises_identity_mismatch_with_its_content(tmp_path):
