@@ -1927,7 +1927,7 @@ def archive_terminal(
     }
 
 
-def _restore_group(group: list[Path], tasks_dir: Path, row: dict[str, Any]) -> None:
+def _restore_group(record_path: Path, tasks_dir: Path, row: dict[str, Any]) -> None:
     """Move an archived record, then its sidecars, back without replacing a hot file.
 
     The clash check before this is advisory: a writer can create the hot record
@@ -1939,10 +1939,12 @@ def _restore_group(group: list[Path], tasks_dir: Path, row: dict[str, Any]) -> N
     ``tasks/archive``. Without it, the sweep can write that name back after
     this move.
     """
-    record_path, *sidecars = group
     kept: list[str] = []
     try:
         with task_state_lock(record_path), task_record_store.task_archive_lock(tasks_dir, moving=True):
+            # An archive move may have been publishing sidecars during the advisory listing.
+            sidecars = sidecar_paths(record_path)
+            row["files"] = [record_path.name, *(sidecar.name for sidecar in sidecars)]
             try:
                 _move_no_replace(record_path, tasks_dir / record_path.name)
             except FileExistsError:
@@ -1979,14 +1981,14 @@ def restore_archived(tasks_dir: Path, names: Iterable[str], *, apply: bool = Fal
             row["action"], row["skip_reason"] = "skipped", "not in archive"
         else:
             group = [record_path, *sidecar_paths(record_path)]
+            row["files"] = [path.name for path in group]
             clashes = [path.name for path in group if (tasks_dir / path.name).exists()]
             if clashes:
                 row["action"], row["skip_reason"] = "skipped", f"hot directory already holds {', '.join(clashes)}"
             elif not apply:
                 row["action"] = "would_restore"
             else:
-                _restore_group(group, tasks_dir, row)
-            row["files"] = [path.name for path in group]
+                _restore_group(record_path, tasks_dir, row)
         rows.append(row)
     return {
         "command": "restore",

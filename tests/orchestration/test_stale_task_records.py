@@ -1058,6 +1058,44 @@ def test_recorder_reads_a_complete_archive_group(tasks_dir, monkeypatch, operati
     assert response == "VERDICT: APPROVE"
 
 
+def test_restore_rechecks_sidecars_published_by_a_concurrent_archive(tasks_dir, monkeypatch):
+    """Defect class: restore freezes an incomplete sidecar list while archive publishes a reply."""
+    hot = _terminal(tasks_dir, "review", worktree_branch="codex/topic")
+    hot.with_suffix(".result").write_text("VERDICT: APPROVE")
+    archived_reply = tasks_dir / "archive" / "review.result"
+    reply_staged = threading.Event()
+    restore_started = threading.Event()
+    finish_archive = threading.Event()
+    move = str_mod._move_no_replace
+    restore_group = str_mod._restore_group
+
+    def pause_archive_reply(source, destination):
+        if destination == archived_reply:
+            reply_staged.set()
+            assert finish_archive.wait(timeout=10)
+        return move(source, destination)
+
+    def observe_restore(*args, **kwargs):
+        restore_started.set()
+        return restore_group(*args, **kwargs)
+
+    monkeypatch.setattr(str_mod, "_move_no_replace", pause_archive_reply)
+    monkeypatch.setattr(str_mod, "_restore_group", observe_restore)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        archive = pool.submit(str_mod.archive_terminal, tasks_dir, now=NOW, apply=True)
+        try:
+            assert reply_staged.wait(timeout=10)
+            restore = pool.submit(str_mod.restore_archived, tasks_dir, ["review"], apply=True)
+            assert restore_started.wait(timeout=10)
+        finally:
+            finish_archive.set()
+        assert archive.result(timeout=10)["actions"] == {"archived": 1}
+        assert restore.result(timeout=10)["records"][0]["files"] == ["review.json", "review.result"]
+
+    record, reply = record_cf_verdict._task("review", tasks_dir)
+    assert (record["task_id"], reply) == ("review", "VERDICT: APPROVE")
+
+
 def test_archive_preserves_stable_lock_anchors(tasks_dir):
     _terminal(tasks_dir, "old-done")
     (tasks_dir / "old-done.json.lock").write_text("")
