@@ -249,8 +249,9 @@ def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
     """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
     launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, overlapping
-    tasks on one pool each charged the pool's whole drop, a nested reset reported as zero spend, or a rise
-    between two tasks' readings reported as measured spend."""
+    tasks on one pool each charged the pool's whole drop, a nested reset reported as zero spend, a rise
+    between two tasks' readings reported as measured spend, or a number taken from two readings that share
+    a timestamp and disagree."""
     readings = iter([None, 35.0])
     monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
@@ -359,10 +360,20 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
             started_at=(NOW - timedelta(hours=7, minutes=30)).isoformat(),
             finished_at=(NOW - timedelta(hours=6)).isoformat(),
             allowance={"pool": "codex:a", "start": {"remaining_pct": 70.0}, "finish": {"remaining_pct": 65.0}})
+    # Same start timestamp, 80 and 95. Finish order does not say which start came first, so 15 points would
+    # be a guess. The clock sits between the other codex:a clusters so this pair is its own row.
+    _record(tasks, "tie-a", model="gpt-6.2-sol", effort="medium",
+            started_at=(NOW - timedelta(hours=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=4)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "tie-b", model="gpt-6.2-sol", effort="medium",
+            started_at=(NOW - timedelta(hours=5)).isoformat(),
+            finished_at=(NOW - timedelta(hours=3)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 65.0}})
     rows.backfill(tasks, batch_state)
     landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer",
               "inner", "cross-outer", "cross-inner", "buried-outer", "buried-inner", "gap-outer", "gap-inner",
-              "cross-read-a", "cross-read-b"}
+              "cross-read-a", "cross-read-b", "tie-a", "tie-b"}
     window = _window(batch_state, stats.Landing(task_ids=landed))
     unknown = {"value": None, "n": 1, "low_sample": True}
     assert window["allowance"] == [
@@ -382,6 +393,9 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
          "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
          "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
         {"pool": "codex:a", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "codex:a", "model": "gpt-6.2-sol", "effort": "medium", "tasks": 2, "landed": 2, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
          "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
         {"pool": "codex:b", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,

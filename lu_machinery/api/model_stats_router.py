@@ -572,8 +572,9 @@ def _clusters(rows: list[_Row]) -> list[_Cluster]:
     """One cluster per overlapping run, built once per pool across every model.
 
     A later pool reading above an earlier one, including a rise between two tasks, means the weekly window
-    reset inside the cluster. That cluster's points stay unknown. A cluster shared by more than one model,
-    effort or class cannot be split from these rows, so a subgroup that only partly owns it is unknown too.
+    reset inside the cluster. Readings that share a timestamp and disagree have no order, so that cluster's
+    points stay unknown too. A cluster shared by more than one model, effort or class cannot be split from
+    these rows, so a subgroup that only partly owns it is unknown too.
     """
     by_pool: dict[str, list[tuple[_Meter, _Row]]] = defaultdict(list)
     for row in rows:
@@ -602,10 +603,15 @@ def _clusters(rows: list[_Row]) -> list[_Cluster]:
             latest = max(meters, key=lambda meter: meter.end)
             events = [(meter.start, meter.start_pct) for meter in meters]
             events.extend((meter.end, meter.finish_pct) for meter in meters)
+            by_time: dict[datetime, set[float]] = defaultdict(set)
+            for at, pct in events:
+                by_time[at].add(pct)
+            # A tie has no order: the higher reading may be the later one, which is a reset.
+            unordered = any(len(pcts) > 1 for pcts in by_time.values())
             # A later reading above an earlier one is a reset, including a rise between two tasks.
-            reset = any(later_pct > earlier_pct for earlier_at, earlier_pct in events
-                        for later_at, later_pct in events if later_at > earlier_at) or any(
-                            meter.finish_pct > meter.start_pct for meter in meters)
+            reset = unordered or any(later_pct > earlier_pct for earlier_at, earlier_pct in events
+                                     for later_at, later_pct in events if later_at > earlier_at) or any(
+                                         meter.finish_pct > meter.start_pct for meter in meters)
             net = earliest.start_pct - latest.finish_pct
             built.append(_Cluster(pool, members, None if reset or net < 0 else net))
     return built
@@ -1011,7 +1017,8 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             "links": "This snapshot does not include task ids.",
             "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
                      "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
-                     "contains a reset, stays unknown. It is never reported as zero.",
+                     "contains a reset or two readings at one timestamp that disagree, stays unknown. "
+                     "It is never reported as zero.",
             "difficulty": "There is no difficulty weight. Compare models inside one task class.",
             "wall_hours": "Wall hours per landed stay blank when any task has no duration. The observed figure "
                           "uses the recorded hours when at most one task, or one percent, is untimed.",
