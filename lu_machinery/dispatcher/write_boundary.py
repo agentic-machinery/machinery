@@ -320,9 +320,15 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
         argv += ["--runtime", str(dispatch_lease(spec.task_id))]
-    for name in sorted(_HOST_CONTEXT):
-        if os.environ.get(name) and name not in invocation.env:
-            argv += ["--host-env", f"{name}={os.environ[name]}"]
+    host = {name: os.environ[name] for name in _HOST_CONTEXT if os.environ.get(name) and name not in invocation.env}
+    # The launcher's own GitHub reads (the published address ranges, the github-read relay) use the dispatcher's
+    # gh login. The launcher starts with the provider's environment, and a provider may point XDG_CONFIG_HOME at
+    # a private, empty root (the Savant route does), where gh would read anonymously. No GH_* variable reaches
+    # the provider, so pinning this one changes nothing inside.
+    host["GH_CONFIG_DIR"] = os.environ.get("GH_CONFIG_DIR") or str(
+        Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gh")
+    for name in sorted(host):
+        argv += ["--host-env", f"{name}={host[name]}"]
     return [*argv, "--", str(Path(found).absolute()), *invocation.argv[1:]]
 
 
@@ -648,11 +654,21 @@ def github_networks() -> tuple:
 
     from lu_machinery.common import github_client
 
+    why = "the reply lacks complete web, api, git and packages ranges"
     try:
         proc = github_client.run(["gh", "api", "meta"], capture_output=True, text=True, check=False, timeout=60)
         meta = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        meta = None
+        if proc.returncode:
+            # The client's typed refusal (for example github_rate_limited: core_below_landing_reserve), never gh's text.
+            try:
+                typed = json_depth.loads(proc.stdout or "{}", max_depth=8)
+            except ValueError:
+                typed = None
+            typed = typed if isinstance(typed, dict) else {}
+            code = ": ".join(str(typed[key])[:60] for key in ("error", "reason") if isinstance(typed.get(key), str))
+            why = f"gh api meta exited {proc.returncode}" + (f": {code}" if code else "")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        meta, why = None, f"gh api meta failed: {type(exc).__name__}"
     networks = []
     ranges: dict = meta if isinstance(meta, dict) else {}
     complete = all(isinstance(ranges.get(key), list) and ranges[key] for key in _GITHUB_META_KEYS)
@@ -663,7 +679,7 @@ def github_networks() -> tuple:
             except (TypeError, ValueError):
                 complete = False
     if not complete or not any(network.version == 4 for network in networks):
-        raise Refused("GitHub's published address ranges cannot be read; the boundary could not refuse GitHub")
+        raise Refused(f"GitHub's published address ranges cannot be read ({why}); the boundary could not refuse GitHub")
     return tuple(dict.fromkeys(networks))
 
 
