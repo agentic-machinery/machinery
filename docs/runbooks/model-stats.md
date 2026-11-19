@@ -198,7 +198,8 @@ appears under **Both sources**.
   have fewer than 10 reviewed PRs or fewer than 10 landed tasks. A green ring marks a model on the
   frontier for the whole window, even when a model filter hides other points.
 - **Best model per job** uses a star for the highest positive landed share in each class among
-  the displayed models with at least 10 tasks. Models tied at that rate all get a star.
+  models with at least 10 tasks in the window. Models tied at that rate all get a star. Filtering
+  by model hides other rows and keeps the original ranks.
 - **Where the work went** counts dispatcher outcomes. **Done** measures completed runs. **Landed**
   in the write table measures merges. The status chart shows each model's total and Done share.
 - **Week by week** uses UTC ISO weeks. An asterisk marks a week that the selected window only

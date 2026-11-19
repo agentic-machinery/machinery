@@ -326,14 +326,16 @@ function svgChart(width, height, label, body) {
 function chartWidth(id) { return Math.min(1000, $(id).clientWidth); }
 function niceScale(maximum, width) {
   const ideal = (maximum || 1) / (width < 400 ? 4 : 6);
-  const base = 10 ** Math.floor(Math.log10(ideal));
-  const unit = [1, 2, 2.5, 5, 10].find((step) => step * base >= ideal) * base;
+  const exponent = Math.floor(Math.log10(ideal)), base = 10 ** exponent;
+  const multiplier = [1, 2, 2.5, 5, 10].find((step) => step * base >= ideal);
+  const unit = multiplier * base;
+  const decimals = Math.max(0, Number(multiplier === 2.5) - exponent);
   const steps = Math.ceil((maximum || 1) / unit);
-  return {max: steps * unit, ticks: Array.from({length: steps + 1}, (_, i) => i * unit)};
+  return {max: steps * unit, ticks: Array.from({length: steps + 1}, (_, i) => i * unit), decimals};
 }
-function verticalTicks(ticks, sx, top, bottom) {
+function verticalTicks({ticks, decimals}, sx, top, bottom) {
   return ticks.map((tick) => `<line class="grid" x1="${sx(tick)}" x2="${sx(tick)}" y1="${top}" y2="${bottom}"/>`
-    + `<text x="${sx(tick)}" y="${bottom + 17}" text-anchor="middle">${num(tick, 2)}</text>`).join("");
+    + `<text x="${sx(tick)}" y="${bottom + 17}" text-anchor="middle">${num(tick, decimals)}</text>`).join("");
 }
 function percentTicks(sy, left, right) {
   return [0, 0.25, 0.5, 0.75, 1].map((share) =>
@@ -372,9 +374,9 @@ function scatter(points, id, yLabel, xLabel, connect = false) {
   }).join("");
   const legend = points.map((p) => `<span>${modelKey(p.model, p.low_sample)}</span>`).join("");
   const shared = groups.filter((group) => group.length > 1).map((group) =>
-    `<li>At ${num(group[0].x, 2)} on the horizontal axis and ${num(group[0].y * 100)}% approval, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
+    `<li>At ${num(group[0].x, 3)} on the horizontal axis and ${num(group[0].y * 100, 1)}% approval, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
   return svgChart(W, H, `${yLabel} against ${xLabel}`,
-    percentTicks(sy, left, right) + verticalTicks(scale.ticks, sx, top, bottom) + line + intervals + dots
+    percentTicks(sy, left, right) + verticalTicks(scale, sx, top, bottom) + line + intervals + dots
     + `<text x="${left}" y="14">${yLabel} ↑</text>`
     + `<text x="${(left + right) / 2}" y="${H - 5}" text-anchor="middle">${xLabel}</text>`)
     + `<div class="legend">${legend}</div>`
@@ -400,10 +402,11 @@ function jobs(data) {
   const charts = data.charts || {};
   const rows = (charts.jobs || []).flatMap((job) => {
     const landedShare = (model) => model.landed / model.tasks;
-    const models = job.models.filter((m) => keepModel(m.model)).sort((a, b) =>
+    const ranked = [...job.models].sort((a, b) =>
       landedShare(b) - landedShare(a) || b.tasks - a.tasks || a.model.localeCompare(b.model));
+    const models = ranked.filter((m) => keepModel(m.model));
     if (!models.length) return [];
-    const best = models.find((m) => m.tasks >= lowBelow() && m.landed > 0);
+    const best = ranked.find((m) => m.tasks >= lowBelow() && m.landed > 0);
     return [`<tr class="group"><th colspan="6">${esc(job.class)}</th></tr>`, ...models.map((m) => {
       const winner = best && m.tasks >= lowBelow() && landedShare(m) === landedShare(best);
       return `<tr class="${winner ? "best" : ""}"><td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
@@ -506,7 +509,7 @@ function strictness(items) {
   if (!shown.length) return '<p class="muted">No model has both an approval rate and a findings count.</p>';
   const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
     + cell(share(p.approve, p.approve_n)) + cell(ciText(p.approve_ci)) + cell(p.approve_n)
-    + cell(num(p.p0_p2, 2)) + cell(p.findings_n) + "</tr>");
+    + cell(num(p.p0_p2, 3)) + cell(p.findings_n) + "</tr>");
   return scatter(shown.map((p) => ({...p, x: p.p0_p2, y: p.approve, ci: p.approve_ci})),
     "strictness", "Reviewer approval", "P0–P2 findings per review →")
     + '<p class="note">Hollow markers have low samples. The records count reviewer findings and verdicts. They cannot tell whether each finding was correct.</p>'
@@ -533,7 +536,7 @@ function boxes(items) {
       + `<span>${mins(item.median)} min median ${item.low_sample ? LOW : ""}</span></div>`
       + `<svg class="chart" width="${W}" height="20" viewBox="0 0 ${W} 20" aria-hidden="true">${bar}</svg>`;
   }).join("");
-  const axis = svgChart(W, 43, "Write task duration in minutes", verticalTicks(scale.ticks, sx, 0, 5)
+  const axis = svgChart(W, 43, "Write task duration in minutes", verticalTicks(scale, sx, 0, 5)
     + `<text x="${(left + right) / 2}" y="37" text-anchor="middle">Minutes →</text>`);
   const rows = shown.map((item) => `<tr><td>${esc(item.model)}</td>${cell(nOf(item))}`
     + [item.p25, item.median, item.p75, item.p90].map((v) => cell(mins(v))).join("") + "</tr>");
