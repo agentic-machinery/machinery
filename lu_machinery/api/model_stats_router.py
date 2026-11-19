@@ -43,6 +43,7 @@ from prometheus_client.core import GaugeMetricFamily
 
 from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 
@@ -71,7 +72,8 @@ WINDOWS: dict[str, int | None] = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "all"
 METRIC_WINDOWS = ("7d", "30d", "90d", "all")
 PAGE_DROP = frozenset({
     "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed"})
-STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed")
+STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
+START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
 ALL_EFFORTS = "all"
 # Review policy blocks on P0 and P1 (fleet_comms.review_publication.BLOCKING_PRIORITIES); the
@@ -302,7 +304,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         verdict = review.get("verdict") if review else None
         priorities = review.get("priorities") if review else None
         row_review: tuple[str, Counter[str] | None, str | None, str | None] | None = None
-        if role == "review":
+        if role == "review" and row_status != NEVER_STARTED:
             if verdict in VERDICTS[:3]:
                 row_review = (verdict, Counter(priorities) if isinstance(priorities, Mapping) else None, None, None)
             elif row_status != "done":
@@ -336,6 +338,7 @@ class _Group:
         self.tokens = [0, 0, 0]
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
+        self.never_started_reasons: Counter[str] = Counter()
         self.unparsed_reasons: Counter[str] = Counter()
         self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str]] = {}
         self.priorities: Counter[str] = Counter()
@@ -345,6 +348,10 @@ class _Group:
 
     def add(self, row: _Row) -> None:
         self.status[row.status] += 1
+        if row.status == NEVER_STARTED:
+            reason = row.raw.get("never_started_reason")
+            code = reason if isinstance(reason, str) and reason in START_REFUSAL_CODES else "unknown"
+            self.never_started_reasons[code] += 1
         if row.duration is not None:
             self.durations.append(row.duration)
         self.tokens = [a + b for a, b in zip(self.tokens, row.tokens, strict=True)]
@@ -378,6 +385,7 @@ class _Group:
         self.tokens = [a + b for a, b in zip(self.tokens, other.tokens, strict=True)]
         self.landed += other.landed
         self.verdicts.update(other.verdicts)
+        self.never_started_reasons.update(other.never_started_reasons)
         self.unparsed_reasons.update(other.unparsed_reasons)
         for reason, item in other.unparsed_samples.items():
             prev = self.unparsed_samples.get(reason)
@@ -399,6 +407,7 @@ class _Group:
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
             "status": {name: self.status[name] for name in (*STATUSES, "other")},
+            "never_started_reasons": dict(sorted(self.never_started_reasons.items())),
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
             "wall_seconds": {"p25": _percentile(self.durations, 0.25), "median": _median(self.durations),
@@ -788,7 +797,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
         head = row.raw.get("pinned_head")
         if row.landed and row.delivery:
             landed.add((row.raw["repo"], row.raw["landing"]["pr"]))
-        if row.role == "review" and (pr := _reviewed_pr(row)) is not None:
+        if row.review is not None and (pr := _reviewed_pr(row)) is not None:
             if head:
                 prs_by_head[(pr[0], head)].add(pr)
             if pr not in first or _review_order(row) < _review_order(first[pr]):
@@ -796,7 +805,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
 
     linked: dict[tuple[str, str], list[tuple[_PrKey, _Row]]] = defaultdict(list)
     for row in rows:
-        if row.role != "review":
+        if row.review is None:
             continue
         pr = _reviewed_pr(row)
         head = row.raw.get("pinned_head")

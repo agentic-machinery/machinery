@@ -13,7 +13,7 @@ ids.
 
 Every settled dispatch task has one summary row in `batch_state/model-stats/rows.jsonl`
 (`lu_machinery/api/model_stats_rows.py`, schema `model-stats-row.v1`): task id, harness, concrete model, effective
-effort, role, class, terminal status, start and finish times, wall seconds, normalised tokens, allowance readings,
+effort, role, class, terminal status, any typed pre-start refusal, start and finish times, wall seconds, normalised tokens, allowance readings,
 the review verdict and finding priorities, the reviewed PR and head, and the merged delivery the task recorded.
 The dispatcher store appends a row after each write of a settled record in a `tasks/` directory; the last row of a
 task id wins, so the record's final update decides. Each row carries its record version (`source_mtime_ns`, the
@@ -41,7 +41,8 @@ store (an indexed table or weekly roll-ups).
 
 Run from the product checkout. Start with `--dry-run` to see how many rows the command would add or refresh.
 The command reads hot and archived task records, with the hot copy taking precedence. It appends missing rows,
-refreshes older rows, and recovers review evidence from retained results. Rerunning it with the same evidence
+refreshes older rows, and recovers review evidence from retained results. It also refreshes a row when its task
+record proves a pre-start refusal. Rerunning it with the same evidence
 makes no changes. The command leaves task records intact. A row shows only what its record and that record's
 current `.result` file prove: nothing is carried over from a stored row. A result that is gone, replaced or
 unreadable when the backfill runs, or when the dispatcher rewrites the record, leaves the row with the record's
@@ -105,6 +106,16 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   directly.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
+- **Never started** records a dispatch refusal before the provider model ran. The task retains its dispatcher
+  terminal status and carries `never_started_reason`. Model stats projects `status.never_started` and reports
+  `never_started_reasons` by model, effort, role and class. The dashboard lists counts by cause for the selected
+  window and model. These rows have zero tokens, count toward total and not-done attempts and contribute no
+  review verdict, unparsed reply or allowance spend. A sandbox launcher can have a process group while the
+  provider it guards has yet to start.
+- **Legacy refusal evidence** comes from a retained task record with a known pre-start error and no provider
+  start evidence, or a verified refusal receipt. For example, exit 125 and a matching `refused` boundary status
+  identify the boundary refusal. A missing receipt or an `interrupted` boundary leaves the original status in
+  model stats. Summary rows whose task records expired retain their original classification.
 - **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer outside a code
   fence, in a commit message on a registered repository's local `origin/main` since the first row, or that
   recorded its own merged delivery into `main` (`delivery_merge_sha`, proven against GitHub at settlement).
@@ -179,7 +190,7 @@ is `other`; `effort` is a catalog effort word
 (`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `thinking`, `thinking-<level>`), `unset`, `not-exposed`,
 `unknown` or `all` (every effort of that model), and any other value is `other`; `role` is `write`, `review` or
 `author`; `status` is a terminal status other than `done` (`no_deliverable`, `failed`, `timeout`, `rate_limited`,
-`cancelled`, `crashed`, `other`). The `other` buckets are aggregated, not summed series; exact values stay in the
+`cancelled`, `crashed`, `never_started`, `other`). The `other` buckets are aggregated, not summed series; exact values stay in the
 rows and the route. No task ids, paths or accounts.
 
 | Metric | Labels | Meaning |

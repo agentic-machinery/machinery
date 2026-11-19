@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict
 
 ReviewAccess = Literal["isolated", "full"]
+NEVER_STARTED = "never_started"
+
+
+class StartRefusal(StrEnum):
+    """Value-free causes safe to copy from a task record into model stats."""
+
+    ACCOUNT = "account_check"
+    BOUNDARY = "boundary_refusal"
+    CAPACITY = "admission_capacity"
+    ELIGIBILITY = "route_eligibility"
+    HEADROOM = "headroom"
+    PLACEMENT = "worker_placement"
+    SETUP = "setup_refusal"
+    REVIEW_SETUP = "review_setup_refusal"
+    MODEL_UNAVAILABLE = "model_unavailable"
 
 
 class ReviewAttempt(TypedDict):
@@ -48,3 +64,4 @@ class ParsedResult:
     rate_limited: bool = False  # the provider's own terminal event says it is out of capacity; error holds its message
     sources_mcp_call_count: int | None = None  # completed Sources MCP calls; None when the provider cannot tell
     incomplete: bool = False  # the run ended with its work still open, whatever error the message reports
+    start_refusal: StartRefusal | None = None

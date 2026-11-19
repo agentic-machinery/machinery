@@ -4,17 +4,38 @@ These helpers retain the account, review-slot and placement contracts used by
 dispatch v2 (C-2188 unit D).
 """
 
+import contextlib
 import functools
+import logging
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from lu_machinery.common import test_slots
+from lu_machinery.dispatcher import providers, store
+from lu_machinery.dispatcher.types import StartRefusal
 from lu_machinery.orchestration import dispatch_isolation
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS
 
 # Slots a Codex read-only review holds for its reviewer: the review bound of two test workers (cto-10744).
 REVIEW_TEST_SLOTS = 2
+
+
+@contextlib.contextmanager
+def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | None = None, hold: dict | None = None):
+    """Keep an operational admission refusal while preserving the CLI error and its exit code."""
+    try:
+        yield
+    except (OSError, ValueError, subprocess.SubprocessError):
+        if agent in providers.PROVIDERS and not (args.dry_run or args.print_advisory_binding):
+            try:
+                store.record_admission_refusal(
+                    task_id or args.task_id or uuid.uuid4().hex, agent, vars(args), reason, hold=hold,
+                )
+            except (OSError, store.TaskRecordError) as exc:
+                logging.getLogger(__name__).warning("could not record pre-start refusal: %s", type(exc).__name__)
+        raise
 
 
 def review_typed(record: dict) -> bool:

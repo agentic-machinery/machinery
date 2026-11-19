@@ -149,17 +149,26 @@ class Refused(RuntimeError):
     """The boundary cannot be proven; AGY does not start."""
 
 
-def unavailable() -> str | None:
+def unavailable(*, require_overlay: bool = False) -> str | None:
     """Why this host cannot start the boundary, or None. Admission checks this; the launch proves it."""
     if platform.system() != "Linux":
         return "its bubblewrap read-only boundary runs on Linux only"
     from lu_machinery.review.isolation import ReviewIsolationError, _resolve_fixed_system_executable
 
     try:
-        _resolve_fixed_system_executable("bwrap", reject_roots=())
+        bwrap = _resolve_fixed_system_executable("bwrap", reject_roots=())
     except ReviewIsolationError:
         return "bubblewrap (bwrap) is not installed, so its read-only boundary cannot start"
+    if require_overlay and not supports_overlay(bwrap):
+        return "bubblewrap 0.10 or later is required (--overlay-src)"
     return None
+
+
+def supports_overlay(bwrap: Path) -> bool:
+    """Probe the native boundary's required overlay option on the resolved system binary."""
+    usage = subprocess.run([str(bwrap), "--help"], capture_output=True, text=True, timeout=30, check=False,  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                           stdin=subprocess.DEVNULL)
+    return "--overlay-src" in usage.stdout + usage.stderr
 
 
 def scratch(task_id: str) -> Path:

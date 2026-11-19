@@ -18,6 +18,7 @@ from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.dispatcher import (
     admission,
+    agy_sandbox,
     checks,
     git,
     headroom,
@@ -32,7 +33,7 @@ from lu_machinery.dispatcher import (
     worker,
 )
 from lu_machinery.dispatcher.environment import child_env, probe_env
-from lu_machinery.dispatcher.types import ReviewAccess, TaskSpec
+from lu_machinery.dispatcher.types import ReviewAccess, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import DEFAULT_INITIAL_RESPONSE_TIMEOUT_S, DEFAULT_SILENCE_TIMEOUT_S, deadlines
 
 # Grok runs through Cursor's TUI: --agent cursor --model grok-4.7-high (grok-build is the separate Grok TUI).
@@ -385,17 +386,18 @@ def _dispatch(args) -> int:
     # runs before any check, worktree or task record.
     from lu_machinery.lib import rules_core
 
-    try:
-        rules_core.require_core()
-    except rules_core.RulesCoreMissing as exc:
-        raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
-    # A CTO seat in safe mode starts no new write work; read-only diagnosis, including the advisory binding
-    # digest it computes from a proposed write dispatch's arguments, still runs (cto_safe_mode).
-    if args.mode != "read-only" and not args.print_advisory_binding and (
-        refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
-    ):
-        raise host_admission.Refused(f"❌ {refusal}", 2)
-    agent =ALIASES.get(args.agent, args.agent)
+    agent = ALIASES.get(args.agent, args.agent)
+    with admission.record_refusal(args, agent, StartRefusal.SETUP):
+        try:
+            rules_core.require_core()
+        except rules_core.RulesCoreMissing as exc:
+            raise ValueError(f"dispatch refused: {exc}; the rules core is required.") from None
+    # A CTO seat in safe mode starts no new write work. Read-only diagnosis and advisory binding still run.
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        if args.mode != "read-only" and not args.print_advisory_binding and (
+            refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
+        ):
+            raise host_admission.Refused(f"❌ {refusal}", 2)
     if agent == "agy":
         # The requested Claude id is the catalog's AGY wire id, not the bare catalog id.
         from lu_machinery.dispatcher.providers.agy import transport_model
@@ -424,16 +426,19 @@ def _dispatch(args) -> int:
         from lu_machinery.dispatcher.agy_sandbox import bind_inputs
 
         bound_inputs = bind_inputs(args.input, repo_root=git.resolve_repo(args.repo)[0])
-    if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent)):
-        raise ValueError(refusal)
+    with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
+        if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent)):
+            raise ValueError(refusal)
     deadlines(vars(args))
     if args.cwd and (args.branch or args.pinned_head or args.worktree is not None):
         raise ValueError("invalid process deadline or conflicting existing-worktree options")
-    account_fields = admission.claude_account(agent, args.claude_account)
-    args.claude_account = account_fields.get("claude_account", args.claude_account)
-    if admission.claude_budget(args.claude_account, args.max_budget_usd) is None and args.max_budget_usd is not None:
+    with admission.record_refusal(args, agent, StartRefusal.ACCOUNT):
+        account_fields = admission.claude_account(agent, args.claude_account)
+        args.claude_account = account_fields.get("claude_account", args.claude_account)
+        budget = admission.claude_budget(args.claude_account, args.max_budget_usd)
+        account_fields.update(admission.codex_account(agent, args.codex_account))
+    if budget is None and args.max_budget_usd is not None:
         raise ValueError("--max-budget-usd applies only to a Claude API-key account")
-    account_fields.update(admission.codex_account(agent, args.codex_account))
     args.codex_account = account_fields.get("codex_account")
     if args.print_advisory_binding:
         if not args.task_id or source == "-":
@@ -473,7 +478,8 @@ def _dispatch(args) -> int:
         raise ValueError("--allow-open-dependency requires --task-card")
     gate_fields: dict[str, object] = {}
     if args.task_card:
-        gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
+        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+            gate_fields["task_card"] = checks.check_task_card(args.task_card, args.allow_open_dependency, info.get("github"))
     if args.mode != "read-only" and args.owned_path:
         overlap, not_checked = checks.owned_path_overlap(args.owned_path, task_id, info["key"])
         if not_checked:
@@ -483,20 +489,24 @@ def _dispatch(args) -> int:
             if args.refuse_on_overlap:
                 raise ValueError(f"owned_path_overlap_refused: owned paths overlap live write tasks {', '.join(overlap)}")
         gate_fields.update(owned_path_overlap=overlap, owned_path_overlap_not_checked=not_checked)
-    host_admission.precheck(args.mode, force_reason=args.force_admission)
+    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+        host_admission.precheck(args.mode, force_reason=args.force_admission)
     role_record = {**vars(args), **account_fields, "prompt_sha256": store.digest(prompt),
                    "repository_id": info.get("github")}
-    trial_fields = checks.check_trial_shadow(agent, args.model, role_record)
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        trial_fields = checks.check_trial_shadow(agent, args.model, role_record)
     role_record.update(trial_fields)
-    try:
-        headroom.check_plan(agent, args.model, role_record,
-                            review=admission.review_typed(vars(args)) or bool(args.risk))
-    except headroom.model_pause.ModelPausedRefused as exc:
-        raise host_admission.Refused(f"❌ {exc}", 2) from None
-    host_admission.check_credit(agent, args.model)
-    checks.check_model_admission(agent, args.model, args.mode, vars(args), prompt)
-    advisory_fields = checks.check_bounded_advisory(args, args.model, repo, prompt)
-    advisory_fields.update(checks.check_advisory_role(args, agent, args.model))
+    with admission.record_refusal(args, agent, StartRefusal.HEADROOM):
+        try:
+            headroom.check_plan(agent, args.model, role_record,
+                                review=admission.review_typed(vars(args)) or bool(args.risk))
+        except headroom.model_pause.ModelPausedRefused as exc:
+            raise host_admission.Refused(f"❌ {exc}", 2) from None
+        host_admission.check_credit(agent, args.model)
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        checks.check_model_admission(agent, args.model, args.mode, vars(args), prompt)
+        advisory_fields = checks.check_bounded_advisory(args, args.model, repo, prompt)
+        advisory_fields.update(checks.check_advisory_role(args, agent, args.model))
     force_reason = args.force_admission
     if force_reason is not None:
         force_reason = str(force_reason).strip()
@@ -582,21 +592,27 @@ def _dispatch(args) -> int:
         options=options,
         **fields,
     )
-    checks.check_private_input(spec, info["key"])
-    # Before any worktree or task record: an endpoint without access or funds is refused, never switched.
-    if agent == "opencode" and (refusal := opencode.endpoint_refusal(
-        spec.provider, probe_env(spec), worktree=worktree, repo=None if args.cwd else repo, sha=sha,
-    )):
-        raise ValueError(refusal)
-    if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):
-        raise ValueError(refusal)
+    # An endpoint without access or funds is refused before a worktree or slot is taken.
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        checks.check_private_input(spec, info["key"])
+        if agent == "opencode" and (refusal := opencode.endpoint_refusal(
+            spec.provider, probe_env(spec), worktree=worktree, repo=None if args.cwd else repo, sha=sha,
+        )):
+            raise ValueError(refusal)
+    with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
+        if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):
+            raise ValueError(refusal)
+        if (args.mode == "read-only" and not binding and agent not in {"agy", "muse"}
+                and (refusal := agy_sandbox.unavailable(require_overlay=True))):
+            raise ValueError(f"read_only_unenforceable: {refusal}")
     # A bound attempt is admitted before anything exists: its prompt is the exact render of its manifest
     # with these ids, its tools are granted and its pins are the commit's bytes (#12114).
-    review_contract = review_attempt.admit(args, prompt, binding, repo, sha) if binding and not args.dry_run else None
-    if args.review_mode == "red_team":
-        checks.check_review_family(args.review_author_model, args.model, review_mode=args.review_mode)
-    else:
-        checks.check_review_family(args.review_author_model, args.model)
+    with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+        review_contract = review_attempt.admit(args, prompt, binding, repo, sha) if binding and not args.dry_run else None
+        if args.review_mode == "red_team":
+            checks.check_review_family(args.review_author_model, args.model, review_mode=args.review_mode)
+        else:
+            checks.check_review_family(args.review_author_model, args.model)
     # Every read-only review of a change, dry runs included, whichever review flag types it (F10). A change is
     # named by --branch (stored as review_branch, the only identity the verdict recorder publishes for), a PR, or a
     # bound review attempt. A typed dispatch with none of them (the uk-preamble eval's --language-lane run at a
@@ -606,7 +622,8 @@ def _dispatch(args) -> int:
         admission.review_typed(vars(args))
         or any((args.risk, args.review_mode, args.language_lane, args.subject_seat, args.subject_family, args.branch))
     ):
-        checks.check_branch_author_families(args, repo, info, sha, args.model)
+        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            checks.check_branch_author_families(args, repo, info, sha, args.model)
     review = any((args.review_profile, args.language_lane, args.review_author_model, args.risk,
                   args.review_mode, args.pr, args.require_review_verdict, args.subject_seat,
                   args.subject_family))
@@ -617,17 +634,19 @@ def _dispatch(args) -> int:
         raise ValueError("--owned-path on a read-only task that is not a review: a task that writes needs "
                          "--mode workspace-write; owned paths on a read-only task only name a review's subjects")
     if args.subject_seat or args.subject_family or (args.mode == "read-only" and args.owned_path):
-        exclusion = checks.check_review_subjects(agent, args.model, args.subject_seat, args.subject_family,
-                                                args.owned_path, review=review)
+        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            exclusion = checks.check_review_subjects(agent, args.model, args.subject_seat, args.subject_family,
+                                                    args.owned_path, review=review)
         args.subject_seat, args.subject_family = sorted(exclusion.seats), sorted(exclusion.families)
         if (exclusion.seats or exclusion.families) and (
             (args.review_profile or "").strip().casefold() == "ukrainian" or args.language_lane
         ):
             raise ValueError("protected subject scope needs a code-profile review without --language-lane")
-    decision = host_admission.check(
-        args.mode, dry_run=args.dry_run, disk_guard=not (args.worktree is not None and (worktree / ".git").exists()),
-        force_reason=force_reason,
-    )
+    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+        decision = host_admission.check(
+            args.mode, dry_run=args.dry_run, disk_guard=not (args.worktree is not None and (worktree / ".git").exists()),
+            force_reason=force_reason,
+        )
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
         invocation = runtime_context.build(spec, child_env(spec))
@@ -639,11 +658,17 @@ def _dispatch(args) -> int:
             plan.update(review_attempt=binding, review_access=args.review_access or "isolated")
         print(json.dumps(plan, indent=2))
         return 0
+    with admission.record_refusal(args, agent, StartRefusal.HEADROOM):
+        try:
+            headroom.check_runtime(agent, args.model, codex_account=args.codex_account)
+        except headroom.RateLimitedError as exc:
+            raise host_admission.Refused(str(exc), 3) from None
     # A review round is spent at dispatch, so the budget is checked here and not only when a verdict is recorded.
     if args.mode == "read-only" and (args.pr or args.branch) and not args.advisory_role and (
         admission.review_typed(vars(args)) or args.risk or args.review_mode
     ):
-        checks.check_review_budget(args, info, sha)
+        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            checks.check_review_budget(args, info, sha)
     # A new tree inherits the repository's origin. Refuse known trust failures before creating
     # a hold, directory or branch; new_record still verifies the actual worktree after creation.
     if args.mode == "workspace-write" and args.owned_path:
@@ -653,47 +678,51 @@ def _dispatch(args) -> int:
             trusted_origin = False
         if not trusted_origin:
             raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
-    with host_admission.reserve(
-        task_id, args.mode, decision, agent=agent, force_reason=force_reason,
-        disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
-    ) as hold:
-        if binding:
-            store.check_review_attempt(binding)  # the supervisor claims it (review_attempt.run)
-        if not args.cwd:
-            # A repository that declares a worktree registry has the tree registered before it exists.
-            registry = git.registry_path(repo, info)
-            registration = None if registry is None else dict(
-                registry=registry, agent=agent, task_id=task_id, initiator=args.initiator,
-                purpose=prompt.decode(errors="replace") if isinstance(prompt, bytes) else prompt)
-            # The hold names the reserved path before git fills it, so a dispatcher that dies at any later step
-            # leaves the tree attributed to this task (worktree_claims remove --owner-task-id).
-            attribution = store.worktree_attribution(spec, info, branch, sha)
-            git.create_worktree(repo, worktree, branch, sha, full_checkout=args.full_checkout,
-                                sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
-                                **exact_start,
-                                on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
-        record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
-        # A task dispatched from inside another task's run names that run, whose settlement then names it while
-        # it still runs (worker._running_children, #12156).
-        if (parent := os.environ.get(ownership.TASK_ID_ENV)) and parent != task_id:
-            record["parent_task_id"] = parent
-        if review_contract is not None:
-            record["review_contract"] = review_contract
-        if publish_remote is not None:
-            record["worktree_remote_url"] = publish_remote
-        if args.mode != "read-only" and args.owned_path and record["worktree_remote_url"] is None:
-            raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
-        record.update(advisory_fields, **account_fields, **trial_fields, **gate_fields)
-        record["pool_shadow"] = pool_selector.shadow_decision(record)
-        if agent == "muse":
-            record["requested_contributor_mode"] = args.contributor_mode or "off"
-            record["contributor_mode"] = "off"
+    with contextlib.ExitStack() as stack:
+        with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
+            hold = stack.enter_context(host_admission.reserve(
+                task_id, args.mode, decision, agent=agent, force_reason=force_reason,
+                disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
+            ))
+        with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
+            if binding:
+                store.check_review_attempt(binding)  # the supervisor claims it (review_attempt.run)
+            if not args.cwd:
+                # A repository that declares a worktree registry has the tree registered before it exists.
+                registry = git.registry_path(repo, info)
+                registration = None if registry is None else dict(
+                    registry=registry, agent=agent, task_id=task_id, initiator=args.initiator,
+                    purpose=prompt.decode(errors="replace") if isinstance(prompt, bytes) else prompt)
+                # The hold names the reserved path before git fills it, so a dispatcher that dies at any later step
+                # leaves the tree attributed to this task (worktree_claims remove --owner-task-id).
+                attribution = store.worktree_attribution(spec, info, branch, sha)
+                git.create_worktree(repo, worktree, branch, sha, full_checkout=args.full_checkout,
+                                    sparse_include=git.SPARSE_EXCLUDE_DEFAULT - set(excluded), registration=registration,
+                                    **exact_start,
+                                    on_reserved=None if hold is None else lambda: store.attribute_hold(hold, attribution))
+            record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
+            # A task dispatched from inside another task's run names that run, whose settlement then names it while
+            # it still runs (worker._running_children, #12156).
+            if (parent := os.environ.get(ownership.TASK_ID_ENV)) and parent != task_id:
+                record["parent_task_id"] = parent
+            if review_contract is not None:
+                record["review_contract"] = review_contract
+            if publish_remote is not None:
+                record["worktree_remote_url"] = publish_remote
+            if args.mode != "read-only" and args.owned_path and record["worktree_remote_url"] is None:
+                raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
+            record.update(advisory_fields, **account_fields, **trial_fields, **gate_fields)
+            record["pool_shadow"] = pool_selector.shadow_decision(record)
+            if agent == "muse":
+                record["requested_contributor_mode"] = args.contributor_mode or "off"
+                record["contributor_mode"] = "off"
         try:
             # Attach to a borrowed worktree under the lock its settlement removes it under, so an
             # active record names it before any removal can start.
             with git.worktree_lock(repo) if args.cwd else contextlib.nullcontext():
-                if args.cwd and not worktree.is_dir():
-                    raise ValueError("cwd worktree was removed before the task started")
+                with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
+                    if args.cwd and not worktree.is_dir():
+                        raise ValueError("cwd worktree was removed before the task started")
                 worker.start(spec, record, prompt, args.hard_timeout)
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.

@@ -12,7 +12,7 @@ from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.dispatcher.providers import read_only_refusal
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER, one_model
 from lu_machinery.dispatcher.providers.stream_json import model_observer as _observe
-from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
+from lu_machinery.dispatcher.types import Invocation, ParsedResult, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import deadlines
 
 MODEL_SOURCE = "agy-stream-json"
@@ -372,7 +372,7 @@ def parse(
     stdout: str, stderr: str, returncode: int, final_text: str | None, *, output_schema: dict | None = None,
 ) -> ParsedResult:
     if returncode and not stdout.strip() and _schema_refused(stderr):
-        return ParsedResult(None, None, _SCHEMA_REFUSAL)
+        return ParsedResult(None, None, _SCHEMA_REFUSAL, start_refusal=StartRefusal.SETUP)
     result, error, models = {}, None, set()
     started = False  # any event besides the terminal result: AGY began the run, whatever it attested
     terminal_failed = False  # error is the terminal result's own failure
@@ -457,13 +457,15 @@ def parse(
         and not started
         and not incomplete
         and terminal_failed
+        and not any((usage or {}).values())
+        and text is None
         and type(result.get("num_turns")) is int and result["num_turns"] == 0
         and terminal_error is not None
         and terminal_error.startswith(_MODEL_SELECTION_REFUSAL)
     ):
         # AGY refused the --model before any init or turn: the model is not offered to this
         # account (an unlisted id, or one withheld in its region). A typed refusal, not a run failure.
-        return ParsedResult(None, None, _MODEL_UNAVAILABLE)
+        return ParsedResult(None, None, _MODEL_UNAVAILABLE, start_refusal=StartRefusal.MODEL_UNAVAILABLE)
     # The process exit is the run's only failure: the stream and its terminal result succeeded.
     exit_only = bool(returncode) and error is None
     if returncode:

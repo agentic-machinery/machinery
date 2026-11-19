@@ -14,7 +14,7 @@ from pathlib import Path, PureWindowsPath
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import validate_plain_branch_name
 from lu_machinery.common.task_store_paths import tasks_dir
-from lu_machinery.dispatcher.types import ReviewAttempt
+from lu_machinery.dispatcher.types import ReviewAttempt, StartRefusal
 from lu_machinery.orchestration.task_record_store import (
     TaskIdentityMismatch,
     is_identical_copy,
@@ -335,6 +335,41 @@ def create(record: dict, prompt: bytes) -> Path:
     with open(record["prompt_file"], "xb", opener=lambda p, f: os.open(p, f, 0o600)) as stream:
         stream.write(prompt)
     return path
+
+
+def record_admission_refusal(
+    task_id: str, agent: str, metadata: dict, reason: StartRefusal, *, hold: dict | None = None,
+) -> None:
+    """Publish a refusal or settle this dispatch's preparation hold with any worktree attribution intact."""
+    path = record_path(task_id)
+    with task_state_lock(path):
+        current = read(task_id, missing_ok=True)
+        if current is not None and not (
+            hold is not None and current.get("run_nonce") == hold["run_nonce"]
+            and current.get("admission_hold") == hold["admission_hold"]
+            and current.get("status") == "spawning" and "prompt_file" not in current
+        ):
+            return  # A concurrent request can have acquired this id since admission began.
+        when = now()
+        record = {name: metadata.get(name) for name in (
+            "model", "effort", "mode", "repo", "pr", "pinned_head", "research_task_family", "data_class",
+        )}
+        record.update(
+            schema_version=2, task_id=task_id, agent=agent, run_nonce=uuid.uuid4().hex,
+            status="failed", never_started_reason=reason, started_at=when, finished_at=when,
+            duration_s=0, pid=None, provider_pgid=None, usage=None, error=reason,
+            review_profile=metadata.get("review_profile"), review_risk=metadata.get("risk"),
+            review_author_model=metadata.get("review_author_model"),
+        )
+        if current is not None and hold is not None:
+            record.update({name: current[name] for name in (
+                "run_nonce", "repo", "worktree_path", "worktree_branch", "worktree_start_sha",
+                "worktree_base_sha", "cwd", "options", "admission",
+            ) if name in current})
+            record["started_at"] = hold["started_at"]
+            elapsed = datetime.fromisoformat(when) - datetime.fromisoformat(hold["started_at"])
+            record["duration_s"] = max(0, elapsed.total_seconds())
+        _write(path, record, exclusive=current is None)
 
 
 def read(task_id: str, nonce: str | None = None, *, missing_ok=False, tasks_root: Path | None = None) -> dict | None:

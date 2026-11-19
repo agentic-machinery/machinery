@@ -62,6 +62,47 @@ def _row(payload: dict, model: str, role: str) -> dict:
     return next(r for r in payload["models"] if r["model"] == model and r["role"] == role)
 
 
+def test_never_started_refusals_survive_backfill_and_keep_failed_review_counts_separate(tmp_path):
+    """A proved pre-start refusal used to inflate failed and unparsed review counts (#889)."""
+    batch_state, tasks = _state(tmp_path)
+    boundary = {"returncode": 125, "error": "write_boundary_refused: local diagnostic", "provider_pgid": 321}
+    cases = {
+        "account": {"never_started_reason": "account_check"},
+        "capacity": {"never_started_reason": "admission_capacity"},
+        "eligibility": {"never_started_reason": "route_eligibility"},
+        "headroom": {"status": "rate_limited", "never_started_reason": "headroom"},
+        "placement": {"returncode_reason": "dispatch_fallback_refused"},
+        "setup": {"never_started_reason": "setup_refusal"},
+        "review-setup": {"never_started_reason": "review_setup_refusal"},
+        "model-selection": {"error": "agy_model_unavailable: unavailable"},
+        "boundary-refused": {**boundary, "write_boundary": {"status": "refused"}},
+        "boundary-interrupted": {**boundary, "write_boundary": {"status": "interrupted"}},
+        "boundary-missing": boundary,
+        "model-ran": {"never_started_reason": "setup_refusal", "usage": {"input_tokens": 7, "cached_input_tokens": 0}},
+    }
+    for task_id, fields in cases.items():
+        record = _record(tasks, task_id, **{"mode": "read-only", "status": "failed", **fields})
+        path = tasks / f"{task_id}.json"
+        old_row = rows.summary_row(path, record, path.stat().st_mtime_ns)
+        assert old_row is not None
+        old_row["status"] = record["status"]
+        del old_row["never_started_reason"]
+        rows.append_row(batch_state, old_row)
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 9
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 0
+    payload = _row(_window(batch_state, stats.Landing()), "gpt-6.1-sol", "review")
+    assert payload["status"]["never_started"] == 9
+    assert payload["status"]["failed"] == payload["verdicts"]["unparsed"] == 3
+    assert payload["never_started_reasons"] == {
+        "account_check": 1, "admission_capacity": 1, "boundary_refusal": 1, "headroom": 1,
+        "model_unavailable": 1, "review_setup_refusal": 1, "route_eligibility": 1,
+        "setup_refusal": 1, "worker_placement": 1,
+    }
+    stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+    assert stored["boundary-refused"]["tokens"] == {"fresh_input": 0, "cached_input": 0, "output": 0}
+    assert "local diagnostic" not in rows.rows_path(batch_state).read_text()
+
+
 def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, monkeypatch):
     """Defect class: wrong aggregation, or a summary row lost, stale, corrupted or dropped by record retention."""
     batch_state, tasks = _state(tmp_path)
