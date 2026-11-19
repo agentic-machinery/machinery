@@ -54,7 +54,7 @@ const {
   escapeHtml, toDate, ageSpan, table, td, text, unknown, chip,
   readingState, windowLeft, paceCell, readingCell, signInCell,
   liveAccounts, summarizeSubscriptions, subscriptionChips,
-  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, prChips, createPanelRunner,
+  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, repoOpenCount, prChips, createPanelRunner,
 } = Machinery;
 
 function alertIdentity(alert) {
@@ -170,10 +170,10 @@ function renderQueueSummary(prs) {
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
     const truncated = repoCoverageIncomplete(repo);
     if (truncated) truncatedRepos += 1;
-    const open = typeof repo.open_total === "number" ? repo.open_total : null;
+    const open = typeof repo.open_total === "number" && Number.isFinite(repo.open_total) && repo.open_total >= 0 ? repo.open_total : null;
     const queued = list.filter(pr => pr.queue);
     const red = list.filter(pr => pr.ci === "failure" || pr.ci === "error").length;
-    if (open !== null) totalOpen += open;
+    totalOpen += repoOpenCount(repo);
     totalRed += red;
     repoRows.push([
       text(repo.name),

@@ -50,9 +50,11 @@ function renderPrs(prs) {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
     if (repo.status !== "ok") return title + unknown(repo.reason);
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
-    const truncatedNote = typeof repo.open_total === "number" && repo.open_total > list.length
-      ? `<p class="warn">Showing newest ${list.length} of ${repo.open_total} open PRs; older open PRs are not listed.</p>`
-      : "";
+    const truncatedNote = typeof repo.open_total !== "number" || !Number.isFinite(repo.open_total)
+      ? `<p class="warn">Total open PR count is unknown; showing ${list.length} returned PR${list.length === 1 ? "" : "s"}.</p>`
+      : repo.open_total > list.length
+        ? `<p class="warn">Showing newest ${list.length} of ${repo.open_total} open PRs; older open PRs are not listed.</p>`
+        : "";
     const rows = list.map(pr => {
       const [ci, ciClass] = ciLabel(pr.ci);
       const [review, reviewClass] = reviewLabel(pr.review);

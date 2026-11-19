@@ -345,23 +345,31 @@
   function repoCoverageIncomplete(repo) {
     if (!repo || repo.status !== "ok") return true;
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
-    return typeof repo.open_total !== "number" || repo.open_total > list.length;
+    return typeof repo.open_total !== "number" || !Number.isFinite(repo.open_total) || repo.open_total > list.length;
+  }
+
+  function repoOpenCount(repo) {
+    if (!repo || repo.status !== "ok") return 0;
+    const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
+    return typeof repo.open_total === "number" && Number.isFinite(repo.open_total) && repo.open_total >= 0
+      ? Math.max(repo.open_total, list.length) : list.length;
   }
 
   function prChips(prs, href = "/pull-requests") {
     if (!prs) return [];
     if (prs.status !== "ok") return [chip(href, "?", "PRs unknown", "warn")];
     const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
-    const open = repos.reduce((sum, repo) => sum + (typeof repo.open_total === "number" ? repo.open_total : 0), 0);
+    const open = repos.reduce((sum, repo) => sum + repoOpenCount(repo), 0);
     const queued = repos.reduce((sum, repo) => sum + (repo.status === "ok" ? (repo.pull_requests || []).filter(pr => pr.queue).length : 0), 0);
     const partial = repos.some(repo => repo.status !== "ok");
     const truncated = repos.some(repo => repo.status === "ok" && repoCoverageIncomplete(repo));
     const notes = [];
     if (partial) notes.push("a repository is unknown");
     if (truncated) notes.push("coverage truncated");
+    const openText = notes.length ? "open PRs observed" : "open PRs";
     const queuedText = notes.length ? `${queued} queued observed` : `${queued} queued`;
     const suffix = notes.length ? ` (${notes.join(", ")})` : "";
-    return [chip(href, open, `open PRs · ${queuedText}${suffix}`, notes.length ? "warn" : "")];
+    return [chip(href, open, `${openText} · ${queuedText}${suffix}`, notes.length ? "warn" : "")];
   }
 
   // ---- Freshness: one reading of "how old, and is it stale" per source ----
@@ -713,6 +721,7 @@
     reviewLabel,
     prLink,
     repoCoverageIncomplete,
+    repoOpenCount,
     prChips,
     finiteAge,
     rowsFreshness,

@@ -241,7 +241,24 @@ const completeEmptyPrs = {
 };
 assert.match(overview.renderQueueSummary(completeEmptyPrs), /No PRs currently in the merge queue\./);
 
-// F1 against Fleet (fleet.html): PR enrichment clears when PR endpoint later fails with HTTP 503.
+// F5: OK repository with open_total: null and 1 queued PR counts 1 open PR observed (lower bound) while per-repo Open stays '?'.
+const unknownTotalPrs = {
+  status: 'ok',
+  repositories: [
+    {name: 'machinery', status: 'ok', open_total: null, pull_requests: [{number: 7, url: 'https://github.com/learn-ukrainian/machinery/pull/7', ci: 'success', review: 'success', queue: {position: 1, state: 'queued'}}]},
+    {name: 'learn-ukrainian', status: 'ok', open_total: 0, pull_requests: []},
+  ],
+};
+const queueUnknownTotal = overview.renderQueueSummary(unknownTotalPrs);
+assert.match(queueUnknownTotal, /1<\/b> open PRs observed/);
+assert.match(queueUnknownTotal, /1<\/b> queued observed/);
+assert.match(queueUnknownTotal, /<td>machinery<\/td><td class="num warn">\?<\/td>/);
+assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed · 1 queued observed \(coverage truncated\)/);
+
+// F1 + F4 against Fleet (fleet.html):
+// 1. Fresh 30s snapshot with readable repo + unreadable sibling (X-Snapshot-State: stale) preserves CI green & queued 1 (F4).
+// 2. Expired HTTP 200 cached snapshot (240s old, 210s bound, X-Snapshot-State: stale) clears CI green & queued 1 (F1).
+// 3. HTTP 503 clears CI green & queued 1 and falls back to delivery_pr #42 (F1).
 (async () => {
   const elements = new Map();
   globalThis.document = {
@@ -251,24 +268,33 @@ assert.match(overview.renderQueueSummary(completeEmptyPrs), /No PRs currently in
       return elements.get(id);
     },
   };
-  let prFails = false;
+  let mode = 'fresh_partial';
   globalThis.fetch = async (url) => {
     if (String(url).includes('/api/git/pull-requests')) {
-      if (prFails) return {ok: false, status: 503, text: async () => '{}', headers: {get: () => null}};
+      if (mode === 'http_503') return {ok: false, status: 503, text: async () => '{}', headers: {get: () => null}};
+      const ageS = mode === 'expired_200' ? 240 : 30;
+      const observedAt = new Date(Date.now() - ageS * 1000).toISOString();
+      const repos = [
+        {
+          name: 'machinery',
+          status: 'ok',
+          open_total: 1,
+          pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', queue: {position: 1}, task_reference: 't1'}],
+        },
+        ...(mode === 'fresh_partial'
+          ? [{name: 'infra-private', status: 'unknown', reason: 'not_readable', open_total: null, pull_requests: []}]
+          : []),
+      ];
+      const headers = {
+        'X-Snapshot-Age-S': String(ageS),
+        'X-Snapshot-Stale-After-S': '210',
+        'X-Snapshot-State': 'stale',
+      };
       return {
         ok: true,
         status: 200,
-        headers: {get: () => null},
-        text: async () => JSON.stringify({
-          status: 'ok',
-          observed_at: new Date().toISOString(),
-          repositories: [{
-            name: 'machinery',
-            status: 'ok',
-            open_total: 1,
-            pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', queue: {position: 1}, task_reference: 't1'}],
-          }],
-        }),
+        headers: {get: name => headers[name] ?? null},
+        text: async () => JSON.stringify({status: 'ok', observed_at: observedAt, repositories: repos}),
       };
     }
     return {
@@ -287,9 +313,24 @@ assert.match(overview.renderQueueSummary(completeEmptyPrs), /No PRs currently in
   const fleetRunner = new Function('Machinery', fleetBody + '\nreturn runner;')(M);
   await fleetRunner.refreshAll();
   await new Promise(resolve => setImmediate(resolve));
+  const partialHtml = document.getElementById('workers-content').innerHTML;
+  assert.match(partialHtml, /CI green/, 'F4: readable repo preserves CI green despite unreadable sibling');
+  assert.match(partialHtml, /queued 1/, 'F4: readable repo preserves queued 1 despite unreadable sibling');
+
+  mode = 'expired_200';
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
+  const expiredHtml = document.getElementById('workers-content').innerHTML;
+  assert.doesNotMatch(expiredHtml, /CI green/, 'F1: expired HTTP 200 snapshot clears CI green');
+  assert.doesNotMatch(expiredHtml, /queued 1/, 'F1: expired HTTP 200 snapshot clears queued 1');
+  assert.match(expiredHtml, /#42/);
+
+  mode = 'fresh_partial';
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
   assert.match(document.getElementById('workers-content').innerHTML, /CI green/);
-  assert.match(document.getElementById('workers-content').innerHTML, /queued 1/);
-  prFails = true;
+
+  mode = 'http_503';
   await fleetRunner.refreshAll();
   await new Promise(resolve => setImmediate(resolve));
   const afterFailure = document.getElementById('workers-content').innerHTML;
