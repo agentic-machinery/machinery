@@ -77,8 +77,9 @@ failure under [Recording the verdict](#recording-the-verdict) do not count again
 Round 1 is the full review; rounds 2-3 review only the diff since the last reviewed head. After
 round 3 the author steps back. When the budget ends with a P0-P2 blocker still open, the change does
 not land: narrow its scope and continue on a fresh lineage (a new branch and PR), carrying the
-findings ledger forward. Any extra round, on either lineage, needs `claude-cto`'s explicit
-authorization first; nothing else grants one.
+findings ledger forward. The old PR gets no further round; the extra round on the fresh lineage
+needs `claude-cto`'s explicit authorization first. The clean base merge, the repair round and the
+capability failure under [Recording the verdict](#recording-the-verdict) are unchanged.
 
 ## 5. Recovery over gates
 
@@ -111,11 +112,12 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   across rounds; the PR body ledger lists id, New or Pre-existing, blocking or not, and state.
   P0-P2 are blocking defects; a reply whose open findings are all P3 is recorded as an approval.
 - **Carried findings.** An APPROVE may leave findings open only when the reviewer classifies each
-  one as P3 and confirms in the reply that no acceptance criterion is unmet. A P0-P2 finding is
-  never carried. Before the change lands, each carried finding becomes an issue with the
-  `known-issue` label (opened under rules core P4, on the author's Fleet Comms proposal), and the
-  PR body links it. `docs/release.md` requires the release notes to list every
-  `known-issue` fixed or still open.
+  one as P3 and confirms in the reply that no acceptance criterion is unmet. The recorder records
+  an all-P3 reply as an approval without reading that confirmation, so whoever lands the change
+  checks that the reply states it. A P0-P2 finding is never carried. Before the change lands,
+  each carried finding becomes an issue with the `known-issue` label (opened under rules core P4,
+  on the author's Fleet Comms proposal), and the PR body links it. `docs/release.md` requires
+  the release notes to list every `known-issue` fixed or still open.
 - **A recorded rejection** (`CHANGES_REQUESTED` or `BLOCKED`) is cleared only by an APPROVE at
   a new head.
 - **Pending CI is not a verdict.** Review runs in parallel with PR CI. A `BLOCKED` reply with no
