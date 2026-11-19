@@ -458,18 +458,21 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/fleet/model-stats",
         "exact",
         "http",
-        "Per concrete model id, effective effort, role (write, review) and task class over a 7d, 30d, 90d or all "
-        "window: tasks, terminal status mix, landed tasks, median and p90 wall time, tokens and wall hours per "
-        "landed task, review verdicts and blocking findings of parsed reviews of record, author-side review rounds, "
-        "first-round approval per author, first reviewer and review class, what followed a blocked first round, "
-        "routed catalog models idle in the window, weekly allowance spent per landed task and ISO-week counts, each "
-        "with its sample size (#581). /metrics exposes the same snapshot.",
+        "Per concrete model id, effective effort, role (write, review) and task class over a 24h, 7d, 30d, 90d or "
+        "all window (view=full keeps by_class, tokens and weeks; view=page omits them and keeps model/effort totals "
+        "plus charts): tasks, terminal status mix, landed tasks, median and p90 wall time, tokens, strict "
+        "wall_hours_per_landed (null when any duration is missing) and wall_hours_observed (recorded hours per landed "
+        "task when at most 1% or 1 of 10+ tasks is untimed), review verdicts and blocking findings of parsed reviews "
+        "of record, reviewer levels, author-side review rounds, first-round approval per author, first reviewer and "
+        "review class, what followed a blocked first round, routed catalog models idle in the window, cluster-grouped "
+        "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). /metrics exposes "
+        "the same snapshot for 7d, 30d, 90d, all and ISO weeks.",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
         "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
-        "One single-flight snapshot of every window, refreshed every 300s while the route or /metrics is read; "
+        "One single-flight snapshot of all five windows, refreshed every 300s while the route or /metrics is read; "
         "healthy data at most 420s old; a request with no snapshot waits up to 15s for that collect, then answers "
-        "pending with Retry-After 1.",
+        "pending with Retry-After 1, or 503 unavailable if the collect fails.",
         ("model-stats.html", "operators"),
         "Joins the agent-runtime usage log (ACP runs only) and /api/fleet/workers/v1 (live workers); "
         "agent success counts runs without landing or rounds.",
@@ -672,12 +675,15 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "model-stats.html",
         "/model-stats",
-        "Model value, waste and speed: which model lands work per wall hour and per allowance share, which wastes "
-        "runs and which is slow, per role and task class, each figure labelled with its window and sample size.",
-        "GET /api/fleet/model-stats?window=7d|30d|90d|all.",
-        "HTTP read on load and on window change; the snapshot is at most 420 seconds old and its age is shown.",
+        "Model value, waste and speed: best-value frontier, per-class job ranking, status mix, weekly trends, "
+        "reviewer strictness, wall-time distributions, pool allowance, observed wall hours per landed task "
+        "(wall_hours_observed), and write/review/author tables labelled with window and sample size.",
+        "GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=page and GET /api/state/routing-budget.",
+        "HTTP read on load and on window change; the model-stats snapshot is at most 420 seconds old and its age is "
+        "shown.",
         ("humans", "operators"),
-        "Reads one route; the machinery home shows live usage, not outcomes.",
+        "Reads /api/fleet/model-stats (view=page) and /api/state/routing-budget (live pool meter); the machinery home "
+        "shows live usage, not outcomes.",
         "medium if a low-sample rate is read as a verdict",
         "keep",
     ),

@@ -1,10 +1,13 @@
 # Model value statistics
 
-`GET /api/fleet/model-stats?window=7d|30d|90d|all` and the page at `/model-stats` show, per concrete model id,
-effective effort, role and task class, how much work a model does, how much it wastes and how slow it is (#581).
-The Monitor's `/metrics` exposes the same snapshot as gauges for Grafana. The collector is
-`lu_machinery/api/model_stats_router.py`; it reads only, and reports counts and model, effort, class, pool and
-repository labels, never prompts, bodies, paths, accounts or task ids.
+`GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=full|page` and the page at `/model-stats` show, per
+concrete model id, effective effort, role and task class, how much work a model does, how much it wastes and how
+slow it is (#581). `view=full` (default) includes per-class breakdowns (`by_class`), token counts and token rates,
+and ISO-week buckets (`weeks`). `view=page` (used by `/model-stats`) omits those fields and keeps model and effort
+totals plus `charts` series. The Monitor's `/metrics` exposes the four longer windows (`7d`, `30d`, `90d`, `all`)
+and ISO weeks as gauges for Grafana. The collector is `lu_machinery/api/model_stats_router.py`; it reads only, and
+reports counts and model, effort, class, pool and repository labels, never prompts, bodies, paths, accounts or task
+ids.
 
 ## History store
 
@@ -61,10 +64,16 @@ it raised (a timeout inside the collect included), answers 503 and the page show
 
 ## Definitions
 
-- **Window**: a task counts when its `finished_at` (else `started_at`) falls in `[since, until)`; `all` starts at
-  the first row. One refresh computes every window and the weekly buckets.
-- **Model**: the concrete model id: the model the runtime observed from the provider when it attested one, else
-  the requested model's catalog id (`grok-4.7-high` is `grok-4.7`, `claude-opus-5-5[1m]` is `claude-opus-5-5`).
+- **Window**: `24h`, `7d`, `30d`, `90d` or `all`. A task counts when its `finished_at` (else `started_at`) falls in
+  `[since, until)`; `all` starts at the first row. One refresh computes all five windows and the weekly buckets;
+  `/metrics` omits `24h`.
+- **Model**: the concrete model id: the model the runtime observed from the provider when it attested one
+  (`resolved_model_known: true`), else the requested model's catalog id (`grok-4.7-high` is `grok-4.7`,
+  `claude-opus-5-5[1m]` is `claude-opus-5-5`). Known Cursor display names map via `canonical_cursor_model`
+  (`Grok 4.7 256K High` is `grok-4.7`, `Composer 2.5` is `composer-2.5`); harness prefixes or catalog ids with one
+  slash are preserved or resolved (`deepseek-direct/deepseek-v4-flash` is `deepseek-v4-flash`,
+  `kimi-code/k3-256k` stays `kimi-code/k3-256k`). When `resolved_model_known` is true and the attested spelling is
+  unrecognized, it stays `unknown` without falling back to the requested model.
   Rows store a bare harness alias with no observed model (`opus`, `sonnet`, `haiku`, `fable`) as recorded. The
   statistics count it as the catalog id it ran only where that is unambiguous: the dispatcher resolves the alias
   to its family's newest catalog id (`model_pause._newest_claude`), and a row counts as that id when it is no
@@ -79,8 +88,9 @@ it raised (a timeout inside the collect included), answers 503 and the page show
 - **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
   `high`, `gemini-3.8-flash-medium` is `medium`); else `unset`. A catalog id that merely ends in an effort word
   (`gemini-3.8-flash-high`) is `unset` without a recorded effort. Legacy values such as `not-exposed` stay as
-  recorded. Each model row shows its totals (`effort` `all`) and the same figures per effort; each effort, and the
-  totals, split again by task class, so `code` at `high` and `code` at `low` compare directly.
+  recorded. Each model row shows its totals (`effort` `all`) and the same figures per effort; under `view=full`,
+  each effort and the totals split again by task class (`by_class`), so `code` at `high` and `code` at `low` compare
+  directly.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
 - **Landed**: a write task whose id appears in a whole-line `X-Agent: <harness>/<task>` trailer outside a code
@@ -90,11 +100,15 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   landing is as fresh as the last fetch of each checkout. `coverage.landing.trailer_task_ids_by_repository`
   counts trailer task ids per repository. See [Landing source](#landing-source) for why the trailer is read and
   what the line scan cannot see.
-- **Wall hours per landed**: wall time of all write tasks of that model divided by its landed tasks, so failed
-  attempts are charged to the work that landed. It is unknown (null) when any of those tasks has no recorded
-  duration; `wall_seconds.n` counts the tasks that have one. Tokens per landed task are computed the same way. Fresh input
-  includes cache writes; output includes reasoning tokens (Codex `output_tokens` already include them; the
-  reasoning or thinking counts of Cursor, AGY and OpenCode are added).
+- **Wall hours per landed**: `wall_hours_per_landed` divides wall time of all write tasks of that model by its landed
+  tasks, so failed attempts are charged to the work that landed. It is unknown (`null`) when `landed` is 0 or any
+  task has no recorded duration; `wall_seconds.n` counts the tasks that have one. `wall_hours_observed` divides total
+  recorded hours by `landed`, and reports a `value` only when `landed` > 0, at least one task is timed, and untimed
+  tasks are at most 1% of tasks or 1 task out of 10 or more; otherwise `value` is `null`. It always reports `n`
+  (`landed`), `timed_tasks` and `untimed_tasks`, and the page displays it with any excluded or missing count labelled.
+  Tokens per landed task are computed from total tokens over `landed`. Fresh input includes cache writes; output
+  includes reasoning tokens (Codex `output_tokens` already include them; the reasoning or thinking counts of Cursor,
+  AGY and OpenCode are added).
 - **Review figures** use structured findings and recorded verdicts from every reviewer. The missing-verdict
   count includes every settled review task without a readable verdict. The approval rate uses parsed verdicts,
   while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
@@ -121,8 +135,13 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   `agy_claude`, `cursor`) and its remaining weekly allowance at start and finish from the Monitor
   routing-budget, or `unknown` when no plan meter funds the seat or no fresh reading exists. Each reading is one
   request of at most 2 s with no readiness wait, so it never delays a launch or a settlement; `agy_claude` records
-  its weekly window, not the stricter five-hour one admission uses. Only tasks with both
-  readings count; a reading that rose (the window reset) is counted as `reset_crossed`, never as negative spend.
+  its weekly window, not the stricter five-hour one admission uses. Only tasks with both readings join allowance
+  aggregation. Overlapping write tasks on one pool are grouped into a cluster charged that pool's net drop once
+  (`earliest.start_pct - latest.finish_pct`). A cluster stays unknown (`null`, never `0`) when a later reading is
+  above an earlier one (a reset anywhere in the cluster, including a task's own finish above its start or a rise
+  between tasks), when two readings share a timestamp and disagree, when net drop is negative, or when the cluster
+  spans multiple models, efforts or classes. Tasks with a finish above start stay in their group's selection and
+  count in `reset_crossed`, so that group reports unknown spend rather than `0`.
 - **Low sample**: every rate carries its denominator `n`; below 10 it is marked `low_sample`.
 
 ## Metrics (Grafana's contract)
@@ -223,8 +242,9 @@ These numbers describe our routing, not the models alone. Harder and security wo
 so their per-task wall time and rounds are inflated. Author and reviewer families are paired by policy, so a
 reviewer's blocking rate partly measures the authors it is paired with; read the first-round matrix, not one
 author figure, before blaming either side. Allowance readings are pool-wide:
-tasks that run at the same time on one pool each see the whole drop, so points per landed task overstate the
-per-task share under concurrency, and the meter's resolution is one reading per probe. Landing depends on the
+overlapping write tasks on one pool are grouped and charged the pool's net drop once, while clusters shared across
+models, efforts or classes or containing a reset or tied-timestamp conflict stay unknown (`null`); the meter's
+resolution is one reading per probe. Landing depends on the
 trailer surviving the merge or on the task observing its own merge; work merged later by another seat, through
 a squash merge that drops `X-Agent` lines, is counted as not landed. Treat a comparison as a question for the
 CTO, not a routing verdict; routing changes stay a catalog decision.
