@@ -95,10 +95,8 @@ from lu_machinery.orchestration.task_record_store import (
     ARCHIVE_DIR_NAME,
     TaskIdentityMismatch,
     is_identical_copy,
-    locate_task_record,
     misnamed_record_refusal,
     read_listed_task_record,
-    read_task_record_bytes,
     task_archive_lock,
 )
 from lu_machinery.publish.github import CfVerdictRecord, Request, request_run
@@ -730,14 +728,12 @@ def _attribute_trailer(commit_sha: str | None, trailer: str, *, repository: str,
     if TASK_ID.fullmatch(model):
         try:
             with task_archive_lock(task_root):
-                hot = task_root / f"{model}.json"
-                task_file = hot if hot.exists() else locate_task_record(task_root, model)
-                if task_file is not None:
-                    if not task_file.resolve().is_relative_to(task_root.resolve()):
-                        raise RecordError("author task provenance unavailable")
-                    author_task = json_depth.loads(
-                        task_file.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH,
-                    )
+                candidate = _hot_or_archived(task_root, f"{model}.json")
+                if not candidate.resolve().is_relative_to(task_root.resolve()):
+                    raise RecordError("author task provenance unavailable")
+                if candidate.exists():
+                    task_file = candidate
+                    author_task = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         except (OSError, ValueError) as exc:
             raise RecordError("author task provenance unavailable") from exc
     if task_file is not None:
@@ -2098,15 +2094,15 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
         raise RecordError("invalid canonical task identity")
     try:
         with task_archive_lock(task_root):
-            task_path, raw_task = read_task_record_bytes(task_root / f"{task_id}.json", tasks_dir=task_root)
-            task = json_depth.loads(raw_task.decode("utf-8"), max_depth=_JSON_MAX_DEPTH)
+            task_path = _hot_or_archived(task_root, f"{task_id}.json")
+            task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
             raw_reply = task_path.with_suffix(".result").read_bytes()
     except (OSError, ValueError) as exc:
         raise RecordError("review task record or reply unavailable") from exc
     if not isinstance(task, dict):
         raise RecordError("review task record malformed")
     # Legacy records have no embedded id; their canonical basename is still authoritative.
-    if task.get("task_id", task_id) != task_id:
+    if task.get("task_id", task_path.stem) != task_id:
         raise RecordError("review task record conflicts with canonical task identity")
     if task.get("status") != "done":
         raise RecordError("review task is not done")
@@ -2755,70 +2751,71 @@ def budget_admission(
 def require_no_outside_review_in_flight(task_root: Path, repository: str, sha: str) -> None:
     """Read the active task ledger before red-team admission or publication."""
     try:
-        # The shared iterator suppresses enumeration errors. Read locally so
-        # both an unreadable directory and a failed glob refuse this guard.
-        list(task_root.iterdir())
-        for path in sorted(path for path in task_root.glob("*.json") if path.is_file()):
-            try:
-                task = read_listed_task_record(path, tasks_dir=task_root)
-            except TaskIdentityMismatch as exc:
-                # An exact copy of the named record adds nothing; any other misnamed file refuses.
-                if is_identical_copy(exc):
+        with task_archive_lock(task_root):
+            # The shared iterator suppresses enumeration errors. Read locally so
+            # both an unreadable directory and a failed glob refuse this guard.
+            list(task_root.iterdir())
+            for path in sorted(path for path in task_root.glob("*.json") if path.is_file()):
+                try:
+                    task = read_listed_task_record(path, tasks_dir=task_root)
+                except TaskIdentityMismatch as exc:
+                    # An exact copy of the named record adds nothing; any other misnamed file refuses.
+                    if is_identical_copy(exc):
+                        continue
+                    raise RecordError(
+                        f"RED_TEAM_REFUSED: task ledger unavailable; {misnamed_record_refusal(path)}"
+                    ) from exc
+                if task is None:
                     continue
-                raise RecordError(
-                    f"RED_TEAM_REFUSED: task ledger unavailable; {misnamed_record_refusal(path)}"
-                ) from exc
-            if task is None:
-                continue
-            if any(task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")):
-                continue
-            prep = task.get("worktree_prep")
-            prep_sha = prep.get("base_sha") if isinstance(prep, dict) else None
-            prep_matches = (
-                isinstance(prep_sha, str)
-                and SHA.fullmatch(prep_sha.casefold())
-                and prep_sha.casefold() == sha.casefold()
-            )
-            # Prep rows lack review typing and repository metadata. Fail closed:
-            # even non-review dispatches preparing this head briefly block red-team.
-            review = (
-                task.get("review")
-                or task.get("pr") is not None
-                or task.get("review_attempt")
-                or task.get("require_review_verdict")
-                or task.get("review_profile")
-                or task.get("review_author_model")
-                or task.get("review_risk")
-                or task.get("type") == "review"
-            )
-            if (
-                (review or prep_matches)
-                and (
-                    (
-                        isinstance(task.get("repository"), str)
-                        and normalize_repository(task["repository"]) == normalize_repository(repository)
-                    )
-                    or (prep_matches and task.get("repository") is None)
+                if any(task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")):
+                    continue
+                prep = task.get("worktree_prep")
+                prep_sha = prep.get("base_sha") if isinstance(prep, dict) else None
+                prep_matches = (
+                    isinstance(prep_sha, str)
+                    and SHA.fullmatch(prep_sha.casefold())
+                    and prep_sha.casefold() == sha.casefold()
                 )
-                and task.get("status") in {"spawning", "running", "queued"}
-                and task.get("review_mode", "cross_family") != "red_team"
-                and (
-                    prep_matches
-                    or sha
-                    in {
-                        task.get(field)
-                        for field in (
-                            "pinned_head",
-                            "worktree_base_sha",
-                            "review_head",
-                            "review_head_sha",
-                            "pr_head_sha",
-                            "head_sha",
+                # Prep rows lack review typing and repository metadata. Fail closed:
+                # even non-review dispatches preparing this head briefly block red-team.
+                review = (
+                    task.get("review")
+                    or task.get("pr") is not None
+                    or task.get("review_attempt")
+                    or task.get("require_review_verdict")
+                    or task.get("review_profile")
+                    or task.get("review_author_model")
+                    or task.get("review_risk")
+                    or task.get("type") == "review"
+                )
+                if (
+                    (review or prep_matches)
+                    and (
+                        (
+                            isinstance(task.get("repository"), str)
+                            and normalize_repository(task["repository"]) == normalize_repository(repository)
                         )
-                    }
-                )
-            ):
-                raise RecordError("RED_TEAM_REFUSED: outside-family review in flight for this head")
+                        or (prep_matches and task.get("repository") is None)
+                    )
+                    and task.get("status") in {"spawning", "running", "queued"}
+                    and task.get("review_mode", "cross_family") != "red_team"
+                    and (
+                        prep_matches
+                        or sha
+                        in {
+                            task.get(field)
+                            for field in (
+                                "pinned_head",
+                                "worktree_base_sha",
+                                "review_head",
+                                "review_head_sha",
+                                "pr_head_sha",
+                                "head_sha",
+                            )
+                        }
+                    )
+                ):
+                    raise RecordError("RED_TEAM_REFUSED: outside-family review in flight for this head")
     except (OSError, ValueError, TypeError) as exc:
         raise RecordError("RED_TEAM_REFUSED: task ledger unavailable") from exc
 

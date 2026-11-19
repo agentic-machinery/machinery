@@ -52,6 +52,7 @@ from lu_machinery.orchestration.task_record_store import (
     misnamed_record_refusal,
     parse_task_record,
     read_task_record_bytes,
+    task_archive_lock,
     task_record_path,
 )
 from lu_machinery.path_safety import assert_delete_target
@@ -437,96 +438,97 @@ def active_worktree_claim_refusal(
         ):
             owner_identity = (owner_path, nonce)
     try:
-        state_files = sorted(tasks_dir.glob("*.json"))
+        with task_archive_lock(tasks_dir):
+            state_files = sorted(tasks_dir.glob("*.json"))
+            for state_file in state_files:
+                if is_superseded_record(state_file):
+                    continue
+                try:
+                    state_file, raw = read_task_record_bytes(state_file, tasks_dir=tasks_dir)
+                except FileNotFoundError:
+                    # Removed between glob and read: it no longer claims anything.
+                    continue
+                except OSError:
+                    return refused(state_file, "unreadable")
+                try:
+                    record = parse_task_record(state_file, raw)
+                except TaskIdentityMismatch as exc:
+                    # An exact copy of the named record claims nothing it does not; any other misnamed file refuses.
+                    if is_identical_copy(exc):
+                        continue
+                    return refused(state_file, f"unreadable ({misnamed_record_refusal(state_file)})")
+                except (ValueError, RecursionError):
+                    return refused(state_file, "unreadable")
+                if record is None or not record_may_claim_worktree(raw, needles):
+                    continue
+                if not isinstance(record, dict):
+                    # Valid JSON that is not an object (a worker's proof list) is no task record; a
+                    # record cut short by a failed write never parses, so it still refuses above.
+                    continue
+                claimed_path = record.get("worktree_path") if isinstance(record, dict) else None
+                if not isinstance(claimed_path, str | None):
+                    return refused(state_file, "unreadable")
+                status = record.get("status")
+                if (
+                    isinstance(status, str)
+                    and status in RELEASED_TASK_STATUSES
+                    and not _worker_blocks_release(record)
+                ):
+                    continue
+                contract = record.get("review_contract")
+                if contract is not None:
+                    if not isinstance(contract, dict):
+                        return refused(state_file, "unreadable")
+                    try:
+                        input_root = review_contract_input_root(contract, review_access=record.get("review_access", "full"))
+                    except ValueError:
+                        return refused(state_file, "unreadable")
+                else:
+                    input_root = None
+                input_paths = record.get("review_input_paths", [])
+                if not isinstance(input_paths, list) or not all(_valid_review_input_path(path) for path in input_paths):
+                    return refused(state_file, "unreadable")
+                claimed_inputs = [("review input root", input_root)] if input_root is not None else []
+                claimed_inputs.extend(("review attempt input", path) for path in input_paths)
+                for label, raw_input in claimed_inputs:
+                    try:
+                        inputs = resolve_claim_path(raw_input, repo_root=repo_root)
+                    except (OSError, RuntimeError, ValueError):
+                        return refused(state_file, "unreadable")
+                    if review_registration is None:
+                        try:
+                            review_registration = repository_registration(repo_root)
+                        except ValueError:
+                            return refused(state_file, "review input worktree registration unavailable")
+                    main_root, registered = review_registration
+                    if review_input_worktree(inputs, main_root=main_root, registered=registered) == target:
+                        return f"{label} claimed by active task {record.get('task_id') or state_file.stem}"
+                if review_inputs_only:
+                    continue
+                if (
+                    owner_identity is not None
+                    and state_file == owner_identity[0]
+                    and record.get("task_id") == owner_task_id
+                    and record.get("run_nonce") == owner_identity[1]
+                    and not _worker_blocks_release(record)
+                ):
+                    continue
+                if not claimed_path:
+                    continue
+                try:
+                    claimed = resolve_claim_path(claimed_path, repo_root=repo_root)
+                except (OSError, RuntimeError, ValueError):
+                    return refused(state_file, "worktree_path unresolvable")
+                if claimed == target:
+                    if status == NEEDS_FINALIZE_STATUS and settled_claim is not None:
+                        try:
+                            if settled_claim(record):
+                                continue
+                        except Exception:
+                            pass
+                    return f"worktree claimed by active task {record.get('task_id') or state_file.stem}"
     except OSError as exc:
         return f"task claims unreadable ({type(exc).__name__}); refusing worktree removal"
-    for state_file in state_files:
-        if is_superseded_record(state_file):
-            continue
-        try:
-            state_file, raw = read_task_record_bytes(state_file, tasks_dir=tasks_dir)
-        except FileNotFoundError:
-            # Removed between glob and read: it no longer claims anything.
-            continue
-        except OSError:
-            return refused(state_file, "unreadable")
-        try:
-            record = parse_task_record(state_file, raw)
-        except TaskIdentityMismatch as exc:
-            # An exact copy of the named record claims nothing it does not; any other misnamed file refuses.
-            if is_identical_copy(exc):
-                continue
-            return refused(state_file, f"unreadable ({misnamed_record_refusal(state_file)})")
-        except (ValueError, RecursionError):
-            return refused(state_file, "unreadable")
-        if record is None or not record_may_claim_worktree(raw, needles):
-            continue
-        if not isinstance(record, dict):
-            # Valid JSON that is not an object (a worker's proof list) is no task record; a
-            # record cut short by a failed write never parses, so it still refuses above.
-            continue
-        claimed_path = record.get("worktree_path") if isinstance(record, dict) else None
-        if not isinstance(claimed_path, str | None):
-            return refused(state_file, "unreadable")
-        status = record.get("status")
-        if (
-            isinstance(status, str)
-            and status in RELEASED_TASK_STATUSES
-            and not _worker_blocks_release(record)
-        ):
-            continue
-        contract = record.get("review_contract")
-        if contract is not None:
-            if not isinstance(contract, dict):
-                return refused(state_file, "unreadable")
-            try:
-                input_root = review_contract_input_root(contract, review_access=record.get("review_access", "full"))
-            except ValueError:
-                return refused(state_file, "unreadable")
-        else:
-            input_root = None
-        input_paths = record.get("review_input_paths", [])
-        if not isinstance(input_paths, list) or not all(_valid_review_input_path(path) for path in input_paths):
-            return refused(state_file, "unreadable")
-        claimed_inputs = [("review input root", input_root)] if input_root is not None else []
-        claimed_inputs.extend(("review attempt input", path) for path in input_paths)
-        for label, raw_input in claimed_inputs:
-            try:
-                inputs = resolve_claim_path(raw_input, repo_root=repo_root)
-            except (OSError, RuntimeError, ValueError):
-                return refused(state_file, "unreadable")
-            if review_registration is None:
-                try:
-                    review_registration = repository_registration(repo_root)
-                except ValueError:
-                    return refused(state_file, "review input worktree registration unavailable")
-            main_root, registered = review_registration
-            if review_input_worktree(inputs, main_root=main_root, registered=registered) == target:
-                return f"{label} claimed by active task {record.get('task_id') or state_file.stem}"
-        if review_inputs_only:
-            continue
-        if (
-            owner_identity is not None
-            and state_file == owner_identity[0]
-            and record.get("task_id") == owner_task_id
-            and record.get("run_nonce") == owner_identity[1]
-            and not _worker_blocks_release(record)
-        ):
-            continue
-        if not claimed_path:
-            continue
-        try:
-            claimed = resolve_claim_path(claimed_path, repo_root=repo_root)
-        except (OSError, RuntimeError, ValueError):
-            return refused(state_file, "worktree_path unresolvable")
-        if claimed == target:
-            if status == NEEDS_FINALIZE_STATUS and settled_claim is not None:
-                try:
-                    if settled_claim(record):
-                        continue
-                except Exception:
-                    pass
-            return f"worktree claimed by active task {record.get('task_id') or state_file.stem}"
     return None
 
 

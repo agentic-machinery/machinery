@@ -79,30 +79,47 @@ def test_locate_prefers_the_hot_record(tmp_path):
     assert store.candidate_task_record_names("other", names) == ()
 
 
-def test_read_follows_the_newest_copy_when_the_archive_name_collides(tmp_path, monkeypatch):
-    """Defect class: a moved record is replaced by an older run's archive copy."""
-    hot = tmp_path / "review.json"
-    old = store.archived_task_record_path(tmp_path, "review")
-    old.parent.mkdir()
-    old.write_bytes(b'{"task_id": "review", "run_nonce": "old"}')
-    os.utime(old, ns=(1, 1))
-    prior_stamp = old.with_name("review.20261119T140000Z.archived.json")
-    prior_stamp.write_bytes(b'{"task_id": "review", "run_nonce": "prior"}')
-    os.utime(prior_stamp, ns=(1, 1))
-    newest = old.with_name("review.20261119T140000123456Z.archived.json")
-    expected = b'{"task_id": "review", "run_nonce": "new"}'
-    hot.write_bytes(expected)
-    os.utime(hot, ns=(1, 1))
+def test_a_listed_record_follows_its_own_file_across_archive_and_restore(tmp_path, monkeypatch):
+    """Defect class: recovery of a moved file reads another run with the same task ID."""
+    canonical = store.archived_task_record_path(tmp_path, "review")
+    canonical.parent.mkdir()
+    canonical.write_bytes(b'{"task_id": "review", "run_nonce": "canonical"}')
+    archived = canonical.with_name("review.20261119T140000Z.archived.json")
+    hot = tmp_path / archived.name
+    legacy = b'{"task_id": "review", "run_nonce": "legacy"}'
+    hot.write_bytes(legacy)
+    for path in (canonical, hot):
+        os.utime(path, ns=(1, 1))
     read_bytes = Path.read_bytes
 
     def archive_before_read(path):
-        if path == hot and hot.exists():
-            hot.rename(newest)
+        if path == hot:
+            hot.rename(archived)
         return read_bytes(path)
 
     monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+    assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (archived, legacy)
+    assert store.locate_task_record(tmp_path, "review") == canonical
 
-    assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (newest, expected)
+    def restore_before_read(path):
+        if path == archived:
+            archived.rename(hot)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", restore_before_read)
+    assert store.read_task_record_bytes(archived, tasks_dir=tmp_path) == (hot, legacy)
+
+    hot_canonical = tmp_path / canonical.name
+    hot_canonical.write_bytes(b'{"task_id": "review", "run_nonce": "replacement"}')
+
+    def collide_before_read(path):
+        if path == hot_canonical:
+            hot_canonical.rename(archived.with_name("review.20261119T150000Z.archived.json"))
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", collide_before_read)
+    with pytest.raises(FileNotFoundError):
+        store.read_task_record_bytes(hot_canonical, tasks_dir=tmp_path)
 
 
 def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch):
@@ -130,8 +147,8 @@ def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch
     monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
 
     for state in (dispatch_store.read("old", tasks_root=tasks), orchestrator_control.load_task_state(tasks, "old")):
-        assert state["run_nonce"] == "second"
-        assert Path(state["result_file"]).read_text() == "second run's reply"
+        assert state["run_nonce"] == "first"
+        assert Path(state["result_file"]).read_text() == "reply"
 
     states = dispatch_store.list_tasks(include_archive=True, strict=True)
     assert [(state["run_nonce"], Path(state["result_file"]).read_text()) for state in states] == [

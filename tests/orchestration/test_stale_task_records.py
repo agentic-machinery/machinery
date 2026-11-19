@@ -1002,45 +1002,57 @@ def test_archive_round_trip_moves_record_with_sidecars(tasks_dir):
     assert task_record_store.locate_task_record(tasks_dir, "old-done") == tasks_dir / "old-done.json"
 
 
-def test_recorder_reads_a_complete_archive_group(tasks_dir, monkeypatch):
+@pytest.mark.parametrize("operation", ["archive", "restore"])
+def test_recorder_reads_a_complete_archive_group(tasks_dir, monkeypatch, operation):
     """Defect class: publishing a record before its reply refuses verdict recording."""
     hot = _terminal(tasks_dir, "review", worktree_branch="codex/topic")
-    reply = hot.with_suffix(".result")
-    reply.write_text("VERDICT: APPROVE")
+    hot.with_suffix(".result").write_text("VERDICT: APPROVE")
+    archived = tasks_dir / "archive" / hot.name
+    if operation == "restore":
+        assert str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)["actions"] == {"archived": 1}
+        source, destination = archived, hot
+    else:
+        source, destination = hot, archived
+
+    def move_record():
+        if operation == "restore":
+            return str_mod.restore_archived(tasks_dir, ["review"], apply=True)
+        return str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
+
     staged = threading.Event()
     reader_entered = threading.Event()
     finish_move = threading.Event()
-    stage = str_mod._stage
+    move = str_mod._move_no_replace
     flock = fcntl.flock
 
-    def pause_with_reply_staged(path, staging_dir):
-        staged_path = stage(path, staging_dir)
-        if path == reply:
+    def pause_before_publishing_reply(src, dst):
+        if dst == destination.with_suffix(".result"):
             staged.set()
             assert finish_move.wait(timeout=10)
-        return staged_path
+        return move(src, dst)
 
     def observe_reader_lock(descriptor, operation):
         if operation == fcntl.LOCK_SH:
             reader_entered.set()
         return flock(descriptor, operation)
 
-    monkeypatch.setattr(str_mod, "_stage", pause_with_reply_staged)
+    monkeypatch.setattr(str_mod, "_move_no_replace", pause_before_publishing_reply)
     monkeypatch.setattr(fcntl, "flock", observe_reader_lock)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        archive = pool.submit(str_mod.archive_terminal, tasks_dir, now=NOW, apply=True)
+        archive = pool.submit(move_record)
         try:
             assert staged.wait(timeout=10)
-            archived = tasks_dir / "archive" / hot.name
-            # The final record rename has already happened. Neither public reply path exists yet.
-            assert archived.is_file() and not hot.exists()
-            assert not reply.exists() and not archived.with_suffix(".result").exists()
+            assert destination.is_file() and not source.exists()
+            assert not destination.with_suffix(".result").exists()
+            if operation == "archive":
+                assert not source.with_suffix(".result").exists()
             read = pool.submit(record_cf_verdict._task, "review", tasks_dir)
             read.add_done_callback(lambda _: reader_entered.set())
             assert reader_entered.wait(timeout=10)
         finally:
             finish_move.set()
-        assert archive.result(timeout=10)["actions"] == {"archived": 1}
+        action = "restored" if operation == "restore" else "archived"
+        assert archive.result(timeout=10)["actions"] == {action: 1}
         record, response = read.result(timeout=10)
     assert record["task_id"] == "review"
     assert response == "VERDICT: APPROVE"

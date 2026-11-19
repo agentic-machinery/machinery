@@ -40,8 +40,8 @@ took is the one it checked, and puts it back if a writer replaced it in
 between. No move ever replaces a file: archive, put-back and ``restore`` place
 each file with ``os.link`` (which fails if the name is taken) before unlinking
 the source, so a writer that created the destination first keeps its file.
-Strict readers share a task-directory lock with the archive group move so
-they cannot see the private staging name or a record without its moved reply. A
+Strict readers share a task-directory lock with archive and restore group
+moves so they cannot see the private staging name or a partly moved group. A
 snapshot directory moves whole with one ``os.rename``, which fails if the
 destination is a non-empty directory; it is never split between hot and
 archive. A staged file that cannot be archived goes back to its hot name, or, if a writer
@@ -1940,23 +1940,20 @@ def _restore_group(group: list[Path], tasks_dir: Path, row: dict[str, Any]) -> N
     this move.
     """
     record_path, *sidecars = group
-    try:
-        with task_state_lock(record_path):
-            _move_no_replace(record_path, tasks_dir / record_path.name)
-    except FileExistsError:
-        row["action"] = "skipped"
-        row["skip_reason"] = f"a writer created {record_path.name} in the hot directory first; archived copy kept"
-        return
-    except OSError as exc:
-        row["action"], row["error"] = "error", f"{type(exc).__name__}: {exc}"
-        return
     kept: list[str] = []
     try:
-        for sidecar in sidecars:
+        with task_state_lock(record_path), task_record_store.task_archive_lock(tasks_dir, moving=True):
             try:
-                _move_no_replace(sidecar, tasks_dir / sidecar.name)
+                _move_no_replace(record_path, tasks_dir / record_path.name)
             except FileExistsError:
-                kept.append(str(sidecar))
+                row["action"] = "skipped"
+                row["skip_reason"] = f"a writer created {record_path.name} in the hot directory first; archived copy kept"
+                return
+            for sidecar in sidecars:
+                try:
+                    _move_no_replace(sidecar, tasks_dir / sidecar.name)
+                except FileExistsError:
+                    kept.append(str(sidecar))
     except OSError as exc:
         row["action"], row["error"] = "error", f"{type(exc).__name__}: {exc}"
         return
