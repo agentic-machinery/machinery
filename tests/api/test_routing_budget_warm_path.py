@@ -240,3 +240,31 @@ def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypa
             assert (await client.get("/api/state/routing-budget")).status_code == 200
 
     asyncio.run(scenario())
+
+
+def test_handler_timeout_error_before_the_deadline_is_a_500_not_a_504(monkeypatch, tmp_path):
+    """Defect class: the request middleware mapped ANY TimeoutError from the handler to the
+    504 "Request exceeded 10.0s", so a computation's own TimeoutError (socket.timeout is
+    TimeoutError) was reported as a request timeout long before the deadline. It is a 500."""
+    from lu_machinery.api import resilience
+
+    monkeypatch.delenv("API_REQUEST_TIMEOUT_S", raising=False)  # the default 10 s limit
+
+    def compute(**_kwargs):
+        raise TimeoutError("upstream socket timed out")
+
+    app = _app(monkeypatch, tmp_path, compute)
+    app.middleware("http")(resilience.resilience_middleware)
+    timeouts_before = resilience.get_resilience_snapshot()["timeout_count"]
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            started = asyncio.get_running_loop().time()
+            response = await client.get("/api/state/routing-budget")
+            elapsed = asyncio.get_running_loop().time() - started
+        assert response.status_code == 500, response.text
+        assert elapsed < resilience.request_timeout_s()
+        assert resilience.get_resilience_snapshot()["timeout_count"] == timeouts_before
+
+    asyncio.run(scenario())
