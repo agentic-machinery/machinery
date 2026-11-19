@@ -77,15 +77,18 @@ _strip_credential_shaped_env()
 
 import ast
 import contextlib
+import fcntl
 import functools
 import importlib.machinery
 import ipaddress
 import itertools
 import json
 import linecache
+import locale
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -884,15 +887,29 @@ def _sanitize_secret_report(report: Any, secrets: Mapping[str, str]) -> Any:
         return report
 
 
+def _is_shim_directory(path: str) -> bool:
+    """``path`` is an agent-runtime shim directory by its normalized name or by its resolved destination."""
+    return any(
+        Path(form).parts[-2:] == ("agent_runtime", "shims") for form in (os.path.normpath(path), os.path.realpath(path))
+    )
+
+
+def _keeps_path_entry(entry: str) -> bool:
+    """An absolute PATH entry that is not an agent-runtime shim directory, by name or by destination."""
+    return os.path.isabs(entry) and not _is_shim_directory(entry)
+
+
 def _is_agent_runtime_shim(path: str | os.PathLike[str]) -> bool:
-    parts = Path(path).parts
-    return len(parts) >= 3 and parts[-3:-1] == ("agent_runtime", "shims")
+    return _is_shim_directory(os.path.dirname(os.fspath(path)))
 
 
 def _resolve_real_gh_binary() -> str | None:
-    """Resolve gh behind agent-runtime shims using the runner's path rules."""
-    candidates = [os.environ.get("AGENT_REAL_GH")]
-    search_path = os.environ.get("AGENT_ORIGINAL_PATH", os.environ.get("PATH", os.defpath))
+    """The gh a bare ``gh`` resolves to on the PATH tests run with (shims dropped), else behind the agent shims."""
+    candidates = [
+        os.path.join(entry, "gh") for entry in os.environ.get("PATH", os.defpath).split(os.pathsep) if _keeps_path_entry(entry)
+    ]
+    candidates.append(os.environ.get("AGENT_REAL_GH"))
+    search_path = os.environ.get("AGENT_ORIGINAL_PATH", "")
     candidates.extend(os.path.join(entry, "gh") for entry in search_path.split(os.pathsep) if entry)
     for candidate in candidates:
         if not candidate or _is_agent_runtime_shim(candidate):
@@ -2987,6 +3004,16 @@ def pytest_configure(config: pytest.Config) -> None:
     if config.option.basetemp is not None and os.pathsep in os.path.realpath(os.path.abspath(config.option.basetemp)):
         # Fixtures prepend directories under it to PATH (the gh, claude and Cursor stubs); one would split there.
         raise pytest.UsageError(f"the base temp {config.option.basetemp} resolves to a path with {os.pathsep!r}, which splits PATH")
+    global _CALLER_ENV
+    if _CALLER_ENV is not None:
+        caller, _CALLER_ENV = _CALLER_ENV, None
+
+        def give_back() -> None:
+            os.environ.clear()
+            os.environ.update(caller)
+
+        # Registered before this module's other cleanups, so it runs after them.
+        config.add_cleanup(give_back)
     home = tempfile.TemporaryDirectory(prefix="home-")
     config.add_cleanup(home.cleanup)
     home_env = pytest.MonkeyPatch()
@@ -4278,19 +4305,9 @@ _INHERITED_ENV_APPLIED = "_lu_inherited_env_applied"
 # The names whose values a worker may hold apart from its controller.
 _WORKER_OWN_ENV = frozenset({"PYTEST_XDIST_WORKER", "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST"})
 _XDIST_CONTROLLER_ENV_KEY = "lu_suite_controller_inherited_env"
-
-
-def _is_shim_directory(path: str) -> bool:
-    return Path(path).parts[-2:] == ("agent_runtime", "shims")
-
-
-def _keeps_path_entry(entry: str) -> bool:
-    """An absolute PATH entry that is not an agent-runtime shim directory, by name or by destination."""
-    return (
-        os.path.isabs(entry)
-        and not _is_shim_directory(os.path.normpath(entry))
-        and not _is_shim_directory(os.path.realpath(entry))
-    )
+# The environment this process had before the replacement, put back when its first session ends, so a program that
+# calls pytest.main and then reads its own settings still has them. Credential-shaped names were removed earlier.
+_CALLER_ENV: dict[str, str] | None = None
 
 
 def _inherited_env_target() -> dict[str, str]:
@@ -4312,28 +4329,61 @@ def _inherited_env_target() -> dict[str, str]:
     return target
 
 
-def _inside_managed_run() -> bool:
-    """TMPDIR is the payload of a pytest_scratch run: this process is a worker or a session the suite started."""
-    payload = Path(os.environ.get("TMPDIR", ""))
-    return payload.name == PAYLOAD_DIRNAME and (payload.parent / LOCK_FILENAME).is_file()
+def _live_run_directory() -> str | None:
+    """The pytest_scratch run whose payload is TMPDIR, when a live session holds its lease lock; else None.
+
+    A worker or a pytest a test starts inherits that payload while the session that owns it holds the lock shared,
+    so an exclusive non-blocking lock fails. A stale or unreadable run, or any OSError, is not evidence of one.
+    """
+    payload = os.environ.get("TMPDIR", "")
+    if os.path.basename(payload) != PAYLOAD_DIRNAME:
+        return None
+    run = os.path.dirname(payload)
+    try:
+        fd = os.open(os.path.join(run, LOCK_FILENAME), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return os.path.realpath(run)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return None
+
+
+def _owned_pythonpath_entry(entry: str, run: str | None) -> bool:
+    """This checkout, or, in a live run, a directory inside it (pytester's, the cursor tripwire's, a test's own)."""
+    if not entry:
+        return False
+    if os.path.abspath(entry) == str(_REPO_ROOT):
+        return True
+    return run is not None and os.path.realpath(entry).startswith(run + os.sep)
 
 
 def _unowned_interpreter_settings() -> list[str]:
     """``PYTHON*`` names this process started with that the suite does not own; they shaped its interpreter.
 
-    Owned: ``PYTHONDONTWRITEBYTECODE=1``, and a ``PYTHONPATH`` whose every entry is this checkout. Nothing counts
-    when the interpreter ignored the environment (``-I``, ``-E``).
+    Owned: ``PYTHONDONTWRITEBYTECODE=1``; a ``PYTHONPATH`` whose every entry is this checkout or, in a session the
+    suite started inside its live run, a directory in that run; and, in such a session, a ``PYTHONPYCACHEPREFIX``
+    in that run. Nothing counts when the interpreter ignored the environment (``-I``, ``-E``).
     """
     if sys.flags.ignore_environment:
         return []
+    run = _live_run_directory()
     unowned = []
     for name, value in os.environ.items():
         if not name.startswith("PYTHON"):
             continue
         if name == "PYTHONDONTWRITEBYTECODE" and value == "1":
             continue
-        if name == "PYTHONPATH" and value and all(entry and os.path.abspath(entry) == str(_REPO_ROOT)
-                                                  for entry in value.split(os.pathsep)):
+        if name == "PYTHONPATH" and all(_owned_pythonpath_entry(entry, run) for entry in value.split(os.pathsep)):
+            continue
+        if name == "PYTHONPYCACHEPREFIX" and run is not None and os.path.realpath(value).startswith(run + os.sep):
             continue
         unowned.append(name)
     return sorted(unowned)
@@ -4352,11 +4402,22 @@ def _keep_only_inherited_env() -> None:
     if getattr(sys, _INHERITED_ENV_APPLIED, False):
         return
     setattr(sys, _INHERITED_ENV_APPLIED, True)
-    if not _inside_managed_run() and (unowned := _unowned_interpreter_settings()):
+    if unowned := _unowned_interpreter_settings():
         raise pytest.UsageError(
             f"the interpreter started with {', '.join(unowned)}, which this suite does not own and cannot undo; "
             "unset them or run Python with -I (a PYTHONPATH may name only this checkout)"
         )
+    if sys.getfilesystemencoding() != "utf-8":
+        raise pytest.UsageError(
+            f"the interpreter started in a {sys.getfilesystemencoding()} locale; run it in a UTF-8 locale or with -X utf8"
+        )
+    # The locale the inherited LC_*/LANG chose for this process; the suite's is C.UTF-8, as CI's env -i gives.
+    try:
+        locale.setlocale(locale.LC_CTYPE, "C.UTF-8")
+    except locale.Error as error:
+        raise pytest.UsageError(f"cannot set the suite's C.UTF-8 locale: {error}") from None
+    global _CALLER_ENV
+    _CALLER_ENV = dict(os.environ)
     target = _inherited_env_target()
     os.environ.clear()
     os.environ.update(target)
