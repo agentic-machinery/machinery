@@ -9,7 +9,9 @@ window back to the first record.
 Writers: the dispatcher appends a row each time it writes a settled record (``record_settled``; the last row
 of a task id wins, so the final update decides), and ``backfill`` adds a row for every settled record that has
 none. Both hold ``rows.lock``; neither ever changes a task record. Rows carry labels, counts, timestamps, PR
-numbers and commit SHAs only: no prompt, body, error text, account identity or host path.
+numbers and commit SHAs only — plus, for an unparsed review reply only, its typed ``unparsed_reason`` and up
+to 200 escaped characters of that reply — never prompts, parsed bodies, error text, account identity or host
+paths.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -50,10 +53,21 @@ ROWS_DIR = "model-stats"
 ROWS_FILE = "rows.jsonl"
 LOCK_FILE = "rows.lock"
 MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_SAMPLE_CHARS = 200
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
+UNPARSED_REASONS = ("missing_result", "too_big", "bad_format", "bad_fields")
 _RECORDED_VERDICTS = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
+_ESCAPE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_NAMED_ESCAPES = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
+_ENVELOPE_FIELD_ERRORS = (
+    "schema_violation:",
+    "duplicate_finding_ids",
+    "invalid_line_range:",
+    "review_envelope_verdict_mismatch",
+    "review_envelope_invalid_verdict:",
+)
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -210,59 +224,103 @@ def role_of(record: Mapping[str, Any]) -> str:
     return "review" if mode == "read-only" or "review" in str(record.get("task_id", "")) else "write"
 
 
-def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Verdict and finding priorities from the record's adjacent ``.result`` sidecar, else None."""
+def _needs_escape(ch: str) -> bool:
+    return ch in _NAMED_ESCAPES or unicodedata.category(ch) in _ESCAPE_CATEGORIES
+
+
+def _escape_char(ch: str) -> str:
+    if ch in _NAMED_ESCAPES:
+        return _NAMED_ESCAPES[ch]
+    code = ord(ch)
+    if code < 0x100:
+        return f"\\x{code:02x}"
+    if code < 0x10000:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def _sample(raw: bytes) -> str:
+    """First ``MAX_SAMPLE_CHARS`` characters of a failing reply, with control/format characters escaped."""
+    # At most 4 UTF-8 bytes per character; read a bounded prefix so a 4 MB+ reply is never decoded whole.
+    prefix = raw[: MAX_SAMPLE_CHARS * 4].decode("utf-8", errors="replace")[:MAX_SAMPLE_CHARS]
+    parts: list[str] = []
+    used = 0
+    for ch in prefix:
+        piece = _escape_char(ch) if _needs_escape(ch) else ch
+        if used + len(piece) > MAX_SAMPLE_CHARS:
+            break
+        parts.append(piece)
+        used += len(piece)
+    return "".join(parts)
+
+
+def _unparsed(reason: str, sample: str | None = None) -> dict[str, Any]:
+    return {"verdict": "unparsed", "priorities": None, "unparsed_reason": reason, "unparsed_sample": sample}
+
+
+def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Verdict and finding priorities from the record's adjacent ``.result`` sidecar, or a typed unparsed cause."""
     declared = record.get("result_file")
     name = Path(declared).name if isinstance(declared, str) and declared else f"{path.stem}.result"
     if not name.endswith(".result"):
-        return None
+        return _unparsed("missing_result")
     try:
         fd = os.open(path.with_name(name), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
-        return None
+        return _unparsed("missing_result")
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return _unparsed("missing_result")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read(MAX_RESULT_BYTES + 1)
     except OSError:
-        return None
+        return _unparsed("missing_result")
     finally:
         os.close(fd)
     if len(raw) > MAX_RESULT_BYTES:
-        return None
+        return _unparsed("too_big", _sample(raw))
     return review_summary(raw)
 
 
-def _recorded_review(verdict: object) -> dict[str, Any]:
+def _recorded_review(verdict: object) -> dict[str, Any] | None:
     """A structured verdict record does not attest a findings count."""
     try:
         return {"verdict": _RECORDED_VERDICTS[normalize_verdict(verdict)], "priorities": None}
     except ReviewPublicationError:
-        return {"verdict": "unparsed", "priorities": None}
+        return None
 
 
 def review_summary(raw: bytes) -> dict[str, Any]:
-    """Read structured review output through the review contract, retaining only counts and the verdict."""
-    unparsed: dict[str, Any] = {"verdict": "unparsed", "priorities": {}}
+    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause."""
     try:
-        payload = parse_reviewer_json(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _unparsed("bad_format", _sample(raw))
+    try:
+        payload = parse_reviewer_json(text)
+    except ContractError as exc:
+        reason = "bad_fields" if str(exc).startswith(_ENVELOPE_FIELD_ERRORS) else "bad_format"
+        return _unparsed(reason, _sample(raw))
+    except (ValueError, RecursionError, TypeError):
+        return _unparsed("bad_format", _sample(raw))
+    try:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
             return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
-            return _recorded_review(payload["verdict"])
-    except (ContractError, ReviewPublicationError, UnicodeDecodeError, ValueError, RecursionError, TypeError, KeyError):
-        return unparsed
+            recorded = _recorded_review(payload["verdict"])
+            return recorded if recorded is not None else _unparsed("bad_fields", _sample(raw))
+    except (ContractError, ReviewPublicationError, ValueError, RecursionError, TypeError, KeyError):
+        return _unparsed("bad_fields", _sample(raw))
     # Older dispatches also recorded the unversioned correctness and priority fields.
     if "schema_version" in payload:
-        return unparsed
+        return _unparsed("bad_fields", _sample(raw))
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
     findings = payload.get("findings", [])
     if verdict not in VERDICTS[:3] or not isinstance(findings, list):
-        return unparsed
+        return _unparsed("bad_fields", _sample(raw))
     priorities: Counter[str] = Counter(
         finding["priority"] for finding in findings
         if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
@@ -271,9 +329,10 @@ def review_summary(raw: bytes) -> dict[str, Any]:
 
 def _review(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
     reply = _result(path, record)
-    if reply and reply["verdict"] != "unparsed":
+    if reply["verdict"] != "unparsed":
         return reply
-    return _recorded_review(record.get("verdict"))
+    recorded = _recorded_review(record.get("verdict"))
+    return recorded if recorded is not None else reply
 
 
 def _reading(value: object) -> dict[str, float] | str:
@@ -479,6 +538,37 @@ def _sha(value: object) -> bool:
     return isinstance(value, str) and _SHA.fullmatch(value) is not None
 
 
+def _sample_ok(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_SAMPLE_CHARS
+        and not any(_needs_escape(ch) for ch in value)
+    )
+
+
+def _review_ok(review: object) -> bool:
+    if not isinstance(review, dict):
+        return False
+    verdict = review.get("verdict")
+    if not isinstance(verdict, str) or verdict not in VERDICTS:
+        return False
+    priorities = review.get("priorities")
+    if not _optional(priorities, lambda p: isinstance(p, dict)
+                     and all(k in PRIORITIES and _count_value(n) for k, n in p.items())):
+        return False
+    if review.keys() == {"verdict", "priorities"}:
+        return True
+    if verdict != "unparsed" or review.keys() != {"verdict", "priorities", "unparsed_reason", "unparsed_sample"}:
+        return False
+    reason = review["unparsed_reason"]
+    sample = review["unparsed_sample"]
+    if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
+        return False
+    if reason == "missing_result":
+        return sample is None
+    return _optional(sample, _sample_ok)
+
+
 def _well_formed(row: Mapping[str, Any]) -> bool:
     """Whether every nested value has the shape ``summary_row`` writes; a damaged row is skipped, never trusted."""
     tokens_ = row.get("tokens")
@@ -493,10 +583,7 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
-        _optional(review, lambda r: isinstance(r, dict) and r.keys() == {"verdict", "priorities"}
-                  and isinstance(r["verdict"], str) and r["verdict"] in VERDICTS
-                  and _optional(r["priorities"], lambda priorities: isinstance(priorities, dict)
-                                and all(p in PRIORITIES and _count_value(n) for p, n in priorities.items()))),
+        _optional(review, _review_ok),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -563,14 +650,31 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     source = candidate["source_mtime_ns"]
     if not isinstance(stored, int) or stored < source:
         return True
+    if stored != source:
+        return False
     review = candidate["review"]
     old_review = present.get("review")
-    return (
-        stored == source
-        and review is not None and review["verdict"] != "unparsed"
-        and (review["priorities"] is not None or old_review is None or old_review["priorities"] is None
+    if review is None:
+        return False
+    if review["verdict"] != "unparsed":
+        return (
+            (review["priorities"] is not None or old_review is None or old_review["priorities"] is None
              or old_review["verdict"] == "unparsed")
-        and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
+            and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
+        )
+    # Refresh an unparsed review when the stored row lacks a reason or a retained sidecar gives a richer cause.
+    if old_review is None or old_review["verdict"] != "unparsed":
+        return False
+    new_reason = review.get("unparsed_reason")
+    old_reason = old_review.get("unparsed_reason")
+    if new_reason is None:
+        return False
+    if old_reason is None:
+        return True
+    return bool(
+        new_reason != "missing_result" and (
+            old_reason != new_reason or old_review.get("unparsed_sample") != review.get("unparsed_sample")
+        )
     )
 
 

@@ -15,8 +15,10 @@ splits by the concrete model id and the effective effort (``unset`` when none wa
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
 CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
 otherwise a write. Reviewer totals include structured results from every lane. Author figures use reviews of
-record (reviews that name a PR and the author's model). Only counts and model, effort, class, pool and repository
-labels leave this module: no prompt, body, path, account or task id.
+record (reviews that name a PR and the author's model). Only counts and model, effort, class, pool and repository labels leave this module — plus,
+on the HTTP route only, the per-reason breakdown and up to 200 escaped characters of the first failing reply
+per model and reason — never prompts, parsed bodies, paths, accounts or task ids (and never any sample on
+``/metrics``).
 """
 
 from __future__ import annotations
@@ -44,7 +46,15 @@ from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
 
-from .model_stats_rows import NATIVE_ALIASES, POOLS, VERDICTS, read_rows, timestamp, variant_effort
+from .model_stats_rows import (
+    NATIVE_ALIASES,
+    POOLS,
+    UNPARSED_REASONS,
+    VERDICTS,
+    read_rows,
+    timestamp,
+    variant_effort,
+)
 from .monitor_context import MonitorContext, get_ctx
 from .panel_values import snapshot_headers
 from .state_helpers import cache_get_or_compute, cache_get_or_compute_async, cache_get_stored, ctx_scoped_ttl_key
@@ -62,6 +72,7 @@ METRIC_WINDOWS = ("7d", "30d", "90d", "all")
 PAGE_DROP = frozenset({
     "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed")
+UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
 ALL_EFFORTS = "all"
 # Review policy blocks on P0 and P1 (fleet_comms.review_publication.BLOCKING_PRIORITIES); the
 # reference script counted P0-P2, so both are reported.
@@ -209,8 +220,8 @@ class _Row:
     tokens: tuple[int, int, int]
     trailer: bool
     delivery: bool
-    # A review's verdict and, when recorded, its finding priorities. None for write tasks.
-    review: tuple[str, Counter[str] | None] | None
+    # A review's (verdict, finding priorities, unparsed reason, escaped sample). None for write tasks.
+    review: tuple[str, Counter[str] | None, str | None, str | None] | None
     author: str | None
     allowance: tuple[str, float] | None
     raw: Mapping[str, Any]
@@ -283,23 +294,35 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         if moment is None:
             continue
         status = raw.get("status")
+        row_status = status if status in STATUSES else "other"
         role = "review" if raw.get("role") == "review" else "write"
         review = raw.get("review") if isinstance(raw.get("review"), Mapping) else None
         # Author outcomes still require a review of record.
         author = raw.get("author_model") if role == "review" and raw.get("pr") is not None else None
         verdict = review.get("verdict") if review else None
         priorities = review.get("priorities") if review else None
+        row_review: tuple[str, Counter[str] | None, str | None, str | None] | None = None
+        if role == "review":
+            if verdict in VERDICTS[:3]:
+                row_review = (verdict, Counter(priorities) if isinstance(priorities, Mapping) else None, None, None)
+            elif row_status != "done":
+                row_review = ("unparsed", None, "not_done", None)
+            else:
+                raw_reason = review.get("unparsed_reason") if review else None
+                reason = raw_reason if isinstance(raw_reason, str) and raw_reason in UNPARSED_REASONS else "unknown"
+                raw_sample = review.get("unparsed_sample") if review else None
+                sample = raw_sample if reason != "missing_result" and isinstance(raw_sample, str) else None
+                row_review = ("unparsed", None, reason, sample)
         counts = cast(dict[str, Any], raw.get("tokens")) if isinstance(raw.get("tokens"), Mapping) else {}
         yield _Row(
             task_id=raw["task_id"], model=resolve(str(raw.get("model") or "unknown"), moment),
             effort=str(raw.get("effort") or "unset"),
             role=role, task_class=str(raw.get("class") or "unclassified"),
-            status=status if status in STATUSES else "other", moment=moment, started=timestamp(raw.get("started_at")),
+            status=row_status, moment=moment, started=timestamp(raw.get("started_at")),
             duration=_number(raw.get("duration_s")),
             tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
-            review=(verdict if verdict in VERDICTS else "unparsed",
-                    Counter(priorities) if isinstance(priorities, Mapping) else None) if role == "review" else None,
+            review=row_review,
             author=resolve(str(author), moment) if author else None,
             allowance=_allowance(raw.get("allowance")),
             raw=raw,
@@ -313,6 +336,8 @@ class _Group:
         self.tokens = [0, 0, 0]
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
+        self.unparsed_reasons: Counter[str] = Counter()
+        self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str]] = {}
         self.priorities: Counter[str] = Counter()
         self.findings_n = 0
         self.allowance: Counter[str] = Counter()
@@ -325,10 +350,19 @@ class _Group:
         self.tokens = [a + b for a, b in zip(self.tokens, row.tokens, strict=True)]
         self.landed += row.landed
         if row.review is not None:
-            self.verdicts[row.review[0]] += 1
-            if row.review[0] != "unparsed" and row.review[1] is not None:
-                self.priorities.update(row.review[1])
+            verdict, priorities, reason, sample = row.review
+            self.verdicts[verdict] += 1
+            if verdict != "unparsed" and priorities is not None:
+                self.priorities.update(priorities)
                 self.findings_n += 1
+            elif verdict == "unparsed":
+                key_reason = reason if reason in UNPARSED_REASON_KEYS else "unknown"
+                self.unparsed_reasons[key_reason] += 1
+                if sample is not None and key_reason in UNPARSED_REASONS:
+                    order = _review_order(row)
+                    prev = self.unparsed_samples.get(key_reason)
+                    if prev is None or order < prev[0]:
+                        self.unparsed_samples[key_reason] = (order, sample)
         if row.role == "write" and row.allowance is not None:
             if row.allowance[1] < 0:  # the weekly window reset between the readings
                 self.allowance["reset_crossed"] += 1
@@ -344,6 +378,11 @@ class _Group:
         self.tokens = [a + b for a, b in zip(self.tokens, other.tokens, strict=True)]
         self.landed += other.landed
         self.verdicts.update(other.verdicts)
+        self.unparsed_reasons.update(other.unparsed_reasons)
+        for reason, item in other.unparsed_samples.items():
+            prev = self.unparsed_samples.get(reason)
+            if prev is None or item[0] < prev[0]:
+                self.unparsed_samples[reason] = item
         self.priorities.update(other.priorities)
         self.findings_n += other.findings_n
         self.allowance.update(other.allowance)
@@ -387,6 +426,9 @@ class _Group:
             parsed = sum(self.verdicts[v] for v in VERDICTS[:3])
             out.update(
                 verdicts={name: self.verdicts[name] for name in VERDICTS},
+                unparsed_reasons={name: self.unparsed_reasons[name] for name in UNPARSED_REASON_KEYS},
+                unparsed_samples={name: self.unparsed_samples[name][1]
+                                  for name in UNPARSED_REASONS if name in self.unparsed_samples},
                 findings=sum(self.priorities.values()) if self.findings_n else None,
                 findings_n=self.findings_n,
                 approve_rate=_rate(self.verdicts["correct"], parsed),
