@@ -207,7 +207,7 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
         ("subq-savant-1.4", "high", "done"), ("subq-savant-1.4", "max", "failed"),
     }
     review = next(row for row in rows if row["task_id"] == record["task_id"])
-    assert review["review"] == {"verdict": "correct", "priorities": {}}
+    assert review["review"] == {"verdict": "correct", "priorities": {}, "blocking_paths": []}
     assert review["pinned_head"] == head and review["pr"] is None
     spec.prompt_file.write_text("Do not send fixture-key", encoding="utf-8")
     with pytest.raises(ValueError, match="savant_prompt_refused"):
