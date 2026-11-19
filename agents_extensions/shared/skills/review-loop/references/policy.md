@@ -113,11 +113,13 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   P0-P2 are blocking defects; a reply whose open findings are all P3 is recorded as an approval.
 - **Carried findings.** An APPROVE may leave findings open only when the reviewer classifies each
   one as P3 and confirms in the reply that no acceptance criterion is unmet. The recorder records
-  an all-P3 reply as an approval without reading that confirmation, so whoever lands the change
-  checks that the reply states it. A P0-P2 finding is never carried. Before the change lands,
-  each carried finding becomes an issue with the `known-issue` label (opened under rules core P4,
-  on the author's Fleet Comms proposal), and the PR body links it. `docs/release.md` requires
-  the release notes to list every `known-issue` fixed or still open.
+  an all-P3 reply as an approval without reading that confirmation, and the merge-queue keeper
+  enqueues an approved PR with green CI. So the author puts the existing `hold` label on the PR
+  before recording a reply that carries findings, and removes it only after checking that the
+  reply states the confirmation and that the PR body links each issue. A P0-P2 finding is never
+  carried. Before the change lands, each carried finding becomes an issue with the `known-issue`
+  label (opened under rules core P4, on the author's Fleet Comms proposal). `docs/release.md`
+  requires the release notes to list every `known-issue` fixed or still open.
 - **A recorded rejection** (`CHANGES_REQUESTED` or `BLOCKED`) is cleared only by an APPROVE at
   a new head.
 - **Pending CI is not a verdict.** Review runs in parallel with PR CI. A `BLOCKED` reply with no
