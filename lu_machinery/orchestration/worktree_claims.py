@@ -135,7 +135,14 @@ def _held_lock_key(lock_file: Path) -> tuple[str, int]:
 
 @contextlib.contextmanager
 def worktree_lock(path: Path | str, *, lock_dir: Path, timeout_s: float | None = None) -> Iterator[None]:
-    """Hold an exclusive ``flock`` advisory lock for one worktree path.
+    """Hold the canonical worktree lock until the context exits."""
+    with worktree_lock_with_path(path, lock_dir=lock_dir, timeout_s=timeout_s):
+        yield
+
+
+@contextlib.contextmanager
+def worktree_lock_with_path(path: Path | str, *, lock_dir: Path, timeout_s: float | None = None) -> Iterator[Path]:
+    """Hold an exclusive ``flock`` advisory lock and yield its lock file path.
 
     The lock file is ``<lock_dir>/<key>.lock``, where the key is the first 32
     hex digits of the SHA-256 of the canonical absolute path. Lock files are
@@ -191,7 +198,7 @@ def worktree_lock(path: Path | str, *, lock_dir: Path, timeout_s: float | None =
         raise
     _HELD_LOCKS.add(holder)
     try:
-        yield
+        yield lock_file
     finally:
         _HELD_LOCKS.discard(holder)
         # Closing the descriptor releases the flock.

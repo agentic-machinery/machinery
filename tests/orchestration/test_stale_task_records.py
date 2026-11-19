@@ -1228,15 +1228,20 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     )
     fleet = tmp_path / "fleet"
     primary, sibling = fleet / "learn-ukrainian", fleet / "machinery"
-    for checkout in (primary, sibling):
+    first, second = fleet / "first-checkout", fleet / "second-checkout"
+    for checkout in (primary, first, second):
         (checkout / ".git").mkdir(parents=True)
+    sibling.symlink_to(first, target_is_directory=True)
     (fleet / "ukrainian-llm-eval").symlink_to(fleet / "ukrainian-llm-eval")  # a sibling that cannot resolve
     monkeypatch.setattr(str_mod, "state_root", lambda: primary)
     codex = Path(".worktrees") / "dispatch" / "codex"
     live = primary / codex / "live"
     live.mkdir(parents=True)
     (primary / codex / "kept").mkdir()
-    (sibling / codex / "sibling-kept").mkdir(parents=True)
+    (primary / "alias").symlink_to("missing/../.worktrees", target_is_directory=True)
+    (primary / "valid-alias").symlink_to(".worktrees", target_is_directory=True)
+    for checkout in (first, second):
+        (checkout / codex / "sibling-kept").mkdir(parents=True)
     (tmp_path / "loop").symlink_to(tmp_path / "loop")
     (tmp_path / "dangling").symlink_to(tmp_path / "no-target")
     _terminal(tasks_dir, "live-task", status="running", age_days=0, repository=public, worktree_path=str(live))
@@ -1244,9 +1249,14 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     _terminal(tasks_dir, "old-gone", **old, worktree_path=str(codex / "gone"))
     _terminal(tasks_dir, "old-kept", **old, worktree_path=str(codex / "kept"))
     _terminal(tasks_dir, "old-canonical-kept", **old, worktree_path=str(codex / "missing" / ".." / "kept"))
+    alias_path = "alias/dispatch/codex/kept"
+    _terminal(tasks_dir, "old-alias-kept", **old, worktree_path=alias_path)
+    _terminal(tasks_dir, "old-alias-acp", **old, acp_runtime_paths=[alias_path])
     _terminal(tasks_dir, "old-dangling-slash", **old, worktree_path=f"{tmp_path / 'dangling'}/")
     _terminal(tasks_dir, "old-sibling-kept", status="failed", repository=sibling_slug,
               worktree_path=str(codex / "sibling-kept"))
+    _terminal(tasks_dir, "old-retargeted", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "retargeted"))
     _terminal(tasks_dir, "old-unattributed", status="failed", repository="owner/elsewhere",
               worktree_path=str(codex / "gone"))
     _terminal(tasks_dir, "old-looped-sibling", status="failed", repository=looped_slug,
@@ -1254,7 +1264,8 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     _terminal(tasks_dir, "old-loop", **old, worktree_path=str(tmp_path / "loop" / "gone"))
     _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
               acp_runtime_paths=[str(tmp_path / "acp\x00gone")])
-    _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"), acp_runtime_paths=[42, " ", "", None])
+    _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[42, " ", "", None, "valid-alias/missing/child"])
     blocked = primary / "blocked"
     blocked.mkdir(mode=0o000)
     _terminal(tasks_dir, "old-blocked-cwd", **old, cwd="blocked/child")
@@ -1266,15 +1277,26 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     held, release = threading.Event(), threading.Event()
 
     def live_worker() -> None:
-        with str_mod.worktree_lock(str(live), timeout_s=1):
+        with (
+            str_mod.worktree_lock(str(live), timeout_s=1),
+            str_mod.worktree_lock(str(second / codex / "retargeted"), timeout_s=1),
+        ):
             held.set()
             release.wait(10)
+
+    def retarget_sibling(path: Path) -> None:
+        if path.name == "old-retargeted.json":
+            replacement = sibling.with_suffix(".new")
+            replacement.symlink_to(second, target_is_directory=True)
+            replacement.replace(sibling)
 
     thread = threading.Thread(target=live_worker)
     thread.start()
     try:
         assert held.wait(5)
-        report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, lock_timeout_s=0.1)
+        report = str_mod.archive_terminal(
+            tasks_dir, now=NOW, apply=True, lock_timeout_s=0.1, before_move=retarget_sibling,
+        )
         live_still_held = worktree_claims.existing_worktree_lock_refusal(
             live, lock_dir=worktree_claims.repository_lock_dir(primary)
         )
@@ -1286,22 +1308,26 @@ def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_c
     assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
         "old-gone.json": ("archived", None),
         "old-acp-junk.json": ("archived", None),
+        "old-retargeted.json": ("skipped", "worktree lock target changed since selection"),
     }
     assert report["kept_hot"] == {
         "worktree path still exists": 3,
-        "worktree path state unknown": 5,
-        "ACP runtime path state unknown": 1,
+        "worktree path state unknown": 6,
+        "ACP runtime path state unknown": 2,
     }
     assert live_still_held == worktree_claims.LOCK_BUSY
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
         "live-task.json",
         "old-acp-nul.json",
+        "old-alias-acp.json",
+        "old-alias-kept.json",
         "old-blocked-cwd.json",
         "old-canonical-kept.json",
         "old-dangling-slash.json",
         "old-kept.json",
         "old-loop.json",
         "old-looped-sibling.json",
+        "old-retargeted.json",
         "old-sibling-kept.json",
         "old-unattributed.json",
     ]
@@ -1343,6 +1369,7 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
     _terminal(tasks_dir, "revived")
     _terminal(tasks_dir, "touched")
     _terminal(tasks_dir, "reattached", worktree_path=str(reattached))
+    _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
 
     def live_writer(path: Path) -> None:
@@ -1355,6 +1382,13 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         elif path.name == "reattached.json":
             reattached.mkdir()
+        elif path.name == "replaced.json":
+            replacement = path.with_suffix(".pending")
+            record = json.loads(path.read_text())
+            record["worktree_path"] = str(tmp_path / "replacement-worktree")
+            replacement.write_text(json.dumps(record))
+            os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            replacement.replace(path)
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=live_writer)
 
@@ -1363,9 +1397,12 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
         "revived.json": ("skipped", "record no longer terminal"),
         "touched.json": ("skipped", "record changed since selection"),
         "reattached.json": ("skipped", "worktree path still exists"),
+        "replaced.json": ("skipped", "worktree lock target changed since selection"),
         "untouched.json": ("archived", None),
     }
-    assert sorted(path.name for path in tasks_dir.glob("*.json")) == ["reattached.json", "revived.json", "touched.json"]
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "reattached.json", "replaced.json", "revived.json", "touched.json",
+    ]
 
 
 def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):

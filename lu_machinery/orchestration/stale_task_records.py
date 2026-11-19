@@ -1681,21 +1681,29 @@ def _anchored(raw: str, record: Mapping[str, Any]) -> str:
 def _path_state(path: str) -> bool | None:
     """Whether a recorded path exists: ``True``, ``False``, or ``None`` when that is unknown.
 
-    A dangling symlink counts as present. "Not found" means absent only for a
-    spelling without ``..``: ``missing/../tree`` names whatever its lock
-    canonicalizes to, which ``lstat`` cannot see, so it is unknown. A relative
-    (unattributed) path, an invalid value and any failure other than "not
-    found" (``ELOOP``, ``EACCES``, ``ENOTDIR``) are unknown, never absent.
+    A dangling leaf symlink counts as present. After ENOENT, establish that
+    the nearest existing parent is a traversable directory. An unresolved
+    parent symlink or ``..`` can conceal a different canonical path, so the
+    record stays hot. An unattributed or unreadable path is also unknown.
     """
-    if not os.path.isabs(path):
+    candidate = Path(path)
+    if not candidate.is_absolute():
         return None
+    prefix = candidate
     try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return None if ".." in Path(path).parts else False
+        while True:
+            try:
+                prefix.lstat()
+            except FileNotFoundError:
+                if ".." in candidate.parts or prefix == prefix.parent:
+                    return None
+                prefix = prefix.parent
+            else:
+                if prefix == candidate:
+                    return True
+                return False if prefix.is_dir() else None
     except (OSError, ValueError):
         return None
-    return True
 
 
 def keep_hot_reason(record: Mapping[str, Any]) -> str | None:
@@ -1897,7 +1905,8 @@ def _archive_one(
 ) -> None:
     """Move one record under its lock after re-checking it, or record why not."""
     try:
-        with worktree_lock(lock_target, timeout_s=lock_timeout_s):
+        lock_dir = worktree_claims.repository_lock_dir(state_root())
+        with worktree_claims.worktree_lock_with_path(lock_target, lock_dir=lock_dir, timeout_s=lock_timeout_s) as held_lock:
             if before_move is not None:
                 before_move(path)
             current, stat = _read_pinned(path)
@@ -1909,12 +1918,21 @@ def _archive_one(
                 row["action"], row["skip_reason"] = "skipped", reason
             else:
                 with task_record_store.task_archive_lock(path.parent, moving=True):
+                    _, current_lock = worktree_claims.lock_path(
+                        _record_lock_target(current, path, anchored=True),
+                        lock_dir=worktree_claims.repository_lock_dir(state_root()),
+                    )
+                    if current_lock != held_lock:
+                        row["action"], row["skip_reason"] = "skipped", "worktree lock target changed since selection"
+                        return
                     row["moved"], problems = _move_group(path, archive_dir, stamp, checked=stat)
                 row["action"] = "error" if problems else "archived"
                 if problems:
                     row["error"] = "record archived; " + "; ".join(problems)
     except worktree_claims.WorktreeLockError as exc:
         row["action"], row["skip_reason"] = "skipped", worktree_claims.lock_refusal(exc)
+    except MachineryConfigError:
+        row["action"], row["skip_reason"] = "skipped", worktree_claims.LOCK_UNAVAILABLE
     except FileNotFoundError:
         row["action"], row["skip_reason"] = "skipped", "record moved since selection"
     except _RecordReplaced:
@@ -1941,8 +1959,8 @@ def archive_terminal(
     """Move old terminal records and their sidecars into ``<tasks_dir>/archive/``.
 
     Each move holds the record's lock (:func:`_record_lock_target`) and first
-    re-reads the record: it is skipped if its mtime changed since selection,
-    its status is no longer terminal, or it still owns a path
+    re-reads the record: it is skipped if its mtime or lock target changed
+    since selection, its status is no longer terminal, or it still owns a path
     (:func:`keep_hot_reason`). ``before_move`` is a test seam called under the
     lock, before that re-check.
     """
@@ -2206,7 +2224,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "batch_state/tasks/archive/. A record stays in place while its checkout path or any\n"
             "acp_runtime_paths entry still exists or cannot be checked; a relative path is read under the\n"
             "checkout of the repository the record names. Each move holds the record's lock and re-checks\n"
-            "its mtime and status first."
+            "its mtime, status and lock target first."
         ),
         epilog=(
             "Examples:\n"
