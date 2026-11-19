@@ -13,6 +13,7 @@ from lu_machinery.dispatcher.environment import child_env, probe_env, task_scrat
 from lu_machinery.dispatcher.providers import load
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.dispatcher import write_boundary
+from tests.helpers.host_env import host_isolated_env  # noqa: F401  (autouse: runs before configured_roots)
 from tests.helpers.product_tree import configured_roots as configured_roots
 import json
 import re
@@ -192,6 +193,129 @@ def test_schema_loss_record_and_real_codex_argv(dispatch, absolute, agent):
     dispatch.schema.write_text('{}')
     with pytest.raises(ValueError, match="SHA-256 changed"):
         provider.build(spec, {})
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+def test_explicit_external_absolute_schema_allowed(dispatch):
+    """An absolute schema outside the checkout is bound as given, and the task stays read-only.
+
+    Restored from learn-ukrainian ``tests/dispatcher/test_output_schema.py`` at 5aba2adb (machinery #904).
+    The product asserted Codex's own ``sandbox_mode="read-only"``; read-only Codex now runs inside the
+    supervisor's write boundary instead (machinery #472, #629), so the mode is read from the spec.
+    Defect class: an explicit external schema is refused, rebound to another path, or turns the task writable.
+    """
+    path = dispatch.schema.parent.parent / "external.json"
+    path.write_text('{}')
+    spec, record = dispatch.invoke(path)
+    assert record["output_schema_path"] == str(path)
+    assert record["output_schema_sha256"] == store.digest(b"{}")
+    assert (spec.mode, record["mode"]) == ("read-only", "read-only")
+    argv = codex.build(spec, {}).argv
+    assert argv[argv.index("--output-schema") + 1] == str(path)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+def test_claude_review_binds_findings_schema(dispatch):
+    """Case 4: a native Claude code review must bind the findings schema.
+
+    A VERDICT-only reply still cannot become a receipt. Restored from learn-ukrainian
+    ``tests/dispatcher/test_output_schema.py`` at 5aba2adb (machinery #904); the product's own
+    Codex schema validator (``scripts.audit.post_build_review``) stays with the product.
+    Defect class: a Claude or Codex code review launches without the findings schema, binds the
+    meta-schema Claude refuses, or settles a reply whose structured output is missing.
+    """
+    from lu_machinery.dispatcher.providers import claude
+    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
+
+    spec, record = dispatch.invoke(path=None, agent="claude", review=True, task_id="claude-schema")
+    assert record["require_review_verdict"] is True
+    assert record["output_schema_path"].endswith("/schemas/code-review-findings.v1.schema.json")
+    argv = claude.build(spec, {}).argv
+    schema = json.loads(argv[argv.index("--json-schema") + 1])
+    canonical = json.loads(Path(record["output_schema_path"]).read_text(encoding="utf-8"))
+    assert "$schema" in canonical and "$schema" not in schema  # Claude Code refuses the meta-schema reference
+    assert schema == {key: value for key, value in canonical.items() if key != "$schema"}
+    assert schema["properties"]["schema_version"]["const"] == "code-review-findings.v1"
+    assert schema["required"] == ["schema_version", "overall", "findings"]
+    with pytest.raises(ContractError, match="review_envelope_requires_one_json_block"):
+        canonical_receipt_payload("VERDICT: APPROVE\nSCORE: 9/10 No defects.\nNo findings.\n")
+    receipt = {
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": "No defects.", "confidence": 0.9},
+        "findings": [],
+    }
+    bound = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "", "structured_output": receipt,
+    })
+    parsed = claude.parse(bound, "", 0, None, output_schema=schema)
+    assert parsed.error is None
+    assert json.loads(parsed.text) == receipt
+    preamble = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "VERDICT: APPROVE", "structured_output": receipt,
+    })
+    parsed = claude.parse(preamble, "", 0, None, output_schema=schema)
+    assert json.loads(parsed.text) == receipt
+    missing = claude.parse(
+        json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "VERDICT: APPROVE"}),
+        "", 0, None, output_schema=schema,
+    )
+    assert missing.error == "claude: missing structured output"
+    failed = claude.parse(bound, "", 1, None, output_schema=schema)
+    assert failed.error == "claude: exited with status 1"
+    codex_spec, codex_record = dispatch.invoke(path=None, agent="sol", review=True, task_id="codex-schema")
+    assert codex_record["output_schema_path"].endswith("/schemas/code-review-findings.v1.schema.json")
+    codex_argv = codex.build(codex_spec, {}).argv
+    assert codex_argv.count("--output-schema") == 1
+    bound_path = Path(codex_argv[codex_argv.index("--output-schema") + 1])
+    assert bound_path.parent.name == ".codex-schemas"
+    assert bound_path.parent.parent == codex_spec.final_file.parent
+    assert codex_spec.options.get("provider_output_schema_sha256") is not None
+    bound = json.loads(bound_path.read_text())
+    assert "if" not in bound and "oneOf" not in json.dumps(bound) and "not" not in bound
+    assert "missing_capabilities" not in bound.get("properties", {})
+    assert bound["properties"]["schema_version"]["type"] == "string"
+    receipt_schema = json.loads(Path(codex_record["output_schema_path"]).read_text())
+    assert "if" in receipt_schema
+    refused = {**receipt, "missing_capabilities": ["shell"]}
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="missing_capabilities"):
+        Draft202012Validator(receipt_schema).validate(refused)
+    Draft202012Validator(receipt_schema).validate(receipt)
+    failed_codex = codex.parse("", "HTTP 400 schema.if is not permitted when strict is true", 1, None)
+    assert failed_codex.error == (
+        "codex: exited with status 1: HTTP 400 schema.if is not permitted when strict is true"
+    )
+
+    dry_spec = TaskSpec(
+        "codex-dry-schema", "sol", CURRENT_SOL, None, "read-only",
+        codex_spec.worktree, codex_spec.prompt_file, codex_spec.final_file,
+        options={**codex_spec.options, "dry_run": "True"},
+    )
+    dry_argv = codex.build(dry_spec, {}).argv
+    dry_path = Path(dry_argv[dry_argv.index("--output-schema") + 1])
+    assert not dry_path.exists()
+
+    name_map_schema = {
+        "type": "object",
+        "properties": {
+            "const": {"type": "string"},
+            "if": {"type": "integer"},
+            "not": {"type": "boolean"},
+        },
+        "required": ["const", "if", "not"],
+    }
+    projected = codex.openai_strict_schema(name_map_schema)
+    assert "const" in projected["properties"]
+    assert "if" in projected["properties"]
+    assert "not" in projected["properties"]
+    assert projected["properties"]["const"]["type"] == "string"
+    assert codex._needs_openai_strict(name_map_schema) is False
 
 
 @pytest.mark.usefixtures('configured_roots')
