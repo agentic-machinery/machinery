@@ -571,10 +571,9 @@ class _Cluster:
 def _clusters(rows: list[_Row]) -> list[_Cluster]:
     """One cluster per overlapping run, built once per pool across every model.
 
-    A finish reading above that task's own start, or any reading above the cluster's first start, means the
-    weekly window reset inside the cluster. That cluster's points stay unknown. A cluster shared by more than
-    one model, effort or class cannot be split from these rows, so a subgroup that only partly owns it is
-    unknown too.
+    A later pool reading above an earlier one, including a rise between two tasks, means the weekly window
+    reset inside the cluster. That cluster's points stay unknown. A cluster shared by more than one model,
+    effort or class cannot be split from these rows, so a subgroup that only partly owns it is unknown too.
     """
     by_pool: dict[str, list[tuple[_Meter, _Row]]] = defaultdict(list)
     for row in rows:
@@ -601,9 +600,12 @@ def _clusters(rows: list[_Row]) -> list[_Cluster]:
             members = tuple(row for _meter, row in group)
             earliest = min(meters, key=lambda meter: (meter.start, meter.end))
             latest = max(meters, key=lambda meter: meter.end)
-            # A rise above this task's own start is a reset even when it stays below the first reading.
-            reset = any(meter.finish_pct > meter.start_pct or meter.start_pct > earliest.start_pct
-                        or meter.finish_pct > earliest.start_pct for meter in meters)
+            events = [(meter.start, meter.start_pct) for meter in meters]
+            events.extend((meter.end, meter.finish_pct) for meter in meters)
+            # A later reading above an earlier one is a reset, including a rise between two tasks.
+            reset = any(later_pct > earlier_pct for earlier_at, earlier_pct in events
+                        for later_at, later_pct in events if later_at > earlier_at) or any(
+                            meter.finish_pct > meter.start_pct for meter in meters)
             net = earliest.start_pct - latest.finish_pct
             built.append(_Cluster(pool, members, None if reset or net < 0 else net))
     return built

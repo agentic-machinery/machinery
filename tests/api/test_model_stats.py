@@ -249,7 +249,8 @@ def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
     """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
     launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, overlapping
-    tasks on one pool each charged the pool's whole drop, or a nested reset reported as zero spend."""
+    tasks on one pool each charged the pool's whole drop, a nested reset reported as zero spend, or a rise
+    between two tasks' readings reported as measured spend."""
     readings = iter([None, 35.0])
     monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
@@ -339,9 +340,29 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
             started_at=(NOW - timedelta(hours=7)).isoformat(),
             finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
             allowance={"pool": "claude:b", "start": {"remaining_pct": 40.0}, "finish": {"remaining_pct": 55.0}})
+    # The pool falls, then a later reading from the outer task sits above the inner finish. Chronological
+    # readings are 80, 40, 35, 70. That rise is a reset even though neither task's own finish rose.
+    _record(tasks, "gap-outer", model="gemini-3.8-flash-high",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "gap-inner", model="gemini-3.8-flash-high",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "gemini", "start": {"remaining_pct": 40.0}, "finish": {"remaining_pct": 35.0}})
+    # Crossing tasks: 80, 70, 50, 65. The rise from 50 to 65 is a reset.
+    _record(tasks, "cross-read-a", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=7)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 50.0}})
+    _record(tasks, "cross-read-b", model="gpt-6.2-sol",
+            started_at=(NOW - timedelta(hours=7, minutes=30)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "codex:a", "start": {"remaining_pct": 70.0}, "finish": {"remaining_pct": 65.0}})
     rows.backfill(tasks, batch_state)
     landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer",
-              "inner", "cross-outer", "cross-inner", "buried-outer", "buried-inner"}
+              "inner", "cross-outer", "cross-inner", "buried-outer", "buried-inner", "gap-outer", "gap-inner",
+              "cross-read-a", "cross-read-b"}
     window = _window(batch_state, stats.Landing(task_ids=landed))
     unknown = {"value": None, "n": 1, "low_sample": True}
     assert window["allowance"] == [
@@ -360,6 +381,9 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
         {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
          "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
+        {"pool": "codex:a", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
+         "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
         {"pool": "codex:b", "model": "gpt-6.2-sol", "effort": "high", "tasks": 2, "landed": 2, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
          "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
@@ -369,6 +393,9 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
         {"pool": "cursor", "model": "grok-4.7", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
          "pct_points_per_landed": unknown},
+        {"pool": "gemini", "model": "gemini-3.8-flash-high", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
         {"pool": "gemini", "model": "gemini-4-hydrogen", "effort": "medium", "tasks": 2, "landed": 2,
          "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": 20.0,
          "pct_points_per_landed": {"value": 10.0, "n": 2, "low_sample": True}},
