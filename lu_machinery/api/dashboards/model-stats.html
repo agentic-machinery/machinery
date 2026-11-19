@@ -3,46 +3,45 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Model value</title>
+<title>Model statistics — Machinery</title>
 <link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
 <style>
-  :root { color-scheme: light dark; --fg: #1d1f23; --muted: #646a73; --bg: #f4f5f7; --card: #fff; --line: #e3e4e8;
-          --ok: #176b36; --warn: #805400; --bad: #b4232a; --link: #0969da; --soft: #e8f3fb;
-          --series-0: #005f9e; --series-1: #a64700; --series-2: #007754; --series-3: #963f78;
-          --series-4: #695100; --series-5: #515965; --series-6: #6442a0; --series-7: #a53239; }
-  @media (prefers-color-scheme: dark) {
-    :root { --fg: #e6e7ea; --muted: #9aa0aa; --bg: #15171a; --card: #1d2024; --line: #30343a;
-            --ok: #65d38a; --warn: #f2bf58; --bad: #ff8880; --link: #79b8ff; --soft: #1c2d41;
-            --series-0: #72b4f2; --series-1: #ffa761; --series-2: #54d4a7; --series-3: #ed9fcd;
-            --series-4: #e7cd65; --series-5: #aab2be; --series-6: #bcabff; --series-7: #ff8a89; }
+  :root {
+    --series-0: #005f9e; --series-1: #a64700; --series-2: #007754; --series-3: #963f78;
+    --series-4: #695100; --series-5: #515965; --series-6: #6442a0; --series-7: #a53239;
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
-  header { background: var(--card); border-bottom: 1px solid var(--line); padding: 10px 20px;
-           display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
-  header h1 { margin: 0; font-size: 18px; }
-  .purpose { margin: 0; flex: 1 1 16rem; font-size: 13px; color: var(--muted); }
-  select { max-width: 100%; font: inherit; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
-  a { color: var(--link); }
-  main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 14px 20px; }
-  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --series-0: #72b4f2; --series-1: #ffa761; --series-2: #54d4a7; --series-3: #ed9fcd;
+      --series-4: #e7cd65; --series-5: #aab2be; --series-6: #bcabff; --series-7: #ff8a89;
+    }
+  }
+  :root[data-theme="dark"] {
+    --series-0: #72b4f2; --series-1: #ffa761; --series-2: #54d4a7; --series-3: #ed9fcd;
+    --series-4: #e7cd65; --series-5: #aab2be; --series-6: #bcabff; --series-7: #ff8a89;
+  }
+  select { max-width: 100%; font: inherit; font-size: 13px; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  .filters { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 13px; }
+  main { grid-template-columns: minmax(0, 1fr); }
+  section { overflow-x: visible; }
   @media (max-width: 599px) {
     header, main { padding-inline: 12px; }
     section { padding-inline: 10px; }
+    .filters { margin-left: 0; }
   }
-  h2 { margin: 0 0 6px; font-size: 15px; }
+  h2 { display: block; }
   h2 .meta { font-weight: normal; font-size: 12px; color: var(--muted); margin-left: 8px; }
   .table-scroll { overflow-x: auto; }
   .table-scroll:focus-visible { outline: 2px solid var(--link); outline-offset: -2px; }
   .scroll-hint { margin: 4px 0; }
-  table { border-spacing: 0; width: 100%; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; }
   th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
-  thead th { min-width: 6ch; }
+  thead th { min-width: 6ch; white-space: normal; }
   td.num { white-space: nowrap; }
   th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
   tr > :first-child:not([colspan]) { position: sticky; left: 0; background: var(--card); }
   tr > :first-child { overflow-wrap: anywhere; min-width: 11ch; }
-  th { font-size: 12px; color: var(--muted); font-weight: 600; }
   tr.cls td { color: var(--muted); font-size: 13px; }
   tr.eff td:first-child { padding-left: 16px; font-style: italic; }
   tr.group td { color: var(--muted); font-weight: 600; padding-top: 10px; }
@@ -52,7 +51,6 @@
   .note { font-size: 13px; color: var(--muted); }
   .low { display: inline-block; color: var(--warn); border: 1px solid currentColor; border-radius: 4px;
          font-size: 11px; padding: 0 4px; margin-left: 4px; white-space: nowrap; }
-  .muted { color: var(--muted); } .error { color: var(--bad); } .warn { color: var(--warn); } .good { color: var(--ok); }
   .banner { padding: 10px 12px; background: var(--soft); border-radius: 8px; overflow-wrap: anywhere; }
   .banner p { margin: 4px 0 0; }
   .coverage { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 8px 0 0; }
@@ -82,16 +80,30 @@
 </style>
 </head>
 <body>
+<a class="skip" href="#main">Skip to main content</a>
 <header>
-  <h1>Model value</h1>
-  <p class="purpose">Which model gives the best value for which job, from our own dispatch records. Routing stays a CTO decision.</p>
-  <label>Window <select id="window">
-    <option value="24h">24 hours</option><option value="7d" selected>7 days</option>
-    <option value="30d">30 days</option><option value="90d">90 days</option><option value="all">All history</option>
-  </select></label>
-  <label>Model <select id="model"><option value="">All models</option></select></label>
+  <div class="header-top">
+    <div class="title">
+      <h1>Model value</h1>
+      <p class="purpose">Which model gives the best value for which job, from our own dispatch records. Routing stays a CTO decision.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="filters">
+      <label>Window <select id="window">
+        <option value="24h">24 hours</option><option value="7d" selected>7 days</option>
+        <option value="30d">30 days</option><option value="90d">90 days</option><option value="all">All history</option>
+      </select></label>
+      <label>Model <select id="model"><option value="">All models</option></select></label>
+    </div>
+  </div>
 </header>
-<main id="main">
+<main id="main" tabindex="-1">
   <section aria-label="Window summary">
     <p class="note" id="age">Loading…</p>
     <div id="coverage"></div>
@@ -164,8 +176,10 @@
   <section><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
 </main>
+<script src="/machinery.js"></script>
 <script>
 "use strict";
+Machinery.initChrome();
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const LOW = '<span class="low">Low sample</span>';

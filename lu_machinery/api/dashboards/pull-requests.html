@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pull requests — Machinery</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header>
+  <div class="header-top">
+    <div class="title">
+      <h1>Pull requests and merge queue</h1>
+      <p class="purpose">Open pull requests, CI rollups, cross-family review status, and merge queue positions.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  <section class="wide" id="prs">
+    <h2>Pull requests and merge queue <span class="age" id="prs-age">Loading…</span></h2>
+    <p id="prs-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="prs-content">Loading…</div>
+  </section>
+</main>
+<script src="/machinery.js"></script>
+<script>
+"use strict";
+const {
+  escapeHtml, safeHttpUrl, ageSpan, table, td, text, unknown,
+  ciLabel, reviewLabel, prChips, createPanelRunner,
+} = Machinery;
+
+function renderPrs(prs) {
+  if (prs.status !== "ok") return unknown(prs.reason);
+  return (Array.isArray(prs.repositories) ? prs.repositories : []).map(repo => {
+    const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
+    if (repo.status !== "ok") return title + unknown(repo.reason);
+    const rows = (Array.isArray(repo.pull_requests) ? repo.pull_requests : []).map(pr => {
+      const [ci, ciClass] = ciLabel(pr.ci);
+      const [review, reviewClass] = reviewLabel(pr.review);
+      const name = text(pr.draft ? "draft" : "ready for review");
+      const safe = safeHttpUrl(pr.url);
+      return [
+        td(safe ? `<a href="${escapeHtml(safe)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
+        name,
+        text(ci, ciClass),
+        text(review, reviewClass),
+        pr.queue ? text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}`, "ok")
+          : text(null, "muted"),
+        text(ageSpan(pr.created_at), "num"),
+      ];
+    });
+    return title + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
+  }).join("");
+}
+
+const PANELS = [
+  {id: "prs", label: "Pull requests", urls: ["/api/git/pull-requests"], render: renderPrs},
+];
+
+const runner = createPanelRunner({
+  panels: PANELS,
+  renderChips: latest => prChips(latest.prs, "#prs").join(""),
+});
+runner.start();
+</script>
+</body>
+</html>
