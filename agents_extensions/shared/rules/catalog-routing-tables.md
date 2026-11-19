@@ -16,7 +16,7 @@ Excluded candidates can appear in a ladder; membership never grants admission.
 
 | seat | model_id | effort | escalate_model_id | escalate_effort |
 | --- | --- | --- | --- | --- |
-| agy | gemini-3.8-flash-high | high | gemini-3.8-flash-high | high |
+| agy | gemini-4-hydrogen | medium | gemini-4-hydrogen | medium |
 | claude | claude-opus-5-5 | high | gpt-6.2-sol | high |
 | codex | gpt-6.2-sol | high | gpt-6.2-sol | high |
 
@@ -40,11 +40,11 @@ Rank follows the catalog; entries at the same rank are peers.
 | medium | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
 | medium | 5 | claude-sonnet-5-5 | claude-sonnet-5-5 |
 | medium | 6 | claude-sonnet-5-5-agy | claude-sonnet-5-5 |
-| medium | 7 | gemini-3.8-flash-high | gemini-3.8-flash-high |
+| medium | 7 | gemini-4-neon-high | gemini-4-neon |
 | low | 1 | openai_frontier_b | gpt-6.2-sol |
 | low | 2 | openai_frontier | gpt-6.2-sol |
 | low | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | low | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
 | low | 5 | claude-sonnet-5-5 | claude-sonnet-5-5 |
 | low | 6 | claude-sonnet-5-5-agy | claude-sonnet-5-5 |
-| low | 7 | gemini-3.8-flash-high | gemini-3.8-flash-high |
+| low | 7 | gemini-4-neon-high | gemini-4-neon |

@@ -10,14 +10,10 @@ from typing import Literal
 
 from lu_machinery.common.http_status import has_http_status
 
-PRIMARY_GEMINI_MODEL = "gemini-3.8-flash-high"
-AGY_GEMINI_MODEL = "gemini-3.8-flash-high"
+AGY_GEMINI_MODEL = "gemini-4-hydrogen-medium"
+PRIMARY_GEMINI_MODEL = AGY_GEMINI_MODEL
 FLASH_GEMINI_MODEL = "gemini-3.8-flash-high"
 FINAL_GEMINI_MODEL = "gemini-3.8-flash-low"
-GEMINI_MODEL_LADDER = (
-    PRIMARY_GEMINI_MODEL,
-    FINAL_GEMINI_MODEL,
-)
 GEMINI_AUTH_ENV_VARS = (
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
@@ -131,36 +127,18 @@ def build_gemini_ladder(
         raise ValueError(refusal)
     if not allowed_auth_modes:
         raise ValueError("allowed_auth_modes must not be empty")
-    if preferred_model in GEMINI_MODEL_LADDER:
-        model_order = list(GEMINI_MODEL_LADDER[GEMINI_MODEL_LADDER.index(preferred_model):])
-    else:
-        model_order = [preferred_model, FLASH_GEMINI_MODEL, FINAL_GEMINI_MODEL]
+    if preferred_model in {PRIMARY_GEMINI_MODEL, FLASH_GEMINI_MODEL}:
+        if allowed_auth_modes == ("api",):
+            return []
+        return [GeminiRung(index=1, total=1, model=preferred_model, auth_mode=None, cli="agy-cli")]
+    if preferred_model == FINAL_GEMINI_MODEL:
+        return []
 
-    rung_specs: list[tuple[str, AuthMode | None, CliMode]] = []
-    include_agy = preferred_model == PRIMARY_GEMINI_MODEL and allowed_auth_modes != ("api",)
-    for model in model_order:
-        # Flash aliases are AGY-only; never send them to the Gemini CLI.
-        if model in {FLASH_GEMINI_MODEL, FINAL_GEMINI_MODEL}:
-            if include_agy and model == PRIMARY_GEMINI_MODEL:
-                rung_specs.append((AGY_GEMINI_MODEL, None, "agy-cli"))
-            continue
-        for auth_mode in ("api", "oauth"):
-            if auth_mode not in allowed_auth_modes:
-                continue
-            rung_specs.append((model, auth_mode, "gemini-cli"))
-        if include_agy and model == PRIMARY_GEMINI_MODEL:
-            rung_specs.append((AGY_GEMINI_MODEL, None, "agy-cli"))
-
-    total = len(rung_specs)
+    auth_modes: tuple[AuthMode, ...] = ("api", "oauth")
+    admitted_modes = [mode for mode in auth_modes if mode in allowed_auth_modes]
     return [
-        GeminiRung(
-            index=index,
-            total=total,
-            model=model,
-            auth_mode=auth_mode,
-            cli=cli,
-        )
-        for index, (model, auth_mode, cli) in enumerate(rung_specs, start=1)
+        GeminiRung(index=index, total=len(admitted_modes), model=preferred_model, auth_mode=auth_mode, cli="gemini-cli")
+        for index, auth_mode in enumerate(admitted_modes, start=1)
     ]
 
 
@@ -172,8 +150,8 @@ def _format_rung(rung: GeminiRung) -> str:
 
 def _format_rung_summary(rung: GeminiRung) -> str:
     if rung.cli == "agy-cli":
-        return f"{_short_model_label(rung.model)} + AGY"
-    return f"{_short_model_label(rung.model)} + {str(rung.auth_mode).upper()}"
+        return f"{rung.model} + AGY"
+    return f"{rung.model} + {str(rung.auth_mode).upper()}"
 
 
 def _run_agy_via_runtime(
@@ -531,15 +509,3 @@ def _emit_attempt_history(logger: Callable[[str], None], attempts: list[AttemptR
             f"attempt {attempt.attempt_index}/{attempt.max_retries}: "
             f"{attempt.status} in {attempt.elapsed_s:.1f}s (stderr: {detail})"
         )
-
-
-def _short_model_label(model: str) -> str:
-    if model == PRIMARY_GEMINI_MODEL:
-        return "3.1-pro"
-    if model == AGY_GEMINI_MODEL:
-        return "agy-3.6-flash-high"
-    if model == FLASH_GEMINI_MODEL:
-        return "3-flash"
-    if model == FINAL_GEMINI_MODEL:
-        return "2.5-pro"
-    return model

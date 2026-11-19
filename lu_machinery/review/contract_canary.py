@@ -306,7 +306,7 @@ _RUN_MODELS = {
     "codex": ("gpt-6.2-sol", "--codex-account", "b-sub"),
     "claude": ("claude-sonnet-5-5", "--claude-account", "b"),
     "cursor": ("grok-4.7-high",),
-    "agy": ("gemini-3.8-flash-high",),
+    "agy": ("gemini-4-neon-high",),
 }
 
 # Run inside the candidate interpreter, with the existing dispatcher and recorder.

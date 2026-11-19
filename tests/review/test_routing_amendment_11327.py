@@ -118,7 +118,7 @@ def test_reviewer_capacity_and_ranking_read_shared_allowance(monkeypatch):
     _simulate_usage_pool(monkeypatch, ("grok", "agy"))
     budget = snapshot()
     budget["agents"]["agy"] = {**budget["agents"]["cursor"]}
-    candidate = REVIEW_CANDIDATES["gemini-3.8-flash-high"]
+    candidate = REVIEW_CANDIDATES["gemini-4-neon-high"]
     record = _route_record(candidate, budget, prefer_route=True)
     assert review_capacity(record, budget["diagnostics"]).remaining_pct == 1
     assert review_capacity(record, budget["diagnostics"]).near_cap

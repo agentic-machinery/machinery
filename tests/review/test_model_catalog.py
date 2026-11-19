@@ -984,7 +984,7 @@ def test_catalog_authorizes_no_claude_review_through_cursor():
 # the #10262 explicit AGY review-risk refusals in both configurations, and the #10630
 # capture-driver account; see SPEC.md.
 PINNED_DIGESTS = {
-    "v2-baseline.json.gz": "53d4fff929fa9c743024081e9040fa1815bcd02c175cf284c497ccf232433733",
+    "v2-baseline.json.gz": "eb058d1428c0a4ab585295f63c6acca1085462c3513673f115fe32784bef657f",
     "routing-10263.json.gz": "3385853a0070ab9a2f77e1fb40d9178ce195e44e7fd6b8c8245702ec529b7d16",
     "SHA256SUMS": "4cba22dff8338f75c8ae96b35119c3da2bea3b3d7d6418c49e466ddc0ddf73a8",
     "SPEC.md": "ed7438340b60df7dcf51271dac1b03952fe96617edd249f14aaed1ecb33a0ede",
@@ -1037,7 +1037,7 @@ def assert_frozen_routing_fixture_pinned(root: Path) -> None:
 # The current fixture contains only the expanded catalog and the existing 1432
 # reviewer cases. It was computed with pure resolver calls, without launching workers.
 _V2_BASELINE_PATH = FIXTURE / "v2-baseline.json.gz"
-assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "53d4fff929fa9c743024081e9040fa1815bcd02c175cf284c497ccf232433733"
+assert hashlib.sha256(_V2_BASELINE_PATH.read_bytes()).hexdigest() == "eb058d1428c0a4ab585295f63c6acca1085462c3513673f115fe32784bef657f"
 _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 # The Sol 6.2 recapture (2026-11-17) also carries the corrected hramatka Gemma text.
 CURRENT_BASELINE = _V2_BASELINE["baseline"]
@@ -1130,16 +1130,14 @@ def assert_frozen_surfaces(actual, *, surfaces):
             previous_gemma = expected["models"].pop("google-ais/gemma-4-31b-it")
             assert hashlib.sha256(encode(previous_gemma)).hexdigest() == "9066a74a9f417fad51e9b1bf60102032a07d880bb4275ee5613012b0f001a271"
             expected["review_scheduler"]["activity_roles"]["review"].remove("surface_review")
-            # #586: Hydrogen is an AGY work model with work roles only; it joins no seat, review
-            # route, ladder or ranking, and its row is pinned.
+            # Hydrogen holds the work and driver pins. It has no review role.
             hydrogen = value["models"].pop("gemini-4-hydrogen")
-            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "1ac63a61c73fbe0e7503d8a6ed0428c5633e4a4acb458690927f578a95d892bc"
-            # Neon replaces Carbon's advisory route. Both rows are pinned while the remaining
-            # catalog and formal routing surfaces still compare against the frozen receipts.
+            assert hashlib.sha256(encode(hydrogen)).hexdigest() == "08581ed81b80743e8b608f659e41f797e98cc335c5d8ebcc545f9aa559a7b8c0"
+            # Carbon is retired. Neon holds the AGY review and consultation pins.
             carbon = value["models"].pop("gemini-4-carbon")
             assert hashlib.sha256(encode(carbon)).hexdigest() == "9cf762a607d9112c013dd70fc6402a536022c28f418207f2ddb610cac106acb8"
             neon = value["models"].pop("gemini-4-neon")
-            assert hashlib.sha256(encode(neon)).hexdigest() == "85226fcdf9424a3c5a2ade95790677438d942c9f646fa52bfa44a232c19c47a8"
+            assert hashlib.sha256(encode(neon)).hexdigest() == "665c1e8543475695374dd30b138a556aadb802fef029ca4ee3cae8deadb5072f"
             expected["models"].pop("gemini-4-carbon")
             # Savant adds a test route and leaves the formal reviewer receipts intact.
             savant = value["models"].pop("subq-savant-1.4")
@@ -1157,8 +1155,15 @@ def refresh_current_baseline():
     from tests.claude_route_accounts import HOST_ACCOUNT
 
     capture = deepcopy(_V2_BASELINE)
-    capture["baseline"]["catalog"] = approved_dispatcher_spelling(without_advisory_roles(plain(expanded_legacy_view())))
-    capture["baseline"]["catalog"]["models"].pop("gemini-4-hydrogen")  # pinned in assert_frozen_surfaces (#586)
+    previous = capture["baseline"]["catalog"]
+    catalog = approved_dispatcher_spelling(without_advisory_roles(plain(expanded_legacy_view())))
+    # Keep the frozen rows and roles that assert_frozen_surfaces checks independently.
+    for model in ("gemini-4-hydrogen", "gemini-4-neon", "subq-savant-1.4"):
+        catalog["models"].pop(model)
+    for model in ("google-ais/gemma-4-31b-it", "gemini-4-carbon"):
+        catalog["models"][model] = previous["models"][model]
+    catalog["review_scheduler"]["activity_roles"]["review"] = previous["review_scheduler"]["activity_roles"]["review"]
+    capture["baseline"]["catalog"] = catalog
     usage_dir = _V2_BASELINE_PATH.parent / ".recapture-no-live-usage"
     assert not usage_dir.exists()
     receipts = []

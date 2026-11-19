@@ -630,7 +630,7 @@ def test_gemini_code_review_refuses_forged_endpoint_in_ladder_and_pin(monkeypatc
     injected = replace(
         SONNET_5_5,
         name="injected-gemini",
-        concrete_model="gemini-3.8-flash-high",
+        concrete_model="gemini-4-neon",
         family="google",
         route="agy",
         transport="agy",

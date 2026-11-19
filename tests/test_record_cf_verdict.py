@@ -1147,7 +1147,7 @@ def test_detached_identity_preserves_specific_review_refusals(monkeypatch, tmp_p
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_gemini_verdict_records_and_gate_accepts_exact_head(monkeypatch, tmp_path, risk, profile):
     tasks, comments, calls = setup_record(monkeypatch, tmp_path, families={"openai"})
-    write_task(tasks, agent="agy", model="gemini-3.8-flash-high", review_profile=profile,
+    write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile=profile,
                review_risk=risk, sources_mcp_call_count=3 if profile == "ukrainian" else None)
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["verdict"] == "APPROVED"
@@ -1171,7 +1171,7 @@ def test_gemini_code_verdict_refused_before_publication(monkeypatch, tmp_path, r
 
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"anthropic"}, changed_paths=(path,)))
-    write_task(tasks, agent="agy", model="gemini-3.8-flash-high", review_profile="code", review_risk=risk)
+    write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
     with pytest.raises(recorder.RecordError, match="Gemini code review requires AGY at low/medium risk"):
         recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert not comments
@@ -1183,7 +1183,7 @@ def test_gemini_code_verdict_refused_before_publication(monkeypatch, tmp_path, r
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_gemini_stale_or_short_head_refused(monkeypatch, tmp_path, head):
     tasks, _, calls = setup_record(monkeypatch, tmp_path, head=head)
-    write_task(tasks, agent="agy", model="gemini-3.8-flash-high", review_risk="low")
+    write_task(tasks, agent="agy", model="gemini-4-neon-high", review_risk="low")
     with pytest.raises(recorder.RecordError):
         recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert calls == {"posts": 0, "statuses": 0}
@@ -1344,7 +1344,7 @@ def test_one_ukrainian_seat_leaves_the_status_pending_and_the_merge_refused(monk
     tasks, comments, _ = setup_record(monkeypatch, tmp_path, families={"anthropic"})
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **kwargs: statuses.append(kwargs))
-    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-3.8-flash-high")
+    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-4-neon-high")
     assert statuses[-1]["state"] == "pending"
     assert statuses[-1]["description"].endswith("; awaiting Ukrainian seat: openai")
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == sweep.NEEDS_SEAT
@@ -1359,7 +1359,7 @@ def test_two_eligible_ukrainian_seats_at_the_same_head_pass(monkeypatch, tmp_pat
     tasks, comments, _ = setup_record(monkeypatch, tmp_path, families={"anthropic"})
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **kwargs: statuses.append(kwargs))
-    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-3.8-flash-high")
+    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-4-neon-high")
     record_seat(tasks, tmp_path, "review-two", started_at="2026-09-23T12:00:01.000001+00:00")
     assert [status["state"] for status in statuses] == ["pending", "success"]
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == "APPROVED"
@@ -1385,7 +1385,7 @@ def test_a_ukrainian_seat_approving_an_older_head_does_not_count(monkeypatch, tm
     stamp = "2026-09-23T12:30:00Z"
     comments.append({"id": 0, "body": older, "user": {"login": "fleet"}, "author_association": "MEMBER",
                      "created_at": stamp, "updated_at": stamp})
-    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-3.8-flash-high")
+    record_seat(tasks, tmp_path, "review-one", agent="agy", model="gemini-4-neon-high")
     assert statuses[-1]["state"] == "pending"
     assert statuses[-1]["description"].endswith("; awaiting Ukrainian seat: openai")
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == sweep.NEEDS_SEAT
@@ -1403,7 +1403,7 @@ def test_sol_authored_gemini_approval_passes_and_gemini_author_needs_sol(monkeyp
     tasks, comments, _ = setup_record(monkeypatch, sol_root, families={"openai"})
     statuses = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **kwargs: statuses.append(kwargs))
-    record_seat(tasks, sol_root, "review-gemini", agent="agy", model="gemini-3.8-flash-high")
+    record_seat(tasks, sol_root, "review-gemini", agent="agy", model="gemini-4-neon-high")
     assert statuses[-1]["state"] == "success"
     assert sweep.lookup_verdict(comments, SHA, "fleet").state == "APPROVED"
     assert len(merge(monkeypatch, comments)) == 1

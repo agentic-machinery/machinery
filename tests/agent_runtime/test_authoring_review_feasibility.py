@@ -447,7 +447,7 @@ def test_mixed_family_at_lower_risk_keeps_a_third_family(repo, tasks, monkeypatc
     assert resolution.selected is None and not resolution.quorum
     assert "cannot partition a commit authored by both families" in resolution.fail_closed_reason
     with pytest.raises(recorder.RecordError, match="mixed-family review requires"):
-        record_verdict(monkeypatch, tmp_path, repo, agent="agy", model="gemini-3.8-flash-high", review_risk="medium")
+        record_verdict(monkeypatch, tmp_path, repo, agent="agy", model="gemini-4-neon-high", review_risk="medium")
     # Neither family can review the shared commit independently.
     for agent, model in (("codex", CURRENT_SOL), ("claude", "claude-opus-5-5")):
         with pytest.raises(recorder.RecordError, match="cannot partition a commit authored by both families"):
@@ -493,7 +493,7 @@ def test_cursor_auto_incoming_writer_adds_only_cursor_family(repo, tasks):
         "anthropic": (repo.sha("HEAD"),), "openai": (repo.sha("HEAD^"),),
     }
     resolution = recorder.structural_review_route(auto, risk="medium", claude_account=HOST_ACCOUNT)
-    assert resolution.selected.name == "gemini-3.8-flash-high"
+    assert resolution.selected.name == "gemini-4-neon-high"
     trace = {entry.name: entry for entry in resolution.trace}
     assert "grok-4.7" not in trace
     assert "grok-4.7-cursor-fallback" not in trace

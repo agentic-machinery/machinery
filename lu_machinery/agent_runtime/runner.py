@@ -4073,8 +4073,8 @@ def _validate_catalog_model(
         from lu_machinery.review.model_catalog import (
             CONSULT_ACTIVITY,
             activity_role_refusal,
+            canonical_model_id,
             load_model_catalog,
-            model_aliases,
         )
 
         catalog = load_model_catalog()
@@ -4084,7 +4084,7 @@ def _validate_catalog_model(
         ) from exc
 
     try:
-        model_entry = catalog["models"][model_aliases(catalog)[model]]
+        model_entry = catalog["models"][canonical_model_id(model, catalog)]
         catalog_transport = ACPX_PARTICIPANT_CATALOG_TRANSPORTS[participant]
     except (KeyError, TypeError) as exc:
         raise InterAgentTransportError(

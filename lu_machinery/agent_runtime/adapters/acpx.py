@@ -177,7 +177,7 @@ _AGY_REQUIRED_FLAGS: tuple[str, ...] = (
     "--log-file",
 )
 _OPENCODE_REQUIRED_ACP_FLAGS: tuple[str, ...] = ("--pure",)
-AGY_ACP_MODEL = "gemini-3.8-flash-high"
+AGY_ACP_MODEL = "gemini-4-neon-high"
 CLAUDE_ACP_MODEL = "claude-sonnet-5-5"
 # Opus 5.5 is the Claude authority pin for advice and review; Fable holds no
 # advisory or review role (operator decision 2026-10-03, #9583).

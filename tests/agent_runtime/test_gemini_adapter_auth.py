@@ -410,18 +410,18 @@ class TestLadderAuthModeFiltering:
     def test_ladder_oauth_only_keeps_agy_rung(self) -> None:
         ladder = build_gemini_ladder(allowed_auth_modes=("oauth",))
         assert [(r.model, r.cli, r.auth_mode) for r in ladder] == [
-            ("gemini-3.8-flash-high", "agy-cli", None),
+            ("gemini-4-hydrogen-medium", "agy-cli", None),
         ]
         assert [(r.index, r.total) for r in ladder] == [(1, 1)]
 
     def test_ladder_api_only_has_no_subscribed_route(self) -> None:
-        # The subscribed Flash route is AGY-only; native API has no eligible rung.
+        # The subscribed Hydrogen route is AGY-only.
         assert build_gemini_ladder(allowed_auth_modes=("api",)) == []
 
-    def test_ladder_both_has_only_subscribed_agy_flash(self) -> None:
+    def test_ladder_both_has_only_subscribed_agy_hydrogen(self) -> None:
         ladder = build_gemini_ladder(allowed_auth_modes=("api", "oauth"))
         assert [(r.model, r.cli, r.auth_mode) for r in ladder] == [
-            ("gemini-3.8-flash-high", "agy-cli", None),
+            ("gemini-4-hydrogen-medium", "agy-cli", None),
         ]
         assert [(r.index, r.total) for r in ladder] == [(1, 1)]
 

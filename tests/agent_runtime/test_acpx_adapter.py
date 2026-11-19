@@ -2436,7 +2436,7 @@ def test_claude_adapter_preflight_refuses_incompatible_version(tmp_path, version
 @pytest.mark.parametrize(
     ("adapter_class", "participant", "provider_binary", "version", "model"),
     [
-        (AcpxAgyShadowAdapter, "agy", "agy", "1.1.9", "gemini-3.8-flash-high"),
+        (AcpxAgyShadowAdapter, "agy", "agy", "1.1.9", "gemini-4-neon-high"),
         (AcpxGlmShadowAdapter, "glm", "opencode", "1.17.13", "glm-5.3"),
         (AcpxDeepSeekShadowAdapter, "deepseek", "opencode", "1.17.13", "deepseek-v4.1-flash"),
     ],

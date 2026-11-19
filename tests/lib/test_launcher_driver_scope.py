@@ -385,8 +385,8 @@ def test_all_paths_enter_once_before_preparation(tmp_path: Path, extra: dict[str
     "provider,model",
     [
         ("gemini", "gemini-unknown"),
-        ("gemini", "gemini-3.7-flash-high"),
-        ("claude", "gemini-3.8-flash-high"),
+        ("gemini", "gemini-3.8-flash-high"),
+        ("claude", "gemini-4-hydrogen-medium"),
         ("claude", "gemini:gemini-3.1-pro-high"),
     ],
 )
@@ -395,7 +395,7 @@ def test_uncertified_gemini_driver_refused_without_entering_scope(tmp_path: Path
     result = _run(launcher, env, LAUNCHER_MODEL=model, FAKE_BUS_FAIL="1")
     assert result.returncode == 4, result.stderr
     assert f"model '{model}' " in result.stderr
-    assert "(certified: gemini-3.8-flash-high)." in result.stderr
+    assert "(certified: gemini-4-hydrogen-medium)." in result.stderr
     assert result.stdout == ""
     assert not Path(env["FAKE_STARTS"]).exists()
     assert "DRIVER_SCOPE_" not in result.stderr

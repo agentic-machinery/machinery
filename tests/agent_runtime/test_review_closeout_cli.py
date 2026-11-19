@@ -827,7 +827,7 @@ def test_resolve_reviewer_excludes_every_branch_author_and_agrees_with_the_recor
         recorder._require_qualified_reviewer(facts, task={"agent": agent, "review_risk": "medium"}, model=model, family=family)
     with pytest.raises(recorder.RecordError, match="mixed-family review requires"):
         recorder._require_qualified_reviewer(
-            facts, task={"agent": "agy", "review_risk": "medium"}, model="gemini-3.8-flash-high", family="google"
+            facts, task={"agent": "agy", "review_risk": "medium"}, model="gemini-4-neon-high", family="google"
         )
 
     # Grok reviews at every risk (#9769); an xAI author leaves no reviewer at all.
@@ -953,7 +953,7 @@ def test_resolve_reviewer_attributes_only_the_branch_after_main_is_merged(tmp_pa
     payload = json.loads(result.stdout)
     assert payload["branch_facts"]["existing_families"] == ["anthropic"]
     assert payload["branch_facts"]["commits"] == 2
-    assert payload["selected"]["name"] == "gemini-3.8-flash-high"
+    assert payload["selected"]["name"] == "gemini-4-neon-high"
     trace = {entry["name"]: entry["reason"] for entry in payload["trace"]}
     assert "same family as author (anthropic)" in trace["claude-opus-5-5"]
     assert squash != head
@@ -1118,7 +1118,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
     body = json.loads(result.stdout)
     if excluded:
         assert result.returncode == 0, result.stdout + result.stderr
-        assert body["selected"]["name"] == "gemini-3.8-flash-high"
+        assert body["selected"]["name"] == "gemini-4-neon-high"
         assert body["branch_facts"]["existing_families"] == ["anthropic"]
     else:
         # Not the default branch: the main squash stays in the PR's range and is
@@ -1138,11 +1138,12 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # Muse retirement re-pins the low/medium receipts after its candidate leaves the trace.
 # Sol 6.2 (2026-11-17) re-pins all three: the only change is gpt-6.1-sol -> gpt-6.2-sol;
 # restoring that spelling in the stdout reproduces the previous digests.
+# The Neon seat replaces the Flash trace row for low and medium risk.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
-        (CURRENT_SOL, "medium", "ordinary.py", "bee25d0b1b573e4bb0afac6aaec6d37a5c89d454e20b59ea39729fcb20e6d453"),
-        ("claude-opus-5-5", "low", "ordinary.py", "2f226e7fd8e9e596cec9ecb8dc344857fb3546469fdf1f6cee8a70f12c8d9959"),
+        (CURRENT_SOL, "medium", "ordinary.py", "58ed0c43fde901d6c8fc06cb5991acfac08f46ebb55af7cb1a9fd64051a20607"),
+        ("claude-opus-5-5", "low", "ordinary.py", "1e7e32caf98d2717ae7a451ecc6d84f38f397016fe793b0db7b9190ec30be7fd"),
         (
             CURRENT_SOL,
             "low",

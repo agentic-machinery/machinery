@@ -28,8 +28,7 @@ formal_review_eligibility_source: scripts/config/model_catalog.yaml#review_sched
 #   consultation or Ukrainian-language seat (operator 2026-11-07).
 #   grok → daily driver and regular code/infra reviewer at every risk with runtime
 #     attestation, native CLI or Cursor (operator decision 2026-10-05, #9769)
-#   agy → gemini-3.8-flash-high @ high (catalog seat for bounded work and Ukrainian content review;
-#         not a planning, design or driver seat, #9584; text-only ACP wrapper is not a formal-review route)
+#   agy uses Hydrogen Medium for work and Neon High for native review and ACP consultation.
 # Codex advisory escalation: gpt-6.2-sol @ high; routine reviewer stays high.
 # Automatic authority Opus 5.5/Sol 6.2 selection stays on the critical ladder;
 # Fable and Astra hold no review role (#9583). An explicit operator pin at another risk keeps every
@@ -41,12 +40,8 @@ formal_review_eligibility_source: scripts/config/model_catalog.yaml#review_sched
 #   · codex(gpt-6.2-sol @ high) · grok(daily driver)
 #   (codex was dropped as a driver on 2026-07-22, then re-added on 2026-07-23 because
 #    HydrationCapsuleV1 reduces rollover overhead; formal-CF eligibility is unchanged.)
-# Each of these may own cold-start / drive-board loops. agy(gemini-3.8-flash-high @ high)
-# is a catalog seat only: Flash is not a planning, design or driver seat (operator
-# decision 2026-10-03, #9584). The `agy` endpoint below is an ACP messaging and
-# dispatch endpoint for bounded work; this registry does not read seat or driver
-# fields. Sealed formal CF (review-pr) was removed in #8520; eligible routes are
-# projected below from model_catalog.
+# AGY drivers use the certified Hydrogen Medium pin. The AGY endpoint below
+# handles ACP messaging. The model catalog defines native review routes.
 endpoints:
   - name: claude
     aliases: [claude]
@@ -76,13 +71,8 @@ endpoints:
     default_ttl_seconds: 3600
     retry_class: standard
     concurrency_limit: 2
-    # Seat pin: gemini-3.8-flash-high @ high; prefer Ukrainian and well-defined work.
-    # Not a cold-start / drive-board driver and not a planning or design seat
-    # (operator decision 2026-10-03, #9584); the endpoint carries bounded work and
-    # Ukrainian content review only.
-    # The source-blind AGY wrapper is text-only and cannot consume the
-    # parent-owned sealed MCP. Formal CF for AGY-authored work is requested through
-    # an eligible cross-family route (sealed review-pr removed in #8520); AGY itself stays advisory.
+    # This endpoint provides text-only consultation with Neon High.
+    # Formal review uses the native routes in the model catalog.
     formal_review_eligible: false
     model_family_resolver: canonical-reviewer-resolver
   - name: grok

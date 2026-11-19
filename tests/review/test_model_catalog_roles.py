@@ -130,7 +130,7 @@ def test_launch_explicitly_pins_current_review_models():
         CURRENT_SOL,
         "claude-opus-5-5",
         "claude-sonnet-5-5",
-        "gemini-3.8-flash-high",
+        "gemini-4-neon",
         "grok-4.7",
     }
     for row in launched.candidates:
