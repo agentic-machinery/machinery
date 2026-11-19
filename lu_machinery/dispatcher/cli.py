@@ -100,10 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
         ("pinned-head", None, "Exact review commit (default: branch or base)"),
-        ("cwd", None, ("Existing dispatch worktree root; when its HEAD is enrolled in the agent deployment, a write "
-                       "task there needs that deployment already applied, e.g. by create_worktree(deploy_agents=True), "
-                       "and no other live task in the tree, so a running task cannot hand its own tree to a write "
-                       "helper; read-only tasks may share it (default: create one)")),
+        ("cwd", None, ("Existing dispatch worktree root; a write task there needs the tree to itself, with no other "
+                       "task or its provider still working in it, so a running task cannot hand its own tree to a "
+                       "write helper, and, when its HEAD is enrolled in the agent deployment, that deployment already "
+                       "applied, e.g. by create_worktree(deploy_agents=True); read-only tasks may share it "
+                       "(default: create one)")),
         ("review-author-model", None, "Author model for family check (default: no review check)"),
         ("codex-account", None, "Codex route: sub or api (account a; also a-sub, a-api), b-sub (also b) or b-api (default: sub; every route but sub requires its entry in the private codex_accounts.json)"),
         ("claude-account", None, "Claude account: subscription a or b, or API key kk or szb (default: inherited configuration)"),
@@ -727,8 +728,8 @@ def _dispatch(args) -> int:
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
                     if args.cwd and args.mode == "workspace-write":
-                        # A write task borrowing an enrolled tree needs it to itself and the deployment its start
-                        # commit composes; nothing is written into a borrowed tree. Checked after any creation
+                        # A write task borrowing a tree needs it to itself and, when enrolled, the deployment its
+                        # start commit composes; nothing is written into a borrowed tree. Checked after any creation
                         # still applying it, under the lock held through the start, so the tree verified is the
                         # tree launched and no other task attaches before this record names it.
                         git.deploy_agent_extensions(worktree, sha, borrowed_by=task_id, repo=repo)

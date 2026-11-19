@@ -336,15 +336,31 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
     or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
     Git status cannot see, reaching the guards; a borrowed tree written into, launched with a deployment
-    that does not match its start commit, or launched while another live task in it can commit and redeploy
-    between the check and the start; a deployed output the checkout tracks, which could enter the
-    worker's commit; and a read-only (review) worktree widened by settings the dispatch did not ask for."""
+    that does not match its start commit, or launched while another task, or the provider of a crashed one,
+    can still commit, enroll or redeploy in it between the check and the start, even when the tree is not
+    enrolled yet; a deployed output the checkout tracks, which could enter the worker's commit; and a
+    read-only (review) worktree widened by settings the dispatch did not ask for."""
+    import os
     import sys
 
     from lu_machinery.dispatcher import git
 
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     primary, _, _ = declared_repo(sandbox)
+    tasks = git.tasks_dir()
+    tasks.mkdir(parents=True, exist_ok=True)
+    # Another task live in a borrowed tree can commit, enroll or redeploy between the check and the start, so
+    # it refuses before anything is read, enrolled or not.
+    plain = primary / ".worktrees/dispatch/codex/plain"
+    run_git(primary, "worktree", "add", "--detach", str(plain), "HEAD")
+    start = run_git(plain, "rev-parse", "HEAD")
+    assert git.deploy_agent_extensions(plain, start, borrowed_by="borrower") is False
+    claim = dict(schema_version=2, task_id="cotenant", run_nonce="cotenant-run", status="running", pid=None,
+                 worktree_path=str(plain))
+    (tasks / "cotenant.json").write_text(json.dumps(claim))
+    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: worktree claimed by active task cotenant$"):
+        git.deploy_agent_extensions(plain, start, borrowed_by="borrower")
+    (tasks / "cotenant.json").unlink()
     sha, settings = enroll(primary)
     tree = primary / ".worktrees/dispatch/codex/enrolled"
     git.create_worktree(primary, tree, "codex/enrolled", sha, deploy_agents=deploy_agents)
@@ -363,16 +379,19 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
     assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
-    # Another live task in a borrowed tree can commit and redeploy between the check and the start: refused until
-    # it is finished.
-    tasks = git.tasks_dir()
-    tasks.mkdir(parents=True, exist_ok=True)
-    claim = dict(schema_version=2, task_id="cotenant", run_nonce="cotenant-run", status="running", pid=None,
-                 worktree_path=str(tree))
+    # The same in an enrolled tree, until the co-tenant is finished and its provider is proven gone: a crashed
+    # supervisor (its own pid reused) can leave a provider (here this test's process group) still working.
+    claim["worktree_path"] = str(tree)
     (tasks / "cotenant.json").write_text(json.dumps(claim))
     with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: worktree claimed by active task cotenant$"):
         git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
-    (tasks / "cotenant.json").write_text(json.dumps({**claim, "status": "done"}))
+    crashed = {**claim, "status": "crashed", "pid": os.getpid(), "process_start": "an earlier process",
+               "provider_pgid": os.getpgrp()}
+    (tasks / "cotenant.json").write_text(json.dumps(crashed))
+    with pytest.raises(ValueError, match="^agent_deploy_tree_in_use: another task's provider may still work in the "
+                                         "tree$"):
+        git.deploy_agent_extensions(tree, sha, borrowed_by="borrower")
+    (tasks / "cotenant.json").write_text(json.dumps({**crashed, "status": "done", "provider_pgid": None}))
     assert git.deploy_agent_extensions(tree, sha, borrowed_by="borrower") is True
     # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
     before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
