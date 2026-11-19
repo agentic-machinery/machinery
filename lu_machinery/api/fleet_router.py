@@ -8,6 +8,7 @@ initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -15,14 +16,16 @@ import os
 import re
 import sqlite3
 from collections import Counter
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.dependencies.utils import get_dependant, solve_dependencies
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
@@ -48,9 +51,11 @@ from .runtime_router import get_acp_conversation, list_acp_conversations, recent
 from .state_helpers import (
     DEMAND_WINDOW_S,
     SWR_DORMANT_READ_WAIT_S,
+    cache_get,
+    cache_get_or_compute_async,
     cache_get_stored,
-    cache_read_swr,
     ctx_scoped_ttl_key,
+    schedule_cache_refresh,
     swr_route,
 )
 
@@ -131,6 +136,16 @@ _TOKEN_LITERAL = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{
 
 
 
+class _OverviewRoutingDriftError(RuntimeError):
+    """Raised when ambient routing settings drift while reading an overview snapshot."""
+
+
+def _require_unretired_plane_root(plane_root: Path) -> None:
+    """Fail closed when ``plane_root`` carries the retirement marker."""
+    if local_plane_is_retired(root=plane_root):
+        raise PlaneRootAnchorError(RETIRED_LOCAL_PLANE_MESSAGE)
+
+
 def _plane_root_cache_key(state_root: Path, allow_shadow: str) -> str:
     return f"fleet-plane-root:{json.dumps([str(state_root), allow_shadow])}"
 
@@ -138,13 +153,15 @@ def _plane_root_cache_key(state_root: Path, allow_shadow: str) -> str:
 def _plane_root_fast(ctx: MonitorContext) -> Path | None:
     """Resolve the plane root without spawning git when cached or env-overridden."""
     if os.environ.get(message_plane.ENV_ROOT):
-        return message_plane.default_plane_root(repo_root=ctx.roots.state_root)
+        root = message_plane.default_plane_root(repo_root=ctx.roots.state_root)
+        _require_unretired_plane_root(root)
+        return root
     allow_shadow = os.environ.get(ENV_ALLOW_LOCAL_SHADOW) or ""
     cache_key = _plane_root_cache_key(ctx.roots.state_root, allow_shadow)
-    root: Path | None = ctx.runtime._derived.get(cache_key)
-    if root is not None and local_plane_is_retired(root=root):
-        raise PlaneRootAnchorError(RETIRED_LOCAL_PLANE_MESSAGE)
-    return root
+    cached_root: Path | None = ctx.runtime._derived.get(cache_key)
+    if cached_root is not None:
+        _require_unretired_plane_root(cached_root)
+    return cached_root
 
 
 def _plane_root(ctx: MonitorContext | None = None) -> Path:
@@ -165,6 +182,7 @@ def _plane_root(ctx: MonitorContext | None = None) -> Path:
         cache_key,
         lambda: message_plane.default_plane_root(repo_root=resolved_ctx.roots.state_root),
     )
+    _require_unretired_plane_root(root)
     return root
 
 
@@ -202,17 +220,28 @@ def _read_connection(
     connection = None
     availability = "available"
     try:
-        connection = (
-            storage.connect(storage.StoreId.FLEET_COMMS, path=db_path, read_only=True, timeout=0.25)
-            if resolved_authority is storage.Authority.PG
-            else open_readonly(db_path, timeout=0.25)
-        )
         if resolved_authority is storage.Authority.PG:
-            connection.autocommit = True
-            connection.execute("SET statement_timeout = 2000")
+            if (
+                authority is not None
+                and storage.resolve_authority(storage.StoreId.FLEET_COMMS) is not storage.Authority.PG
+            ):
+                raise _OverviewRoutingDriftError("resolved authority drifted from pg")
+            connection = storage.connect(storage.StoreId.FLEET_COMMS, read_only=True)
+            if is_sqlite_connection(connection):
+                connection.close()
+                connection = None
+                if authority is not None:
+                    raise _OverviewRoutingDriftError("resolved authority drifted from pg to sqlite")
+                availability = "pg_probe_failed"
+            else:
+                connection.autocommit = True
+                connection.execute("SET statement_timeout = 2000")
         else:
+            connection = open_readonly(db_path, timeout=0.25)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only = ON")
+    except _OverviewRoutingDriftError:
+        raise
     except Exception as exc:
         availability = read_failure_code(exc, resolved_authority)
     try:
@@ -494,15 +523,15 @@ BOARD_PR_LIST_TTL_S = 30.0
 
 
 def _count_by_state_checked(
-    connection: Any, table: str, column: str
+    connection: Any, table: str, column: str, *, required: bool = False
 ) -> tuple[dict[str, int], bool]:
     if not _table_exists(connection, table):
-        return {}, True
+        return {}, not required
     try:
         rows = connection.execute(
             f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column} ORDER BY {column}"
         ).fetchall()
-    except sqlite3.Error:
+    except _DATABASE_ERRORS:
         return {}, False
     return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}, True
 
@@ -815,14 +844,22 @@ def fleet_health(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class _OverviewRoutingInputs:
-    """Routing inputs captured once per overview read and shared by key and worker."""
+    """Resolved routing inputs captured once per overview read and shared by key and worker."""
 
     plane_root: Path
     telemetry_path: Path
-    plane_mode_env: str
-    telemetry_env: str
-    allow_shadow: str
+    plane_mode: str
+    allow_shadow: bool
     authority: storage.Authority
+    pg_dsn_digest: str
+
+
+class _UnstorableOverview(Exception):
+    """Overview snapshot served to its caller without caching."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__("overview snapshot is not storable")
+        self.payload = payload
 
 
 _OVERVIEW_DORMANT_TASKS: set[asyncio.Task[Any]] = set()
@@ -850,36 +887,69 @@ def _is_storable_overview(payload: dict[str, Any]) -> bool:
     )
 
 
+def _resolve_overview_plane_mode() -> str:
+    try:
+        return message_plane.resolve_plane_mode()
+    except ValueError:
+        return "invalid"
+
+
+def _pg_dsn_digest(authority: storage.Authority) -> str:
+    if authority is not storage.Authority.PG:
+        return ""
+    raw_dsn = os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or ""
+    if not raw_dsn:
+        return ""
+    return hashlib.sha256(raw_dsn.encode("utf-8")).hexdigest()
+
+
 def _capture_overview_routing(plane_root: Path) -> _OverviewRoutingInputs:
-    """Freeze plane-routing inputs for one overview read."""
+    """Freeze resolved plane-routing inputs from a single read of each setting."""
     telemetry_env = os.environ.get(message_plane.ENV_TELEMETRY) or ""
+    telemetry_path = (
+        Path(telemetry_env).expanduser()
+        if telemetry_env
+        else plane_root / message_plane.DEFAULT_TELEMETRY_NAME
+    )
+    authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
     return _OverviewRoutingInputs(
         plane_root=plane_root,
-        telemetry_path=message_plane.default_parity_telemetry_path(plane_root),
-        plane_mode_env=os.environ.get(message_plane.ENV_MODE) or "",
-        telemetry_env=telemetry_env,
-        allow_shadow=os.environ.get(ENV_ALLOW_LOCAL_SHADOW) or "",
-        authority=storage.resolve_authority(storage.StoreId.FLEET_COMMS),
+        telemetry_path=telemetry_path,
+        plane_mode=_resolve_overview_plane_mode(),
+        allow_shadow=os.environ.get(ENV_ALLOW_LOCAL_SHADOW, "").strip() == "1",
+        authority=authority,
+        pg_dsn_digest=_pg_dsn_digest(authority),
     )
 
 
+def _status_matches_routing(status: dict[str, Any], routing: _OverviewRoutingInputs) -> bool:
+    """True only when ``status`` reflects the exact mode and authority bound to ``routing``."""
+    if status.get("mode") != routing.plane_mode:
+        return False
+    schema = status.get("schema")
+    observed_authority = schema.get("authority") if isinstance(schema, dict) else None
+    return observed_authority == routing.authority.value
+
+
 def _routing_env_unchanged(routing: _OverviewRoutingInputs) -> bool:
-    """Verify ambient env inputs read inside ``read_plane_status`` did not drift."""
+    """Verify ambient routing inputs read during an overview read did not drift."""
     return (
-        (os.environ.get(message_plane.ENV_MODE) or "") == routing.plane_mode_env
-        and (os.environ.get(ENV_ALLOW_LOCAL_SHADOW) or "") == routing.allow_shadow
+        _resolve_overview_plane_mode() == routing.plane_mode
+        and (os.environ.get(ENV_ALLOW_LOCAL_SHADOW, "").strip() == "1") == routing.allow_shadow
         and storage.resolve_authority(storage.StoreId.FLEET_COMMS) is routing.authority
+        and _pg_dsn_digest(routing.authority) == routing.pg_dsn_digest
     )
 
 
 def _overview_cache_key(scope: str, routing: _OverviewRoutingInputs) -> str:
-    """Bind cache identity to the exact routing inputs used by the worker."""
+    """Bind cache identity to the exact resolved routing inputs used by the worker."""
     key_parts = (
         str(routing.plane_root),
-        routing.plane_mode_env,
-        routing.telemetry_env,
+        routing.plane_mode,
+        str(routing.telemetry_path),
         routing.allow_shadow,
         routing.authority.value,
+        routing.pg_dsn_digest,
     )
     return f"{scope}:{json.dumps(key_parts)}"
 
@@ -900,11 +970,25 @@ def _compute_fleet_overview_checked(
 ) -> tuple[dict[str, Any], bool]:
     """Build the overview snapshot and report whether it is safe to cache."""
     resolved = routing if routing is not None else _capture_overview_routing(_plane_root(ctx))
+    _require_unretired_plane_root(resolved.plane_root)
     status = _safe_plane_status(
         ctx,
         plane_root=resolved.plane_root,
         telemetry_path=resolved.telemetry_path,
     )
+    if not _status_matches_routing(status, resolved):
+        raise HTTPException(
+            status_code=503,
+            detail="fleet routing configuration changed during read",
+        )
+    if (
+        resolved.authority is storage.Authority.PG
+        and _pg_dsn_digest(resolved.authority) != resolved.pg_dsn_digest
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="fleet routing configuration changed during read",
+        )
     result: dict[str, Any] = {
         "read_only": True,
         "authority": status["authority"],
@@ -929,15 +1013,28 @@ def _compute_fleet_overview_checked(
             plane_root=resolved.plane_root,
             authority=resolved.authority,
         )
+    except _OverviewRoutingDriftError:
+        raise HTTPException(
+            status_code=503,
+            detail="fleet routing configuration changed during read",
+        ) from None
     except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
         return result, False
+    if resolved.authority is storage.Authority.PG and (
+        storage.resolve_authority(storage.StoreId.FLEET_COMMS) is not storage.Authority.PG
+        or _pg_dsn_digest(resolved.authority) != resolved.pg_dsn_digest
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="fleet routing configuration changed during read",
+        )
+    _require_unretired_plane_root(resolved.plane_root)
     cacheable = (
         counts_complete
         and _is_storable_overview(payload)
         and _routing_env_unchanged(resolved)
-        and not local_plane_is_retired(root=resolved.plane_root)
     )
     return payload, cacheable
 
@@ -951,71 +1048,145 @@ def _compute_fleet_overview(
     return _compute_fleet_overview_checked(ctx, routing=routing)[0]
 
 
-def _resolve_request_ctx(request: Request) -> MonitorContext:
-    """Resolve ``MonitorContext`` on the event loop without an AnyIO worker hop."""
-    override = request.app.dependency_overrides.get(get_ctx)
-    ctx = override() if callable(override) else get_ctx(request)
-    return resolve_context(ctx)
+def _extract_override_ctx(ctx: Any = Depends(get_ctx)) -> Any:
+    return ctx
+
+
+_CTX_OVERRIDE_DEPENDANT = get_dependant(path="", call=_extract_override_ctx)
+
+
+async def _get_overview_ctx(
+    request: Request,
+    response: Response,
+) -> AsyncIterator[MonitorContext]:
+    """Resolve request ``MonitorContext`` on the event loop while preserving FastAPI overrides."""
+    if get_ctx not in request.app.dependency_overrides:
+        ctx: Any = get_ctx(request)
+        if not isinstance(ctx, MonitorContext) and (
+            ctx is None
+            or not (
+                hasattr(ctx, "roots")
+                and hasattr(ctx.roots, "state_root")
+                and hasattr(ctx.roots, "project_root")
+                and hasattr(ctx, "runtime")
+            )
+        ):
+            raise TypeError("fleet overview requires a MonitorContext")
+        yield ctx
+        return
+
+    async with AsyncExitStack() as stack:
+        solved = await solve_dependencies(
+            request=request,
+            response=response,
+            dependant=_CTX_OVERRIDE_DEPENDANT,
+            dependency_overrides_provider=request.app,
+            async_exit_stack=stack,
+            embed_body_fields=False,
+        )
+        if solved.errors:
+            raise RequestValidationError(solved.errors)
+        ctx = solved.values.get("ctx")
+        if not isinstance(ctx, MonitorContext) and (
+            ctx is None
+            or not (
+                hasattr(ctx, "roots")
+                and hasattr(ctx.roots, "state_root")
+                and hasattr(ctx.roots, "project_root")
+                and hasattr(ctx, "runtime")
+            )
+        ):
+            raise TypeError("fleet overview requires a MonitorContext")
+        yield ctx
+
+
+async def _read_overview_swr(
+    key: str,
+    ttl: float,
+    compute: Callable[[], dict[str, Any]],
+) -> tuple[dict[str, Any], float, bool]:
+    """Single-decision SWR read for ``/api/fleet/overview``.
+
+    Reads the stored entry once so a clock boundary cannot transition from the
+    non-dormant path into an unbounded executor wait, and starts the dormant
+    deadline on the event loop before any executor submission.
+    """
+    stored = cache_get_stored(key)
+    if stored is None:
+        try:
+            first = await cache_get_or_compute_async(key, ttl, compute)
+        except _UnstorableOverview as failed:
+            return failed.payload, 0.0, False
+        after = cache_get_stored(key)
+        return first, 0.0 if after is None else after[1], True
+
+    stored_value, age = stored
+    if age < ttl:
+        return stored_value, age, True  # type: ignore[return-value]
+
+    if age < ttl + DEMAND_WINDOW_S:
+        schedule_cache_refresh(
+            key,
+            ttl,
+            compute,
+            should_refresh=lambda: cache_get(key, ttl) is None,
+        )
+        return stored_value, age, True  # type: ignore[return-value]
+
+    task: asyncio.Task[dict[str, Any]] = asyncio.create_task(
+        cache_get_or_compute_async(key, ttl, compute)
+    )
+    _OVERVIEW_DORMANT_TASKS.add(task)
+    task.add_done_callback(_finish_overview_dormant_task)
+    try:
+        fresh = await asyncio.wait_for(asyncio.shield(task), timeout=SWR_DORMANT_READ_WAIT_S)
+    except (PlaneRootAnchorError, HTTPException):
+        raise
+    except Exception:
+        latest = cache_get_stored(key)
+        if latest is not None:
+            return latest[0], latest[1], True  # type: ignore[return-value]
+        return stored_value, age, True  # type: ignore[return-value]
+    after = cache_get_stored(key)
+    return fresh, 0.0 if after is None else after[1], True
 
 
 @router.get("/overview")
 async def fleet_overview(
-    request: Request,
     response: Response,
+    ctx: MonitorContext = Depends(_get_overview_ctx),
 ) -> dict[str, Any]:
     """Compact durable-plane counts for the consolidated fleet dashboard."""
-    resolved_ctx = _resolve_request_ctx(request)
-    plane_root = _plane_root_fast(resolved_ctx)
+    plane_root = _plane_root_fast(ctx)
     if plane_root is None:
-        plane_root = await asyncio.to_thread(_plane_root, resolved_ctx)
+        plane_root = await asyncio.to_thread(_plane_root, ctx)
+    _require_unretired_plane_root(plane_root)
     routing = _capture_overview_routing(plane_root)
 
-    roots = repr(resolved_ctx.roots)
+    roots = repr(ctx.roots)
     scope_name = f"swr-key-scope:fleet-overview:{roots}"
-    cached_scope = resolved_ctx.runtime._derived.get(scope_name)
+    cached_scope = ctx.runtime._derived.get(scope_name)
     scope: str = (
         cached_scope
         if isinstance(cached_scope, str)
         else str(
             await asyncio.to_thread(
-                resolved_ctx.runtime.get_or_create_derived,
+                ctx.runtime.get_or_create_derived,
                 scope_name,
-                lambda: ctx_scoped_ttl_key(resolved_ctx, "swr", "fleet-overview", roots),
+                lambda: ctx_scoped_ttl_key(ctx, "swr", "fleet-overview", roots),
             )
         )
     )
     key = _overview_cache_key(scope, routing)
-    cacheable = [True]
 
     def compute() -> dict[str, Any]:
-        payload, ok = _compute_fleet_overview_checked(resolved_ctx, routing=routing)
-        cacheable[0] = ok
+        payload, ok = _compute_fleet_overview_checked(ctx, routing=routing)
+        if not ok or not _is_storable_overview(payload):
+            raise _UnstorableOverview(payload)
         return payload
 
-    def storable(payload: dict[str, Any]) -> bool:
-        return cacheable[0] and _is_storable_overview(payload)
-
-    stored = cache_get_stored(key)
-    if stored is not None and stored[1] >= FACADE_TTL_S + DEMAND_WINDOW_S:
-        # Start the dormant deadline on the event loop before any executor wait so a
-        # saturated default executor cannot stall a dormant read past the budget.
-        task: asyncio.Task[tuple[dict[str, Any], float, bool]] = asyncio.create_task(
-            cache_read_swr(key, FACADE_TTL_S, compute, storable=storable)
-        )
-        _OVERVIEW_DORMANT_TASKS.add(task)
-        task.add_done_callback(_finish_overview_dormant_task)
-        try:
-            value, age, is_stored = await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=SWR_DORMANT_READ_WAIT_S,
-            )
-        except TimeoutError:
-            latest = cache_get_stored(key) or stored
-            value, age, is_stored = latest[0], latest[1], True  # type: ignore[assignment]
-    else:
-        value, age, is_stored = await cache_read_swr(
-            key, FACADE_TTL_S, compute, storable=storable
-        )
+    value, age, is_stored = await _read_overview_swr(key, FACADE_TTL_S, compute)
+    _require_unretired_plane_root(routing.plane_root)
     response.headers.update(snapshot_headers(age, FACADE_TTL_S, unavailable=not is_stored))
     return value
 
@@ -1025,6 +1196,11 @@ _SQLITE_OVERVIEW_BASE_TABLES = frozenset(
 )
 _SQLITE_OVERVIEW_AUTHORITY_TABLES = _SQLITE_OVERVIEW_BASE_TABLES | {"authority_dead_letters"}
 _SQLITE_OVERVIEW_LEGACY_TABLES = _SQLITE_OVERVIEW_BASE_TABLES | {"dead_letters"}
+_PG_OVERVIEW_LEGACY_TABLES = frozenset({"requests", "comms_messages"})
+_PG_OVERVIEW_AUTHORITY_TABLES = _PG_OVERVIEW_LEGACY_TABLES | {
+    "authority_jobs",
+    "authority_dead_letters",
+}
 
 _SQLITE_OVERVIEW_AUTHORITY_SQL = """
 SELECT
@@ -1211,9 +1387,18 @@ def _populate_fleet_overview_queries_checked(
     result: dict[str, Any],
     status: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
+    is_sqlite = is_sqlite_connection(connection)
+    is_auth = status["mode"] == "authority"
+    required_tables = (
+        (_SQLITE_OVERVIEW_AUTHORITY_TABLES if is_auth else _SQLITE_OVERVIEW_LEGACY_TABLES)
+        if is_sqlite
+        else (_PG_OVERVIEW_AUTHORITY_TABLES if is_auth else _PG_OVERVIEW_LEGACY_TABLES)
+    )
     counts = {key: dict(value) for key, value in result["counts"].items()}
-    legacy_request_states, legacy_ok = _count_by_state_checked(connection, "requests", "state")
-    if status["mode"] == "authority":
+    legacy_request_states, legacy_ok = _count_by_state_checked(
+        connection, "requests", "state", required="requests" in required_tables
+    )
+    if is_auth:
         request_states = _count_by_state_where(
             connection,
             "authority_jobs",
@@ -1224,9 +1409,18 @@ def _populate_fleet_overview_queries_checked(
     else:
         request_states = legacy_request_states
         request_source = "legacy_requests"
-    message_kinds, messages_ok = _count_by_state_checked(connection, "comms_messages", "kind")
-    review_states, reviews_ok = _count_by_state_checked(connection, "formal_review_jobs", "state")
-    authority_job_states, aj_ok = _count_by_state_checked(connection, "authority_jobs", "state")
+    message_kinds, messages_ok = _count_by_state_checked(
+        connection, "comms_messages", "kind", required="comms_messages" in required_tables
+    )
+    review_states, reviews_ok = _count_by_state_checked(
+        connection,
+        "formal_review_jobs",
+        "state",
+        required="formal_review_jobs" in required_tables,
+    )
+    authority_job_states, aj_ok = _count_by_state_checked(
+        connection, "authority_jobs", "state", required="authority_jobs" in required_tables
+    )
     counts["requests"] = {
         "total": sum(request_states.values()),
         "by_state": request_states,
@@ -1243,27 +1437,31 @@ def _populate_fleet_overview_queries_checked(
         "total": sum(authority_job_states.values()),
         "by_state": authority_job_states,
     }
-    dead_letter_table = (
-        "authority_dead_letters" if status["mode"] == "authority" else "dead_letters"
-    )
+    dead_letter_table = "authority_dead_letters" if is_auth else "dead_letters"
+    dead_letters_ok = dead_letter_table not in required_tables
     if _table_exists(connection, dead_letter_table):
         counts["dead_letters"]["total"] = int(
             connection.execute(f"SELECT COUNT(*) FROM {dead_letter_table}").fetchone()[0]
         )
+        dead_letters_ok = True
+    acp_ok = "acp_conversations" not in required_tables
     if _table_exists(connection, "acp_conversations"):
         counts["acp_conversations"]["total"] = int(
             connection.execute("SELECT COUNT(*) FROM acp_conversations").fetchone()[0]
         )
+        acp_ok = True
     result["counts"] = counts
     result["availability"] = "available" if any(
         section["total"] for section in counts.values()
     ) else "empty"
     result["authority_health"] = (
         _authority_health_snapshot(connection)
-        if status["mode"] == "authority"
+        if is_auth
         else None
     )
-    return result, (legacy_ok and messages_ok and reviews_ok and aj_ok)
+    return result, (
+        legacy_ok and messages_ok and reviews_ok and aj_ok and dead_letters_ok and acp_ok
+    )
 
 
 def _populate_fleet_overview_queries(

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import sqlite3
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -15,11 +17,12 @@ from typing import Any
 import anyio
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import fleet_router, state_helpers
-from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.api import fleet_router, monitor_context, state_helpers
+from lu_machinery.api.monitor_context import fixture_context, get_ctx
+from lu_machinery.control_plane import storage
 from lu_machinery.fleet_comms.migrations import apply_migrations
 from lu_machinery.fleet_comms.paths import RETIRED_LOCAL_MARKER, PlaneRootAnchorError
 
@@ -262,9 +265,12 @@ def test_overview_reuses_cached_plane_root_and_respects_overrides_and_retired_ma
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
     monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
 
+    real_default_plane_root = fleet_router.message_plane.default_plane_root
     calls: list[Path | None] = []
 
     def fake_default_plane_root(*, repo_root: Path | None = None, allow_non_git: bool = False) -> Path:
+        if os.environ.get("FLEET_COMMS_ROOT"):
+            return real_default_plane_root(repo_root=repo_root, allow_non_git=allow_non_git)
         calls.append(repo_root)
         return plane
 
@@ -276,6 +282,19 @@ def test_overview_reuses_cached_plane_root_and_respects_overrides_and_retired_ma
     assert first["availability"] == "available"
     assert second["counts"] == first["counts"]
     assert len(calls) == 1
+
+    # Explicit FLEET_COMMS_ROOT override takes precedence; clearing it returns to the cached default root
+    # without spawning git again and still rejects a retirement marker on that default root.
+    override_plane = _make_plane_db(tmp_path / "override", populate=False)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(override_plane))
+    assert fleet_router._plane_root(ctx) == override_plane
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    assert fleet_router._plane_root(ctx) == plane
+    assert len(calls) == 1
+    (plane / RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
+    with pytest.raises(PlaneRootAnchorError):
+        fleet_router._plane_root(ctx)
+    (plane / RETIRED_LOCAL_MARKER).unlink()
 
     # F4: Primed HTTP cache must refuse a newly retired plane at warm (1s), stale (20s), and dormant (200s) ages.
     monkeypatch.undo()
@@ -479,6 +498,24 @@ def test_overview_swr_serves_warm_hits_without_executor_and_refreshes_on_expiry(
                 assert dormant_exec.status_code == 200
                 assert dormant_exec.headers["X-Snapshot-State"] == "stale"
                 assert elapsed < 0.95
+
+                # F2: Clock straddling the 135 s dormancy cutoff between consecutive lookups
+                # must stay single-decision and never fall through to an unbounded executor wait.
+                cutoff = fleet_router.FACADE_TTL_S + state_helpers.DEMAND_WINDOW_S
+                stored_ts = state_helpers._ttl_cache[key][0]
+                straddle_ticks = iter([stored_ts + cutoff - 0.001, stored_ts + cutoff + 0.001])
+                prev_clock = state_helpers._ttl_clock
+                state_helpers._ttl_clock = lambda: next(straddle_ticks, stored_ts + cutoff + 0.001)
+                try:
+                    straddle_t0 = time.monotonic()
+                    straddle_resp = await asyncio.wait_for(
+                        async_client.get("/api/fleet/overview"), timeout=0.5
+                    )
+                    assert straddle_resp.status_code == 200
+                    assert straddle_resp.headers["X-Snapshot-State"] == "stale"
+                    assert time.monotonic() - straddle_t0 < 0.5
+                finally:
+                    state_helpers._ttl_clock = prev_clock
             finally:
                 exec_release.set()
                 if blocked is not None:
@@ -597,3 +634,251 @@ def test_overview_sqlite_falls_back_on_partial_corrupt_schema(
     assert overview["counts"]["dead_letters"]["total"] == 1
     assert overview["authority_health"]["availability"] == "schema_read_failed"
     assert cacheable is False
+
+
+def test_overview_missing_required_table_is_not_cached_and_recovers_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F3): dropping a required migrated table (e.g. comms_messages) while leaving
+    migration receipts intact must not cache zero counts as fresh or mask recovery."""
+    state_helpers.cache_invalidate()
+    plane = _make_plane_db(tmp_path / "missing-table")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+    app, _ = _overview_app(tmp_path / "monitor-missing-table")
+
+    with sqlite3.connect(plane / "comms.sqlite3") as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("DROP TABLE comms_messages")
+        conn.commit()
+
+    with TestClient(app) as client:
+        degraded = client.get("/api/fleet/overview")
+        assert degraded.status_code == 200
+        assert degraded.json()["counts"]["messages"]["total"] == 0
+        assert degraded.headers["X-Snapshot-State"] == "unavailable"
+
+        # Recreate comms_messages and insert a row; the very next GET must see it immediately.
+        with sqlite3.connect(plane / "comms.sqlite3") as conn:
+            conn.execute(
+                "CREATE TABLE comms_messages ("
+                "message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, kind TEXT NOT NULL, "
+                "sender TEXT NOT NULL, recipient TEXT, created_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO comms_messages(message_id, conversation_id, kind, sender, recipient, created_at) "
+                "VALUES ('m-new', 'conv-1', 'message', 'a', 'b', '2026-11-19T00:00:00Z')"
+            )
+            conn.commit()
+
+        recovered = client.get("/api/fleet/overview")
+        assert recovered.status_code == 200
+        assert recovered.headers["X-Snapshot-State"] == "fresh"
+        assert recovered.json()["counts"]["messages"]["total"] == 1
+
+
+def test_overview_rechecks_retirement_before_queued_compute_and_after_dormant_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F4): creating the retirement marker after entry check (before cold compute
+    starts or during a dormant wait timeout) must raise PlaneRootAnchorError, never HTTP 200."""
+    state_helpers.cache_invalidate()
+    now = [3000.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
+
+    # 1. Retirement marker created after entry check passes, before cold compute opens the store.
+    cold_plane = _make_plane_db(tmp_path / "cold-retire")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(cold_plane))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+    cold_app, _ = _overview_app(tmp_path / "monitor-cold-retire")
+
+    real_checked = fleet_router._compute_fleet_overview_checked
+    retired_before_compute = [False]
+
+    def retire_then_compute(target_ctx: Any, *, routing: Any = None) -> tuple[dict[str, Any], bool]:
+        if not retired_before_compute[0]:
+            retired_before_compute[0] = True
+            (cold_plane / RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
+        return real_checked(target_ctx, routing=routing)
+
+    monkeypatch.setattr(fleet_router, "_compute_fleet_overview_checked", retire_then_compute)
+    with TestClient(cold_app, raise_server_exceptions=True) as cold_client, pytest.raises(
+        PlaneRootAnchorError
+    ):
+        cold_client.get("/api/fleet/overview")
+
+    # 2. Retirement marker created while a dormant wait times out under a saturated executor.
+    monkeypatch.setattr(fleet_router, "_compute_fleet_overview_checked", real_checked)
+    dormant_plane = _make_plane_db(tmp_path / "dormant-retire")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(dormant_plane))
+    dormant_app, _ = _overview_app(tmp_path / "monitor-dormant-retire")
+
+    with TestClient(dormant_app, raise_server_exceptions=True) as dormant_client:
+        primed = dormant_client.get("/api/fleet/overview")
+        assert primed.status_code == 200
+        assert primed.headers["X-Snapshot-State"] == "fresh"
+
+    async def probe_dormant_retirement() -> None:
+        transport = httpx.ASGITransport(app=dormant_app, raise_app_exceptions=True)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+            loop = asyncio.get_running_loop()
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            loop.set_default_executor(executor)
+            exec_started = threading.Event()
+            exec_release = threading.Event()
+            blocked = None
+            try:
+                def block_executor() -> None:
+                    exec_started.set()
+                    exec_release.wait(timeout=5)
+
+                blocked = loop.run_in_executor(None, block_executor)
+                assert exec_started.wait(2)
+
+                now[0] += fleet_router.FACADE_TTL_S + state_helpers.DEMAND_WINDOW_S + 5.0
+                orig_wait_for = fleet_router.asyncio.wait_for
+
+                async def wait_and_retire(awaitable: Any, *, timeout: float) -> Any:
+                    (dormant_plane / RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
+                    return await orig_wait_for(awaitable, timeout=timeout)
+
+                monkeypatch.setattr(fleet_router.asyncio, "wait_for", wait_and_retire)
+                with pytest.raises(PlaneRootAnchorError):
+                    await async_client.get("/api/fleet/overview")
+            finally:
+                exec_release.set()
+                if blocked is not None:
+                    await blocked
+                if fleet_router._OVERVIEW_DORMANT_TASKS:
+                    await asyncio.gather(*list(fleet_router._OVERVIEW_DORMANT_TASKS), return_exceptions=True)
+                executor.shutdown(wait=True)
+
+    asyncio.run(probe_dormant_retirement())
+
+
+def test_overview_rejects_aba_mode_switch_and_guards_routing_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F5): ABA mode toggle during read_plane_status must never return or cache
+    shadow counts under the authority key; telemetry path and PG connect must not drift."""
+    state_helpers.cache_invalidate()
+    plane = _make_plane_db(tmp_path / "aba")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+    app, ctx = _overview_app(tmp_path / "monitor-aba")
+
+    # 1. ABA mode toggle: authority -> shadow during read_plane_status -> back to authority.
+    real_read_plane_status = fleet_router.read_plane_status
+    toggled = [False]
+
+    def aba_read_plane_status(**kwargs: Any) -> dict[str, Any]:
+        if not toggled[0]:
+            toggled[0] = True
+            monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+            try:
+                return real_read_plane_status(**kwargs)
+            finally:
+                monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+        return real_read_plane_status(**kwargs)
+
+    monkeypatch.setattr(fleet_router, "read_plane_status", aba_read_plane_status)
+
+    with TestClient(app) as client:
+        drifted = client.get("/api/fleet/overview")
+        assert drifted.status_code == 503
+
+        # Nothing was cached under the authority key; next authority GET returns fresh authority data.
+        clean = client.get("/api/fleet/overview")
+        assert clean.status_code == 200
+        assert clean.headers["X-Snapshot-State"] == "fresh"
+        assert clean.json()["counts"]["requests"]["source"] == "authority_jobs"
+
+    # 2. Telemetry path construction reads ENV_TELEMETRY once (never calls default_parity_telemetry_path).
+    def fail_default_telemetry(*_args: Any, **_kwargs: Any) -> Path:
+        raise AssertionError("default_parity_telemetry_path must not re-read ambient env")
+
+    monkeypatch.setattr(fleet_router.message_plane, "default_parity_telemetry_path", fail_default_telemetry)
+    custom_tele = tmp_path / "custom-parity.jsonl"
+    monkeypatch.setenv("FLEET_COMMS_PLANE_TELEMETRY", str(custom_tele))
+    routing = fleet_router._capture_overview_routing(plane)
+    assert routing.telemetry_path == custom_tele
+
+    # 3. PG read connection refuses authority drift back to SQLite before storage.connect.
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "sqlite")
+    with pytest.raises(fleet_router._OverviewRoutingDriftError), fleet_router._read_connection(
+        ctx, pg_supported=True, plane_root=plane, authority=storage.Authority.PG
+    ):
+        pass
+
+
+def test_overview_preserves_fastapi_get_ctx_overrides_and_never_falls_back_to_production(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F7): async/sync get_ctx dependency overrides (with or without Request, or
+    async generator) must resolve via FastAPI, and invalid/None results must fail closed."""
+    state_helpers.cache_invalidate()
+    plane_default = _make_plane_db(tmp_path / "ctx-default", populate=False)
+    plane_override = _make_plane_db(tmp_path / "ctx-override", populate=True)
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+
+    app, _default_ctx = _overview_app(tmp_path / "monitor-default")
+    override_ctx = fixture_context(tmp_path / "monitor-override")
+    override_ctx = replace(override_ctx, stores=replace(override_ctx.stores, epics_store=None))
+
+    # Map each context's state_root to its own plane root so we can prove which ctx served the GET.
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+
+    def routed_plane_root(*, repo_root: Path | None = None, allow_non_git: bool = False) -> Path:
+        if repo_root == override_ctx.roots.state_root:
+            return plane_override
+        return plane_default
+
+    monkeypatch.setattr(fleet_router.message_plane, "default_plane_root", routed_plane_root)
+    monkeypatch.setattr(
+        monitor_context,
+        "production_context",
+        lambda: (_ for _ in ()).throw(AssertionError("production_context fallback must not run")),
+    )
+
+    cleaned: list[str] = []
+
+    async def async_with_request(request: Request) -> Any:
+        assert request.url.path == "/api/fleet/overview"
+        return override_ctx
+
+    async def async_zero_arg() -> Any:
+        return override_ctx
+
+    def sync_with_request(request: Request) -> Any:
+        assert request.url.path == "/api/fleet/overview"
+        return override_ctx
+
+    def sync_zero_arg() -> Any:
+        return override_ctx
+
+    async def async_gen_override() -> AsyncIterator[Any]:
+        try:
+            yield override_ctx
+        finally:
+            cleaned.append("closed")
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        for override in (
+            async_with_request,
+            async_zero_arg,
+            sync_with_request,
+            sync_zero_arg,
+            async_gen_override,
+        ):
+            state_helpers.cache_invalidate()
+            app.dependency_overrides[get_ctx] = override
+            resp = client.get("/api/fleet/overview")
+            assert resp.status_code == 200
+            assert resp.json()["counts"]["messages"]["total"] == 5
+
+        assert cleaned == ["closed"]
+
+        # None or non-context return must fail closed (HTTP 500), never falling back to production_context.
+        app.dependency_overrides[get_ctx] = lambda: None
+        bad = client.get("/api/fleet/overview")
+        assert bad.status_code == 500
