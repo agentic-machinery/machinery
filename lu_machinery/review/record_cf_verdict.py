@@ -725,7 +725,8 @@ def _attribute_trailer(commit_sha: str | None, trailer: str, *, repository: str,
         raise RecordError("author model unknown")
     # Task provenance wins over family tokens embedded in the trailer's task id.
     task_file = None
-    if TASK_ID.fullmatch(model):
+    # Release parsing uses os.devnull when no task store is configured.
+    if TASK_ID.fullmatch(model) and task_root != Path(os.devnull):
         try:
             with task_archive_lock(task_root):
                 candidate = _hot_or_archived(task_root, f"{model}.json")
