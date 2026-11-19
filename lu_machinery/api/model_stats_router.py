@@ -321,7 +321,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             effort=str(raw.get("effort") or "unset"),
             role=role, task_class=str(raw.get("class") or "unclassified"),
             status=row_status, moment=moment, started=timestamp(raw.get("started_at")),
-            duration=_number(raw.get("duration_s")),
+            duration=None if row_status == NEVER_STARTED else _number(raw.get("duration_s")),
             tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
             review=row_review,
@@ -401,9 +401,9 @@ class _Group:
         tasks = sum(self.status.values())
         seconds = sum(self.durations)
         hours = seconds / 3600
-        # A task with no recorded duration makes the total, and so the cost per landed task, unknown, never zero.
-        timed = len(self.durations) == tasks
-        untimed = tasks - len(self.durations)
+        # Only started attempts belong in the runtime denominator.
+        started = tasks - self.status[NEVER_STARTED]
+        untimed = started - len(self.durations)
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
             "status": {name: self.status[name] for name in (*STATUSES, "other")},
@@ -422,8 +422,8 @@ class _Group:
             observed = round(hours / self.landed, 2) if self.landed and self.durations else None
             out.update(
                 landed=self.landed, landed_rate=_rate(self.landed, tasks),
-                wall_hours_per_landed={**_rate(hours, self.landed, 2), **({} if timed else {"value": None})},
-                wall_hours_observed={"value": observed if _timing_shown(tasks, untimed) else None,
+                wall_hours_per_landed={**_rate(hours, self.landed, 2), **({"value": None} if untimed else {})},
+                wall_hours_observed={"value": observed if _timing_shown(started, untimed) else None,
                                      "n": self.landed, "timed_tasks": len(self.durations),
                                      "untimed_tasks": untimed},
                 output_tokens_per_landed=_rate(self.tokens[2], self.landed, 0),

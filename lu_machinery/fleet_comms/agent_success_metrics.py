@@ -14,6 +14,7 @@ from statistics import mean, median
 from typing import Any
 
 from lu_machinery.common import json_depth
+from lu_machinery.dispatcher.types import StartRefusal
 from lu_machinery.fleet_comms.efficiency_metrics import _parse_timestamp, _read_task_record, _task_record_paths
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.review.model_catalog import ModelCatalogError, load_model_catalog, model_aliases
@@ -440,6 +441,10 @@ def collect_agent_success(
             if not since <= start < until:
                 coverage["outside_window"] += 1
                 continue
+            status = record.get("status")
+            refusal = record.get("never_started_reason")
+            if status in ("failed", "rate_limited", "crashed") and isinstance(refusal, str) and refusal in StartRefusal:
+                continue
             requested = _label(record.get("model"))
             # Runtime identity wins when recorded as known; display aliases use the shared normalizer.
             resolved = record.get("resolved_model")
@@ -453,7 +458,6 @@ def collect_agent_success(
                 model = "unknown"
             author = _label(record.get("review_author_model"))
             author = _label(aliases.get(author.casefold(), author)) if available else "unknown"
-            status = record.get("status")
             rows.append(
                 {
                     "record": record,

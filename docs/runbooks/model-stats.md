@@ -110,8 +110,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   terminal status and carries `never_started_reason`. Model stats projects `status.never_started` and reports
   `never_started_reasons` by model, effort, role and class. The dashboard lists counts by cause for the selected
   window and model. These rows have zero tokens, count toward total and not-done attempts and contribute no
-  review verdict, unparsed reply or allowance spend. A sandbox launcher can have a process group while the
-  provider it guards has yet to start.
+  review verdict, unparsed reply, allowance spend or runtime measurement. A sandbox launcher can have a
+  process group while the provider it guards has yet to start.
   Admission refusals without an attributed worktree have their own record ID. The requested task ID remains
   available for a later invocation. If preparation leaves a worktree, its original task record retains custody.
 - **Legacy refusal evidence** comes from a retained task record with a known pre-start error and no provider
@@ -125,11 +125,12 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   landing is as fresh as the last fetch of each checkout. `coverage.landing.trailer_task_ids_by_repository`
   counts trailer task ids per repository. See [Landing source](#landing-source) for why the trailer is read and
   what the line scan cannot see.
-- **Wall hours per landed**: `wall_hours_per_landed` divides wall time of all write tasks of that model by its landed
-  tasks, so failed attempts are charged to the work that landed. It is unknown (`null`) when `landed` is 0 or any
-  task has no recorded duration; `wall_seconds.n` counts the tasks that have one. `wall_hours_observed` divides total
-  recorded hours by `landed`, and reports a `value` only when `landed` > 0, at least one task is timed, and untimed
-  tasks are at most 1% of tasks or 1 task out of 10 or more; otherwise `value` is `null`. It always reports `n`
+- **Wall hours per landed**: `wall_hours_per_landed` divides wall time of started write tasks of that model by its
+  landed tasks, so failed runs are charged to the work that landed. It is unknown (`null`) when `landed` is 0
+  or any started task has no recorded duration. `wall_seconds.n` counts started tasks with a duration.
+  `wall_hours_observed` divides total recorded hours by `landed` and reports a `value` when `landed` > 0, at
+  least one task is timed, and untimed tasks are at most 1% of started tasks or 1 task out of 10 or more.
+  Otherwise `value` is `null`. It always reports `n`
   (`landed`), `timed_tasks` and `untimed_tasks`, and the page displays it with any excluded or missing count labelled.
   Tokens per landed task are computed from total tokens over `landed`. Fresh input includes cache writes; output
   includes reasoning tokens (Codex `output_tokens` already include them; the reasoning or thinking counts of Cursor,
