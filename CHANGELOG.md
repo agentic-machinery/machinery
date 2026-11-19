@@ -9,6 +9,20 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.43"></a>
+## [0.1.43] - 2026-11-19
+
+### Added
+
+- Reviewer finding precision and author results per risk tier (#902) ([#925](https://github.com/learn-ukrainian/machinery/pull/925))
+- Let Savant draft owned-path fixes on public repositories (#898) ([#926](https://github.com/learn-ukrainian/machinery/pull/926))
+
+### Fixed
+
+- Keep task-record identity during archive moves ([#921](https://github.com/learn-ukrainian/machinery/pull/921))
+- Flag home paths in file URIs, and bounded-root segments in dot-relative paths and /api queries (#909) ([#924](https://github.com/learn-ukrainian/machinery/pull/924))
+- Keep reply samples off the model-stats page feed ([#929](https://github.com/learn-ukrainian/machinery/pull/929))
+
 <a id="v0.1.42"></a>
 ## [0.1.42] - 2026-11-19
 
@@ -1063,7 +1077,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...HEAD
+[0.1.43]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...v0.1.43
 [0.1.42]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...v0.1.42
 [0.1.41]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...v0.1.41
 [0.1.40]: https://github.com/learn-ukrainian/machinery/compare/v0.1.39...v0.1.40
