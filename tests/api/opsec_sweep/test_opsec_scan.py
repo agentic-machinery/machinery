@@ -146,8 +146,10 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("file:///etc/fixture.conf?u=file:///home/fixture-user/x", "file:///home/fixture-user/x"),
         ("[fixture](file://fixture-host./home)", "file://fixture-host./home"),
         ("Read `file://fixture-host/home`.", "file://fixture-host/home"),
-        ("[local](file:///home/fixture-user/x),[docs](/api/health)", "file:///home/fixture-user/x"),
-        ("/api/fixture?source=/home/fixture-user/x&view=page#/details", "/home/fixture-user/x"),
+        # Fail-closed span contract: a glued neighbour is covered, never path bytes left behind.
+        ("[local](file:///home/fixture-user/x),[docs](/api/health)", "file:///home/fixture-user/x),[docs](/api/health"),
+        ("/api/fixture?source=/home/fixture-user/x&view=page#/details", "/home/fixture-user/x&view=page#/details"),
+        ("/home/fixture-user/team,notes/x", "/home/fixture-user/team,notes/x"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
@@ -173,6 +175,8 @@ def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: 
         "file://fixture-host./tmp.backup/fixture.conf",
         "/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/fixture.conf",
         "[fixture](file:///tmp./fixture.conf)",
+        "file:///tmp,backup/fixture.conf",
+        "file:///tmp.#anchor",
     ],
 )
 def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:

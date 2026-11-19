@@ -63,18 +63,19 @@ _ISO_DURATION_RE = re.compile(
 # subtly different IP parser.  Bracketed addresses keep an optional port as a
 # single candidate.  Unbracketed IPv4:port is handled by the same parser.
 _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{1,5})?|[0-9A-Fa-f:.]+)(?![A-Za-z0-9])")
-# Path text stops at whitespace, quotes, angle brackets, backticks, list and
-# Markdown closers, and query or fragment separators, so a path finding never
-# swallows a neighbouring value, link, URL or later query parameter.
-_PATH_STOP = r"\s\"'<>`,;|&#)\]}"
-_PATH_TEXT = "[^" + _PATH_STOP + "]"
-_PATH_TRAILING_PUNCTUATION = ".,;:!?)]}"
+# A path finding ends where its whitespace-, quote- or angle-bracket-delimited
+# run ends, less trailing prose punctuation and backticks.  Text cannot tell a
+# "," ";" "&" or ")" inside a path component from a separator, so the span
+# fails closed: it may also cover a glued neighbour, but never leaves path
+# bytes behind.
+_PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
+_PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
 # A bare root must not follow a slash, so URL authorities such as
 # "https://tmp.example.org" stay unflagged.
 _FILESYSTEM_PATH_RE = re.compile(
     rf"(?<![A-Za-z0-9/])/(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
     r"(?![A-Za-z0-9_-])"
-    "(?P<tail>/" + _PATH_TEXT + "*)?"
+    r"(?P<tail>/[^\s\"'<>]*)?"
 )
 # A file URI carries its path after the scheme's slashes and optional
 # authority ("file:///home/...", "file://host/home/...", "file:////home/...",
@@ -84,14 +85,10 @@ _FILESYSTEM_PATH_RE = re.compile(
 # or digit before "file:" makes it another scheme's suffix ("profile:");
 # punctuation ("...file:", a diff's "+file:") does not.  Each scheme start is
 # found on its own, so a rejected URI never hides a later one, and the head
-# match reads no further than the first path segment.
+# match reads no further than the first path segment, which is a whole RFC
+# 3986 segment (it ends only at "/", "?" or "#").
 _FILE_SCHEME_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):")
-# The authority keeps RFC 3986 sub-delimiters and IP-literal brackets
-# ("file://[::1]/..."); only the path uses the stricter path-text stops.
-_FILE_URI_HEAD_RE = re.compile(
-    r"(?://[^/?#\s\"'<>`]*|(?!//))(?P<path>/+)(?P<segment>[^/?" + _PATH_STOP + "]*)"
-)
-_PATH_TEXT_RE = re.compile(_PATH_TEXT + "*")
+_FILE_URI_HEAD_RE = re.compile(r"(?://[^/?#\s\"'<>]*|(?!//))(?P<path>/+)(?P<segment>[^/?#\s\"'<>]*)")
 _BOUNDED_ROOT_NAMES = frozenset(root[1:] for root in BOUNDED_FILESYSTEM_ROOTS)
 _MAX_ROOT_NAME_LENGTH = max(map(len, _BOUNDED_ROOT_NAMES))
 _USER_AT_HOST_RE = re.compile(
@@ -232,7 +229,9 @@ class _Candidate:
     start: int
     end: int
     kind: str
-    token: str
+    # ``None`` means the finding text is ``text[start:end]``, built only for a
+    # selected candidate, so overlapping URI candidates hold no copies.
+    token: str | None
     priority: int
 
 
@@ -368,33 +367,36 @@ def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
     """Return flagged file URIs and the path start of every file URI.
 
     A URI is flagged whole when its first path segment is exactly a bounded
-    root ("file:///tmp.backup/..." and "file:///tmp./x" are not under /tmp);
-    a final segment is compared without its trailing prose punctuation
-    ("file:///home." is). The path is read once, and only for a flagged URI;
-    a later scheme inside a flagged URI is already covered by it, so every
-    character is scanned a bounded number of times.
+    root ("file:///tmp.backup/...", "file:///tmp,backup/..." and
+    "file:///tmp./x" are not under /tmp); a segment that ends its run is
+    compared without trailing prose punctuation ("file:///home." is).  Every
+    flagged URI is a candidate, also inside an earlier one, because selection
+    may drop that earlier one; each costs offsets only, and a run's trimmed
+    end is computed once.
     """
     candidates: list[_Candidate] = []
     path_starts: set[int] = set()
-    covered = 0
+    runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
+    run_starts = [start for start, _ in runs]
+    trimmed_ends: dict[int, int] = {}
     for scheme in _FILE_SCHEME_RE.finditer(text):
         head = _FILE_URI_HEAD_RE.match(text, scheme.end())
         if head is None:
             continue
         path_starts.add(head.start("path"))
-        if scheme.start() < covered:
-            continue
         segment_start, segment_end = head.span("segment")
-        if segment_end == len(text) or text[segment_end] not in "/?":
+        if segment_end == len(text) or text[segment_end] not in "/?#":
             segment_end = _trim_end(text, segment_start, segment_end)
         if segment_end - segment_start > _MAX_ROOT_NAME_LENGTH:
             continue
         if text[segment_start:segment_end] not in _BOUNDED_ROOT_NAMES:
             continue
-        path = _PATH_TEXT_RE.match(text, head.start("path"))
-        end = _trim_end(text, scheme.start(), path.end() if path is not None else head.end())
-        candidates.append(_Candidate(scheme.start(), end, "filesystem-root", text[scheme.start() : end], 80))
-        covered = end
+        run_index = bisect.bisect_right(run_starts, scheme.start()) - 1
+        if run_index not in trimmed_ends:
+            run_start, run_end = runs[run_index]
+            trimmed_ends[run_index] = _trim_end(text, run_start, run_end)
+        end = max(trimmed_ends[run_index], segment_end)
+        candidates.append(_Candidate(scheme.start(), end, "filesystem-root", None, 80))
     return candidates, path_starts
 
 
@@ -409,24 +411,32 @@ def _is_css_numeric_property(text: str, match: re.Match[str]) -> bool:
 
 
 def _select_candidates(candidates: Iterable[_Candidate]) -> list[_Candidate]:
-    """Deduplicate overlapping descriptions while retaining the strongest one."""
+    """Deduplicate overlapping descriptions while retaining the strongest one.
+
+    The higher priority wins, then the earlier start, then the longer span.
+    Priorities are a handful of fixed tiers: within a tier candidates arrive
+    in start order, so only the last one taken can overlap; spans taken by
+    higher tiers are disjoint and sorted, so a bisect finds the only two that
+    can.  Each tier is merged in once, so no list is shifted per candidate.
+    """
     unique = {(item.start, item.end, item.kind, item.token): item for item in candidates}
-    ordered = sorted(
-        unique.values(),
-        key=lambda item: (-item.priority, item.start, -(item.end - item.start), item.kind),
-    )
-    # Selected spans are disjoint and kept in start order, so only the nearest
-    # neighbour on each side can overlap a new candidate.
-    starts: list[int] = []
+    tiers: dict[int, list[_Candidate]] = {}
+    for item in unique.values():
+        tiers.setdefault(item.priority, []).append(item)
     selected: list[_Candidate] = []
-    for candidate in ordered:
-        index = bisect.bisect_right(starts, candidate.start)
-        if index and selected[index - 1].end > candidate.start:
-            continue
-        if index < len(selected) and selected[index].start < candidate.end:
-            continue
-        starts.insert(index, candidate.start)
-        selected.insert(index, candidate)
+    for priority in sorted(tiers, reverse=True):
+        starts = [item.start for item in selected]
+        taken: list[_Candidate] = []
+        for candidate in sorted(tiers[priority], key=lambda item: (item.start, -(item.end - item.start), item.kind)):
+            if taken and candidate.start < taken[-1].end:
+                continue
+            index = bisect.bisect_right(starts, candidate.start)
+            if index and selected[index - 1].end > candidate.start:
+                continue
+            if index < len(selected) and selected[index].start < candidate.end:
+                continue
+            taken.append(candidate)
+        selected = sorted(selected + taken, key=lambda item: item.start)
     return sorted(selected, key=lambda item: (item.start, item.end, item.kind))
 
 
@@ -437,7 +447,16 @@ def scan_text(
     field_path: str = "body",
     canaries: object = (),
 ) -> list[Finding]:
-    """Scan one text value and preserve its operation/field provenance."""
+    """Scan one text value and preserve its operation/field provenance.
+
+    Span contract for ``filesystem-root`` findings (the sanitizer redacts these
+    spans verbatim): a finding starts at the bounded root, or at the scheme of
+    a file URI whose first path segment is a bounded root, and ends where its
+    whitespace-, quote- or angle-bracket-delimited run ends, less trailing
+    prose punctuation and backticks.  It fails closed: over-redaction of a
+    glued neighbour (a Markdown closer, a later query parameter, a joined URI)
+    is accepted; leaving path bytes behind is not.
+    """
     if not isinstance(text, str):
         return []
 
@@ -508,7 +527,7 @@ def scan_text(
             operation=str(operation),
             field_path=field_path,
             kind=candidate.kind,
-            token=candidate.token,
+            token=candidate.token if candidate.token is not None else text[candidate.start : candidate.end],
             start=candidate.start,
             end=candidate.end,
         )
