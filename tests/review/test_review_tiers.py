@@ -108,12 +108,12 @@ def _record_of_record(comments):
     })
 
 
-def test_flash_explicit_pin_is_refused_as_the_reviewer_of_record(low_review, tmp_path):
-    """Defect class: an explicit-only Flash result is recorded as the formal verdict."""
+def test_retired_flash_result_is_refused_as_the_reviewer_of_record(low_review, tmp_path):
+    """Defect class: a retired Flash result is recorded as a new formal verdict."""
     tasks, comments, statuses, files, _admit = low_review
     files[:] = [{"filename": SECURITY_FILES[0], "status": "modified"}]
     name = _carbon_task(tasks, "review-flash", model="gemini-3.8-flash-high")
-    with pytest.raises(recorder.RecordError, match="holds no review"):
+    with pytest.raises(recorder.RecordError, match="is retired in the model catalog"):
         recorder.record(name, pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
     assert comments == [] and statuses == []
 

@@ -247,10 +247,10 @@ def test_resolve_compat_model_tracks_pin_rotation(monkeypatch) -> None:
     )
     assert registered_participant_model("agy") == "gemini-9.9-flash-high"
     assert resolve_compat_model("gemini", "Gemini 9.9 Flash (High)") == "gemini-9.9-flash-high"
-    # Compatibility aliases still follow a rotated pin. A retired concrete
-    # generation must not silently upgrade, even when the registry rotates (#9301).
-    assert resolve_compat_model("gemini", "gemini-3-flash-preview") == "gemini-9.9-flash-high"
-    assert resolve_compat_model("gemini", "gemini-3.0-flash-preview") == "gemini-9.9-flash-high"
+    # Retired legacy selectors stay retired when the registry rotates (#9301).
+    for model in ("gemini-3-flash-preview", "gemini-3.0-flash-preview"):
+        with pytest.raises(ValueError, match=r"retired in the model catalog \(gemini-3\.8-flash-high\)"):
+            resolve_compat_model("gemini", model)
     with pytest.raises(ValueError, match=r"gemini-3\.7-flash.*retired.*use gemini-4-hydrogen"):
         resolve_compat_model("gemini", "gemini-3.7-flash")
     # Non-Gemini model ids pass through for the route resolver to judge loudly.

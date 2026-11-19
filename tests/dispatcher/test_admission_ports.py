@@ -500,7 +500,7 @@ def test_headroom_stop_refuses_matching_models_only(headroom_box, capsys, monkey
     assert headroom_box.dispatch(agent="agy", model="claude-opus-5-5-high") == 2
     assert "MODEL_HEADROOM_USAGE_UNKNOWN" in capsys.readouterr().err
     headroom_box.meter(agy_weekly=100.0)
-    assert headroom_box.dispatch(agent="agy", model="gemini-3.8-flash-high") == 0
+    assert headroom_box.dispatch(agent="agy", model="gemini-4-hydrogen-medium") == 0
     headroom_box.meter(agy_weekly={"used_pct": float("nan"), "remaining_pct": 90})
     assert headroom_box.dispatch(agent="agy", model="claude-opus-5-5-high") == 2
     assert "MODEL_HEADROOM_USAGE_UNKNOWN" in capsys.readouterr().err

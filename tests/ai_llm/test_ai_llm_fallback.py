@@ -26,7 +26,7 @@ def isolate_gemini_auth_state(monkeypatch, tmp_path):
     )
 
 
-def test_build_gemini_ladder_keeps_flash_on_agy_only():
+def test_build_gemini_ladder_keeps_hydrogen_on_agy_only():
     ladder = build_gemini_ladder(allowed_auth_modes=("api", "oauth"))
 
     assert [(r.cli, r.model, r.auth_mode) for r in ladder] == [
@@ -50,9 +50,18 @@ def test_build_gemini_ladder_without_api_key_keeps_agy_rung():
 
 @pytest.mark.parametrize("model", [PRIMARY_GEMINI_MODEL, FLASH_GEMINI_MODEL, FINAL_GEMINI_MODEL, "custom-model"])
 @pytest.mark.parametrize("auth_modes", [("api", "oauth"), ("api",), ("oauth",)])
-def test_agy_only_models_never_get_gemini_cli_rungs(model, auth_modes):
+def test_gemini_ladder_separates_agy_and_gemini_cli_and_refuses_retired_models(model, auth_modes):
+    if model in {FLASH_GEMINI_MODEL, FINAL_GEMINI_MODEL}:
+        with pytest.raises(ValueError, match="is retired in the model catalog"):
+            build_gemini_ladder(model, allowed_auth_modes=auth_modes)
+        return
+
     ladder = build_gemini_ladder(model, allowed_auth_modes=auth_modes)
-    assert all(r.cli != "gemini-cli" or r.model not in {FLASH_GEMINI_MODEL, FINAL_GEMINI_MODEL} for r in ladder)
+    if model == PRIMARY_GEMINI_MODEL:
+        expected = [] if auth_modes == ("api",) else [("agy-cli", model, None)]
+    else:
+        expected = [("gemini-cli", model, mode) for mode in auth_modes]
+    assert [(r.cli, r.model, r.auth_mode) for r in ladder] == expected
 
 
 @pytest.mark.parametrize("model", [

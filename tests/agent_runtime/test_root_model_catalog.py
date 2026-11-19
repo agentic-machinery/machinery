@@ -125,14 +125,14 @@ def test_retired_models_cannot_retain_any_transport(model_id):
     ("cursor:grok-4.5-high", "cursor", "is retired"),
     ("claude-opus-4.6", "native_claude", "not in the model catalog"),
     ("claude-opus-5-5", "native_codex", "no admitted native_codex transport"),
-    ("gemini-3.8-flash-high", "native_gemini", "no admitted native_gemini transport"),
+    ("gemini-4-hydrogen-medium", "native_gemini", "no admitted native_gemini transport"),
 ])
 def test_execution_defaults_refused_by_catalog_identity_and_transport(model, transport, message):
     with pytest.raises(ModelCatalogError, match=message):
         require_execution_model(model, transport=transport)
 
 
-def test_execution_default_resolves_active_alias_and_rejects_hold():
+def test_execution_default_resolves_active_selector_and_rejects_hold():
     catalog = deepcopy(load_model_catalog())
     assert require_execution_model("gpt-6.1-terra", transport="native_codex", catalog=catalog) == "gpt-6.1-terra"
     terra = catalog["models"]["gpt-6.1-terra"]
@@ -145,10 +145,10 @@ def test_execution_default_resolves_active_alias_and_rejects_hold():
     assert all(row["model_id"] != "gpt-6.1-terra" for row in catalog["review_candidates"].values())
     assert catalog["review_scheduler"]["endpoints"]["codex"]["models"] == [CURRENT_SOL]
     assert catalog["orchestrator_seats"]["codex"]["model_id"] == CURRENT_SOL
-    assert require_execution_model("gemini-3.8-flash-low", transport="agy", catalog=catalog) == "gemini-3.8-flash-high"
-    catalog["models"]["gemini-3.8-flash-high"]["lifecycle"] = "hold"
+    assert require_execution_model("gemini-4-hydrogen-low", transport="agy", catalog=catalog) == "gemini-4-hydrogen"
+    catalog["models"]["gemini-4-hydrogen"]["lifecycle"] = "hold"
     with pytest.raises(ModelCatalogError, match="not admitted for execution"):
-        require_execution_model("gemini-3.8-flash-low", transport="agy", catalog=catalog)
+        require_execution_model("gemini-4-hydrogen-low", transport="agy", catalog=catalog)
 
 
 def test_fallback_sonnet_candidate_cannot_reenter_automatic_ladder():
@@ -329,7 +329,7 @@ def test_recon_models_consult_but_never_review():
     assert activity_role_refusal("gpt-6-luna", "consult") is None
     assert activity_role_refusal("gemini-4-neon-high", "consult") is None
     assert "holds no review" in activity_role_refusal("gemini-4-hydrogen-medium", "review")
-    assert "holds no review" in activity_role_refusal("gemini-3.8-flash-high", "review")
+    assert "is retired" in activity_role_refusal("gemini-3.8-flash-high", "review")
     assert "is retired" in activity_role_refusal("gemini-4-carbon-medium", "consult")
     assert "holds no review" in activity_role_refusal("gpt-6-luna", "review")
 
@@ -1229,7 +1229,7 @@ def test_argon_formal_code_review_is_refused_before_routing_or_launch(monkeypatc
 
 @pytest.mark.parametrize(
     ("agent", "model"),
-    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-3.8-flash-high"),
+    [("agy", "gemini-4-argon-low"), ("claude", "claude-fable-5-2"), ("agy", "gemini-4-hydrogen-low"),
      ("agy", "gemini-4-hydrogen-medium"), ("agy", "gemini-4-hydrogen-xhigh")],
 )
 def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent, model):
@@ -1237,7 +1237,7 @@ def test_work_only_model_is_refused_a_review_typed_dispatch_before_launch(agent,
 
     Dispatch admission must refuse it before any worktree or provider starts; the verdict
     recorder's later refusal only discards a run that already happened (#9583). The same
-    model stays admitted for untyped read-only work. Flash and Hydrogen hold no review role.
+    model stays admitted for untyped read-only work.
     """
     from lu_machinery.dispatcher import checks
 
@@ -1366,10 +1366,16 @@ def test_driver_brief_population_follows_catalog_capabilities():
 
 
 @pytest.mark.parametrize(
-    "model", ["gemini-4-argon-xhigh", "gemini-4-carbon-max", "gemini-4-hydrogen-max", "claude-opus-5-5-low"],
+    ("model", "reason"),
+    [
+        ("gemini-4-argon-xhigh", "not an AGY selector"),
+        ("gemini-4-carbon-max", "is retired in the model catalog"),
+        ("gemini-4-hydrogen-max", "not an AGY selector"),
+        ("claude-opus-5-5-low", "not an AGY selector"),
+    ],
 )
-def test_agy_admission_refuses_unattestable_catalog_variants(model):
+def test_agy_admission_refuses_unattestable_catalog_variants(model, reason):
     """Defect class: generic catalog variants launch on AGY without an attestable selector."""
     assert canonical_model_id(model) is not None
-    with pytest.raises(ValueError, match="not an AGY selector"):
+    with pytest.raises(ValueError, match=reason):
         checks.check_model_admission("agy", model, "workspace-write", {}, b"implement the brief")

@@ -752,17 +752,16 @@ models:
     sources:
       - https://platform.claude.com/docs/en/about-claude/models/whats-new-sonnet-5
   gemini-3.8-flash-high:
-    routing_wire_ids:
-      agy: gemini-3.8-flash-high
     family: google
     tier: frontier_practical
-    lifecycle: active
+    lifecycle: retired
+    replaced_by: gemini-4-hydrogen
     aliases: [gemini-3.8-flash, gemini-3.8-flash-medium, gemini-3.8-flash-low]
     roles: [historical_record_resolution]
-    transports: [agy]
+    transports: []
     strengths: [token_efficient_agentic_loops, fast_tool_use, coding_benchmark_gains, low_cost]
     weaknesses: [not_default_critical_authority, deep_architecture_prefers_sol]
-    notes: Explicit AGY pin until Google retires it. Existing receipts retain this identity.
+    notes: Retired by GEMINI-TIERS-1119 (2026-11-19). Existing receipts retain this identity.
     sources:
       - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/3-8-flash-and-3-8-flash-cyber/

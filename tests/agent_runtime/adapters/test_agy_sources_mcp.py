@@ -31,7 +31,7 @@ def build(tmp_path: Path, mode: str, tool_config: dict | None = None):
         prompt="Call the native Sources verify_words tool once. This is a tool probe.",
         mode=mode,
         cwd=tmp_path,
-        model="gemini-3.8-flash-high",
+        model="gemini-4-hydrogen-medium",
         task_id="sources-probe",
         session_id=None,
         tool_config=tool_config,
@@ -47,7 +47,7 @@ def test_noninteractive_command_selects_auto_mode(tmp_path: Path, adapter_home: 
     assert plan.cmd[plan.cmd.index("--mode") + 1] == "auto"
     assert plan.cmd[plan.cmd.index("--input-format") + 1] == "stream-json"
     assert plan.cmd[plan.cmd.index("--output-format") + 1] == "stream-json"
-    assert plan.cmd[plan.cmd.index("--model") + 1] == "gemini-3.8-flash-high"
+    assert plan.cmd[plan.cmd.index("--model") + 1] == "gemini-4-hydrogen-medium"
     assert json.loads(plan.stdin_payload)["event"] == "user"
 
 
