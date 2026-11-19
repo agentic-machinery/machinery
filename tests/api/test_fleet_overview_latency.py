@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from lu_machinery.api import fleet_router, state_helpers
 from lu_machinery.api.monitor_context import MonitorContext, fixture_context, get_ctx
-from lu_machinery.fleet_comms import message_plane, migrations
+from lu_machinery.fleet_comms import migrations
 from lu_machinery.fleet_comms import paths as fleet_paths
 
 
@@ -223,44 +223,74 @@ def test_sqlite_single_row_overview_matches_per_table_for_edge_values(
         assert body["counts"]["messages"]["by_kind"][long_prefix] == 2
 
 
-def test_overview_caches_plane_root_without_repeated_git_rev_parse(
+def test_overview_caches_git_anchor_and_revalidates_default_symlink_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect class: GET /api/fleet/overview spawns git rev-parse twice per request when FLEET_COMMS_ROOT is unset."""
+    """Defect classes (F4, git rev-parse): overview must cache only the git anchor, not symlink target or retirement."""
     state_repo = tmp_path / "state-repo"
     state_repo.mkdir()
     subprocess.run(["git", "init", "-q", str(state_repo)], check=True, timeout=15)
-    plane_root = state_repo / "batch_state" / "fleet-comms" / "v1"
-    _seed_plane_db(plane_root)
 
-    calls: list[Path | None] = []
-    real_default = message_plane.default_plane_root
+    fixture_a = tmp_path / "fixture-a"
+    fixture_b = tmp_path / "fixture-b"
+    db_a = _seed_plane_db(fixture_a)
+    db_b = _seed_plane_db(fixture_b)
+    with sqlite3.connect(db_a) as conn:
+        _seed_conversation(conn)
+        _insert_message(conn, "a-1", "from-a")
+    with sqlite3.connect(db_b) as conn:
+        _seed_conversation(conn)
+        _insert_message(conn, "b-1", "from-b")
+        _insert_message(conn, "b-2", "from-b")
 
-    def _counting_default(*, repo_root: Path | None = None, allow_non_git: bool = False) -> Path:
-        calls.append(repo_root)
-        return real_default(repo_root=repo_root, allow_non_git=allow_non_git)
+    default_link = state_repo / "batch_state" / "fleet-comms" / "v1"
+    default_link.parent.mkdir(parents=True, exist_ok=True)
+    default_link.symlink_to(fixture_a)
 
-    monkeypatch.setattr(message_plane, "default_plane_root", _counting_default)
+    anchor_calls: list[Path] = []
+    real_resolve_main = fleet_paths.resolve_main_root
+
+    def _counting_resolve_main(path: Path) -> Path:
+        anchor_calls.append(path)
+        return real_resolve_main(path)
+
+    monkeypatch.setattr(fleet_paths, "resolve_main_root", _counting_resolve_main)
 
     app, _ctx = _make_app(tmp_path, state_root=state_repo)
-    with TestClient(app) as client:
+    with TestClient(app, raise_server_exceptions=False) as client:
         r1 = client.get("/api/fleet/overview")
         assert r1.status_code == 200
-        assert len(calls) == 1
+        assert r1.json()["counts"]["messages"]["total"] == 1
+        assert len(anchor_calls) == 1
 
-        # Even after cache invalidation (a second cold overview collect), plane_root stays cached per context.
+        # Second cold read keeps git anchor cached (0 extra git rev-parse calls).
         state_helpers.cache_invalidate()
         r2 = client.get("/api/fleet/overview")
         assert r2.status_code == 200
-        assert len(calls) == 1
+        assert r2.json()["counts"]["messages"]["total"] == 1
+        assert len(anchor_calls) == 1
+
+        # Retarget default symlink from A to B: next GET must observe B immediately (0 extra git rev-parse).
+        default_link.unlink()
+        default_link.symlink_to(fixture_b)
+        r3 = client.get("/api/fleet/overview")
+        assert r3.status_code == 200
+        assert r3.json()["counts"]["messages"]["total"] == 2
+        assert len(anchor_calls) == 1
+
+        # Marking B retired must refuse immediately even with cached git anchor and warm cache.
+        (fixture_b / fleet_paths.RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
+        r4 = client.get("/api/fleet/overview")
+        assert r4.status_code == 500
+        assert len(anchor_calls) == 1
 
 
 def test_overview_swr_fresh_stale_and_dormant_headers_and_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect class: overview bypasses SWR caching, serves wrong freshness headers, or fails to refresh after expiry/dormancy."""
+    """Defect class (F7): overview SWR headers/refresh lifecycle must synchronize on cache publication."""
     plane_root = tmp_path / "plane"
     db_path = _seed_plane_db(plane_root)
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
@@ -268,19 +298,30 @@ def test_overview_swr_fresh_stale_and_dormant_headers_and_refresh(
     clock = [1000.0]
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock[0])
 
-    refresh_done = threading.Event()
+    refresh_published = threading.Event()
     collect_count = 0
+    cache_writes = 0
     real_collect = fleet_router._collect_fleet_overview
+    real_cache_set = state_helpers.cache_set
 
-    def _tracked_collect(ctx: MonitorContext, *, plane_root: Path | None = None) -> tuple[dict[str, Any], bool]:
+    def _tracked_collect(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
         nonlocal collect_count
         collect_count += 1
-        out = real_collect(ctx, plane_root=plane_root)
-        if collect_count >= 2:
-            refresh_done.set()
-        return out
+        return real_collect(ctx, expected_routing=expected_routing)
+
+    def _tracked_cache_set(key: str, value: object) -> None:
+        nonlocal cache_writes
+        real_cache_set(key, value)
+        cache_writes += 1
+        if cache_writes >= 2:
+            refresh_published.set()
 
     monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _tracked_collect)
+    monkeypatch.setattr(state_helpers, "cache_set", _tracked_cache_set)
 
     app, _ctx = _make_app(tmp_path)
     with TestClient(app) as client:
@@ -310,7 +351,8 @@ def test_overview_swr_fresh_stale_and_dormant_headers_and_refresh(
         assert r3.status_code == 200
         assert r3.headers["X-Snapshot-State"] == "stale"
         assert r3.json()["counts"]["messages"]["total"] == 0
-        assert refresh_done.wait(timeout=5.0), "background SWR refresh did not complete"
+        # Wait on publication (after cache_set), not collector return, so r4 cannot race publication.
+        assert refresh_published.wait(timeout=5.0), "background SWR refresh did not publish"
         assert collect_count == 2
 
         # Next read sees refreshed count as fresh.
@@ -480,13 +522,270 @@ def test_overview_cache_key_isolates_root_mode_telemetry_authority_and_hashes_pg
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "pg")
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_PG_DSN", secret_dsn)
 
-    key_pg_1 = asyncio.run(fleet_router._overview_cache_key(ctx, root_a))
+    key_pg_1 = asyncio.run(
+        fleet_router._overview_cache_key(ctx, fleet_router._capture_overview_routing(root_a))
+    )
     assert secret_dsn not in key_pg_1
     assert "synthetic_reader_a" not in key_pg_1
 
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_PG_DSN", "dbname=synthetic_fleet_b user=synthetic_reader_b")
-    key_pg_2 = asyncio.run(fleet_router._overview_cache_key(ctx, root_a))
+    key_pg_2 = asyncio.run(
+        fleet_router._overview_cache_key(ctx, fleet_router._capture_overview_routing(root_a))
+    )
     assert key_pg_1 != key_pg_2
+
+
+def test_overview_telemetry_paths_differing_only_by_whitespace_stay_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F6): stripping FLEET_COMMS_PLANE_TELEMETRY collapses distinct files in SWR cache."""
+    plane_root = tmp_path / "plane"
+    _seed_plane_db(plane_root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+
+    tele_a = tmp_path / "events"
+    tele_b = tmp_path / "events "
+    tele_a.write_text('{"parity_ok": true}\n', encoding="utf-8")
+    tele_b.write_text('{"parity_ok": false}\n', encoding="utf-8")
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        monkeypatch.setenv("FLEET_COMMS_PLANE_TELEMETRY", str(tele_a))
+        ra = client.get("/api/fleet/overview")
+        assert ra.status_code == 200
+        assert ra.json()["health"]["parity_telemetry"]["parity_ok_count"] == 1
+        assert ra.json()["health"]["parity_telemetry"]["parity_fail_count"] == 0
+
+        monkeypatch.setenv("FLEET_COMMS_PLANE_TELEMETRY", str(tele_b))
+        rb = client.get("/api/fleet/overview")
+        assert rb.status_code == 200
+        assert rb.json()["health"]["parity_telemetry"]["parity_ok_count"] == 0
+        assert rb.json()["health"]["parity_telemetry"]["parity_fail_count"] == 1
+
+
+def test_overview_background_refresh_aborts_on_routing_change_without_overwriting_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F5): stale background refresh running under changed mode overwrites original key."""
+    plane_root = tmp_path / "plane"
+    _seed_plane_db(plane_root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+
+    clock = [2000.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock[0])
+
+    refresh_entered = threading.Event()
+    allow_refresh = threading.Event()
+    refresh_aborted = threading.Event()
+    real_collect = fleet_router._collect_fleet_overview
+    call_num = 0
+
+    def _gated_collect(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        nonlocal call_num
+        call_num += 1
+        if call_num == 2:
+            refresh_entered.set()
+            assert allow_refresh.wait(timeout=5.0)
+            try:
+                return real_collect(ctx, expected_routing=expected_routing)
+            except fleet_router._OverviewRoutingChangedError:
+                refresh_aborted.set()
+                raise
+        return real_collect(ctx, expected_routing=expected_routing)
+
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _gated_collect)
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        r1 = client.get("/api/fleet/overview")
+        assert r1.status_code == 200
+        assert r1.json()["health"]["mode"] == "authority"
+
+        # Expire past TTL so GET queues a background refresh for authority.
+        clock[0] += 20.0
+        r2 = client.get("/api/fleet/overview")
+        assert r2.status_code == 200
+        assert r2.headers["X-Snapshot-State"] == "stale"
+        assert refresh_entered.wait(timeout=5.0)
+
+        # Switch mode to shadow while refresh is held, then let refresh proceed.
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+        allow_refresh.set()
+        assert refresh_aborted.wait(timeout=5.0)
+
+        # Restore authority: cached entry must still belong to authority, never overwritten with shadow.
+        monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+        r3 = client.get("/api/fleet/overview")
+        assert r3.status_code == 200
+        assert r3.json()["health"]["mode"] == "authority"
+        assert r3.json()["authority_health"] is not None
+
+
+def test_overview_cold_read_respects_route_deadline_and_keeps_single_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F2): slow cold overview stalls past the 1s route budget instead of bounding wait."""
+    plane_root = tmp_path / "plane"
+    db_path = _seed_plane_db(plane_root)
+    with sqlite3.connect(db_path) as conn:
+        _seed_conversation(conn)
+        _insert_message(conn, "cold-1", "update")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.05)
+
+    release_collect = threading.Event()
+    published = threading.Event()
+    collect_calls = 0
+    real_collect = fleet_router._collect_fleet_overview
+    real_cache_set = state_helpers.cache_set
+
+    def _slow_collect(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        nonlocal collect_calls
+        collect_calls += 1
+        assert release_collect.wait(timeout=5.0)
+        return real_collect(ctx, expected_routing=expected_routing)
+
+    def _watch_publish(key: str, value: object) -> None:
+        real_cache_set(key, value)
+        published.set()
+
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _slow_collect)
+    monkeypatch.setattr(state_helpers, "cache_set", _watch_publish)
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        r1 = client.get("/api/fleet/overview")
+        assert r1.status_code == 200
+        assert r1.headers["X-Snapshot-State"] == "unavailable"
+        assert r1.json()["availability"] == "unavailable"
+        assert r1.json()["health"]["schema"]["db_error"] == "overview_deadline_exceeded"
+
+        # Unblock the single shielded background flight; once published, next GET hits cache cleanly.
+        release_collect.set()
+        assert published.wait(timeout=5.0)
+
+        r2 = client.get("/api/fleet/overview")
+        assert r2.status_code == 200
+        assert r2.headers["X-Snapshot-State"] == "fresh"
+        assert r2.json()["counts"]["messages"]["total"] == 1
+        assert collect_calls == 1
+
+
+def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F3): PostgreSQL overview refuses to cache because SQLite-only tables are absent."""
+    plane_root = tmp_path / "pg-absent"
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "pg")
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_PG_DSN", "dbname=synthetic_pg_overview user=reader")
+
+    existing_pg_tables = {"requests", "comms_messages", "authority_jobs", "authority_dead_letters"}
+    connect_calls = 0
+
+    class _FakePgCursor:
+        def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+            self._rows = rows
+
+        def fetchone(self) -> tuple[Any, ...] | None:
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self) -> list[tuple[Any, ...]]:
+            return list(self._rows)
+
+    class _FakePgConn:
+        autocommit = False
+
+        def execute(self, sql: str, params: Any = None) -> _FakePgCursor:
+            if "pg_class" in sql:
+                table = params[0]
+                return _FakePgCursor([(1,)] if table in existing_pg_tables else [])
+            if "GROUP BY" in sql:
+                return _FakePgCursor([])
+            if "COUNT(*)" in sql:
+                return _FakePgCursor([(0,)])
+            return _FakePgCursor([])
+
+        def close(self) -> None:
+            pass
+
+    def _fake_status(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        store = {"kind": "comms-plane", "reachable": True, "authority": "pg"}
+        return {
+            "mode": "authority",
+            "enabled": True,
+            "read_only": True,
+            "response_schema_version": 2,
+            "store": store,
+            "schema": {
+                "known_version": 1,
+                "applied_version": 1,
+                "applied_name": "v1",
+                "db_exists": True,
+                "authority": "pg",
+                "db_error": None,
+                "store": store,
+            },
+            "parity_telemetry": {
+                "store": {"kind": "parity-telemetry", "reachable": False},
+                "exists": False,
+                "event_count": 0,
+                "parity_ok_count": 0,
+                "parity_fail_count": 0,
+            },
+        }
+
+    def _fake_connect(*args: Any, **kwargs: Any) -> _FakePgConn:
+        nonlocal connect_calls
+        connect_calls += 1
+        return _FakePgConn()
+
+    monkeypatch.setattr(fleet_router, "read_plane_status", _fake_status)
+    monkeypatch.setattr(fleet_router.storage, "connect", _fake_connect)
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        # Supported PG tables present (no formal_review_jobs/acp_conversations): caches as fresh.
+        r1 = client.get("/api/fleet/overview")
+        assert r1.status_code == 200
+        assert r1.headers["X-Snapshot-State"] == "fresh"
+        assert r1.json()["availability"] == "empty"
+        assert connect_calls == 1
+
+        # Second GET serves from SWR cache with 0 extra PG connections.
+        r2 = client.get("/api/fleet/overview")
+        assert r2.status_code == 200
+        assert r2.headers["X-Snapshot-State"] == "fresh"
+        assert connect_calls == 1
+
+        # Dropping a supported PG table (comms_messages) must return unavailable and not cache.
+        state_helpers.cache_invalidate()
+        existing_pg_tables.remove("comms_messages")
+        r3 = client.get("/api/fleet/overview")
+        assert r3.status_code == 200
+        assert r3.headers["X-Snapshot-State"] == "unavailable"
+        assert connect_calls == 2
+
+        # Restoring comms_messages recovers immediately on the next GET.
+        existing_pg_tables.add("comms_messages")
+        r4 = client.get("/api/fleet/overview")
+        assert r4.status_code == 200
+        assert r4.headers["X-Snapshot-State"] == "fresh"
+        assert connect_calls == 3
 
 
 def test_overview_preserves_dependency_override_and_background_tasks(
