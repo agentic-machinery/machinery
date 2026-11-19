@@ -157,7 +157,7 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   parsed verdict for that level on the PR's first review head. A supplemental review without a PR number can join
   a PR through an exact head match in the same repository. The time per landed PR divides time across PR-linked
   reviews by linked PRs with recorded merges. Quota uses valid readings and counts landed PRs once per pool.
-  Levels with fewer than 10 parsed verdicts show “not enough data yet.”
+  Levels with fewer than 10 parsed verdicts carry a **Low sample** badge.
 - **Author figures**: per PR reviewed in the window, only parsed reviews of record count; an unparsed reply is no
   round. Rounds are the distinct pinned heads those reviews judged, ordered by the start of each head's first
   review; the first round is the earliest review of the earliest head. "Approved eventually" means any parsed
@@ -186,6 +186,33 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   with a finish above start stay in their group's selection and count in `reset_crossed`, so that group reports
   unknown spend rather than `0`.
 - **Low sample**: every rate carries its denominator `n`; below 10 it is marked `low_sample`.
+
+## Read the dashboard
+
+Use the window summary to check how old the snapshot is and how many repositories it could read.
+The landing counts are exclusive. A task confirmed by both a commit trailer and a recorded merge
+appears under **Both sources**.
+
+- **Best value in this window** ranks eligible catalog models by first-round approvals per recorded
+  hour. The frontier plots first-round approval against recorded hours per merge. Hollow points
+  have fewer than 10 reviewed PRs or fewer than 10 landed tasks. A green ring marks a model on the
+  frontier for the whole window, even when a model filter hides other points.
+- **Best model per job** uses a star for the highest positive landed share in each class among
+  the displayed models with at least 10 tasks. Models tied at that rate all get a star.
+- **Where the work went** counts dispatcher outcomes. **Done** measures completed runs. **Landed**
+  in the write table measures merges. The status chart shows each model's total and Done share.
+- **Week by week** uses UTC ISO weeks. An asterisk marks a week that the selected window only
+  partly covers. A line joins consecutive full weeks for the same model when both have at least
+  10 tasks and the chart has more than two weeks. Hollow points show smaller weekly samples.
+- **Reviewer strictness** shows how often a reviewer approved and how many P0–P2 findings it
+  reported per review with a findings count. Differences also reflect who reviewed which work.
+- **Time to finish** orders up to 12 of the busiest timed write models by median. The box spans
+  the 25th through 75th percentiles, and the right whisker ends at the 90th percentile. Positive
+  times under a minute display as **<1**.
+
+Open the values beneath a chart for counts, intervals, and exact displayed values with a mouse,
+keyboard, or touch. If a table shows **Scroll across for more columns**, scroll inside the table.
+The first column stays visible.
 
 ## Metrics (Grafana's contract)
 

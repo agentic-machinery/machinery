@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -30,6 +31,35 @@ from lu_machinery.dispatcher import store, worker
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
 SINCE = NOW - timedelta(days=7)
+
+
+def test_model_value_sections_explain_how_to_read_the_figures():
+    """A dashboard section can keep showing numbers after losing the nearby reading guidance."""
+    html = machinery_path("api/dashboards/model-stats.html").read_text()
+    sections = re.findall(r"<section\b[^>]*>.*?</section>", html, re.DOTALL)
+    explanations = {
+        "Window summary": ("Landed share divides those merges by all write tasks", "Low sample means"),
+        "Value frontier": ("first-round approval with recorded hours per landed task", "Look toward the upper left"),
+        "Best model per job": ("Compare landed share within each job class", "A star marks the highest positive share"),
+        "Where the work went": ("how many write tasks settled", "A larger Done share"),
+        "Week by week": ("Higher points mean more write tasks landed", "Use full weeks with enough tasks"),
+        "Neon medium against high": ("write landings, reviewer approvals and typical runtime", "Use the counts"),
+        "Reviewer strictness": ("points farther right report more P0–P2 findings", "Compare similar assignments"),
+        "Time to finish": ("box spans the middle half of timed writes", "Shorter times are better"),
+        "Ukrainian tasks": ("report merged writes and how often reviewers approved", "Prefer a higher landed share"),
+        "Pool allowance": ("remaining allowance and reset time", "Cool means more headroom", "Lower points per landed task"),
+        "Author or reviewer?": ("approved first time", "Read down one reviewer column"),
+        "Write tasks": ("includes settled writes", "higher landed share"),
+        "Never started": ("refused before execution by cause and role", "Fewer refusals"),
+        "Reviews": ("includes settled reviews", "fewer unreadable or unfinished results"),
+        "Compare reviewer levels": ("readable results, first-round approval", "lower time or allowance cost"),
+        "Reviewed PRs": ("reviewed PRs for the shown authors", "higher first-round approval and fewer rounds"),
+    }
+    for section, phrases in explanations.items():
+        rendered = next(fragment for fragment in sections if f"<h2>{section}" in fragment
+                        or f'aria-label="{section}"' in fragment)
+        for phrase in phrases:
+            assert phrase in rendered, (section, phrase)
 
 
 def _record(tasks: Path, task_id: str, **fields) -> dict:
@@ -815,7 +845,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert all(key not in model and key not in effort
                for model in page["models"] for effort in model["by_effort"] for key in dropped)
     html = machinery_path("api/dashboards/model-stats.html").read_text()
-    assert "view=page" in html and "not enough data yet" in html and "Best value" in html
+    assert "view=page" in html and "Best value needs more data" in html and "Low sample" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
