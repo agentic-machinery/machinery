@@ -7,7 +7,8 @@ ISO-week buckets (`weeks`) and the reply samples below. `view=page` (the figures
 fields, including every `unparsed_samples` leaf, and keeps model and effort totals plus `charts` series. Its string
 values are closed-vocabulary labels, timestamps or ISO weeks, and the fixed sentences in `window.cohort`,
 `charts.recommendation` and `charts.limits`. `view=samples` returns only the reply samples for that window.
-`/model-stats` fetches it on its own and leaves the failing-reply section empty when that fetch is refused.
+`/model-stats` fetches it on its own and leaves the failing-reply section empty when that fetch is refused
+or when the samples window name or `until` does not match the page snapshot.
 The page groups model, author, reviewer, effort and class labels before calculating
 the figures. It admits the metrics model and effort vocabularies, the page's fixed model labels `auto` and
 `unrecognized`, the defined work and review classes, and configured repository keys in landing coverage.
@@ -159,7 +160,7 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   data classes, only for a reply of at most 16 KiB, and only when no OPSEC or secret match in the whole reply
   starts inside those characters. `missing_result` and `too_big` have no sample. `view=page` and `/metrics` never
   carry one. The page reads samples from `view=samples` and shows no failing-reply section when that response is
-  not ok.
+  not ok, or when its window name or `until` differs from the page snapshot it is about to draw.
   The approval rate uses parsed verdicts,
   while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
   unknown. The author figures and first-round matrix use **reviews of record**, which name the PR and the

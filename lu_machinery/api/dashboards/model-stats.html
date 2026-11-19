@@ -763,21 +763,28 @@ async function loadPools(allowance) {
   }
   updateTableScroll();
 }
+function sampleStamp(window) {
+  if (!window || typeof window.name !== "string" || typeof window.until !== "string" || window.until === "") return null;
+  return {name: window.name, until: window.until};
+}
+function emptySamples() {
+  return {map: new Map(), window: null};
+}
 async function loadSamples(name) {
   try {
     const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}&view=samples`, {cache: "no-store"});
-    if (!response.ok) return new Map();
+    if (!response.ok) return emptySamples();
     const body = await response.json();
-    if (!body || body.status !== "ok" || !Array.isArray(body.models)) return new Map();
+    if (!body || body.status !== "ok" || !Array.isArray(body.models)) return emptySamples();
     const map = new Map();
     for (const model of body.models) {
       if (!model || typeof model.model !== "string" || !model.unparsed_samples
           || typeof model.unparsed_samples !== "object") continue;
       map.set(model.model, model.unparsed_samples);
     }
-    return map;
+    return {map, window: sampleStamp(body.window)};
   } catch {
-    return new Map();
+    return emptySamples();
   }
 }
 async function load() {
@@ -820,9 +827,13 @@ async function load() {
   renderLevels();
   loadPools(data.allowance);
   const samples = await samplesPromise;
-  if (generation !== loadGeneration) return;
-  current.samples = samples;
-  render();
+  if (generation !== loadGeneration || current === null) return;
+  const pageWindow = sampleStamp(data.window);
+  if (samples.window && pageWindow && samples.window.name === pageWindow.name
+      && samples.window.until === pageWindow.until) {
+    current.samples = samples.map;
+    render();
+  }
 }
 $("window").addEventListener("change", load);
 $("model").addEventListener("change", () => { render(); renderLevels(); });

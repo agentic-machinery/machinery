@@ -995,6 +995,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
                for model in page["models"] for effort in model["by_effort"] for key in dropped)
     html = machinery_path("api/dashboards/model-stats.html").read_text()
     assert "view=page" in html and "view=samples" in html and "Best value needs more data" in html and "Low sample" in html
+    assert "samples.window.until === pageWindow.until" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
