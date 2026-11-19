@@ -142,10 +142,13 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("/api/fixture?source=file:///home/fixture-user/input", "file:///home/fixture-user/input"),
         ("...file:///home/fixture-user/x", "file:///home/fixture-user/x"),
         ("+FILE://fixture-host/home/fixture-user/x", "FILE://fixture-host/home/fixture-user/x"),
+        ("file:///etc/fixture.conf,file://fixture-host/home/fixture-user/x", "file://fixture-host/home/fixture-user/x"),
+        ("file:///etc/fixture.conf?u=file:///home/fixture-user/x", "file:///home/fixture-user/x"),
+        ("[fixture](file://fixture-host./home)", "file://fixture-host./home"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
-    """Defect class: a slash or punctuation before a file URI, or a protected span in the path, hid a home path (#909)."""
+    """Defect class: a home path hidden by its file-URI shape or a protected span in it (#909)."""
     findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
     assert [(finding.kind, finding.token) for finding in findings] == [("filesystem-root", token)], text
 
@@ -165,6 +168,8 @@ def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: 
         "file:///tmp%20backup/fixture.conf",
         "file:/tmp.backup/fixture.conf",
         "file://fixture-host./tmp.backup/fixture.conf",
+        "/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/fixture.conf",
+        "[fixture](file:///tmp./fixture.conf)",
     ],
 )
 def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
