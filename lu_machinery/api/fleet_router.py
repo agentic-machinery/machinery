@@ -51,6 +51,7 @@ from .state_helpers import (
 )
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
+_conninfo_to_dict: Callable[..., dict[str, Any]] | None = None
 try:
     from psycopg import Error as PostgresError
 except ModuleNotFoundError as exc:
@@ -58,6 +59,10 @@ except ModuleNotFoundError as exc:
         raise
 else:
     _DATABASE_ERRORS += (PostgresError,)
+    try:
+        from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
+    except ImportError:
+        _conninfo_to_dict = None
 _OVERVIEW_ERRORS: tuple[type[Exception], ...] = (*_DATABASE_ERRORS, storage.ControlPlaneError)
 
 router = APIRouter(tags=["fleet"])
@@ -860,10 +865,25 @@ class _OverviewRouting:
     """Routing inputs that identify one overview cache slot."""
 
     plane_root: Path
-    plane_mode_env: str
+    plane_mode: str
     telemetry_path: Path
     authority: str
     pg_dsn_digest: str
+
+
+def _resolve_effective_plane_mode() -> str:
+    """Resolve the effective plane mode including configured default, matching ``read_plane_status``."""
+    try:
+        return str(message_plane.resolve_plane_mode())
+    except ValueError:
+        return "invalid"
+
+
+def _remaining_deadline(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
 
 
 def _decode_count_pairs(raw: Any) -> dict[str, int]:
@@ -892,9 +912,22 @@ async def _resolve_overview_plane_root(ctx: MonitorContext) -> Path:
     return await asyncio.to_thread(_plane_root, ctx)
 
 
+def _revalidate_overview_plane_root_fast(ctx: MonitorContext) -> Path | None:
+    """Revalidate the current plane root and retirement marker without spawning ``git``."""
+    if os.environ.get(fleet_paths.ENV_ROOT):
+        return _plane_root(ctx)
+    cache_key = f"fleet-git-anchor:{ctx.roots.state_root}"
+    anchor = ctx.runtime._derived.get(cache_key)
+    if not isinstance(anchor, Path):
+        return None
+    root = fleet_paths.validate_plane_root(anchor / fleet_paths.DEFAULT_ROOT_REL)
+    _check_not_retired(root)
+    return root
+
+
 def _capture_overview_routing(plane_root: Path) -> _OverviewRouting:
-    """Snapshot effective routing inputs matching reader semantics without disk I/O."""
-    plane_mode_env = (os.environ.get(message_plane.ENV_MODE) or "").strip().lower()
+    """Snapshot effective routing inputs matching reader semantics (including configured default mode)."""
+    plane_mode = _resolve_effective_plane_mode()
     # Preserve exact reader semantics (no .strip()) so distinct telemetry paths stay distinct.
     telemetry_path = message_plane.default_parity_telemetry_path(plane_root)
     try:
@@ -910,7 +943,7 @@ def _capture_overview_routing(plane_root: Path) -> _OverviewRouting:
             pg_dsn_digest = hashlib.sha256(raw_dsn.encode("utf-8")).hexdigest()
     return _OverviewRouting(
         plane_root=plane_root,
-        plane_mode_env=plane_mode_env,
+        plane_mode=plane_mode,
         telemetry_path=telemetry_path,
         authority=authority_label,
         pg_dsn_digest=pg_dsn_digest,
@@ -921,6 +954,25 @@ def _overview_routing_matches(ctx: MonitorContext, expected: _OverviewRouting) -
     """Verify the live plane target, retirement status, and routing inputs still match ``expected``."""
     current_root = _plane_root(ctx)
     return _capture_overview_routing(current_root) == expected
+
+
+def _pg_connection_matches_dsn(connection: Any, expected_dsn: str) -> bool:
+    """When a real psycopg connection exposes ``info``, verify it connected to ``expected_dsn``."""
+    info = getattr(connection, "info", None)
+    if info is None or not expected_dsn or _conninfo_to_dict is None:
+        return True
+    try:
+        expected = _conninfo_to_dict(expected_dsn)
+    except Exception:
+        return True
+    for attr in ("host", "port", "dbname", "user"):
+        wanted = expected.get(attr)
+        if wanted is None:
+            continue
+        actual = getattr(info, attr, None)
+        if actual is not None and str(actual) != str(wanted):
+            return False
+    return True
 
 
 async def _overview_cache_key(ctx: MonitorContext, routing: _OverviewRouting) -> str:
@@ -938,7 +990,7 @@ async def _overview_cache_key(ctx: MonitorContext, routing: _OverviewRouting) ->
         [
             scope,
             str(routing.plane_root),
-            routing.plane_mode_env,
+            routing.plane_mode,
             str(routing.telemetry_path),
             routing.authority,
             routing.pg_dsn_digest,
@@ -947,22 +999,9 @@ async def _overview_cache_key(ctx: MonitorContext, routing: _OverviewRouting) ->
     )
 
 
-def _normalized_mode_env(raw: str) -> str | None:
-    """Normalize ``FLEET_COMMS_MESSAGE_PLANE`` to ``read_plane_status`` mode labels, or None if unset."""
-    if not raw:
-        return None
-    if raw in {"0", "false", "off", "disabled"}:
-        return "off"
-    if raw in {"dual-write", "dualwrite", "dual_write"}:
-        return "dual_write"
-    if raw in {"shadow", "authority"}:
-        return raw
-    return "invalid"
-
-
 def _overview_deadline_payload(routing: _OverviewRouting) -> dict[str, Any]:
-    """Return the existing unavailable overview shape without blocking I/O when a cold read times out."""
-    mode = _normalized_mode_env(routing.plane_mode_env) or "unknown"
+    """Return the existing unavailable overview contract without blocking I/O when a cold read times out."""
+    mode = routing.plane_mode
     authority_active = mode == "authority"
     authority_label = (
         "fleet_comms_authoritative" if authority_active else "file_handoffs_authoritative"
@@ -975,9 +1014,9 @@ def _overview_deadline_payload(routing: _OverviewRouting) -> dict[str, Any]:
     }
     health = {
         "mode": mode,
-        "enabled": mode not in {"off", "invalid", "unknown"},
+        "enabled": mode not in {"off", "invalid"},
         "read_only": True,
-        "response_schema_version": None,
+        "response_schema_version": message_plane.COMMS_RESPONSE_SCHEMA_VERSION,
         "store": store,
         "authority": authority_label,
         "cutover": cutover_label,
@@ -1035,11 +1074,17 @@ def _overview_is_storable(item: tuple[dict[str, Any], bool]) -> bool:
         return False
     if schema.get("db_error") or store.get("reachable") is not True:
         return False
-    authority_health = payload.get("authority_health")
-    return not (
-        isinstance(authority_health, dict)
-        and authority_health.get("state") == "unavailable"
-    )
+    # For PostgreSQL, ``complete`` enforces authority_health availability whenever
+    # authority_jobs exists while permitting caching on the shipped PG schema
+    # where authority_jobs is not yet migrated.
+    if schema.get("authority") != storage.Authority.PG.value:
+        authority_health = payload.get("authority_health")
+        if (
+            isinstance(authority_health, dict)
+            and authority_health.get("state") == "unavailable"
+        ):
+            return False
+    return True
 
 
 @router.get("/overview")
@@ -1050,11 +1095,18 @@ async def fleet_overview(
     """Compact durable-plane counts for the consolidated fleet dashboard."""
     deadline = time.monotonic() + OVERVIEW_COLD_DEADLINE_S
     resolved_ctx = resolve_context(ctx)
-    plane_root = await _resolve_overview_plane_root(resolved_ctx)
-    routing = _capture_overview_routing(plane_root)
-    key = await _overview_cache_key(resolved_ctx, routing)
-    remaining = max(0.05, deadline - time.monotonic())
+    routing: _OverviewRouting | None = None
+    key: str | None = None
     try:
+        plane_root = await asyncio.wait_for(
+            _resolve_overview_plane_root(resolved_ctx),
+            timeout=_remaining_deadline(deadline),
+        )
+        routing = _capture_overview_routing(plane_root)
+        key = await asyncio.wait_for(
+            _overview_cache_key(resolved_ctx, routing),
+            timeout=_remaining_deadline(deadline),
+        )
         (payload, _complete), age, stored = await asyncio.wait_for(
             cache_read_swr(
                 key,
@@ -1062,41 +1114,44 @@ async def fleet_overview(
                 lambda: _collect_fleet_overview(resolved_ctx, expected_routing=routing),
                 storable=_overview_is_storable,
             ),
-            timeout=remaining,
+            timeout=_remaining_deadline(deadline),
         )
+        after_root = _revalidate_overview_plane_root_fast(resolved_ctx)
+        if after_root is None or _capture_overview_routing(after_root) != routing:
+            raise _OverviewRoutingChangedError("routing changed before returning overview")
     except _OverviewRoutingChangedError as exc:
         raise HTTPException(
             status_code=503,
             detail="fleet overview routing changed during read",
         ) from exc
     except TimeoutError:
-        after_root = await _resolve_overview_plane_root(resolved_ctx)
-        if _capture_overview_routing(after_root) != routing:
+        if routing is None:
+            raise HTTPException(
+                status_code=503,
+                detail="fleet overview target validation timed out",
+            ) from None
+        after_root = _revalidate_overview_plane_root_fast(resolved_ctx)
+        if after_root is None or _capture_overview_routing(after_root) != routing:
             raise HTTPException(
                 status_code=503,
                 detail="fleet overview routing changed during read",
             ) from None
-        stored_entry = cache_get_stored(key)
-        if stored_entry is not None:
-            cached_item, cached_age = stored_entry
-            if (
-                isinstance(cached_item, tuple)
-                and len(cached_item) == 2
-                and isinstance(cached_item[0], dict)
-            ):
-                response.headers.update(snapshot_headers(cached_age, FACADE_TTL_S))
-                return cached_item[0]
+        if key is not None:
+            stored_entry = cache_get_stored(key)
+            if stored_entry is not None:
+                cached_item, cached_age = stored_entry
+                if (
+                    isinstance(cached_item, tuple)
+                    and len(cached_item) == 2
+                    and isinstance(cached_item[0], dict)
+                ):
+                    response.headers.update(snapshot_headers(cached_age, FACADE_TTL_S))
+                    return cached_item[0]
         response.headers.update(
             snapshot_headers(0.0, FACADE_TTL_S, unavailable=True)
         )
         return _overview_deadline_payload(routing)
 
-    after_root = await _resolve_overview_plane_root(resolved_ctx)
-    if _capture_overview_routing(after_root) != routing:
-        raise HTTPException(
-            status_code=503,
-            detail="fleet overview routing changed during read",
-        )
     response.headers.update(snapshot_headers(age, FACADE_TTL_S, unavailable=not stored))
     return payload
 
@@ -1107,11 +1162,14 @@ def _collect_fleet_overview(
     expected_routing: _OverviewRouting | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Collect one overview snapshot and whether all backend-required tables were readable."""
+    expected_pg_dsn = ""
     if expected_routing is not None:
         if not _overview_routing_matches(ctx, expected_routing):
             raise _OverviewRoutingChangedError("routing changed before overview collection")
         effective_root = expected_routing.plane_root
         telemetry_path: Path | None = expected_routing.telemetry_path
+        if expected_routing.authority == storage.Authority.PG.value:
+            expected_pg_dsn = (os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or "").strip()
     else:
         effective_root = _plane_root(ctx)
         telemetry_path = None
@@ -1123,8 +1181,7 @@ def _collect_fleet_overview(
     if expected_routing is not None:
         if status.get("schema", {}).get("authority") != expected_routing.authority:
             raise _OverviewRoutingChangedError("authority drifted during plane status probe")
-        expected_mode = _normalized_mode_env(expected_routing.plane_mode_env)
-        if expected_mode is not None and status.get("mode") != expected_mode:
+        if status.get("mode") != expected_routing.plane_mode:
             raise _OverviewRoutingChangedError("plane mode drifted during plane status probe")
         if not _overview_routing_matches(ctx, expected_routing):
             raise _OverviewRoutingChangedError("routing changed before opening counts store")
@@ -1146,7 +1203,11 @@ def _collect_fleet_overview(
     }
     try:
         populated, complete = _populate_fleet_overview(
-            result, status, ctx, plane_root=effective_root
+            result,
+            status,
+            ctx,
+            plane_root=effective_root,
+            expected_pg_dsn=expected_pg_dsn,
         )
     except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
@@ -1323,11 +1384,8 @@ def _populate_fleet_overview_per_table(
         dead_letters_total=dead_letters_total,
         acp_total=acp_total,
     )
-    result["authority_health"] = (
-        _authority_health_snapshot(connection)
-        if is_authority
-        else None
-    )
+    authority_health = _authority_health_snapshot(connection) if is_authority else None
+    result["authority_health"] = authority_health
     if is_sqlite_connection(connection):
         required_ok: tuple[bool, ...] = (
             has_requests,
@@ -1337,16 +1395,22 @@ def _populate_fleet_overview_per_table(
             has_dead_letters,
             has_acp,
         )
-    else:
-        # Supported PostgreSQL schema (lu_machinery/pg_schema.py) provides requests and
-        # comms_messages, plus authority_jobs and authority_dead_letters in authority mode.
-        # formal_review_jobs, acp_conversations, and legacy dead_letters remain SQLite-only.
-        required_ok = (
-            (has_requests, has_messages, has_authority_jobs, has_dead_letters)
-            if is_authority
-            else (has_requests, has_messages)
+        health_ok = not (
+            isinstance(authority_health, dict)
+            and authority_health.get("state") == "unavailable"
         )
-    complete = not fallback_from_error and all(required_ok)
+    else:
+        # Shipped PostgreSQL migrations (lu_machinery/pg_schema.py) create requests and
+        # comms_messages; authority_jobs and authority_dead_letters are not in the PG ledger.
+        # Keep unsupported authority_health explicitly unavailable while allowing supported
+        # PG overview snapshots to cache. When authority_jobs exists on PG, an unavailable
+        # health read stays unstorable.
+        required_ok = (has_requests, has_messages)
+        health_ok = not has_authority_jobs or not (
+            isinstance(authority_health, dict)
+            and authority_health.get("state") == "unavailable"
+        )
+    complete = not fallback_from_error and all(required_ok) and health_ok
     return result, complete
 
 
@@ -1356,6 +1420,7 @@ def _populate_fleet_overview(
     ctx: MonitorContext,
     *,
     plane_root: Path | None = None,
+    expected_pg_dsn: str = "",
 ) -> tuple[dict[str, Any], bool]:
     with _read_connection(ctx, pg_supported=True, plane_root=plane_root) as (
         connection,
@@ -1371,6 +1436,8 @@ def _populate_fleet_overview(
                 return _populate_fleet_overview_per_table(
                     result, status, connection, fallback_from_error=True
                 )
+        if expected_pg_dsn and not _pg_connection_matches_dsn(connection, expected_pg_dsn):
+            raise _OverviewRoutingChangedError("postgres connection target drifted from expected DSN")
         return _populate_fleet_overview_per_table(result, status, connection)
 
 

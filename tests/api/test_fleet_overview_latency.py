@@ -628,17 +628,59 @@ def test_overview_background_refresh_aborts_on_routing_change_without_overwritin
         assert r3.json()["authority_health"] is not None
 
 
+def test_overview_rejects_transient_mode_override_when_mode_env_unset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F5): transient mode override during status read caches shadow under configured-authority key."""
+    plane_root = tmp_path / "plane"
+    _seed_plane_db(plane_root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.delenv("FLEET_COMMS_MESSAGE_PLANE", raising=False)
+
+    real_status = fleet_router.read_plane_status
+    injected = False
+
+    def _transient_shadow(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal injected
+        if not injected:
+            injected = True
+            monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "shadow")
+            try:
+                return real_status(*args, **kwargs)
+            finally:
+                monkeypatch.delenv("FLEET_COMMS_MESSAGE_PLANE", raising=False)
+        return real_status(*args, **kwargs)
+
+    monkeypatch.setattr(fleet_router, "read_plane_status", _transient_shadow)
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        # Transient shadow mode during status probe must fail closed with 503 and not cache.
+        r1 = client.get("/api/fleet/overview")
+        assert r1.status_code == 503
+
+        # Next GET with env still unset returns the configured default authority snapshot cleanly.
+        r2 = client.get("/api/fleet/overview")
+        assert r2.status_code == 200
+        assert r2.headers["X-Snapshot-State"] == "fresh"
+        assert r2.json()["health"]["mode"] == "authority"
+        assert r2.json()["authority"] == "fleet_comms_authoritative"
+
+
 def test_overview_cold_read_respects_route_deadline_and_keeps_single_refresh(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect class (F2): slow cold overview stalls past the 1s route budget instead of bounding wait."""
+    """Defect classes (F2, F9): cold timeout bounds wait, keeps single refresh, and preserves mode + comms.v2 contract."""
     plane_root = tmp_path / "plane"
     db_path = _seed_plane_db(plane_root)
     with sqlite3.connect(db_path) as conn:
         _seed_conversation(conn)
         _insert_message(conn, "cold-1", "update")
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    # Unset mode env so configured default (authority) from fleet_communications.yaml applies.
+    monkeypatch.delenv("FLEET_COMMS_MESSAGE_PLANE", raising=False)
     monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.05)
 
     release_collect = threading.Event()
@@ -669,8 +711,14 @@ def test_overview_cold_read_respects_route_deadline_and_keeps_single_refresh(
         r1 = client.get("/api/fleet/overview")
         assert r1.status_code == 200
         assert r1.headers["X-Snapshot-State"] == "unavailable"
-        assert r1.json()["availability"] == "unavailable"
-        assert r1.json()["health"]["schema"]["db_error"] == "overview_deadline_exceeded"
+        body1 = r1.json()
+        assert body1["availability"] == "unavailable"
+        assert body1["authority"] == "fleet_comms_authoritative"
+        assert body1["cutover"] == "authority_active"
+        assert body1["health"]["mode"] == "authority"
+        assert body1["health"]["response_schema_version"] == "comms.v2"
+        assert body1["health"]["schema"]["db_error"] == "overview_deadline_exceeded"
+        assert body1["authority_health"]["state"] == "unavailable"
 
         # Unblock the single shielded background flight; once published, next GET hits cache cleanly.
         release_collect.set()
@@ -683,19 +731,69 @@ def test_overview_cold_read_respects_route_deadline_and_keeps_single_refresh(
         assert collect_calls == 1
 
 
+def test_overview_deadline_bounds_slow_git_anchor_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F2): slow one-time Git anchor resolution bypasses route deadline before cache read."""
+    state_repo = tmp_path / "state-repo"
+    state_repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(state_repo)], check=True, timeout=15)
+    _seed_plane_db(state_repo / "batch_state" / "fleet-comms" / "v1")
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.05)
+
+    release_anchor = threading.Event()
+    anchor_done = threading.Event()
+    real_resolve_main = fleet_paths.resolve_main_root
+
+    def _slow_resolve_main(path: Path) -> Path:
+        assert release_anchor.wait(timeout=5.0)
+        try:
+            return real_resolve_main(path)
+        finally:
+            anchor_done.set()
+
+    monkeypatch.setattr(fleet_paths, "resolve_main_root", _slow_resolve_main)
+
+    app, _ctx = _make_app(tmp_path, state_root=state_repo)
+    with TestClient(app) as client:
+        r1 = client.get("/api/fleet/overview")
+        assert r1.status_code == 503
+        release_anchor.set()
+        assert anchor_done.wait(timeout=5.0)
+
+        r2 = client.get("/api/fleet/overview")
+        assert r2.status_code == 200
+        assert r2.headers["X-Snapshot-State"] == "fresh"
+
+
 def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Defect class (F3): PostgreSQL overview refuses to cache because SQLite-only tables are absent."""
+    """Defect class (F3): shipped PostgreSQL migration schema (no authority_jobs/dead_letters) must cache as fresh."""
     plane_root = tmp_path / "pg-absent"
     monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
     monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "pg")
     monkeypatch.setenv("LEARN_UKRAINIAN_CP_PG_DSN", "dbname=synthetic_pg_overview user=reader")
 
-    existing_pg_tables = {"requests", "comms_messages", "authority_jobs", "authority_dead_letters"}
+    # Exact shipped PG migration inventory from lu_machinery/pg_schema.py (no authority_jobs,
+    # authority_dead_letters, formal_review_jobs, or acp_conversations).
+    existing_pg_tables = {
+        "fleet_comms_artifact_blobs",
+        "conversations",
+        "comms_messages",
+        "requests",
+        "message_artifacts",
+    }
     connect_calls = 0
+
+    class _FakePgInfo:
+        dbname = "synthetic_pg_overview"
+        user = "reader"
+        host = None
+        port = None
 
     class _FakePgCursor:
         def __init__(self, rows: list[tuple[Any, ...]]) -> None:
@@ -709,6 +807,7 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
 
     class _FakePgConn:
         autocommit = False
+        info = _FakePgInfo()
 
         def execute(self, sql: str, params: Any = None) -> _FakePgCursor:
             if "pg_class" in sql:
@@ -729,12 +828,12 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
             "mode": "authority",
             "enabled": True,
             "read_only": True,
-            "response_schema_version": 2,
+            "response_schema_version": "comms.v2",
             "store": store,
             "schema": {
-                "known_version": 1,
-                "applied_version": 1,
-                "applied_name": "v1",
+                "known_version": 6,
+                "applied_version": 6,
+                "applied_name": "fleet-comms-pg-v6-v4-operation-ownership",
                 "db_exists": True,
                 "authority": "pg",
                 "db_error": None,
@@ -759,11 +858,14 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
 
     app, _ctx = _make_app(tmp_path)
     with TestClient(app) as client:
-        # Supported PG tables present (no formal_review_jobs/acp_conversations): caches as fresh.
+        # Shipped PG schema in default authority mode: authority_health stays explicitly unavailable,
+        # while the supported overview snapshot caches as fresh.
         r1 = client.get("/api/fleet/overview")
         assert r1.status_code == 200
         assert r1.headers["X-Snapshot-State"] == "fresh"
-        assert r1.json()["availability"] == "empty"
+        body1 = r1.json()
+        assert body1["availability"] == "empty"
+        assert body1["authority_health"]["state"] == "unavailable"
         assert connect_calls == 1
 
         # Second GET serves from SWR cache with 0 extra PG connections.
@@ -772,7 +874,7 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
         assert r2.headers["X-Snapshot-State"] == "fresh"
         assert connect_calls == 1
 
-        # Dropping a supported PG table (comms_messages) must return unavailable and not cache.
+        # Dropping a shipped PG overview table (comms_messages) must return unavailable and not cache.
         state_helpers.cache_invalidate()
         existing_pg_tables.remove("comms_messages")
         r3 = client.get("/api/fleet/overview")
@@ -786,6 +888,12 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
         assert r4.status_code == 200
         assert r4.headers["X-Snapshot-State"] == "fresh"
         assert connect_calls == 3
+
+        # Real-connection info mismatch (connected to wrong PG dbname) must fail closed with 503.
+        state_helpers.cache_invalidate()
+        monkeypatch.setattr(_FakePgInfo, "dbname", "other_db")
+        r5 = client.get("/api/fleet/overview")
+        assert r5.status_code == 503
 
 
 def test_overview_preserves_dependency_override_and_background_tasks(
