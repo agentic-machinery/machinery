@@ -100,8 +100,10 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
     else:
         assert captured.err == ""
         assert "BENCH HEALTH PASS" in captured.out
-    # Sol alone reviews Anthropic-authored high and critical work since Cursor Grok retired (GROK-CANCEL-1110).
-    assert captured.out.count("[EXPECTED single seat]") == (1 if risk in {"high", "critical"} else 0)
+    # Sol alone reviews Anthropic-authored critical work since Cursor Grok retired (GROK-CANCEL-1110);
+    # at high Neon is the second code-review seat (GEMINI-TIERS-1119); it holds no infra profile.
+    neon = ["gemini-4-neon-high"] if profile == "code" else []
+    assert captured.out.count("[EXPECTED single seat]") == (1 if risk == "critical" or (risk == "high" and not neon) else 0)
     for family, seats in results.items():
         resolution = resolve_reviewer(
             ResolverInputs(
@@ -116,11 +118,13 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
         assert set(seats) == {entry.name for entry in resolution.trace if entry.status in {"selected", "eligible"}}
     if risk == "high":
         assert {family: results[family] for family in ("anthropic", "openai")} == {
-            "anthropic": ["openai_frontier"],
-            "openai": ["claude-opus-5-5", "claude-opus-5-5-agy"],
+            "anthropic": ["openai_frontier", *neon],
+            "openai": ["claude-opus-5-5", "claude-opus-5-5-agy", *neon],
         }
         for family in set(AUTHOR_FAMILIES) - {"anthropic", "openai"}:
-            assert results[family] == ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy"]
+            # Neon never reviews Google-authored work.
+            own = [] if family == "google" else neon
+            assert results[family] == ["openai_frontier", "claude-opus-5-5", "claude-opus-5-5-agy", *own]
         # The resolver names the single eligibility rule, not a bench-local list.
         rule = f"performed only by {CURRENT_SOL}, claude-opus-5-5"
         assert rule in exclusions["anthropic"][GROK]
@@ -302,11 +306,15 @@ def test_accepted_single_seat_still_requires_available_reviewer(risk, status, ro
             "diagnostics": {"stale": False}}
     if route == "claude":
         data["agents"]["agy"] = {"status": "unhealthy"}
-    assert main(["--risk", risk], routing_snapshot=data) == (1 if status == "unhealthy" or route == "claude" else 0)
+    # Neon on AGY still reviews Anthropic-authored high-risk code when Codex is out (GEMINI-TIERS-1119).
+    neon_fills = route == "codex" and risk == "high"
+    expected_exit = 0 if neon_fills else (1 if status == "unhealthy" or route == "claude" else 0)
+    assert main(["--risk", risk], routing_snapshot=data) == expected_exit
     captured = capsys.readouterr()
+    neon = ["gemini-4-neon-high"] if neon_fills else []
     if status == "near_cap":
         results = check_bench_health(routing_snapshot=data, risk=risk)
-        assert results[family] == (["openai_frontier"] if route == "codex" else [])
+        assert results[family] == (["openai_frontier", *neon] if route == "codex" else [])
         findings = _findings(captured)
         if route == "claude":
             # Claude's cap leaves OpenAI authors with no reviewer and every other non-Anthropic
@@ -324,6 +332,10 @@ def test_accepted_single_seat_still_requires_available_reviewer(risk, status, ro
         else:
             assert not findings
             assert "BENCH HEALTH PASS" in captured.out
+        return
+    if neon_fills:
+        assert check_bench_health(routing_snapshot=data, risk=risk)[family] == neon
+        assert not [item for item in _findings(captured) if item["author_family"] == family]
         return
     finding = next(item for item in _findings(captured) if item["author_family"] == family)
     assert finding["minimum"] == 1

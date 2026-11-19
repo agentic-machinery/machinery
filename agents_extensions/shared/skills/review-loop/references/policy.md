@@ -49,13 +49,14 @@ lets the PR land. A break-it finding is fixed, and the same reviewer confirms th
 budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
-change, and the resolver seats only Opus or Sol at either. For `code` and `infra` reviews the
+change. At `critical` the resolver seats only Opus or Sol; at `high` it seats Sol, then Opus,
+then Gemini 4 Neon High for code (GEMINI-TIERS-1119). For `code` and `infra` reviews the
 security-path classifier (`lu_machinery/review/security_paths.py`) is a floor: a change touching
 one of its paths, either name of a rename or a deletion included, is reviewed at `critical`
 whatever risk was passed. Nothing lowers that floor.
 
 One exact-head cross-family review per change (owner decision C-5345, 2026-11-12).
-High and critical risk keep an Opus or Sol reviewer. There is no second review.
+Critical risk keeps an Opus or Sol reviewer. High risk takes Sol, then Opus, then Gemini 4 Neon High (GEMINI-TIERS-1119). There is no second review.
 
 ## 3. Findings
 

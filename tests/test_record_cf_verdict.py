@@ -1162,7 +1162,7 @@ def test_gemini_verdict_records_and_gate_accepts_exact_head(monkeypatch, tmp_pat
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
-@pytest.mark.parametrize("risk,path", [("high", "ordinary.py"), ("critical", "ordinary.py"),
+@pytest.mark.parametrize("risk,path", [("critical", "ordinary.py"),
                                       ("low", "scripts/review/reviewer_resolver.py"),
                                       ("medium", ".github/workflows/ci.yml")])
 @pytest.mark.usefixtures("agent_runtime_roots")
@@ -1172,7 +1172,7 @@ def test_gemini_code_verdict_refused_before_publication(monkeypatch, tmp_path, r
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"anthropic"}, changed_paths=(path,)))
     write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
-    with pytest.raises(recorder.RecordError, match="Gemini code review requires AGY at low/medium risk"):
+    with pytest.raises(recorder.RecordError, match="Gemini code review requires AGY at low, medium or high risk"):
         recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert not comments
     assert calls == {"posts": 0, "statuses": 0}

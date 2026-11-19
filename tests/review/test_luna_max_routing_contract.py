@@ -1674,6 +1674,7 @@ _HIGH_SEATS = {
     "openai_frontier",
     "claude-opus-5-5",
     "claude-opus-5-5-agy",
+    "gemini-4-neon-high",
 }
 
 
@@ -1682,7 +1683,8 @@ _SOL_UNAVAILABLE = {"codex": "unhealthy"}
 
 _HIGH_DENOMINATOR = {
     (author, sol, profile): (
-        (CURRENT_SOL if sol == "healthy" else None)
+        # Neon follows Sol and Opus at high and holds no infra profile (GEMINI-TIERS-1119).
+        (CURRENT_SOL if sol == "healthy" else ("gemini-4-neon" if profile == "code" else None))
         if author in {"claude-opus-5-5", "claude-sonnet-5-5"}
         else (
             CURRENT_SOL
@@ -1699,7 +1701,7 @@ _HIGH_DENOMINATOR = {
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("key", sorted(_HIGH_DENOMINATOR))
 def test_high_risk_resolves_to_sol_or_opus(key):
-    """The denominator admits only Sol and Opus; the Cursor Grok transport (#9769) retired (GROK-CANCEL-1110)."""
+    """The denominator admits Sol, Opus, then Neon; the Cursor Grok transport (#9769) retired (GROK-CANCEL-1110)."""
     author, sol, profile = key
     snapshot = _SOL_UNAVAILABLE if sol == "unavailable" else None
     resolution = resolve_reviewer(
@@ -1717,11 +1719,11 @@ def test_high_risk_resolves_to_sol_or_opus(key):
         return
     assert resolution.selected is not None
     assert resolution.selected.concrete_model == expected
-    assert resolution.selected.concrete_model in _SOL_OPUS
+    assert resolution.selected.concrete_model in _SOL_OPUS | {"gemini-4-neon"}
     assert resolution.selected.transport in {"native_codex", "native_claude", "agy"}
 
 
-_HIGH_RISK_RULE = f"a formal review at high risk is performed only by {CURRENT_SOL}, claude-opus-5-5"
+_HIGH_RISK_RULE = f"a formal review at high risk is performed only by {CURRENT_SOL}, claude-opus-5-5, gemini-4-neon"
 
 
 @pytest.mark.usefixtures('configured_roots')

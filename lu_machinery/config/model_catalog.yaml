@@ -104,7 +104,9 @@ review_scheduler:
   profile_risk_role_order:
     code:
       critical: [critical_review]
-      high: [strong_review, standard_review, long_context_review, critical_review]
+      # GEMINI-TIERS-1119: critical_review precedes long_context_review so
+      # Neon reviews high-risk code only after the OpenAI and Anthropic seats.
+      high: [strong_review, standard_review, critical_review, long_context_review]
       medium: [standard_review, strong_review, long_context_review, routine_review, critical_review]
       low: [routine_review, standard_review, strong_review, long_context_review, critical_review]
     infra:
@@ -147,8 +149,14 @@ review_scheduler:
   # performed only by these models, on any catalogued review route (Opus 5.5
   # natively; no Claude model through Cursor, #10464). This is an eligibility gate: ladders, explicit
   # pins, custom ladders and delegate review admission all apply it.
+  # GEMINI-TIERS-1119 (operator 2026-11-19): Gemini 4 Neon is an Opus-tier
+  # seat and reviews high-risk code after the OpenAI and Anthropic seats.
+  # Critical and security-path reviews still exclude Gemini.
   risk_reviewer_models:
-    high: [{role: openai_frontier_coder}, {role: anthropic_authority_reviewer}]
+    high:
+    - {role: openai_frontier_coder}
+    - {role: anthropic_authority_reviewer}
+    - {role: legacy_reviewers, seat: google_bounded}
   endpoints:
     claude:
       formal_review_eligible: true
@@ -822,7 +830,8 @@ models:
       the stable task ID's SHA-256, with the same parity rule. Without a stable
       ID use high, the AGY wire default. Pass the exact selector in each
       dispatch for supplemental work. Native formal code review uses Neon High
-      at low or medium risk and excludes security paths. Ukrainian review uses
+      at low, medium or high risk (high after the OpenAI and Anthropic seats,
+      GEMINI-TIERS-1119) and excludes critical and security paths. Ukrainian review uses
       Neon High with the Sources MCP and VESUM. ACP consultation pins Neon High.
       Google's
       AA Index v5.0.1 chart shows Neon high
@@ -1356,7 +1365,7 @@ review_candidates:
 
 # Fleet-comms stream orchestrator seats (#5512 / #4707 / #5703). These lanes may own a
 # cold-start loop (prioritize → delegate → CF → merge-in-lane).
-# Native AGY reviews low/medium code in an exact-head worktree; its ACP wrapper cannot consume the
+# Native AGY reviews low/medium/high code in an exact-head worktree; its ACP wrapper cannot consume the
 # parent-owned sealed MCP. Grok reviews through Cursor and holds no driver seat;
 # Kimi: web, UI and backend coding only, never review.
 # Parallel escalate ladder (user 2026-07-22): practical default + authority deep.
@@ -1429,7 +1438,7 @@ formal_cf_defaults:
       - {role: legacy_reviewers, seat: anthropic_practical}
       - {role: anthropic_authority_reviewer}
   agy:
-    # #10073: native low/medium code review; Ukrainian review needs Sources MCP.
+    # #10073, GEMINI-TIERS-1119: native low/medium/high code review; Ukrainian review needs Sources MCP.
     model_id: {role: legacy_reviewers, seat: google_bounded}
     effort: high
     formal_review_eligible: true
@@ -1447,11 +1456,13 @@ review_ladders:
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}]
   # High lists only review_scheduler.risk_reviewer_models.high (#9538): when
   # no seat is eligible the resolver returns no reviewer with a stated reason.
+  # Neon follows the OpenAI and Anthropic seats (GEMINI-TIERS-1119).
   high:
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}]
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}]
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}]
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}]
+    - [{role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}]
   medium: &practical_first_code_review
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}]
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}]
@@ -1703,6 +1714,7 @@ roles:
     - openai_frontier/native
     - anthropic_authority/native
     - anthropic_authority/agy
+    - google_bounded/native
     cardinality: many
     risk: high
   code_review_critical:
