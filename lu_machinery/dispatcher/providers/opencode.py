@@ -14,6 +14,7 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.safe_open import safe_open_below
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
+from lu_machinery.orchestration import dispatch_isolation
 
 # OpenCode allows edits and every shell command by default and has no OS sandbox, so read-only
 # carries its own permission rules (https://opencode.ai/docs/permissions/): ``edit`` covers the
@@ -48,6 +49,7 @@ MODELS = {
 }
 _SAVANT_API = "https://api.subq.ai/v1"
 _SAVANT_KEY_FILE_ENV = "LU_SUBQ_API_KEY_FILE"
+_SAVANT_MANAGER_ENV_MAX_BYTES = 1024 * 1024
 _SAVANT_CONTEXT = 4_000_000
 _SAVANT_DEFAULT_MAX_TOKENS = 64_000
 SAVANT_DEFAULT_EFFORT = "high"
@@ -111,9 +113,38 @@ def savant_token_cap(raw: str | None) -> int:
     raise ValueError("savant_token_cap_refused: --max-tokens must be an integer from 1 to 3999999")
 
 
+def _savant_host_key_path() -> str:
+    """Read the configured path from the local user manager, even from a sanitized worker."""
+    try:
+        result = subprocess.run(
+            [
+                "busctl", "--user", "--json=short", "--auto-start=no", "get-property",
+                "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager",
+                "Environment",
+            ],
+            env=dispatch_isolation.user_manager_env({"PATH": os.defpath}),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=dispatch_isolation.PROBE_TIMEOUT_S, check=False,
+        )
+        if result.returncode or len(result.stdout) > _SAVANT_MANAGER_ENV_MAX_BYTES:
+            raise ValueError
+        payload = json_depth.loads(result.stdout, max_depth=2)
+        entries = payload.get("data") if isinstance(payload, dict) and payload.get("type") == "as" else None
+        if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+            raise ValueError
+    except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+        raise ValueError("savant_key_unavailable: could not read the systemd user manager environment") from None
+    name = f"{_SAVANT_KEY_FILE_ENV}="
+    paths = [entry.removeprefix(name) for entry in entries if entry.startswith(name)]
+    if len(paths) != 1:
+        raise ValueError(f"savant_key_unavailable: expected one {_SAVANT_KEY_FILE_ENV} in the systemd user manager")
+    return paths[0]
+
+
 def _savant_api_key() -> str:
     """Read the operator's file. Keep the path and value out of diagnostics and task records."""
-    path = Path(os.environ.get(_SAVANT_KEY_FILE_ENV, ""))
+    override = os.environ.get(_SAVANT_KEY_FILE_ENV)
+    path = Path(_savant_host_key_path() if override is None else override)
     if not path.is_absolute():
         raise ValueError(f"savant_key_unavailable: configure {_SAVANT_KEY_FILE_ENV} with an absolute path")
     try:
