@@ -749,10 +749,11 @@ def _publication_ok(entry: object) -> bool:
 
 
 def publication(*, task_id: str, repository: str, pr: int, head: str, verdict: str,
-                published_at: str) -> dict[str, Any]:
+                published_at: object) -> dict[str, Any]:
     """One ledger line: which review task's verdict was published on which PR head, and when GitHub stored it.
 
-    Raises ValueError when a field has the wrong shape, so a malformed line is never written.
+    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted). Raises
+    ValueError when a field has the wrong shape, so a malformed line is never written.
     """
     entry = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr, "head": head,
              "verdict": verdict, "published_at": published_at}

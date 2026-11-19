@@ -2994,7 +2994,7 @@ def _store_publication(
     try:
         entry = model_stats_rows.publication(
             task_id=task_id, repository=repository, pr=number, head=sha, verdict=verdict,
-            published_at=comment.get("created_at"),  # publication() refuses a missing or malformed time
+            published_at=comment.get("created_at"),
         )
         model_stats_rows.record_publications(task_root.parent, [entry], wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
     except (OSError, ValueError) as exc:
