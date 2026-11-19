@@ -346,4 +346,4 @@ def test_mixed_family_head_refuses_neon(dispatch, monkeypatch, tmp_path, capsys)
     dispatch(*review, agent="agy", model="gemini-4-neon-high", expected=2, refusal="review_setup_refusal")
     assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
     dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2, refusal="route_eligibility")
-    assert "holds no review" in capsys.readouterr().err
+    assert "is retired in the model catalog" in capsys.readouterr().err

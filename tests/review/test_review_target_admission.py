@@ -364,7 +364,7 @@ def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
         ("claude", "claude-opus-5-5", "dispatch", "code"),
         ("claude", "claude-opus-5-5", "mode", "code"),
         ("claude", "claude-opus-5-5", "flag", "code"),
-        ("agy", "gemini-3.8-flash-high", "none", "code"),
+        ("agy", "gemini-4-hydrogen-medium", "none", "code"),
     ],
 )
 def test_explicit_review_risk_other_work_remains_unaffected(seat, model, entry, profile):

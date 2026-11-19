@@ -616,7 +616,7 @@ def test_agy_waits_for_background_work_until_after_the_dispatcher_deadline(tmp_p
     """agy-print-timeout: AGY's own deadline never cuts a wait the task's deadline still allows (#12156)."""
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("literal request")
-    spec = TaskSpec("agy-deadline", "agy", "gemini-3.8-flash-high", None, "workspace-write", tmp_path, prompt,
+    spec = TaskSpec("agy-deadline", "agy", "gemini-4-hydrogen-medium", None, "workspace-write", tmp_path, prompt,
                     tmp_path / "final.txt", options={"hard_timeout": hard_timeout})
     argv = load("agy").build(spec, {}).argv
     assert argv[argv.index("--print-timeout") + 1] == print_timeout
@@ -919,7 +919,7 @@ def test_agy_usage_keeps_only_known_non_negative_integer_counters():
 
 
 @pytest.mark.parametrize(("model", "attested"), [
-    ("gemini-3.8-flash-high", "gemini-3.8-flash-high"),
+    ("gemini-3.8-flash-high", "unrecognized"),
     ("claude-sonnet-5-5-high", "claude-sonnet-5-5-high"),
     ("claude-sonnet-5-5", "claude-sonnet-5-5"),
     ("gpt-6.1-sol", "unrecognized"),

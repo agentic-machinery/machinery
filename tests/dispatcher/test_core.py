@@ -607,14 +607,14 @@ def test_provider_process_lingering_after_its_final_result_settles_with_that_res
     monkeypatch.setattr(worker, "TERMINAL_EXIT_GRACE_S", 1)
     monkeypatch.setattr(worker.agy_sandbox, "verify", lambda *_args: ({}, None, None))
     monkeypatch.setattr(worker.agy_sandbox, "unavailable", lambda: None)
-    spec = TaskSpec("agy-final-hang", "agy", "gemini-3.8-flash-high", None, "read-only", sandbox.repo,
+    spec = TaskSpec("agy-final-hang", "agy", "gemini-4-hydrogen-medium", None, "read-only", sandbox.repo,
                     sandbox.repo / "agy-final-hang.prompt", sandbox.tasks / "agy-final-hang.result",
                     options={"hard_timeout": "60", "silence_timeout": "0.5"})
     spec.prompt_file.write_bytes(b"literal final response")
     log = sandbox.repo / "provider.log"
     code = (
         "import json, sys, time\n"
-        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-3.8-flash-high'}}), flush=True)\n"
+        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-4-hydrogen-medium'}}), flush=True)\n"
         "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
         "'response': 'literal final response'}}), flush=True)\n"
         "with open(sys.argv[2], 'a') as log:\n"
@@ -693,7 +693,7 @@ def test_agy_open_command_without_terminal_result_cannot_use_merged_rescue(sandb
     monkeypatch.setattr(worker.git, "merged_delivery", rescue)
     code = (
         "import json\n"
-        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-3.8-flash-high'}}), flush=True)\n"
+        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-4-hydrogen-medium'}}), flush=True)\n"
         "print(json.dumps({'event': 'step_update', 'step_update': "
         "{'step_index': 4, 'state': 'ACTIVE', 'tool_name': 'run_command'}}), flush=True)\n"
         "raise SystemExit(9)\n"
@@ -701,7 +701,7 @@ def test_agy_open_command_without_terminal_result_cannot_use_merged_rescue(sandb
     monkeypatch.setattr(agy, "build", lambda _spec, env: Invocation(
         [sys.executable, "-c", code],
         b'{"event":"user","message":{"role":"user","content":[{"type":"text","text":""}]}}\n', env, None))
-    spec = TaskSpec("agy-open-command", "agy", "gemini-3.8-flash-high", None, "workspace-write", sandbox.repo,
+    spec = TaskSpec("agy-open-command", "agy", "gemini-4-hydrogen-medium", None, "workspace-write", sandbox.repo,
                     sandbox.repo / "agy-open-command.prompt", sandbox.tasks / "agy-open-command.result")
     spec.prompt_file.write_bytes(b"literal parent request")
     record = store.new_record(spec, {"key": "public", "github": str(sandbox.remote)}, "main",
@@ -783,7 +783,7 @@ def test_agy_write_run_does_not_settle_while_its_child_is_running(sandbox, monke
         "repo": "org/repo", "number": 7, "merge_sha": "a" * 40, "paths": []})
     code = (
         "import json\n"
-        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-3.8-flash-high'}}), flush=True)\n"
+        "print(json.dumps({'event': 'init', 'init': {'model': 'gemini-4-hydrogen-medium'}}), flush=True)\n"
         "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', "
         "'response': 'I will pause to await the review verdict.'}}), flush=True)\n"
     )
@@ -792,7 +792,7 @@ def test_agy_write_run_does_not_settle_while_its_child_is_running(sandbox, monke
         b'{"event":"user","message":{"role":"user","content":[{"type":"text","text":""}]}}\n', env, None))
     head = run_git(sandbox.repo, "rev-parse", "HEAD")
     remote = {"key": "public", "github": str(sandbox.remote)}
-    spec = TaskSpec("agy-write-child", "agy", "gemini-3.8-flash-high", None, "workspace-write", sandbox.repo,
+    spec = TaskSpec("agy-write-child", "agy", "gemini-4-hydrogen-medium", None, "workspace-write", sandbox.repo,
                     sandbox.repo / "agy-write-child.prompt", sandbox.tasks / "agy-write-child.result")
     spec.prompt_file.write_bytes(b"literal parent request")
     record = store.new_record(spec, remote, "main", head, {"research_owned_path": []})
