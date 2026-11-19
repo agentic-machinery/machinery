@@ -430,7 +430,7 @@ ORIENT_REFRESH_INTERVAL_S = 10.0
 _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
-_detached_orient_last_good: dict[str, tuple[Any, str, float]] = {}
+_detached_orient_last_good: dict[str, tuple[Any, str]] = {}
 _detached_orient_last_error: dict[str, str] = {}
 # Section cache keys whose refresh worker has not yet published. The worker
 # publishes its value and leaves this set in one critical section, so a reader's
@@ -874,7 +874,7 @@ def _run_detached_orient_refresh(
         with _detached_orient_lock:
             if ttl > 0:
                 cache_set(cache_key, (value, generated_at))
-            _detached_orient_last_good[cache_key] = (value, generated_at, _orient_clock())
+            _detached_orient_last_good[cache_key] = (value, generated_at)
             _detached_orient_last_error.pop(cache_key, None)
             _detached_orient_pending.discard(cache_key)
     except Exception as exc:
@@ -903,17 +903,17 @@ async def _await_thread(thread: threading.Thread, timeout: float) -> None:
         await asyncio.sleep(min(_THREAD_WAIT_POLL_S, remaining))
 
 
-def _due_for_stale_serve(cache_key: str, ttl: float) -> bool:
-    """True when a section's refresh has only just come due and its last value is still near-fresh.
+def _serves_last_good_at_once(cache_key: str, ttl: float) -> bool:
+    """True when an expired section has a last value to serve while it refreshes.
 
-    A section under steady reads is refreshed once per TTL. That read gets the
-    last value at once, labelled ``stale`` and ``refreshing``, instead of
-    waiting out the join for a collector that usually outlasts it. A section
-    nobody read for two TTLs holds an old value, so its first read waits for
-    fresh data. A zero TTL never takes this shortcut.
+    That read gets the last value at once, labelled ``stale`` and
+    ``refreshing`` with its own ``generated_at``, instead of waiting out the
+    join for a collector that usually outlasts it. This holds however old the
+    value is: the host's orient readers come minutes apart, after every section
+    has expired, and the join returned an empty fallback for every slow
+    section on every such read. A zero TTL never takes this shortcut.
     """
-    last_good = _detached_orient_last_good.get(cache_key)
-    return ttl > 0 and last_good is not None and _orient_clock() - last_good[2] < ttl * 2
+    return ttl > 0 and cache_key in _detached_orient_last_good
 
 
 async def _cached_detached_orient_section(
@@ -932,7 +932,7 @@ async def _cached_detached_orient_section(
     On a miss, one detached worker runs the collector. This request waits
     up to ``DETACHED_ORIENT_INLINE_WAIT_S`` only if *this* call started
     that worker (so cheap test doubles still populate the same response),
-    except a refresh that has only just come due (``_due_for_stale_serve``),
+    except a section that has a last value (``_serves_last_good_at_once``),
     which serves last-good at once. A ``fresh`` request never takes that
     shortcut, and it too waits only for a worker it started: a worker started
     before its invalidation may hold older data, which must not read as current.
@@ -959,7 +959,7 @@ async def _cached_detached_orient_section(
 
     started = _schedule_detached_orient_refresh(key, compute, cache_key, ttl=ttl)
     thread = _detached_orient_threads.get(cache_key)
-    if started and thread is not None and thread.is_alive() and (fresh or not _due_for_stale_serve(cache_key, ttl)):
+    if started and thread is not None and thread.is_alive() and (fresh or not _serves_last_good_at_once(cache_key, ttl)):
         await _await_thread(thread, DETACHED_ORIENT_INLINE_WAIT_S)
 
     # One snapshot under the lock the worker publishes under: the value, its
@@ -981,9 +981,10 @@ async def _cached_detached_orient_section(
         }
 
     # Product sections may use their own TTL (including zero). Last-good is a
-    # bounded stale fallback, never another freshness window.
-    if last_good is not None and _orient_clock() - last_good[2] < max(120.0, ttl * 2):
-        value, generated_at, _stored_at = last_good
+    # stale fallback, never another freshness window: it keeps its own
+    # ``generated_at`` and is labelled ``stale`` while its refresh runs or fails.
+    if last_good is not None:
+        value, generated_at = last_good
         meta: dict[str, Any] = {
             "generated_at": generated_at,
             "stale_after_s": ttl,
@@ -1466,14 +1467,20 @@ async def _cached_orient_section(
     """
     if key == "idle_prs":
         return _cached_idle_pr_section(collector, fallback, ctx=ctx)  # type: ignore[arg-type]
-    if background or key in DETACHED_ORIENT_SECTION_KEYS:
-        return await _cached_detached_orient_section(
-            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
-        )  # type: ignore[arg-type]
-
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
     cache_key = f"orient_{key}{_ctx_cache_scope(ctx)}"
+    # An inline section that already has a value is served like a detached
+    # one: its last value at once while one worker refreshes it. Only its first
+    # read, and a ``fresh`` read, collect on the request path.
+    if (
+        background
+        or key in DETACHED_ORIENT_SECTION_KEYS
+        or (not fresh and _serves_last_good_at_once(cache_key, ttl))
+    ):
+        return await _cached_detached_orient_section(
+            key, collector, fallback, ctx=ctx, ttl=ttl, source=source, is_async=is_async, fresh=fresh,
+        )  # type: ignore[arg-type]
 
     # ttl == 0 means "don't cache at the orient layer". Skip both the
     # cache read AND the cache write paths so callers never see stale
@@ -1529,7 +1536,10 @@ async def _cached_orient_section(
         return fallback, meta
 
     if ttl > 0:
-        cache_set(cache_key, (value, generated_at))
+        with _detached_orient_lock:
+            cache_set(cache_key, (value, generated_at))
+            _detached_orient_last_good[cache_key] = (value, generated_at)
+            _detached_orient_last_error.pop(cache_key, None)
     return value, meta
 
 
