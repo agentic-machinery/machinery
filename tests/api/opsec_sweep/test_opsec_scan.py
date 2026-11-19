@@ -156,6 +156,7 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("file:///tmp,backup/fixture.conf", "file:///tmp,backup/fixture.conf"),
         ("file:///tmp.#anchor", "file:///tmp.#anchor"),
         ("/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/x", "file:/tmp.backup/x"),
+        ("/api/fixture?source=/tmp.backup/fixture.conf", "/tmp.backup/fixture.conf"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
@@ -184,6 +185,8 @@ def test_planted_canary_never_hides_a_file_uri_finding() -> None:
         "file://tmp/etc/fixture.conf",
         "profile://fixture-host/home/fixture-user/input",
         "`file://fixture-host`+`docs/home/guide.md`",
+        "/api/fixture/{account}/home/view",
+        "../api/../home/guide.md",
     ],
 )
 def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
