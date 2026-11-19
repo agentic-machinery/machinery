@@ -12,7 +12,8 @@ model outside the lane's credit-period allowlist whenever the plan window is at
 or below the threshold AND a fresh positive credit balance exists
 (:func:`allowlist_applies`: ``credit_balance_present``, ``credit_use_unconfirmed``
 and ``credits_unverified`` for unreadable usage records all qualify), and under
-``policy_error``, whether or not the router currently recommends the lane;
+``policy_error``, whether or not the router currently recommends the lane. It also
+refuses an off-allowlist model when the routing-budget snapshot cannot be read.
 :func:`reset_advice` says whether a free full reset is worth using now. The policy lives in
 ``scripts/config/credit_lanes.yaml``. Everything here reads snapshots only:
 nothing consumes credits or resets.
@@ -33,15 +34,16 @@ retirement, transport, wave configuration). Missing data stays ``unknown``.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,7 @@ from lu_machinery.common import json_depth
 SCHEMA_VERSION = "credit-lanes.v1"
 POLICY_PATH = Path(__file__).resolve().parents[1] / "config" / "credit_lanes.yaml"
 REFUSAL_CODE = "CREDIT_PERIOD_MODEL_REFUSED"
+_MAX_WARMING_RETRY_DELAY_S = 2  # Monitor's routing-budget warming response advertises 2 seconds.
 
 # Hard-wired minimal policy for a policy file that cannot be read: only these
 # lanes stay restricted, to these models. A test pins it to the shipped yaml.
@@ -1346,14 +1349,37 @@ def routing_facts(
 
 
 def read_routing_budget(*, timeout: float = 8.0) -> dict[str, Any] | None:
-    """Fresh Monitor routing-budget snapshot, or None when it cannot be read."""
+    """Read Monitor's routing budget, retrying its typed warming response once within the read budget."""
     base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
+    url = f"{base}/api/state/routing-budget?fresh_codexbar=true"
+    deadline = time.monotonic() + timeout
     try:
-        with urllib.request.urlopen(f"{base}/api/state/routing-budget?fresh_codexbar=true", timeout=timeout) as resp:
-            payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
-    except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError, ValueError):
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                with urllib.request.urlopen(url, timeout=remaining) as resp:
+                    payload = json_depth.loads(resp.read().decode("utf-8"), max_depth=512)
+                return payload if isinstance(payload, dict) else None
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    if attempt or exc.code != 503 or exc.headers is None:
+                        return None
+                    retry_after = exc.headers.get("Retry-After", "").strip()
+                    if not retry_after.isascii() or not retry_after.isdecimal():
+                        return None
+                    delay = int(retry_after)
+                    if delay > _MAX_WARMING_RETRY_DELAY_S:
+                        return None
+                    if json_depth.loads(exc.read(1024), max_depth=8) != {"detail": "routing budget warming"}:
+                        return None
+                if delay >= deadline - time.monotonic():
+                    return None
+                time.sleep(delay)
+    except (OSError, HTTPException, ValueError, RecursionError):
         return None
-    return payload if isinstance(payload, dict) else None
+    return None
 
 
 def _policy_error_refusal(lane: str, model: str | None, error: str) -> str | None:
@@ -1374,13 +1400,11 @@ def _policy_error_refusal(lane: str, model: str | None, error: str) -> str | Non
 
 
 def dispatch_refusal(lane: str, model: str | None, *, policy: CreditPolicy | None = None) -> str | None:
-    """Refusal text when the credit-period allowlist applies to ``lane`` and ``model`` is off it, else None.
+    """Check an off-allowlist model against the credit policy and the routing-budget snapshot.
 
     ``model`` is the model the dispatch launches (the caller resolves the
     lane default first). The snapshot is read only for an off-allowlist model
-    on a configured lane; an unreadable snapshot gives no evidence of a credit
-    balance, so admission is unchanged from before the credit policy. The
-    allowlist does not depend on the router recommending the lane. An
+    on a configured lane. An unreadable snapshot prevents admission. An
     unreadable policy restricts only :data:`DEFAULT_ALLOWED_MODELS` lanes.
     """
     lane_key = lane.strip().lower()
@@ -1391,17 +1415,21 @@ def dispatch_refusal(lane: str, model: str | None, *, policy: CreditPolicy | Non
             return _policy_error_refusal(lane_key, model, str(exc))
     if model_allowed(policy, lane_key, model):
         return None
-    raw = read_routing_budget()
-    if raw is None:
-        return None
     from lu_machinery.fleet.claude_account_lane import bind_snapshot, no_claude_account, other_lane_record
 
+    raw = read_routing_budget()
     # A credit lane is one no Claude account owns: the snapshot is bound to no account where it
     # enters, and the claude lane is never read without its account (#10630, #10770).
-    budget = bind_snapshot(raw, account=no_claude_account())
-    record = other_lane_record(budget, lane_key)
-    diagnostics = budget.get("diagnostics") if isinstance(budget.get("diagnostics"), dict) else {}
-    state = lane_credit_state(lane_key, record or None, policy, snapshot_stale=bool(diagnostics.get("stale")))
-    if not allowlist_applies(state):
-        return None
-    return refusal_text(lane_key, model, state, policy)
+    if raw is not None:
+        budget = bind_snapshot(raw, account=no_claude_account())
+        record = other_lane_record(budget, lane_key)
+        freshness, _ = snapshot_freshness(budget.get("diagnostics"))
+        if isinstance(record.get("status"), str) and freshness != UNKNOWN:
+            state = lane_credit_state(lane_key, dict(record), policy, snapshot_stale=freshness == STALE)
+            return refusal_text(lane_key, model, state, policy) if allowlist_applies(state) else None
+    return (
+        f"{REFUSAL_CODE}: lane {lane_key} is routing_snapshot_unavailable "
+        "(Monitor routing-budget snapshot unreadable for this lane). "
+        f"Dispatch an allowlisted model [{', '.join(policy.lane_models(lane_key) or ())}] "
+        "or retry when Monitor can serve the routing-budget snapshot."
+    )

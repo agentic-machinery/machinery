@@ -4124,18 +4124,8 @@
     },
     {
       "path": "lu_machinery/fleet/credit_lane.py",
-      "code": "arg-type",
-      "message": "Argument 2 to \"lane_credit_state\" has incompatible type \"Mapping[str, Any] | None\"; expected \"None | dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/fleet/credit_lane.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/fleet/credit_lane.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
       "path": "lu_machinery/fleet/credit_lane.py",
