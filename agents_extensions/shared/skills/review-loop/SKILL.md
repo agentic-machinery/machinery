@@ -126,6 +126,24 @@ interpreter does not select the primary checkout's Python modules.
    cannot take a schema gets one format correction in the same task before it settles; the
    correction cannot change the verdict, the findings, or their meaning. A Ukrainian review
    does not bind that schema. Stdout is two lines: the task id, then the run nonce. Record both.
+
+   **Supplemental trials.** On the first code or infra review head, offer both
+   [Neon](../../rules/model-assignment.md#gemini-4-neon-advisory-routing) and
+   [Savant](../../rules/model-assignment.md#subq-savant-test-routing) a parallel read-only review.
+   Use `--research-role advisory` and `--pinned-head "$HEAD_SHA"`. Put the PR number in the
+   prompt. Omit `--pr` and formal review flags so the dispatch stays supplemental. For Savant,
+   classify the prompt, inline the exact-head diff and relevant evidence, and ask for the
+   same canonical findings JSON as the reviewer of record. Savant cannot open the checkout
+   or the schema file, so include the schema from the merge-base in the prompt. Do not send
+   secrets or unknown-class inputs. Record an unavailable seat as such.
+
+   Check the reported findings against the pinned head and compare confirmed and missed
+   defects with the review of record. Record each trial's model, effort,
+   verdict, [score](../drive-epic/references/decision-report.md#council-optional-independent-panel)
+   and finding dispositions in the PR body. The settled task supplies the verdict and finding
+   counts to model stats, which joins it to the PR by exact head. The trial score and verdict
+   carry no landing authority. Fix any independently confirmed blocker through the review loop.
+
 4. **Wait on that task and nonce.** Never re-dispatch.
 
    ```bash

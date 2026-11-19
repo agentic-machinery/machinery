@@ -395,8 +395,9 @@ Code-profile `closeout_cli resolve-reviewer` requires a resolved target or an ow
   * **Top advisors**: Opus 5.5 / Sol 6.2 for advice, critiques and design input; they hold
     designated approval by agreeing; when one authored the proposal, the other's approval
     completes it, and any other author needs both (#9583, #9616).
-  * **Other advisors**: Gemini 4 Neon provides supplemental review and hard-problem advice
-    under [Gemini 4 Neon advisory routing](#gemini-4-neon-advisory-routing). Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 3.8 Flash is not an advisor for
+  * **Other advisors**: Gemini 4 Neon and SubQ Savant provide supplemental review and
+    hard-problem advice under their [Neon](#gemini-4-neon-advisory-routing) and
+    [Savant](#subq-savant-test-routing) routing rules. Grok 4.7 codes and reviews code/infra (C-5307) and is not an advisor. Gemini 3.8 Flash is not an advisor for
     planning or design (operator decision 2026-10-03, #9584); its task-level uses stay as listed in the routing tables. (Kimi is retired, OO-58.)
   * Legacy Terra review qualification does not authorize GPT-6.1 Terra review
     or advisory work; its current admission is routine coding only.
@@ -1045,24 +1046,35 @@ reported by AGY in the settled dispatch. Compare review outcomes by selector.
 
 ### SubQ Savant test routing
 
-Use the pinned `subq-savant-1.4` model through native OpenCode for classified data
-trials. This includes supplemental review, hard-problem advice,
-proposed patches and the independent round of non-Ukrainian councils. Savant's
-findings are advisory and carry no formal review, Ukrainian authoring or review,
-or designated approval authority.
+Use `subq-savant-1.4` through native OpenCode as a trial alongside Neon for
+supplemental PR review, hard-problem advice and the independent round of
+non-Ukrainian councils. Keep the existing reviewer of record and designated
+approval seats. For public coding jobs, give Savant the relevant source and
+acceptance criteria and ask for a proposed patch. The authorized worker applies
+and tests it because workspace-write OpenCode runs outside the OS boundary.
+
+For Ukrainian checks, gather the relevant VESUM and facet-specific Sources
+results before dispatch. Include those results and their source identifiers in
+the classified prompt. Ask Savant to check the text against the supplied
+evidence and flag unsupported judgments as unresolved. Skip the trial when
+required Sources evidence is unavailable. A qualified Sources-enabled seat
+verifies any proposed correction and owns authoring and formal review.
 
 Pass `--agent opencode --provider subq --model subq-savant-1.4 --mode read-only`,
-with `--data-class public-code`, `public-docs`, `private-code`, or `private-docs`. Use `--research-role
-advisory` for counsel and supplemental review and `--research-role test` for
-trials. Put the question and its evidence in the prompt. Treat unreleased
+with `--data-class public-code`, `public-docs`, `private-code`, or `private-docs`.
+Use `--research-role advisory` for counsel and supplemental review and
+`--research-role test` for proposed patches and Ukrainian checks. Put the
+question and its evidence in the prompt. Treat unreleased
 curriculum and private infrastructure as private material. The model receives
 the prompt with its tools disabled. A private repository requires a private
 data class. Dispatch refuses secrets, credentials, and unknown or undeclared
 classes.
 
-Use a stable `--task-id`. Dispatch assigns `low`, `high` or `max` by SHA-256 of
-that ID modulo three and records the effective effort for model stats. Compare
-results by effort on held-out real jobs. The Chat Completions route sends
+Use a stable `--task-id`. Dispatch defaults to `high`. Use `--effort max` only
+when the brief explains why the job needs it. Settled dispatches contribute
+the exact model ID, effective effort and outcome to model stats. Check the
+trial's findings or patch against held-out real-job evidence and compare
+results by effort. The Chat Completions route sends
 `store: false` for private requests and uses the provider's default storage
 for public requests. The generation cap defaults to 64,000 tokens, including
 reasoning. Set `--max-tokens` when a trial needs a different cap.
