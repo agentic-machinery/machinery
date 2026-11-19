@@ -229,7 +229,7 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         if reviewed and (refusal := activity_role_refusal(role_model, REVIEW_ACTIVITY, catalog)):
             raise ValueError(refusal)
         if identity == SAVANT_MODEL or options.get("provider") == SAVANT_PROVIDER:
-            _check_savant_route(agent, model, identity, options)
+            _check_savant_route(agent, model, identity, mode, options)
         elif any(options.get(field) is not None for field in ("data_class", "max_tokens")):
             raise ValueError("--data-class and --max-tokens apply only to the Savant test route")
         return
@@ -251,8 +251,12 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         raise ValueError("Temporary reviewer exception requires a fresh, branch-pinned red-team code review, with no other role (#10437)")
 
 
-def _check_savant_route(agent: str, model: str, identity: str | None, options: dict) -> None:
-    """Savant is admitted only on its explicit, classified trial route."""
+def _check_savant_route(agent: str, model: str, identity: str | None, mode: str, options: dict) -> None:
+    """Savant is admitted only on its explicit, classified routes.
+
+    Read-only: advisory or test. Workspace-write (#898): implementation only, with a public data class and owned
+    paths; ``check_private_input`` refuses a private repository for a public class.
+    """
     if identity != SAVANT_MODEL:
         raise ValueError(f"savant_model_refused: the SubQ endpoint requires {SAVANT_MODEL}")
     try:
@@ -262,8 +266,21 @@ def _check_savant_route(agent: str, model: str, identity: str | None, options: d
         )
     except RoutingGuardError as exc:
         raise ValueError(str(exc)) from None
-    if options.get("research_role") not in {"advisory", "test"} or options.get("advisory_role"):
-        raise ValueError("savant_role_refused: use --research-role advisory or test")
+    if options.get("advisory_role"):
+        raise ValueError("savant_role_refused: Savant records no advisory decision")
+    if mode != "workspace-write":
+        if options.get("research_role") not in {"advisory", "test"}:
+            raise ValueError("savant_role_refused: use --research-role advisory or test, or --mode workspace-write "
+                             "with --research-role implementation")
+        return
+    from lu_machinery.dispatcher.providers.opencode import savant_tools
+
+    if options.get("research_role") != "implementation":
+        raise ValueError("savant_role_refused: a write run needs --research-role implementation")
+    if not savant_tools(options.get("data_class")):
+        raise ValueError("savant_write_refused: a write run needs --data-class public-code or public-docs")
+    if options.get("owned_path") in (None, [], "[]"):
+        raise ValueError("savant_write_refused: a write run needs --owned-path")
 
 
 def advisory_binding(args, prompt: bytes) -> tuple[dict, str, str]:
