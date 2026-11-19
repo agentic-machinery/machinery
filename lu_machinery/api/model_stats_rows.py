@@ -17,6 +17,8 @@ paths.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -407,12 +409,11 @@ def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str,
         fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return _unparsed("missing_result"), "pruned"
-    except OSError:  # a symlink, socket or directory in the sidecar's place is not a result file
-        try:
-            regular = stat.S_ISREG(os.lstat(sidecar).st_mode)
-        except OSError:
-            regular = True
-        return _unparsed("missing_result"), "unreadable" if regular else "rejected"
+    except OSError as exc:  # a symlink, socket or directory in the sidecar's place is not a result file
+        refused = exc.errno in (errno.ELOOP, errno.ENXIO)
+        with contextlib.suppress(OSError):
+            refused = refused or not stat.S_ISREG(os.lstat(sidecar).st_mode)
+        return _unparsed("missing_result"), "rejected" if refused else "unreadable"
     allow_sample = _record_allows_sample(record)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
