@@ -420,16 +420,14 @@ ORIENT_REFRESH_INTERVAL_S = 10.0
 _orient_clock: Callable[[], float] = time.monotonic
 _detached_orient_lock = threading.Lock()
 _detached_orient_threads: dict[str, threading.Thread] = {}
+# Each section's single ``fresh=true`` collection; it never waits on the background one.
+_fresh_orient_threads: dict[str, threading.Thread] = {}
 # Each section's one stored value: ``(value, generated_at, stamp)``. ``stamp`` is
 # ``_orient_clock()`` read with ``generated_at`` as its collection began. A
 # collection replaces the stored value only if its stamp is newer, so the stored
-# value never goes backwards.
+# value never goes backwards. The last error keeps its stamp the same way.
 _orient_values: dict[str, tuple[Any, str, float]] = {}
-_detached_orient_last_error: dict[str, str] = {}
-# ``fresh=true`` collections run here, bounded by the section's wait; one that
-# outlives the wait still publishes. Cheap orient collections stay clear of
-# unrelated ``asyncio.to_thread()`` backlog elsewhere in the process.
-_ORIENT_SYNC_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="orient-sync")
+_detached_orient_last_error: dict[str, tuple[str, float]] = {}
 # Section cache keys whose refresh worker has not yet published. The worker
 # publishes its value and leaves this set in one critical section, so a reader's
 # snapshot never pairs a new value with "still refreshing" or an old one with "done".
@@ -828,11 +826,12 @@ def _cached_idle_pr_section(
 def reset_detached_orient_state_for_tests() -> None:
     """Drop stored orient values so tests do not leak across cases."""
     with _detached_orient_lock:
-        threads = list(_detached_orient_threads.values())
+        threads = [*_detached_orient_threads.values(), *_fresh_orient_threads.values()]
     for thread in threads:
         thread.join(timeout=2.0)
     with _detached_orient_lock:
         _detached_orient_threads.clear()
+        _fresh_orient_threads.clear()
     _orient_values.clear()
     _detached_orient_last_error.clear()
     _detached_orient_pending.clear()
@@ -842,15 +841,15 @@ def reset_detached_orient_state_for_tests() -> None:
 
 def _collect_orient_section(
     collector: Callable[[], Any], cache_key: str, collect_slot: bool, *, background: bool = False,
-) -> tuple[float, str, Any, str | None]:
+) -> None:
     """Collect one section and publish it by compare-and-set on when the collection began.
 
-    Returns ``(stamp, generated_at, value, error)``. The result replaces the
-    stored value (or records its error) only if no newer collection published
-    first, so the stored value never goes backwards. It never raises: a
-    collector that raises anything, ``SystemExit`` included, records that error.
-    ``collect_slot`` False keeps a cheap section off the shared collect slots,
-    so a hung slow collector never queues it.
+    A value replaces the stored value only if its stamp is newer, so the stored
+    value never goes backwards; it clears an older error. An error is recorded
+    only if it is newer than both the stored value and the last error. It never
+    raises: a collector that raises anything, ``SystemExit`` included, records
+    that error. ``collect_slot`` False keeps a cheap section off the shared
+    collect slots, so a hung slow collector never queues it.
     """
     stamp, generated_at, value, error = _orient_clock(), _isoformat_z(datetime.now(UTC)), None, None
     try:
@@ -858,37 +857,47 @@ def _collect_orient_section(
             stamp, generated_at = _orient_clock(), _isoformat_z(datetime.now(UTC))
             value = collector()
     except BaseException as exc:  # a worker thread would otherwise end without recording an error
-        error = str(exc) or type(exc).__name__
+        try:
+            error = str(exc) or type(exc).__name__
+        except BaseException:  # an exception whose text itself raises
+            error = type(exc).__name__
     with _detached_orient_lock:
         stored = _orient_values.get(cache_key)
-        if stored is None or stamp > stored[2]:
-            if error is None:
-                _orient_values[cache_key] = (value, generated_at, stamp)
+        last_error = _detached_orient_last_error.get(cache_key)
+        newer_than_value = stored is None or stamp > stored[2]
+        newer_than_error = last_error is None or stamp > last_error[1]
+        if error is None and newer_than_value:
+            _orient_values[cache_key] = (value, generated_at, stamp)
+            if newer_than_error:
                 _detached_orient_last_error.pop(cache_key, None)
-            else:
-                _detached_orient_last_error[cache_key] = error
+        elif error is not None and newer_than_value and newer_than_error:
+            _detached_orient_last_error[cache_key] = (error, stamp)
         if background:
             _detached_orient_pending.discard(cache_key)
-    return stamp, generated_at, value, error
 
 
 def _schedule_detached_orient_refresh(
-    key: str, collector: Callable[[], Any], cache_key: str, *, collect_slot: bool = True,
+    key: str, collector: Callable[[], Any], cache_key: str, *, collect_slot: bool = True, fresh: bool = False,
 ) -> threading.Thread:
-    """Start the section's background refresh unless one is running; return the running one."""
+    """Start the section's background (or ``fresh``) collection unless one is running; return the running one.
+
+    Each kind is single-flight per section, so a section has at most one of each.
+    """
+    threads = _fresh_orient_threads if fresh else _detached_orient_threads
     with _detached_orient_lock:
-        thread = _detached_orient_threads.get(cache_key)
+        thread = threads.get(cache_key)
         if thread is not None and thread.is_alive():
             return thread
         worker = threading.Thread(
             target=_collect_orient_section,
             args=(collector, cache_key, collect_slot),
-            kwargs={"background": True},
+            kwargs={"background": not fresh},
             daemon=True,
-            name=f"orient-{key}-refresh",
+            name=f"orient-{key}-{'fresh' if fresh else 'refresh'}",
         )
-        _detached_orient_threads[cache_key] = worker
-        _detached_orient_pending.add(cache_key)
+        threads[cache_key] = worker
+        if not fresh:
+            _detached_orient_pending.add(cache_key)
         worker.start()
         return worker
 
@@ -927,12 +936,13 @@ async def _cached_detached_orient_section(
     A stored value younger than the TTL is a ``hit``. An older one, whatever
     its age and TTL (zero included), is served at once, labelled ``stale`` with
     its own ``generated_at``, while one background refresh runs. With no stored
-    value the read waits up to ``wait_s`` for that refresh. ``fresh`` collects
-    for this request, bounded by ``wait_s``. Every collection
-    publishes the same way (``_collect_orient_section``), and nothing cancels
-    another. A value is current when it is younger than the TTL or its
-    collection began during this read. A hung collector never pins the gather;
-    the read then gets the stored value or the fallback with ``meta.error``.
+    value the read waits up to ``wait_s`` for that refresh. ``fresh`` starts
+    (or joins) the section's one fresh collection and waits up to ``wait_s``.
+    Every collection publishes the same way (``_collect_orient_section``), and
+    nothing cancels another. A value is current when it is younger than the TTL
+    or its collection began during this read. A hung collector never pins the
+    gather; the read then gets the stored value or the fallback with
+    ``meta.error``.
     """
     ttl = ORIENT_SECTION_TTLS.get(key, 60.0) if ttl is None else ttl
     source = ORIENT_SECTION_SOURCES.get(key, "fs") if source is None else source
@@ -946,19 +956,10 @@ async def _cached_detached_orient_section(
     read_started = _orient_clock()
     failure: str | None = None
     if fresh:
-        try:
-            _stamp, generated_at, value, failure = await asyncio.wait_for(
-                asyncio.get_running_loop().run_in_executor(
-                    _ORIENT_SYNC_EXECUTOR, _collect_orient_section, compute, cache_key, collect_slot,
-                ),
-                timeout=wait_s,
-            )
-        except TimeoutError:
+        worker = _schedule_detached_orient_refresh(key, compute, cache_key, collect_slot=collect_slot, fresh=True)
+        await _await_thread(worker, wait_s)
+        if worker.is_alive():
             failure = f"section_timeout_{wait_s}s"
-        if failure is None:
-            with _detached_orient_lock:
-                refreshing = cache_key in _detached_orient_pending
-            return value, {**meta, "generated_at": generated_at, "stale": False, "refreshing": refreshing}
     else:
         with _detached_orient_lock:
             stored = _orient_values.get(cache_key)
@@ -970,7 +971,8 @@ async def _cached_detached_orient_section(
 
     with _detached_orient_lock:
         stored = _orient_values.get(cache_key)
-        error = failure or _detached_orient_last_error.get(cache_key)
+        last_error = _detached_orient_last_error.get(cache_key)
+        error = failure or (last_error[0] if last_error is not None else None)
         refreshing = cache_key in _detached_orient_pending
     if stored is not None:
         value, generated_at, stamp = stored
