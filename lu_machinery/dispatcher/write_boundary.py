@@ -98,10 +98,13 @@ _MAX_PROBES_PER_DIRECTORY = 128
 _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_GITHUB_SLUG", "LEARN_UKRAINIAN_STATE_ROOT",
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
-    "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "GH_CONFIG_DIR",
-    "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
-
+    "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+    "XDG_CACHE_HOME", "XDG_DATA_HOME", "GH_CONFIG_DIR", "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
 })
+# A provider may point these at its own private, empty roots (the Savant route does). The launcher's host steps
+# (gh, its credential and toolchain lookups) always take the dispatcher's values, an empty value meaning unset;
+# the provider keeps its own.
+_HOST_ROOTS = frozenset({"XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"})
 
 # Native read-only reviewers use the host's login for named GitHub reads only.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
@@ -320,11 +323,11 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
         argv += ["--runtime", str(dispatch_lease(spec.task_id))]
-    host = {name: os.environ[name] for name in _HOST_CONTEXT if os.environ.get(name) and name not in invocation.env}
-    # The launcher's own GitHub reads (the published address ranges, the github-read relay) use the dispatcher's
-    # gh login. The launcher starts with the provider's environment, and a provider may point XDG_CONFIG_HOME at
-    # a private, empty root (the Savant route does), where gh would read anonymously. No GH_* variable reaches
-    # the provider, so pinning this one changes nothing inside.
+    host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
+            if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
+    # The launcher starts with the provider's environment. Its own GitHub reads (the published address ranges, the
+    # github-read relay) use the dispatcher's gh login, never gh under a provider's private config root, where it
+    # reads anonymously and the client refuses it below the landing reserve. No GH_* variable reaches the provider.
     host["GH_CONFIG_DIR"] = os.environ.get("GH_CONFIG_DIR") or str(
         Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gh")
     for name in sorted(host):
@@ -1288,9 +1291,9 @@ class _Boundary:
                  interpreter, "-I", str(boundary / "forwarder.py"), str(boundary / "egress.sock"), *command]
         self.receipt["bwrap"] = str(bwrap)
         self.receipt["argv_sha256"] = __import__("hashlib").sha256(json.dumps(argv).encode()).hexdigest()
-        env = {key: value for key, value in os.environ.items()
+        env = {key: value for key, value in self.args.provider_env.items()
                if key not in {"SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "TMUX", "TMUX_PANE"}
-               and key not in self.args.host_only and not _github_credential_variable(key)}
+               and not _github_credential_variable(key)}
         (tmp / "scratch").mkdir(mode=0o700)
         (tmp / "run").mkdir(mode=0o700)
         # The namespace has no DNS or route out; Node's own fetch uses the forwarder's proxy only when told to.
@@ -1721,15 +1724,18 @@ def main(argv: list[str]) -> int:
         receipt["reason"] = "unsafe task id"
         _write_receipt(Path(args.receipt), receipt)
         return REFUSED
-    args.host_only = set()
+    args.provider_env = dict(os.environ)  # the provider's own environment, before the host context is applied
     for item in args.host_env:
         name, equals, value = item.partition("=")
         if name not in _HOST_CONTEXT or not equals or "\0" in value:
             receipt["reason"] = f"--host-env names an unknown variable: {name[:40]}"
             _write_receipt(Path(args.receipt), receipt)
             return REFUSED
-        os.environ[name] = value  # the launcher's own host steps read it; the provider never sees it
-        args.host_only.add(name)
+        # The launcher's own host steps read it; the provider keeps its own environment.
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
     boundary = None
 
     def cancelled(_signum, _frame):

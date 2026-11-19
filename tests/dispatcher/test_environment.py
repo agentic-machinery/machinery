@@ -78,6 +78,16 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
             read_only = argv[:argv.index("--")]
             assert (read_only[read_only.index("--sources-mcp") + 1] if "--sources-mcp" in read_only else None) == (
                 "cursor" if agent == "cursor" else None)
+            # Defect class: the launcher's host GitHub reads inherit a provider's private config root (the Savant
+            # route's), so gh reads anonymously and the boundary refuses. They keep the dispatcher's login.
+            monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+            monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+            monkeypatch.setenv("HOME", str(tmp_path / "host-home"))
+            private = {**child, "XDG_CONFIG_HOME": str(tmp_path / "private")}
+            host = write_boundary.launcher(spec, Invocation(["/bin/sh"], None, private, None), tmp_path / "task.json")
+            host = host[:host.index("--")]
+            assert f"GH_CONFIG_DIR={tmp_path / 'host-home' / '.config' / 'gh'}" in host
+            assert "XDG_CONFIG_HOME=" in host
 
     # A missing anchor stays missing; worker Git metadata must never fill it in.
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
