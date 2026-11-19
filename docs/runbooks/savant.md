@@ -64,15 +64,19 @@ repository or the worktree.
 Settlement checks the patch's paths against the owned paths again. A Savant write delivers only
 this patch: a run without a draft settles `no_deliverable` (`savant_draft_missing`), whatever
 commits, branches or merged PRs exist elsewhere. Then, at the moment the run's status is final
-and before the record is published, settlement links the unnamed file as `<task-id>.patch` only
-when the run settled `done` and the file holds exactly the size and SHA-256 the receipt names.
+and before the record is published, settlement links the unnamed file as `<task-id>.patch` when
+the run settled `done` and the file holds exactly the size and SHA-256 the receipt names.
 Anything else settles `no_deliverable` (`savant_draft_patch_missing_or_changed`,
-`savant_draft_receipt_malformed`). A refused, cancelled, timed-out, over-ceiling or crashed run,
-and a launcher that writes late or only in part, leave no file at all: the unnamed file vanishes
-with its last descriptor. Every path that publishes a record that is not `done` (including crash
-recovery) removes `<task-id>.patch` first, so it exists only beside a `done` record. The task
-record's `write_boundary.import` holds `patch` (that path, once linked), `patch_sha256`, `bytes`
-and `paths`. An unchanged view settles `no_deliverable` (`savant_draft_missing`).
+`savant_draft_receipt_malformed`). A run that settles any other way never names its unnamed
+file, which vanishes with its last descriptor. The task record's `write_boundary.import` holds
+`patch` (that path, once linked), `patch_sha256`, `bytes` and `paths`. An unchanged view settles
+`no_deliverable` (`savant_draft_missing`).
+
+The deliverable of a Savant write run is its `done` record and that record's `patch_sha256`, not
+the file. A `<task-id>.patch` file is never trusted on its own: one beside a record that is not
+`done` (for example a supervisor that crashed after the link, or a record that could not be
+published as `done`) is not a draft, and a `done` record whose file is missing or does not match
+its digest is not landable. Nothing removes such files yet (hygiene owns their retention).
 
 OpenCode's formatters and language servers are off for every Savant run, so the patch holds only
 the model's own edits and no language server starts or downloads inside the boundary.

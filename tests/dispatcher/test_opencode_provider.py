@@ -480,11 +480,9 @@ def test_savant_draft_patch_is_the_write_runs_deliverable(change, status, cause)
     ("missing", "no_deliverable", "savant_draft_patch_missing_or_changed"),
     ("changed", "no_deliverable", "savant_draft_patch_missing_or_changed"),
     ("failed-run", "failed", None),
-    # A supervisor that died after keeping the patch, before publishing done: crash recovery removes it.
-    ("crashed-after-keep", "crashed", None),
 ])
 def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path):
-    """Defect class (#898, review of #919): a refused run leaves a patch, or a run settles done with its patch
+    """Defect class (#898, review of #919): a refused run names its patch, or a run settles done with its patch
     missing or different from the one its receipt names."""
     task_file = tmp_path / "oc-write.json"
     patch = b"diff --git a/docs/a.md b/docs/a.md\n"
@@ -492,11 +490,9 @@ def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path)
     descriptor = None if case == "missing" else os.open(tmp_path, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
     if descriptor is not None:
         os.write(descriptor, patch + (b"tampered\n" if case == "changed" else b""))
-    if case == "crashed-after-keep":
-        write_boundary.draft_patch(task_file).write_bytes(patch)
     record = {
         "task_id": "oc-write", "agent": "opencode", "provider": "subq", "mode": "workspace-write",
-        "status": {"failed-run": "failed", "crashed-after-keep": "crashed"}.get(case, "done"),
+        "status": "failed" if case == "failed-run" else "done",
         "write_boundary": {"import": {"status": "drafted", "paths": ["docs/a.md"], "bytes": len(patch),
                                       "patch_sha256": hashlib.sha256(patch).hexdigest()}},
     }

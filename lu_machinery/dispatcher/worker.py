@@ -281,7 +281,6 @@ def _observe(record: dict) -> dict:
             return current
         record.update(status="crashed", finished_at=store.now(), error="supervisor exited without a result")
         _discard_read_only_scratch(record)  # a killed supervisor never reached its own cleanup
-        _drop_savant_patch(record, store.record_path(record["task_id"]))  # nor its patch's, before publication
         record["duration_s"] = (
             datetime.fromisoformat(record["finished_at"]) - datetime.fromisoformat(record["started_at"])
         ).total_seconds()
@@ -639,26 +638,19 @@ def _savant_write(record: dict) -> bool:
                                                                                      "workspace-write"))
 
 
-def _drop_savant_patch(record: dict, task_file: Path) -> None:
-    """Remove a Savant write run's named patch; called before any record that is not ``done`` is published."""
-    if _savant_write(record):
-        with contextlib.suppress(OSError):
-            write_boundary.draft_patch(task_file).unlink(missing_ok=True)
-
-
 def _settle_savant_patch(record: dict, task_file: Path, descriptor: int | None) -> None:
-    """Name a Savant write run's patch ``<task>.patch`` only when it settles ``done`` (``_keep_savant_patch``).
+    """Name a Savant write run's patch ``<task>.patch`` when it settles ``done`` (``_keep_savant_patch``).
 
-    Called at the supervisor's publication cutoff, once the status is final and before it is published. Any
-    other outcome removes the name, so it exists only beside a ``done`` record (crash and republication paths
-    call ``_drop_savant_patch`` before they publish).
+    Called at the supervisor's publication cutoff, once the status is final and before it is published. The
+    deliverable is the ``done`` record's ``write_boundary.import.patch_sha256``: a landing worker applies a patch
+    file only after checking it against that digest (docs/runbooks/savant.md). A ``<task>.patch`` beside any other
+    record is never trusted, and a ``done`` record without its file is never landable, so no other path names or
+    removes it.
     """
     if not _savant_write(record):
         return
     if record["status"] == "done" and (cause := _keep_savant_patch(record, task_file, descriptor)):
         record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
-    if record["status"] != "done":
-        _drop_savant_patch(record, task_file)
 
 
 def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) -> str | None:
@@ -666,7 +658,9 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
 
     The launcher wrote the patch into ``descriptor``, an ``O_TMPFILE`` the supervisor opened. It must still be
     unnamed and hold exactly the size and SHA-256 the receipt names. That very file is linked, never replacing an
-    existing path, so a crash, a late or a partial write leaves nothing to find.
+    existing path. The link names the task directory by descriptor and the file by its basename, so CPython
+    calls ``linkat`` with ``AT_SYMLINK_FOLLOW`` on every supported version (a bare ``os.link`` of the
+    ``/proc/self/fd`` path calls ``link`` on 3.12, which does not follow it and fails ``EXDEV``).
     """
     paths = _savant_draft(record)
     if paths is None:
@@ -688,7 +682,11 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
         if read != size or hasher.hexdigest() != digest:
             return "savant_draft_patch_missing_or_changed"
         final = write_boundary.draft_patch(task_file)
-        os.link(f"/proc/self/fd/{descriptor}", final, follow_symlinks=True)
+        directory = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.link(f"/proc/self/fd/{descriptor}", final.name, dst_dir_fd=directory, follow_symlinks=True)
+        finally:
+            os.close(directory)
     except OSError:
         return "savant_draft_patch_missing_or_changed"
     draft["patch"] = str(final)
@@ -1981,14 +1979,17 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                                 draft_fd = os.open(path.parent, os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600)
                             except OSError as exc:
                                 raise ValueError(f"savant_draft_file_unavailable: {type(exc).__name__}") from None
-                        invocation = replace(invocation, argv=write_boundary.launcher(spec, invocation, path,
-                                                                                      draft_fd=draft_fd))
+                        # Only a Savant write run takes the patch descriptor; every other route keeps the
+                        # launcher's three-argument call.
+                        draft = {} if draft_fd is None else {"draft_fd": draft_fd}
+                        invocation = replace(invocation, argv=write_boundary.launcher(spec, invocation, path, **draft))
                     except ValueError as exc:
                         status, error = "failed", str(exc)
                         if child is None:
                             start_refusal = StartRefusal.BOUNDARY
                         return
-                child = subprocess.Popen(
+                # A fixed argv list from the provider's builder (and the boundary launcher), no shell.
+                child = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                     invocation.argv,
                     stdin=stdin,
                     stdout=out,
@@ -2268,7 +2269,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     if cancel_requested and record["status"] != "cancelled":
                         record.pop("no_deliverable_reason", None)
                         record.update(status="cancelled", error="cancelled by client")
-                    # The status is final here: a Savant patch exists only beside a run settled done.
+                    # The status is final here: a Savant write run's patch is named only when it settles done.
                     _settle_savant_patch(record, path, draft_fd)
                     if start_refusal is not None and record["status"] in {"failed", "rate_limited"}:
                         record["never_started_reason"] = start_refusal
@@ -2279,7 +2280,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     try:
                         store.replace(record, path, require_existing=True)
                     except store.TaskRecordError:
-                        _drop_savant_patch(record, path)  # it is published as crashed: no patch stays
                         store.publish_failed_record(record, path)
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
@@ -2288,7 +2288,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 try:
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
-                    _drop_savant_patch(record, path)
                     store.publish_failed_record(record, path)
         finally:
             if draft_fd is not None:
