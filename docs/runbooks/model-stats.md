@@ -175,9 +175,13 @@ it raised (a timeout inside the collect included), answers 503 and the page show
 - **First-round matrix** (`first_round_matrix`): per author, first reviewer and review class of that first
   review (`profile/risk`, and `all`), the PRs and how many the first round approved. See [Author or
   reviewer](#author-or-reviewer).
-- **Author results per risk tier** (`authors[].by_risk`): the same author figures (PRs, first-round approval,
-  P0-P1 and P0-P2 findings per PR with a known count) split by the risk tier of the PR's first review of
-  record (`critical`, `high`, `medium`, `low`, then any other recorded tier; a class with no tier is `other`).
+- **Author results per risk tier** (`authors[].by_risk`): PRs, first-round approval and P0-P1 and P0-P2
+  findings per PR with a known count, from published reviews only (see [Publication ledger](#publication-ledger)):
+  a round is a head with a published review, each review counts by the verdict the recorder published (a P3-only
+  reply published as an approval is an approval), and the tier is the risk of the PR's first published review
+  (`critical`, `high`, `medium`, `low`, then any other recorded tier; a class with no tier is `other`). A PR
+  with no published review is left out and counted in `authors[].by_risk_without_review_of_record`. The author
+  totals above still read the parsed replies, so the tiers need not sum to them.
 - **Reviewer accuracy** (`reviewer_accuracy`): per reviewer model, the outcome of every P0-P1 finding of its
   blocking reviews of record, and the planted-defect recall. See [Reviewer accuracy](#reviewer-accuracy).
 - **Allowance**: the dispatcher records the task's pool (`claude:<subscription label>`, `codex:a|b`, `gemini`,
@@ -310,24 +314,34 @@ in every author figure, a review here must name the PR and the author's model.
 
 `batch_state/model-stats/publications.jsonl` (schema `review-publication.v1`) holds one line per verdict the
 recorder published: task id, repository, PR, head, verdict and GitHub's comment time. Its one writer is
-`lu_machinery/review/record_cf_verdict.py`, under the rows lock: `record` stores the line after it posts the
-verdict or finds it already posted, and reports `publication_marker` (`stored`, or `failed: <reason>; rerun
-record to store it`; a failure never undoes the publication, and the rerun finds the posted comment and stores
-the line). The statistics read the ledger; the Monitor never reads GitHub. A line that does not have the writer's
-shape is skipped and counted in `coverage.publications.malformed_lines`; the last line of a task id wins.
+`lu_machinery/review/record_cf_verdict.py`, under the rows lock. Both of its paths read a posted comment the way
+the verdict reader (`integration_sweep.lookup_verdict`) does (`publication_of`): a `CHANGES_REQUESTED` whose open
+findings are all P3, and that no repair receipt holds back, is an approval; a voided chunk, a second review and a
+marker of a model that cannot supply a review of record store nothing. `record` stores the line after it posts
+the verdict or finds it already posted, and reports `publication_marker`: `stored`, `not stored: <reason>`, or
+`failed: <reason>; store it with: ... import-publications --repository <owner/name> --pr <N>`. A failure never
+undoes the publication, and that one-PR import works even after the PR has moved on or closed.
+
+The statistics read the ledger; the Monitor never reads GitHub. A line that does not have the writer's shape is
+skipped and counted in `coverage.publications.malformed_lines`. Per task, the publication with the latest GitHub
+comment time wins (a later line breaks a tie), so an import never supersedes a newer publication. A row takes its
+entry only when the entry's repository is the row's and its head is the row's; a review dispatched by branch alone
+keeps no PR in its row, and takes the PR the recorder resolved from the entry.
 
 History: verdicts published before the ledger existed are imported once, after the release installs, by the same
 module from the PRs' `cf-verdict` comments. It keeps only the markers the recorder itself would trust (the
-current identity, an owner, member or collaborator association, never edited) and adds what the ledger lacks:
+current identity, an owner, member or collaborator association, never edited, well-formed author fields) and
+adds what the ledger lacks:
 
 ```
 .venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --dry-run
 .venv/bin/python -m lu_machinery.review.record_cf_verdict import-publications --days 30
 ```
 
-It reads each PR of the review rows that finished in the last `--days` days once (about 180 PRs for 30 days).
-Rerunning it is safe; it exits 1 when a PR could not be read. Reviews older than the import stay of unknown
-publication.
+It reads each PR of the review rows that finished in the last `--days` days once. Measured on 2026-11-19 against
+a copy of the store: 1,976 PRs for 30 days in about 15 minutes, 3,303 verdicts. A rate limit stops the reads and
+keeps what was read; rerunning it is safe, and it exits 1 when a PR could not be read or a rate limit stopped it.
+Reviews older than the import stay of unknown publication.
 
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one

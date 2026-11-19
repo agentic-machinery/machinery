@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from functools import cache, partial
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -2980,59 +2980,108 @@ def _post_verdict(repository: str, number: int, comment: str, login: str) -> dic
     return readback
 
 
-def _store_publication(
-    task_root: Path, *, task_id: str, repository: str, number: int, sha: str, verdict: str, comment: Mapping[str, Any],
-) -> str:
-    """Store the local marker of a verdict that is now on the PR (#902); the model statistics count only these.
+def publication_of(repository: str, number: int, comment: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """The publication-ledger entry a posted verdict comment proves, read as the verdict reader reads it (#902).
 
-    The marker goes to the publication ledger beside the task store (``model_stats_rows.record_publications``). A
-    failure never undoes the publication: the result names it, and rerunning ``record``, which finds the posted
-    comment, stores the marker then.
+    Returns (entry, "") or (None, reason). A voided chunk, a second review and a marker of a model that cannot
+    supply a review of record are no review of record. A ``CHANGES_REQUESTED`` body whose open findings are all P3,
+    and that no repair receipt holds back, is an approval, exactly as ``integration_sweep.lookup_verdict`` reads it.
+    The caller decides whether the comment's author is trusted.
     """
     from lu_machinery.api import model_stats_rows
 
+    body = comment.get("body")
+    marker = parse_marker(body) if isinstance(body, str) else None
+    if marker is None:
+        return None, "no intact verdict marker"
+    if marker.get("void"):
+        return None, "voided chunk"
+    if is_second_review(marker) or not reviews_of_record(marker["model"], recorded=True):
+        return None, "not a reviewer of record"
+    verdict = integration_sweep.VERDICT_ALIASES.get(marker["verdict"], marker["verdict"])
+    if (
+        verdict == "CHANGES_REQUESTED"
+        and recorded_p3_residuals(cast(str, body)) is not None
+        and not integration_sweep._repair_receipt_blocks(cast(str, body), marker["sha"])
+    ):
+        verdict = "APPROVED"
     try:
         entry = model_stats_rows.publication(
-            task_id=task_id, repository=repository, pr=number, head=sha, verdict=verdict,
+            task_id=marker["task"], repository=repository, pr=number, head=marker["sha"], verdict=verdict,
             published_at=comment.get("created_at"),
         )
+    except ValueError:
+        return None, "malformed field"
+    return entry, ""
+
+
+def _recovery_command(repository: str, number: int) -> str:
+    return f"{RECORDER_COMMAND} import-publications --repository {repository} --pr {number}"
+
+
+def _store_publication(task_root: Path, *, repository: str, number: int, comment: Mapping[str, Any]) -> str:
+    """Store the local marker of a verdict that is now on the PR (#902); the model statistics count only these.
+
+    The marker goes to the publication ledger beside the task store (``model_stats_rows.record_publications``). A
+    failure never undoes the publication: the result names it and the one-PR import that stores it later.
+    """
+    from lu_machinery.api import model_stats_rows
+
+    entry, reason = publication_of(repository, number, comment)
+    if entry is None:
+        return f"not stored: {reason}"
+    try:
         model_stats_rows.record_publications(task_root.parent, [entry], wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
     except (OSError, ValueError) as exc:
-        return f"failed: {type(exc).__name__}; rerun record to store it"
+        return f"failed: {type(exc).__name__}; store it with: {_recovery_command(repository, number)}"
     return "stored"
+
+
+def _comment_login(item: Mapping[str, Any]) -> str | None:
+    user = item.get("user")
+    login = user.get("login") if isinstance(user, Mapping) else None
+    return login if isinstance(login, str) else None
 
 
 def import_publications(
     *, days: int, dry_run: bool, task_root: Path | None = None, now: datetime | None = None,
-    adapter: GitHubAdapter | None = None,
+    adapter: GitHubAdapter | None = None, only: tuple[str, int] | None = None,
 ) -> dict[str, int]:
-    """One-shot history import (#902): the verdicts published on the PRs of the last ``days`` days of review rows.
+    """One-shot history import (#902): the verdicts published on the PRs of the last ``days`` days of review rows,
+    or on the one PR ``only`` names (repository, number), which also stores a marker a failed ``record`` left out.
 
-    Reads each such PR's comments once and keeps the verdict markers the current identity posted with a trusted
-    association and never edited, as the recorder itself trusts them; a second-review marker is not a review of
-    record. Appends what the ledger lacks (``dry_run``: counts only). Never runs inside the Monitor.
+    Reads each PR's comments once and keeps the verdict markers the current identity posted with a trusted
+    association and never edited, as the recorder itself trusts them, read through ``publication_of``. Appends what
+    the ledger lacks (``dry_run``: counts only); entries read before a rate limit stops the reads are still stored.
+    Never runs inside the Monitor.
     """
     from lu_machinery.api import model_stats_rows
+    from lu_machinery.common.github_client import GitHubRateLimited
     from lu_machinery.common.task_store_paths import tasks_dir
 
     if days < 1:
         raise RecordError("--days must be at least 1")
     batch_state_dir = (task_root or tasks_dir()).parent
-    since = (now or datetime.now(UTC)) - timedelta(days=days)
     counts: dict[str, int] = dict.fromkeys(
-        ("prs", "prs_unreadable", "markers", "markers_untrusted", "markers_skipped", "rows_unregistered_repo"), 0
+        ("prs", "prs_read", "prs_unreadable", "rate_limited", "markers", "markers_untrusted", "markers_skipped",
+         "rows_unregistered_repo"), 0,
     )
-    slugs = {key.casefold(): repo.github for key, repo in load_fleet_repos().items()}
     prs: set[tuple[str, int]] = set()
-    for row in model_stats_rows.read_rows(batch_state_dir)[0]:
-        moment = model_stats_rows.timestamp(row.get("finished_at")) or model_stats_rows.timestamp(row.get("started_at"))
-        if row.get("role") != "review" or not isinstance(row.get("pr"), int) or moment is None or moment < since:
-            continue
-        slug = slugs.get(str(row.get("repo") or "public").casefold())
-        if slug is None:
-            counts["rows_unregistered_repo"] += 1
-        else:
-            prs.add((slug, row["pr"]))
+    if only is not None:
+        prs.add(only)
+    else:
+        since = (now or datetime.now(UTC)) - timedelta(days=days)
+        slugs = {key.casefold(): repo.github for key, repo in load_fleet_repos().items()}
+        for row in model_stats_rows.read_rows(batch_state_dir)[0]:
+            moment = (model_stats_rows.timestamp(row.get("finished_at"))
+                      or model_stats_rows.timestamp(row.get("started_at")))
+            if row.get("role") != "review" or not isinstance(row.get("pr"), int) or moment is None or moment < since:
+                continue
+            slug = slugs.get(str(row.get("repo") or "public").casefold())
+            if slug is None:
+                counts["rows_unregistered_repo"] += 1
+            else:
+                prs.add((slug, row["pr"]))
     counts["prs"] = len(prs)
     adapter = adapter or GitHubAdapter(Path.cwd())
     login = adapter.identity()
@@ -3043,28 +3092,30 @@ def import_publications(
         except SweepError:
             counts["prs_unreadable"] += 1
             continue
+        except GitHubRateLimited:
+            counts["rate_limited"] = 1
+            break
+        counts["prs_read"] += 1
         for item in comments:
             body = item.get("body")
             if not isinstance(body, str) or MARKER_PREFIX not in body:
                 continue
+            association = item.get("author_association")
+            created = item.get("created_at")
             if (
-                item.get("user", {}).get("login") != login
-                or item.get("author_association") not in TRUSTED_ASSOCIATIONS
-                or item.get("created_at") != item.get("updated_at")
+                _comment_login(item) != login
+                or not isinstance(association, str)
+                or association not in TRUSTED_ASSOCIATIONS
+                or not isinstance(created, str)
+                or created != item.get("updated_at")
             ):
                 counts["markers_untrusted"] += 1
                 continue
-            marker = parse_marker(body)
-            try:
-                if marker is None or is_second_review(marker):
-                    raise ValueError("not a verdict of record")
-                verdict = integration_sweep.VERDICT_ALIASES.get(marker["verdict"], marker["verdict"])
-                entries.append(model_stats_rows.publication(
-                    task_id=marker["task"], repository=repository, pr=number, head=marker["sha"], verdict=verdict,
-                    published_at=item["created_at"],
-                ))
-            except (KeyError, ValueError):
+            entry, _ = publication_of(repository, number, item)
+            if entry is None:
                 counts["markers_skipped"] += 1
+            else:
+                entries.append(entry)
     counts["markers"] = len(entries)
     if dry_run:
         present = model_stats_rows.publication_keys(batch_state_dir)
@@ -3077,31 +3128,42 @@ def import_publications(
 def import_publications_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="record_cf_verdict.py import-publications",
-        description="One-shot import of the verdicts already published on PRs into the local publication ledger\n"
-        "(<batch_state>/model-stats/publications.jsonl), so the model statistics can count reviews recorded\n"
-        "before the recorder stored a marker for each verdict it publishes (#902). Reads GitHub; run it by hand\n"
-        "after the release installs, never from the Monitor. Idempotent: an entry already present is not added.",
+        description="Store verdicts already published on PRs in the local publication ledger\n"
+        "(<batch_state>/model-stats/publications.jsonl), which the model statistics count (#902): once after\n"
+        "the release installs for the history, or for one PR when record reported a marker it could not store.\n"
+        "Reads GitHub; run it by hand, never from the Monitor. Idempotent: an entry already present is not added.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"{RECORDER_EXAMPLES}  {RECORDER_COMMAND} import-publications --dry-run\n"
         f"  {RECORDER_COMMAND} import-publications --days 30\n"
-        "Outputs: JSON counts on stdout (prs, prs_unreadable, markers, markers_untrusted, markers_skipped,\n"
-        "rows_unregistered_repo, and added, or would_add with --dry-run).\n"
-        "Exit codes: 0: imported (or counted); 1: refused, the ledger unwritable or a PR unreadable (rerun is safe).\n"
+        f"  {RECORDER_COMMAND} import-publications --repository owner/name --pr 42\n"
+        "Outputs: JSON counts on stdout (prs, prs_read, prs_unreadable, rate_limited, markers, markers_untrusted,\n"
+        "markers_skipped, rows_unregistered_repo, and added, or would_add with --dry-run).\n"
+        "Exit codes: 0: every PR read and its entries stored (or counted); 1: refused, the ledger unwritable,\n"
+        "a PR unreadable or a rate limit hit (what was read is stored; rerun is safe).\n"
         "Related: lu_machinery/api/model_stats_rows.py, docs/runbooks/model-stats.md",
     )
     parser.add_argument(
         "--days", type=int, default=30,
         help="Import the PRs of review rows that finished in the last N days (default: 30)",
     )
+    parser.add_argument("--repository", help="With --pr: import this one PR only (owner/name); default: none")
+    parser.add_argument("--pr", type=int, help="With --repository: the PR number to import; default: none")
     parser.add_argument("--dry-run", action="store_true", help="Count the entries that would be added; write nothing")
     args = parser.parse_args(argv)
+    from lu_machinery.api.model_stats_rows import REPOSITORY_SLUG
+
+    if (args.repository is None) != (args.pr is None) or (args.pr is not None and (
+            args.pr < 1 or not REPOSITORY_SLUG.fullmatch(args.repository))):
+        parser.error("--repository owner/name and --pr N go together, with a PR number of at least 1")
     try:
-        counts = import_publications(days=args.days, dry_run=args.dry_run)
+        counts = import_publications(
+            days=args.days, dry_run=args.dry_run, only=None if args.pr is None else (args.repository, args.pr),
+        )
     except (RecordError, SweepError, FleetRepoError, OSError) as exc:
         print(f"publication import refused: {type(exc).__name__}: {exc}")
         return 1
     print(json.dumps(counts, sort_keys=True))
-    return 1 if counts["prs_unreadable"] else 0
+    return 1 if counts["prs_unreadable"] or counts["rate_limited"] else 0
 
 
 def _item_judgments_or_review_verdict(task: Mapping[str, Any], reply: str) -> tuple[str, int | Literal["unknown"]]:
@@ -3504,8 +3566,7 @@ def record(
                 _repair_receipts(task_root), repair, comment=str(posted_comment["id"] if posted else existing.get("id"))
             )
         publication_marker = _store_publication(
-            task_root, task_id=task_id, repository=repository, number=number, sha=sha, verdict=verdict,
-            comment=posted_comment if posted else existing or {},
+            task_root, repository=repository, number=number, comment=posted_comment if posted else existing or {},
         )
         state = "failure"
         pending_reason = ""

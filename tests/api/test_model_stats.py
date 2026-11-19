@@ -55,7 +55,7 @@ def test_model_value_sections_explain_how_to_read_the_figures():
         "Compare reviewer levels": ("readable results, first-round approval", "lower time or allowance cost"),
         "Reviewed PRs": ("reviewed PRs for the shown authors", "higher first-round approval and fewer rounds"),
         "Reviewer accuracy": ("counts as fixed when the author changed its file", "check the settled count"),
-        "Authors by risk tier": ("risk tier of each PR's first review", "Compare authors within one tier"),
+        "Authors by risk tier": ("risk tier of each PR's first published review", "Compare authors within one tier"),
     }
     for section, phrases in explanations.items():
         rendered = next(fragment for fragment in sections if f"<h2>{section}" in fragment
@@ -1151,10 +1151,11 @@ def _findings_review(tasks: Path, task_id: str, correctness: str, findings: list
     }))
 
 
-def _publish(batch_state: Path, *published: tuple[str, int, str, str]) -> int:
+def _publish(batch_state: Path, *published: tuple[str, int, str, str],
+             repository: str = "learn-ukrainian/machinery") -> int:
     """Ledger lines, as the verdict recorder writes them, for (task id, PR, head, verdict) publications."""
     return rows.record_publications(batch_state, [rows.publication(
-        task_id=task_id, repository="learn-ukrainian/machinery", pr=pr, head=head, verdict=verdict,
+        task_id=task_id, repository=repository, pr=pr, head=head, verdict=verdict,
         published_at=NOW.isoformat()) for task_id, pr, head, verdict in published])
 
 
@@ -1162,9 +1163,10 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         tmp_path, monkeypatch):
     """Defect class: reviewer precision that counts a finding as real without the author changing its file, lets
     another reviewer's approval (or an unrecordable same-head approval, or one that finished first) settle it,
-    counts a verdict that was never published (or settles a finding on an unpublished approval), reads a path as a
-    commit header, guesses an outcome for a head the checkout lacks, or reports a planted-defect recall the rows
-    cannot support. Every expected figure below is counted by hand."""
+    counts a verdict that was never published (or settles a finding on an unpublished approval), trusts a
+    publication from another repository, drops a review dispatched by branch alone, reads a path as a commit header,
+    guesses an outcome for a head the checkout lacks, or reports a planted-defect recall the rows cannot support.
+    Every expected figure below is counted by hand."""
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -1234,6 +1236,11 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     # PR 11: the same reviewer approved a new head, but that approval was never published: the finding stays open.
     _findings_review(tasks, "p11a-review", "incorrect", [("P1", "src/b.py")], pr=11, pinned_head=h1, **blocked)
     _findings_review(tasks, "p11b-review", "correct", [], pr=11, pinned_head=h2, **approved)
+    # PR 12: reviews dispatched by branch alone keep no PR in their rows; the ledger names it: 1 fixed.
+    _findings_review(tasks, "p12a-review", "incorrect", [("P1", "src/a.py")], pinned_head=h1, **blocked)
+    _findings_review(tasks, "p12b-review", "correct", [], pinned_head=h2, **approved)
+    # PR 13: the ledger names the task in another repository than the row's: of unknown publication.
+    _findings_review(tasks, "p13a-review", "incorrect", [("P1", "src/a.py")], pr=13, pinned_head=h1, **blocked)
     rows.backfill(tasks, batch_state)
     assert "src/a.py" not in rows.rows_path(batch_state).read_text()
     blocked_by, approved_by = "CHANGES_REQUESTED", "APPROVED"
@@ -1248,7 +1255,10 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         ("p8a-review", 8, h2, blocked_by), ("p8b-review", 8, h1, approved_by),
         ("p9b-review", 9, h2, approved_by), ("p10a-review", 10, h2, blocked_by), ("p11a-review", 11, h1, blocked_by),
     ]
-    assert _publish(batch_state, *published) == 19
+    published += [("p12a-review", 12, h1, blocked_by), ("p12b-review", 12, h2, approved_by)]
+    assert _publish(batch_state, *published) == 21
+    assert _publish(batch_state, ("p13a-review", 13, h1, blocked_by),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 1
     # The ledger holds each publication once: a recorder rerun adds nothing.
     assert _publish(batch_state, published[0]) == 0
 
@@ -1257,12 +1267,13 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     # Distinct (repository, blocked, approved) heads with finding paths: PR 1 and PR 7 share h1 to h2 (PR 5 keeps no
     # paths, so it needs no pair); PR 4's blocked head is missing.
     assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
-    assert snapshot["coverage"]["publications"] == {"lines": 19, "tasks": 19}
+    assert snapshot["coverage"]["publications"] == {"lines": 22, "tasks": 22}
     opus = {
-        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 7, "reviews_unknown_publication": 2,
-        "reviews_without_paths": 0, "blocking_findings": 7, "fixed": 1, "dismissed": 1, "open": 4, "unknown": 1,
-        "precision": {"value": 0.5, "n": 2, "low_sample": True}, "precision_ci": stats._wilson(1, 2),
+        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 3,
+        "reviews_without_paths": 0, "blocking_findings": 8, "fixed": 2, "dismissed": 1, "open": 4, "unknown": 1,
+        "precision": stats._rate(2, 3), "precision_ci": stats._wilson(2, 3),
     }
+    assert opus["precision"]["low_sample"] and opus["precision"]["n"] == 3
     pilot = {"blocking_reviews": 1, "blocking_findings": 1, "open": 1, "fixed": 0, "dismissed": 0, "unknown": 0}
     for payload, pilot_label in ((snapshot["windows"]["7d"], "pilot-model-a"),
                                  (snapshot["page_windows"]["7d"], "other")):
@@ -1287,8 +1298,9 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
 
 def test_author_results_split_by_risk_tier(tmp_path):
     """Defect class: author first-round approval and findings per PR that mix risk tiers, so an author given the
-    critical work looks worse than its peers, or that take a later round for the first when a window starts
-    mid-PR. Every expected figure below is counted by hand."""
+    critical work looks worse than its peers, that take a later round for the first when a window starts mid-PR, or
+    that read a reply instead of the published verdict (a P3-only rejection published as an approval, an unpublished
+    run taken for the first round). Every expected figure below is counted by hand."""
     batch_state, tasks = _state(tmp_path)
     grok, sol = {"review_author_model": "grok-4.7"}, {"review_author_model": "gpt-6.1-sol"}
     critical = {"review_profile": "infra", "review_risk": "critical"}
@@ -1301,7 +1313,21 @@ def test_author_results_split_by_risk_tier(tmp_path):
     _review(tasks, "r15a-review", "incorrect", ["P1"], pr=15, pinned_head="1" * 40, review_risk="high",
             started_at=(NOW - timedelta(days=9)).isoformat(), finished_at=(NOW - timedelta(days=8)).isoformat(), **grok)
     _review(tasks, "r15b-review", "correct", [], pr=15, pinned_head="2" * 40, **grok)
+    # PR 16: a reply with only a P3 finding, published as an approval: a first-round approval.
+    _review(tasks, "r16-review", "incorrect", ["P3"], pr=16, pinned_head="3" * 40, review_risk="low", **grok)
+    # PR 17: an unpublished high-risk run came first; the first review of record is the medium approval.
+    _review(tasks, "r17a-review", "incorrect", ["P1"], pr=17, pinned_head="4" * 40, review_risk="high", **grok)
+    _review(tasks, "r17b-review", "correct", [], pr=17, pinned_head="5" * 40, **grok)
+    # PR 18: no review of it was published: left out of the tiers and counted.
+    _review(tasks, "r18-review", "correct", [], pr=18, pinned_head="6" * 40, **grok)
     rows.backfill(tasks, batch_state)
+    approved, blocked = "APPROVED", "CHANGES_REQUESTED"
+    assert _publish(batch_state, ("r10-review", 10, "a" * 40, approved), ("r11-review", 11, "b" * 40, blocked),
+                    ("r12-review", 12, "c" * 40, approved), ("r13-review", 13, "d" * 40, blocked),
+                    ("r14-review", 14, "f" * 40, approved), ("r15a-review", 15, "1" * 40, blocked),
+                    ("r15b-review", 15, "2" * 40, approved), ("r16-review", 16, "3" * 40, approved),
+                    ("r17b-review", 17, "5" * 40, approved),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 9
 
     snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
 
@@ -1310,15 +1336,18 @@ def test_author_results_split_by_risk_tier(tmp_path):
         return [(r["risk"], r["prs"], r["first_round_approved"]["value"], r["blocking_per_pr"]["value"],
                  r["p0_p2_per_pr"]["value"], r["low_sample"]) for r in found["by_risk"]]
 
-    week = [("critical", 2, 0.5, 0.5, 1.0, True), ("medium", 1, 0.0, 2.0, 2.0, True), ("low", 1, 1.0, 0.0, 0.0, True)]
+    week = [("critical", 2, 0.5, 0.5, 1.0, True), ("medium", 2, 0.5, 1.0, 1.0, True), ("low", 2, 1.0, 0.0, 0.0, True)]
     assert tiers("7d", "grok-4.7") == week
     assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), *week[1:]]
     assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
+    (grok_row,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
+    assert grok_row["by_risk_without_review_of_record"] == 1
 
 
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path):
     """Defect class: a malformed publication is written, or a damaged ledger line is trusted, so a review counts as
-    published without proof; or a missing ledger reads as anything but "no publication known"."""
+    published without proof; a missing ledger reads as anything but "no publication known"; or an older publication
+    appended later (a history import) supersedes a newer one."""
     from collections import Counter
 
     import pytest
@@ -1344,3 +1373,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert rows.record_publications(batch_state, [later, good]) == 1
     assert rows.read_publications(batch_state) == (
         {"t-review": later}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
+    # An import appends an older publication after the newer one: the newer one still stands.
+    older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
+    assert rows.record_publications(batch_state, [older]) == 1
+    assert rows.read_publications(batch_state)[0] == {"t-review": later}

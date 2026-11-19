@@ -39,7 +39,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
@@ -734,7 +734,7 @@ PUBLICATION_SCHEMA = "review-publication.v1"
 PUBLICATIONS_FILE = "publications.jsonl"
 PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _PUBLICATION_KEYS = frozenset({"schema", "task_id", "repository", "pr", "head", "verdict", "published_at"})
-_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
+REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
 
 
 def _publication_ok(entry: object) -> bool:
@@ -742,7 +742,7 @@ def _publication_ok(entry: object) -> bool:
         return False
     pr, repository = entry["pr"], entry["repository"]
     return (entry["schema"] == PUBLICATION_SCHEMA and valid_task_id(entry["task_id"])
-            and isinstance(repository, str) and _REPOSITORY.fullmatch(repository) is not None
+            and isinstance(repository, str) and REPOSITORY_SLUG.fullmatch(repository) is not None
             and _count_value(pr) and pr > 0 and _sha(entry["head"])
             and isinstance(entry["verdict"], str) and entry["verdict"] in PUBLISHED_VERDICTS
             and timestamp(entry["published_at"]) is not None)
@@ -816,13 +816,24 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
 
 
 def read_publications(batch_state_dir: Path) -> tuple[dict[str, dict[str, Any]], Counter[str]]:
-    """Each review task's latest published verdict (a later line of a task id supersedes an earlier one), and read
-    counts. A missing ledger gives no entries: every review is then of unknown publication."""
+    """Each review task's latest published verdict by GitHub's comment time (a later line breaks a tie, so a history
+    import appended after a newer publication never supersedes it), and read counts. A missing ledger gives no
+    entries: every review is then of unknown publication."""
     counts: Counter[str] = Counter()
-    latest = {entry["task_id"]: entry
-              for entry in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, counts)}
+    latest: dict[str, dict[str, Any]] = {}
+    for entry in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, counts):
+        current = latest.get(entry["task_id"])
+        if current is None or cast(datetime, timestamp(entry["published_at"])) >= cast(
+                datetime, timestamp(current["published_at"])):
+            latest[entry["task_id"]] = entry
     counts["tasks"] = len(latest)
     return latest, counts
+
+
+def repository_keys() -> dict[str, str]:
+    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``); empty
+    when the catalog cannot be read, so no publication matches a row."""
+    return _fleet_repo_visibility()[1]
 
 
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")

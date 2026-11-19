@@ -63,6 +63,7 @@ from .model_stats_rows import (
     path_digest,
     read_publications,
     read_rows,
+    repository_keys,
     timestamp,
     variant_effort,
 )
@@ -383,22 +384,30 @@ def alias_resolver(raw_rows: Iterable[Mapping[str, Any]]) -> Callable[[str, date
     return resolve
 
 
-def _published(raw: Mapping[str, Any], publications: Mapping[str, Mapping[str, Any]]) -> str | None:
-    """The verdict published for a review row, when the ledger names its task at the row's own PR and head."""
+def _publication(raw: Mapping[str, Any], publications: Mapping[str, Mapping[str, Any]],
+                 keys: Mapping[str, str]) -> Mapping[str, Any] | None:
+    """The ledger entry of a review row: its task, at the row's own repository and head, and at the row's PR when the
+    row names one. A review dispatched by branch alone keeps no PR in its row; the recorder resolved it, so the
+    entry's PR is the review's PR."""
     entry = publications.get(raw["task_id"])
-    if entry is None or raw.get("role") != "review" or entry["pr"] != raw.get("pr") or entry["head"] != raw.get(
-            "pinned_head"):
+    if (entry is None or raw.get("role") != "review" or entry["head"] != raw.get("pinned_head")
+            or keys.get(str(entry["repository"]).lower()) != (raw.get("repo") or "public")
+            or raw.get("pr") not in (None, entry["pr"])):
         return None
-    return str(entry["verdict"])
+    return entry
 
 
 def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
           resolve: Callable[[str, datetime], str] = lambda model, _moment: model,
-          publications: Mapping[str, Mapping[str, Any]] | None = None) -> Iterator[_Row]:
+          publications: Mapping[str, Mapping[str, Any]] | None = None,
+          keys: Mapping[str, str] | None = None) -> Iterator[_Row]:
     for raw in raw_rows:
         moment = _moment(raw)
         if moment is None:
             continue
+        publication = _publication(raw, publications or {}, keys or {})
+        if publication is not None and raw.get("pr") is None:
+            raw = {**raw, "pr": publication["pr"]}
         status = raw.get("status")
         row_status = status if status in STATUSES else "other"
         role = "review" if raw.get("role") == "review" else "write"
@@ -432,7 +441,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             author=resolve(str(author), moment) if author else None,
             allowance=_allowance(raw.get("allowance")),
             raw=raw,
-            published=_published(raw, publications or {}),
+            published=None if publication is None else str(publication["verdict"]),
         )
 
 
@@ -605,42 +614,59 @@ def _models(fine: _Fine, *, include_samples: bool = True) -> list[dict[str, Any]
     ]
 
 
+# A published verdict as the parsed verdict it stands for.
+_OF_RECORD = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
+_Review = tuple[datetime, str, str, Counter[str] | None, str, str, datetime]
+
+
+def _outcome(by_head: Mapping[str, list[_Review]]) -> dict[str, Any]:
+    """A PR's outcome over its rounds (the distinct heads, ordered by their first review's start)."""
+    heads = sorted((sorted(reviews, key=lambda r: r[:2]) for reviews in by_head.values()),
+                   key=lambda reviews: reviews[0][:2])
+    _, _, verdict, _, reviewer, review_class, first_moment = heads[0][0]
+    after_block = None
+    if verdict != "correct":
+        after_block = ("approved_on_same_head" if any(r[2] == "correct" for r in heads[0][1:])
+                       else "approved_on_new_head" if any(r[2] == "correct" for h in heads[1:] for r in h)
+                       else "not_approved")
+    return {
+        "rounds": len(heads), "first": verdict,
+        "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "first_at": first_moment,
+        "after_block": after_block,
+        "approved": any(r[2] == "correct" for h in heads for r in h),
+        # Findings of each round: the head's first review.
+        "blocking": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in BLOCKING),
+        "p0_p2": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in P0_P2),
+        "findings_known": all(h[0][3] is not None for h in heads),
+    }
+
+
 def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
     """One outcome per reviewed PR, from its parsed reviews of record only (an unparsed reply is no round).
 
     Rounds are the distinct pinned heads, ordered by their first review's start; the first round is the earliest
-    review of the earliest head, and its reviewer and review class are the ones the matrix splits by.
+    review of the earliest head, and its reviewer and review class are the ones the matrix splits by. ``of_record``
+    is the same outcome over the PR's published reviews alone, each counted by the verdict the recorder published
+    (None when no review of the PR has a recorded publication).
     """
-    prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(lambda: {"authors": set(), "heads": defaultdict(list)})
+    prs: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+        lambda: {"authors": set(), "heads": defaultdict(list), "record": defaultdict(list)})
     never = datetime.max.replace(tzinfo=UTC)
     for row in rows:
-        if row.review is None or row.review[0] == "unparsed" or row.author is None:
+        if row.review is None or row.author is None or (row.review[0] == "unparsed" and row.published is None):
             continue
         entry = prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))]
         entry["authors"].add(row.author)
-        entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
-            (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class, row.moment))
-    outcomes = []
-    for entry in prs.values():
-        heads = sorted((sorted(reviews, key=lambda r: r[:2]) for reviews in entry["heads"].values()),
-                       key=lambda reviews: reviews[0][:2])
-        _, _, verdict, _, reviewer, review_class, first_moment = heads[0][0]
-        after_block = None
-        if verdict != "correct":
-            after_block = ("approved_on_same_head" if any(r[2] == "correct" for r in heads[0][1:])
-                           else "approved_on_new_head" if any(r[2] == "correct" for h in heads[1:] for r in h)
-                           else "not_approved")
-        outcomes.append({
-            "author": "+".join(sorted(entry["authors"])), "rounds": len(heads), "first": verdict,
-            "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "first_at": first_moment,
-            "after_block": after_block,
-            "approved": any(r[2] == "correct" for h in heads for r in h),
-            # Findings of each round: the head's first review.
-            "blocking": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in BLOCKING),
-            "p0_p2": sum(h[0][3][p] for h in heads if h[0][3] is not None for p in P0_P2),
-            "findings_known": all(h[0][3] is not None for h in heads),
-        })
-    return outcomes
+        head = row.raw.get("pinned_head") or row.task_id
+        review = (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class,
+                  row.moment)
+        if row.review[0] != "unparsed":
+            entry["heads"][head].append(review)
+        if row.published is not None:
+            entry["record"][head].append((*review[:2], _OF_RECORD[row.published], *review[3:]))
+    return [{"author": "+".join(sorted(entry["authors"])), **_outcome(entry["heads"]),
+             "of_record": _outcome(entry["record"]) if entry["record"] else None}
+            for entry in prs.values() if entry["heads"]]
 
 
 AFTER_BLOCK = ("approved_on_new_head", "approved_on_same_head", "not_approved")
@@ -650,7 +676,7 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
     """Author-side review outcomes per author model (a PR with two author models is grouped under ``a+b``), in
     total and per risk tier (``by_risk``)."""
     prs = list(prs)
-    risks = _author_risks(prs, name)
+    risks, without_record = _author_risks(prs, name)
     by_author: dict[str, Counter[str]] = defaultdict(Counter)
     for pr in prs:
         counts = by_author[name(pr["author"])]
@@ -676,7 +702,7 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
          # code), the same head (approved without a change), or nothing yet in this window?
          "after_blocked_first_round": {"blocked": c["blocked"],
                                        **{outcome: _rate(c[outcome], c["blocked"]) for outcome in AFTER_BLOCK}},
-         "by_risk": risks[author]}
+         "by_risk": risks.get(author, []), "by_risk_without_review_of_record": without_record[author]}
         for author, c in sorted(by_author.items(), key=lambda item: (-item[1]["prs"], item[0]))
     ]
 
@@ -805,17 +831,24 @@ def _risk(review_class: str) -> str:
     return review_class.split("/", 1)[1] if "/" in review_class else OTHER
 
 
-def _author_risks(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str]) -> dict[str, list[dict[str, Any]]]:
-    """Per author, first-round approval and findings per PR split by the risk tier of the PR's first review."""
+def _author_risks(prs: Iterable[Mapping[str, Any]],
+                  name: Callable[[str], str]) -> tuple[dict[str, list[dict[str, Any]]], Counter[str]]:
+    """Per author, first-round approval and findings per PR split by the risk tier of the PR's first review of record,
+    all from published verdicts (``of_record``); and per author the PRs with no published review, left out."""
     cells: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    without_record: Counter[str] = Counter()
     for pr in prs:
-        cell = cells[name(pr["author"])][_risk(pr["class"])]
+        record = pr["of_record"]
+        if record is None:
+            without_record[name(pr["author"])] += 1
+            continue
+        cell = cells[name(pr["author"])][_risk(record["class"])]
         cell["prs"] += 1
-        cell["first_round_approved"] += pr["first"] == "correct"
-        if pr["findings_known"]:
+        cell["first_round_approved"] += record["first"] == "correct"
+        if record["findings_known"]:
             cell["findings_known"] += 1
-            cell["blocking"] += pr["blocking"]
-            cell["p0_p2"] += pr["p0_p2"]
+            cell["blocking"] += record["blocking"]
+            cell["p0_p2"] += record["p0_p2"]
 
     def order(risk: str) -> tuple[int, str]:
         return (_RISK_ORDER.index(risk) if risk in _RISK_ORDER else len(_RISK_ORDER), risk)
@@ -825,7 +858,7 @@ def _author_risks(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str]) 
                       "blocking_per_pr": _rate(c["blocking"], c["findings_known"], 2),
                       "p0_p2_per_pr": _rate(c["p0_p2"], c["findings_known"], 2)}
                      for risk, c in sorted(risks.items(), key=lambda item: order(item[0]))]
-            for author, risks in cells.items()}
+            for author, risks in cells.items()}, without_record
 
 
 @dataclass(frozen=True)
@@ -1483,11 +1516,13 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     until = now or datetime.now(UTC)
     raw_rows, row_counts = read_rows(batch_state_dir)
     publications, publication_counts = read_publications(batch_state_dir)
+    keys = repository_keys() if publications else {}
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
     if landing is None:
         landing = scan_landing(primary_root, first)
-    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications) if row.moment < until]
+    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications, keys)
+            if row.moment < until]
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs)
     all_prs = _prs(rows)
@@ -1506,7 +1541,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched)}
         # Bound the combined author id after deriving PR outcomes, so a joint author cannot become a known model.
         page_prs = [{**pr, "author": _page_model(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
-                     "class": _page_class(pr["class"])} for pr in prs]
+                     "class": _page_class(pr["class"]),
+                     "of_record": pr["of_record"] and {**pr["of_record"], "reviewer": _page_model(
+                         pr["of_record"]["reviewer"]), "class": _page_class(pr["of_record"]["class"])}}
+                    for pr in prs]
         page_selected = [row for row in page_rows if since <= row.moment]
         page_windows[name] = {
             "window": window,

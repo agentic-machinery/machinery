@@ -159,7 +159,7 @@
     <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show approval on a new head, approval on the same head, or no approval in the window.</p>
     <div id="author">Loading…</div></section>
   <section><h2>Authors by risk tier <span class="meta" id="risk-meta"></span></h2>
-    <p class="note">The same author figures split by the risk tier of each PR's first review. Compare authors within one tier, where the work is alike; higher first-round approval and fewer findings per PR are better.</p>
+    <p class="note">Author figures from published reviews only, split by the risk tier of each PR's first published review. Compare authors within one tier, where the work is alike; higher first-round approval and fewer findings per PR are better.</p>
     <div id="risk">Loading…</div></section>
   <section><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
@@ -544,8 +544,12 @@ function risks(authors) {
   const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}</td>`
     + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
     + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
-  return rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
-    : '<p class="muted">No reviewed PR in this selection.</p>';
+  const without = authors.filter((a) => a.by_risk_without_review_of_record)
+    .map((a) => `${named(a)}: ${num(a.by_risk_without_review_of_record)}`);
+  const note = without.length
+    ? `<p class="note"><strong class="warn">PRs with no published review, left out:</strong> ${without.join(", ")}</p>` : "";
+  return (rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
+    : '<p class="muted">No PR with a published review in this selection.</p>') + note;
 }
 function boxes(items) {
   const timed = (items || []).filter((item) => item.p90 !== null && keepModel(item.model));
