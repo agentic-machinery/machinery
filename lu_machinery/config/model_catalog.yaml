@@ -1197,10 +1197,10 @@ models:
     tier: frontier_practical
     lifecycle: active
     aliases: [subq-savant-latest]
-    roles: [advisory, test]
+    roles: [advisory, test, implementation]
     transports: [opencode]
     efforts: [low, high, max]
-    modes: [read-only]
+    modes: [read-only, workspace-write]
     # True uses the provider's default. False sends store:false on this request.
     data_classes:
       public-code: true
@@ -1212,7 +1212,10 @@ models:
     notes: >-
       Read-only trial for supplemental PR review, non-Ukrainian councils and
       hard-problem advice, proposed code patches, and Ukrainian checks against
-      verified Sources evidence. Dispatch defaults to high. Request max only
+      verified Sources evidence. Public-repository write runs
+      (--research-role implementation, owned paths) draft bounded mechanical
+      fixes as a patch a normal worker lands (#898,
+      docs/runbooks/savant.md). Dispatch defaults to high. Request max only
       for jobs that justify it. An explicit public or private data class
       determines request storage. Review of record, designated approval and
       Ukrainian authoring stay with qualified seats. Measure on held-out real jobs.
