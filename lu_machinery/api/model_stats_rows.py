@@ -17,6 +17,7 @@ paths.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -395,8 +396,8 @@ def _verify_stream_digest(initial: bytes, stream: Any, expected: str) -> bool | 
 
 
 def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Return ``(review_summary, sidecar)``: ``"pruned"`` when the sidecar is cleanly absent, ``"rejected"`` when it
-    is present or declared but fails binding or digest verification, else None (an unreadable sidecar is unknown)."""
+    """Return ``(review_summary, sidecar)``: ``"pruned"`` (cleanly absent) or ``"unreadable"`` (transient I/O error)
+    when it cannot be observed, ``"rejected"`` when it fails binding, file-type or digest verification, else None."""
     sidecar = _sidecar_path(path, record)
     if sidecar is None:
         return _unparsed("missing_result"), "rejected"
@@ -407,8 +408,8 @@ def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str,
         fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except FileNotFoundError:
         return _unparsed("missing_result"), "pruned"
-    except OSError:
-        return _unparsed("missing_result"), None
+    except OSError as exc:  # a symlink (ELOOP) or a socket (ENXIO) is not a result file
+        return _unparsed("missing_result"), "rejected" if exc.errno in (errno.ELOOP, errno.ENXIO) else "unreadable"
     allow_sample = _record_allows_sample(record)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -422,10 +423,10 @@ def _result_with_state(path: Path, record: Mapping[str, Any]) -> tuple[dict[str,
                     if verified is False:
                         return _unparsed("missing_result"), "rejected"
                     sample = _sample(preview) if allow_sample and verified is True else None
-                    return _unparsed("too_big", sample), None
+                    return _unparsed("too_big", sample), None if verified else "rejected"
                 return _unparsed("too_big", _sample(preview) if allow_sample else None), None
     except OSError:
-        return _unparsed("missing_result"), None
+        return _unparsed("missing_result"), "unreadable"
     finally:
         os.close(fd)
     if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
@@ -696,11 +697,9 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
         built = _summary_candidate(path, record, source_mtime_ns)
         if built is not None:
             row, sidecar, sample_allowed = built
-            if sidecar == "pruned":
+            if sidecar in _UNOBSERVED:
                 def _merge(existing: Mapping[str, Any] | None, candidate: dict[str, Any]) -> dict[str, Any]:
-                    return _preserve_review_evidence(
-                        existing, candidate, sidecar_pruned=True, sample_allowed=sample_allowed,
-                    )
+                    return _preserve_review_evidence(existing, candidate, unobserved=True, sample_allowed=sample_allowed)
                 append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S, merge=_merge)
             else:
                 append_row(batch_state_dir, row, SETTLEMENT_LOCK_WAIT_S)
@@ -708,6 +707,7 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
         _log.warning("model-stats summary row not written for a settled task: %s", type(exc).__name__)
 
 
+_UNOBSERVED = ("pruned", "unreadable")
 _LABEL_FIELDS = ("harness", "model", "effort", "role", "class", "status", "repo")
 
 
@@ -879,7 +879,7 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any], reje
     review = candidate["review"]
     old_review = present.get("review")
     if review is None:
-        return False
+        return old_review is not None  # a record that no longer yields a review clears the stored one
     if rejected:  # the record's sidecar fails verification: nothing retained from it stands
         return bool(old_review != review)
     if review["verdict"] != "unparsed":
@@ -916,11 +916,11 @@ def _preserve_review_evidence(
     present: Mapping[str, Any] | None,
     candidate: dict[str, Any],
     *,
-    sidecar_pruned: bool,
+    unobserved: bool,
     sample_allowed: bool,
 ) -> dict[str, Any]:
     """Keep earlier retained review evidence when a pruned sidecar belongs to the same verified review attempt."""
-    if not sidecar_pruned or present is None or not _same_review_attempt(present, candidate):
+    if not unobserved or present is None or not _same_review_attempt(present, candidate):
         return candidate
     old_review = present.get("review")
     new_review = candidate.get("review")
@@ -928,7 +928,7 @@ def _preserve_review_evidence(
         return candidate
     if new_review.get("verdict") != "unparsed":  # a recorded verdict carries no counts: keep the verified ones
         keep = new_review.get("priorities") is None and old_review.get("verdict") == new_review.get("verdict")
-        return {**candidate, "review": dict(old_review)} if keep and old_review.get("priorities") else candidate
+        return {**candidate, "review": dict(old_review)} if keep and old_review.get("priorities") is not None else candidate
     if new_review.get("unparsed_reason") != "missing_result":
         return candidate
     has_richer_old = (
@@ -947,9 +947,14 @@ def _preserve_review_evidence(
 
 def _merged(present: Mapping[str, Any], candidates: list[tuple[dict[str, Any], str | None, bool]]) -> list[Any]:
     """Each candidate row with retained evidence merged in, and whether its sidecar was rejected."""
-    return [(_preserve_review_evidence(present.get(row["task_id"]), row, sidecar_pruned=sidecar == "pruned",
-                                       sample_allowed=allowed), sidecar == "rejected")
-            for row, sidecar, allowed in candidates]
+    merged = []
+    for row, sidecar, allowed in candidates:
+        old = present.get(row["task_id"])
+        unobserved = sidecar in _UNOBSERVED
+        kept = _preserve_review_evidence(old, row, unobserved=unobserved, sample_allowed=allowed)
+        # Evidence that cannot be carried over to the current record, or that its sidecar rejects, no longer stands.
+        merged.append((kept, sidecar == "rejected" or (unobserved and kept is row and old is not None)))
+    return merged
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:

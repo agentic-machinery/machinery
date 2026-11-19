@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -328,33 +329,40 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
 
 
-def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp_path):
-    """Defect class: a rewrite after sidecar pruning drops finding counts (F6), or a rejected sidecar leaves a stale
-    sample or digest-less row in the stored review (F8)."""
+def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp_path, monkeypatch):
+    """Defect class: a rewrite after sidecar pruning drops finding counts, including zero (F6), or a rejected,
+    unreadable or ineligible sidecar leaves a stale or lost sample in the stored review (F8)."""
     batch_state, tasks = _state(tmp_path)
-    kept = _record(tasks, "kept-counts-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-                   verdict="CHANGES_REQUESTED")
-    (tasks / "kept-counts-review.result").write_text(
-        json.dumps({"overall": {"correctness": "incorrect"}, "findings": [{"id": "F1", "priority": "P2"}]}))
-    kept_path = tasks / "kept-counts-review.json"
-    os.utime(kept_path, ns=(1_000_000_000, 1_000_000_000))  # an older record version, no sleep needed
-    first = rows.summary_row(kept_path, kept, 1_000_000_000)
-    assert first is not None and first["review"]["priorities"] == {"P2": 1}
-    rows.append_row(batch_state, first)
-    (tasks / "kept-counts-review.result").unlink()
-    store.replace({**kept, "duration_s": 90}, tasks / "kept-counts-review.json")
-    stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
-    assert stored["kept-counts-review"]["duration_s"] == 90.0
-    assert stored["kept-counts-review"]["review"] == {"verdict": "incorrect", "priorities": {"P2": 1}}
+    for task_id, correctness, findings, verdict, counts in (
+        ("kept-counts-review", "incorrect", [{"id": "F1", "priority": "P2"}], "CHANGES_REQUESTED", {"P2": 1}),
+        ("kept-zero-review", "correct", [], "APPROVED", {}),
+    ):
+        record = _record(tasks, task_id, mode="read-only", agent="claude", model="claude-opus-5-5", verdict=verdict)
+        path = tasks / f"{task_id}.json"
+        sidecar = tasks / f"{task_id}.result"
+        sidecar.write_text(json.dumps({"overall": {"correctness": correctness}, "findings": findings}))
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))  # an older record version, no sleep needed
+        first = rows.summary_row(path, record, 1_000_000_000)
+        assert first is not None and first["review"]["priorities"] == counts
+        rows.append_row(batch_state, first)
+        sidecar.unlink()
+        store.replace({**record, "duration_s": 90}, path)
+        stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+        assert stored[task_id]["duration_s"] == 90.0
+        assert stored[task_id]["review"] == {"verdict": first["review"]["verdict"], "priorities": counts}
 
     body = b"authenticated prose reply"
     digest = hashlib.sha256(body).hexdigest()
-    _record(tasks, "swapped-sidecar-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-                      result_sha256=digest)
-    (tasks / "swapped-sidecar-review.result").write_bytes(body)
-    rows.backfill(tasks, batch_state)
-    (tasks / "swapped-sidecar-review.result").write_bytes(b"replacement prose")
-    assert rows.backfill(tasks, batch_state)["refreshed"] == 1
+    gone = {"verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None}
+    for task_id, replace in (
+        ("swapped-sidecar-review", lambda p: p.write_bytes(b"replacement prose")),
+        ("symlinked-sidecar-review", lambda p: (p.unlink(), p.symlink_to(p.name))),
+    ):
+        _record(tasks, task_id, mode="read-only", agent="claude", model="claude-opus-5-5", result_sha256=digest)
+        (tasks / f"{task_id}.result").write_bytes(body)
+        rows.backfill(tasks, batch_state)
+        replace(tasks / f"{task_id}.result")
+        assert rows.backfill(tasks, batch_state)["refreshed"] == 1
     undigested = _record(tasks, "late-digest-review", mode="read-only", agent="claude", model="claude-opus-5-5")
     (tasks / "late-digest-review.result").write_bytes(body)
     rows.backfill(tasks, batch_state)
@@ -365,10 +373,30 @@ def test_pruned_or_replaced_sidecar_never_leaves_unsupported_review_evidence(tmp
     os.utime(undigested_path, ns=(mtime_ns, mtime_ns))
     assert rows.backfill(tasks, batch_state)["refreshed"] == 1
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
-    for task_id in ("swapped-sidecar-review", "late-digest-review"):
-        assert stored[task_id]["review"] == {
-            "verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None,
-        }
+    for task_id in ("swapped-sidecar-review", "symlinked-sidecar-review", "late-digest-review"):
+        assert stored[task_id]["review"] == gone
+
+    # A transient read error keeps the retained sample; a record corrected to a private repository drops it.
+    kept = _record(tasks, "transient-review", mode="read-only", agent="claude", model="claude-opus-5-5")
+    (tasks / "transient-review.result").write_bytes(body)
+    rows.backfill(tasks, batch_state)
+    path = tasks / "transient-review.json"
+    mtime_ns = os.stat(path).st_mtime_ns
+    real_open = os.open
+
+    def flaky_open(file, *args, **kwargs):
+        if str(file).endswith(".result"):
+            raise OSError(errno.EIO, "transient")
+        return real_open(file, *args, **kwargs)
+
+    for version, fields in enumerate(({"duration_s": 5}, {"duration_s": 5, "repo": "infra-private"}), 1):
+        path.write_text(json.dumps({**kept, **fields}))  # the second correction keeps the record's mtime
+        os.utime(path, ns=(mtime_ns + 1_000_000, mtime_ns + 1_000_000))
+        with monkeypatch.context() as patch:
+            patch.setattr(rows.os, "open", flaky_open)
+            assert rows.backfill(tasks, batch_state)["refreshed"] == 1
+        review = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}["transient-review"]["review"]
+        assert review["unparsed_sample"] == ("authenticated prose reply" if version == 1 else None)
 
 
 def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
