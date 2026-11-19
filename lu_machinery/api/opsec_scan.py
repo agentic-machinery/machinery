@@ -70,27 +70,25 @@ _IP_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9])(?:\[[0-9A-Fa-f:.%]+\](?::[0-9]{
 # bytes behind.
 _PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
 _PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
+# A root is a bounded root name followed by anything but a name character, so
+# "/tmp.backup" counts as under /tmp (fail closed) while "/tmpx" does not.
+_ROOT = rf"(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})(?![A-Za-z0-9_-])"
 # A bare root must not follow a slash, so URL authorities such as
 # "https://tmp.example.org" stay unflagged.
-_FILESYSTEM_PATH_RE = re.compile(
-    rf"(?<![A-Za-z0-9/])/(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})"
-    r"(?![A-Za-z0-9_-])"
-    r"(?P<tail>/[^\s\"'<>]*)?"
-)
+_FILESYSTEM_PATH_RE = re.compile(rf"(?<![A-Za-z0-9/])/{_ROOT}" r"(?P<tail>/[^\s\"'<>]*)?")
 # A file URI carries its path after the scheme's slashes and optional
 # authority ("file:///home/...", "file://host/home/...", "file:////home/...",
 # "file:/home/..."), which the bare rule above cannot see.  "//" after the
-# scheme always opens an authority (RFC 8089), and the authority excludes "/",
-# so a host such as "home.example" is never re-read as a path.  Only a letter
-# or digit before "file:" makes it another scheme's suffix ("profile:");
-# punctuation ("...file:", a diff's "+file:") does not.  Each scheme start is
-# found on its own, so a rejected URI never hides a later one, and the head
-# match reads no further than the first path segment, which is a whole RFC
-# 3986 segment (it ends only at "/", "?" or "#").
+# scheme always opens an authority (RFC 8089); the authority excludes "/" and
+# backticks, so neither a host such as "home.example" nor a following inline
+# code span is re-read as a path.  Only a letter or digit before "file:" makes
+# it another scheme's suffix ("profile:"); punctuation ("...file:", a diff's
+# "+file:") does not.  Each scheme start is found on its own, so a rejected URI
+# never hides a later one, and its first path segment is judged with the bare
+# rule's root boundary.
 _FILE_SCHEME_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):")
-_FILE_URI_HEAD_RE = re.compile(r"(?://[^/?#\s\"'<>]*|(?!//))(?P<path>/+)(?P<segment>[^/?#\s\"'<>]*)")
-_BOUNDED_ROOT_NAMES = frozenset(root[1:] for root in BOUNDED_FILESYSTEM_ROOTS)
-_MAX_ROOT_NAME_LENGTH = max(map(len, _BOUNDED_ROOT_NAMES))
+_FILE_URI_HEAD_RE = re.compile(r"(?://[^/?#\s\"'<>`]*|(?!//))(?P<path>/+)")
+_FILE_URI_ROOT_RE = re.compile(_ROOT)
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
@@ -366,10 +364,9 @@ def _trim_end(text: str, start: int, end: int) -> int:
 def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
     """Return flagged file URIs and the path start of every file URI.
 
-    A URI is flagged whole when its first path segment is exactly a bounded
-    root ("file:///tmp.backup/...", "file:///tmp,backup/..." and
-    "file:///tmp./x" are not under /tmp); a segment that ends its run is
-    compared without trailing prose punctuation ("file:///home." is).  Every
+    A URI is flagged whole when its first path segment starts with a bounded
+    root followed by a non-name character, the bare rule's boundary; like the
+    bare rule this fails closed ("file:///tmp.backup/..." counts).  Every
     flagged URI is a candidate, also inside an earlier one, because selection
     may drop that earlier one; each costs offsets only, and a run's trimmed
     end is computed once.
@@ -384,18 +381,14 @@ def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
         if head is None:
             continue
         path_starts.add(head.start("path"))
-        segment_start, segment_end = head.span("segment")
-        if segment_end == len(text) or text[segment_end] not in "/?#":
-            segment_end = _trim_end(text, segment_start, segment_end)
-        if segment_end - segment_start > _MAX_ROOT_NAME_LENGTH:
-            continue
-        if text[segment_start:segment_end] not in _BOUNDED_ROOT_NAMES:
+        root = _FILE_URI_ROOT_RE.match(text, head.end())
+        if root is None:
             continue
         run_index = bisect.bisect_right(run_starts, scheme.start()) - 1
         if run_index not in trimmed_ends:
             run_start, run_end = runs[run_index]
             trimmed_ends[run_index] = _trim_end(text, run_start, run_end)
-        end = max(trimmed_ends[run_index], segment_end)
+        end = max(trimmed_ends[run_index], root.end())
         candidates.append(_Candidate(scheme.start(), end, "filesystem-root", None, 80))
     return candidates, path_starts
 
@@ -522,6 +515,13 @@ def scan_text(
         if not _overlaps(match.start(), match.end(), protected):
             candidates.append(_Candidate(match.start(), match.end(), "transcript-filename", match.group(0), 40))
 
+    # A planted canary is reported in addition to what it overlaps; it never
+    # hides a real finding (the canary marks a sweep fixture, not a leak class).
+    selected = sorted(
+        _select_candidates([item for item in candidates if item.kind != "canary"])
+        + _select_candidates([item for item in candidates if item.kind == "canary"]),
+        key=lambda item: (item.start, item.end, item.kind),
+    )
     return [
         Finding(
             operation=str(operation),
@@ -531,7 +531,7 @@ def scan_text(
             start=candidate.start,
             end=candidate.end,
         )
-        for candidate in _select_candidates(candidates)
+        for candidate in selected
     ]
 
 

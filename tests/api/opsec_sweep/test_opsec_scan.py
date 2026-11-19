@@ -150,12 +150,27 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("[local](file:///home/fixture-user/x),[docs](/api/health)", "file:///home/fixture-user/x),[docs](/api/health"),
         ("/api/fixture?source=/home/fixture-user/x&view=page#/details", "/home/fixture-user/x&view=page#/details"),
         ("/home/fixture-user/team,notes/x", "/home/fixture-user/team,notes/x"),
+        ("[a](file:/home),[b](/api/health)", "file:/home),[b](/api/health"),
+        # Fail-closed detection: a root followed by a non-name character counts, as in the bare rule.
+        ("file:///tmp.backup/fixture.conf", "file:///tmp.backup/fixture.conf"),
+        ("file:///tmp,backup/fixture.conf", "file:///tmp,backup/fixture.conf"),
+        ("file:///tmp.#anchor", "file:///tmp.#anchor"),
+        ("/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/x", "file:/tmp.backup/x"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
     """Defect class: a home path hidden by its file-URI shape or a protected span in it (#909)."""
     findings = scan_text(text, operation="GET /api/opsec", field_path="body.value")
     assert [(finding.kind, finding.token) for finding in findings] == [("filesystem-root", token)], text
+
+
+def test_planted_canary_never_hides_a_file_uri_finding() -> None:
+    """Defect class: a canary inside a widened path span displaced the path finding (#909)."""
+    findings = scan_text("file:///home#fixture-canary", canaries=("fixture-canary",))
+    assert [(finding.kind, finding.token) for finding in findings] == [
+        ("filesystem-root", "file:///home#fixture-canary"),
+        ("canary", "fixture-canary"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -167,16 +182,8 @@ def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: 
         "file:///etc/fixture.conf",
         "file://home.example.invalid/etc/fixture.conf",
         "file://tmp/etc/fixture.conf",
-        "file:///tmp.backup/fixture.conf",
         "profile://fixture-host/home/fixture-user/input",
-        "file:///tmp..backup/fixture.conf",
-        "file:///tmp%20backup/fixture.conf",
-        "file:/tmp.backup/fixture.conf",
-        "file://fixture-host./tmp.backup/fixture.conf",
-        "/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/fixture.conf",
-        "[fixture](file:///tmp./fixture.conf)",
-        "file:///tmp,backup/fixture.conf",
-        "file:///tmp.#anchor",
+        "`file://fixture-host`+`docs/home/guide.md`",
     ],
 )
 def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
