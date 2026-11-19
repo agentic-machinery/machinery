@@ -574,8 +574,11 @@ def deployment_sources(repo: Path, commit: str) -> list[str] | None:
         return []
 
 
-def _agent_deploy(root: Path, *args: str) -> None:
-    """Run the deployer on the checkout at ``root``; any failure is ``agent_deploy_failed`` with its last line."""
+def _agent_deploy(root: Path, *args: str, drift_ok: bool = False) -> None:
+    """Run the deployer on the checkout at ``root``; any failure is ``agent_deploy_failed`` with its last line.
+
+    ``drift_ok`` accepts a check's exit 1 (outputs differ from the plan), never its exit 2 (invalid input).
+    """
     try:
         interpreter = project_interpreter(env=os.environ)
         # The interpreter is the configured project interpreter every worker hook runs (child_env), not task input.
@@ -588,7 +591,7 @@ def _agent_deploy(root: Path, *args: str) -> None:
         raise ValueError(f"agent_deploy_failed: no result within {AGENT_DEPLOY_TIMEOUT} s") from None
     except (OSError, ValueError) as exc:
         raise ValueError(f"agent_deploy_failed: project interpreter unavailable ({type(exc).__name__})") from None
-    if result.returncode:
+    if result.returncode and not (drift_ok and result.returncode == 1):
         reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
         raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
 
@@ -603,8 +606,9 @@ def deploy_agent_extensions(path: Path) -> bool:
     worker's hooks use. The deployer's own check then recomposes the plan from the HEAD commit's objects
     (``--check --inputs-commit``) and verifies the written outputs against it, so a sparse checkout that hides
     an input from the apply (a source, or a product marker that selects a validation) refuses instead of
-    deploying less. An attached tree's deployment inputs must equal HEAD's: a difference refuses before
-    anything is written. Applying again is
+    deploying less. Before anything is written, the same check refuses a commit whose plan is invalid (its
+    drift is what the apply then fixes), and an attached tree's deployment inputs must equal HEAD's. Applying
+    again is
     idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each
     refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
     deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
@@ -624,8 +628,10 @@ def deploy_agent_extensions(path: Path) -> bool:
     ).splitlines() if "__pycache__" not in PurePosixPath(line[3:]).parts]
     if pending:
         raise ValueError(f"agent_deploy_failed: deployment inputs differ from HEAD: {', '.join(pending[:3])}")
+    verify = ("--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
+    _agent_deploy(root, *verify, drift_ok=True)  # an invalid commit plan refuses before anything is written
     _agent_deploy(root)
-    _agent_deploy(root, "--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
+    _agent_deploy(root, *verify)
     # Only the deployment's own outputs are checked: an attached worktree may hold the worker's own changes.
     try:
         manifest = json_depth.loads((root / AGENT_DEPLOY_STATE).read_text(encoding="utf-8"), max_depth=16)

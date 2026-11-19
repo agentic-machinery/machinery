@@ -404,6 +404,8 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
                           "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
                           "--task-id", "refused", expected=2)
     assert refused.stderr.splitlines()[-1].startswith("dispatcher: " + reason), refused.stderr
+    # An invalid commit plan refuses before the apply writes anything into the tree.
+    assert (primary / ".worktrees/dispatch/codex/refused/.claude").exists() == ("exit 2" not in reason)
     # Never launched; as for any creation failure, the hold keeps the surviving tree attributed (#490).
     hold = json.loads((sandbox.tasks / "refused.json").read_text())
     assert (hold["status"], hold["pid"], hold["admission_hold"]["run_nonce"]) == ("spawning", None, hold["run_nonce"])
