@@ -284,6 +284,19 @@ function withClasses(models, role, render, width) {
       ...((e.by_class || []).map((c) => render(c, "cls")))])], width);
 }
 function keepModel(name) { return !picked() || name === picked(); }
+// An author label can join several models (`a+b`): it matches the picked model when that model is one of them, exactly.
+function keepAuthor(name) { return !picked() || String(name).split("+").includes(picked()); }
+// Every model a filtered table can show, so each one can be picked: task models, authors (each member of a joint
+// author), the matrix's reviewers and the reviewer accuracy rows.
+function pickerModels(data) {
+  const members = (name) => String(name).split("+");
+  return [...new Set([
+    ...(data.models || []).map((m) => m.model),
+    ...[...(data.authors || []), ...(data.author_risks || [])].flatMap((a) => members(a.model)),
+    ...(data.first_round_matrix || []).flatMap((c) => [...members(c.author), c.reviewer]),
+    ...(data.reviewer_accuracy?.findings || []).map((r) => r.model),
+  ])].sort();
+}
 
 function recommend(rec) {
   const sample = `Ranking requires at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per catalog model.`;
@@ -591,7 +604,7 @@ function ukrainian(items) {
     + `${cell(share(item.rate, item.tasks), item.landed ? "good" : "")}${cell(share(item.approve, item.approve_n || 0))}</tr>`), [0, 1, 2]);
 }
 function matrix(data, cls) {
-  const cells = (data.first_round_matrix || []).filter((c) => c.class === cls && (keepModel(c.author) || keepModel(c.reviewer)));
+  const cells = (data.first_round_matrix || []).filter((c) => c.class === cls && (keepAuthor(c.author) || keepModel(c.reviewer)));
   if (!cells.length) return '<p class="muted">No parsed review of record in this window and class.</p>';
   const tally = (key) => {
     const totals = new Map();
@@ -692,7 +705,7 @@ function render() {
     "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 14));
   $("unparsed-samples").innerHTML = unparsedSamples(reviews);
   const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
-  const authors = (data.authors || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
+  const authors = (data.authors || []).filter((a) => keepAuthor(a.model));
   $("author-meta").textContent = `${label} · ${num(authors.reduce((s, a) => s + a.prs, 0))} PRs`;
   $("author").innerHTML = table(["Author model", "PRs", "Rounds / PR", "Approved eventually", "Approved first round",
     "Blocked first round", "New head", "Same head", "No approval", "Blocking / PR", "P0–P2 / PR"],
@@ -700,7 +713,7 @@ function render() {
       + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}${cell(a.after_blocked_first_round.blocked)}`
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
-  const authorRisks = (data.author_risks || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
+  const authorRisks = (data.author_risks || []).filter((a) => keepAuthor(a.model));
   const riskPrs = authorRisks.reduce((s, a) => s + (a.by_risk || []).reduce((t, r) => t + r.prs, 0), 0);
   $("risk-meta").textContent = `${label} · ${num(riskPrs)} PRs with a published review`;
   $("risk").innerHTML = risks(authorRisks);
@@ -765,7 +778,7 @@ async function load() {
   $("age").textContent = `${num(data.records)} settled tasks across all models in ${label}. The snapshot was collected ${num(data.age_seconds)} seconds ago.`;
   renderCoverage(data);
   const select = $("model"), previous = select.value;
-  const names = [...new Set((data.models || []).map((m) => m.model))].sort();
+  const names = pickerModels(data);
   select.innerHTML = '<option value="">All models</option>' + names.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join("");
   if (names.includes(previous)) select.value = previous;
   current = {data, label};

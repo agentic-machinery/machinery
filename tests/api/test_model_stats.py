@@ -1392,9 +1392,10 @@ def test_author_results_split_by_risk_tier(tmp_path):
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
     """Defect class: a malformed publication is written, or a damaged ledger line is trusted, so a review counts as
     published without proof; a missing ledger reads as anything but "no publication known"; or an older publication
-    appended later (a history import) supersedes a newer one; or a collection reuses a catalog reading of an earlier
-    one (an unreadable catalog then hides publications and reply samples after its repair, or a valid one outlives
-    the file)."""
+    appended later (a history import) supersedes a newer one; or a line for another repository, PR or head blocks or
+    hides the real publication; or a collection reuses a fleet or model catalog reading of an earlier one (an
+    unreadable catalog then hides publications and reply samples after its repair, or a valid one outlives the
+    file)."""
     from collections import Counter
 
     import pytest
@@ -1418,12 +1419,22 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
         stream.write(b'{"schema": "review-publication.v1", "task_id": "t-review"}\nnot json\n')
     later = {**good, "verdict": "CHANGES_REQUESTED"}
     assert rows.record_publications(batch_state, [later, good]) == 1
+    # Newest first; of two at the same comment time, the later line first.
     assert rows.read_publications(batch_state) == (
-        {"t-review": later}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
+        {"t-review": [later, good]}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
     # An import appends an older publication after the newer one: the newer one still stands.
     older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
     assert rows.record_publications(batch_state, [older]) == 1
-    assert rows.read_publications(batch_state)[0] == {"t-review": later}
+    assert rows.read_publications(batch_state)[0] == {"t-review": [later, good, older]}
+    # Newer lines naming the task on another PR, repository or head are other publications: each is stored, and the
+    # row's join still takes the newest entry that matches its own repository, PR and head.
+    newer = (NOW + timedelta(hours=1)).isoformat()
+    elsewhere = [{**later, "pr": 4, "published_at": newer}, {**later, "head": "b" * 40, "published_at": newer},
+                 {**later, "repository": "learn-ukrainian/learn-ukrainian.github.io", "published_at": newer}]
+    assert rows.record_publications(batch_state, elsewhere) == 3
+    row = {"task_id": "t-review", "role": "review", "repo": "machinery", "pr": 3, "pinned_head": "a" * 40}
+    keys = rows.repository_keys(rows.fleet_catalog())
+    assert stats._publication(row, rows.read_publications(batch_state)[0], keys) == later
 
     # Each collection reads the catalogs afresh through every cache, the real loader included: one that cannot be
     # read matches no publication and admits no reply sample in that collection only, and a valid reading is never
@@ -1432,7 +1443,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
 
     _review(tasks, "c-review", "incorrect", ["P1"], pr=3, pinned_head="c" * 40, review_author_model="grok-4.7",
             repo="machinery")
-    _record(tasks, "u-review", mode="read-only", agent="claude", model="claude-opus-5-5")
+    _record(tasks, "u-review", mode="read-only", agent="claude", model="claude-opus-5-5", data_class="public-code")
     (tasks / "u-review.result").write_text("prose reply", encoding="utf-8")
     rows.backfill(tasks, batch_state)
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
@@ -1443,17 +1454,28 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     catalog = tmp_path / "fleet_repos.yaml"
     monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
 
-    def collected() -> tuple[int, int, int]:
+    def collected() -> tuple[int, int, int, bool]:
         snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
         (found,) = snapshot["windows"]["7d"]["reviewer_accuracy"]["findings"]
         return (found["blocking_reviews"], found["reviews_unknown_publication"],
-                snapshot["coverage"]["rows"].get("malformed_lines", 0))
+                snapshot["coverage"]["rows"].get("malformed_lines", 0),
+                bool(snapshot["windows"]["7d"]["idle_catalog_models"]))
 
-    unreadable = (0, 1, 1)
+    unreadable, valid = (0, 1, 1, True), (1, 0, 0, True)
     for text, expected in (
             (registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"), unreadable),
-            (registry, (1, 0, 0)), ("repos: [", unreadable), (registry, (1, 0, 0))):
+            (registry, valid), ("repos: [", unreadable), (registry, valid)):
         catalog.write_text(text, encoding="utf-8")
+        assert collected() == expected, text[:40]
+    # The model catalog through its own loader's cache: unreadable, it admits no public data class (the sample row
+    # is skipped) and names no idle model, in that collection only.
+    from lu_machinery.review import model_catalog
+
+    models_file = tmp_path / "model_catalog.yaml"
+    models_text = model_catalog.CATALOG_PATH.read_text(encoding="utf-8")
+    monkeypatch.setattr(model_catalog.load_model_catalog.__wrapped__, "__defaults__", (models_file,))
+    for text, expected in ((models_text, valid), ("models: [", (1, 0, 1, False)), (models_text, valid)):
+        models_file.write_text(text, encoding="utf-8")
         assert collected() == expected, text[:40]
     # Leave no reading of the scratch catalog to later tests.
     monkeypatch.undo()

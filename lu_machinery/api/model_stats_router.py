@@ -30,7 +30,7 @@ import re
 import subprocess
 import threading
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -52,7 +52,6 @@ from lu_machinery.review.model_catalog import (
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
     VARIANT_SUFFIX,
-    load_model_catalog,
 )
 
 from .model_stats_rows import (
@@ -61,6 +60,7 @@ from .model_stats_rows import (
     UNPARSED_REASONS,
     VERDICTS,
     fleet_catalog,
+    model_catalog_reading,
     path_digest,
     read_publications,
     read_rows,
@@ -381,7 +381,8 @@ def alias_resolver(raw_rows: Iterable[Mapping[str, Any]]) -> Callable[[str, date
         if model not in NATIVE_ALIASES:
             return model
         if model not in targets:
-            targets[model] = _newest_claude(model)
+            # The loader holds the reading model_catalog_reading took, so the alias reads the same catalog, or none.
+            targets[model] = _newest_claude(model) if model_catalog_reading() is not None else None
         target = targets[model]
         if target is None or target not in first or moment < first[target]:
             return model
@@ -393,22 +394,23 @@ def alias_resolver(raw_rows: Iterable[Mapping[str, Any]]) -> Callable[[str, date
     return resolve
 
 
-def _publication(raw: Mapping[str, Any], publications: Mapping[str, Mapping[str, Any]],
+def _publication(raw: Mapping[str, Any], publications: Mapping[str, Sequence[Mapping[str, Any]]],
                  keys: Mapping[str, str]) -> Mapping[str, Any] | None:
-    """The ledger entry of a review row: its task, at the row's own repository and head, and at the row's PR when the
-    row names one. A review dispatched by branch alone keeps no PR in its row; the recorder resolved it, so the
+    """The newest ledger entry of a review row (``read_publications`` order) that names its task at the row's own
+    repository and head, and at the row's PR when the row names one; an entry for another target never hides a
+    matching one. A review dispatched by branch alone keeps no PR in its row; the recorder resolved it, so the
     entry's PR is the review's PR."""
-    entry = publications.get(raw["task_id"])
-    if (entry is None or raw.get("role") != "review" or entry["head"] != raw.get("pinned_head")
-            or keys.get(str(entry["repository"]).lower()) != (raw.get("repo") or "public")
-            or raw.get("pr") not in (None, entry["pr"])):
+    if raw.get("role") != "review":
         return None
-    return entry
+    return next((entry for entry in publications.get(raw["task_id"], ())
+                 if entry["head"] == raw.get("pinned_head")
+                 and keys.get(str(entry["repository"]).lower()) == (raw.get("repo") or "public")
+                 and raw.get("pr") in (None, entry["pr"])), None)
 
 
 def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
           resolve: Callable[[str, datetime], str] = lambda model, _moment: model,
-          publications: Mapping[str, Mapping[str, Any]] | None = None,
+          publications: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
           keys: Mapping[str, str] | None = None) -> Iterator[_Row]:
     for raw in raw_rows:
         moment = _moment(raw)
@@ -1439,7 +1441,9 @@ _PAGE_CLASSES = frozenset({
 
 @lru_cache(maxsize=1)
 def _catalog_models() -> dict[str, Any]:
-    return dict(load_model_catalog().get("models") or {})
+    """The models of the collection's one catalog reading; none when the catalog cannot be read."""
+    models = (model_catalog_reading() or {}).get("models")
+    return dict(models) if isinstance(models, Mapping) else {}
 
 
 @lru_cache(maxsize=1)
@@ -1448,21 +1452,15 @@ def _known_models() -> frozenset[str]:
 
 
 def _routed_models() -> frozenset[str]:
-    try:
-        models = _catalog_models()
-    except Exception:  # no catalog: no model is known to be routed
-        return frozenset()
-    return frozenset(mid for mid, info in models.items()
+    """Every catalog model not retired; none without a catalog."""
+    return frozenset(mid for mid, info in _catalog_models().items()
                      if isinstance(info, Mapping) and info.get("lifecycle") != "retired")
 
 
 @lru_cache(maxsize=256)
 def _model_runtime_levels(model: str) -> frozenset[str]:
     """Include catalogued selectors with no results yet, without guessing a level from a model name."""
-    try:
-        info = _catalog_models().get(model, {})
-    except Exception:  # a missing catalog cannot supply a selector
-        return frozenset()
+    info = _catalog_models().get(model, {})  # without a catalog, no selector
     selectors = [*info.get("routing_wire_ids", {}).values(), *info.get("runtime_model_ids", ())]
     return frozenset(level for selector in selectors if (level := variant_effort(selector)))
 

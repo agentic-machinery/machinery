@@ -220,7 +220,12 @@ def tokens(usage: object) -> tuple[int, int, int]:
 
 
 @lru_cache(maxsize=1)
-def _catalog() -> dict[str, Any] | None:
+def model_catalog_reading() -> dict[str, Any] | None:
+    """The model catalog, or None when it cannot be read (models are then stored and counted as recorded).
+
+    One reading, kept until ``refresh_readings``: every statistics consumer of the catalog reads it here, so within
+    one collection they all see the same catalog, or all see none.
+    """
     try:
         return load_model_catalog()
     except Exception:  # no catalog: models are stored as recorded
@@ -246,7 +251,7 @@ def model_id(raw: object) -> str:
     displayed = canonical_cursor_model(spelling)
     if displayed:
         spelling = displayed
-    catalog = _catalog()
+    catalog = model_catalog_reading()
     if catalog is not None and (matched := canonical_model_id(spelling, catalog)):
         return model_label(matched)
     return model_label(spelling)
@@ -315,7 +320,7 @@ def _fleet_repo_visibility() -> tuple[frozenset[str], dict[str, str], str | None
 @lru_cache(maxsize=1)
 def _public_data_classes() -> frozenset[str]:
     """Exact catalogued public data classes (``store: true``); fail closed to empty when unreadable."""
-    catalog = _catalog()
+    catalog = model_catalog_reading()
     models = catalog.get("models") if isinstance(catalog, Mapping) else None
     if not isinstance(models, Mapping):
         return frozenset()
@@ -783,12 +788,13 @@ def _publication_lines(path: Path, counts: Counter[str]) -> list[dict[str, Any]]
     return entries
 
 
-def publication_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
-    """What makes two ledger lines the same publication: the task, the head and the verdict."""
-    return (entry["task_id"], entry["head"], entry["verdict"])
+def publication_key(entry: Mapping[str, Any]) -> tuple[str, str, int, str, str]:
+    """What makes two ledger lines the same publication: the task, the repository (GitHub's slugs ignore case), the
+    PR, the head and the verdict. A line for another repository or PR is another publication, never a duplicate."""
+    return (entry["task_id"], str(entry["repository"]).lower(), entry["pr"], entry["head"], entry["verdict"])
 
 
-def publication_keys(batch_state_dir: Path) -> set[tuple[str, str, str]]:
+def publication_keys(batch_state_dir: Path) -> set[tuple[str, str, int, str, str]]:
     """The keys of every well-formed ledger line."""
     return {publication_key(e) for e in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, Counter())}
 
@@ -815,28 +821,31 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
         return added
 
 
-def read_publications(batch_state_dir: Path) -> tuple[dict[str, dict[str, Any]], Counter[str]]:
-    """Each review task's latest published verdict by GitHub's comment time (a later line breaks a tie, so a history
-    import appended after a newer publication never supersedes it), and read counts. A missing ledger gives no
-    entries: every review is then of unknown publication."""
+def read_publications(batch_state_dir: Path) -> tuple[dict[str, list[dict[str, Any]]], Counter[str]]:
+    """Each review task's published verdicts, newest first by GitHub's comment time (of two at the same time, the
+    later line first, so a history import appended after a newer publication never comes before it), and read
+    counts. A reader takes the first entry that matches its row's repository, PR and head. A missing ledger gives
+    no entries: every review is then of unknown publication."""
     counts: Counter[str] = Counter()
-    latest: dict[str, dict[str, Any]] = {}
-    for entry in _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, counts):
-        current = latest.get(entry["task_id"])
-        if current is None or cast(datetime, timestamp(entry["published_at"])) >= cast(
-                datetime, timestamp(current["published_at"])):
-            latest[entry["task_id"]] = entry
-    counts["tasks"] = len(latest)
-    return latest, counts
+    by_task: dict[str, list[tuple[datetime, int, dict[str, Any]]]] = {}
+    lines = _publication_lines(batch_state_dir / ROWS_DIR / PUBLICATIONS_FILE, counts)
+    for index, entry in enumerate(lines):
+        by_task.setdefault(entry["task_id"], []).append(
+            (cast(datetime, timestamp(entry["published_at"])), index, entry))
+    counts["tasks"] = len(by_task)
+    return {task: [entry for *_, entry in sorted(found, key=lambda item: item[:2], reverse=True)]
+            for task, found in by_task.items()}, counts
 
 
 def refresh_readings() -> None:
-    """Forget every catalog reading this module and the fleet registry keep, so their next use reads the files.
+    """Forget every catalog reading this module, the model catalog loader and the fleet registry keep, so their next
+    use reads the files.
 
     The statistics collector calls it once as each collection starts: a catalog that was unreadable, or valid, at
     an earlier collection is never reused, and a failed reading lasts only for the collection that made it.
     """
-    _catalog.cache_clear()
+    load_model_catalog.cache_clear()
+    model_catalog_reading.cache_clear()
     _fleet_repo_visibility.cache_clear()
     _public_data_classes.cache_clear()
     clear_repository_cache()

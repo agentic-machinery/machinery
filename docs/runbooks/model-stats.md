@@ -331,15 +331,20 @@ the verdict or finds it already posted, and reports `publication_marker`: `store
 undoes the publication, and that one-PR import works even after the PR has moved on or closed.
 
 The statistics read the ledger; the Monitor never reads GitHub. A line that does not have the writer's shape is
-skipped and counted in `coverage.publications.malformed_lines`. Per task, the publication with the latest GitHub
-comment time wins (a later line breaks a tie), so an import never supersedes a newer publication. A row takes its
-entry only when the entry's repository is the row's and its head is the row's; a review dispatched by branch alone
-keeps no PR in its row, and joins the PR the recorder resolved from the entry for the publication figures only
-(reviewer accuracy and the risk tiers); the legacy author totals, matrix and review levels still read only rows
-that name their PR. Each collection starts by dropping every catalog reading the statistics and the fleet
-registry keep (`refresh_readings`), so the model and fleet catalogs are read afresh and no reading of an earlier
-collection, failed or valid, is reused; the repository map and the changed-file read share one reading of the
-fleet catalog, and an unreadable one matches no entry and reads no file in that collection. A parsed rejection of
+skipped and counted in `coverage.publications.malformed_lines`. A line is one publication of a task's verdict on
+one repository, PR and head: a line for another repository, PR or head is stored beside it, never taken for a
+duplicate. A row takes the newest entry by GitHub comment time (of two at the same time, the later line) whose
+repository is the row's, whose head is the row's and, when the row names a PR, whose PR is the row's; so an import
+never supersedes a newer publication, and an entry for another target never hides a matching one. A review
+dispatched by branch alone keeps no PR in its row, and joins the PR the recorder resolved from the entry for the
+publication figures only (reviewer accuracy and the risk tiers); the legacy author totals, matrix and review
+levels still read only rows that name their PR. Each collection starts by dropping every catalog reading the
+statistics, the model catalog loader and the fleet registry keep (`refresh_readings`), so the model and fleet
+catalogs are read afresh and no reading of an earlier collection, failed or valid, is reused. Within a collection
+every statistics consumer of the model catalog (labels, idle models, runtime levels, alias resolution, the public
+data classes of reply samples) shares one reading, or all see none; the repository map and the changed-file read
+share one reading of the fleet catalog, and an unreadable one matches no entry and reads no file in that
+collection. A parsed rejection of
 a formal review (one that names its author's model) with no matching entry counts as unknown publication, whether
 or not its row names a PR.
 
