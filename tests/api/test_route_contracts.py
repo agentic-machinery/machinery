@@ -258,7 +258,8 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
 // F1 + F4 against Fleet (fleet.html):
 // 1. Fresh 30s snapshot with readable repo + unreadable sibling (X-Snapshot-State: stale) preserves CI green & queued 1 (F4).
 // 2. Expired HTTP 200 cached snapshot (240s old, 210s bound, X-Snapshot-State: stale) clears CI green & queued 1 (F1).
-// 3. HTTP 503 clears CI green & queued 1 and falls back to delivery_pr #42 (F1).
+// 3. Browser clock offsets (-120s behind / +240s ahead) honor X-Snapshot-Age-S over observed_at (F1).
+// 4. HTTP 503 clears CI green & queued 1 and falls back to delivery_pr #42 (F1).
 (async () => {
   const elements = new Map();
   globalThis.document = {
@@ -272,8 +273,9 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   globalThis.fetch = async (url) => {
     if (String(url).includes('/api/git/pull-requests')) {
       if (mode === 'http_503') return {ok: false, status: 503, text: async () => '{}', headers: {get: () => null}};
-      const ageS = mode === 'expired_200' ? 240 : 30;
-      const observedAt = new Date(Date.now() - ageS * 1000).toISOString();
+      const ageS = mode === 'expired_200' || mode === 'clock_behind_expired' ? 240 : 30;
+      const clockOffsetS = mode === 'clock_behind_expired' ? -120 : mode === 'clock_ahead_fresh' ? 240 : 0;
+      const observedAt = new Date(Date.now() - (ageS + clockOffsetS) * 1000).toISOString();
       const repos = [
         {
           name: 'machinery',
@@ -310,7 +312,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
     };
   };
   const fleetBody = extractScript('fleet.html', '\nrunner.start();');
-  const fleetRunner = new Function('Machinery', fleetBody + '\nreturn runner;')(M);
+  const {runner: fleetRunner, prSnapshotFresh} = new Function('Machinery', fleetBody + '\nreturn {runner, prSnapshotFresh};')(M);
   await fleetRunner.refreshAll();
   await new Promise(resolve => setImmediate(resolve));
   const partialHtml = document.getElementById('workers-content').innerHTML;
@@ -324,6 +326,27 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
   assert.doesNotMatch(expiredHtml, /CI green/, 'F1: expired HTTP 200 snapshot clears CI green');
   assert.doesNotMatch(expiredHtml, /queued 1/, 'F1: expired HTTP 200 snapshot clears queued 1');
   assert.match(expiredHtml, /#42/);
+
+  mode = 'clock_behind_expired';
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
+  const behindHtml = document.getElementById('workers-content').innerHTML;
+  assert.doesNotMatch(behindHtml, /CI green/, 'F1: -120s browser clock offset still expires 240s server snapshot');
+  assert.doesNotMatch(behindHtml, /queued 1/, 'F1: -120s browser clock offset still clears queued 1');
+  assert.match(behindHtml, /#42/);
+
+  mode = 'clock_ahead_fresh';
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
+  const aheadHtml = document.getElementById('workers-content').innerHTML;
+  assert.match(aheadHtml, /CI green/, 'F1: +240s browser clock offset still trusts 30s server snapshot');
+  assert.match(aheadHtml, /queued 1/, 'F1: +240s browser clock offset still keeps queued 1');
+
+  const now = Date.now();
+  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now - 30000).toISOString()}, age: null, bound: 210, state: 'fresh', receivedAt: now}, now), true);
+  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now - 240000).toISOString()}, age: Number.NaN, bound: 210, state: 'stale', receivedAt: now}, now), false);
+  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: null}, age: null, bound: 210, state: 'fresh', receivedAt: now}, now), false);
+  assert.equal(prSnapshotFresh({data: {status: 'ok', observed_at: new Date(now).toISOString()}, age: 200, bound: 210, state: 'fresh', receivedAt: now - 20000}, now), false);
 
   mode = 'fresh_partial';
   await fleetRunner.refreshAll();

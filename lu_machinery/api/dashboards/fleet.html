@@ -59,19 +59,23 @@ const PULL_REQUESTS_BOUND_S = 210;
 
 let latestPrsReading = null;
 
-// Judge PR snapshot freshness by observation age against the route's 210 s bound (or tighter header bound),
-// independent of aggregate sibling-repo coverage; prIndex() filters unreadable repositories individually.
+// Judge PR snapshot freshness by server observation age (`X-Snapshot-Age-S` + elapsed time since receipt)
+// against the route's 210 s bound (or tighter header bound), falling back to `observed_at` only when
+// `reading.age` is absent or invalid; independent of aggregate sibling-repo coverage.
 function prSnapshotFresh(reading, now = Date.now()) {
   if (!reading || !reading.data || reading.data.status !== "ok") return false;
   if (reading.state === "unavailable") return false;
-  const observed = toDate(reading.data.observed_at);
+  if (typeof now !== "number" || !Number.isFinite(now)) return false;
   let age = null;
-  if (observed) {
-    age = Math.max(0, (now - observed.getTime()) / 1000);
-  } else if (typeof reading.age === "number" && Number.isFinite(reading.age) && reading.age >= 0) {
+  if (typeof reading.age === "number" && Number.isFinite(reading.age) && reading.age >= 0) {
     const elapsed = typeof reading.receivedAt === "number" && Number.isFinite(reading.receivedAt)
       ? Math.max(0, (now - reading.receivedAt) / 1000) : 0;
     age = reading.age + elapsed;
+  } else {
+    const observed = toDate(reading.data.observed_at);
+    if (observed) {
+      age = Math.max(0, (now - observed.getTime()) / 1000);
+    }
   }
   if (age === null) return false;
   const headerBound = typeof reading.bound === "number" && Number.isFinite(reading.bound) && reading.bound > 0
