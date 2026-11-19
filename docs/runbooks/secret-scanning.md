@@ -291,9 +291,11 @@ encoded component. It ends where its whitespace-, quote- or angle-bracket-
 delimited run ends, less trailing prose punctuation and backticks. The span
 covers the path and may also cover a glued neighbour.
 
-The scanner reads Markdown link destinations and inline code as separate
-parts. It splits URI authorities, paths, queries and fragments before testing
-path components against the bounded roots. URI components follow [RFC 3986].
+The scanner reads balanced Markdown link destinations and inline code as
+separate parts. Escaped delimiters stay in their current part, and incomplete
+destinations stay in the surrounding text. It splits URI authorities, paths,
+queries and fragments before testing path components against the bounded
+roots. URI components follow [RFC 3986].
 The scanner reads query separators before percent-decoding a value once. If
 the decoded value contains a host path, the finding starts at the original
 encoded value so the sanitizer can remove it.
@@ -302,7 +304,8 @@ encoded value so the sanitizer can remove it.
   boundary. A dot after a root still counts, as in `/tmp.backup`. A file URI
   may contain an authority, an empty authority or extra slashes.
 - A valid non-file URI authority is outside the path. A root-shaped host or
-  an ordinary remote path can appear in a URL-valued parameter. A malformed
+  an ordinary remote path can appear in a URL-valued parameter. The scanner
+  stops at query and joined-reference separators. An ambiguous or malformed
   authority keeps the conservative local path checks.
 - Dot-relative paths use whole root segments. `../home/x` counts.
   `../home.md`, `./docs/x` and `../guide.md` stay clear. An absolute path

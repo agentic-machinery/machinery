@@ -130,9 +130,10 @@ def test_sanitize_document_strips_embedded_remote_capsule() -> None:
 def test_middleware_strips_paths_that_a_bare_route_would_leak() -> None:
     encoded = "/api/fixture?path=%2F%68ome%2Ffixture%2Fx&view=1"
     public = "/api/fixture?url=https://tmp/home/guide"
+    joined = "/api/fixture?url=https://fixture.example&path=/home/fixture/x"
 
     def leak() -> dict[str, str]:
-        return {"repo_root": PLANTED_PATH, "encoded": encoded, "public": public}
+        return {"repo_root": PLANTED_PATH, "encoded": encoded, "public": public, "joined": joined}
 
     bare = FastAPI()
     bare.get("/synthetic")(leak)
@@ -140,6 +141,7 @@ def test_middleware_strips_paths_that_a_bare_route_would_leak() -> None:
     assert leaked["repo_root"] == PLANTED_PATH
     assert leaked["encoded"] == encoded
     assert leaked["public"] == public
+    assert leaked["joined"] == joined
     assert any(finding.kind == "filesystem-root" for finding in scan_body(leaked))
 
     guarded = FastAPI()
@@ -150,6 +152,7 @@ def test_middleware_strips_paths_that_a_bare_route_would_leak() -> None:
     assert sanitized["repo_root"] == REDACTED_ABSOLUTE_PATH
     assert sanitized["encoded"] == f"/api/fixture?path={REDACTED_ABSOLUTE_PATH}"
     assert sanitized["public"] == public
+    assert sanitized["joined"] == f"/api/fixture?url=https://fixture.example&path={REDACTED_ABSOLUTE_PATH}"
     assert scan_body(sanitized) == []
 
 

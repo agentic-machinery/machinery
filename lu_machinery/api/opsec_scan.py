@@ -73,10 +73,17 @@ _PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
 _PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
 # Delimit scan parts independently of the wider redaction span. A comma or
 # semicolon can join references in prose as well as form part of a path.
-_MARKUP_RE = re.compile(r"`+|(?<!\\)\]\(|[()]")
-_PART_END_RE = re.compile(r"[?#&=]|[,;](?=\.{0,2}/)|(?<![A-Za-z0-9])(?=(?i:file):)")
-_AUTHORITY_END_RE = re.compile(r"[/#?`]|[,;](?=(?i:file):)")
-_SCHEME_RE = re.compile(r"[.!+\[:]*(?P<name>[A-Za-z][A-Za-z0-9+.-]*):")
+_MARKUP_RE = re.compile(r"`+|[\[\]()]")
+_BACKTICKS_RE = re.compile(r"`+")
+_URI_LEAD = r"[.!+\[:]*"
+_URI_SCHEME = r"[A-Za-z][A-Za-z0-9+.-]*"
+_FILE_SCHEME_BOUNDARY = r"(?<![A-Za-z0-9])(?=(?i:file):)"
+_DOT_PATH_JOIN = r"[^.\w~%+@$/-](?=\.{1,2}/)"
+_REFERENCE_BOUNDARY = rf"[?#&=]|[,;](?=/|{_URI_LEAD}{_URI_SCHEME}:)|{_DOT_PATH_JOIN}|{_FILE_SCHEME_BOUNDARY}"
+_PART_END_RE = re.compile(_REFERENCE_BOUNDARY)
+_AUTHORITY_END_RE = re.compile(rf"[/`]|{_REFERENCE_BOUNDARY}")
+_FILE_AUTHORITY_END_RE = re.compile(rf"[/?#`]|[,;](?=(?i:file):)|{_FILE_SCHEME_BOUNDARY}")
+_SCHEME_RE = re.compile(rf"{_URI_LEAD}(?P<name>{_URI_SCHEME}):")
 _AUTHORITY_RE = re.compile(
     r"(?:[A-Za-z0-9._~!$%&'()*+,;=:-]*@)?"
     r"(?:\[(?P<literal>[^\[\]]+)\]|[A-Za-z0-9._~!$%&'()*+,;=-]+)"
@@ -400,7 +407,11 @@ def _trim_end(text: str, start: int, end: int) -> int:
 
 
 def _valid_authority(text: str, start: int, end: int) -> bool:
-    """Accept only RFC 3986 authority syntax before treating a URI as remote."""
+    """Allow the remote-path exemption only for an unambiguous authority."""
+    # RFC 3986 sub-delimiters and an empty port are legal here, but a trailing
+    # one can also separate an authority-only URL from a local path in prose.
+    if end > start and text[end - 1] in "!$&'()*+,;=:":
+        return False
     match = _AUTHORITY_RE.fullmatch(text, start, end)
     if match is None or _BAD_ESCAPE_RE.search(text, start, end):
         return False
@@ -416,25 +427,46 @@ def _valid_authority(text: str, start: int, end: int) -> bool:
 
 def _markup_parts(text: str, start: int, end: int) -> Iterable[tuple[int, int]]:
     """Yield prose, inline code contents and Markdown destinations as parts."""
-    link_depth = code_ticks = 0
+    last_ticks = {len(match.group()): match.start() for match in _BACKTICKS_RE.finditer(text, start, end)}
+    labels = depth = code_ticks = 0
+    destination: int | None = None
     for match in _MARKUP_RE.finditer(text, start, end):
         marker = match.group()
-        if marker.startswith("`"):
-            if code_ticks and code_ticks != len(marker):
-                continue
-            code_ticks = 0 if code_ticks else len(marker)
-        elif code_ticks:
+        if code_ticks:
+            if marker.startswith("`") and len(marker) == code_ticks:
+                yield start, match.start()
+                start = match.end()
+                code_ticks = 0
             continue
-        elif marker == "](" and not link_depth:
-            link_depth = 1
-        elif link_depth:
-            link_depth += -1 if marker == ")" else 1
-            if link_depth:
-                continue
-        else:
+
+        escape = match.start()
+        while escape > start and text[escape - 1] == "\\":
+            escape -= 1
+        if (match.start() - escape) % 2:
             continue
-        yield start, match.start()
-        start = match.end()
+
+        # Keep an unterminated destination in the surrounding prose so it
+        # cannot lose any conservative path checks from that part.
+        if destination is not None:
+            if marker == "(":
+                depth += 1
+            elif marker == ")":
+                depth -= 1
+                if depth == 0:
+                    yield start, destination
+                    yield destination + 2, match.start()
+                    start = match.end()
+                    destination = None
+        elif marker.startswith("`") and last_ticks[len(marker)] != match.start():
+            yield start, match.start()
+            start = match.end()
+            code_ticks = len(marker)
+        elif marker == "[":
+            labels += 1
+        elif marker == "]" and labels:
+            labels -= 1
+            if text.startswith("(", match.end(), end):
+                destination = match.start()
     yield start, end
 
 
@@ -462,18 +494,13 @@ def _path_root(
             text, root.end(), end
         ):
             return position
-        if _BARE_NAME_RE.match(text, root.end(), end):
+        if dot_relative or _BARE_NAME_RE.match(text, root.end(), end):
             continue
         if absolute and position == first and not remote:
             return position
         if position > start:
             previous = text[position - 1]
             if previous == "/" or (previous.isascii() and previous.isalnum()):
-                continue
-            if dot_relative and previous == "." and any(
-                offset >= start and _DOT_SEGMENT_RE.match(text, offset, position + 1)
-                for offset in (position - 2, position - 1)
-            ):
                 continue
             return position
     return None
@@ -500,18 +527,22 @@ def _path_root_in_part(
         path_start = scheme.end() if scheme is not None else start
         file_uri = scheme is not None and scheme.group("name").lower() == "file"
         remote = False
-        nested_file = None
+        file_join = None
         has_authority = scheme is not None and text.startswith("//", path_start, end)
         if has_authority:
             authority_start = path_start + 2
-            authority_end = _AUTHORITY_END_RE.search(text, authority_start, end)
+            boundary = _FILE_AUTHORITY_END_RE if file_uri else _AUTHORITY_END_RE
+            authority_end = boundary.search(text, authority_start, end)
             path_start = authority_end.start() if authority_end else end
             remote = not file_uri and _valid_authority(
                 text, authority_start, path_start
             )
-            if (path_start - authority_start == 5 and text[authority_start:path_start].lower() == "file:"
-                and text.startswith("//", path_start, end)):
-                nested_file = authority_start
+            if file_uri:
+                # A file authority can contain sub-delimiters. Check its
+                # local path first, then inspect any earlier joined values.
+                join = _PART_END_RE.search(text, authority_start, end)
+                if join is not None and join.start() < path_start:
+                    file_join = join
 
         # A file scheme at the cursor has already been consumed. A later
         # zero-width delimiter starts another URI without discarding its scheme.
@@ -583,15 +614,14 @@ def _path_root_in_part(
             ):
                 return scheme.start("name")
             return root
-        if nested_file is not None:
-            start = nested_file
-            continue
+        if file_join is not None:
+            separator = file_join
         if separator is None:
             break
         delimiter = separator.group()
         if delimiter == "#" and api_reference:
             value_context = "api-fragment"
-        elif delimiter in ("?", "#") and value_context is None and (scheme is not None or part_end > start):
+        elif value_context is None and (delimiter == "?" or (delimiter == "#" and part_end > start)):
             value_context = "value"
         start = separator.end()
     return None
