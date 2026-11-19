@@ -9,13 +9,15 @@ window back to the first record.
 Writers: the dispatcher appends a row each time it writes a settled record (``record_settled``; the last row
 of a task id wins, so the final update decides), and ``backfill`` adds a row for every settled record that has
 none. Both hold ``rows.lock``; neither ever changes a task record. Rows carry labels, counts, timestamps, PR
-numbers and commit SHAs only: no prompt, body, error text, account identity or host path.
+numbers and commit SHAs only, plus, for an unparsed review reply, its typed ``unparsed_reason`` and up to 200
+escaped characters of that reply: no prompt, parsed body, error text, account identity or host path.
 """
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -24,6 +26,7 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -33,14 +36,17 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
+from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, normalize_verdict
 from lu_machinery.model_families import canonical_cursor_model
+from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
 from lu_machinery.review.verdict_parser import checked_findings_payload
+from lu_machinery.secret_redactor import redact_text
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
 _JSON_MAX_DEPTH = 128
@@ -50,10 +56,24 @@ ROWS_DIR = "model-stats"
 ROWS_FILE = "rows.jsonl"
 LOCK_FILE = "rows.lock"
 MAX_RESULT_BYTES = 4 * 1024 * 1024
+MAX_DIGEST_STREAM_BYTES = 256 * 1024 * 1024
+MAX_SAMPLE_CHARS = 200
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
+UNPARSED_REASONS = ("missing_result", "too_big", "bad_format", "bad_fields")
 _RECORDED_VERDICTS = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
+_ESCAPE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_NAMED_ESCAPES = {"\n": r"\n", "\r": r"\r", "\t": r"\t"}
+_FIELD_CONTRACT_ERRORS = (
+    "review_root_must_be_object",
+    "schema_violation:",
+    "duplicate_finding_ids",
+    "invalid_line_range:",
+    "review_envelope_verdict_mismatch",
+    "review_envelope_invalid_verdict:",
+)
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 UNSET = "unset"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
@@ -210,59 +230,243 @@ def role_of(record: Mapping[str, Any]) -> str:
     return "review" if mode == "read-only" or "review" in str(record.get("task_id", "")) else "write"
 
 
-def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Verdict and finding priorities from the record's adjacent ``.result`` sidecar, else None."""
-    declared = record.get("result_file")
-    name = Path(declared).name if isinstance(declared, str) and declared else f"{path.stem}.result"
-    if not name.endswith(".result"):
-        return None
+@lru_cache(maxsize=1)
+def _fleet_repo_visibility() -> tuple[frozenset[str], dict[str, str], str | None]:
+    """(public_keys, github_slug_to_key, default_key); fail closed to empty when unreadable."""
     try:
-        fd = os.open(path.with_name(name), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
+        repos = load_fleet_repos()
+    except Exception:  # fail closed: an unreadable repo catalog admits no reply samples
+        return frozenset(), {}, None
+    public_keys = frozenset(key for key, repo in repos.items() if repo.role.startswith("public-"))
+    by_github = {repo.github.lower(): key for key, repo in repos.items()}
+    default_key = next((key for key, repo in repos.items() if repo.default), None)
+    return public_keys, by_github, default_key
+
+
+@lru_cache(maxsize=1)
+def _public_data_classes() -> frozenset[str]:
+    """Exact catalogued public data classes (``store: true``); fail closed to empty when unreadable."""
+    catalog = _catalog()
+    models = catalog.get("models") if isinstance(catalog, Mapping) else None
+    if not isinstance(models, Mapping):
+        return frozenset()
+    admitted: set[str] = set()
+    for info in models.values():
+        classes = info.get("data_classes") if isinstance(info, Mapping) else None
+        if isinstance(classes, Mapping):
+            admitted.update(
+                name for name, allowed in classes.items()
+                if isinstance(name, str) and allowed is True
+            )
+    return frozenset(admitted)
+
+
+def _repo_is_public(repo: object) -> bool:
+    public_keys, _, _ = _fleet_repo_visibility()
+    return isinstance(repo, str) and repo in public_keys
+
+
+def _record_allows_sample(record: Mapping[str, Any]) -> bool:
+    """Whether a failing reply from ``record`` may give a bounded stats sample (exact allowlists, fail closed)."""
+    public_keys, by_github, default_key = _fleet_repo_visibility()
+    if not public_keys:
+        return False
+    options = _options(record)
+    declared_repos = [value for value in (record.get("repo"), options.get("repo")) if value is not None]
+    resolved_repo: str | None = None
+    for value in declared_repos:
+        if not isinstance(value, str) or value not in public_keys:
+            return False
+        if resolved_repo is not None and value != resolved_repo:
+            return False
+        resolved_repo = value
+    slugs = [
+        value for value in (
+            record.get("repository"), record.get("repository_id"),
+            options.get("repository"), options.get("repository_id"),
+        )
+        if value is not None
+    ]
+    for slug in slugs:
+        if not isinstance(slug, str):
+            return False
+        slug_key = by_github.get(slug.strip().lower())
+        if slug_key is None or slug_key not in public_keys:
+            return False
+        if resolved_repo is not None and slug_key != resolved_repo:
+            return False
+        resolved_repo = slug_key
+    if resolved_repo is None and default_key not in public_keys:
+        return False
+    declared_classes = [value for value in (record.get("data_class"), options.get("data_class")) if value is not None]
+    if declared_classes:
+        public_classes = _public_data_classes()
+        if not public_classes:
+            return False
+        first_class: str | None = None
+        for value in declared_classes:
+            if not isinstance(value, str) or value not in public_classes:
+                return False
+            if first_class is not None and value != first_class:
+                return False
+            first_class = value
+    return True
+
+
+def _needs_escape(ch: str) -> bool:
+    return ch in _NAMED_ESCAPES or unicodedata.category(ch) in _ESCAPE_CATEGORIES
+
+
+def _escape_char(ch: str) -> str:
+    if ch in _NAMED_ESCAPES:
+        return _NAMED_ESCAPES[ch]
+    code = ord(ch)
+    if code < 0x100:
+        return f"\\x{code:02x}"
+    if code < 0x10000:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def _escape_sample(prefix: str) -> str:
+    parts: list[str] = []
+    used = 0
+    for ch in prefix:
+        piece = _escape_char(ch) if _needs_escape(ch) else ch
+        if used + len(piece) > MAX_SAMPLE_CHARS:
+            break
+        parts.append(piece)
+        used += len(piece)
+    return "".join(parts)
+
+
+def _sample_text_cleared(text: str) -> bool:
+    """Reject samples carrying OPSEC tokens (paths, IPs, emails, SSH) or secret/credential patterns."""
+    return not scan_text(text) and redact_text(text) == text
+
+
+def _sample(raw: bytes) -> str | None:
+    """First ``MAX_SAMPLE_CHARS`` escaped characters of a failing reply when cleared for stats, else None."""
+    # At most 4 UTF-8 bytes per character; read a bounded prefix so a 4 MB+ reply is never decoded whole.
+    prefix = raw[: MAX_SAMPLE_CHARS * 4].decode("utf-8", errors="replace")[:MAX_SAMPLE_CHARS]
+    escaped = _escape_sample(prefix)
+    if not _sample_text_cleared(prefix) or not _sample_text_cleared(escaped):
         return None
+    return escaped
+
+
+def _unparsed(reason: str, sample: str | None = None) -> dict[str, Any]:
+    return {"verdict": "unparsed", "priorities": None, "unparsed_reason": reason, "unparsed_sample": sample}
+
+
+def _sidecar_path(path: Path, record: Mapping[str, Any]) -> Path | None:
+    """Derive the owning ``.result`` sidecar from ``path.stem`` and reject conflicting/malformed declarations."""
+    expected_name = f"{path.stem}.result"
+    declared = record.get("result_file")
+    if declared is not None:
+        if not isinstance(declared, str) or not declared.endswith(".result"):
+            return None
+        declared_name = Path(declared).name
+        if declared_name != expected_name:
+            task_id = record.get("task_id")
+            stamped_archive = (
+                isinstance(task_id, str)
+                and path.stem.startswith(f"{task_id}.")
+                and path.stem.endswith(".archived")
+                and declared_name == f"{task_id}.result"
+            )
+            if not stamped_archive:
+                return None
+    return path.with_name(expected_name)
+
+
+def _digest_matches(initial: bytes, stream: Any, expected: str) -> bool | None:
+    """Whether the whole sidecar hashes to ``expected``, read in bounded chunks; None past the digest cap."""
+    hasher = hashlib.sha256(initial)
+    total = len(initial)
+    while chunk := stream.read(65536):
+        total += len(chunk)
+        if total > MAX_DIGEST_STREAM_BYTES:
+            return None
+        hasher.update(chunk)
+    return hasher.hexdigest() == expected
+
+
+def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
+    """Verdict and finding priorities from the record's bound ``.result`` sidecar, or a typed unparsed cause.
+
+    Only a regular file, opened without following a link, whose bytes match the record's ``result_sha256`` (when
+    declared) is a result. Anything else (absent, a symlink, directory, socket or FIFO, unreadable, replaced bytes)
+    is ``missing_result`` with no sample. A reply past the digest cap is ``too_big`` with no sample.
+    """
+    sidecar = _sidecar_path(path, record)
+    expected = record.get("result_sha256")
+    if sidecar is None or (expected is not None and not (isinstance(expected, str) and _SHA256.fullmatch(expected))):
+        return _unparsed("missing_result")
+    try:
+        fd = os.open(sidecar, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return _unparsed("missing_result")
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return _unparsed("missing_result")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read(MAX_RESULT_BYTES + 1)
+            verified = True if expected is None else _digest_matches(raw, stream, expected)
     except OSError:
-        return None
+        return _unparsed("missing_result")
     finally:
         os.close(fd)
+    if verified is False:
+        return _unparsed("missing_result")
+    allow_sample = verified is True and _record_allows_sample(record)
     if len(raw) > MAX_RESULT_BYTES:
-        return None
-    return review_summary(raw)
+        return _unparsed("too_big", _sample(raw) if allow_sample else None)
+    return review_summary(raw, allow_sample=allow_sample)
 
 
-def _recorded_review(verdict: object) -> dict[str, Any]:
+def _recorded_review(verdict: object) -> dict[str, Any] | None:
     """A structured verdict record does not attest a findings count."""
     try:
         return {"verdict": _RECORDED_VERDICTS[normalize_verdict(verdict)], "priorities": None}
     except ReviewPublicationError:
-        return {"verdict": "unparsed", "priorities": None}
+        return None
 
 
-def review_summary(raw: bytes) -> dict[str, Any]:
-    """Read structured review output through the review contract, retaining only counts and the verdict."""
-    unparsed: dict[str, Any] = {"verdict": "unparsed", "priorities": {}}
+def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
+    """Read structured review output through the review contract, retaining only counts, verdict, or parse cause."""
+    def fail(reason: str) -> dict[str, Any]:
+        return _unparsed(reason, _sample(raw) if allow_sample else None)
+
     try:
-        payload = parse_reviewer_json(raw.decode("utf-8"))
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return fail("bad_format")
+    try:
+        payload = parse_reviewer_json(text)
+    except ContractError as exc:
+        reason = "bad_fields" if str(exc).startswith(_FIELD_CONTRACT_ERRORS) else "bad_format"
+        return fail(reason)
+    except (ValueError, RecursionError, TypeError):
+        return fail("bad_format")
+    try:
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
             return {"verdict": _RECORDED_VERDICTS[decision], "priorities": dict(counts)}
         if "verdict" in payload and "overall" not in payload and "schema_version" not in payload:
-            return _recorded_review(payload["verdict"])
-    except (ContractError, ReviewPublicationError, UnicodeDecodeError, ValueError, RecursionError, TypeError, KeyError):
-        return unparsed
+            recorded = _recorded_review(payload["verdict"])
+            return recorded if recorded is not None else fail("bad_fields")
+    except (ContractError, ReviewPublicationError, ValueError, RecursionError, TypeError, KeyError):
+        return fail("bad_fields")
     # Older dispatches also recorded the unversioned correctness and priority fields.
     if "schema_version" in payload:
-        return unparsed
+        return fail("bad_fields")
     overall = payload.get("overall")
     verdict = overall.get("correctness") if isinstance(overall, dict) else None
     findings = payload.get("findings", [])
     if verdict not in VERDICTS[:3] or not isinstance(findings, list):
-        return unparsed
+        return fail("bad_fields")
     priorities: Counter[str] = Counter(
         finding["priority"] for finding in findings
         if isinstance(finding, dict) and finding.get("priority") in PRIORITIES)
@@ -271,9 +475,9 @@ def review_summary(raw: bytes) -> dict[str, Any]:
 
 def _review(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
     reply = _result(path, record)
-    if reply and reply["verdict"] != "unparsed":
+    if reply["verdict"] != "unparsed":
         return reply
-    return _recorded_review(record.get("verdict"))
+    return _recorded_review(record.get("verdict")) or reply
 
 
 def _reading(value: object) -> dict[str, float] | str:
@@ -332,6 +536,8 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     pr = record.get("pr", options.get("pr"))
     head = record.get("pinned_head") or options.get("pinned_head") or record.get("worktree_base_ref")
     author = record.get("review_author_model") or options.get("review_author_model")
+    raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
+    repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     fresh, cached, output = tokens(record.get("usage"))
     return {
         "schema": ROW_SCHEMA,
@@ -348,7 +554,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
         "allowance": _allowance(record),
         "review": _review(path, record) if role == "review" and status == "done" else None,
-        "repo": label(record.get("repo") or options.get("repo"), "public"),
+        "repo": repo,
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
         "pinned_head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
         "author_model": model_id(author) if author else None,
@@ -479,6 +685,42 @@ def _sha(value: object) -> bool:
     return isinstance(value, str) and _SHA.fullmatch(value) is not None
 
 
+def _sample_ok(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_SAMPLE_CHARS
+        and not any(_needs_escape(ch) for ch in value)
+        and _sample_text_cleared(value)
+    )
+
+
+def _review_ok(review: object, *, role: object, status: object, repo: object) -> bool:
+    if review is None:
+        return True
+    if role != "review" or status != "done" or not isinstance(review, dict):
+        return False
+    verdict = review.get("verdict")
+    if not isinstance(verdict, str) or verdict not in VERDICTS:
+        return False
+    priorities = review.get("priorities")
+    if not _optional(priorities, lambda p: isinstance(p, dict)
+                     and all(k in PRIORITIES and _count_value(n) for k, n in p.items())):
+        return False
+    if review.keys() == {"verdict", "priorities"}:
+        return True
+    if verdict != "unparsed" or priorities is not None or review.keys() != {
+        "verdict", "priorities", "unparsed_reason", "unparsed_sample",
+    }:
+        return False
+    reason = review["unparsed_reason"]
+    sample = review["unparsed_sample"]
+    if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
+        return False
+    if reason == "missing_result" or not _repo_is_public(repo):
+        return sample is None
+    return _optional(sample, _sample_ok)
+
+
 def _well_formed(row: Mapping[str, Any]) -> bool:
     """Whether every nested value has the shape ``summary_row`` writes; a damaged row is skipped, never trusted."""
     tokens_ = row.get("tokens")
@@ -493,10 +735,7 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
-        _optional(review, lambda r: isinstance(r, dict) and r.keys() == {"verdict", "priorities"}
-                  and isinstance(r["verdict"], str) and r["verdict"] in VERDICTS
-                  and _optional(r["priorities"], lambda priorities: isinstance(priorities, dict)
-                                and all(p in PRIORITIES and _count_value(n) for p, n in priorities.items()))),
+        _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo")),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -556,28 +795,24 @@ def _settled_records(tasks_dir: Path, counts: Counter[str]) -> Iterator[tuple[Pa
 
 
 def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> bool:
-    """Refresh missing or older rows, or reprocess a review whose retained evidence yields a better summary."""
+    """Refresh missing or older rows, or a row of the same record version that its sidecar no longer supports.
+
+    A row shows only what its record and sidecar prove when it is written: nothing is carried over from a stored
+    row, so a sidecar that is gone, replaced or unreadable now yields the row it yields on its own.
+    """
     if present is None:
         return True
     stored = present.get("source_mtime_ns")
     source = candidate["source_mtime_ns"]
     if not isinstance(stored, int) or stored < source:
         return True
-    review = candidate["review"]
-    old_review = present.get("review")
-    return (
-        stored == source
-        and review is not None and review["verdict"] != "unparsed"
-        and (review["priorities"] is not None or old_review is None or old_review["priorities"] is None
-             or old_review["verdict"] == "unparsed")
-        and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
-    )
+    return stored == source and any(present.get(key) != candidate[key] for key in ("review", "effort", "pinned_head"))
 
 
 def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -> dict[str, int]:
     """Add a row for every settled record without a current one; idempotent. Records are read outside the lock.
 
-    A new last line supersedes an older record version or a review summary improved by retained evidence.
+    A new last line supersedes an older record version, or a row whose review its record's sidecar no longer gives.
     """
     counts: Counter[str] = Counter()
     candidates: list[dict[str, Any]] = []
@@ -642,7 +877,9 @@ def _parser() -> argparse.ArgumentParser:
             "Outputs: appends missing rows to <batch-state-dir>/model-stats/rows.jsonl (atomic replace under\n"
             "rows.lock) and prints one JSON object of counts (settled_records, added, refreshed, already_present,\n"
             "unreadable, duplicate_task_ids, active_or_foreign; would_add and would_refresh with --dry-run).\n"
-            "A refreshed row replaces one taken from an older version of its record. Task records are never changed.\n\n"
+            "A refreshed row replaces one taken from an older version of its record, or one whose review the\n"
+            "record's sidecar no longer gives (rows carry nothing over from the stored row). Task records are never\n"
+            "changed.\n\n"
             "Exit codes: 0 rows written or nothing to add; 1 the task store or the rows file could not be used.\n\n"
             "Related: lu_machinery/api/model_stats_router.py, docs/runbooks/model-stats.md, issue #581."
         ),

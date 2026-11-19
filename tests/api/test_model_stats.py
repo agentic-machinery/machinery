@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -122,6 +124,10 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert review["tasks"] == 3 and "landed" not in review
     # r3's malformed reply is visible in the missing-verdict count, despite having no PR.
     assert review["verdicts"] == {"correct": 1, "incorrect": 1, "uncertain": 0, "unparsed": 1}
+    assert review["unparsed_reasons"] == {
+        "missing_result": 0, "too_big": 0, "bad_format": 0, "bad_fields": 1, "not_done": 0, "unknown": 0,
+    }
+    assert review["unparsed_samples"] == {"bad_fields": '{"overall": {"correctness": "incorrect"}, "findings": 1}'}
     assert review["blocking_per_review"]["value"] == 1.0 and review["p0_p2_per_review"]["value"] == 1.5
     assert review["by_class"][0]["class"] == "code/medium"
 
@@ -133,6 +139,180 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert author["blocking_per_pr"]["value"] == 2.0 and author["p0_p2_per_pr"]["value"] == 3.0
     assert payload["records"] == 6
     assert _window(batch_state, stats.Landing(), "all")["records"] == 7
+
+    # Split of unparsed reasons, the earliest escaped 200-char sample per model (model total only), archive
+    # binding, the upgrade of a legacy row and fail-closed row validation. Sidecar outcomes: the table test below.
+    u_state, u_tasks = _state(tmp_path / "unparsed_causes")
+    # Conflicting unstamped result_file declaration must never attach another task's sidecar.
+    (u_tasks / "other-secret.result").write_text("OTHER-TASK-REPLY-NEVER-SHOWN", encoding="utf-8")
+    _record(u_tasks, "u-conflict-sidecar-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            started_at=_at(5.05), result_file=str(u_tasks / "other-secret.result"))
+    # Later bad_format reply sits on a different effort and risk class: must not leak via by_effort or by_class.
+    _record(u_tasks, "u-fmt-later-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            effort="medium", review_profile="infra", review_risk="high", started_at=_at(2))
+    (u_tasks / "u-fmt-later-review.result").write_text("later-effort-reply", encoding="utf-8")
+    _record(u_tasks, "u-fmt-first-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            effort="high", review_profile="code", review_risk="medium", started_at=_at(4))
+    (u_tasks / "u-fmt-first-review.result").write_text(
+        "first\n\t\x1b[31m\u202e<script>" + "B" * 240 + "TAIL-BEYOND-200", encoding="utf-8",
+    )
+    _record(u_tasks, "u-fields-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            started_at=_at(3))
+    (u_tasks / "u-fields-review.result").write_text(
+        '{"overall": {"correctness": "maybe"}, "findings": []}', encoding="utf-8",
+    )
+    _record(u_tasks, "u-envelope-fields-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            started_at=_at(2.5))
+    (u_tasks / "u-envelope-fields-review.result").write_text(
+        'VERDICT: APPROVE\nSCORE: 9/10\n\n```json\n{"schema_version": "code-review-findings.v1", "overall": {}}\n```',
+        encoding="utf-8",
+    )
+    # Valid JSON with a non-object root (bare or inside a valid envelope) classifies as bad_fields.
+    assert rows.review_summary(b"[]")["unparsed_reason"] == "bad_fields"
+    assert rows.review_summary(b"VERDICT: APPROVE\nSCORE: 9/10\n\n```json\n[]\n```")["unparsed_reason"] == "bad_fields"
+    # Stamped archive collision: renamed record pairs with its stamped sidecar, never an older unstamped basename.
+    (u_tasks / "archive").mkdir()
+    (u_tasks / "archive" / "u-stamped-review.result").write_text("WRONG-UNSTAMPED-ARCHIVE", encoding="utf-8")
+    stamped_bytes = b"stamped archive reply"
+    (u_tasks / "archive" / "u-stamped-review.20261115T050000Z.archived.result").write_bytes(stamped_bytes)
+    (u_tasks / "archive" / "u-stamped-review.20261115T050000Z.archived.json").write_text(json.dumps({
+        "schema_version": 2, "task_id": "u-stamped-review", "agent": "claude", "model": "claude-opus-5-5",
+        "effort": "high", "mode": "read-only", "status": "done", "started_at": _at(4.5), "finished_at": _at(1),
+        "result_file": str(u_tasks / "u-stamped-review.result"),
+        "result_sha256": hashlib.sha256(stamped_bytes).hexdigest(),
+    }), encoding="utf-8")
+    _record(u_tasks, "u-failed-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            status="failed", started_at=_at(1))
+    # Seed a legacy pre-change unparsed row without unparsed_reason; reader marks it unknown, backfill upgrades it.
+    legacy_path = u_tasks / "u-legacy-review.json"
+    legacy_rec = _record(u_tasks, "u-legacy-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+                         started_at=_at(1.5), duration_s=100)
+    (u_tasks / "u-legacy-review.result").write_text("legacy prose reply", encoding="utf-8")
+    legacy_row = rows.summary_row(legacy_path, legacy_rec, os.stat(legacy_path).st_mtime_ns)
+    assert legacy_row is not None
+    legacy_row["review"] = {"verdict": "unparsed", "priorities": None}
+    rows.append_row(u_state, legacy_row)
+    before_backfill = _row(_window(u_state, stats.Landing()), "claude-opus-5-5", "review")
+    assert before_backfill["verdicts"]["unparsed"] == 1
+    assert before_backfill["unparsed_reasons"]["unknown"] == 1 and before_backfill["unparsed_samples"] == {}
+
+    bf1 = rows.backfill(u_tasks, u_state)
+    assert (bf1["added"], bf1["refreshed"]) == (7, 1)
+    assert rows.backfill(u_tasks, u_state)["refreshed"] == 0
+
+    stored_u = {row["task_id"]: row for row in rows.read_rows(u_state)[0]}
+    assert stored_u["u-legacy-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None,
+        "unparsed_reason": "bad_format", "unparsed_sample": "legacy prose reply",
+    }
+    assert stored_u["u-stamped-review"]["review"]["unparsed_sample"] == "stamped archive reply"
+    assert stored_u["u-conflict-sidecar-review"]["review"] == {
+        "verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None,
+    }
+
+    u_window = _window(u_state, stats.Landing())
+    u_review = _row(u_window, "claude-opus-5-5", "review")
+    assert u_review["verdicts"]["unparsed"] == 8
+    assert u_review["unparsed_reasons"] == {
+        "missing_result": 1, "too_big": 0, "bad_format": 4, "bad_fields": 2, "not_done": 1, "unknown": 0,
+    }
+    assert set(u_review["unparsed_samples"]) == {"bad_format", "bad_fields"}
+    # Samples are emitted only at model total, never on by_effort or by_class subgroups.
+    assert u_review["unparsed_samples"]["bad_format"] == "stamped archive reply"
+    assert all("unparsed_samples" not in item for item in (*u_review["by_effort"], *u_review["by_class"]))
+    assert all("unparsed_samples" not in c for e in u_review["by_effort"] for c in e["by_class"])
+    assert "later-effort-reply" not in json.dumps(u_window)
+    assert "WRONG-UNSTAMPED-ARCHIVE" not in json.dumps(u_window)
+    assert "OTHER-TASK-REPLY-NEVER-SHOWN" not in json.dumps(u_window)
+    fmt_stored = stored_u["u-fmt-first-review"]["review"]["unparsed_sample"]
+    assert fmt_stored.startswith(r"first\n\t\x1b[31m\u202e<script>B")
+    assert "TAIL-BEYOND-200" not in fmt_stored and len(fmt_stored) <= rows.MAX_SAMPLE_CHARS
+    assert u_review["unparsed_samples"]["bad_fields"] == '{"overall": {"correctness": "maybe"}, "findings": []}'
+    page_u = _row(stats.page_window(u_window), "claude-opus-5-5", "review")
+    assert page_u["unparsed_reasons"] == u_review["unparsed_reasons"]
+    assert page_u["unparsed_samples"] == u_review["unparsed_samples"]
+    assert all("unparsed_samples" not in e for e in page_u["by_effort"])
+    # Fail-closed cross-field validation rejects writer-impossible rows.
+    base_row = stored_u["u-legacy-review"]
+    bad_rows = [
+        {**base_row, "role": "write"},
+        {**base_row, "status": "failed"},
+        {**base_row, "repo": "infra-private"},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": {"P0": 1}, "unparsed_reason": "bad_format", "unparsed_sample": "x"}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bogus", "unparsed_sample": None}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": "x"}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "x" * 201}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "raw\nline"}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "bidi\u202e"}},
+        {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "/home/ops/secret"}},
+        {**base_row, "review": {"verdict": "correct", "priorities": {}, "unparsed_reason": "bad_format", "unparsed_sample": None}},
+    ]
+    assert all(not rows._well_formed(bad) for bad in bad_rows)
+
+
+def test_each_sidecar_outcome_yields_one_review_and_never_carries_older_evidence(tmp_path, monkeypatch):
+    """Defect class: retained review evidence outliving the current sidecar, so a verdict or reply sample read
+    from an earlier sidecar survives a sidecar that is now absent, a link, a special file, unreadable or replaced."""
+    batch_state, tasks = _state(tmp_path)
+    monkeypatch.setattr(rows, "MAX_RESULT_BYTES", 128)
+    monkeypatch.setattr(rows, "MAX_DIGEST_STREAM_BYTES", 256)  # a sample comes from the 129 bytes read
+    body, big, huge = b"prose reply, not JSON", b"BIG\n" + b"A" * 156, b"HUGE\n" + b"A" * 300
+    gone = {"verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None}
+
+    def sampled(reason: str, sample: str | None) -> dict:
+        return {"verdict": "unparsed", "priorities": None, "unparsed_reason": reason, "unparsed_sample": sample}
+
+    def unreadable(path: Path) -> None:
+        path.write_bytes(body)
+        path.chmod(0)
+
+    def link(path: Path) -> None:
+        path.with_name(f"{path.name}.target").write_bytes(body)
+        path.symlink_to(f"{path.name}.target")
+
+    parsed = json.dumps({"overall": {"correctness": "incorrect"}, "findings": [{"id": "F1", "priority": "P1"}]})
+    # outcome: (what replaces the first readable sidecar, record fields, the one review that outcome yields)
+    table = {
+        "absent": (lambda p: None, {}, gone),
+        "absent-recorded-verdict": (lambda p: None, {"verdict": "CHANGES_REQUESTED"},
+                                    {"verdict": "incorrect", "priorities": None}),
+        "regular": (lambda p: p.write_bytes(b"another prose reply"), {}, sampled("bad_format", "another prose reply")),
+        "regular-parsed": (lambda p: p.write_text(parsed), {}, {"verdict": "incorrect", "priorities": {"P1": 1}}),
+        "symlink": (link, {}, gone),
+        "directory": (lambda p: p.mkdir(), {}, gone),
+        "socket": (lambda p: os.mknod(p, stat.S_IFSOCK | 0o600), {}, gone),
+        "fifo": (os.mkfifo, {}, gone),
+        "unreadable": (unreadable, {}, gone),
+        "replaced-bytes": (lambda p: p.write_bytes(b"replacement"), {"result_sha256": hashlib.sha256(body).hexdigest()},
+                           gone),
+        "too-big": (lambda p: p.write_bytes(big), {}, sampled("too_big", r"BIG\n" + "A" * 125)),
+        "too-big-digested": (lambda p: p.write_bytes(big), {"result_sha256": hashlib.sha256(big).hexdigest()},
+                             sampled("too_big", r"BIG\n" + "A" * 125)),
+        "digest-cap": (lambda p: p.write_bytes(huge), {"result_sha256": hashlib.sha256(huge).hexdigest()},
+                       sampled("too_big", None)),
+    }
+    for outcome, (_, fields, _) in table.items():
+        _record(tasks, f"{outcome}-review", mode="read-only", **fields)
+        (tasks / f"{outcome}-review.result").write_bytes(body)
+    rows.backfill(tasks, batch_state)
+    earlier = {row["task_id"]: row["review"] for row in rows.read_rows(batch_state)[0]}
+    assert earlier["absent-review"] == sampled("bad_format", "prose reply, not JSON")  # evidence that could be kept
+    for outcome, (replace, _, _) in table.items():
+        sidecar = tasks / f"{outcome}-review.result"
+        sidecar.unlink()
+        replace(sidecar)
+    # The same record version, then a rewritten one: both show only what the current sidecar proves.
+    rows.backfill(tasks, batch_state)
+    same_version = {row["task_id"]: row["review"] for row in rows.read_rows(batch_state)[0]}
+    for outcome in table:
+        record = json.loads((tasks / f"{outcome}-review.json").read_text())
+        store.replace({**record, "duration_s": 7}, tasks / f"{outcome}-review.json")
+    rewritten = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+    for outcome, (_, _, expected) in table.items():
+        assert (outcome, same_version[f"{outcome}-review"]) == (outcome, expected)
+        assert (outcome, rewritten[f"{outcome}-review"]["review"]) == (outcome, expected)
+        assert rewritten[f"{outcome}-review"]["duration_s"] == 7.0
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 0
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -185,7 +365,8 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     """Defect class: data leak of prompts, result bodies, host paths, errors, task ids or account identities."""
     batch_state, tasks = _state(tmp_path)
     secrets = ["PROMPT-TEXT-x1", "/home/leaky/worktree", "kk", "ERROR-DETAIL-x2", "EXPLANATION-x3",
-               "finding body 0", "/srv/private/model", "../escape", "acct-identity@example.invalid"]
+               "finding body 0", "/srv/private/model", "../escape", "acct-identity@example.invalid",
+               "PRIVATE-BRIEF-x5", "INVALID-REPO-x6", "UNKNOWN-CLASS-x7", "AFTER-200-DIFF-TEXT-x9"]
     _record(tasks, "leaky", prompt="PROMPT-TEXT-x1", prompt_file="/home/leaky/worktree/prompt.md",
             worktree_path="/home/leaky/worktree", claude_account="kk", error="ERROR-DETAIL-x2",
             research_task_family="../escape", allowance={"pool": "claude:kk", "start": {"remaining_pct": 50},
@@ -197,6 +378,26 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     payload = json.loads(result.read_text())
     payload["overall"]["explanation"] = "EXPLANATION-x3"
     result.write_text(json.dumps(payload))
+    # Private-repo, invalid-repo, unknown-data-class, and OPSEC-bearing replies suppress the sample (F1).
+    _record(tasks, "unparsed-private-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="infra-private", started_at=_at(5))
+    (tasks / "unparsed-private-review.result").write_text("PRIVATE-BRIEF-x5 quoted line", encoding="utf-8")
+    _record(tasks, "unparsed-invalid-repo-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="/srv/private/repo", started_at=_at(4.5))
+    (tasks / "unparsed-invalid-repo-review.result").write_text("INVALID-REPO-x6 quoted line", encoding="utf-8")
+    _record(tasks, "unparsed-bad-class-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="public", data_class="public-unadmitted", started_at=_at(4))
+    (tasks / "unparsed-bad-class-review.result").write_text("UNKNOWN-CLASS-x7 quoted line", encoding="utf-8")
+    _record(tasks, "unparsed-opsec-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="public", started_at=_at(3))
+    (tasks / "unparsed-opsec-review.result").write_text(
+        "failed for acct-identity@example.invalid in /home/leaky/worktree", encoding="utf-8",
+    )
+    _record(tasks, "unparsed-public-review", mode="read-only", agent="claude", model="claude-opus-5-5",
+            repo="public", data_class="public-code", started_at=_at(2))
+    (tasks / "unparsed-public-review.result").write_text(
+        "UNPARSED-PREFIX-x4 " + "z" * 220 + "AFTER-200-DIFF-TEXT-x9", encoding="utf-8",
+    )
     rows.backfill(tasks, batch_state)
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
     ctx = SimpleNamespace(roots=SimpleNamespace(batch_state_dir=batch_state, live_repo_root=tmp_path))
@@ -209,6 +410,8 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     metrics = generate_latest(registry).decode()
 
     assert [s for s in secrets if s in stored + text + metrics] == []
+    assert "UNPARSED-PREFIX-x4" in text and "UNPARSED-PREFIX-x4" not in metrics
+    assert "UNPARSED-PREFIX-x4" not in json.dumps(snapshot["metrics"])
     assert [t for t in ("leaky", "odd-model") if t in metrics] == []
     assert '"model": "unknown"' in text and '{effort="high",model="unknown",role="write",window="7d"} 1.0' in metrics
     assert snapshot["windows"]["7d"]["allowance"] == []  # an API-key label is no admitted pool
@@ -504,6 +707,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
                for model in page["models"] for effort in model["by_effort"] for key in dropped)
     html = machinery_path("api/dashboards/model-stats.html").read_text()
     assert "view=page" in html and "not enough data yet" in html and "Best value" in html
+    assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
@@ -590,9 +794,18 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     review = _row(window, "claude-opus-5-5", "review")
     assert review["tasks"] == 2
     assert review["verdicts"] == {"correct": 1, "incorrect": 0, "uncertain": 0, "unparsed": 1}
+    assert review["unparsed_reasons"] == {
+        "missing_result": 0, "too_big": 0, "bad_format": 1, "bad_fields": 0, "not_done": 0, "unknown": 0,
+    }
+    assert review["unparsed_samples"] == {"bad_format": "Looks fine to me."}
     assert review["approve_rate"] == {"value": 1.0, "n": 1, "low_sample": True}
     assert review["blocking_per_review"]["value"] == 0.0
-    assert _row(window, "grok-4.7", "review")["verdicts"]["unparsed"] == 1
+    grok = _row(window, "grok-4.7", "review")
+    assert grok["verdicts"]["unparsed"] == 1
+    assert grok["unparsed_reasons"] == {
+        "missing_result": 0, "too_big": 0, "bad_format": 0, "bad_fields": 0, "not_done": 1, "unknown": 0,
+    }
+    assert grok["unparsed_samples"] == {}
     neon = _row(window, "gemini-4-neon", "review")
     assert (neon["approve_rate"]["n"], neon["findings"], neon["findings_n"]) == (2, 1, 1)
     levels = {level["effort"]: level for model in window["review_levels"] if model["model"] == "gemini-4-neon"
