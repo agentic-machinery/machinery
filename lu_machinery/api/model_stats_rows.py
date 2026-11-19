@@ -44,6 +44,7 @@ from typing import Any, cast
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_credentials import repository_registry
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.fleet_comms.review_publication import (
@@ -831,9 +832,10 @@ def read_publications(batch_state_dir: Path) -> tuple[dict[str, dict[str, Any]],
 
 
 def repository_keys() -> dict[str, str]:
-    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``), read now
-    (never cached, so a catalog that was unreadable once is read again next time); empty when the catalog cannot be
-    read, so no publication matches a row in that reading."""
+    """Each registered GitHub ``owner/name``, lowercased, to its fleet repository key (the rows' ``repo``), read from
+    the file now: the registry cache is cleared first, so a catalog that was unreadable, or valid, at an earlier
+    reading is never reused. Empty when the catalog cannot be read, so no publication matches a row in that reading."""
+    repository_registry.cache_clear()
     try:
         repos = load_fleet_repos()
     except Exception:  # fail closed: an unreadable catalog matches no publication

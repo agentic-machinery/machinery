@@ -329,8 +329,10 @@ The statistics read the ledger; the Monitor never reads GitHub. A line that does
 skipped and counted in `coverage.publications.malformed_lines`. Per task, the publication with the latest GitHub
 comment time wins (a later line breaks a tie), so an import never supersedes a newer publication. A row takes its
 entry only when the entry's repository is the row's and its head is the row's; a review dispatched by branch alone
-keeps no PR in its row, and takes the PR the recorder resolved from the entry. The repository map is read from the
-fleet catalog at each collection; an unreadable catalog matches no entry in that collection. A parsed rejection of
+keeps no PR in its row, and joins the PR the recorder resolved from the entry for the publication figures only
+(reviewer accuracy and the risk tiers); the legacy author totals, matrix and review levels still read only rows
+that name their PR. The repository map is read from the fleet catalog file at each collection (its registry cache
+is cleared first); an unreadable catalog matches no entry in that collection. A parsed rejection of
 a formal review (one that names its author's model) with no matching entry counts as unknown publication, whether
 or not its row names a PR.
 

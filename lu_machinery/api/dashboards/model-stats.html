@@ -698,8 +698,10 @@ function render() {
       + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}${cell(a.after_blocked_first_round.blocked)}`
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
-  $("risk-meta").textContent = $("author-meta").textContent;
-  $("risk").innerHTML = risks((data.author_risks || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked()))));
+  const authorRisks = (data.author_risks || []).filter((a) => keepModel(a.model) || (picked() && String(a.model).includes(picked())));
+  const riskPrs = authorRisks.reduce((s, a) => s + (a.by_risk || []).reduce((t, r) => t + r.prs, 0), 0);
+  $("risk-meta").textContent = `${label} · ${num(riskPrs)} PRs with a published review`;
+  $("risk").innerHTML = risks(authorRisks);
   $("accuracy-meta").textContent = label;
   $("accuracy").innerHTML = accuracy(data);
   const allowance = (data.allowance || []).filter((a) => keepModel(a.model));

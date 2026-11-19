@@ -1333,6 +1333,9 @@ def test_author_results_split_by_risk_tier(tmp_path):
     # PR 20: its only review was published as an approval, but its reply is not parsed: counted, findings unknown.
     _review(tasks, "r20-review", "correct", [], pr=20, pinned_head="9" * 40, review_risk="low", **grok)
     (tasks / "r20-review.result").unlink()
+    # PR 21: an approval dispatched by branch alone (its row names no PR), published on PR 21: it joins the published
+    # cohort, and never the legacy author figures, which read only rows that name their PR.
+    _review(tasks, "r21-review", "correct", [], pinned_head="e" * 40, review_risk="low", **grok)
     rows.backfill(tasks, batch_state)
     approved, blocked = "APPROVED", "CHANGES_REQUESTED"
     assert _publish(batch_state, ("r10-review", 10, "a" * 40, approved), ("r11-review", 11, "b" * 40, blocked),
@@ -1340,8 +1343,8 @@ def test_author_results_split_by_risk_tier(tmp_path):
                     ("r14-review", 14, "f" * 40, approved), ("r15a-review", 15, "1" * 40, blocked),
                     ("r15b-review", 15, "2" * 40, approved), ("r16-review", 16, "3" * 40, approved),
                     ("r17b-review", 17, "5" * 40, approved), ("r19b-review", 19, "8" * 40, approved),
-                    ("r20-review", 20, "9" * 40, approved),
-                    repository="learn-ukrainian/learn-ukrainian.github.io") == 11
+                    ("r20-review", 20, "9" * 40, approved), ("r21-review", 21, "e" * 40, approved),
+                    repository="learn-ukrainian/learn-ukrainian.github.io") == 12
 
     snapshot = stats.collect(batch_state, batch_state.parent, NOW, landing=stats.Landing())
 
@@ -1350,18 +1353,22 @@ def test_author_results_split_by_risk_tier(tmp_path):
         return [(r["risk"], r["prs"], r["first_round_approved"]["value"], r["blocking_per_pr"]["value"],
                  r["p0_p2_per_pr"]["value"], r["low_sample"]) for r in found["by_risk"]]
 
-    # Medium: r13 blocked (P0, P1), r17b and r19b approved without findings. Low: r12, r16 and r20 approved; r20's
-    # findings are unknown, so the per-PR findings rates count r12 and r16 only.
+    # Medium: r13 blocked (P0, P1), r17b and r19b approved without findings. Low: r12, r16, r20 and r21 approved;
+    # r20's findings are unknown, so the per-PR findings rates count r12, r16 and r21 only.
     week = [("critical", 2, 0.5, 0.5, 1.0, True),
             ("medium", 3, stats._rate(2, 3)["value"], stats._rate(2, 3, 2)["value"],
              stats._rate(2, 3, 2)["value"], True),
-            ("low", 3, 1.0, 0.0, 0.0, True)]
+            ("low", 4, 1.0, 0.0, 0.0, True)]
     assert tiers("7d", "grok-4.7") == week == tiers("7d", "grok-4.7", "page_windows")
     assert tiers("30d", "grok-4.7") == [week[0], ("high", 1, 0.0, 1.0, 1.0, True), *week[1:]]
     # Sol authored only the unpublished r17a and the published r14.
     assert [r[:3] for r in tiers("7d", "gpt-6.1-sol")] == [("high", 1, 1.0)]
     without = {a["model"]: a["prs_without_review_of_record"] for a in snapshot["windows"]["7d"]["author_risks"]}
     assert without == {"grok-4.7": 1, "gpt-6.1-sol": 0}
+    # The legacy cohort is the parsed replies of rows that name their PR: grok's PRs 10-13, 16 and 18 this week
+    # (PR 17 is a joint author's, PR 19 started before the week, PR 20 is unparsed, PR 21's row names no PR).
+    (legacy,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
+    assert legacy["prs"] == 6
 
 
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
@@ -1394,14 +1401,19 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     assert rows.record_publications(batch_state, [later, good]) == 1
     assert rows.read_publications(batch_state) == (
         {"t-review": later}, Counter({"lines": 2, "malformed_lines": 2, "tasks": 1}))
-    # A catalog that cannot be read matches nothing, and is read again the next time.
-    def unreadable():
-        raise OSError("catalog unreadable")
+    # A catalog that cannot be read matches nothing, and the file is read again the next time, through every cache.
+    from lu_machinery.orchestration import fleet_repos
 
-    with monkeypatch.context() as patched:
-        patched.setattr(rows, "load_fleet_repos", unreadable)
-        assert rows.repository_keys() == {}
+    catalog = tmp_path / "fleet_repos.yaml"
+    registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
+    assert "github: learn-ukrainian/machinery" in registry
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", catalog)
+    catalog.write_text(registry.replace("github: learn-ukrainian/machinery", "github: learn-ukrainian-machinery"))
+    assert rows.repository_keys() == {}
+    catalog.write_text(registry)
     assert rows.repository_keys()["learn-ukrainian/machinery"] == "machinery"
+    catalog.write_text("repos: [")
+    assert rows.repository_keys() == {}
     # An import appends an older publication after the newer one: the newer one still stands.
     older = {**good, "verdict": "BLOCKED", "published_at": (NOW - timedelta(days=1)).isoformat()}
     assert rows.record_publications(batch_state, [older]) == 1

@@ -319,9 +319,12 @@ class _Row:
     author: str | None
     allowance: tuple[str, float] | None
     raw: Mapping[str, Any]
-    # The verdict the recorder published for this review at this row's PR and head (the publication ledger), or
-    # None when no publication of it is recorded: its publication is unknown.
+    # The verdict the recorder published for this review at this row's head (the publication ledger) and the PR it
+    # was published on, or None when no publication of it is recorded: its publication is unknown.
     published: str | None = None
+    published_pr: int | None = None
+    # The author model a review names, whether or not its row names a PR (``author`` needs the row's own PR).
+    review_author: str | None = None
 
     @property
     def landed(self) -> bool:
@@ -406,14 +409,14 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         if moment is None:
             continue
         publication = _publication(raw, publications or {}, keys or {})
-        if publication is not None and raw.get("pr") is None:
-            raw = {**raw, "pr": publication["pr"]}
         status = raw.get("status")
         row_status = status if status in STATUSES else "other"
         role = "review" if raw.get("role") == "review" else "write"
         review = raw.get("review") if isinstance(raw.get("review"), Mapping) else None
+        review_author = (resolve(str(raw["author_model"]), moment)
+                         if role == "review" and raw.get("author_model") else None)
         # Author outcomes still require a review of record.
-        author = raw.get("author_model") if role == "review" and raw.get("pr") is not None else None
+        author = review_author if raw.get("pr") is not None else None
         verdict = review.get("verdict") if review else None
         priorities = review.get("priorities") if review else None
         row_review: tuple[str, Counter[str] | None, str | None, str | None] | None = None
@@ -438,10 +441,12 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
             review=row_review,
-            author=resolve(str(author), moment) if author else None,
+            author=author,
             allowance=_allowance(raw.get("allowance")),
             raw=raw,
             published=None if publication is None else str(publication["verdict"]),
+            published_pr=None if publication is None else int(publication["pr"]),
+            review_author=review_author,
         )
 
 
@@ -655,16 +660,22 @@ def _prs(rows: Iterable[_Row], *, of_record: bool = False) -> list[dict[str, Any
     published: set[tuple[str, str]] = set()
     never = datetime.max.replace(tzinfo=UTC)
     for row in rows:
-        if row.review is None or row.author is None:
+        if row.review is None:
             continue
-        key = (str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))
-        if row.published is not None:
-            published.add(key)
-        if (row.published is None) if of_record else (row.review[0] == "unparsed"):
-            continue
-        verdict = _OF_RECORD[cast(str, row.published)] if of_record else row.review[0]
+        repo = str(row.raw.get("repo") or "public")
+        if row.published is not None and row.review_author is not None:
+            published.add((repo, str(row.published_pr)))
+        if of_record:
+            # A published review joins its PR by the PR it was published on, even when its row names none.
+            if row.published is None or row.review_author is None:
+                continue
+            key, author, verdict = (repo, str(row.published_pr)), row.review_author, _OF_RECORD[row.published]
+        else:
+            if row.author is None or row.review[0] == "unparsed":
+                continue
+            key, author, verdict = (repo, str(row.raw.get("pr"))), row.author, row.review[0]
         entry = prs[key]
-        entry["authors"].add(row.author)
+        entry["authors"].add(author)
         entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
             (row.started or never, row.task_id, verdict, row.review[1], row.model, row.task_class, row.moment))
     return [{"author": "+".join(sorted(entry["authors"])), **_outcome(entry["heads"]),
@@ -736,8 +747,8 @@ def _blocking_reviews(rows: Iterable[_Row]) -> Iterator[tuple[_Row, list[_Row], 
     counts by its finish (``moment``): a review that started later can finish first."""
     prs: dict[tuple[str, str], list[_Row]] = defaultdict(list)
     for row in rows:
-        if row.review is not None and row.published is not None and row.author is not None:
-            prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))].append(row)
+        if row.review is not None and row.published is not None and row.review_author is not None:
+            prs[(str(row.raw.get("repo") or "public"), str(row.published_pr))].append(row)
     for reviews in prs.values():
         reviews.sort(key=lambda r: (r.moment, r.task_id))
         for row in reviews:
@@ -791,7 +802,7 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     for row in rows:
         # A formal review names its author's model; one dispatched by branch alone has no PR until a publication
         # supplies it, so the author model, not the PR, decides.
-        if (row.published is None and row.raw.get("author_model") and row.review is not None
+        if (row.published is None and row.review_author is not None and row.review is not None
                 and row.review[0] == "incorrect"):
             counts[name(row.model)]["unknown_publication"] += 1
     for row, later, paths, count in _blocking_reviews(rows):
