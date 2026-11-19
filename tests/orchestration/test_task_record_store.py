@@ -102,6 +102,9 @@ def test_read_follows_the_newest_copy_when_the_archive_name_collides(tmp_path, m
 
 
 def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
+    from lu_machinery.dispatcher import store as dispatch_store
+    from lu_machinery.orchestration import orchestrator_control
+
     tasks = tmp_path / "tasks"
     archived = store.archived_task_record_path(tasks, "old")
     archived.parent.mkdir(parents=True)
@@ -113,6 +116,20 @@ def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
     # Hot records and empty values are never rewritten.
     assert store.relocated_result_file(tasks / "old.json", hot_result) == hot_result
     assert store.relocated_result_file(archived, None) is None
+
+    archived.write_text(json.dumps({"task_id": "old", "run_nonce": "first", "result_file": hot_result}))
+    os.utime(archived, ns=(1, 1))
+    stamped = archived.with_name("old.20261119T140000Z.archived.json")
+    stamped.write_text(json.dumps({"task_id": "old", "run_nonce": "second", "result_file": hot_result}))
+    stamped_reply = stamped.with_suffix(".result")
+    stamped_reply.write_text("second run's reply", encoding="utf-8")
+
+    for state in (dispatch_store.read("old", tasks_root=tasks), orchestrator_control.load_task_state(tasks, "old")):
+        assert state["run_nonce"] == "second"
+        assert Path(state["result_file"]).read_text() == "second run's reply"
+
+    stamped_reply.unlink()
+    assert store.relocated_result_file(stamped, hot_result) == str(stamped_reply)
 
 
 def test_v2_record_under_another_name_raises_identity_mismatch_with_its_content(tmp_path):
