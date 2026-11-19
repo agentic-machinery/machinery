@@ -74,8 +74,10 @@ _PATH_TRAILING_PUNCTUATION = ".,;:!?)]}`"
 # "/tmp.backup" counts as under /tmp (fail closed) while "/tmpx" does not.
 _ROOT = rf"(?P<root>{'|'.join(re.escape(root[1:]) for root in BOUNDED_FILESYSTEM_ROOTS)})(?![A-Za-z0-9_-])"
 # A bare root must not follow a slash, so URL authorities such as
-# "https://tmp.example.org" stay unflagged.
-_FILESYSTEM_PATH_RE = re.compile(rf"(?<![A-Za-z0-9/])/{_ROOT}" r"(?P<tail>/[^\s\"'<>]*)?")
+# "https://tmp.example.org" stay unflagged.  The pattern matches the root only:
+# the span comes from the path run, and an exempt root never consumes a later
+# root in the same run.
+_FILESYSTEM_PATH_RE = re.compile(rf"(?<![A-Za-z0-9/])/{_ROOT}")
 # A file URI carries its path after the scheme's slashes and optional
 # authority ("file:///home/...", "file://host/home/...", "file:////home/...",
 # "file:/home/..."), which the bare rule above cannot see.  "//" after the
