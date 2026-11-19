@@ -2,13 +2,15 @@
 
 Restored from learn-ukrainian ``tests/dispatcher/test_core_delivery_heads.py`` at 5aba2adb (machinery #904).
 The product kept that file because it imported the recorder, which ships here now
-(``lu_machinery.review.record_cf_verdict``). Muse's contributor-mode forwarding case is not restored:
-Muse is retired in the catalog (``lifecycle: retired``), so no dispatch reaches it.
+(``lu_machinery.review.record_cf_verdict``). Muse's contributor-mode forwarding case is adapted, not
+restored as written: machinery #558 forces contributor mode off, and ``muse-spark-1.3`` is still dispatchable
+(``lifecycle: hold``).
 
 Defect classes, one per case: a delivery is counted from a prefixed, unrelated or dirty head, or from a
-crashed supervisor; a review runs on a moved head or a reused branch; a sibling repository's records
-leave the shared store; a dry run or an invalid flag creates a record, worktree or branch; and a
-contributor-mode request reaches an agent that cannot honour it.
+crashed supervisor; a review runs at a branch tip that moved past its pinned commit, or on a reused branch;
+a sibling repository's records leave the shared store; a dry run or an invalid flag creates a record,
+worktree or branch; a contributor-mode request reaches an agent that cannot honour it; and a Muse dispatch
+forwards contributor mode or loses the request from its record.
 """
 
 import json
@@ -117,7 +119,11 @@ def test_review_uses_exact_commit_on_fresh_branch_and_cwd_reuses(sandbox):
     sandbox.review_models("echo")
     head = run_git(sandbox.repo, "commit-tree", f"{first['head_sha']}^{{tree}}", "-p", f"{first['head_sha']}^",
                    "-m", "stub delivery\n\nX-Agent: claude/claude-opus-5-5")
-    run_git(sandbox.repo, "update-ref", f"refs/heads/{first['worktree_branch']}", head)
+    # The branch then moves past the pinned commit, so a review started from the branch tip runs another commit.
+    newer = run_git(sandbox.repo, "commit-tree", f"{head}^{{tree}}", "-p", head,
+                    "-m", "later round\n\nX-Agent: claude/claude-opus-5-5")
+    run_git(sandbox.repo, "update-ref", f"refs/heads/{first['worktree_branch']}", newer)
+    assert newer != head
     result = sandbox.cli(
         "dispatch",
         "--agent",
