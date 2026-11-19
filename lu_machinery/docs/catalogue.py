@@ -1237,7 +1237,7 @@ def marker_errors(repo: Path, report: Report, catalogue: dict) -> tuple[list[str
 
 README_PATH = 'docs/README.md'
 README_BEGIN = ('<!-- BEGIN GENERATED: catalogue families. Edit docs/knowledge/catalogue.yaml, then run '
-                f'python -m {_self()} readme -->')
+                'python -m {tree}.docs.catalogue readme -->')
 README_END = '<!-- END GENERATED: catalogue families -->'
 STATUS_WORDS = {'active': 'current', 'archive': 'historical', 'superseded': 'superseded', 'draft': 'draft'}
 
@@ -1257,11 +1257,11 @@ def _status(entry: dict) -> str:
     return f"{word} → {_code(entry['superseded_by'])}" if entry.get('superseded_by') else word
 
 
-def readme_block(catalogue: dict) -> str:
+def readme_block(catalogue: dict, *, tree: str = _PRODUCT_TREE) -> str:
     """The generated family and store tables for docs/README.md, markers included."""
     families = [e for e in catalogue['entries'] if e['kind'] != 'data_store']
     stores = [e for e in catalogue['entries'] if e['kind'] == 'data_store']
-    lines = [README_BEGIN, '',
+    lines = [README_BEGIN.format(tree=tree), '',
              f'{len(families)} document families and {len(stores)} local data stores, generated from '
              '`docs/knowledge/catalogue.yaml`. Status words: current = `active`, historical = `archive`.',
              '', '### Document families', '',
@@ -1279,13 +1279,14 @@ def readme_block(catalogue: dict) -> str:
     return '\n'.join([*lines, '', README_END])
 
 
-def render_readme(text: str, catalogue: dict) -> str:
+def render_readme(text: str, catalogue: dict, *, tree: str = _PRODUCT_TREE) -> str:
     """``text`` with the generated block between its markers replaced; ValueError without one pair."""
-    if text.count(README_BEGIN) != 1 or text.count(README_END) != 1 or text.index(README_BEGIN) > text.index(README_END):
-        raise ValueError(f'{README_PATH} needs exactly one {README_BEGIN!r} ... {README_END!r} pair')
-    start = text.index(README_BEGIN)
+    begin = README_BEGIN.format(tree=tree)
+    if text.count(begin) != 1 or text.count(README_END) != 1 or text.index(begin) > text.index(README_END):
+        raise ValueError(f'{README_PATH} needs exactly one {begin!r} ... {README_END!r} pair')
+    start = text.index(begin)
     end = text.index(README_END) + len(README_END)
-    return text[:start] + readme_block(catalogue) + text[end:]
+    return text[:start] + readme_block(catalogue, tree=tree) + text[end:]
 
 
 def readme_errors(repo: Path, report: Report, catalogue: dict, files: dict[str, IndexEntry]) -> list[str]:
@@ -1301,7 +1302,7 @@ def readme_errors(repo: Path, report: Report, catalogue: dict, files: dict[str, 
         return [f'{README_PATH}: not content-readable ({withheld} withheld), so its generated block cannot be checked']
     text = heads[README_PATH]
     try:
-        current = render_readme(text, catalogue) == text
+        current = render_readme(text, catalogue, tree=owner_tree(repo)) == text
     except ValueError as exc:
         return [f'{README_PATH}: {str(exc)[:300]}']
     return [] if current else [f'{README_PATH}: the generated family table is stale; run '
@@ -1346,7 +1347,8 @@ def store_registry_errors(repo: Path, catalogue: dict, files: dict[str, IndexEnt
     """
     if not store_census.registry(catalogue):
         return []
-    wanted = store_census.writer_files(catalogue) | {store_census.ALLOWLIST_PATH}
+    allowlist_path = f'{owner_tree(repo)}/config/backup-allowlist.json'
+    wanted = store_census.writer_files(catalogue) | {allowlist_path}
     objects = {p: files[p].oid for p in sorted(wanted) if p in files and files[p].mode in REGULAR_MODES
                and not CONTROL_CHARS.search(p) and not is_excluded(p)}
     sources = {}
@@ -1355,13 +1357,15 @@ def store_registry_errors(repo: Path, catalogue: dict, files: dict[str, IndexEnt
             sources[path] = blob.decode('utf-8')
         except UnicodeDecodeError:
             continue
-    if store_census.ALLOWLIST_PATH not in sources:
-        return [f'{store_census.ALLOWLIST_PATH}: not readable from the index, so registry backup facts are unchecked']
+    if allowlist_path not in sources:
+        return [f'{allowlist_path}: not readable from the index, so registry backup facts are unchecked']
     try:
-        allowlist = json_depth.loads(sources.pop(store_census.ALLOWLIST_PATH), max_depth=512)
+        allowlist = json_depth.loads(sources.pop(allowlist_path), max_depth=512)
     except json.JSONDecodeError as exc:
-        return [f'{store_census.ALLOWLIST_PATH}: not JSON ({exc.msg}), so registry backup facts are unchecked']
-    return store_census.registry_errors(catalogue, set(files), owner_keys(repo), allowlist, sources, literals)
+        return [f'{allowlist_path}: not JSON ({exc.msg}), so registry backup facts are unchecked']
+    return store_census.registry_errors(
+        catalogue, set(files), owner_keys(repo), allowlist, sources, literals, allowlist_path=allowlist_path,
+    )
 
 
 # ---------------------------------------------------------------- suggestions
@@ -1658,7 +1662,7 @@ def _readme_command(args: argparse.Namespace) -> int:
     catalogue = load(repo / CATALOGUE_PATH)
     path = repo / README_PATH
     text = path.read_text(encoding='utf-8')
-    rendered = render_readme(text, catalogue)
+    rendered = render_readme(text, catalogue, tree=owner_tree(repo))
     stale = rendered != text
     if stale and not args.check:
         path.write_text(rendered, encoding='utf-8')
