@@ -1736,6 +1736,8 @@ class _Boundary:
                         # Nothing inside sends any more; stopped, the egress's upload ceiling state is final.
                         try:
                             self.egress.cleanup()
+                        except Refused:
+                            raise  # a cancel arriving here stays a cancel
                         except Exception:
                             raise Refused("savant_draft_refused: the run's egress did not stop") from None
                         if self.egress.ceiling_reached:
