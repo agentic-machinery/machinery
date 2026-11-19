@@ -173,8 +173,8 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
 
     An explicit pin with no catalog id is refused after native Claude alias
     normalization and before the red-team exemption. Cursor's ``auto`` selector
-    has no catalog id and keeps its own gate. The refusal text is the catalog's
-    unknown-model sentence; transport and lifecycle stay on the execution gate.
+    has no catalog id and keeps its own gate. Retired pins are refused before
+    checking transport selectors. Red-team-only pins need the scoped check below.
     A review-typed request needs a catalog review role (#9583) before any worktree or provider
     starts; the verdict recorder's later refusal would only discard a run that already happened.
     """
@@ -196,6 +196,10 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
     identity = canonical_model_id(_normalize_native_claude_alias(agent, model), catalog)
     if identity is None and not (agent == "cursor" and is_cursor_auto_selector(model)):
         raise ValueError(unknown_model_refusal(model))
+    red_team_only = catalog["models"].get(identity, {}).get("red_team_only")
+    # Every role refuses a retired catalog model, not only review (product #12946).
+    if not red_team_only and (refusal := retired_model_refusal(model, catalog)):
+        raise ValueError(refusal)
     if agent == "agy":
         from lu_machinery.dispatcher.providers.agy import _agy_model_ids, transport_model
 
@@ -211,10 +215,7 @@ def check_model_admission(agent: str, model: str, mode: str, options: dict, prom
         raise ValueError(refusal)
     if refusal := mode_refusal(identity, mode, catalog):
         raise ValueError(refusal)
-    if not catalog["models"].get(identity, {}).get("red_team_only"):
-        # Every role refuses a retired catalog model, not only review (product #12946).
-        if refusal := retired_model_refusal(model, catalog):
-            raise ValueError(refusal)
+    if not red_team_only:
         # Review typing is the one dispatch role admission infers: every review flag, --risk,
         # --review-mode, --language-lane, the subject selectors and a review research role.
         # Provider re-checks read the task's str()-serialized options, where an unused repeatable

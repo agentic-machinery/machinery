@@ -39,7 +39,7 @@ def test_delegate_dispatch_accepts_agy_agent(tmp_path, monkeypatch, capsys):
             "--agent",
             "agy",
             "--model",
-            "gemini-3.8-flash-high",
+            "gemini-4-hydrogen-medium",
             "--task-id",
             task_id,
             "--prompt",
@@ -59,7 +59,7 @@ def test_delegate_dispatch_accepts_agy_agent(tmp_path, monkeypatch, capsys):
     plan = json.loads(captured.out)
     assert Path(plan["record_path"]).name == f"{task_id}.json"
     assert plan["argv"][0] == "agy"
-    assert plan["argv"][plan["argv"].index("--model") + 1] == "gemini-3.8-flash-high"
+    assert plan["argv"][plan["argv"].index("--model") + 1] == "gemini-4-hydrogen-medium"
 
 
 def test_ab_discuss_accepts_agy_in_multi_participant_list(discuss_bridge, monkeypatch):

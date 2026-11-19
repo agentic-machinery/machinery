@@ -237,7 +237,7 @@ def test_provider_init_identity_on_existing_parse_result(tmp_path, monkeypatch, 
     if observed not in {"no-init", "tool-only"}:
         init = {"event": "init"}
         if observed != "absent":
-            value = slug if observed == "matching" else "gemini-3.8-flash-high"
+            value = slug if observed == "matching" else "gemini-4-neon-high"
             init.update({"init": {"model": value}} if shape == "nested" else {"model": value})
         events.append(init)
     events.extend(
@@ -277,7 +277,7 @@ def test_provider_init_identity_on_existing_parse_result(tmp_path, monkeypatch, 
         return
     assert identity is not None
     assert identity["actual_model"] == (
-        slug if observed == "matching" else "gemini-3.8-flash-high" if observed == "mismatching" else None
+        slug if observed == "matching" else "gemini-4-neon-high" if observed == "mismatching" else None
     )
     assert identity["actual_model_known"] is (observed in {"matching", "mismatching"})
     assert identity["substituted"] is (observed == "mismatching")
@@ -390,7 +390,7 @@ def test_claude_reported_identity_fails_closed(tmp_path, slug, label, backend, f
         "pin": slug,
         "display": label,
         "backend": backend,
-        "different": "gemini-3.8-flash-high",
+        "different": "gemini-4-hydrogen-medium",
         "whitespace": "   ",
         "non-string": 7,
         "retired": "Claude Opus 4.6 (Thinking)",

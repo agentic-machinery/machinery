@@ -1731,10 +1731,10 @@ def test_invoke_gemini_runtime_all_rate_limited_raises(tmp_path, monkeypatch):
     ))
     with pytest.raises(RateLimitedError):
         invoke("gemini", "hello", mode="workspace-write", cwd=tmp_path,
-               model="gemini-3.8-flash-high", task_id="gemini-rate-limited")
+               model="gemini-4-hydrogen-medium", task_id="gemini-rate-limited")
     assert len(launches) == 1
     assert records[-1]["outcome"] == "rate_limited"
-    assert records[-1]["model"] == "gemini-3.8-flash-high"
+    assert records[-1]["model"] == "gemini-4-hydrogen-medium"
 
 
 def test_invoke_gemini_runtime_timeout_ladder_raises_timeout(tmp_path):

@@ -1124,6 +1124,14 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
+            # Keep the captured reviewer receipts and overlay only Flash's retirement fields.
+            flash = expected["models"]["gemini-3.8-flash-high"]
+            flash.update(
+                lifecycle="retired",
+                replaced_by="gemini-4-hydrogen",
+                transports=[],
+                notes="Retired by GEMINI-TIERS-1119 (2026-11-19). Existing receipts retain this identity.",
+            )
             # #513: pin the kept hramatka route independently; all remaining
             # catalog bytes and every frozen resolver result must still match.
             gemma = value["models"].pop("google-ais/gemma-4-31b-it")

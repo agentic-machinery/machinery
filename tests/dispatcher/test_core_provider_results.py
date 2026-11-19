@@ -147,7 +147,7 @@ def test_review_dispatch_resolves_a_running_cursor_author_only_from_its_stream_a
 
 @pytest.mark.parametrize(
     ("terminal", "attested_model"),
-    [("SUCCESS", "gemini-3.8-flash-high"), ("ERROR", "gemini-3.8-flash-high"), ("ERROR", None)],
+    [("SUCCESS", "gemini-4-hydrogen-medium"), ("ERROR", "gemini-4-hydrogen-medium"), ("ERROR", None)],
 )
 def test_agy_stream_from_another_model_family_settles_as_a_failure(sandbox, terminal, attested_model):
     """Defect: a silently substituted model was credited as the requested one."""
@@ -211,7 +211,7 @@ def test_agy_stream_from_another_model_family_settles_as_a_failure(sandbox, term
         refusal = (
             "agy_model_identity_unverified: "
             "requested claude-sonnet-5-5-high (anthropic), attested "
-            + ("gemini-3.8-flash-high (google)" if attested_model else "none (unknown)")
+            + ("gemini-4-hydrogen-medium (google)" if attested_model else "none (unknown)")
         )
         if terminal == "ERROR":
             provider_error = "agy: terminal result unsuccessful (ERROR)"
