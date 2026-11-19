@@ -1046,7 +1046,7 @@ requires a private data class. Dispatch refuses secrets, credentials, and
 unknown or undeclared classes.
 
 With `public-code` or `public-docs`, Savant may also use OpenCode's read-only
-`read`, `grep`, `glob` and `list` tools. The write boundary limits them to a
+`read`, `grep` and `glob` tools; `read` also lists a directory. The write boundary limits them to a
 read-only snapshot of the published start commit, and the run's view holds no
 checkout, worktree or Git metadata. The dispatch refuses a start commit that no
 branch of the registered public remote contains now. The snapshot holds the

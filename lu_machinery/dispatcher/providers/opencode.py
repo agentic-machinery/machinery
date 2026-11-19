@@ -57,7 +57,8 @@ _SAVANT_OPENCODE_VERSION = "1.19.6"
 # start commit; private classes keep every tool disabled and the prompt as the only input (designated approval,
 # conditions C1-C4). The snapshot cap and the run's upstream byte ceiling bound what reaches SubQ.
 _SAVANT_TOOL_CLASSES = frozenset({"public-code", "public-docs"})
-_SAVANT_READ_TOOLS = ("read", "grep", "glob", "list")
+# OpenCode 1.19.6 has no ``list`` tool: ``read`` lists a directory under the ``read`` permission.
+_SAVANT_READ_TOOLS = ("read", "grep", "glob")
 SAVANT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 SAVANT_UPLOAD_MAX_BYTES = 16 * 1024 * 1024
 OPENROUTER_PROVIDERS = ("fireworks/us", "baseten/us", "inference-net/us")

@@ -158,6 +158,9 @@ _SNAPSHOT_SECRET = re.compile(
     rb"|sk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})")
 MAX_READ_PATHS = 64
 MAX_SNAPSHOT_FILES = 20_000
+# The recursive tree listing, excluded and skipped entries included, is read up to this size (about 16 times what
+# MAX_SNAPSHOT_FILES records of ordinary paths need), so the launcher's memory before the caps apply is bounded too.
+MAX_TREE_LISTING_BYTES = 16 * 1024 * 1024
 _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor/mcp.json", "opencode": None}
 # Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
@@ -596,9 +599,13 @@ def _pre_commit_store(home: Path, env: dict[str, str]) -> Path | None:
     return Path(store) if os.path.isabs(store) else None
 
 
-def _toolchain(home: Path, executable: str, env: dict[str, str]) -> list[Path]:
+def _toolchain(home: Path, executable: str, env: dict[str, str], *, package: bool = True) -> list[Path]:
     """Read-only restores below HOME and the data roots: the provider's toolchain and this launcher's own
     interpreter and installation (decision A4). Nothing of a provider's configuration is one of them.
+
+    ``package=False`` leaves out the directory this launcher's ``lu_machinery`` was imported from, which is a whole
+    checkout or worktree when it runs from source: a snapshot run's view holds no checkout, and nothing inside it
+    imports the package (its canary and forwarder are projected stdlib-only copies).
 
     pre-commit's hook store is part of the toolchain: a product commit's hooks run from it, and inside it cannot
     be fetched (GitHub is refused). Read-only, pre-commit records nothing and runs the installed environments;
@@ -609,7 +616,9 @@ def _toolchain(home: Path, executable: str, env: dict[str, str]) -> list[Path]:
         candidates.append(store)
     candidates += [Path(entry) for entry in path_env.split(os.pathsep) if entry and os.path.isabs(entry)]
     candidates += _package_roots(path_env, [executable, sources_command()[0]])
-    candidates += [_interpreter_root(), Path(sys.prefix), machinery_path("dispatcher/write_boundary.py").parents[2]]
+    candidates += [_interpreter_root(), Path(sys.prefix)]
+    if package:
+        candidates.append(machinery_path("dispatcher/write_boundary.py").parents[2])
     hidden_roots = [home, *_MASKED_ROOTS, *_DATA_ROOTS]
     # Never a whole emptied root or a parent of HOME (a PATH entry such as /opt or /home restores nothing).
     paths = sorted({path for candidate in candidates if (path := _resolved(candidate)) is not None
@@ -720,19 +729,57 @@ def github_networks() -> tuple:
     return tuple(dict.fromkeys(networks))
 
 
-def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
-    """Raw output of a read-only Git plumbing command over the objects' own links: no user or system configuration,
-    hooks, fsmonitor, replacement objects, grafts or commit-graph."""
+def _plain_git_command(repository: Path, *args: str) -> tuple[list[str], dict[str, str]]:
+    """Argv and environment of a read-only Git plumbing command over the objects' own links: no user or system
+    configuration, hooks, fsmonitor, replacement objects, grafts or commit-graph."""
     env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0",
            "GIT_GRAFT_FILE": os.devnull, "GIT_NO_REPLACE_OBJECTS": "1"}
+    return (["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
+             "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", "-C", str(repository), *args], env)
+
+
+def _plain_git(repository: Path, *args: str, data: bytes | None = None) -> bytes:
+    """Raw output of a read-only Git plumbing command (``_plain_git_command``) whose output the caller bounds."""
+    argv, env = _plain_git_command(repository, *args)
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        ["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
-         "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false", "-C", str(repository), *args],
-        input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=env)
+        argv, input=data, capture_output=True, timeout=_GIT_TIMEOUT, check=False, env=env)
     if result.returncode:
         raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
     return result.stdout
+
+
+def _plain_git_bounded(repository: Path, *args: str, max_bytes: int) -> bytes:
+    """Output of a read-only Git plumbing command, refused and the process killed once it passes ``max_bytes``
+    or ``_GIT_TIMEOUT`` seconds, so host memory never scales with what the command would print."""
+    argv, env = _plain_git_command(repository, *args)
+    deadline = time.monotonic() + _GIT_TIMEOUT
+    output = bytearray()
+    process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    assert process.stdout is not None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                raise Refused(f"savant_snapshot_refused: git {args[0]} timed out")
+            chunk = os.read(process.stdout.fileno(), 1 << 16)
+            if not chunk:
+                break
+            output += chunk
+            if len(output) > max_bytes:
+                raise Refused(f"savant_snapshot_refused: git {args[0]} printed more than {max_bytes} bytes; name "
+                              "the task's files or directories with --read-path")
+        if process.wait(timeout=max(deadline - time.monotonic(), 0.001)):
+            raise Refused(f"savant_snapshot_refused: git {args[0]} failed")
+    except subprocess.TimeoutExpired:
+        raise Refused(f"savant_snapshot_refused: git {args[0]} timed out") from None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+    return bytes(output)
 
 
 def _public_origin(repository: Path) -> str:
@@ -823,12 +870,16 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
     except NeedlesError:
         raise Refused("savant_snapshot_refused: the host's OPSEC needles cannot be read") from None
     needles = (*(home.encode() for home in loaded.home_dirs if home), *_known_secrets())
-    # An account name counts only as a whole word, so a short one does not drop every file that contains it.
-    accounts = re.compile(rb"(?<![\w.-])(?:" + b"|".join(re.escape(user.encode()) for user in loaded.run_users) + rb")(?![\w.-])"
+    # An account name counts only as a whole word, so a short one does not drop every file that contains it. Its
+    # characters are letters, digits, "_" and "-" (the needles loader's rule), so a period or other punctuation
+    # beside it is a boundary: "Run as name." still matches.
+    accounts = re.compile(rb"(?<![\w-])(?:" + b"|".join(re.escape(user.encode()) for user in loaded.run_users) + rb")(?![\w-])"
                        ) if loaded.run_users else None
     entries: list[tuple[str, int, tuple[str, ...]]] = []
     left_out = total = 0
-    for record in _plain_git(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths).split(b"\0"):
+    listing = _plain_git_bounded(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths,
+                                 max_bytes=MAX_TREE_LISTING_BYTES)
+    for record in listing.split(b"\0"):
         if not record:
             continue
         meta, _, raw = record.partition(b"\t")
@@ -1351,7 +1402,7 @@ class _Boundary:
         snapshot_only = self.args.snapshot_bytes is not None
         checkouts = [] if snapshot_only else [repository, *([product] if product is not None and product != repository
                                                             else [])]
-        toolchain = _toolchain(home, command[0], self.args.provider_env)
+        toolchain = _toolchain(home, command[0], self.args.provider_env, package=not snapshot_only)
         data = list(dict.fromkeys(found for root in _DATA_ROOTS if (found := _resolved(root)) is not None
                                   and found.is_dir() and found != Path("/")))
         own = task_reads(self.args.task_id)
@@ -1905,11 +1956,9 @@ def _positive_bytes(value: str) -> int:
 
 def read_path(value: str) -> str:
     """A repository-relative path in Git's form: no absolute, dot, empty or control-character component."""
-    from pathlib import PurePosixPath
-
-    parts = PurePosixPath(value).parts
+    parts = value.removesuffix("/").split("/")  # raw components: PurePosixPath would drop "." ones
     if (not value or len(value) > 4096 or value.startswith(("/", "-")) or not value.isprintable()
-            or any(part in (".", "..") for part in parts) or "//" in value):
+            or any(part in ("", ".", "..") for part in parts)):
         raise argparse.ArgumentTypeError("expected a repository-relative path such as lu_machinery/config")
     return value
 

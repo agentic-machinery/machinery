@@ -157,7 +157,7 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     # A public class reads the boundary's snapshot of the published start commit with the read-only file tools
     # only; every other tool and any path outside the snapshot stay denied.
     assert config["permission"] == {"*": "deny", "external_directory": "deny", "read": "allow", "grep": "allow",
-                                    "glob": "allow", "list": "allow"}
+                                    "glob": "allow"}
     assert invocation.argv[invocation.argv.index("--dir") + 1] == write_boundary.SNAPSHOT_INSIDE
     provider = config["provider"]["subq"]
     assert provider["env"] == ["SUBQ_API_KEY"]
@@ -241,7 +241,7 @@ def _published_repository(tmp_path, files, links=()):
 
     def run(*args):
         return subprocess.run(["git", "-C", str(repository), *args], check=True, capture_output=True,
-                              text=True, env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+                              text=True, timeout=60, env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
                                               "GIT_CONFIG_GLOBAL": os.devnull}).stdout.strip()
 
     run("init", "-q", "-b", "main")
@@ -249,7 +249,7 @@ def _published_repository(tmp_path, files, links=()):
     run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fixture")
     commit = run("rev-parse", "HEAD")
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True, capture_output=True, timeout=60)
     run("remote", "add", "origin", remote.as_uri())
     run("push", "-q", "origin", "main")
     return repository, commit, run
@@ -265,7 +265,7 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
         "AGENTS.md": secret, "nested/CLAUDE.md": secret, "opencode.json": secret, ".opencode/agent.md": secret,
         "docs/CONTEXT.md": secret, "home/auth.json": secret, "home/.credentials.json": secret, "prod.env": secret,
         ".gitconfig": secret, ".mcp.json": secret, "config/settings.ini": b"api = opaque-fixture-value-0123456789\n",
-        "config/subq.txt": b"subq = k3y\n",
+        "config/subq.txt": b"subq = k3y\n", "docs/howto.md": b"Run as fixtureacct.\n",
         "docs/notes.txt": b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + secret,
         "src/token.py": b"TOKEN = 'ghp_" + b"A" * 36 + b"'\n" + secret,
     }
@@ -278,6 +278,11 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
     monkeypatch.setattr(write_boundary, "_public_origin", lambda _repository: "example/public")
     monkeypatch.setattr(write_boundary, "_remote_tips", lambda slug: {
         ref: oid for oid, ref in (line.split("\t") for line in run("ls-remote", "origin", "refs/heads/*").splitlines())})
+    # The host's account names come from its needles file; the test owns that file. Sentence punctuation beside a
+    # name is a word boundary ("Run as fixtureacct." is screened).
+    needles = tmp_path / "needles.json"
+    needles.write_text('{"schema_version": 1, "run_users": ["fixtureacct"], "home_dirs": []}', encoding="utf-8")
+    monkeypatch.setenv("LU_OPSEC_NEEDLES_FILE", str(needles))
     # An opaque credential the launcher holds (the run's SubQ key, for one) is screened by its exact value.
     monkeypatch.setenv("FIXTURE_API_KEY", "opaque-fixture-value-0123456789")
     monkeypatch.setenv("SUBQ_API_KEY", "k3y")  # the configured SubQ key, however short
@@ -288,8 +293,9 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
     assert not any(path.is_symlink() for path in target.rglob("*"))
     assert all(secret not in path.read_bytes() for path in written.values())
     assert all(path.stat().st_mode & 0o777 == 0o400 for path in written.values())
-    # 18 excluded names and 2 links leave before reading; 4 files leave for a key, a token or a known secret.
-    assert info["files"] == 2 and info["left_out"] == 24 and info["commit"] == commit
+    # 18 excluded names and 2 links leave before reading; 5 files leave for a key, a token, a known secret or an
+    # account name.
+    assert info["files"] == 2 and info["left_out"] == 25 and info["commit"] == commit
     # --read-path narrows it to the named directory.
     narrowed = write_boundary._snapshot(repository, commit, ["docs"], tmp_path / "narrow", 1024)
     assert narrowed["files"] == 1 and (tmp_path / "narrow" / "docs" / "guide.md").is_file()
@@ -298,6 +304,12 @@ def test_savant_snapshot_holds_only_published_regular_files(tmp_path, monkeypatc
         write_boundary._snapshot(repository, commit, ["missing"], tmp_path / "missing", 1024)
     with pytest.raises(write_boundary.Refused, match="exceed 10 bytes or 20000 files; name the task's files"):
         write_boundary._snapshot(repository, commit, [], tmp_path / "small", 10)
+    # The tree listing itself is bounded, excluded entries included, before any cap is checked.
+    listing_cap = write_boundary.MAX_TREE_LISTING_BYTES
+    monkeypatch.setattr(write_boundary, "MAX_TREE_LISTING_BYTES", 100)
+    with pytest.raises(write_boundary.Refused, match="git ls-tree printed more than 100 bytes"):
+        write_boundary._snapshot(repository, commit, [], tmp_path / "listing", 1024)
+    monkeypatch.setattr(write_boundary, "MAX_TREE_LISTING_BYTES", listing_cap)
     (repository / "src" / "allowed.py").write_bytes(b"UNPUBLISHED = 1\n")
     run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "local only")
     with pytest.raises(write_boundary.Refused, match="no branch of the public remote contains the start commit"):

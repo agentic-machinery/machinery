@@ -156,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
              "digests or digests changed before start.",
     )
     dispatch.add_argument(
-        "--read-path", action="append", metavar="PATH",
+        "--read-path", action="append", metavar="PATH", default=argparse.SUPPRESS,
         help="Repository file or directory, e.g. lu_machinery/config, that a public Savant run's read-only tools "
              "may read from the published start commit; requires --provider subq with --data-class public-code "
              "or public-docs (repeatable, at most 64; default: the whole tree, refused above 64 MiB). "
@@ -445,26 +445,28 @@ def _dispatch(args) -> int:
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
     repo, info = git.resolve_repo(args.repo)
+    # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
+    read_paths = getattr(args, "read_path", [])
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
         from lu_machinery.dispatcher.providers.opencode import SAVANT_DEFAULT_EFFORT, savant_token_cap
 
         if args.effort is None:
             args.effort = SAVANT_DEFAULT_EFFORT
         args.max_tokens = savant_token_cap(args.max_tokens)
-        if args.read_path:
+        if read_paths:
             from lu_machinery.dispatcher.providers.opencode import savant_tools
             from lu_machinery.dispatcher.write_boundary import MAX_READ_PATHS, read_path
 
             if not savant_tools(args.data_class):
                 raise ValueError("savant_read_path_refused: --read-path needs --data-class public-code or public-docs")
 
-            if len(args.read_path) > MAX_READ_PATHS:
+            if len(read_paths) > MAX_READ_PATHS:
                 raise ValueError(f"savant_read_path_refused: at most {MAX_READ_PATHS} --read-path values")
             try:
-                args.read_path = [read_path(path) for path in args.read_path]
+                read_paths = [read_path(path) for path in read_paths]
             except argparse.ArgumentTypeError as exc:
                 raise ValueError(f"savant_read_path_refused: {exc}") from None
-    elif args.read_path:
+    elif read_paths:
         raise ValueError("savant_read_path_refused: --read-path applies only to --agent opencode --provider subq")
     # Work that cannot land yet, or that collides with a live worker, is caught before anything is spent (#583).
     if args.allow_open_dependency and not args.task_card:
@@ -542,8 +544,8 @@ def _dispatch(args) -> int:
     prompt_path.content = prompt
     options = {key: str(value) for key, value in vars(args).items()
                if value is not None and key not in {"prompt", "input", "read_path"}}
-    if args.read_path:
-        options["read_paths"] = json.dumps(args.read_path, separators=(",", ":"))
+    if read_paths:
+        options["read_paths"] = json.dumps(read_paths, separators=(",", ":"))
     if bound_inputs:
         options["inputs"] = json.dumps(bound_inputs, separators=(",", ":"), sort_keys=True)
     output_schema = args.output_schema
