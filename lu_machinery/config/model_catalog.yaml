@@ -1221,10 +1221,12 @@ models:
     strengths: [four_million_token_context, function_calling, structured_outputs]
     weaknesses: [early_access, qualification_pending, no_zero_data_retention_agreement]
     notes: >-
-      Savant supports explicit test and advisory dispatches through the first-party
-      SubQ endpoint. An explicit public or private data class determines request
-      storage. No review-of-record, designated
-      approval, or Ukrainian authoring or review seat. Qualify on held-out real jobs.
+      Read-only trial for supplemental PR review, non-Ukrainian councils and
+      hard-problem advice, proposed code patches, and Ukrainian checks against
+      verified Sources evidence. Dispatch defaults to high. Request max only
+      for jobs that justify it. An explicit public or private data class
+      determines request storage. Review of record, designated approval and
+      Ukrainian authoring stay with qualified seats. Measure on held-out real jobs.
     sources:
       - https://docs.subq.ai/using-the-api/models/
       - https://docs.subq.ai/endpoints/chat-completions-api/

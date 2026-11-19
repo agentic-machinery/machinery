@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("task-id", None, "Unique safe task ID (default: random UUID)"),
         ("prompt-file", None, "UTF-8 prompt path; '-' reads stdin (one source required)"),
         ("prompt", None, "Literal prompt; '-' reads stdin (one source required)"),
-        ("effort", None, "Provider effort, e.g. high (default: provider default)"),
+        ("effort", None, "Provider effort, e.g. high (default: high for Savant, otherwise provider default)"),
         ("repo", None, "fleet_repos.yaml key (default: public primary)"),
         ("base", "origin/main", "Starting Git ref (default: origin/main)"),
         ("branch", None, "Review source or publish branch; unpinned writes require a remote tip, e.g. codex/fix (default: base)"),
@@ -438,12 +438,10 @@ def _dispatch(args) -> int:
         raise ValueError("task id already exists; choose a new task id")
     repo, info = git.resolve_repo(args.repo)
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
-        from lu_machinery.dispatcher.providers.opencode import savant_effort, savant_token_cap
+        from lu_machinery.dispatcher.providers.opencode import SAVANT_DEFAULT_EFFORT, savant_token_cap
 
-        effort = savant_effort(task_id)
-        if args.effort is not None and args.effort != effort:
-            raise ValueError(f"savant_effort_refused: {task_id} is assigned {effort}")
-        args.effort = effort
+        if args.effort is None:
+            args.effort = SAVANT_DEFAULT_EFFORT
         args.max_tokens = savant_token_cap(args.max_tokens)
     # Work that cannot land yet, or that collides with a live worker, is caught before anything is spent (#583).
     if args.allow_open_dependency and not args.task_card:
