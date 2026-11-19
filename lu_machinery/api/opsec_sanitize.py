@@ -35,10 +35,17 @@ def sanitize_text(text: str) -> str:
     findings = [finding for finding in scan_text(text) if finding.kind == "filesystem-root"]
     if not findings:
         return text
-    rewritten = text
-    for finding in sorted(findings, key=lambda item: item.start, reverse=True):
-        rewritten = rewritten[: finding.start] + REDACTED_ABSOLUTE_PATH + rewritten[finding.end :]
-    return rewritten
+    # One pass over the ordered spans: k findings copy the text once, not k
+    # times.  Selected findings are disjoint; an overlap would be covered whole.
+    parts: list[str] = []
+    position = 0
+    for finding in sorted(findings, key=lambda item: item.start):
+        if finding.start >= position:
+            parts.append(text[position : finding.start])
+            parts.append(REDACTED_ABSOLUTE_PATH)
+        position = max(position, finding.end)
+    parts.append(text[position:])
+    return "".join(parts)
 
 
 def sanitize_document(value: Any) -> Any:
