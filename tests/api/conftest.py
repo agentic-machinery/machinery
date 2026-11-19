@@ -1,4 +1,4 @@
-"""Isolate the process-global status cache between API tests.
+"""Isolate process-global cache state between API tests.
 
 Pytest shortens very long test names onto one temporary directory. A snapshot
 keyed only by that directory would otherwise be served to the next case.
@@ -195,6 +195,10 @@ def _isolate_status_ttl_cache(monkeypatch):
     from lu_machinery.api import claude_account_usage
     from lu_machinery.api.state_helpers import cache_invalidate
 
+    # Drain detached refreshes before invalidating the TTL cache they can refill.
+    main = sys.modules.get("lu_machinery.api.main")
+    if main is not None:
+        main.reset_detached_orient_state_for_tests()
     cache_invalidate()
     claude_account_usage._reset_for_tests()
     monkeypatch.setattr(
