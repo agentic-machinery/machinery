@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -46,24 +47,32 @@ PATH_PAIRS = [
 ]
 
 
-def _git(repo, *args):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, timeout=15,
-        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-    ).stdout.strip()
+def _git(repo: Path, *args: str) -> None:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, timeout=15,
+        env=env,
+    )
 
 
 @pytest.fixture
-def repositories(tmp_path):
-    repos = [tmp_path / "one", tmp_path / "two"]
+def repositories(tmp_path: Path) -> tuple[Path, Path]:
+    repos = (tmp_path / "one", tmp_path / "two")
     for repo in repos:
         repo.mkdir()
-        _git(repo, "init", "-q")
-    _git(repos[0], "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        _git(repo, "init", "-q", "--template=")
+    return repos
+
+
+@pytest.fixture
+def linked_worktree(tmp_path: Path, repositories: tuple[Path, Path]) -> Path:
+    primary = repositories[0]
+    _git(primary, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
          "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "fixture")
     worktree = tmp_path / "linked"
-    _git(repos[0], "worktree", "add", "-q", "--detach", str(worktree))
-    return *repos, worktree
+    _git(primary, "worktree", "add", "-q", "--detach", "--no-checkout", str(worktree))
+    return worktree
 
 
 def _ledger(tmp_path, repo, monkeypatch):
@@ -73,14 +82,14 @@ def _ledger(tmp_path, repo, monkeypatch):
         return ownership.OwnershipLedger(tmp_path / "ownership.sqlite3", task_state_dir=tmp_path)
 
 
-def test_linked_identity_matches_primary_without_spawning(tmp_path, repositories, monkeypatch):
+def test_linked_identity_matches_primary_without_spawning(tmp_path, repositories, linked_worktree, monkeypatch):
     """A Git subprocess in ledger construction must fail this regression (#11375)."""
     def no_spawn(*_args, **_kwargs):
         raise AssertionError("identity resolution must not spawn")
 
     monkeypatch.setattr(subprocess, "Popen", no_spawn)
     primary = _ledger(tmp_path, repositories[0], monkeypatch)
-    linked = _ledger(tmp_path, repositories[2], monkeypatch)
+    linked = _ledger(tmp_path, linked_worktree, monkeypatch)
     assert primary.repository_identity == linked.repository_identity == str((repositories[0] / ".git").resolve())
 
 
@@ -120,10 +129,10 @@ def test_cross_repository_paths_never_conflict_or_wait(tmp_path, repositories, m
 
 
 @pytest.mark.parametrize("held,incoming", PATH_PAIRS[:4])
-def test_linked_worktrees_still_conflict_and_queue(tmp_path, repositories, monkeypatch, held, incoming):
+def test_linked_worktrees_still_conflict_and_queue(tmp_path, repositories, linked_worktree, monkeypatch, held, incoming):
     """Linked worktrees of one repository must still share admission conflicts and queue order."""
     a = _ledger(tmp_path, repositories[0], monkeypatch)
-    linked = _ledger(tmp_path, repositories[2], monkeypatch)
+    linked = _ledger(tmp_path, linked_worktree, monkeypatch)
     assert _admit(a, "holder", [held]).admitted
     assert not _admit(linked, "refused", [incoming]).admitted
     fake = FakeTime(limit=15)
@@ -183,7 +192,7 @@ def test_reclamation_release_and_pid_binding_preserve_foreign_rows(tmp_path, rep
 
 
 @pytest.mark.parametrize("legacy_kind", ["file", "subtree", "ownership_unknown"])
-def test_legacy_claims_default_to_each_current_repository(tmp_path, repositories, monkeypatch, legacy_kind):
+def test_legacy_claims_default_to_each_current_repository(tmp_path, repositories, linked_worktree, monkeypatch, legacy_kind):
     """Legacy claims must default to the current repository instead of crossing repository boundaries."""
     a = _ledger(tmp_path, repositories[0], monkeypatch)
     with a._connect() as conn:
@@ -191,7 +200,7 @@ def test_legacy_claims_default_to_each_current_repository(tmp_path, repositories
             "legacy", json.dumps({"raw": "tests", "kind": legacy_kind, "norm": "tests"}), PID, time.time(),
         ))
     before = _claims(a)
-    for repo in repositories:
+    for repo in (*repositories, linked_worktree):
         current = _ledger(tmp_path, repo, monkeypatch)
         result = _admit(current, "incoming", ["tests/unit.py"])
         assert not result.admitted and result.would_refuse
@@ -233,11 +242,11 @@ def test_unresolvable_identity_keeps_global_admission_and_typed_note(tmp_path, r
     assert not _admit(b, "other-repo", ["other.py"]).admitted
 
 
-def test_identity_ignores_git_environment_and_resolves_symlinks(tmp_path, repositories, monkeypatch):
+def test_identity_ignores_git_environment_and_resolves_symlinks(tmp_path, repositories, linked_worktree, monkeypatch):
     """Ambient Git variables and path aliases must not forge distinct repository identities."""
     a = _ledger(tmp_path, repositories[0], monkeypatch)
     alias = tmp_path / "alias"
-    alias.symlink_to(repositories[2], target_is_directory=True)
+    alias.symlink_to(linked_worktree, target_is_directory=True)
     monkeypatch.setenv("GIT_DIR", str(repositories[1] / ".git"))
     monkeypatch.setenv("GIT_COMMON_DIR", str(repositories[1] / ".git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(repositories[1]))
@@ -250,7 +259,7 @@ def test_common_directory_identity_preserves_trailing_spaces(tmp_path, monkeypat
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     common = tmp_path / "git store "
-    _git(checkout, "init", "-q", f"--separate-git-dir={common}")
+    _git(checkout, "init", "-q", "--template=", f"--separate-git-dir={common}")
     ledger = _ledger(tmp_path, checkout, monkeypatch)
     assert ledger.repository_identity == str(common.resolve())
 
@@ -336,14 +345,16 @@ def _process_admission(repo, ledger_path, state_dir, task, barrier, results, rel
 
 
 @pytest.mark.parametrize("same_repository", [False, True])
-def test_concurrent_processes_preserve_atomic_repository_admission(tmp_path, repositories, monkeypatch, same_repository):
+def test_concurrent_processes_preserve_atomic_repository_admission(
+    tmp_path, repositories, monkeypatch, same_repository, request
+):
     """Concurrent callers must not both acquire conflicting ownership in the same repository."""
     ledger = _ledger(tmp_path, repositories[0], monkeypatch)
     with ledger._connect():
         pass
     ctx = multiprocessing.get_context("fork")
     barrier, results, release = ctx.Barrier(4), ctx.Queue(), ctx.Event()
-    repos = [repositories[0], repositories[2]] if same_repository else repositories[:2]
+    repos = (repositories[0], request.getfixturevalue("linked_worktree")) if same_repository else repositories
     processes = [ctx.Process(target=_process_admission, args=(
         repos[i % 2], ledger.path, tmp_path, f"writer-{i}", barrier, results, release,
     )) for i in range(4)]

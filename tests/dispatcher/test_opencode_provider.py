@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from lu_machinery.api import subscription_usage as usage
+from lu_machinery.api import model_stats_rows, subscription_usage as usage
 from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker
 from lu_machinery.dispatcher.providers import opencode
 from lu_machinery.dispatcher.types import TaskSpec
@@ -144,7 +144,9 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     key_file.chmod(0o600)
     monkeypatch.setenv("LU_SUBQ_API_KEY_FILE", str(key_file))
     monkeypatch.setattr(opencode, "_savant_runtime_refusal", lambda env: None)
-    record = dispatch(*SAVANT_FLAGS, "--data-class", "public-code")
+    head = "a" * 40
+    record = dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--research-role", "advisory",
+                      "--pinned-head", head, task_id="oc-public")
     assert (record["provider"], record["model"], record["effort"]) == ("subq", "subq-savant-1.4", "high")
     trial = replace(spec, provider=record["provider"], model=record["model"], effort=record["effort"],
                     options=record["options"])
@@ -166,12 +168,28 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     assert all("ready" not in arg for arg in invocation.argv)
     override = opencode.build(replace(trial, options={**trial.options, "max_tokens": "12345"}), {})
     assert override.env["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] == "12345"
-    private = dispatch(*SAVANT_FLAGS, "--data-class", "private-code", "--repo", "infra-private", task_id="oc-private")
-    private_trial = replace(trial, task_id="oc-private", effort=private["effort"], options=private["options"])
+    private = dispatch(*SAVANT_FLAGS, "--data-class", "private-code", "--repo", "infra-private",
+                       "--effort", "max", task_id="oc-private-max")
+    assert private["effort"] == "max"
+    private_trial = replace(trial, task_id="oc-private-max", effort=private["effort"], options=private["options"])
     invocation = runtime_context.build(private_trial, {})
     model = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])["provider"]["subq"]["models"]["subq-savant-1.4"]
-    assert model["options"] == {"store": False, "reasoningEffort": private["effort"]}
+    assert model["options"] == {"store": False, "reasoningEffort": "max"}
     assert invocation.stdin == b"Reply with exactly: ready\n"
+    store.record_path(record["task_id"]).with_suffix(".result").write_text(json.dumps({
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": "No findings.", "confidence": 1},
+        "findings": [],
+    }), encoding="utf-8")
+    store.replace({**record, "status": "done"})
+    store.replace({**private, "status": "failed"})
+    rows, _ = model_stats_rows.read_rows(tmp_path)
+    assert {(row["model"], row["effort"], row["status"]) for row in rows} == {
+        ("subq-savant-1.4", "high", "done"), ("subq-savant-1.4", "max", "failed"),
+    }
+    review = next(row for row in rows if row["task_id"] == record["task_id"])
+    assert review["review"] == {"verdict": "correct", "priorities": {}}
+    assert review["pinned_head"] == head and review["pr"] is None
     spec.prompt_file.write_text("Do not send fixture-key", encoding="utf-8")
     with pytest.raises(ValueError, match="savant_prompt_refused"):
         runtime_context.build(private_trial, {})
@@ -189,6 +207,10 @@ def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
     assert all(candidate.concrete_model != "subq-savant-1.4" for candidate in REVIEW_CANDIDATES.values())
     dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--risk", "high", "--require-review-verdict", expected=2)
     assert "holds no review, critique or approval role" in capsys.readouterr().err
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--mode", "workspace-write", expected=2)
+    assert "does not run in mode 'workspace-write'" in capsys.readouterr().err
+    dispatch(*SAVANT_FLAGS, "--data-class", "public-code", "--effort", "medium", expected=2)
+    assert "does not offer effort 'medium'" in capsys.readouterr().err
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

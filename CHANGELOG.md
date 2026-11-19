@@ -9,6 +9,26 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.37"></a>
+## [0.1.37] - 2026-11-19
+
+### Added
+
+- Apply Savant storage policy per request ([#838](https://github.com/learn-ukrainian/machinery/pull/838))
+
+### Changed
+
+- Fix installed command hints and CTO recipes ([#842](https://github.com/learn-ukrainian/machinery/pull/842))
+
+### Fixed
+
+- Count structured verdicts across reviewer levels ([#837](https://github.com/learn-ukrainian/machinery/pull/837))
+- Bound the cold routing-budget read with a typed warming 503 (Supersedes #835) ([#840](https://github.com/learn-ukrainian/machinery/pull/840))
+
+### Removed
+
+- Retire orphaned Git finalization paths ([#839](https://github.com/learn-ukrainian/machinery/pull/839))
+
 <a id="v0.1.36"></a>
 ## [0.1.36] - 2026-11-19
 
@@ -967,7 +987,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...HEAD
+[0.1.37]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...v0.1.37
 [0.1.36]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...v0.1.35
 [0.1.34]: https://github.com/learn-ukrainian/machinery/compare/v0.1.33...v0.1.34

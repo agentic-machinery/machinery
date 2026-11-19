@@ -1130,9 +1130,9 @@ def assert_frozen_surfaces(actual, *, surfaces):
             previous_gemma = expected["models"].pop("google-ais/gemma-4-31b-it")
             assert hashlib.sha256(encode(previous_gemma)).hexdigest() == "9066a74a9f417fad51e9b1bf60102032a07d880bb4275ee5613012b0f001a271"
             expected["review_scheduler"]["activity_roles"]["review"].remove("surface_review")
-            # Savant adds a test route and leaves the formal reviewer receipts intact.
+            # Savant's trial route leaves the formal reviewer receipts intact.
             savant = value["models"].pop("subq-savant-1.4")
-            assert hashlib.sha256(encode(savant)).hexdigest() == "c4d0df975564495fbe8dac145250404aec99711f299675d9df1411f35e92f7db"
+            assert hashlib.sha256(encode(savant)).hexdigest() == "ae705b3c282b4b8086e44fe063660fae142dc37ada78dfc8275f5d120c7dd472"
         assert value == expected, f"current surface differs: {surface}"
 
 

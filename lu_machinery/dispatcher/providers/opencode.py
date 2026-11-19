@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -51,7 +50,7 @@ _SAVANT_API = "https://api.subq.ai/v1"
 _SAVANT_KEY_FILE_ENV = "LU_SUBQ_API_KEY_FILE"
 _SAVANT_CONTEXT = 4_000_000
 _SAVANT_DEFAULT_MAX_TOKENS = 64_000
-_SAVANT_EFFORTS = ("low", "high", "max")
+SAVANT_DEFAULT_EFFORT = "high"
 # Revalidate the full request body before widening the compatible OpenCode version.
 _SAVANT_OPENCODE_VERSION = "1.19.6"
 OPENROUTER_PROVIDERS = ("fireworks/us", "baseten/us", "inference-net/us")
@@ -92,12 +91,6 @@ def endpoint(provider: str | None) -> str:
     if selected not in MODELS:
         raise ValueError(f"opencode_endpoint_unknown: --provider {provider!r}; use one of {', '.join(MODELS)}")
     return selected
-
-
-def savant_effort(task_id: str) -> str:
-    """Assign a stable one-third split for comparative trial scoring."""
-    digest = hashlib.sha256(task_id.encode("utf-8")).digest()
-    return _SAVANT_EFFORTS[int.from_bytes(digest, "big") % len(_SAVANT_EFFORTS)]
 
 
 def savant_token_cap(raw: str | None) -> int:
@@ -160,11 +153,13 @@ def _savant_build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     from lu_machinery.dispatcher.checks import check_model_admission
 
     prompt = spec.prompt_file.read_bytes()
-    check_model_admission(spec.agent, spec.model, spec.mode, {**spec.options, "provider": spec.provider}, prompt)
+    check_model_admission(
+        spec.agent, spec.model, spec.mode, {**spec.options, "provider": spec.provider, "effort": spec.effort}, prompt,
+    )
     store = savant_request_store(spec.options.get("data_class"))
-    effort = savant_effort(spec.task_id)
-    if spec.effort != effort:
-        raise ValueError(f"savant_effort_refused: the route requires the recorded effort {effort}")
+    effort = spec.effort
+    if effort is None:
+        raise ValueError("savant_effort_refused: the route requires a recorded effort")
     cap = savant_token_cap(spec.options.get("max_tokens"))
     if refusal := _savant_runtime_refusal(env):
         raise ValueError(refusal)
