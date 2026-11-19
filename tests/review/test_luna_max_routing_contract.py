@@ -1288,6 +1288,43 @@ def test_resolve_reviewer_subject_seat_blocks_codex_for_its_adapter():
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "path,seat",
+    [
+        ("dispatcher/claude_review_shell", "claude"),
+        ("agent_runtime/claude_acp_exec.sh", "claude"),
+        ("agent_runtime/deepseek_admission.py", "deepseek"),
+        ("agent_runtime/grok_reviewer_permissions.py", "grok"),
+        ("agy_hooks/pending_orders_inject.sh", "agy"),
+    ],
+)
+def test_extracted_seat_boundary_paths_preserve_subject_exclusion(path, seat):
+    """A legacy path or a missing package file must still identify the governed seat."""
+    canonical = f"lu_machinery/{path}"
+    for prefix in ("lu_machinery", "scripts"):
+        owned_paths = (f"{prefix}/{path}",)
+        subject = prepare_subject_exclusion(owned_paths=owned_paths)
+        assert subject.seats == {seat}
+        assert subject.evidence == (canonical,)
+        if seat == "claude":
+            result = resolve_reviewer(
+                ResolverInputs(
+                    author_model=CURRENT_SOL,
+                    domain="infra",
+                    risk="critical",
+                    owned_paths=owned_paths,
+                    claude_account=HOST_ACCOUNT,
+                )
+            )
+            assert result.selected is None and result.fail_closed_reason
+            assert any(
+                entry.status == "excluded" and "subject seat claude" in (entry.reason or "")
+                for entry in result.trace
+                if entry.concrete_model == "claude-opus-5-5"
+            )
+
+
+@pytest.mark.usefixtures('configured_roots')
 def test_resolve_reviewer_without_subject_information_matches_empty_subject_fields():
     """AC-02: explicit empty subject inputs do not change the trace."""
     authors = (
