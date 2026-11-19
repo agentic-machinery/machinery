@@ -148,7 +148,8 @@ def _git_state_anchor(ctx: MonitorContext) -> Path:
         except (OSError, RuntimeError):
             raise fleet_paths.PlaneRootAnchorError("plane_root_unresolvable") from None
 
-    return ctx.runtime.get_or_create_derived(cache_key, _resolve)
+    anchor: Path = ctx.runtime.get_or_create_derived(cache_key, _resolve)
+    return anchor
 
 
 def _plane_root(ctx: MonitorContext | None = None) -> Path:
@@ -1078,7 +1079,11 @@ async def fleet_overview(
         stored_entry = cache_get_stored(key)
         if stored_entry is not None:
             cached_item, cached_age = stored_entry
-            if isinstance(cached_item, tuple) and len(cached_item) == 2:
+            if (
+                isinstance(cached_item, tuple)
+                and len(cached_item) == 2
+                and isinstance(cached_item[0], dict)
+            ):
                 response.headers.update(snapshot_headers(cached_age, FACADE_TTL_S))
                 return cached_item[0]
         response.headers.update(
