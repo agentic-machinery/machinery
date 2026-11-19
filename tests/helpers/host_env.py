@@ -28,25 +28,26 @@ A module opts in by importing the fixture; it is autouse, so it runs before the 
 An exported setting is one whose current value is the caller's. In a single process, the caller's values are the
 environment it started with (``/proc/self/environ``). An xdist worker starts with its controller's environment,
 which holds the caller's values and the ones the controller published (``PYTHONDONTWRITEBYTECODE``, the scratch
-``CLAUDE_CONFIG_DIR``, the cursor tripwire's ``PYTHONPATH`` entry), and then applies the ``env:`` settings of its
-``--tx`` specification. So the controller names both in the worker's ``workerinput`` (``LAUNCH_KEY``, written by
-``tests/conftest.py``): what it published (its environment minus its own start environment) and the specification's
-settings. A worker's caller values are its start environment minus what the controller published, plus the
-specification's settings. A worker is known by its ``workerinput``, never by an environment variable a nested run
-inherits, and a worker without a well-formed launch record fails the test with the reason.
+``CLAUDE_CONFIG_DIR``, the cursor tripwire's ``PYTHONPATH`` entry). So the controller writes a launch record into the
+worker's ``workerinput`` (``LAUNCH_KEY``, from ``tests/conftest.py``): its pid and what it published (its environment
+minus its own start environment, ``PYTHONPATH`` by entry). A worker's caller values are its own start environment
+minus what the controller published. A worker is known by its ``workerinput``, never by an environment variable a
+nested run inherits. The test fails with the reason when the record is missing or malformed, when the worker's parent
+is not the controller it names (a proxy or other intermediary supplied the environment), or when the worker's
+``--tx`` specification sets a judged name: the specification applies its ``env:`` settings after the worker
+starts, so neither the start environment nor the record can tell them from the suite's values.
 
 The values the suite publishes itself, such as the telemetry redirect, scratch root and task store, differ from the
-caller's and stay, so a child never loses a redirect and writes to production; a caller value that replaced one the
-controller published is set back to the controller's. Equal values cannot show who set a variable, so the names in
-``SUITE_PUBLISHED`` are never dropped: the suite publishes each of them for every test, whatever the caller exported.
-Every other caller value goes, ``LU_TEST_*`` harness settings included: a caller's test-slot pool
-(``LU_TEST_SLOTS_DIR``) would otherwise steer a sandbox child's dispatch admission to that pool. The test interpreter
-(``LEARN_UKRAINIAN_PYTHON``) is set to this interpreter, so a test needs no caller-provided value. ``monkeypatch``
-restores everything after the test.
+caller's and stay, so a child never loses a redirect and writes to production. Equal values cannot show who set a
+variable, so the names in ``SUITE_PUBLISHED`` are never dropped: the suite publishes each of them for every test,
+whatever the caller exported. Every other caller value goes, ``LU_TEST_*`` harness settings included: a caller's
+test-slot pool (``LU_TEST_SLOTS_DIR``) would otherwise steer a sandbox child's dispatch admission to that pool. The
+test interpreter (``LEARN_UKRAINIAN_PYTHON``) is set to this interpreter, so a test needs no caller-provided value.
+``monkeypatch`` restores everything after the test.
 
 A start environment still holds the credentials ``tests/conftest.py`` stripped at import, so it is read only inside
-the functions below, before which every input that could raise is checked; they return names and suite values, never
-a caller value, and no fixture frame a failure report shows holds one.
+the functions below, which check every input that could raise before the read and return names, never a caller
+value; no fixture frame a failure report shows holds one.
 """
 
 from __future__ import annotations
@@ -105,18 +106,24 @@ def start_environment() -> dict[str, str] | str:
 
 
 def launch_record(specification: object) -> dict[str, object]:
-    """What an xdist controller tells a worker it starts: its own published settings and the ``--tx`` ``env:`` ones.
+    """What an xdist controller tells a worker it starts: its pid and the settings it published.
 
-    ``specification`` is the execnet ``XSpec.env`` mapping (``None`` when the specification sets none). Published means
-    set by this process after it started: a judged name whose value differs from the start environment, and for
-    ``PYTHONPATH`` the entries the start value lacks. Never raises: a failure is recorded under ``error`` and fails
-    the worker's tests that use the fixture, not the session.
+    ``specification`` is the worker's execnet ``XSpec.env`` mapping. Published means set by this process after it
+    started: a judged name whose value differs from the start environment, and for ``PYTHONPATH`` the entries the
+    start value lacks. Never raises: a failure, or a specification that sets a judged name, is recorded under
+    ``error`` and fails the worker's tests that use the fixture, not the session.
     """
+    if not isinstance(specification, dict):
+        return {"error": f"the --tx env settings are {type(specification).__name__}, not a mapping"}
+    specified = sorted(str(name) for name in specification if judged(str(name)))
+    if specified:
+        return {
+            "error": f"the --tx specification sets {', '.join(specified)} after the worker starts, so they cannot be "
+            "told from the suite's values; export them in the caller's environment instead"
+        }
     start = start_environment()
     if isinstance(start, str):
         return {"error": start}
-    if specification is not None and not isinstance(specification, dict):
-        return {"error": f"host_isolated_env: the --tx env settings are {type(specification).__name__}, not a mapping"}
     published = {
         name: value
         for name, value in os.environ.items()
@@ -124,19 +131,16 @@ def launch_record(specification: object) -> dict[str, object]:
     }
     caller_entries = set(search_path_entries(start.get(SEARCH_PATH_VARIABLE)))
     added = [entry for entry in search_path_entries(os.environ.get(SEARCH_PATH_VARIABLE)) if entry not in caller_entries]
-    settings = {
-        str(name): str(value) for name, value in (specification or {}).items() if judged(str(name))
-    }
-    return {"published": published, "published_search_path": added, "specification": settings}
+    return {"controller": os.getpid(), "published": published, "published_search_path": added}
 
 
-def checked_launch(workerinput: dict[str, object] | None) -> tuple[dict[str, str], list[str], dict[str, str]] | str:
-    """The worker's launch record as (published, published search-path entries, specification), or why it is unusable.
+def checked_launch(workerinput: dict[str, object] | None) -> tuple[dict[str, str], list[str]] | str:
+    """The worker's launch record as (published, published search-path entries), or why it is unusable.
 
     A single process (no ``workerinput``) has an empty record.
     """
     if workerinput is None:
-        return {}, [], {}
+        return {}, []
     record = workerinput.get(LAUNCH_KEY)
     if not isinstance(record, dict):
         return (
@@ -144,54 +148,49 @@ def checked_launch(workerinput: dict[str, object] | None) -> tuple[dict[str, str
             f"only {type(record).__name__}"
         )
     if "error" in record:
-        return f"host_isolated_env: the controller could not describe this worker's launch: {record['error']}"
-    published, search_path, settings = (
-        record.get("published"), record.get("published_search_path"), record.get("specification")
-    )
-    mappings_ok = all(
-        isinstance(mapping, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items())
-        for mapping in (published, settings)
-    )
-    if not mappings_ok or not isinstance(search_path, list) or not all(isinstance(e, str) for e in search_path):
+        return f"host_isolated_env: the controller cannot describe this worker's environment: {record['error']}"
+    controller = record.get("controller")
+    if type(controller) is not int or controller != os.getppid():
+        return (
+            f"host_isolated_env: this xdist worker's parent ({os.getppid()}) is not the controller its launch record "
+            f"names ({controller!r}), so its start environment is not the controller's"
+        )
+    published, search_path = record.get("published"), record.get("published_search_path")
+    if (
+        not isinstance(published, dict)
+        or not all(isinstance(name, str) and isinstance(value, str) for name, value in published.items())
+        or not isinstance(search_path, list)
+        or not all(isinstance(entry, str) for entry in search_path)
+    ):
         return f"host_isolated_env: this xdist worker's launch record ({LAUNCH_KEY}) is malformed"
-    return published, search_path, settings
+    return published, search_path
 
 
-def caller_settings(workerinput: dict[str, object] | None) -> tuple[dict[str, str | None], set[str]] | str:
-    """The settings in ``os.environ`` that hold the caller's value, or why that is unknown.
+def caller_settings(workerinput: dict[str, object] | None) -> tuple[list[str], set[str]] | str:
+    """The names in ``os.environ`` that hold the caller's value and the caller's ``PYTHONPATH`` entries, or why not.
 
-    Returns each such name mapped to the suite's value to put back (``None``: drop it), and the caller's ``PYTHONPATH``
-    entries. ``PYTHONPATH`` itself is never in the mapping, and a ``SUITE_PUBLISHED`` name only when a ``--tx``
-    setting replaced the suite's value. The caller's values stay inside this function: the launch record is checked
-    before the start environment is read, and nothing after the read can raise.
+    ``SUITE_PUBLISHED`` names and ``PYTHONPATH`` itself are never among the names. The caller's values stay inside
+    this function: the launch record is checked before the start environment is read, and nothing after the read can
+    raise.
     """
     launch = checked_launch(workerinput)
     if isinstance(launch, str):
         return launch
-    published, published_entries, specification = launch
+    published, published_entries = launch
     start = start_environment()
     if isinstance(start, str):
         return start
     entries = set(search_path_entries(start.get(SEARCH_PATH_VARIABLE))) - set(published_entries)
-    entries |= set(search_path_entries(specification.get(SEARCH_PATH_VARIABLE)))
-    held: dict[str, str | None] = {}
-    for name, value in os.environ.items():
-        if not judged(name) or name == SEARCH_PATH_VARIABLE:
-            continue
-        if specification.get(name) == value:
-            # Set by the --tx specification over the start value. The start value is the suite's when the controller
-            # published it or the suite publishes the name; a SUITE_PUBLISHED name with no other suite value stays,
-            # since a per-test fixture may have set the same value after the specification.
-            prior = start.get(name)
-            if prior is not None and (name in SUITE_PUBLISHED or published.get(name) == prior):
-                held[name] = prior
-            elif name in published:
-                held[name] = published[name]
-            elif name not in SUITE_PUBLISHED:
-                held[name] = None
-        elif name not in SUITE_PUBLISHED and start.get(name) == value and published.get(name) != value:
-            held[name] = published.get(name)
-    return held, entries
+    names = [
+        name
+        for name, value in os.environ.items()
+        if judged(name)
+        and name not in SUITE_PUBLISHED
+        and name != SEARCH_PATH_VARIABLE
+        and start.get(name) == value
+        and published.get(name) != value
+    ]
+    return names, entries
 
 
 def without_shims(search_path: str) -> str:
@@ -222,14 +221,9 @@ def host_isolated_env(
     settings = caller_settings(getattr(request.config, "workerinput", None))
     if isinstance(settings, str):
         pytest.fail(settings)
-    held, caller_entries = settings
-    for name in [name for name in os.environ if name.startswith((GIT_PREFIX, XDG_PREFIX))]:
+    caller_names, caller_entries = settings
+    for name in [name for name in os.environ if name.startswith((GIT_PREFIX, XDG_PREFIX))] + caller_names:
         monkeypatch.delenv(name)
-    for name, suite_value in held.items():
-        if suite_value is None:
-            monkeypatch.delenv(name)
-        else:
-            monkeypatch.setenv(name, suite_value)
     if SEARCH_PATH_VARIABLE in os.environ:
         entries = search_path_entries(os.environ[SEARCH_PATH_VARIABLE])
         search_path = os.pathsep.join(entry for entry in entries if entry not in caller_entries)
