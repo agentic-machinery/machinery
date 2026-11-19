@@ -780,23 +780,13 @@ models:
       - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/3-8-flash-and-3-8-flash-cyber/
   gemini-4-carbon:
-    routing_wire_ids:
-      agy: gemini-4-carbon-medium
     family: google
     tier: frontier_practical
-    lifecycle: active
-    # The listed AGY selectors are separate wire values. -medium is the routing
-    # wire id (the Gemini work route); -high and -low are runtime ids, which dispatch
-    # passes through unchanged and identity attestation recognises, for explicit
-    # selection only. They are not aliases: dispatch rewrites an alias to the wire
-    # id, so an alias would run -medium.
-    runtime_model_ids: [gemini-4-carbon-high, gemini-4-carbon-low]
-    # Not a Gemini work route: Gemini work defaults to gemini-4-hydrogen
-    # (operator 2026-11-17). The advisory (consult) role admits ACP asks;
-    # read-only review dispatches without review typing need no role. It holds
-    # no review role, seat or ladder entry, so it is never a review of record.
-    roles: [advisory]
-    transports: [agy]
+    lifecycle: retired
+    replaced_by: gemini-4-neon
+    runtime_model_ids: [gemini-4-carbon-high, gemini-4-carbon-medium, gemini-4-carbon-low]
+    roles: [historical_record_resolution]
+    transports: []
     strengths: [listed_agy_selector, one_million_token_context, terminal_bench_coding]
     weaknesses:
       - provider_listing_is_not_qualification
@@ -807,6 +797,7 @@ models:
       - cyber_scores_via_fairwind_program_access
       - agy_selector_thinking_level_mapping_unverified
     notes: >-
+      Retired by NEON-REPLACES-CARBON-1118 (2026-11-18). Historical routing:
       Operator orders 2026-11-17: Gemini 4 Carbon is used for read-only review
       and security-review dispatches outside the review-of-record ladders and
       for advisory asks, and not as a Gemini work route; Gemini work defaults to Gemini 4 Hydrogen at
@@ -833,6 +824,31 @@ models:
       - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/
       - https://aistudio.google.com/docs/changelog
       - https://aistudio.google.com/docs/thinking
+  gemini-4-neon:
+    routing_wire_ids:
+      agy: gemini-4-neon-high
+    family: google
+    tier: frontier_practical
+    lifecycle: active
+    runtime_model_ids: [gemini-4-neon-low, gemini-4-neon-medium, gemini-4-neon-xhigh]
+    roles: [advisory]
+    transports: [agy]
+    strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels]
+    weaknesses: [provider_listing_is_not_qualification]
+    notes: >-
+      NEON-REPLACES-CARBON-1118 (2026-11-18) moves Carbon's advisory work to
+      Neon and adds it to the non-Ukrainian council, supplemental security
+      review and hard-problem advisory pools. Use high for odd PR numbers and
+      medium for even PR numbers. For non-PR work, use the first hex digit of
+      the stable task ID's SHA-256, with the same parity rule. Without a stable
+      ID use high, the AGY wire default. Pass the exact selector in each
+      dispatch. Formal review still requires its own catalog seat. Google's
+      AA Index v5.0.1 chart shows Neon high
+      around 60 at USD 3.7 per task, matching Carbon's highest score and
+      costing less than Carbon medium (around 58 at USD 5.2). These are vendor
+      claims. Neon review qualification depends on observed review outcomes.
+    sources:
+      - https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-neon/
   gemini-4-hydrogen:
     routing_wire_ids:
       agy: gemini-4-hydrogen-medium

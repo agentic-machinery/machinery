@@ -74,12 +74,12 @@ def delivered_paths(run: Callable[..., str], head_sha: str, base_sha: str, start
                     commits_expected: bool = False) -> list[str]:
     """Every path the task's own commits touch, as settlement reads them.
 
-    The range is ``head`` minus everything reachable from the base or the task's start. Remerge
-    diffs isolate edits made during a merge from clean upstream changes; older Git and octopus
-    merges cannot prove the absence of resolution edits, so they are refused.
+    The range excludes everything reachable from the task's start or any of the delivery's
+    merge bases with the base branch. Remerge diffs isolate edits made during a merge from clean
+    upstream changes. Older Git and octopus merges cannot prove the absence of resolution edits.
     """
-    merge_base = run("merge-base", head_sha, base_sha)
-    revision_range = (head_sha, "--not", merge_base, start_sha)
+    merge_bases = run("merge-base", "--all", head_sha, base_sha).splitlines()
+    revision_range = (head_sha, "--not", *merge_bases, start_sha)
     if commits_expected and not run("rev-list", "--max-count=1", *revision_range):
         raise ValueError("empty ownership range with recorded commits ahead")
     version = tuple(int(part) for part in run("version").split()[2].split(".")[:2])

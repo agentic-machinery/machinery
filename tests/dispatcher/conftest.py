@@ -412,7 +412,10 @@ def merged_delivery_world(tmp_path, monkeypatch):
         },
     )
 
+    current_pr = None
+
     def gh(args, **_):
+        nonlocal current_pr
         if world.lookup_error:
             raise world.lookup_error
         words = args[1:]
@@ -426,6 +429,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
             out = json.dumps(listed)
         elif words[:2] == ["pr", "view"]:
             number = int(words[2])
+            current_pr = number
             branch = next((pr["headRefName"] for pr in world.listed if pr["number"] == number),
                           world.record["worktree_branch"])
             out = json.dumps({"headRefName": branch, **world.prs[number]})
@@ -439,7 +443,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
                    if words[0] == "api" and words[2].endswith("/commits")
                    else json.dumps(world.search_listed if "--search" in words and world.search_listed is not None
                                    else world.listed) if words[:2] == ["pr", "list"]
-                   else "\n".join(json.dumps(name) for name in world.files[int(words[2].split("/")[4])]))
+                   else "[]")
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     state = tmp_path / "state.json"
@@ -450,10 +454,10 @@ def merged_delivery_world(tmp_path, monkeypatch):
     def ownership_git(_record, head=None):
         if head is None:
             raise subprocess.CalledProcessError(128, ["git", "fetch"], stderr="branch gone")
-        yield Mock(return_value="b" * 40)  # the merged head, fetched by id, adds no path beyond its file list
+        yield Mock(side_effect=lambda command, *args, **kwargs: "b" * 40 if command != "rev-list" else "")
 
     monkeypatch.setattr(git, "ownership_git", ownership_git)
-    monkeypatch.setattr(ownership, "delivered_paths", Mock(return_value=[]))
+    monkeypatch.setattr(ownership, "delivered_paths", lambda *args, **kwargs: world.files[current_pr])
 
     def accept(*numbers):
         history = [{"event": "accepted", "pr": f"org/repo#{n}", "successor": "merge-probe"} for n in numbers]

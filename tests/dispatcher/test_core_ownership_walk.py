@@ -71,6 +71,27 @@ def test_ownership_walk_verifies_distinct_publish_branch(sandbox, delivery_settl
     assert (rejected["status"], rejected["error"]) == ("no_deliverable", "outside_owned_paths: outside.txt")
 
 
+def test_ownership_walk_excludes_all_merge_bases(sandbox, delivery_settle):
+    """Criss-cross base merges can put a trusted upstream commit outside a single merge base."""
+    record, settle = delivery_settle
+    tree = Path(record["cwd"])
+    (tree / "base-left.txt").write_text("left\n")
+    run_git(tree, "add", "base-left.txt")
+    run_git(tree, "commit", "-m", "left")
+    left = run_git(tree, "rev-parse", "HEAD")
+    (sandbox.repo / "base-right.txt").write_text("right\n")
+    run_git(sandbox.repo, "add", "base-right.txt")
+    run_git(sandbox.repo, "commit", "-m", "right")
+    right = run_git(sandbox.repo, "rev-parse", "HEAD")
+    run_git(sandbox.repo, "merge", "--no-ff", "--no-edit", left)
+    run_git(sandbox.repo, "push", "origin", "main:release")
+    run_git(tree, "merge", "--no-ff", "--no-edit", right)
+    assert set(run_git(tree, "merge-base", "--all", "HEAD", "origin/release").splitlines()) == {left, right}
+
+    delivered = settle("pushed")
+    assert (delivered["status"], delivered["error"]) == ("done", None)
+
+
 @pytest.mark.parametrize("publish_branch", ["release", "fix/published"])
 def test_ownership_walk_requires_distinct_refs_and_nonempty_range(sandbox, delivery_settle, publish_branch):
     """Equal delivery/base refs and empty inspected ranges fail ownership verification."""
@@ -171,6 +192,18 @@ def test_ownership_shallow_fetches_do_not_change_linked_worktree_primary(tmp_pat
     assert git._verification_git(primary, "show-ref") == refs
 
 
+@pytest.mark.parametrize("entry", [None, {"github": []}, {"github": "fixture/private", "transport": []},
+                                   {"github": "fixture/private", "local_name": 4}])
+def test_settlement_registry_rejects_malformed_entries(tmp_path, entry):
+    """Malformed entries must fail at startup rather than aborting the terminal record write."""
+    from lu_machinery.common import git_credentials
+
+    registry = tmp_path / "fleet_repos.yaml"
+    registry.write_text(yaml.safe_dump({"repos": {"public": entry}}))
+    with pytest.raises(ValueError, match="invalid fleet repository registry"):
+        git_credentials.repository_registry(registry)
+
+
 def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_remote(
     sandbox, delivery_settle, monkeypatch, tmp_path,
 ):
@@ -183,7 +216,7 @@ def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_
     import shlex
 
     from lu_machinery.common import git_credentials
-    from lu_machinery.orchestration import merge_closeout
+    from lu_machinery.orchestration import fleet_repos, merge_closeout
 
     record, settle = delivery_settle
     record = settle("pushed")
@@ -194,8 +227,14 @@ def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_
     run_git(tree, "config", "remote.origin.url", remote)
     record["worktree_remote_url"] = remote
     registry = tmp_path / "registry.yaml"
-    registry.write_text(yaml.safe_dump({"repos": {"fixture": {"github": "fixture/private", "transport": "https"}}}))
+    registry.write_text(yaml.safe_dump({"repos": {"fixture": {
+        "github": "fixture/private", "transport": "https", "local_name": "fixture", "default": True,
+    }}}))
     monkeypatch.setattr(git_credentials, "CONFIG", registry)
+    monkeypatch.setattr(git, "machinery_path", lambda _relative: registry)
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", registry)
+    git.pin_settlement_registry()
+    registry.unlink()  # Simulate removing the installed package after launch.
     log = tmp_path / "helper-contexts"
     marker = tmp_path / "untrusted-helper-ran"
     fake_gh = tmp_path / "fake gh"

@@ -10,8 +10,8 @@ provider output kept beside a ``summary.json``. Every dispatch goes through
 ``lu_machinery.dispatch``; this module adds no provider route of its own.
 
 Usage:
-    .venv/bin/python -m lu_machinery.bakeoff.review_eval --seat carbon --dry-run
-    .venv/bin/python -m lu_machinery.bakeoff.review_eval --seat carbon --out <dir> --run-label r1
+    .venv/bin/python -m lu_machinery.bakeoff.review_eval --seat neon --dry-run
+    .venv/bin/python -m lu_machinery.bakeoff.review_eval --seat neon --out <dir> --run-label r1
 
 Cases split into ``tune`` and ``test`` by a stable hash of repository and PR number. The default
 split is ``test``, the held-out split; the tuning split is never read when ``test`` is selected.
@@ -644,7 +644,7 @@ def execute(evalset: EvalSet, items: list[Item], out: Path, dispatcher: Dispatch
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--seat", action="append", required=True,
-                        help="seat from protocol.yaml, e.g. sol, opus, grok, carbon (repeatable)")
+                        help="seat from protocol.yaml, e.g. sol, opus, grok, neon (repeatable)")
     parser.add_argument("--split", choices=SPLITS, default="test", help="case split (default: test, held out)")
     parser.add_argument("--set-dir", type=Path, default=Path("docs/review-eval"),
                         help="directory holding the frozen set (default: docs/review-eval)")

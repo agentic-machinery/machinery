@@ -15,14 +15,22 @@ import signal
 import time
 from tests.dispatcher.conftest import in_process_repo as in_process_repo, local_branches as local_branches
 
-def test_accepted_merged_pr_without_new_commits_is_delivered(merged_delivery_world):
-    """Defect class: a task that landed a PR it accepted, with no commits of its own, was marked no_deliverable."""
+@pytest.mark.parametrize("unpublished_ancestor", [False, True], ids=["unchanged-start", "unpublished-ancestor"])
+def test_accepted_merged_pr_without_new_commits_is_delivered(merged_delivery_world, unpublished_ancestor):
+    """An accepted PR can credit an unchanged task, but a zero count does not prove a different HEAD."""
     world = merged_delivery_world
     world.accept(77)
-    world.prs[77], world.files[77] = MERGED, ["docs/owned.md"]
+    world.prs[77], world.files[77] = MERGED, []
+    world.published = (None, False)
+    if not unpublished_ancestor:
+        world.record["head_sha"] = world.record["worktree_base_sha"]
     worker._enforce_delivery(world.record)
-    assert (world.record["status"], world.record["error"]) == ("done", None)
-    assert world.record["delivery_pr"] == "org/repo#77"
+    if unpublished_ancestor:
+        assert world.record["status"] == "no_deliverable"
+        assert "delivery_pr" not in world.record
+    else:
+        assert (world.record["status"], world.record["error"]) == ("done", None)
+        assert world.record["delivery_pr"] == "org/repo#77"
 
 
 def test_branch_reset_or_deleted_after_merge_is_delivered(merged_delivery_world):
@@ -433,6 +441,24 @@ def test_branch_write_refuses_local_outside_commit_after_remote_branch_deleted(s
     assert "publish branch is absent from the canonical remote" in result.stderr
     assert not (sandbox.tasks / "missing-remote.json").exists()
     assert not (sandbox.repo / ".worktrees/dispatch/codex/missing-remote").exists()
+
+
+def test_takeover_uses_recorded_start_after_history_rewrite(sandbox, delivery_settle):
+    """The old published start may be detached from both tips after a takeover rewrites its branch."""
+    record, settle = delivery_settle
+    tree = Path(record["cwd"])
+    (tree / "predecessor.txt").write_text("first predecessor commit\n")
+    run_git(tree, "add", "predecessor.txt")
+    run_git(tree, "commit", "-m", "predecessor")
+    predecessor = run_git(tree, "rev-parse", "HEAD")
+    run_git(tree, "commit", "--allow-empty", "-m", "superseded predecessor tip")
+    record["worktree_start_sha"] = run_git(tree, "rev-parse", "HEAD")
+    run_git(tree, "push", "origin", f"HEAD:{record['worktree_branch']}")
+    run_git(tree, "reset", "--hard", predecessor)
+    run_git(tree, "push", "--force-with-lease", "origin", f"HEAD:{record['worktree_branch']}")
+
+    delivered = settle("pushed")
+    assert (delivered["status"], delivered["error"]) == ("done", None)
 
 
 def test_workspace_write_sha_base_is_refused_at_dispatch(sandbox):
@@ -855,7 +881,7 @@ def test_lingering_provider_process_is_ended_at_settlement_before_the_worktree_g
 def test_settlement_after_a_dispatcher_module_changes_on_disk_removes_the_worktree(sandbox):
     """Defect (#12634): a worker running while a dispatcher change landed settled with old in-memory and new
     on-disk modules, so removal failed with an ImportError and left a clean tree. The worker now loads its
-    post-start code when it starts, so a later edit on disk never reaches its settlement."""
+    post-start code and registry at launch so an on-disk release replacement cannot reach settlement."""
     task = sandbox.dispatch("blocked")
     await_file(sandbox.tasks / f"{task[0]}.started")
     # The change a merge brings: store gains a function, and the module that settlement loads imports it.
@@ -863,6 +889,7 @@ def test_settlement_after_a_dispatcher_module_changes_on_disk_removes_the_worktr
         stream.write("\n\ndef added_after_the_worker_started():\n    return None\n")
     consumer = sandbox.repo / "lu_machinery/fleet/ignored_task_output.py"
     consumer.write_text("from scripts.dispatcher.store import added_after_the_worker_started\n" + consumer.read_text())
+    (sandbox.repo / "lu_machinery/config/fleet_repos.yaml").unlink()
     (sandbox.tasks / f"{task[0]}.release").touch()
     record = sandbox.settle(task)
     assert (record["worktree_disposition"], record["worktree_disposition_reason"]) == ("removed", "clean"), (
@@ -998,6 +1025,45 @@ def test_write_task_merged_into_main_counts_as_published_after_its_branch_is_del
     assert git.settle_worktree(record) == dict(worktree_disposition="removed", worktree_disposition_reason="clean")
     assert not tree.exists()
     assert branch not in local_branches(sandbox.repo)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("head_moved", [False, True])
+def test_reap_uses_verified_merged_snapshot_only_for_same_head(sandbox, monkeypatch, head_moved):
+    """Removal uses the pinned registry and merge proof, with the proof bound to one HEAD."""
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos, merge_closeout
+
+    record = sandbox.settle(sandbox.dispatch("unpushed", "--mode", "workspace-write"), expected=1)
+    tree = Path(record["worktree_path"])
+    if head_moved:
+        run_git(tree, "commit", "--allow-empty", "-m", "later unpublished work")
+    in_process_repo(sandbox, monkeypatch)
+    registry = git.machinery_path("config/fleet_repos.yaml")
+    monkeypatch.setattr(git_credentials, "CONFIG", registry)
+    monkeypatch.setattr(fleet_repos, "_CONFIG_PATH", registry)
+    git.pin_settlement_registry()
+    registry.unlink()
+    monkeypatch.setattr(git, "merged_delivery", lambda _: {"repo": "org/repo", "number": 7, "merge_sha": "a" * 40})
+
+    def fetch_pr_info(repo_root, number, *, repo):
+        assert (repo_root, number, repo) == (sandbox.repo, 7, "org/repo")
+        assert fleet_repos.canonical_repository("public") == str(sandbox.remote).casefold()
+        return merge_closeout.PullRequestInfo(number=number, state="MERGED", head_ref_name=None, head_sha=None)
+
+    monkeypatch.setattr(merge_closeout, "fetch_pr_info", fetch_pr_info)
+
+    worker._reap_settled(record)
+
+    assert tree.exists() is head_moved, record.get("worktree_disposition_reason")
+    if head_moved:
+        assert record["worktree_disposition_reason"] == "unpublished"
+        assert "closeout" not in record
+    else:
+        assert record["worktree_disposition"] == "removed"
+        assert record["closeout"]["pr"] == 7
+        assert record["closeout"]["returncode"] == 0, record["closeout"]
+        assert json.loads(record["closeout"]["stdout"])["ok"] is True
 
 
 @pytest.mark.usefixtures('configured_roots')

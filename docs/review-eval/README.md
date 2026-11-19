@@ -1,9 +1,13 @@
 # Reviewer grading set
 
-A frozen set for grading each review seat (Sol 6.1, Opus 5.5, Grok 4.7-high, Gemini 4 Carbon):
-recall on known defects and false alarms on clean controls (operator order VERIFY-ADOPT item 4).
+A frozen set for measuring recall on known defects and false alarms on clean controls
+(operator order VERIFY-ADOPT item 4). The active seats are listed in `protocol.yaml`.
 `lu_machinery/bakeoff/review_eval.py` runs it. Paid runs start only after the CTO approves the
 frozen criteria below.
+
+The 2026-11-18 protocol replaces Carbon with a fixed Neon High seat. It requires fresh run
+approval. Give the new protocol its own output directory and run label. Its AGY planning figures
+carry over from the previous protocol and need measurement in the canary.
 
 | File | Content |
 | --- | --- |
@@ -86,8 +90,8 @@ frozen criteria below.
 ## Running it
 
 ```bash
-.venv/bin/python -m lu_machinery.bakeoff.review_eval --seat sol --seat carbon --dry-run
-.venv/bin/python -m lu_machinery.bakeoff.review_eval --seat carbon --run-label r1 --out <dir>
+.venv/bin/python -m lu_machinery.bakeoff.review_eval --seat sol --seat neon --dry-run
+.venv/bin/python -m lu_machinery.bakeoff.review_eval --seat neon --run-label r1 --out <dir>
 ```
 
 A Claude-hosted caller strips its own `CLAUDE*` and `ANTHROPIC*` variables first, or the

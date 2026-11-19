@@ -82,8 +82,7 @@ def test_merged_task_survives_missing_branch_search_and_provider_error(
         elif words[2].endswith("/commits"):
             out = json.dumps(f"deliver\n\nX-Agent: {agent}/{task}\n")
         else:
-            assert words[2].endswith("/files")
-            out = json.dumps("docs/owned.md")
+            raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     @contextmanager
@@ -116,6 +115,10 @@ def test_merged_task_survives_missing_branch_search_and_provider_error(
     ("missing-merge", "clean"),
     ("history-outside", "clean"),
     ("commit-unavailable", "clean"),
+    ("release-trailer", "clean"),
+    ("takeover-inherited-outside", "clean"),
+    ("pr-head-advanced", "clean"),
+    ("unpublished-snapshot", "clean"),
 ])
 def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         tmp_path, monkeypatch, case, tree, replacement, provider_status):
@@ -132,6 +135,10 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     for key, value in (("user.name", "t"), ("user.email", "t@example.invalid"), ("commit.gpgsign", "false")):
         _git(work, "config", key, value)
     _git(work, "commit", "--allow-empty", "-m", "base")
+    if case == "rename-outside":
+        (work / "outside.md").write_text("existing contents\n")
+        _git(work, "add", "outside.md")
+        _git(work, "commit", "-m", "add original path")
     base = _git(work, "rev-parse", "HEAD")
     _git(work, "push", "origin", "main")
     _git(work, "switch", "-c", "claude/rescue-probe")
@@ -139,10 +146,22 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     if replacement:
         _git(work, "push", "origin", "claude/rescue-probe")
         _git(work, "switch", "-c", branch)
+    if case == "takeover-inherited-outside":
+        (work / "outside.md").write_text("predecessor contents\n")
+        _git(work, "add", "outside.md")
+        _git(work, "commit", "-m", "predecessor")
+        base = _git(work, "rev-parse", "HEAD")
     (work / "docs").mkdir()
-    (work / "docs" / "owned.md").write_text("delivered\n")
-    _git(work, "add", "docs/owned.md")
-    _git(work, "commit", "-m", "deliver", "--trailer", "X-Agent: claude/rescue-probe")
+    if case == "rename-outside":
+        _git(work, "mv", "outside.md", "docs/owned.md")
+    else:
+        (work / "docs" / "owned.md").write_text("delivered\n")
+        _git(work, "add", "docs/owned.md")
+    if case == "outside":
+        (work / "outside.md").write_text("outside scope\n")
+        _git(work, "add", "outside.md")
+    trailer = "claude/claude-opus-5-5" if case == "release-trailer" else "claude/rescue-probe"
+    _git(work, "commit", "-m", "deliver", "--trailer", f"X-Agent: {trailer}")
     if case == "history-outside":
         # The ownership walk sees every commit; the final PR diff omits this reverted change.
         (work / "outside.md").write_text("outside scope\n")
@@ -152,6 +171,16 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         _git(work, "commit", "-m", "revert outside", "--trailer", "X-Agent: claude/rescue-probe")
     head = _git(work, "rev-parse", "HEAD")
     _git(work, "push", "origin", branch)
+    pr_head = head
+    if case == "pr-head-advanced":
+        _git(work, "switch", "main")
+        (work / "upstream.md").write_text("upstream\n")
+        _git(work, "add", "upstream.md")
+        _git(work, "commit", "-m", "advance base")
+        _git(work, "switch", branch)
+        _git(work, "merge", "--no-edit", "main")
+        pr_head = _git(work, "rev-parse", "HEAD")
+        _git(work, "push", "origin", branch)
     # The queue squash-merges the work as a new commit on main, then closeout deletes the task branch.
     _git(work, "switch", "main")
     _git(work, "merge", "--squash", branch)
@@ -159,6 +188,10 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     _git(work, "push", "origin", "main", f":{branch}")
     # The task worktree stays on its branch, with the canonical origin recorded at dispatch.
     _git(work, "switch", branch)
+    if case == "pr-head-advanced":
+        _git(work, "reset", "--hard", head)
+    if case == "unpublished-snapshot":
+        _git(work, "commit", "--allow-empty", "-m", "unpublished work")
     _git(work, "remote", "set-url", "origin", "https://github.com/org/repo.git")
 
     @contextmanager
@@ -172,8 +205,8 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
 
     pr = {"state": "OPEN" if case == "open" else "MERGED", "baseRefName": "other" if case == "wrong-base" else "main",
           "mergedAt": "2026-11-08T12:00:00Z" if case == "before-start" else "2026-11-08T12:50:00Z",
-          "headRefOid": "b" * 40 if case == "merged-other-head" else head,
-          "headRefName": branch,
+          "headRefOid": "b" * 40 if case == "merged-other-head" else pr_head,
+          "headRefName": "other/task" if case == "foreign-trailer" else branch,
           "mergeCommit": None if case == "missing-merge" else {"oid": _git(work, "rev-parse", "main")},
           "isCrossRepository": case == "foreign-repository"}
 
@@ -202,17 +235,17 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         elif words[:2] == ["pr", "view"]:
             out = json.dumps(pr)
         elif words[2].endswith("/pulls"):
+            if case in {"merged-other-head", "unpublished-snapshot"}:
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
             if case == "commit-unavailable":
                 return real_run(args, client=client, runner=Mock(side_effect=AssertionError("native fallthrough")),
                                 **kwargs)
             out = json.dumps([{"number": 7, "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
                                "base": {"repo": {"full_name": "org/repo"}}}])
         elif words[2].endswith("/commits"):
-            out = json.dumps("deliver\n\nX-Agent: claude/" + ("foreign" if "foreign-trailer" in case else "rescue-probe"))
+            out = json.dumps("deliver\n\nX-Agent: " + ("claude/foreign" if "foreign-trailer" in case else trailer))
         else:
-            out = json.dumps("outside.md" if case == "outside" else "docs/owned.md")
-            if case == "rename-outside":
-                out += "\n" + json.dumps("outside.md")
+            raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     monkeypatch.setattr(git, "_private_remote_git", private_remote)
@@ -235,7 +268,7 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         monkeypatch.setattr(git, "ownership_git", ownership_git)
     assert not _git(remote, "for-each-ref", "refs/pull", f"refs/heads/{branch}")
     if replacement:
-        assert _git(remote, "rev-parse", "refs/heads/claude/rescue-probe") == base
+        assert _git(remote, "rev-parse", "refs/heads/claude/rescue-probe") != head
     if tree == "untracked":
         (work / ".pytest_breadcrumbs").mkdir()
         (work / ".pytest_breadcrumbs" / "breadcrumb_master.txt").write_text("scratch\n")
@@ -256,8 +289,10 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         _git(work, "reset", "--hard", "main")
     record.update(git.snapshot_delivery(SimpleNamespace(worktree=work, mode="workspace-write"), record))
     assert (record["head_sha"], record["commits_ahead"], record["worktree_dirty_on_exit"]) == (
-        pr["mergeCommit"]["oid"] if case == "accepted-reset" else head,
-        3 if case == "history-outside" else 1, tree != "clean")
+        _git(work, "rev-parse", "HEAD"), {"history-outside": 3, "unpublished-snapshot": 2}.get(case, 1),
+        tree != "clean")
+    if case in {"pr-head-advanced", "unpublished-snapshot"}:
+        monkeypatch.setattr(git, "_canonical_publication", Mock(return_value=(None, False)))
     if tree == "late-commit":
         # A surviving descendant commits after the exit snapshot: the gate reads the snapshot, not the tree.
         _git(work, "commit", "-am", "further work")
@@ -265,7 +300,8 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     if case == "commit-unavailable":
         # Aggregation inspects association candidates even after an exact-branch match.
         assert association_requests == [f"repos/org/repo/commits/{head}/pulls"]
-    if (case in {"merged", "accepted-foreign-trailer", "accepted-reset"} or (case == "commit-unavailable" and not replacement)
+    if (case in {"merged", "accepted-foreign-trailer", "accepted-reset", "takeover-inherited-outside", "pr-head-advanced"}
+            or (case in {"commit-unavailable", "release-trailer"} and not replacement)
             ) and tree in {"clean", "untracked"}:
         assert (record["status"], record["error"], record["delivery_pr"]) == ("done", None, "org/repo#7")
     elif case in {"outside", "rename-outside", "history-outside"}:
@@ -360,8 +396,7 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
         elif words[2].endswith("/commits"):
             out = json.dumps("deliver\n\nX-Agent: claude/rescue-stacked\n")
         else:
-            assert words[2].endswith("/files")
-            out = json.dumps("docs/owned.md")
+            raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     monkeypatch.setattr(git, "_private_remote_git", private_remote)

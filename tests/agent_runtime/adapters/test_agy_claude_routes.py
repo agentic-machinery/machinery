@@ -92,9 +92,9 @@ def test_agy_read_only_without_attempt_boundary_is_refused_not_run_unguarded(
     ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
     ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
     ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
-    ("gemini-4-carbon-low", "Gemini 4 Carbon (Low)"),
-    ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
-    ("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+    ("gemini-4-neon-low", "Gemini 4 Neon (Low)"),
+    ("gemini-4-neon-medium", "Gemini 4 Neon (Medium)"),
+    ("gemini-4-neon-high", "Gemini 4 Neon (High)"),
 ])
 def test_exact_slug_and_display_label_resolve(slug, label):
     adapter = agy.AgyAdapter()
@@ -559,7 +559,7 @@ def test_provider_session_must_bind_to_this_stream(tmp_path, identifiers):
     "claude-sonnet-5-5-high",
     "gemini-4-hydrogen-high",
     "gemini-4-hydrogen-xhigh",
-    "gemini-4-carbon-medium",
+    "gemini-4-neon-high",
 ])
 def test_identity_survives_provider_failure_without_claiming_success(tmp_path, model):
     plan, terminal = _identity_stream_plan(tmp_path, model)
@@ -579,7 +579,7 @@ def test_identity_survives_provider_failure_without_claiming_success(tmp_path, m
     ("claude-opus-5-5-high", "claude-sonnet-5-5-high"),
     ("gemini-4-hydrogen-high", "gemini-4-hydrogen-medium"),
     ("gemini-4-hydrogen-xhigh", "gemini-3.8-flash-high"),
-    ("gemini-4-carbon-high", "gemini-4-carbon-medium"),
+    ("gemini-4-neon-high", "gemini-4-neon-medium"),
 ])
 def test_adapter_substitution_uses_invocation_pin_instead_of_metadata(tmp_path, pin, other):
     plan, terminal = _identity_stream_plan(tmp_path, pin)
@@ -776,7 +776,7 @@ def consistency_stream(slug, case):
 
 @pytest.mark.parametrize("selector", [
     "gemini-4-argon-high",
-    "gemini-4-carbon-medium",
+    "gemini-4-neon-high",
     "gemini-4-hydrogen-high",
     "gemini-4-hydrogen-xhigh",
 ])

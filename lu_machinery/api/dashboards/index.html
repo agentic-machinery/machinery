@@ -398,7 +398,7 @@ function renderUsage(subs, budget, logins) {
   if (cache && cache.status !== "ok") notes.push(`Usage cache: ${cache.status}.`);
   if (hidden.length) notes.push(`Hidden, subscription ended: ${hidden.join(", ")}.`);
   if (logins === null || logins === undefined) notes.push("Sign-in state unknown: the sign-in reader did not answer.");
-  notes.push("Headroom and deficit are percentage points against an even pace to the weekly reset. Carbon draws on the AGY pools. "
+  notes.push("Headroom and deficit are percentage points against an even pace to the weekly reset. Neon draws on the AGY pools. "
     + "The Codex API credits belong to Codex a and renew with its monthly turnover.");
   notes.push("Sign-in is read for Claude a, Claude b, Codex a and Codex b only. Any other account has no side-effect-free sign-in reader.");
   const head = `<thead><tr>${SUBSCRIPTION_HEADERS.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>`;

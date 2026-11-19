@@ -650,7 +650,7 @@
    }
   },
   "bridge-inbox": {
-   "title": "Agent bridge inbox view on the mock plane",
+   "title": "Agent bridge inbox retirement or legacy pending count, by release",
    "mocks": [
     "product-root",
     "fleet-plane"
@@ -658,19 +658,11 @@
    "argv": [
     "{py}",
     "-I",
-    "-m",
-    "lu_machinery.ai_agent_bridge",
-    "inbox",
-    "--for",
-    "claude",
-    "show",
-    "claude"
+    "{kit}/probes.py",
+    "bridge-inbox"
    ],
    "expect": {
     "rc": 0,
-    "stdout_re": [
-     "pending: +0"
-    ],
     "machinery_loaded": true
    }
   },
@@ -1085,7 +1077,7 @@
    "kind": "scheduled-user-service",
    "class": "mock",
    "probe": "bridge-inbox",
-   "summary": "Agent bridge inbox view on the mock plane"
+   "summary": "Agent bridge inbox retirement or legacy pending count, by release"
   },
   {
    "id": "R010",

@@ -263,7 +263,7 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
     }
     if response is not None:
         terminal["response"] = response
-    model = "gemini-4-carbon-medium"
+    model = "gemini-4-neon-high"
     attested = "claude-sonnet-5-5-high" if failure == "wrong_model" else model
     events = [
         {"event": "init", "init": {"model": attested}},
