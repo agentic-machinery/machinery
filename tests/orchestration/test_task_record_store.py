@@ -86,9 +86,13 @@ def test_read_follows_the_newest_copy_when_the_archive_name_collides(tmp_path, m
     old.parent.mkdir()
     old.write_bytes(b'{"task_id": "review", "run_nonce": "old"}')
     os.utime(old, ns=(1, 1))
-    newest = old.with_name("review.20261119T140000Z.archived.json")
+    prior_stamp = old.with_name("review.20261119T140000Z.archived.json")
+    prior_stamp.write_bytes(b'{"task_id": "review", "run_nonce": "prior"}')
+    os.utime(prior_stamp, ns=(1, 1))
+    newest = old.with_name("review.20261119T140000123456Z.archived.json")
     expected = b'{"task_id": "review", "run_nonce": "new"}'
     hot.write_bytes(expected)
+    os.utime(hot, ns=(1, 1))
     read_bytes = Path.read_bytes
 
     def archive_before_read(path):
@@ -101,7 +105,7 @@ def test_read_follows_the_newest_copy_when_the_archive_name_collides(tmp_path, m
     assert store.read_task_record_bytes(hot, tasks_dir=tmp_path) == (newest, expected)
 
 
-def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
+def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path, monkeypatch):
     from lu_machinery.dispatcher import store as dispatch_store
     from lu_machinery.orchestration import orchestrator_control
 
@@ -123,10 +127,16 @@ def test_relocated_result_file_points_at_the_moved_sidecar(tmp_path):
     stamped.write_text(json.dumps({"task_id": "old", "run_nonce": "second", "result_file": hot_result}))
     stamped_reply = stamped.with_suffix(".result")
     stamped_reply.write_text("second run's reply", encoding="utf-8")
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
 
     for state in (dispatch_store.read("old", tasks_root=tasks), orchestrator_control.load_task_state(tasks, "old")):
         assert state["run_nonce"] == "second"
         assert Path(state["result_file"]).read_text() == "second run's reply"
+
+    states = dispatch_store.list_tasks(include_archive=True, strict=True)
+    assert [(state["run_nonce"], Path(state["result_file"]).read_text()) for state in states] == [
+        ("second", "second run's reply"), ("first", "reply"),
+    ]
 
     stamped_reply.unlink()
     assert store.relocated_result_file(stamped, hot_result) == str(stamped_reply)

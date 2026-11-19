@@ -265,9 +265,12 @@ def locate_task_record(tasks_dir: Path, task_id: str) -> Path | None:
         except FileNotFoundError:
             continue
         if stat.S_ISREG(info.st_mode):
-            candidates.append((info.st_mtime_ns, name))
+            collision = _REDISPATCH_ARCHIVED_STEM_RE.fullmatch(path.stem) if name != hot.name else None
+            # Compare the timestamp without its terminator so fractional seconds sort after whole seconds.
+            stamp = collision["tag"].partition("Z")[0] if collision is not None else ""
+            candidates.append((info.st_mtime_ns, stamp, info.st_ctime_ns, name))
     newest = max(candidates, default=None)
-    return archive / newest[1] if newest is not None else None
+    return archive / newest[-1] if newest is not None else None
 
 
 def read_task_record_bytes(path: Path, *, tasks_dir: Path) -> tuple[Path, bytes]:
