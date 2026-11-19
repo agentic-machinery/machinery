@@ -26,7 +26,7 @@ publish_order() {
   local body="$1" recipient="$2" idempotency_key="$3"
   shift 3
   sed "s/@UTC@/$(date -u +%Y-%m-%dT%H:%M:%SZ)/g" "$body" |
-    "$PROJECT_PYTHON" -m lu_machinery.fleet_comms channel publish cto - \
+    "$PROJECT_PYTHON" -I -m lu_machinery.fleet_comms channel publish cto - \
       --sender "$LU_INBOX_WORKER" --source cto --recipient "$recipient" \
       --idempotency-key "$idempotency_key" "$@"
 }
@@ -35,6 +35,8 @@ publish_order "$TMPDIR/order.txt" "<registered-slot>" "<unique-order-key>"
 
 `$LU_INBOX_WORKER` is the sender (your consumer identity), never a recipient; the CTO's own
 recipient is `claude-cto`.
+
+Wait at least 15 seconds after claiming a delivery before acknowledging it, then read the `ack.sh` output.
 
 Preserve required message references per `docs/runbooks/driver-seat-cli-move.md` § 5.
 
@@ -51,6 +53,11 @@ re-enqueue or quarantine it. Only a failure with no failing test node (a lost ru
 job list, a network fetch that failed before the change's code ran) may be recovered. Verify
 that passing comparison runs executed that step. Compare failed paths with the full applicable
 diff; follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
+
+## Host changes
+
+- Stop or skip the machinery release-cut timer before applying `loopback_services`, because the role starts the timer and it fires immediately.
+- After swapping a venv's Python, restart every running unit that uses that venv and confirm no process still runs the old interpreter.
 
 ## Reviews
 
@@ -92,6 +99,10 @@ operator. Never discard its changes (or run any other command under "Dangerous C
 guarded remover.
 
 ## Dispatch helpers
+
+- Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
+- Before amending a live worker's brief, check its PR and put the change in a separate task if review has started.
+- Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
 
 Record each new in-flight task with `lu-driver-state add --lane cto --kind inflight`, its
 owner and done condition. Attach its task ID with `link <id> task <task-id>` and record the
