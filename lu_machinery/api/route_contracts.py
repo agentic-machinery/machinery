@@ -216,7 +216,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "http",
         "Unified read-only observer for durable fleet-comms requests, authority queue jobs, messages, discussions, ACP rounds, formal reviews, endpoints, migrations, dead letters, provenance, and operations health.",
         "Fleet-comms v1 SQLite read models, endpoint registry metadata, sanitized runtime/ACP projections, and sanitized batch operations read models.",
-        "No response cache except the default acp/conversations page, served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S for 15 s; every other route opens the durable plane in SQLite read-only mode. Lists have deterministic order and bounded limit/offset pages; inline bodies are preview-only, redacted, and never fetch artifact blobs.",
+        "No response cache except overview and the default acp/conversations page, served stale-while-revalidate (state_helpers.cache_read_swr / swr_route): the last value at once with its true age in X-Snapshot-Age-S for 15 s; every other route opens the durable plane in SQLite read-only mode. Lists have deterministic order and bounded limit/offset pages; inline bodies are preview-only, redacted, and never fetch artifact blobs.",
         ("operators", "agents"),
         "Consolidates observation previously spread across comms, runtime, ACP, and session-stream pages; legacy pages remain during the pre-flip soak.",
         "medium if a consumer mistakes the observer for plane authority or relies on an absent optional table as evidence of no historical work",
