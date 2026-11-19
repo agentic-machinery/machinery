@@ -194,3 +194,77 @@ def test_slow_compute_duration_counts_toward_served_age(monkeypatch, tmp_path):
             assert body["ranked_by_headroom"] == []
 
     asyncio.run(scenario())
+
+
+def test_startup_cold_read_answers_typed_503_within_the_request_timeout(monkeypatch, tmp_path):
+    """Defect class: right after a restart the cold routing-budget read awaited the startup
+    warmup's computation with no bound, so the request middleware cut it off with a 504.
+    While the first attempt runs, even with the default executor saturated, the read answers
+    the typed warming 503 with Retry-After inside the 2 s client bound, then 200 once it lands.
+    Only the context that started the warmup is starting; a running server waits longer."""
+    from lu_machinery.api import resilience
+
+    monkeypatch.delenv("API_REQUEST_TIMEOUT_S", raising=False)  # the default 10 s limit
+    release = threading.Event()
+
+    def compute(**kwargs):
+        assert release.wait(30), "the test did not release the startup computation"
+        kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
+        return {"agents": {}, "diagnostics": {"data_age_s": 0, "stale": False, "stale_threshold_s": 900}}
+
+    app = _app(monkeypatch, tmp_path, compute)
+    app.middleware("http")(resilience.resilience_middleware)
+    ctx = app.state.ctx
+    warmup = state_router.schedule_state_scan_warmup(ctx)  # what the lifespan starts at process start
+    running_wait = resilience.request_timeout_s() - state_router.ROUTING_BUDGET_RESPONSE_RESERVE_S
+    # Another context on the same root that would reuse this thread is not starting.
+    assert state_router._routing_budget_cold_wait_s(fixture_context(tmp_path)) == running_wait
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            try:
+                async with _saturated_executor():
+                    started = asyncio.get_running_loop().time()
+                    cold = await client.get("/api/state/routing-budget")
+                    elapsed = asyncio.get_running_loop().time() - started
+            finally:
+                release.set()
+            assert cold.status_code == 503, cold.text
+            assert cold.json() == {"detail": "routing budget warming"}
+            assert cold.headers["Retry-After"] == "2"
+            assert cold.headers["X-Snapshot-Age-S"] == "unknown"
+            assert elapsed < 2.0
+            await asyncio.to_thread(warmup.join, 30)
+            assert not warmup.is_alive()
+            assert state_router._routing_budget_cold_wait_s(ctx) == running_wait
+            assert (await client.get("/api/state/routing-budget")).status_code == 200
+
+    asyncio.run(scenario())
+
+
+def test_handler_timeout_error_before_the_deadline_is_a_500_not_a_504(monkeypatch, tmp_path):
+    """Defect class: the request middleware mapped ANY TimeoutError from the handler to the
+    504 "Request exceeded 10.0s", so a computation's own TimeoutError (socket.timeout is
+    TimeoutError) was reported as a request timeout long before the deadline. It is a 500."""
+    from lu_machinery.api import resilience
+
+    monkeypatch.delenv("API_REQUEST_TIMEOUT_S", raising=False)  # the default 10 s limit
+
+    def compute(**_kwargs):
+        raise TimeoutError("upstream socket timed out")
+
+    app = _app(monkeypatch, tmp_path, compute)
+    app.middleware("http")(resilience.resilience_middleware)
+    timeouts_before = resilience.get_resilience_snapshot()["timeout_count"]
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            started = asyncio.get_running_loop().time()
+            response = await client.get("/api/state/routing-budget")
+            elapsed = asyncio.get_running_loop().time() - started
+        assert response.status_code == 500, response.text
+        assert elapsed < resilience.request_timeout_s()
+        assert resilience.get_resilience_snapshot()["timeout_count"] == timeouts_before
+
+    asyncio.run(scenario())
