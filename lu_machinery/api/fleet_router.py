@@ -8,9 +8,11 @@ initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -20,7 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
@@ -28,15 +30,17 @@ from lu_machinery.common import json_depth
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import read_failure_code
 from lu_machinery.fleet_comms import message_plane
+from lu_machinery.fleet_comms import paths as fleet_paths
 from lu_machinery.fleet_comms.endpoints import load_endpoint_registry
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
 
 from .monitor_context import MonitorContext, get_ctx, resolve_context
+from .panel_values import snapshot_headers
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
-from .state_helpers import swr_route
+from .state_helpers import cache_read_swr, ctx_scoped_ttl_key, reports_failure, swr_route
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
 try:
@@ -115,10 +119,29 @@ _TOKEN_LITERAL = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|sk-[A-Za-z0-9_-]{
 
 
 
+def _check_not_retired(root: Path) -> None:
+    """Fail closed when the local plane has been retired, honoring the shadow fixture override."""
+    if fleet_paths.local_plane_is_retired(root=root):
+        raise fleet_paths.PlaneRootAnchorError(fleet_paths.RETIRED_LOCAL_PLANE_MESSAGE)
+
+
 def _plane_root(ctx: MonitorContext | None = None) -> Path:
-    """Resolve the existing durable plane root without creating it."""
+    """Resolve the existing durable plane root without creating it.
+
+    Caches the git-anchored root per ``MonitorContext.runtime`` when
+    ``FLEET_COMMS_ROOT`` is unset so repeated reads do not spawn
+    ``git rev-parse``, while checking the local retirement marker on every read.
+    """
     resolved_ctx = resolve_context(ctx)
-    return message_plane.default_plane_root(repo_root=resolved_ctx.roots.state_root)
+    if os.environ.get(fleet_paths.ENV_ROOT):
+        return message_plane.default_plane_root(repo_root=resolved_ctx.roots.state_root)
+    cache_key = f"fleet-plane-root:{resolved_ctx.roots.state_root}"
+    root: Path = resolved_ctx.runtime.get_or_create_derived(
+        cache_key,
+        lambda: message_plane.default_plane_root(repo_root=resolved_ctx.roots.state_root),
+    )
+    _check_not_retired(root)
+    return root
 
 
 def _plane_db_path(ctx: MonitorContext | None = None) -> Path:
@@ -130,10 +153,15 @@ def _read_connection(
     ctx: MonitorContext | None = None,
     *,
     pg_supported: bool = False,
+    plane_root: Path | None = None,
 ) -> Iterator[tuple[Any | None, str]]:
     """Yield a query-only connection, never creating a database or schema."""
     resolved_ctx = resolve_context(ctx)
-    db_path = _plane_db_path(resolved_ctx)
+    if plane_root is not None:
+        _check_not_retired(plane_root)
+        db_path = plane_root / "comms.sqlite3"
+    else:
+        db_path = _plane_db_path(resolved_ctx)
     authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
     if authority is storage.Authority.PG and not pg_supported:
         # Detail routes still use SQLite-shaped SQL. Do not read a stale
@@ -362,10 +390,18 @@ def _paged_query(
     )
 
 
-def _safe_plane_status(ctx: MonitorContext | None = None) -> dict[str, Any]:
+def _safe_plane_status(
+    ctx: MonitorContext | None = None,
+    *,
+    plane_root: Path | None = None,
+) -> dict[str, Any]:
     """Project the existing plane read model without paths or raw telemetry rows."""
     resolved_ctx = resolve_context(ctx)
-    status = read_plane_status(repo_root=resolved_ctx.roots.state_root, recent_limit=0)
+    status = (
+        read_plane_status(root=plane_root, recent_limit=0)
+        if plane_root is not None
+        else read_plane_status(repo_root=resolved_ctx.roots.state_root, recent_limit=0)
+    )
     mode = _safe_text(status.get("mode"), fallback="invalid")
     authority_active = mode == "authority"
     schema = status.get("schema") if isinstance(status.get("schema"), dict) else {}
@@ -425,16 +461,22 @@ BOARD_PR_LIST_TTL_S = 30.0
 
 
 
-def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
+def _count_by_state_checked(
+    connection: Any, table: str, column: str
+) -> tuple[dict[str, int], bool]:
     if not _table_exists(connection, table):
-        return {}
+        return {}, False
     try:
         rows = connection.execute(
             f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column} ORDER BY {column}"
         ).fetchall()
     except sqlite3.Error:
-        return {}
-    return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}
+        return {}, False
+    return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}, True
+
+
+def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
+    return _count_by_state_checked(connection, table, column)[0]
 
 
 def _count_by_state_where(
@@ -455,21 +497,20 @@ def _count_by_state_where(
     return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}
 
 
-def _authority_health_snapshot(
-    connection: Any | None,
-    *,
-    now: datetime | None = None,
-    availability: str = "available",
-) -> dict[str, Any]:
-    """Derive current health only from a fixed authority evidence window."""
+def _authority_health_window(now: datetime | None = None) -> dict[str, Any]:
     observed_at = (now or datetime.now(UTC)).astimezone(UTC)
     since = observed_at - timedelta(hours=AUTHORITY_HEALTH_WINDOW_HOURS)
-    window = {
+    return {
         "hours": AUTHORITY_HEALTH_WINDOW_HOURS,
         "since": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "until": observed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    unavailable = {
+
+
+def _authority_health_unavailable(
+    window: dict[str, Any], *, availability: str
+) -> dict[str, Any]:
+    return {
         "state": "unavailable",
         "ok": False,
         "availability": availability,
@@ -478,6 +519,45 @@ def _authority_health_snapshot(
         "overdue_nonterminal": 0,
         "dead_letters": 0,
     }
+
+
+def _authority_health_from_counts(
+    *,
+    window: dict[str, Any],
+    states: dict[str, int],
+    overdue: int,
+    dead_letters: int,
+) -> dict[str, Any]:
+    total = sum(states.values())
+    failures = sum(
+        states.get(name, 0) for name in ("failed", "expired", "dead_lettered")
+    )
+    if failures or overdue or dead_letters:
+        state = "degraded"
+    elif total:
+        state = "healthy"
+    else:
+        state = "idle"
+    return {
+        "state": state,
+        "ok": state in {"healthy", "idle"},
+        "availability": "available",
+        "window": window,
+        "jobs": {"total": total, "by_state": states},
+        "overdue_nonterminal": overdue,
+        "dead_letters": dead_letters,
+    }
+
+
+def _authority_health_snapshot(
+    connection: Any | None,
+    *,
+    now: datetime | None = None,
+    availability: str = "available",
+) -> dict[str, Any]:
+    """Derive current health only from a fixed authority evidence window."""
+    window = _authority_health_window(now)
+    unavailable = _authority_health_unavailable(window, availability=availability)
     if connection is None:
         return unavailable
     placeholder = "?" if is_sqlite_connection(connection) else "%s"
@@ -512,25 +592,12 @@ def _authority_health_snapshot(
     except _DATABASE_ERRORS:
         logger.warning("Fleet observer could not derive authority health")
         return {**unavailable, "availability": "schema_read_failed"}
-    total = sum(states.values())
-    failures = sum(
-        states.get(name, 0) for name in ("failed", "expired", "dead_lettered")
+    return _authority_health_from_counts(
+        window=window,
+        states=states,
+        overdue=overdue,
+        dead_letters=dead_letters,
     )
-    if failures or overdue or dead_letters:
-        state = "degraded"
-    elif total:
-        state = "healthy"
-    else:
-        state = "idle"
-    return {
-        "state": state,
-        "ok": state in {"healthy", "idle"},
-        "availability": "available",
-        "window": window,
-        "jobs": {"total": total, "by_state": states},
-        "overdue_nonterminal": overdue,
-        "dead_letters": dead_letters,
-    }
 
 
 def _runtime_activity_snapshot(since: str, ctx: MonitorContext | None = None) -> dict[str, Any]:
@@ -730,10 +797,129 @@ def fleet_health(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
     }
 
 
+_REQUIRED_OVERVIEW_TABLES_BASE = frozenset(
+    {
+        "requests",
+        "comms_messages",
+        "formal_review_jobs",
+        "authority_jobs",
+        "acp_conversations",
+    }
+)
+
+
+def _decode_count_pairs(raw: Any) -> dict[str, int]:
+    """Decode SQLite ``json_group_array(json_array(label, count))`` preserving SQL order."""
+    if not isinstance(raw, str) or not raw:
+        return {}
+    pairs = json_depth.loads(raw, max_depth=8)
+    if not isinstance(pairs, list):
+        raise ValueError("expected JSON array of count pairs")
+    counts: dict[str, int] = {}
+    for pair in pairs:
+        counts[_safe_text(pair[0], fallback="unknown")] = int(pair[1])
+    return counts
+
+
+async def _resolve_overview_plane_root(ctx: MonitorContext) -> Path:
+    """Resolve the plane root without running the one-time git subprocess on the event loop."""
+    if os.environ.get(fleet_paths.ENV_ROOT):
+        return _plane_root(ctx)
+    cache_key = f"fleet-plane-root:{ctx.roots.state_root}"
+    cached = ctx.runtime._derived.get(cache_key)
+    if isinstance(cached, Path):
+        _check_not_retired(cached)
+        return cached
+    return await asyncio.to_thread(_plane_root, ctx)
+
+
+async def _overview_cache_key(ctx: MonitorContext, plane_root: Path) -> str:
+    """Build a collision-free SWR cache key scoped to context and live routing settings."""
+    roots = repr(ctx.roots)
+    scope_name = f"swr-key-scope:fleet-overview:{roots}"
+    scope = ctx.runtime._derived.get(scope_name)
+    if scope is None:
+        scope = await asyncio.to_thread(
+            ctx.runtime.get_or_create_derived,
+            scope_name,
+            lambda: ctx_scoped_ttl_key(ctx, "swr", "fleet-overview", roots),
+        )
+    plane_mode_env = (os.environ.get(message_plane.ENV_MODE) or "").strip().lower()
+    telemetry_env = (os.environ.get(message_plane.ENV_TELEMETRY) or "").strip()
+    try:
+        authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
+        authority_label = authority.value
+    except storage.ControlPlaneError:
+        authority = None
+        authority_label = "invalid"
+    pg_dsn_digest = ""
+    if authority is storage.Authority.PG:
+        raw_dsn = (os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or "").strip()
+        if raw_dsn:
+            pg_dsn_digest = hashlib.sha256(raw_dsn.encode("utf-8")).hexdigest()
+    return json.dumps(
+        [
+            scope,
+            str(plane_root),
+            plane_mode_env,
+            telemetry_env,
+            authority_label,
+            pg_dsn_digest,
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _overview_is_storable(item: tuple[dict[str, Any], bool]) -> bool:
+    """Store only complete, healthy overview snapshots in the SWR cache."""
+    payload, complete = item
+    if not complete or reports_failure(payload):
+        return False
+    health = payload.get("health")
+    if not isinstance(health, dict):
+        return False
+    schema = health.get("schema")
+    store = health.get("store")
+    if not isinstance(schema, dict) or not isinstance(store, dict):
+        return False
+    if schema.get("db_error") or store.get("reachable") is not True:
+        return False
+    authority_health = payload.get("authority_health")
+    return not (
+        isinstance(authority_health, dict)
+        and authority_health.get("state") == "unavailable"
+    )
+
+
 @router.get("/overview")
-def fleet_overview(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
+async def fleet_overview(
+    response: Response,
+    ctx: MonitorContext = Depends(get_ctx),
+) -> dict[str, Any]:
     """Compact durable-plane counts for the consolidated fleet dashboard."""
-    status = _safe_plane_status(ctx)
+    resolved_ctx = resolve_context(ctx)
+    plane_root = await _resolve_overview_plane_root(resolved_ctx)
+    key = await _overview_cache_key(resolved_ctx, plane_root)
+    (payload, _complete), age, stored = await cache_read_swr(
+        key,
+        FACADE_TTL_S,
+        lambda: _collect_fleet_overview(resolved_ctx, plane_root=plane_root),
+        storable=_overview_is_storable,
+    )
+    await _resolve_overview_plane_root(resolved_ctx)
+    response.headers.update(snapshot_headers(age, FACADE_TTL_S, unavailable=not stored))
+    return payload
+
+
+def _collect_fleet_overview(
+    ctx: MonitorContext,
+    *,
+    plane_root: Path | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Collect one overview snapshot and whether all required tables were readable."""
+    effective_root = plane_root if plane_root is not None else _plane_root(ctx)
+    _check_not_retired(effective_root)
+    status = _safe_plane_status(ctx, plane_root=effective_root)
     result: dict[str, Any] = {
         "read_only": True,
         "authority": status["authority"],
@@ -751,73 +937,243 @@ def fleet_overview(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
         "availability": "db_missing",
     }
     try:
-        return _populate_fleet_overview(result, status, ctx)
+        return _populate_fleet_overview(result, status, ctx, plane_root=effective_root)
     except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
-        return result
+        return result, False
+
+
+def _populate_fleet_overview_sqlite(
+    result: dict[str, Any],
+    status: dict[str, Any],
+    connection: SQLiteConnection,
+) -> tuple[dict[str, Any], bool]:
+    """Fetch all SQLite overview counts and 24h authority health in two single-row queries."""
+    is_authority = status["mode"] == "authority"
+    dead_letter_table = "authority_dead_letters" if is_authority else "dead_letters"
+    required_tables = _REQUIRED_OVERVIEW_TABLES_BASE | {dead_letter_table}
+    table_names = sorted(required_tables)
+    placeholders = ", ".join("?" for _ in table_names)
+    tables_row = connection.execute(
+        f"SELECT json_group_array(name) FROM sqlite_master WHERE type = 'table' AND name IN ({placeholders})",
+        table_names,
+    ).fetchone()
+    existing: set[str] = (
+        set(json_depth.loads(tables_row[0], max_depth=8))
+        if tables_row is not None and tables_row[0]
+        else set()
+    )
+    complete = required_tables.issubset(existing)
+
+    window = _authority_health_window() if is_authority else None
+    params: list[Any] = []
+    expressions = [
+        (
+            "(SELECT json_group_array(json_array(state, cnt)) "
+            "FROM (SELECT state, COUNT(*) AS cnt FROM requests GROUP BY state ORDER BY state))"
+            if "requests" in existing
+            else "'[]'"
+        ),
+        (
+            "(SELECT json_group_array(json_array(state, cnt)) "
+            "FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs "
+            "WHERE job_kind = 'request' GROUP BY state ORDER BY state))"
+            if is_authority and "authority_jobs" in existing
+            else "'[]'"
+        ),
+        (
+            "(SELECT json_group_array(json_array(kind, cnt)) "
+            "FROM (SELECT kind, COUNT(*) AS cnt FROM comms_messages GROUP BY kind ORDER BY kind))"
+            if "comms_messages" in existing
+            else "'[]'"
+        ),
+        (
+            "(SELECT json_group_array(json_array(state, cnt)) "
+            "FROM (SELECT state, COUNT(*) AS cnt FROM formal_review_jobs GROUP BY state ORDER BY state))"
+            if "formal_review_jobs" in existing
+            else "'[]'"
+        ),
+        (
+            "(SELECT json_group_array(json_array(state, cnt)) "
+            "FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs GROUP BY state ORDER BY state))"
+            if "authority_jobs" in existing
+            else "'[]'"
+        ),
+        f"(SELECT COUNT(*) FROM {dead_letter_table})" if dead_letter_table in existing else "0",
+        "(SELECT COUNT(*) FROM acp_conversations)" if "acp_conversations" in existing else "0",
+    ]
+    if is_authority and window is not None and "authority_jobs" in existing:
+        expressions.append(
+            "(SELECT json_group_array(json_array(state, cnt)) "
+            "FROM (SELECT state, COUNT(*) AS cnt FROM authority_jobs "
+            "WHERE updated_at >= ? GROUP BY state ORDER BY state))"
+        )
+        params.append(window["since"])
+        expressions.append(
+            "(SELECT COUNT(*) FROM authority_jobs "
+            "WHERE state IN ('queued', 'running') AND deadline_at IS NOT NULL AND deadline_at < ?)"
+        )
+        params.append(window["until"])
+    else:
+        expressions.extend(("'[]'", "0"))
+    if is_authority and window is not None and "authority_dead_letters" in existing:
+        expressions.append(
+            "(SELECT COUNT(*) FROM authority_dead_letters "
+            "WHERE created_at >= ? AND reason_code <> ?)"
+        )
+        params.extend((window["since"], "expired_by_cleanup"))
+    else:
+        expressions.append("0")
+
+    row = connection.execute("SELECT " + ", ".join(expressions), params).fetchone()
+    if row is None:
+        raise sqlite3.OperationalError("empty sqlite overview aggregate row")
+
+    legacy_request_states = _decode_count_pairs(row[0])
+    if is_authority:
+        request_states = _decode_count_pairs(row[1])
+        request_source = "authority_jobs"
+    else:
+        request_states = legacy_request_states
+        request_source = "legacy_requests"
+    message_kinds = _decode_count_pairs(row[2])
+    review_states = _decode_count_pairs(row[3])
+    authority_job_states = _decode_count_pairs(row[4])
+
+    counts = {key: dict(value) for key, value in result["counts"].items()}
+    counts["requests"] = {
+        "total": sum(request_states.values()),
+        "by_state": request_states,
+        "source": request_source,
+    }
+    counts["legacy_requests"] = {
+        "total": sum(legacy_request_states.values()),
+        "by_state": legacy_request_states,
+        "excluded_from_authority_health": True,
+    }
+    counts["messages"] = {"total": sum(message_kinds.values()), "by_kind": message_kinds}
+    counts["reviews"] = {"total": sum(review_states.values()), "by_state": review_states}
+    counts["authority_jobs"] = {
+        "total": sum(authority_job_states.values()),
+        "by_state": authority_job_states,
+    }
+    counts["dead_letters"]["total"] = int(row[5] or 0)
+    counts["acp_conversations"]["total"] = int(row[6] or 0)
+
+    result["counts"] = counts
+    result["availability"] = "available" if any(
+        section["total"] for section in counts.values()
+    ) else "empty"
+    if is_authority and window is not None:
+        if "authority_jobs" not in existing:
+            result["authority_health"] = _authority_health_unavailable(
+                window, availability="schema_read_failed"
+            )
+        else:
+            result["authority_health"] = _authority_health_from_counts(
+                window=window,
+                states=_decode_count_pairs(row[7]),
+                overdue=int(row[8] or 0),
+                dead_letters=int(row[9] or 0),
+            )
+    else:
+        result["authority_health"] = None
+    return result, complete
+
+
+def _populate_fleet_overview_per_table(
+    result: dict[str, Any],
+    status: dict[str, Any],
+    connection: Any,
+    *,
+    fallback_from_error: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    counts = {key: dict(value) for key, value in result["counts"].items()}
+    legacy_request_states, has_requests = _count_by_state_checked(connection, "requests", "state")
+    if status["mode"] == "authority":
+        request_states = _count_by_state_where(
+            connection,
+            "authority_jobs",
+            "state",
+            where="job_kind = 'request'",
+        )
+        request_source = "authority_jobs"
+    else:
+        request_states = legacy_request_states
+        request_source = "legacy_requests"
+    message_kinds, has_messages = _count_by_state_checked(connection, "comms_messages", "kind")
+    review_states, has_reviews = _count_by_state_checked(connection, "formal_review_jobs", "state")
+    authority_job_states, has_authority_jobs = _count_by_state_checked(
+        connection, "authority_jobs", "state"
+    )
+    counts["requests"] = {
+        "total": sum(request_states.values()),
+        "by_state": request_states,
+        "source": request_source,
+    }
+    counts["legacy_requests"] = {
+        "total": sum(legacy_request_states.values()),
+        "by_state": legacy_request_states,
+        "excluded_from_authority_health": True,
+    }
+    counts["messages"] = {"total": sum(message_kinds.values()), "by_kind": message_kinds}
+    counts["reviews"] = {"total": sum(review_states.values()), "by_state": review_states}
+    counts["authority_jobs"] = {
+        "total": sum(authority_job_states.values()),
+        "by_state": authority_job_states,
+    }
+    dead_letter_table = (
+        "authority_dead_letters" if status["mode"] == "authority" else "dead_letters"
+    )
+    has_dead_letters = _table_exists(connection, dead_letter_table)
+    if has_dead_letters:
+        counts["dead_letters"]["total"] = int(
+            connection.execute(f"SELECT COUNT(*) FROM {dead_letter_table}").fetchone()[0]
+        )
+    has_acp = _table_exists(connection, "acp_conversations")
+    if has_acp:
+        counts["acp_conversations"]["total"] = int(
+            connection.execute("SELECT COUNT(*) FROM acp_conversations").fetchone()[0]
+        )
+    result["counts"] = counts
+    result["availability"] = "available" if any(
+        section["total"] for section in counts.values()
+    ) else "empty"
+    result["authority_health"] = (
+        _authority_health_snapshot(connection)
+        if status["mode"] == "authority"
+        else None
+    )
+    complete = (
+        not fallback_from_error
+        and all((has_requests, has_messages, has_reviews, has_authority_jobs, has_dead_letters, has_acp))
+    )
+    return result, complete
 
 
 def _populate_fleet_overview(
-    result: dict[str, Any], status: dict[str, Any], ctx: MonitorContext,
-) -> dict[str, Any]:
-    with _read_connection(ctx, pg_supported=True) as (connection, availability):
+    result: dict[str, Any],
+    status: dict[str, Any],
+    ctx: MonitorContext,
+    *,
+    plane_root: Path | None = None,
+) -> tuple[dict[str, Any], bool]:
+    with _read_connection(ctx, pg_supported=True, plane_root=plane_root) as (
+        connection,
+        availability,
+    ):
         if connection is None:
             result["availability"] = availability
-            return result
-        counts = {key: dict(value) for key, value in result["counts"].items()}
-        legacy_request_states = _count_by_state(connection, "requests", "state")
-        if status["mode"] == "authority":
-            request_states = _count_by_state_where(
-                connection,
-                "authority_jobs",
-                "state",
-                where="job_kind = 'request'",
-            )
-            request_source = "authority_jobs"
-        else:
-            request_states = legacy_request_states
-            request_source = "legacy_requests"
-        message_kinds = _count_by_state(connection, "comms_messages", "kind")
-        review_states = _count_by_state(connection, "formal_review_jobs", "state")
-        authority_job_states = _count_by_state(connection, "authority_jobs", "state")
-        counts["requests"] = {
-            "total": sum(request_states.values()),
-            "by_state": request_states,
-            "source": request_source,
-        }
-        counts["legacy_requests"] = {
-            "total": sum(legacy_request_states.values()),
-            "by_state": legacy_request_states,
-            "excluded_from_authority_health": True,
-        }
-        counts["messages"] = {"total": sum(message_kinds.values()), "by_kind": message_kinds}
-        counts["reviews"] = {"total": sum(review_states.values()), "by_state": review_states}
-        counts["authority_jobs"] = {
-            "total": sum(authority_job_states.values()),
-            "by_state": authority_job_states,
-        }
-        dead_letter_table = (
-            "authority_dead_letters" if status["mode"] == "authority" else "dead_letters"
-        )
-        if _table_exists(connection, dead_letter_table):
-            counts["dead_letters"]["total"] = int(
-                connection.execute(f"SELECT COUNT(*) FROM {dead_letter_table}").fetchone()[0]
-            )
-        if _table_exists(connection, "acp_conversations"):
-            counts["acp_conversations"]["total"] = int(
-                connection.execute("SELECT COUNT(*) FROM acp_conversations").fetchone()[0]
-            )
-        result["counts"] = counts
-        result["availability"] = "available" if any(
-            section["total"] for section in counts.values()
-        ) else "empty"
-        result["authority_health"] = (
-            _authority_health_snapshot(connection)
-            if status["mode"] == "authority"
-            else None
-        )
-    return result
+            return result, False
+        if is_sqlite_connection(connection):
+            try:
+                return _populate_fleet_overview_sqlite(result, status, connection)
+            except (sqlite3.OperationalError, ValueError, TypeError):
+                return _populate_fleet_overview_per_table(
+                    result, status, connection, fallback_from_error=True
+                )
+        return _populate_fleet_overview_per_table(result, status, connection)
 
 
 def _registered_endpoints(connection: SQLiteConnection | None) -> dict[str, dict[str, Any]]:

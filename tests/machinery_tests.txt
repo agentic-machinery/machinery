@@ -235,6 +235,7 @@ tests/api/test_epics_registry_seed.py
 tests/api/test_epics_router.py
 tests/api/test_fleet_dashboard_contract.py
 tests/api/test_fleet_health_runtime_activity.py
+tests/api/test_fleet_overview_latency.py
 tests/api/test_fleet_workers_sanitize.py
 tests/api/test_fleet_workers_unmocked.py
 tests/api/test_get_routes_no_5xx.py
