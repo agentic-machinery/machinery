@@ -47,7 +47,11 @@ def test_d02_routing_contract_declares_its_source() -> None:
 
 
 def test_d06_home_reads_exclude_agent_monitor_status() -> None:
-    """The home reader must not trigger the reconciling agent-monitor GET."""
-    source = HOME_PAGE.read_text(encoding="utf-8")
-    assert "/api/agent-monitor/status" not in source
-    assert "agent-monitor" not in source
+    """No machinery dashboard page or shared script may trigger the reconciling agent-monitor GET."""
+    dashboards = HOME_PAGE.parent
+    files = sorted((*dashboards.glob("*.html"), *dashboards.glob("*.js")))
+    assert HOME_PAGE in files
+    for path in files:
+        source = path.read_text(encoding="utf-8")
+        assert "/api/agent-monitor/status" not in source, path.name
+        assert "agent-monitor" not in source, path.name
