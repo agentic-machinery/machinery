@@ -24,7 +24,6 @@ from lu_machinery.api.opsec_sanitize import (
 )
 from lu_machinery.api.opsec_scan import scan_body, scan_text
 
-
 PLANTED_ROOT = "/tmp/opsec-canary-root"
 PLANTED_PATH = f"{PLANTED_ROOT}/repo"
 
@@ -129,13 +128,18 @@ def test_sanitize_document_strips_embedded_remote_capsule() -> None:
 
 
 def test_middleware_strips_paths_that_a_bare_route_would_leak() -> None:
+    encoded = "/api/fixture?path=%2F%68ome%2Ffixture%2Fx&view=1"
+    public = "/api/fixture?url=https://tmp/home/guide"
+
     def leak() -> dict[str, str]:
-        return {"repo_root": PLANTED_PATH}
+        return {"repo_root": PLANTED_PATH, "encoded": encoded, "public": public}
 
     bare = FastAPI()
     bare.get("/synthetic")(leak)
     leaked = TestClient(bare).get("/synthetic").json()
     assert leaked["repo_root"] == PLANTED_PATH
+    assert leaked["encoded"] == encoded
+    assert leaked["public"] == public
     assert any(finding.kind == "filesystem-root" for finding in scan_body(leaked))
 
     guarded = FastAPI()
@@ -144,6 +148,8 @@ def test_middleware_strips_paths_that_a_bare_route_would_leak() -> None:
     sanitized = TestClient(guarded).get("/synthetic").json()
     assert PLANTED_PATH not in json.dumps(sanitized)
     assert sanitized["repo_root"] == REDACTED_ABSOLUTE_PATH
+    assert sanitized["encoded"] == f"/api/fixture?path={REDACTED_ABSOLUTE_PATH}"
+    assert sanitized["public"] == public
     assert scan_body(sanitized) == []
 
 
@@ -176,8 +182,8 @@ def test_repeated_strings_scan_once_without_cross_document_cache(monkeypatch):
 def test_memo_preserves_equal_distinct_unchanged_values():
     from lu_machinery.api.opsec_sanitize import sanitize_document
 
-    first = "".join(["public", "-monitor"])
-    second = "".join(["public-", "monitor"])
+    first = b"public-monitor".decode()
+    second = b"public-monitor".decode()
     assert first == second and first is not second
     payload = {"list": [first, second], "tuple": (first, second)}
     assert sanitize_document(payload) is payload

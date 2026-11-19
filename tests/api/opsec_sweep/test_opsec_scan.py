@@ -7,7 +7,6 @@ import pytest
 from lu_machinery.api.opsec_scan import scan_response, scan_text
 
 
-
 @pytest.mark.parametrize(
     "text",
     [
@@ -31,7 +30,7 @@ def _ipv4(*octets: int) -> str:
 
 
 def _ipv6() -> str:
-    return ":".join(("2001", "db8", "0", "0", "0", "0", "0", "17"))
+    return ":".join(("2001", "db8", "0", "0", "0", "0", "0", "17"))  # noqa: FLY002 - synthetic address
 
 
 def test_positive_corpus_catches_each_r3_shape() -> None:
@@ -202,6 +201,8 @@ def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
         ("./home/fixture-user/x", "/home/fixture-user/x"),
         ("../home/fixture-user/x", "/home/fixture-user/x"),
         ("../api/../home/fixture-user/x", "/home/fixture-user/x"),
+        # #924 retiered this #920 negative under the dot-relative contract.
+        ("../api/../home/guide.md", "/home/guide.md"),
         ("../api/home/fixture-user/x", "/home/fixture-user/x"),
         ("../api/fixture/{id}/home/view", "/home/view"),
         ("docs/../home/fixture-user/x", "/home/fixture-user/x"),
@@ -274,6 +275,39 @@ def test_dot_relative_and_api_query_root_segments_are_flagged(text: str, token: 
 def test_ordinary_relative_paths_stay_unflagged(text: str) -> None:
     """Defect class: an ordinary relative path reported as a host path (#909)."""
     assert scan_text(text, operation="GET /api/opsec", field_path="body.value") == [], text
+
+
+@pytest.mark.parametrize(
+    ("text", "token"),
+    [
+        pytest.param("/api?url=https://tmp/x", None, id="query-authority"),
+        pytest.param("/api#https://fixture.example/home/page", None, id="fragment-remote-path"),
+        pytest.param("/api?url=https://tmp/page&doc=../guide.md", None, id="independent-query-values"),
+        pytest.param("/api?doc=examples/home/page", None, id="ordinary-relative-query-value"),
+        pytest.param("`./docs`+`examples/home/page`", None, id="independent-code-spans"),
+        pytest.param("[a](./docs)[b](examples/home/page)", None, id="independent-link-destinations"),
+        pytest.param("[a](https://fixture.example/home/(notes))", None, id="balanced-link-destination"),
+        pytest.param("/api/[a](/home/fixture/x)", "/home/fixture/x", id="link-after-api-route"),
+        pytest.param("/api?uri=https://[bad]/api/items/home/fixture", "/home/fixture", id="malformed-authority"),
+        pytest.param("https://fixture.example/home/path%xy", "/home/path%xy", id="malformed-uri-escape"),
+        pytest.param("file://file://fixture/home/x", "file://fixture/home/x", id="adjacent-uri-authority"),
+        pytest.param("[path](file://fixture(backup)/home)", "file://fixture(backup)/home", id="uri-authority-subdelim"),
+        pytest.param("./docs/section;%78/home/fixture", "/home/fixture", id="relative-path-subdelim"),
+        pytest.param("/api?source=%2Fhome%2Ffixture%2Fx&view=1", "%2Fhome%2Ffixture%2Fx&view=1", id="encoded-query"),
+        pytest.param("file://fixture/%55sers/fixture/x", "file://fixture/%55sers/fixture/x", id="encoded-file-path"),
+        pytest.param("/api?url=%66ile%3A%2F%2F%2fhome%2Fx", "%66ile%3A%2F%2F%2fhome%2Fx", id="encoded-file-uri"),
+        pytest.param("/api#%2ftmp%2Fx", "%2ftmp%2Fx", id="encoded-fragment"),
+        pytest.param("/api?url=https%3A%2F%2Ftmp%2Fhome%2Fpage", None, id="encoded-remote-uri"),
+        pytest.param("/api?url=https://tmp/home/%20note", None, id="encoded-remote-path"),
+        pytest.param("/api?x=..%2Fhome.md", None, id="encoded-relative-filename"),
+        pytest.param("https://fixture.example/api?x=/home/fixture", "/home/fixture", id="remote-query-local-path"),
+    ],
+)
+def test_path_detection_respects_parsed_parts(text: str, token: str | None) -> None:
+    """Defect class: another part's syntax hid a local path or flagged a public reference (#922)."""
+    paths = [finding for finding in scan_text(text) if finding.kind == "filesystem-root"]
+    assert [finding.token for finding in paths] == ([] if token is None else [token])
+    assert all(text[finding.start : finding.end] == finding.token for finding in paths)
 
 
 @pytest.mark.parametrize(
