@@ -389,6 +389,18 @@ def _jsonl(records) -> bytes:
     return b"".join(json.dumps(record, ensure_ascii=False).encode() + b"\n" for record in records)
 
 
+def _public_review_core(monkeypatch):
+    """Supply public rules content while the supervisor checks the real prompt contract."""
+    from lu_machinery.review import render_contract
+
+    block = "<rules-core>\nPublic review test rules.\n</rules-core>"
+    dependency = {"seat": "core", "sources": [], "block_sha256": store.digest(block.encode("utf-8"))}
+    provenance = json.dumps(dependency, sort_keys=True, separators=(",", ":"))
+    prefix = f"{block}\n<trusted-rules-dependency>\n{provenance}\n</trusted-rules-dependency>\n\n"
+    monkeypatch.setattr(render_contract, "trusted_core_context", lambda **_: (prefix, dependency))
+    return prefix, dependency
+
+
 def _run_manifest_ukrainian_attempt(
     attempt, tmp_path, monkeypatch, reply: str, *, ledger_records=(), foreign_records=()
 ):
@@ -400,7 +412,7 @@ def _run_manifest_ukrainian_attempt(
         "dispatch", "--agent", "agy", "--model", "gemini-3.8-flash-high", *attempt, "--review-profile", "ukrainian",
     ])
     binding = store.review_binding(vars(args))
-    prefix, dependency = trusted_core_context()
+    prefix, dependency = _public_review_core(monkeypatch)
     rendered = (prefix + "Rendered review prompt\nattempt: review/attempt\n").encode()
     prompt = cli._PromptPath(tmp_path / "tasks" / "task.prompt")
     prompt.content = rendered
@@ -794,7 +806,7 @@ def test_bound_attempt_on_codex_b_runs_as_account_b(codex_accounts_ab, attempt, 
     args = cli.build_parser().parse_args(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, *attempt,
                                           "--codex-account", "b-sub", "--review-access", "full"])
     binding = store.review_binding(vars(args))
-    prefix, dependency = trusted_core_context()
+    prefix, dependency = _public_review_core(monkeypatch)
     rendered = (prefix + "Rendered review prompt\nattempt: review/attempt\n").encode()
     prompt = cli._PromptPath(tmp_path / "tasks" / "task.prompt")
     prompt.content = rendered
