@@ -378,8 +378,8 @@ def test_savant_launch_builds_the_snapshot_and_ceiling_only_for_public_classes(t
                                       tmp_path / "task.json")
     private = private[:private.index("--")]
     assert "--upload-ceiling" in private and "--snapshot-bytes" not in private and "--read-path" not in private
-    # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process).
-    assert "--no-github-relays" in public and "--no-github-relays" in private
+    # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process) or a Sources relay (#898).
+    assert all(flag in argv for flag in ("--no-github-relays", "--no-sources-relay") for argv in (public, private))
     # A malformed record's paths are refused, never read as the whole tree.
     with pytest.raises(ValueError, match="savant_read_path_refused"):
         opencode.savant_read_paths({"read_paths": "{}"})
@@ -435,7 +435,8 @@ def test_savant_write_run_is_admitted_only_public_implementation_with_owned_path
     assert argv[argv.index("--mode") + 1] == "workspace-write"
     assert argv[argv.index("--draft-patch") + 1] == str(task_file.with_suffix(".patch"))
     assert argv[argv.index("--owned-path") + 1] == "docs" and argv[argv.index("--read-path") + 1] == "docs"
-    assert "--no-github-relays" in argv and "--sources-mcp" not in argv and "--snapshot-bytes" in argv
+    assert "--no-github-relays" in argv and "--no-sources-relay" in argv and "--snapshot-bytes" in argv
+    assert "--sources-mcp" not in argv
     store.replace({**record, "owned_paths": []})
     with pytest.raises(ValueError, match="a Savant write run needs owned paths"):
         write_boundary.launcher(trial, invocation, task_file)

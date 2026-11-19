@@ -877,7 +877,7 @@ def _savant_write(primary, monkeypatch, tmp_path, script: str, *owned: str) -> t
     monkeypatch.setattr(write_boundary, "_DATA_ROOTS", _ALL_DATA_ROOTS)
     patch = tmp_path / "wb-test.patch"
     code, data = _run(primary, script, "--mode", "workspace-write", "--snapshot-bytes", "65536", "--no-github-relays",
-                      "--upload-ceiling", "65536", "--draft-patch", str(patch),
+                      "--no-sources-relay", "--upload-ceiling", "65536", "--draft-patch", str(patch),
                       *(arg for path in owned for arg in ("--owned-path", path)))
     return code, data, patch
 
@@ -915,6 +915,8 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
     assert code == 0 and receipt["status"] == "ran" and receipt["canary"]["passed"], receipt
     probes = {(probe["op"], probe["path"]): probe["outcome"] for probe in receipt["canary"]["probes"]}
     assert probes[("stat", str(worktree))] == "ENOENT" and probes[("stat", str(repo / ".git" / "HEAD"))] == "ENOENT"
+    # No host service: neither Sources relay nor GitHub relay exists inside.
+    assert probes[("stat", write_boundary._SOURCES_INSIDE)] == "ENOENT" and receipt["sources"] == {"status": "disabled"}
     imported = receipt["import"]
     assert imported["status"] == "drafted" and imported["paths"] == ["docs/guide.md", "docs/new.md", "gone.txt"]
     assert imported["patch_sha256"] == hashlib.sha256(patch.read_bytes()).hexdigest()
@@ -932,11 +934,16 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
 
 
 @pytest.mark.parametrize(("case", "script", "reason"), [
-    ("outside-owned", "printf 'x\\n' > a.txt", "edits outside the owned paths: a.txt"),
-    ("link", "ln -s ../a.txt docs/link", "is not a single-link regular file"),
-    ("hard-link", "ln docs/guide.md docs/second", "is not a single-link regular file"),
-    ("excluded-name", "printf 'x\\n' > docs/.env", "excluded or unprintable path"),
+    ("outside-owned", "printf 'x\\n' > a.txt", "1 edited path(s) lie outside the owned paths"),
+    ("link", "ln -s ../a.txt docs/link", "is not a directory or a regular file"),
+    ("hard-link", "ln docs/guide.md docs/second", "is not a directory or a single-link regular file"),
+    ("fifo", "mkfifo docs/pipe", "is not a directory or a single-link regular file"),
+    ("excluded-name", "printf 'x\\n' > docs/.env", "excluded, unprintable or screened name"),
+    ("screened-name", "printf 'x\\n' > docs/ghp_" + "A" * 36, "excluded, unprintable or screened name"),
     ("filtered-path", "printf 'x\\n' > docs/AGENTS.txt", "a path of the start commit that the view left out"),
+    # A directory where the start commit holds a file the view left out: Git would delete that file.
+    ("file-parent", "mkdir docs/AGENTS.txt && printf 'x\\n' > docs/AGENTS.txt/child",
+     "a path of the start commit that the view left out"),
     ("secret", "printf 'k = ghp_%s\\n' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > docs/guide.md", "a private key, a token"),
     ("oversize", "head -c 70000 /dev/zero > docs/big.bin", "more than 65536 bytes"),
 ])
@@ -961,12 +968,12 @@ def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path,
 
 def test_savant_write_run_needs_its_bounds(primary, tmp_path):
     """Defect class (#898): a write run starts without the view, the patch target, its owned paths or with a
-    GitHub relay or Sources MCP."""
-    full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--no-github-relays",
+    GitHub or Sources relay or Sources MCP."""
+    full = ["--mode", "workspace-write", "--snapshot-bytes", "1024", "--no-github-relays", "--no-sources-relay",
             "--draft-patch", str(tmp_path / "p.patch"), "--owned-path", "docs"]
-    for drop in ("--snapshot-bytes", "--no-github-relays", "--draft-patch", "--owned-path"):
+    for drop in ("--snapshot-bytes", "--no-github-relays", "--no-sources-relay", "--draft-patch", "--owned-path"):
         index = full.index(drop)
-        argv = full[:index] + full[index + (1 if drop == "--no-github-relays" else 2):]
+        argv = full[:index] + full[index + (1 if drop.startswith("--no-") else 2):]
         with pytest.raises(SystemExit):
             _run(primary, "true", *argv)
     for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):

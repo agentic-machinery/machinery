@@ -354,7 +354,7 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
     if savant:
         from lu_machinery.dispatcher.providers import opencode
 
-        argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES), "--no-github-relays"]
+        argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES), "--no-github-relays", "--no-sources-relay"]
         if opencode.savant_tools(spec.options.get("data_class")):
             argv += ["--snapshot-bytes", str(opencode.SAVANT_SNAPSHOT_MAX_BYTES)]
             argv += [arg for path in opencode.savant_read_paths(spec.options) for arg in ("--read-path", path)]
@@ -1330,6 +1330,7 @@ class _Boundary:
         self.gh: Any = None
         self.created = False
         self.created_outputs: list[Path] = []
+        self.status_read: int | None = None
         # A write run's baseline: each path of its writable view and that file's Git mode, object id and SHA-256.
         self.manifest: dict[str, tuple[str, str, bytes]] | None = {} if args.mode == "workspace-write" else None
 
@@ -1561,12 +1562,15 @@ class _Boundary:
         try:
             # Sources goes through the read-only AGY boundary's relay: read-only tools only, one server per
             # connection, started by the launcher from the product checkout. Providers reach it through
-            # ``sources_command``.
-            from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+            # ``sources_command``. A Savant run has none: nothing inside reaches a host service.
+            if self.args.no_sources_relay:
+                self.receipt["sources"] = {"status": "disabled"}
+            else:
+                from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 
-            readers, _writers = sources_tool_sets()
-            self.relay = agy_sandbox.SourcesRelay(boundary / "sources.sock", frozenset(readers), {
-                name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ})
+                readers, _writers = sources_tool_sets()
+                self.relay = agy_sandbox.SourcesRelay(boundary / "sources.sock", frozenset(readers), {
+                    name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ})
         except Exception as exc:  # Sources is optional; containment does not depend on it
             self.receipt["sources"] = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"[:200]}
         argv += ["--cap-drop", "ALL", "--chdir", SNAPSHOT_INSIDE if snapshot_only else str(self.worktree)]
@@ -1579,6 +1583,13 @@ class _Boundary:
             {"report_fd": report_write, "go_fd": go_read, "probes": probes}).encode(), 0o444)
         argv += [interpreter, "-I", str(boundary / "canary.py"), str(boundary / "plan.json"), "--",
                  interpreter, "-I", str(boundary / "forwarder.py"), str(boundary / "egress.sock"), *command]
+        status_read = status_write = None
+        if self.manifest is not None:
+            # A write run's draft waits for the sandbox's PID-namespace init, whose exit ends every process inside
+            # (``_sandbox_init``); bubblewrap names it on this descriptor.
+            status_read, status_write = os.pipe()
+            self.status_read = status_read  # open until bubblewrap exits: it writes its exit status there too
+            argv[1:1] = ["--json-status-fd", str(status_write)]
         self.receipt["bwrap"] = str(bwrap)
         self.receipt["argv_sha256"] = __import__("hashlib").sha256(json.dumps(argv).encode()).hexdigest()
         env = {key: value for key, value in self.args.provider_env.items()
@@ -1603,11 +1614,15 @@ class _Boundary:
         try:
             # The argv is the fixed bubblewrap binary and launcher-validated paths; env is the dispatcher's
             # provider environment, passed on deliberately (the provider runs inside with it).
-            process = subprocess.Popen(argv, env=env, cwd=self.worktree, pass_fds=(report_write, go_read))  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            fds = (report_write, go_read, *(() if status_write is None else (status_write,)))
+            process = subprocess.Popen(argv, env=env, cwd=self.worktree, pass_fds=fds)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
             self.process = process
         finally:
             os.close(report_write)
             os.close(go_read)
+            if status_write is not None:
+                os.close(status_write)
+        init = None
         try:
             outcomes = self._report(report_read)
             failed = [probe for probe in outcomes or [] if probe.get("outcome") not in probe.get("expect_any", [])]
@@ -1618,6 +1633,8 @@ class _Boundary:
             if not passed:
                 raise Refused("the write boundary canary failed: " + ", ".join(
                     f"{probe.get('op')} {probe.get('path')} gave {probe.get('outcome')}" for probe in failed[:5]))
+            if status_read is not None:
+                init = self._sandbox_init(status_read, process.pid)
             os.write(go_write, b"1")
         finally:
             os.close(go_write)
@@ -1626,12 +1643,50 @@ class _Boundary:
         returncode = process.wait()
         self.receipt["returncode"] = returncode
         self.receipt["import"] = {"status": "unchanged", "before": self.tip, "after": self.tip}
-        if self.manifest is not None:
+        if self.manifest is not None and init is not None:
             try:
+                # Nothing inside may still write to the view while the host reads it.
+                if not select.select([init], [], [], _CANARY_TIMEOUT)[0]:
+                    raise Refused("savant_draft_refused: the sandbox's processes did not stop")
                 self.receipt["import"].update(self._draft(boundary / Path(SNAPSHOT_INSIDE).name))
             except Refused as exc:
                 self.receipt["import"].update(status="refused", reason=str(exc))
+            finally:
+                os.close(init)
         return returncode
+
+    def _sandbox_init(self, descriptor: int, launcher: int) -> int:
+        """A pidfd of the sandbox's PID-namespace init, from bubblewrap's first ``--json-status-fd`` document.
+
+        The init is bubblewrap's own child (its parent is checked after the pidfd is open, so a reused number is
+        refused). The pidfd becomes readable when the init exits, and the kernel ends and reaps every other process
+        of the namespace before that exit completes.
+        """
+        buffer, deadline = b"", time.monotonic() + _CANARY_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]:
+                raise Refused("the sandbox's init was not reported in time")
+            chunk = os.read(descriptor, 4096)
+            buffer += chunk
+            try:
+                document, _end = json.JSONDecoder().raw_decode(buffer.decode("utf-8").lstrip())
+                break
+            except ValueError:
+                if not chunk or len(buffer) > 65536:
+                    raise Refused("the sandbox's init report is unreadable") from None
+        pid = document.get("child-pid") if isinstance(document, dict) else None
+        if type(pid) is not int or pid <= 1:
+            raise Refused("the sandbox's init report names no process")
+        pidfd = os.pidfd_open(pid)
+        try:
+            parent = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            parent = -1
+        if parent != launcher:
+            os.close(pidfd)
+            raise Refused("the sandbox's init is not bubblewrap's child")
+        return pidfd
 
     def _claude_login(self, home: Path, repository: Path) -> tuple[tuple[Path, Path] | None, list[Path]]:
         """The selected Claude login's projection, wherever it lives: a private directory bound at its resolved
@@ -1771,6 +1826,8 @@ class _Boundary:
         def expect(op: str, path: Path | str, *outcomes: str, port: int | None = None) -> None:
             probes.append({"op": op, "path": str(path), "expect_any": list(outcomes), **({"port": port} if port else {})})
 
+        if self.args.no_sources_relay:
+            expect("stat", _SOURCES_INSIDE, "ENOENT")  # no host service is reachable through the boundary
         if snapshot_only:
             # Absent, not merely read-only: the worktree, the primary's tracked files and its Git metadata.
             expect("stat", self.worktree, "ENOENT")
@@ -1916,86 +1973,150 @@ class _Boundary:
             chunks.append(chunk)
         raise Refused("the write boundary canary did not report in time")
 
+    def _read_view(self, view: Path, needles: tuple[bytes, ...], accounts: re.Pattern[bytes] | None
+                   ) -> dict[str, bytes]:
+        """Every regular file of the view, read once below directory descriptors that never follow a link.
+
+        Each component is opened with ``O_NOFOLLOW`` relative to its parent's descriptor, so no entry a sandbox
+        process plants can lead outside the view. An entry that is not a directory or a single-link regular file,
+        an excluded, unprintable or screened name, more than ``2 * MAX_SNAPSHOT_FILES`` entries or more than
+        ``--snapshot-bytes`` bytes refuse the draft; the listing is read lazily, so memory stays within those
+        bounds. Refusals never name the entry: names are the model's.
+        """
+        assert self.args.snapshot_bytes is not None
+        refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
+        files: dict[str, bytes] = {}
+        total = entries = 0
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        pending = [""]
+        root = os.open(view, flags | os.O_DIRECTORY)
+
+        def below(prefix: str) -> int:
+            # One component at a time: O_NOFOLLOW holds for each, not only the last.
+            current = os.dup(root)
+            for part in prefix.split("/")[:-1]:
+                try:
+                    nested = os.open(part, flags | os.O_DIRECTORY, dir_fd=current)
+                finally:
+                    os.close(current)
+                current = nested
+            return current
+
+        try:
+            while pending:
+                prefix = pending.pop()
+                directory = below(prefix)
+                try:
+                    with os.scandir(directory) as listing:
+                        for entry in listing:
+                            entries += 1
+                            if entries > 2 * MAX_SNAPSHOT_FILES:
+                                raise Refused(f"{refusal}: the view holds more than {2 * MAX_SNAPSHOT_FILES} entries")
+                            relative = prefix + entry.name
+                            if (not relative.isprintable() or _sensitive(os.fsencode(relative), needles, accounts)
+                                    or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in relative.split("/"))):
+                                raise Refused(f"{refusal}: an entry has an excluded, unprintable or screened name")
+                            try:
+                                descriptor = os.open(entry.name, flags, dir_fd=directory)
+                            except OSError:
+                                raise Refused(f"{refusal}: an entry is not a directory or a regular file") from None
+                            try:
+                                info = os.fstat(descriptor)
+                                if stat.S_ISDIR(info.st_mode):
+                                    pending.append(relative + "/")
+                                    continue
+                                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                                    raise Refused(f"{refusal}: an entry is not a directory or a single-link regular file")
+                                total += info.st_size
+                                if total > limit:
+                                    raise Refused(f"{refusal}: the edited view holds more than {limit} bytes")
+                                data = os.read(descriptor, info.st_size + 1) if info.st_size else b""
+                                if len(data) != info.st_size:
+                                    raise Refused(f"{refusal}: a file changed while it was read")
+                                files[relative] = data
+                            finally:
+                                os.close(descriptor)
+                finally:
+                    os.close(directory)
+        except OSError as exc:
+            raise Refused(f"{refusal}: the view could not be read ({type(exc).__name__})") from None
+        finally:
+            os.close(root)
+        return files
+
     def _draft(self, view: Path) -> dict:
         """A write run's edits of its view as a Git patch against the start commit, written to ``--draft-patch``.
 
-        Runs on the host once the sandbox has exited, so nothing inside can change the view while it is read.
-        Every entry must be a directory or a single-link regular file whose printable path has no excluded
-        component; a new file may not name a path the start commit holds (one the view left out); edited bytes are
-        screened as the view's own were (``_sensitive``) and bounded by ``--snapshot-bytes``. Git builds the patch
-        with a private object directory and index that read the primary's objects as alternates, so nothing is
-        written to the repository or the worktree. An edit outside ``--owned-path`` refuses the draft, and
-        settlement checks the patch's paths again. An empty dict means nothing changed.
+        ``run`` calls it only after the run's init has exited (``_sandbox_init``). Each file is read once
+        (``_read_view``), and Git gets those bytes, never the view's paths. An edit outside ``--owned-path``,
+        a new file whose path or any of its parents names something of the start commit that the view left out,
+        and edited bytes the view's own screen would refuse (``_sensitive``) refuse the draft. Git runs in a
+        private bare repository whose only link to the primary is read-only alternates, and the tree delta it
+        computes must be exactly the validated paths. Settlement checks the paths again. An empty dict means
+        nothing changed.
         """
         from pathlib import PurePosixPath
 
-        assert self.manifest is not None and self.args.snapshot_bytes is not None
-        refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
-        edits: dict[str, str | None] = {}  # path: the Git mode of its new bytes, or None when deleted
-        contents: dict[str, bytes] = {}
-        seen: set[str] = set()
-        total = entries = 0
-        for directory, dirs, files in os.walk(view):  # never follows a link
-            for name in (*dirs, *files):
-                path = Path(directory, name)
-                relative = path.relative_to(view).as_posix()
-                entries += 1
-                if entries > 2 * MAX_SNAPSHOT_FILES:
-                    raise Refused(f"{refusal}: the view holds more than {2 * MAX_SNAPSHOT_FILES} entries")
-                if not relative.isprintable() or any(_SNAPSHOT_EXCLUDED.fullmatch(part)
-                                                     for part in PurePosixPath(relative).parts):
-                    raise Refused(f"{refusal}: an edit names an excluded or unprintable path")
-                info = os.lstat(path)
-                if name in dirs and stat.S_ISDIR(info.st_mode):
-                    continue
-                if name in dirs or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    raise Refused(f"{refusal}: {relative[:200]!r} is not a single-link regular file")
-                total += info.st_size
-                if total > limit:
-                    raise Refused(f"{refusal}: the edited view holds more than {limit} bytes")
-                seen.add(relative)
-                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-                with os.fdopen(descriptor, "rb") as stream:
-                    data = stream.read(limit + 1)
-                baseline = self.manifest.get(relative)
-                if baseline is None or hashlib.sha256(data).digest() != baseline[2]:
-                    edits[relative], contents[relative] = (baseline[0] if baseline else "100644"), data
-        edits.update(dict.fromkeys(self.manifest.keys() - seen))
-        if not edits:
-            return {}
         from lu_machinery.dispatcher.ownership import outside_owned
 
-        if outside := outside_owned(edits, self.args.owned_path):
-            raise Refused(f"{refusal}: edits outside the owned paths: {', '.join(outside[:5])[:300]}")
-        # A new file must not name a path of the start commit: the view left that one out (name, content or
-        # --read-path), so the run never read what it would replace.
-        new = [path for path in edits if path not in self.manifest]
-        listed = _plain_git(self.repository, "cat-file", "--batch-check", refusal=refusal,
-                            data="".join(f"{self.tip}:{path}\n" for path in new).encode()).decode()
-        if any(not line.endswith(" missing") for line in listed.splitlines()):
-            raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
+        assert self.manifest is not None and self.args.snapshot_bytes is not None
+        refusal, limit = "savant_draft_refused", self.args.snapshot_bytes
         needles, accounts = _screen(refusal)
-        if any(_sensitive(data, needles, accounts) for data in contents.values()):
+        files = self._read_view(view, needles, accounts)
+        edits: dict[str, str | None] = {}  # path: the Git mode of its new bytes, or None when deleted
+        for path, data in files.items():
+            baseline = self.manifest.get(path)
+            if baseline is None or hashlib.sha256(data).digest() != baseline[2]:
+                edits[path] = baseline[0] if baseline else "100644"
+        edits.update(dict.fromkeys(self.manifest.keys() - files.keys()))
+        if not edits:
+            return {}
+        if outside := outside_owned(edits, self.args.owned_path):
+            raise Refused(f"{refusal}: {len(outside)} edited path(s) lie outside the owned paths")
+        if any(_sensitive(files[path], needles, accounts) for path, mode in edits.items() if mode is not None):
             raise Refused(f"{refusal}: an edit holds a private key, a token, a configured secret or a host name")
         work = self.base / "draft"
-        (work / "objects").mkdir(mode=0o700, parents=True)
-        env = {"GIT_OBJECT_DIRECTORY": str(work / "objects"), "GIT_INDEX_FILE": str(work / "index"),
-               "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(self.common / "objects")}
-        _plain_git(self.repository, "read-tree", self.tip, env=env, refusal=refusal)
-        written = [path for path, mode in edits.items() if mode is not None]
-        oids = _plain_git(self.repository, "hash-object", "-w", "--no-filters", "--stdin-paths", env=env,
-                          refusal=refusal, data="".join(f"{view / path}\n" for path in written).encode()).split()
-        if len(oids) != len(written):
-            raise Refused(f"{refusal}: git hash-object returned {len(oids)} ids for {len(written)} files")
-        zero = "0" * len(self.tip)
-        index = [f"{edits[path]} {oid.decode()}\t{path}\0" for path, oid in zip(written, oids, strict=True)]
-        index += [f"0 {zero}\t{path}\0" for path, mode in edits.items() if mode is None]
-        _plain_git(self.repository, "update-index", "-z", "--index-info", data="".join(index).encode(), env=env,
+        work.mkdir(mode=0o700)
+        draft = work / "draft.git"
+        object_format = "sha256" if len(self.tip) == 64 else "sha1"
+        _plain_git(work, "init", "--bare", "-q", "--template=", f"--object-format={object_format}", str(draft),
                    refusal=refusal)
-        tree = _plain_git(self.repository, "write-tree", env=env, refusal=refusal).decode().strip()
-        patch = _plain_git_bounded(self.repository, "diff-tree", "-r", "-p", "--binary", "--full-index",
-                                   "--no-renames", "--no-ext-diff", "--no-textconv", self.tip, tree,
-                                   max_bytes=4 * limit, env=env, refusal=refusal)
+        (draft / "objects" / "info").mkdir(parents=True, exist_ok=True)
+        _write_private(draft / "objects" / "info" / "alternates", f"{self.common / 'objects'}\n".encode(), 0o600)
+        env = {"GIT_INDEX_FILE": str(work / "index")}
+        # A new file must not name, below or at any of its parents, a path of the start commit: the view left
+        # that one out (its name, content or --read-path), and Git would replace what the run never read.
+        new = {path for path in edits if path not in self.manifest}
+        prefixes = sorted({str(parent) for path in new for parent in (PurePosixPath(path), *PurePosixPath(path).parents)
+                           if str(parent) != "."})
+        listed = _plain_git(draft, "cat-file", "--batch-check", refusal=refusal,
+                            data="".join(f"{self.tip}:{prefix}\n" for prefix in prefixes).encode()).decode()
+        lines = listed.splitlines()
+        if len(lines) != len(prefixes):
+            raise Refused(f"{refusal}: git cat-file answered {len(lines)} of {len(prefixes)} paths")
+        for prefix, line in zip(prefixes, lines, strict=True):
+            # The new path itself must be absent; a parent may only be a directory the view also had.
+            if not line.endswith(" missing") and (prefix in new or line.split(" ")[1:2] != ["tree"]):
+                raise Refused(f"{refusal}: a new file names a path of the start commit that the view left out")
+        _plain_git(draft, "read-tree", self.tip, env=env, refusal=refusal)
+        index = []
+        for path, mode in edits.items():
+            if mode is None:
+                index.append(f"0 {'0' * len(self.tip)}\t{path}\0")
+                continue
+            oid = _plain_git(draft, "hash-object", "-w", "--no-filters", "--stdin", data=files[path],
+                             refusal=refusal).decode().strip()
+            index.append(f"{mode} {oid}\t{path}\0")
+        _plain_git(draft, "update-index", "-z", "--index-info", data="".join(index).encode(), env=env,
+                   refusal=refusal)
+        tree = _plain_git(draft, "write-tree", env=env, refusal=refusal).decode().strip()
+        delta = _plain_git(draft, "diff-tree", "-r", "-z", "--name-only", "--no-renames", self.tip, tree,
+                           refusal=refusal)
+        if {os.fsdecode(name) for name in delta.split(b"\0") if name} != set(edits):
+            raise Refused(f"{refusal}: Git's tree change differs from the validated edits")
+        patch = _plain_git_bounded(draft, "diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames",
+                                   "--no-ext-diff", "--no-textconv", self.tip, tree, max_bytes=4 * limit,
+                                   refusal=refusal)
         _write_private(Path(self.args.draft_patch), patch, 0o600)
         return {"status": "drafted", "patch": self.args.draft_patch, "patch_sha256": hashlib.sha256(patch).hexdigest(),
                 "paths": sorted(edits), "bytes": len(patch)}
@@ -2010,6 +2131,9 @@ class _Boundary:
             with contextlib.suppress(OSError):
                 self.process.kill()
             self.process.wait()
+        if self.status_read is not None:
+            os.close(self.status_read)
+            self.status_read = None
         if self.receipt.get("status") in ("ran", "interrupted") and "import" not in self.receipt:
             # Read-only mounts leave the branch tip unchanged, including interrupted runs.
             self.receipt["import"] = {"status": "unchanged", "before": self.tip, "after": self.tip}
@@ -2139,6 +2263,8 @@ def main(argv: list[str]) -> int:
                         help="At most this many bytes sent upstream by the whole run, e.g. 16777216 (default: none)")
     parser.add_argument("--no-github-relays", action="store_true",
                         help="Start neither GitHub read relay nor the gh shim inside (default: both start)")
+    parser.add_argument("--no-sources-relay", action="store_true",
+                        help="Start no Sources relay, so its socket is absent inside (default: it starts)")
     parser.add_argument("--snapshot-bytes", type=_positive_bytes,
                         help="Write a read-only snapshot of the published start commit at most this large, e.g. "
                         f"67108864, at {SNAPSHOT_INSIDE} (default: none)")
@@ -2153,9 +2279,11 @@ def main(argv: list[str]) -> int:
         parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
     write = args.mode == "workspace-write"
     if write != (args.draft_patch is not None) or write != bool(args.owned_path) or (
-            write and (args.snapshot_bytes is None or not args.no_github_relays or args.sources_mcp is not None)):
-        parser.error("--mode workspace-write needs --draft-patch, --owned-path, --snapshot-bytes and "
-                     "--no-github-relays, without --sources-mcp; --draft-patch and --owned-path need it")
+            write and (args.snapshot_bytes is None or not args.no_github_relays or not args.no_sources_relay
+                       or args.sources_mcp is not None)):
+        parser.error("--mode workspace-write needs --draft-patch, --owned-path, --snapshot-bytes, "
+                     "--no-github-relays and --no-sources-relay, without --sources-mcp; --draft-patch and "
+                     "--owned-path need it")
     if write and not Path(args.draft_patch).is_absolute():
         parser.error("--draft-patch must be an absolute path")
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "mode": args.mode, "status": "refused", "started_at": _now()}
