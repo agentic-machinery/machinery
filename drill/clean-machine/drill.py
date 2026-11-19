@@ -1900,9 +1900,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     missing = []
-    if not args.version:
+    if args.version is None or not args.version.strip():
         missing.append("--version")
-    if args.command == "all" and not args.rollback_to:
+    if args.command == "all" and (
+        args.rollback_to is None or not args.rollback_to.strip()
+    ):
         missing.append("--rollback-to")
     if missing:
         parser.error("the following arguments are required: " + ", ".join(missing))
