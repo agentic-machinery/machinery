@@ -19,11 +19,11 @@ from fastapi.testclient import TestClient
 from prometheus_client import CollectorRegistry, generate_latest
 
 from lu_machinery.agent_runtime import model_pause
-from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
 from lu_machinery.api.monitor_context import get_ctx
 from lu_machinery.api.state_helpers import cache_invalidate
+from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import store, worker
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
@@ -313,11 +313,22 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
             started_at=(NOW - timedelta(hours=8) + timedelta(minutes=5)).isoformat(),
             finished_at=(NOW - timedelta(hours=6)).isoformat(),
             allowance={"pool": "codex:b", "start": {"remaining_pct": 95.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "outer", model="claude-opus-5-5",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "agy_claude", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "inner", model="claude-opus-5-5",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "agy_claude", "start": {"remaining_pct": 75.0}, "finish": {"remaining_pct": 95.0}})
     rows.backfill(tasks, batch_state)
-    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b"}
+    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer", "inner"}
     window = _window(batch_state, stats.Landing(task_ids=landed))
     unknown = {"value": None, "n": 1, "low_sample": True}
     assert window["allowance"] == [
+        {"pool": "agy_claude", "model": "claude-opus-5-5", "effort": "high", "tasks": 1, "landed": 1,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
         {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
          "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
@@ -433,6 +444,19 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     recommendation = ranked["windows"]["7d"]["charts"]["recommendation"]
     assert recommendation["model"] == "gpt-6.2-sol"
     assert recommendation["approvals"] == 10
+    # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
+    fine = tmp_path / "fine"
+    fine_tasks = fine / "tasks"
+    fine_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(fine_tasks, f"a-{index}", model="gpt-6.1-sol", duration_s=3.001)
+        _review(fine_tasks, f"a-review-{index}", "correct", [], pr=300 + index, review_author_model="gpt-6.1-sol")
+        _record(fine_tasks, f"b-{index}", model="gpt-6.2-sol", duration_s=3.004)
+        _review(fine_tasks, f"b-review-{index}", "correct", [], pr=400 + index, review_author_model="gpt-6.2-sol")
+    rows.backfill(fine_tasks, fine)
+    fine_window = stats.collect(fine, tmp_path, NOW, landing=stats.Landing(
+        task_ids={f"a-{index}" for index in range(10)} | {f"b-{index}" for index in range(10)}))
+    assert fine_window["windows"]["7d"]["charts"]["recommendation"]["model"] == "gpt-6.1-sol"
     classes = []
     for index in range(9):
         classes.append({"role": "write", "model": "gpt-6.1-sol", "identity": "catalog", "tasks": 11, "landed": 11,

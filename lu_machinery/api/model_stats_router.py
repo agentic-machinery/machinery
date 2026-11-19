@@ -540,7 +540,11 @@ class _Meter:
 
 
 def _meter(row: _Row) -> _Meter | None:
-    """The task's pool interval, or None when a reading is missing or the window reset (finish above start)."""
+    """The task's pool interval, or None when a reading is missing.
+
+    A finish above the start is a reset. The interval still joins a cluster, so a task running inside another
+    one can show that the meter reset during the outer task.
+    """
     block = row.raw.get("allowance")
     if not isinstance(block, Mapping):
         return None
@@ -551,8 +555,6 @@ def _meter(row: _Row) -> _Meter | None:
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
             return None
         ends.append(float(value))
-    if ends[1] > ends[0]:
-        return None
     start = row.started or row.moment
     end = row.moment if row.moment >= start else start
     return _Meter(start, end, ends[0], ends[1], row.landed)
@@ -575,7 +577,7 @@ def _clusters(rows: list[_Row]) -> list[_Cluster]:
     """
     by_pool: dict[str, list[tuple[_Meter, _Row]]] = defaultdict(list)
     for row in rows:
-        if row.role != "write" or row.allowance is None or row.allowance[1] < 0:
+        if row.role != "write" or row.allowance is None:
             continue
         meter = _meter(row)
         if meter is not None:
@@ -652,28 +654,27 @@ def _stamp_allowance(models: list[dict[str, Any]], rows: list[_Row], *,
                      effort_of: Callable[[str], str] = lambda effort: effort) -> None:
     """Replace the summed per-task allowance with one net drop per overlapping cluster."""
     clusters = _clusters(rows)
+
+    def pick(name: str, effort_name: str | None = None, class_name: str | None = None) -> tuple[set[int], int]:
+        def predicate(row: _Row) -> bool:
+            if model_of(row.model) != name:
+                return False
+            if effort_name is not None and effort_of(row.effort) != effort_name:
+                return False
+            return class_name is None or row.task_class == class_name
+        return _selected(rows, predicate)
+
     for model in models:
         if model["role"] != "write":
             continue
         name = model["model"]
-        chosen, resets = _selected(rows, lambda row, name=name: model_of(row.model) == name)
-        _apply_allowance(model, _facts_for(clusters, chosen, resets))
+        _apply_allowance(model, _facts_for(clusters, *pick(name)))
         for effort in model["by_effort"]:
-            chosen, resets = _selected(
-                rows, lambda row, name=name, effort_name=effort["effort"]:
-                model_of(row.model) == name and effort_of(row.effort) == effort_name)
-            _apply_allowance(effort, _facts_for(clusters, chosen, resets))
+            _apply_allowance(effort, _facts_for(clusters, *pick(name, effort["effort"])))
             for task_class in effort.get("by_class", []):
-                chosen, resets = _selected(
-                    rows, lambda row, name=name, effort_name=effort["effort"], class_name=task_class["class"]:
-                    model_of(row.model) == name and effort_of(row.effort) == effort_name
-                    and row.task_class == class_name)
-                _apply_allowance(task_class, _facts_for(clusters, chosen, resets))
+                _apply_allowance(task_class, _facts_for(clusters, *pick(name, effort["effort"], task_class["class"])))
         for task_class in model.get("by_class", []):
-            chosen, resets = _selected(
-                rows, lambda row, name=name, class_name=task_class["class"]:
-                model_of(row.model) == name and row.task_class == class_name)
-            _apply_allowance(task_class, _facts_for(clusters, chosen, resets))
+            _apply_allowance(task_class, _facts_for(clusters, *pick(name, None, task_class["class"])))
 
 
 def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
@@ -688,8 +689,10 @@ def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
             grouped[(row.allowance[0], row.model, row.effort)].append(row)
     table = []
     for (pool, model, effort), grouped_rows in sorted(grouped.items()):
-        chosen, resets = _selected(
-            grouped_rows, lambda row, pool=pool: row.allowance is not None and row.allowance[0] == pool)
+        def in_pool(row: _Row, pool: str = pool) -> bool:
+            return row.allowance is not None and row.allowance[0] == pool
+
+        chosen, resets = _selected(grouped_rows, in_pool)
         facts = _facts_for([cluster for cluster in clusters if cluster.pool == pool], chosen, resets)
         points = facts["points"]
         table.append({
@@ -826,11 +829,15 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         approved[pr["author"]] += pr["first"] == "correct"
         reviewed[pr["author"]] += 1
 
+    # total_seconds on the model is rounded to one decimal. Ranking uses the unrounded durations.
+    raw_seconds: dict[str, float] = defaultdict(float)
+    for row in rows:
+        if row.role == "write" and row.duration is not None:
+            raw_seconds[row.model] += row.duration
     pareto = []
     for model in writes:
         name = model["model"]
-        seconds = model.get("wall_seconds")
-        total = _number(seconds.get("total_seconds") if isinstance(seconds, Mapping) else None)
+        total = raw_seconds.get(name)
         observed = model.get("wall_hours_observed") or {}
         trials = reviewed[name]
         # Rank on the raw counts. Rounding the per-landing hours first drops a short task and
