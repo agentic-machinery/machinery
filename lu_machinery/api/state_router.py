@@ -2547,6 +2547,12 @@ async def routing_budget(
     except TimeoutError:
         if not deadline.expired():
             raise  # the computation's own TimeoutError is a failure, not warming
+        # A TimeoutError delivered to this request before its deadline is a
+        # failure (500), never warming. One that settles in its worker thread
+        # just before the deadline but reaches the event loop after it is
+        # indistinguishable from a later one and answers warming: the failed
+        # flight has left the in-flight map, so the Retry-After retry
+        # recomputes and a persistent failure then answers 500 (#840 F10).
         raise HTTPException(
             status_code=503, detail="routing budget warming",
             headers={
