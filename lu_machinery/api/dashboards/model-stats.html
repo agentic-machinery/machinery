@@ -238,8 +238,12 @@ function reasonCell(count, sample) {
   const title = sample !== undefined && sample !== null ? ` title="${esc(sample)}"` : "";
   return `<td class="num"${title}>${num(count || 0)}</td>`;
 }
+function samplesOf(model) {
+  const found = current && current.samples && current.samples.get(model);
+  return found || {};
+}
 function reviewRow(r, kind) {
-  const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : (r.unparsed_samples || {});
+  const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : samplesOf(r.model);
   const notDone = pct(r.not_done) + (u.not_done ? ` <span class="muted">(${num(u.not_done)})</span>` : "");
   const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(notDone)}`
@@ -266,7 +270,7 @@ function neverStarted(models) {
 function unparsedSamples(reviews) {
   const items = [];
   for (const m of (reviews || []).filter((r) => keepModel(r.model))) {
-    const u = m.unparsed_reasons || {}, samples = m.unparsed_samples || {};
+    const u = m.unparsed_reasons || {}, samples = samplesOf(m.model);
     for (const reason of UNPARSED_REASONS) {
       if (samples[reason] !== undefined && samples[reason] !== null) {
         items.push(`<tr><td><b>${esc(m.model)}</b></td><td>${esc(reason)}</td>${cell(num(u[reason] || 0))}<td class="sample">${esc(samples[reason])}</td></tr>`);
@@ -676,6 +680,7 @@ function renderCharts() {
 }
 
 let current = null;
+let loadGeneration = 0;
 function render() {
   if (!current) return;
   const data = current.data, charts = data.charts || {}, label = current.label;
@@ -758,8 +763,34 @@ async function loadPools(allowance) {
   }
   updateTableScroll();
 }
+function sampleStamp(window) {
+  if (!window || typeof window.name !== "string" || typeof window.until !== "string" || window.until === "") return null;
+  return {name: window.name, until: window.until};
+}
+function emptySamples() {
+  return {map: new Map(), window: null};
+}
+async function loadSamples(name) {
+  try {
+    const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}&view=samples`, {cache: "no-store"});
+    if (!response.ok) return emptySamples();
+    const body = await response.json();
+    if (!body || body.status !== "ok" || !Array.isArray(body.models)) return emptySamples();
+    const map = new Map();
+    for (const model of body.models) {
+      if (!model || typeof model.model !== "string" || !model.unparsed_samples
+          || typeof model.unparsed_samples !== "object") continue;
+      map.set(model.model, model.unparsed_samples);
+    }
+    return {map, window: sampleStamp(body.window)};
+  } catch {
+    return emptySamples();
+  }
+}
 async function load() {
+  const generation = ++loadGeneration;
   const name = $("window").value;
+  const samplesPromise = loadSamples(name);
   let data, retry = 1;
   try {
     const response = await fetch(`/api/fleet/model-stats?window=${encodeURIComponent(name)}&view=page`, {cache: "no-store"});
@@ -767,9 +798,11 @@ async function load() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     retry = Math.max(1, Number(response.headers.get("Retry-After")) || 1);
   } catch (err) {
+    if (generation !== loadGeneration) return;
     $("age").innerHTML = `<span class="error">unavailable: ${esc(err.message)}</span>`;
     return;
   }
+  if (generation !== loadGeneration) return;
   if (data.status === "pending") {
     $("age").textContent = `Collecting… retrying in ${retry} s`;
     setTimeout(load, retry * 1000);
@@ -783,7 +816,7 @@ async function load() {
   const names = pickerModels(data);
   select.innerHTML = '<option value="">All models</option>' + names.map((model) => `<option value="${esc(model)}">${esc(model)}</option>`).join("");
   if (names.includes(previous)) select.value = previous;
-  current = {data, label};
+  current = {data, label, samples: new Map()};
   setModelSeries(data);
   matrixClasses(data);
   const levelModel = $("level-model"), previousModel = levelModel.value;
@@ -793,6 +826,14 @@ async function load() {
   render();
   renderLevels();
   loadPools(data.allowance);
+  const samples = await samplesPromise;
+  if (generation !== loadGeneration || current === null) return;
+  const pageWindow = sampleStamp(data.window);
+  if (samples.window && pageWindow && samples.window.name === pageWindow.name
+      && samples.window.until === pageWindow.until) {
+    current.samples = samples.map;
+    render();
+  }
 }
 $("window").addEventListener("change", load);
 $("model").addEventListener("change", () => { render(); renderLevels(); });
