@@ -19,6 +19,12 @@ window. Any other bug is fixed in a follow-up PR and rides the next train. Do
 not rebuild or replace a version that was already published, and do not move
 a tag.
 
+## Rollout gate drill
+
+Record the passing clean-machine drill for the exact release selected for the v0.7.0
+rollout gate in a comment on [issue #866](https://github.com/learn-ukrainian/machinery/issues/866).
+Include the release identity and complete drill results.
+
 ## Rollback
 
 Rollback is to the previous pin. Restore the previous consumer lock, wheel,

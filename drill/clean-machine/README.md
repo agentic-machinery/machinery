@@ -56,12 +56,14 @@ On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bu
    touches nothing outside it (pip's cache and every row's home directory live inside it too):
 
    ```sh
-   python3 -I drill.py all --version 0.1.28 --rollback-to 0.1.27
+   python3 -I drill.py all --version <release> --rollback-to <previous-release>
    ```
 
+   Replace the placeholders with version numbers, without angle brackets.
+
    The kit downloads both wheels and `SHA256SUMS` from the GitHub release, checks the sums,
-   installs v0.1.28, checks every installed file against the wheel's RECORD, runs all rows, rolls
-   back to v0.1.27 (RECORD check again), runs all rows again, then rolls forward to v0.1.28 and
+   installs the release, checks every installed file against the wheel's RECORD, runs all rows, rolls
+   back to the previous release (RECORD check again), runs all rows again, then rolls forward and
    checks RECORD once more. At the end it deletes the venv, the mock world, the wheels and the
    traces of rows that passed, and keeps `out/` (pass `--keep-work` to keep everything).
 
