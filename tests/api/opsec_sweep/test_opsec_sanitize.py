@@ -69,6 +69,21 @@ def test_real_app_rules_json_preserves_source_bytes(scope, tmp_path, monkeypatch
     assert payload["sources"] == sources
 
 
+@pytest.mark.parametrize(
+    ("text", "sanitized"),
+    [
+        ("../api/../home/fixture-user/x", f"../api/..{REDACTED_ABSOLUTE_PATH}"),
+        ("../api/home/fixture-user/x", f"../api{REDACTED_ABSOLUTE_PATH}"),
+        ("/api/fixture?next=/api/fixture/{id}/home/view", f"/api/fixture?next=/api/fixture/{{id}}{REDACTED_ABSOLUTE_PATH}"),
+        ("../home.md", "../home.md"),
+    ],
+)
+def test_relative_root_segments_are_redacted_whole(text: str, sanitized: str) -> None:
+    """Defect class: a scanner finding the sanitizer's root pre-check skips (#909)."""
+    assert sanitize_text(text) == sanitized
+    assert scan_text(sanitize_text(text)) == []
+
+
 def test_sanitize_document_strips_planted_absolute_paths() -> None:
     leaked = {
         "ok": True,

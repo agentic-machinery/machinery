@@ -277,6 +277,50 @@ it pulls `:latest`. Bump both steps together to the newest
 then re-run `scripts/audit/secret_scan_local.py tree`.
 `tests/ci/test_trufflehog_scanner_pin.py` rejects a missing pin and `latest`.
 
+## Monitor API OPSEC scanner: filesystem paths
+
+`lu_machinery/api/opsec_scan.py` is the detector of record for Monitor API
+responses. `lu_machinery/api/opsec_sanitize.py` replaces each
+`filesystem-root` span it reports with `[redacted-path]`. The bounded roots are
+`BOUNDED_FILESYSTEM_ROOTS`: `/home`, `/Users`, `/Volumes`, `/private`, `/opt`,
+`/srv`, `/tmp` and `/var`.
+
+**Span contract.** A finding starts at the bounded root, or at the scheme of a
+file URI whose first path segment is a bounded root. It ends where its
+whitespace-, quote- or angle-bracket-delimited run ends, less trailing prose
+punctuation and backticks. Over-redaction of a glued neighbour is accepted;
+leaving path bytes behind is not.
+
+**Detection contract (fail closed).**
+
+- Bare rule: a bounded root after anything but a letter, digit or `/`, and
+  before anything but a name character, is flagged (`/tmp.backup` counts).
+- File URIs: a `file:` scheme not preceded by a letter or digit, with any
+  authority, is flagged whole when its first path segment passes the bare
+  rule's boundary.
+- Exemptions: a bare hash route (`#/home`) and an absolute `/api` route's path
+  component (`/api/x/{id}/home/view`), unless a `.` or `..` segment precedes
+  the root (`/api/../home/x` is flagged). An `/api` query or fragment, a SHA, a
+  timestamp or a duration never exempts a path.
+
+**Relative paths (designated amendment, 2026-11-19).** A dot-relative path is
+a relative path token with a `.` or `..` segment followed by `/` (`./home/x`,
+`../home/x`, `docs/../home/x`). In a dot-relative path, and in the query or
+fragment of an `/api` route, every whole bounded-root segment is flagged,
+whatever precedes it and with no route exemption: `../api/../home/x`,
+`../api/home/x`, `/api/x?next=../home/x`, `/api/x?next=/api/y/{id}/home/view`.
+A whole segment is the root name after `/` and before anything but a name
+character. Over-flagging there is accepted: `./docs/home/x`, a URL authority
+named like a root inside an `/api` query value, and a glued neighbour in the
+same run. Ordinary relative paths are not flagged: `./docs/x`, `../guide.md`,
+`../api/v1/x`, a root name with an extension (`../home.md`, `./tmp.log`) and a
+value that starts with a root name (`?path=home/x`). Finer parsing (URI
+components, decoded query values, Markdown destinations) is machinery #922.
+
+`tests/api/opsec_sweep/test_opsec_scan.py` holds the synthetic positive and
+negative cases. `tests/api/opsec_sweep/test_opsec_sanitize.py` proves that each
+relative finding is redacted whole.
+
 ## CodeQL baseline alert triage
 
 The first whole-repository Python analysis on `main` at `62f026eb`
