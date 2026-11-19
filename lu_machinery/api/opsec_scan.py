@@ -11,6 +11,7 @@ failure output.
 from __future__ import annotations
 
 import bisect
+import heapq
 import ipaddress
 import re
 from collections.abc import Iterable, Mapping
@@ -94,25 +95,31 @@ _FILE_URI_HEAD_RE = re.compile(r"(?://[^/?#\s\"'<>`]*|(?!//))(?P<path>/+)")
 _FILE_URI_ROOT_RE = re.compile(_ROOT)
 # Relative paths (designated amendment, 2026-11-19; fail closed).  A path
 # token is a run of name characters and slashes; it is relative unless it
-# starts with "/".  A relative token with a "." or ".." segment followed by
-# "/" ("./home/x", "../home/x", "docs/../home/x") is a dot-relative path.
-# Inside a dot-relative path, and inside an /api route's query or fragment,
-# every whole bounded-root segment is flagged whatever precedes it
-# ("../api/home/x", "?next=/api/x/{id}/home/v"), and no route exemption
-# applies.  A whole segment is a root name after "/" and before anything but a
-# name character; a root name followed by "." and a name character is a longer
-# file name, so "../home.md" and "./tmp.log" stay ordinary relative paths.  A
-# value that starts with a root name ("?path=home/x") names no root, like
-# "docs/x", and every finding keeps the "/root" text the sanitizer pre-checks.
-# A bare root right after a "." or ".." segment is judged by this rule in a
-# relative token; in an absolute one ("/api/../home/x") the bare rule judges
-# it and the route exemption does not apply.  Each region runs to the end of
-# its path run, like the span contract, so over-flagging a glued neighbour is
-# accepted.
-_PATH_NAME_CHARS = r"\w.~%+@$-"
+# starts with "/".  A token with a "." or ".." segment followed by "/" is
+# judged segment by segment: a relative one ("./home/x", "docs/../home/x", a
+# dot-relative path) from its start, an absolute one ("/api/..//home/x") from
+# that segment on.  There, and in an /api route's query or fragment ("/api?",
+# "/api#", "/api/x?"), every whole bounded-root segment is flagged whatever
+# precedes it, repeated slashes included ("../api/home/x",
+# "?next=/api/x/{id}/home/v"), and no route exemption applies: an /api path
+# component exempts roots only before its first dot segment.  A whole segment
+# is a root name after "/" that no name character continues, where a run of
+# dots before a name character also continues it: "../home.md", "./tmp.log",
+# "../homeX", "../home+page" and "../home..md" are ordinary relative paths.
+# A value that starts with a root name ("?path=home/x") names no root, like
+# "docs/x", and every finding keeps the "/root" text the sanitizer
+# pre-checks.  A bare root right after a dot segment of a relative token is
+# judged by this rule; in an absolute token the bare rule judges it too.
+# Each region runs to the end of its path run, like the span contract, so
+# over-flagging a glued neighbour is accepted.
+_NAME_CONTINUE_CHARS = r"\w~%+@$-"
+_PATH_NAME_CHARS = "." + _NAME_CONTINUE_CHARS
 _PATH_TOKEN_RE = re.compile(rf"[/{_PATH_NAME_CHARS}]+")
 _PATH_NAME_CHAR_RE = re.compile(rf"[{_PATH_NAME_CHARS}]")
-_ROOT_SEGMENT_RE = re.compile(rf"/(?:{_ROOT_NAMES})(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])")
+_ROOT_SEGMENT_RE = re.compile(rf"/(?:{_ROOT_NAMES})(?![{_NAME_CONTINUE_CHARS}]|\.+[{_NAME_CONTINUE_CHARS}])")
+# The filesystem rule's /api route also opens on "?" or "#" ("/api?next=...");
+# the protected-span pattern above keeps its shape for the other finding kinds.
+_API_PATH_ROUTE_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])/api(?:[/?#][^\s\"'<>]*)?")
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<token>[A-Za-z0-9_.-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?)"
@@ -367,6 +374,32 @@ def _ip_version(candidate: str) -> int | None:
         return None
 
 
+class _Cursor:
+    """Index of the last of sorted starts at or before a position, or -1.
+
+    Each scan pass looks positions up in ascending order, so the cursor
+    gallops forward from its last answer: a pass of k lookups over n starts
+    costs O(k + n) comparisons, not O(k log n).  A lookup behind the cursor
+    (the next pass) bisects once.
+    """
+
+    def __init__(self, starts: list[int]) -> None:
+        self._starts = starts
+        self._index = -1
+
+    def locate(self, position: int) -> int:
+        starts = self._starts
+        low = self._index
+        if low >= 0 and starts[low] > position:
+            low = -1
+        step = 1
+        while low + step < len(starts) and starts[low + step] <= position:
+            low += step
+            step *= 2
+        self._index = bisect.bisect_right(starts, position, max(low, 0), min(low + step, len(starts))) - 1
+        return self._index
+
+
 class _PathRuns:
     """Trimmed end of the path run holding a position; each run is trimmed once.
 
@@ -378,11 +411,11 @@ class _PathRuns:
     def __init__(self, text: str) -> None:
         self._text = text
         self._runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
-        self._starts = [start for start, _ in self._runs]
+        self._cursor = _Cursor([start for start, _ in self._runs])
         self._trimmed: dict[int, int] = {}
 
     def end(self, position: int) -> int:
-        index = bisect.bisect_right(self._starts, position) - 1
+        index = self._cursor.locate(position)
         if index not in self._trimmed:
             start, end = self._runs[index]
             self._trimmed[index] = _trim_end(self._text, start, end)
@@ -390,14 +423,14 @@ class _PathRuns:
 
 
 class _SpanSet:
-    """Membership in and overlap with sorted, disjoint spans by bisect."""
+    """Membership in and overlap with sorted, disjoint spans."""
 
     def __init__(self, spans: Iterable[tuple[int, int]]) -> None:
         self._spans = list(spans)
-        self._starts = [start for start, _ in self._spans]
+        self._cursor = _Cursor([start for start, _ in self._spans])
 
     def __contains__(self, position: int) -> bool:
-        index = bisect.bisect_right(self._starts, position) - 1
+        index = self._cursor.locate(position)
         return index >= 0 and position < self._spans[index][1]
 
     def overlaps(self, start: int, end: int) -> bool:
@@ -406,37 +439,40 @@ class _SpanSet:
         Only the last span starting before ``end`` can: every earlier one ends
         before that one starts.
         """
-        index = bisect.bisect_left(self._starts, end) - 1
+        index = self._cursor.locate(end - 1)
         return index >= 0 and start < self._spans[index][1]
 
 
 class _PathTokens:
-    """Path tokens (runs of name characters and slashes), looked up by bisect."""
+    """Path tokens (runs of name characters and slashes)."""
 
     def __init__(self, text: str) -> None:
         self._text = text
         self._tokens = [(match.start(), match.end()) for match in _PATH_TOKEN_RE.finditer(text)]
-        self._starts = [start for start, _ in self._tokens]
+        self._cursor = _Cursor([start for start, _ in self._tokens])
 
     def is_relative(self, position: int) -> bool:
         """Whether the token holding ``position`` does not start with "/"."""
-        index = bisect.bisect_right(self._starts, position) - 1
+        index = self._cursor.locate(position)
         if index < 0 or position >= self._tokens[index][1]:
             return False
         return self._text[self._tokens[index][0]] != "/"
 
-    def dot_relative_starts(self) -> Iterable[int]:
-        """Yield the start of each relative token with a "." or ".." segment before a "/".
+    def dot_region_starts(self) -> Iterable[int]:
+        """Yield where each token with a "." or ".." segment before a "/" is judged by segments.
 
-        A lone "." or ".." (prose, "x).(y") or a trailing one ("docs/..")
-        leads to no path, so it opens no region.
+        A relative token (a dot-relative path) is judged from its start, an
+        absolute one from its first dot segment.  A lone "." or ".." (prose,
+        "x).(y") or a trailing one ("docs/..") leads to no path and opens no
+        region.
         """
         for start, end in self._tokens:
-            if self._text[start] == "/":
-                continue
             segments = f"/{self._text[start:end]}"
-            if "/./" in segments or "/../" in segments:
-                yield start
+            found = [index for index in (segments.find("/./"), segments.find("/../")) if index >= 0]
+            if not found:
+                continue
+            # segments[i] is text[start + i - 1]: the dot after that "/" is text[start + i].
+            yield start if self._text[start] != "/" else start + min(found)
 
 
 def _after_dot_segment(text: str, position: int) -> bool:
@@ -450,21 +486,27 @@ def _after_dot_segment(text: str, position: int) -> bool:
     return False
 
 
-def _api_routes(text: str) -> list[tuple[int, int, int]]:
-    """Return each /api route's start, path-component end and end.
+def _api_routes(text: str) -> list[tuple[int, int, int, int]]:
+    """Return each /api route's start, exempt end, path-component end and end.
 
-    The path component is exempt from the bare rule; the query and fragment
-    (from the path end to the route end) are not, and are a relative-path
-    region.
+    The path component is exempt from the bare rule up to its first "." or
+    ".." segment; the query and fragment (from the path end to the route end)
+    are not, and are a relative-path region.
     """
-    routes: list[tuple[int, int, int]] = []
-    for match in _API_ROUTE_RE.finditer(text):
+    routes: list[tuple[int, int, int, int]] = []
+    for match in _API_PATH_ROUTE_RE.finditer(text):
+        start = match.start()
         path_end = match.end()
         for separator in "?#":
-            found = text.find(separator, match.start(), path_end)
+            found = text.find(separator, start, path_end)
             if found >= 0:
                 path_end = found
-        routes.append((match.start(), path_end, match.end()))
+        exempt_end = path_end
+        for dot_segment in ("/./", "/../"):
+            found = text.find(dot_segment, start, path_end)
+            if found >= 0:
+                exempt_end = min(exempt_end, found)
+        routes.append((start, exempt_end, path_end, match.end()))
     return routes
 
 
@@ -472,19 +514,19 @@ def _relative_segment_candidates(
     text: str,
     path_runs: _PathRuns,
     path_tokens: _PathTokens,
-    api_routes: Iterable[tuple[int, int, int]],
+    api_routes: Iterable[tuple[int, int, int, int]],
 ) -> list[_Candidate]:
-    """Flag every whole bounded-root segment in a dot-relative path or an /api query or fragment.
+    """Flag every whole bounded-root segment in a dot-segment path or an /api query or fragment.
 
-    A dot-relative region runs from its token start to the trimmed end of its
-    path run; an /api region from the "?" or "#" to the route end.  Regions
-    are merged before matching, so each character is matched once.
+    A dot-segment region runs from where its token is judged by segments to
+    the trimmed end of its path run; an /api region from the "?" or "#" to the
+    route end.  Both lists are already sorted, so they are merged in one pass
+    and each character is matched once.
     """
-    regions = [(start, path_runs.end(start)) for start in path_tokens.dot_relative_starts()]
-    regions.extend((path_end, end) for _, path_end, end in api_routes if path_end < end)
-    regions.sort()
+    dot_regions = [(start, path_runs.end(start)) for start in path_tokens.dot_region_starts()]
+    api_regions = [(path_end, end) for _, _, path_end, end in api_routes if path_end < end]
     merged: list[tuple[int, int]] = []
-    for start, end in regions:
+    for start, end in heapq.merge(dot_regions, api_regions):
         if merged and start <= merged[-1][1]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         elif start < end:
@@ -586,15 +628,17 @@ def scan_text(
     is accepted; leaving path bytes behind is not.
 
     Detection contract for relative paths (designated amendment, 2026-11-19;
-    fail closed): a dot-relative path (a relative path token with a "." or
-    ".." segment followed by "/"), or an /api route's query or fragment, is
-    flagged at each whole bounded-root segment, with no route exemption:
-    "./home/x", "../home/x", "../api/../home/x", "../api/home/x",
-    "/api/x?next=/api/y/{id}/home/v".  Over-flagging there ("./docs/home/x")
-    is accepted.  Ordinary relative paths are not flagged: "./docs/x",
-    "../guide.md", "../api/v1/x", "../home.md", "?path=home/x".  An /api
-    route's path component exempts a root only when no "." or ".." segment
-    precedes it ("/api/../home/x" is flagged).
+    fail closed): a path with a "." or ".." segment before a "/" (from the
+    start of a relative one, from that segment on in an absolute one), and an
+    /api route's query or fragment ("/api?", "/api#", "/api/x?"), are flagged
+    at each whole bounded-root segment, with no route exemption: "./home/x",
+    "../home/x", "../api/../home/x", "../api/home/x", "/api/..//home/x",
+    "/api?next=/api/y/{id}/home/v".  Over-flagging there ("./docs/home/x",
+    "/api/../docs/home/x") is accepted.  Ordinary relative paths are not
+    flagged: "./docs/x", "../guide.md", "../api/v1/x", and a root name that a
+    name character or a dot run plus one continues ("../home.md",
+    "../home+page", "../home..md"), and "?path=home/x".  An /api route's path
+    component exempts roots only before its first "." or ".." segment.
     """
     if not isinstance(text, str):
         return []
@@ -613,23 +657,22 @@ def scan_text(
     candidates.extend(file_uri_candidates)
 
     # A bare root is exempt only inside a bare hash route ("#/home") or an /api
-    # route's path component ("/api/x/{id}/home/view") when no "." or ".."
-    # segment precedes it.  A SHA, timestamp or duration in the path, or an
+    # route's path component ("/api/x/{id}/home/view") before its first "." or
+    # ".." segment.  A SHA, timestamp or duration in the path, or an
     # /api query or fragment carrying the path, never exempts it.  A bare root
     # right after a dot segment of a relative token is left to the
     # relative-segment rule, which judges whole segments.
     hash_routes = _SpanSet((match.start(), match.end()) for match in _HASH_ROUTE_RE.finditer(text))
     api_routes = _api_routes(text)
-    api_route_paths = _SpanSet((start, path_end) for start, path_end, _ in api_routes)
+    api_route_paths = _SpanSet((start, exempt_end) for start, exempt_end, _, _ in api_routes)
     path_tokens = _PathTokens(text)
     for match in _FILESYSTEM_PATH_RE.finditer(text):
         start = match.start()
         if start in file_uri_paths or start in hash_routes:
             continue
-        after_dot = _after_dot_segment(text, start)
-        if after_dot and path_tokens.is_relative(start):
+        if start in api_route_paths:
             continue
-        if start in api_route_paths and not after_dot:
+        if _after_dot_segment(text, start) and path_tokens.is_relative(start):
             continue
         end = max(path_runs.end(start), match.end("root"))
         candidates.append(_Candidate(start, end, "filesystem-root", None, 80))

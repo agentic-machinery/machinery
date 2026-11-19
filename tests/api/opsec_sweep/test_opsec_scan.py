@@ -219,8 +219,19 @@ def test_relative_paths_and_url_authorities_stay_unflagged(text: str) -> None:
         ("/api/fixture/../../home.old/fixture-user", "/home.old/fixture-user"),
         # A dot that ends a longer segment name opens no dot-relative path.
         ("\u0434\u0438\u0432./home.old/fixture-user", "/home.old/fixture-user"),
-        # Accepted over-flagging: any whole root segment of a dot-relative path.
+        # A bare /api route opens its query or fragment too.
+        ("/api?next=/api/fixture/{id}/home/view", "/home/view"),
+        ("/api#docs/home/fixture-user", "/home/fixture-user"),
+        # After a dot segment an absolute path is judged by segments, repeated slashes included.
+        ("/api/..//home/fixture-user", "/home/fixture-user"),
+        ("/api/../{id}/home/fixture-user", "/home/fixture-user"),
+        ("/api/./{id}/home/fixture-user", "/home/fixture-user"),
+        ("/fixture/..//home/fixture-user", "/home/fixture-user"),
+        # A trailing dot run is prose punctuation, not part of the name.
+        ("cd ../home..", "/home"),
+        # Accepted over-flagging: any whole root segment of a dot-segment path.
         ("./docs/home/fixture-user", "/home/fixture-user"),
+        ("/api/../docs/home/fixture-user", "/home/fixture-user"),
     ],
 )
 def test_dot_relative_and_api_query_root_segments_are_flagged(text: str, token: str) -> None:
@@ -248,9 +259,16 @@ def test_dot_relative_and_api_query_root_segments_are_flagged(text: str, token: 
         "/api/fixture?next=../api/v1/x",
         "/api/fixture#./docs/x",
         "/api/fixture?next=../home.md",
+        # A name character or a dot run plus one continues the name.
+        "../docs/home\u00e9/x",
+        "./docs/home+page/x",
+        "../docs/home~page/x",
+        "../docs/home..md",
+        "/api?next=docs/home+page/x",
         # A value that starts with a root name names no root.
         "/api/fixture?tab=home",
         "/api/fixture?path=home/fixture-user",
+        "/api?tab=home",
     ],
 )
 def test_ordinary_relative_paths_stay_unflagged(text: str) -> None:
