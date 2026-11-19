@@ -9,6 +9,23 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.38"></a>
+## [0.1.38] - 2026-11-19
+
+### Added
+
+- Offer Savant trials on real jobs ([#845](https://github.com/learn-ukrainian/machinery/pull/845))
+- Make model value readable without hiding the gaps ([#849](https://github.com/learn-ukrainian/machinery/pull/849))
+
+### Changed
+
+- Isolate repository fixture setup ([#847](https://github.com/learn-ukrainian/machinery/pull/847))
+
+### Fixed
+
+- Refuse when the credit-lane snapshot is unreadable ([#843](https://github.com/learn-ukrainian/machinery/pull/843))
+- Make native package setup survive apt lock and mirror failures ([#850](https://github.com/learn-ukrainian/machinery/pull/850))
+
 <a id="v0.1.37"></a>
 ## [0.1.37] - 2026-11-19
 
@@ -987,7 +1004,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.38...HEAD
+[0.1.38]: https://github.com/learn-ukrainian/machinery/compare/v0.1.37...v0.1.38
 [0.1.37]: https://github.com/learn-ukrainian/machinery/compare/v0.1.36...v0.1.37
 [0.1.36]: https://github.com/learn-ukrainian/machinery/compare/v0.1.35...v0.1.36
 [0.1.35]: https://github.com/learn-ukrainian/machinery/compare/v0.1.34...v0.1.35
