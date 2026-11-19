@@ -951,15 +951,16 @@ def remote_heartbeat(
         if lease.stream_id != stream_id:
             raise ValueError("stream mismatch")
         store = _store(ctx)
-        renewed = store.heartbeat(lease)
-        projection = store.remote_stream_projection(stream_id)["lease"]
+        # State and session state come from the write transaction. A second
+        # connection here only repeated setup and yielded the GIL (#935).
+        renewed, projection_state, session_state = store.heartbeat_with_session_state(lease)
         return JSONResponse(
             content={
                 "schema": SCHEMA,
                 "lease": _lease_payload(
                     renewed,
-                    projection_state=str(projection["state"]),
-                    session_state=str(projection["session_state"]),
+                    projection_state=projection_state,
+                    session_state=session_state,
                     now=utc_now(),
                 ),
             },
