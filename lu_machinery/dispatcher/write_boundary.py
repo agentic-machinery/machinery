@@ -141,6 +141,16 @@ _CODEX_HOME = "codex-home"
 # there; OpenCode reads the file ``OPENCODE_CONFIG`` names, which is the file's fixed path inside.
 _SOURCES_MCP = "sources-mcp.json"
 _SOURCES_MCP_INSIDE = "/run/lu-write-boundary/sources-mcp.json"
+# A public Savant run's tools read only this read-only snapshot of the published start commit (designated
+# approval, Savant tool conditions C1-C4): regular files, none of whose path components names Git metadata, an
+# environment file, a key or credential store, or an instruction or config file OpenCode loads by itself.
+SNAPSHOT_INSIDE = "/run/lu-write-boundary/snapshot"
+_SNAPSHOT_EXCLUDED = re.compile(
+    r"\.git|\.env.*|\.?secrets?(\..*)?|\.ssh|\.gnupg|\.aws|\.docker|\.kube|\.netrc|\.npmrc|\.pypirc"
+    r"|\.git-credentials|credentials(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\..*)?"
+    r"|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|gpg|asc)|agents\.md|claude\.md|opencode\.jsonc?|\.opencode",
+    re.IGNORECASE)
+MAX_READ_PATHS = 64
 _SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor/mcp.json", "opencode": None}
 # Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
@@ -323,6 +333,13 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
         argv += ["--runtime", str(dispatch_lease(spec.task_id))]
+    if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
+        from lu_machinery.dispatcher.providers import opencode
+
+        argv += ["--upload-ceiling", str(opencode.SAVANT_UPLOAD_MAX_BYTES)]
+        if opencode.savant_tools(spec.options.get("data_class")):
+            argv += ["--snapshot-bytes", str(opencode.SAVANT_SNAPSHOT_MAX_BYTES)]
+            argv += [arg for path in opencode.savant_read_paths(spec.options) for arg in ("--read-path", path)]
     host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
             if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
     # The launcher starts with the provider's environment. Its own GitHub reads (the published address ranges, the
@@ -353,6 +370,14 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return summary, f"write_boundary_refused: {receipt.get('reason') or receipt.get('status')}"
     if (receipt.get("import") or {}).get("status") != "unchanged":
         return summary, f"write_boundary_import_failed: {(receipt.get('import') or {}).get('status')}"
+    ceiling = receipt.get("upload_ceiling")
+    if isinstance(ceiling, dict):
+        summary["upload_ceiling"] = ceiling
+        if ceiling.get("reached") is not False:
+            return summary, (f"savant_upload_ceiling: the run tried to send more than {ceiling.get('limit')} bytes "
+                             "upstream; the boundary cut the connection")
+    if isinstance(receipt.get("snapshot"), dict):
+        summary["snapshot"] = receipt["snapshot"]
     return summary, None
 
 
@@ -686,6 +711,63 @@ def github_networks() -> tuple:
     if not complete or not any(network.version == 4 for network in networks):
         raise Refused(f"GitHub's published address ranges cannot be read ({why}); the boundary could not refuse GitHub")
     return tuple(dict.fromkeys(networks))
+
+
+def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int) -> dict:
+    """Write the published ``commit``'s regular files below ``paths`` (default: all) into ``target``, read-only.
+
+    Refuses a commit no remote-tracking branch of origin contains, a snapshot over ``limit`` bytes, and one with
+    no file. Excluded names (``_SNAPSHOT_EXCLUDED``) and anything but a regular file are left out.
+    """
+    import tarfile
+    from pathlib import PurePosixPath
+
+    if not _OBJECT_ID.fullmatch(commit) or not _git(
+            repository, "for-each-ref", "--contains", commit, "--format=%(refname)", "refs/remotes/origin").strip():
+        raise Refused("savant_snapshot_refused: the start commit is on no branch of the public remote")
+    env = {"PATH": os.defpath, "HOME": os.environ.get("HOME", "/"), "LC_ALL": "C", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"}
+    command = ["git", "--no-replace-objects", "--literal-pathspecs", "-c", f"core.hooksPath={os.devnull}",
+               "-c", "core.fsmonitor=false", "-C", str(repository), "archive", "--format=tar", commit, "--", *paths]
+    target.mkdir(mode=0o700)
+    files = total = left_out = 0
+    unreadable = None
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as archive:
+            for member in archive:
+                parts = PurePosixPath(member.name).parts
+                if not parts or member.name.startswith("/") or any(part in ("", ".", "..") for part in parts):
+                    raise Refused("savant_snapshot_refused: the archive names a path outside the tree")
+                if member.isdir():
+                    continue
+                if not member.isreg() or any(_SNAPSHOT_EXCLUDED.fullmatch(part) for part in parts):
+                    left_out += 1
+                    continue
+                total += member.size
+                if total > limit:
+                    raise Refused(f"savant_snapshot_refused: the files to read exceed {limit} bytes; "
+                                  "name the task's files or directories with --read-path")
+                path = target.joinpath(*parts)
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                _write_private(path, source.read() if source is not None else b"", 0o400)
+                files += 1
+    except tarfile.TarError as exc:
+        unreadable = type(exc).__name__  # judged after Git's own status, which explains an empty stream
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+    if process.returncode != 0:
+        raise Refused("savant_snapshot_refused: git archive failed; a --read-path may name nothing at the start commit")
+    if unreadable is not None:
+        raise Refused(f"savant_snapshot_refused: the archive could not be read ({unreadable})")
+    if not files:
+        raise Refused("savant_snapshot_refused: no readable file is left to snapshot")
+    return {"commit": commit, "files": files, "bytes": total, "left_out": left_out, "read_paths": len(paths)}
 
 
 def _under(path: Path, roots) -> bool:
@@ -1123,6 +1205,9 @@ class _Boundary:
             directory.mkdir(mode=0o700)
         for name, source in _PROJECTED.items():
             _write_private(boundary / name, source.read_bytes(), 0o500)
+        if self.args.snapshot_bytes is not None:
+            self.receipt["snapshot"] = _snapshot(repository, self.tip, self.args.read_path,
+                                                 boundary / Path(SNAPSHOT_INSIDE).name, self.args.snapshot_bytes)
 
         outputs = []
         for raw in self.args.output or []:
@@ -1284,7 +1369,7 @@ class _Boundary:
         argv += ["--cap-drop", "ALL", "--chdir", str(self.worktree)]
 
         self.egress = AttemptEgress(boundary / "egress.sock", refused_domains=GITHUB_DOMAINS,
-                                    refused_networks=github_networks())
+                                    refused_networks=github_networks(), upload_ceiling=self.args.upload_ceiling)
         report_read, report_write = os.pipe()
         go_read, go_write = os.pipe()
         _write_private(boundary / "plan.json", json.dumps(
@@ -1636,6 +1721,9 @@ class _Boundary:
                 self.egress.cleanup()
             self.receipt["egress"] = list(self.egress.records)
             self.receipt["egress_overflow_count"] = self.egress.overflow_count
+            if self.egress.upload_ceiling is not None:
+                self.receipt["upload_ceiling"] = {"limit": self.egress.upload_ceiling, "sent": self.egress.uploaded,
+                                                  "reached": self.egress.ceiling_reached}
         for path in self.created_outputs:
             with contextlib.suppress(OSError):
                 if path.stat().st_size == 0:
@@ -1684,6 +1772,23 @@ def _pr_number(text: str) -> int:
     return int(text)
 
 
+def _positive_bytes(value: str) -> int:
+    if not (value.isascii() and value.isdecimal() and len(value) <= 12 and int(value) > 0):
+        raise argparse.ArgumentTypeError("expected a positive byte count")
+    return int(value)
+
+
+def read_path(value: str) -> str:
+    """A repository-relative path in Git's form: no absolute, dot, empty or control-character component."""
+    from pathlib import PurePosixPath
+
+    parts = PurePosixPath(value).parts
+    if (not value or len(value) > 4096 or value.startswith(("/", "-")) or not value.isprintable()
+            or any(part in (".", "..") for part in parts) or "//" in value):
+        raise argparse.ArgumentTypeError("expected a repository-relative path such as lu_machinery/config")
+    return value
+
+
 def main(argv: list[str]) -> int:
     if argv[:1] == ["call"]:
         return call_main(argv[1:])
@@ -1717,10 +1822,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--sources-mcp", choices=tuple(_SOURCES_MCP_HOME),
                         help="Sources projection selector; read-only dispatches use cursor only, with AGY/OpenCode "
                         "definitions retained (default: none)")
+    parser.add_argument("--upload-ceiling", type=_positive_bytes,
+                        help="At most this many bytes sent upstream by the whole run, e.g. 16777216 (default: none)")
+    parser.add_argument("--snapshot-bytes", type=_positive_bytes,
+                        help="Write a read-only snapshot of the published start commit at most this large, e.g. "
+                        f"67108864, at {SNAPSHOT_INSIDE} (default: none)")
+    parser.add_argument("--read-path", action="append", default=[], type=read_path,
+                        help="Repository path the snapshot is limited to, e.g. lu_machinery/config; repeatable, "
+                        f"at most {MAX_READ_PATHS} (default: the whole tree)")
     parser.add_argument("--host-env", action="append", default=[],
                         help="NAME=VALUE of the dispatcher's host configuration, for the launcher only (default: none)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Provider argv after --; executable must be absolute")
     args = parser.parse_args(argv)
+    if len(args.read_path) > MAX_READ_PATHS or (args.read_path and args.snapshot_bytes is None):
+        parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
     receipt = {"schema": SCHEMA, "task_id": args.task_id, "mode": args.mode, "status": "refused", "started_at": _now()}
     if not _TASK_ID.fullmatch(args.task_id):
         receipt["reason"] = "unsafe task id"

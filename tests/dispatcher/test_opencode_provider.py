@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 from lu_machinery.api import model_stats_rows, subscription_usage as usage
-from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker
+from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker, write_boundary
 from lu_machinery.dispatcher.providers import opencode
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.review.reviewer_resolver import REVIEW_CANDIDATES
@@ -154,7 +154,11 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     config = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])
     assert config["model"] == config["small_model"] == "subq/subq-savant-1.4"
     assert config["enabled_providers"] == ["subq"]
-    assert config["permission"] == {"*": "deny"}
+    # A public class reads the boundary's snapshot of the published start commit with the read-only file tools
+    # only; every other tool and any path outside the snapshot stay denied.
+    assert config["permission"] == {"*": "deny", "external_directory": "deny", "read": "allow", "grep": "allow",
+                                    "glob": "allow", "list": "allow"}
+    assert invocation.argv[invocation.argv.index("--dir") + 1] == write_boundary.SNAPSHOT_INSIDE
     provider = config["provider"]["subq"]
     assert provider["env"] == ["SUBQ_API_KEY"]
     assert provider["options"] == {"baseURL": "https://api.subq.ai/v1"}
@@ -173,8 +177,12 @@ def test_savant_pins_wire_options_and_records_effort(spec, dispatch, monkeypatch
     assert private["effort"] == "max"
     private_trial = replace(trial, task_id="oc-private-max", effort=private["effort"], options=private["options"])
     invocation = runtime_context.build(private_trial, {})
-    model = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])["provider"]["subq"]["models"]["subq-savant-1.4"]
+    private_config = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])
+    model = private_config["provider"]["subq"]["models"]["subq-savant-1.4"]
     assert model["options"] == {"store": False, "reasoningEffort": "max"}
+    # A private class keeps every tool disabled: the prompt is its only input.
+    assert private_config["permission"] == {"*": "deny"}
+    assert invocation.argv[invocation.argv.index("--dir") + 1] == "/tmp"
     assert invocation.stdin == b"Reply with exactly: ready\n"
     store.record_path(record["task_id"]).with_suffix(".result").write_text(json.dumps({
         "schema_version": "code-review-findings.v1",
@@ -214,3 +222,84 @@ def test_savant_refuses_review_of_record_before_spawn(dispatch, capsys):
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+def _published_repository(tmp_path, files, links=()):
+    """A fixture repository whose commit is on ``refs/remotes/origin/main``, as a fetched public branch is."""
+    import subprocess
+
+    repository = tmp_path / "public"
+    for name, data in files.items():
+        (repository / name).parent.mkdir(parents=True, exist_ok=True)
+        (repository / name).write_bytes(data)
+    for name, target in links:
+        (repository / name).symlink_to(target)
+
+    def run(*args):
+        return subprocess.run(["git", "-C", str(repository), *args], check=True, capture_output=True,
+                              text=True, env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1",
+                                              "GIT_CONFIG_GLOBAL": os.devnull}).stdout.strip()
+
+    run("init", "-q", "-b", "main")
+    run("add", "-A")
+    run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fixture")
+    commit = run("rev-parse", "HEAD")
+    run("update-ref", "refs/remotes/origin/main", commit)
+    return repository, commit, run
+
+
+def test_savant_snapshot_holds_only_published_regular_files(tmp_path):
+    """Defect class: a public Savant run's tools reach Git metadata, secrets, links or unpublished work (C2, C4)."""
+    secret = b"EXCLUDED-CONTENT"
+    files = {
+        "src/allowed.py": b"ALLOWED = 1\n", "docs/guide.md": b"# Guide\n",
+        ".env": secret, "config/.env.local": secret, "keys/id_ed25519": secret, "keys/server.pem": secret,
+        "secrets/token.txt": secret, "app/credentials.json": secret, ".ssh/config": secret, "deploy/site.key": secret,
+        "AGENTS.md": secret, "nested/CLAUDE.md": secret, "opencode.json": secret, ".opencode/agent.md": secret,
+    }
+    repository, commit, run = _published_repository(tmp_path, files, links=[("link.py", "src/allowed.py"),
+                                                                             ("outside", "/etc")])
+    target = tmp_path / "snapshot"
+    info = write_boundary._snapshot(repository, commit, [], target, 1024)
+    written = {path.relative_to(target).as_posix(): path for path in target.rglob("*") if path.is_file()}
+    assert sorted(written) == ["docs/guide.md", "src/allowed.py"]
+    assert not any(path.is_symlink() for path in target.rglob("*"))
+    assert all(secret not in path.read_bytes() for path in written.values())
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in written.values())
+    assert info == {"commit": commit, "files": 2, "bytes": 20, "left_out": 14, "read_paths": 0}
+    # --read-path narrows it to the named directory.
+    narrowed = write_boundary._snapshot(repository, commit, ["docs"], tmp_path / "narrow", 1024)
+    assert narrowed["files"] == 1 and (tmp_path / "narrow" / "docs" / "guide.md").is_file()
+    # Fail closed, each with its reason: a path naming nothing, an over-cap tree and an unpublished commit.
+    with pytest.raises(write_boundary.Refused, match="a --read-path may name nothing"):
+        write_boundary._snapshot(repository, commit, ["missing"], tmp_path / "missing", 1024)
+    with pytest.raises(write_boundary.Refused, match="exceed 10 bytes; name the task's files"):
+        write_boundary._snapshot(repository, commit, [], tmp_path / "small", 10)
+    (repository / "src" / "allowed.py").write_bytes(b"UNPUBLISHED = 1\n")
+    run("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "local only")
+    with pytest.raises(write_boundary.Refused, match="on no branch of the public remote"):
+        write_boundary._snapshot(repository, run("rev-parse", "HEAD"), [], tmp_path / "local", 1024)
+
+
+def test_savant_launch_builds_the_snapshot_and_ceiling_only_for_public_classes(tmp_path, monkeypatch):
+    """Defect class: a private Savant run gets file tools, or a public one runs without its bounds (C1, C3)."""
+    from lu_machinery.dispatcher.types import Invocation
+
+    monkeypatch.setattr(write_boundary.shutil, "which", lambda *args, **kwargs: "/usr/bin/true")
+    base = TaskSpec("oc-launch", "opencode", "subq-savant-1.4", "high", "read-only", tmp_path, tmp_path / "prompt",
+                    tmp_path / "final", provider="subq")
+    invocation = Invocation(["opencode"], None, {}, None)
+    public = write_boundary.launcher(replace(base, options={"data_class": "public-code",
+                                                            "read_paths": '["lu_machinery/config"]'}),
+                                     invocation, tmp_path / "task.json")
+    public = public[:public.index("--")]
+    assert public[public.index("--upload-ceiling") + 1] == str(opencode.SAVANT_UPLOAD_MAX_BYTES)
+    assert public[public.index("--snapshot-bytes") + 1] == str(opencode.SAVANT_SNAPSHOT_MAX_BYTES)
+    assert public[public.index("--read-path") + 1] == "lu_machinery/config"
+    private = write_boundary.launcher(replace(base, options={"data_class": "private-code"}), invocation,
+                                      tmp_path / "task.json")
+    private = private[:private.index("--")]
+    assert "--upload-ceiling" in private and "--snapshot-bytes" not in private and "--read-path" not in private
+    # A malformed record's paths are refused, never read as the whole tree.
+    with pytest.raises(ValueError, match="savant_read_path_refused"):
+        opencode.savant_read_paths({"read_paths": "{}"})

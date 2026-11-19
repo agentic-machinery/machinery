@@ -1036,10 +1036,20 @@ Use `--research-role advisory` for counsel and supplemental review and
 `--research-role test` for proposed patches and Ukrainian checks. Describe
 the language check in the prompt because `--language-lane` invokes formal
 review admission. Put the question and its evidence in the prompt. Treat unreleased
-curriculum and private infrastructure as private material. The model receives
-the prompt with its tools disabled. A private repository requires a private
-data class. Dispatch refuses secrets, credentials, and unknown or undeclared
-classes.
+curriculum and private infrastructure as private material. A private repository
+requires a private data class. Dispatch refuses secrets, credentials, and
+unknown or undeclared classes.
+
+With `public-code` or `public-docs`, Savant may also use OpenCode's read-only
+`read`, `grep`, `glob` and `list` tools. The write boundary limits them to a
+read-only snapshot of the published start commit. The dispatch refuses a
+start commit that no branch of the public remote contains. The snapshot holds
+regular files only. It leaves out Git metadata, environment files, key and
+credential stores, symlinks and the instruction files OpenCode loads by itself.
+The whole tree is the default. Name the task's paths with `--read-path`; a
+snapshot over 64 MiB is refused. The boundary cuts a run that tries to send
+more than 16 MiB upstream. With a private class, every tool stays disabled.
+Inline only the excerpts the job needs.
 
 Use a stable `--task-id`. Dispatch defaults to `high`. Use `--effort max` only
 when the brief explains why the job needs it. Settled dispatches contribute

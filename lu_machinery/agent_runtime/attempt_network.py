@@ -133,8 +133,11 @@ class AttemptEgress:
     """Bounded asyncio proxy with killable DNS processes and numeric connects."""
 
     def __init__(self, endpoint: Path, *, limits: Limits = DEFAULT_LIMITS, refused_domains: tuple[str, ...] = (),
-                 refused_networks: tuple = ()):
+                 refused_networks: tuple = (), upload_ceiling: int | None = None):
         self.endpoint, self.limits = endpoint, limits
+        # At most this many bytes, summed over every tunnel, go upstream (None: no ceiling). The tunnel whose
+        # write would pass it is cut before the write, and ``ceiling_reached`` stays set for the receipt.
+        self.upload_ceiling, self.uploaded, self.ceiling_reached = upload_ceiling, 0, False
         # A service this run may not reach at all (the write boundary's GitHub): its names, each domain and every
         # name below it, and its addresses, so another name that resolves to it is refused too.
         self.refused_domains = tuple(domain.casefold() for domain in refused_domains)
@@ -243,7 +246,7 @@ class AttemptEgress:
                 raise
         raise OSError("provider unreachable")
 
-    async def _pump(self, reader, writer, record, activity):
+    async def _pump(self, reader, writer, record, activity, upload=False):
         while True:
             try:
                 data = await asyncio.wait_for(reader.read(self.limits.buffer_bytes), self.limits.idle_seconds)
@@ -254,6 +257,11 @@ class AttemptEgress:
             if not data:
                 return
             activity[0] = self.loop.time()
+            if upload and self.upload_ceiling is not None:
+                if self.uploaded + len(data) > self.upload_ceiling:
+                    self.ceiling_reached = record["upload_ceiling_reached"] = True
+                    raise ValueError("upload ceiling reached")
+                self.uploaded += len(data)
             writer.write(data)
             await asyncio.wait_for(writer.drain(), self.limits.idle_seconds)
             activity[0] = self.loop.time()
@@ -292,7 +300,7 @@ class AttemptEgress:
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await asyncio.wait_for(writer.drain(), self.limits.header_seconds)
             activity = [self.loop.time()]
-            pumps = [asyncio.create_task(self._pump(reader, upstream, record, activity)),
+            pumps = [asyncio.create_task(self._pump(reader, upstream, record, activity, upload=True)),
                      asyncio.create_task(self._pump(remote, writer, record, activity))]
             await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
         except (OSError, ValueError, UnicodeError, TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
