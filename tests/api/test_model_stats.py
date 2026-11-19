@@ -42,7 +42,7 @@ def test_model_value_sections_explain_how_to_read_the_figures():
         "Value frontier": ("first-round approval with recorded hours per landed task", "Look toward the upper left"),
         "Best model per job": ("Compare landed share within each job class", "A star marks the highest positive share"),
         "Where the work went": ("how many write tasks settled", "A larger Done share"),
-        "Week by week": ("Higher points mean more write tasks landed", "Use full weeks with enough tasks"),
+        "Week by week": ("Higher points mean a larger share of that UTC week's write tasks landed", "Use full weeks with enough tasks"),
         "Neon medium against high": ("write landings, reviewer approvals and typical runtime", "Use the counts"),
         "Reviewer strictness": ("points farther right report more P0–P2 findings", "Compare similar assignments"),
         "Time to finish": ("box spans the middle half of timed writes", "Shorter times are better"),

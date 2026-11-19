@@ -211,8 +211,10 @@ appears under **Both sources**.
   times under a minute display as **<1**.
 
 Open the values beneath a chart for counts, intervals, and exact displayed values with a mouse,
-keyboard, or touch. If a table shows **Scroll across for more columns**, scroll inside the table.
-The first column stays visible.
+keyboard, or touch. On the two scatterplots, the legend identifies individual models and a plus
+marks models with identical coordinates. Text below the chart names the models that share each
+position. If a table shows **Scroll across for more columns**, scroll inside the table. The
+first column stays visible.
 
 ## Metrics (Grafana's contract)
 

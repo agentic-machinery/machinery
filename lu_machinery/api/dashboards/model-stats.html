@@ -113,7 +113,7 @@
     <p class="note">Bar length shows how many write tasks settled for each model, and the segments show how they ended. A larger Done share means fewer runs ended in other states, and Write tasks shows the share that merged.</p>
     <div id="failures">Loading…</div></section>
   <section><h2>Week by week</h2>
-    <p class="note">Higher points mean more write tasks landed that UTC week, among the busiest models with at least 10 tasks in the window. Use full weeks with enough tasks to compare changes over time.</p>
+    <p class="note">Higher points mean a larger share of that UTC week's write tasks landed, among the busiest models with at least 10 tasks in the window. Use full weeks with enough tasks to compare changes over time.</p>
     <div id="trends">Loading…</div></section>
   <section><h2>Neon medium against high</h2>
     <p class="note">Compare Neon medium and high on write landings, reviewer approvals and typical runtime. Use the counts and approval intervals before favoring a setting, and compare approvals only for similar review work.</p>
@@ -347,16 +347,38 @@ function scatter(points, id, yLabel, xLabel, connect = false) {
   const sy = (share) => bottom - share * (bottom - top);
   const line = connect ? `<polyline fill="none" stroke="var(--ok)" stroke-width="2" stroke-dasharray="5 3" points="${
     points.filter((p) => p.frontier).sort((a, b) => a.x - b.x).map((p) => `${sx(p.x)},${sy(p.y)}`).join(" ")}"/>` : "";
-  const dots = [...points].sort((a, b) => Number(b.low_sample) - Number(a.low_sample)).map((p) => {
-    const x = sx(p.x), y = sy(p.y), ci = p.ci;
-    const interval = ci ? `<line x1="${x}" x2="${x}" y1="${sy(ci[0])}" y2="${sy(ci[1])}" stroke="${seriesColor(p.model)}" stroke-width="2"/>` : "";
-    const ring = p.frontier ? `<circle cx="${x}" cy="${y}" r="8" fill="none" stroke="var(--ok)" stroke-width="2"/>` : "";
-    return `<g><title>${esc(p.model)}</title>${interval}${ring}${marker(p.model, x, y, p.low_sample)}</g>`;
+  const positions = new Map();
+  for (const point of points) {
+    const key = `${point.x},${point.y}`;
+    if (!positions.has(key)) positions.set(key, []);
+    positions.get(key).push(point);
+  }
+  const groups = [...positions.values()];
+  const intervals = points.filter((p) => p.ci).map((p) => {
+    const x = sx(p.x);
+    return `<line x1="${x}" x2="${x}" y1="${sy(p.ci[0])}" y2="${sy(p.ci[1])}" stroke="${seriesColor(p.model)}" stroke-width="2"/>`;
   }).join("");
+  const dots = groups.map((group) => {
+    const [first] = group;
+    const x = sx(first.x), y = sy(first.y);
+    const coincident = group.length > 1;
+    const ring = group.some((p) => p.frontier)
+      ? `<circle cx="${x}" cy="${y}" r="9" fill="none" stroke="var(--ok)" stroke-width="2"/>` : "";
+    const dot = coincident
+      ? `<circle cx="${x}" cy="${y}" r="6" fill="var(--card)" stroke="var(--fg)" stroke-width="2"/>`
+        + `<path d="M${x - 3} ${y}h6 M${x} ${y - 3}v6" stroke="var(--fg)" stroke-width="2"/>`
+      : marker(first.model, x, y, first.low_sample);
+    return `<g${coincident ? ' class="shared-point"' : ""}><title>${group.map((p) => esc(p.model)).join(", ")}</title>${ring}${dot}</g>`;
+  }).join("");
+  const legend = points.map((p) => `<span>${modelKey(p.model, p.low_sample)}</span>`).join("");
+  const shared = groups.filter((group) => group.length > 1).map((group) =>
+    `<li>At ${num(group[0].x, 2)} on the horizontal axis and ${num(group[0].y * 100)}% approval, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
   return svgChart(W, H, `${yLabel} against ${xLabel}`,
-    percentTicks(sy, left, right) + verticalTicks(scale.ticks, sx, top, bottom) + line + dots
+    percentTicks(sy, left, right) + verticalTicks(scale.ticks, sx, top, bottom) + line + intervals + dots
     + `<text x="${left}" y="14">${yLabel} ↑</text>`
-    + `<text x="${(left + right) / 2}" y="${H - 5}" text-anchor="middle">${xLabel}</text>`);
+    + `<text x="${(left + right) / 2}" y="${H - 5}" text-anchor="middle">${xLabel}</text>`)
+    + `<div class="legend">${legend}</div>`
+    + (shared ? `<p class="note">A plus marks models at the same position.</p><ul class="note">${shared}</ul>` : "");
 }
 function pareto(points) {
   const shown = (points || []).filter((p) => keepModel(p.model));
