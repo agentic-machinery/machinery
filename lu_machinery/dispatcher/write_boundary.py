@@ -100,6 +100,7 @@ _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
     "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
     "XDG_CACHE_HOME", "XDG_DATA_HOME", "GH_CONFIG_DIR", "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
+    "LU_OPSEC_NEEDLES_FILE",
 })
 # A provider may point these at its own private, empty roots (the Savant route does). The launcher's host steps
 # (gh and the masks of its credential stores) always take the dispatcher's values, an empty value meaning unset;
@@ -795,9 +796,11 @@ def _known_secrets() -> tuple[bytes, ...]:
     return tuple(dict.fromkeys(value.encode() for value in found))
 
 
-def _sensitive(data: bytes, needles: tuple[bytes, ...]) -> bool:
-    """Whether a file's bytes hold a private key, a known token format or one of the host's OPSEC needles."""
-    return bool(_SNAPSHOT_SECRET.search(data)) or any(needle in data for needle in needles)
+def _sensitive(data: bytes, needles: tuple[bytes, ...], names: re.Pattern[bytes] | None) -> bool:
+    """Whether a file's bytes hold a private key, a known token format, an exact secret or path needle, or one of
+    the host's account names as a whole word."""
+    return (bool(_SNAPSHOT_SECRET.search(data)) or any(needle in data for needle in needles)
+            or (names is not None and names.search(data) is not None))
 
 
 def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, limit: int) -> dict:
@@ -819,7 +822,10 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
         loaded = load_needles()
     except NeedlesError:
         raise Refused("savant_snapshot_refused: the host's OPSEC needles cannot be read") from None
-    needles = (*(needle.encode() for needle in (*loaded.run_users, *loaded.home_dirs) if needle), *_known_secrets())
+    needles = (*(home.encode() for home in loaded.home_dirs if home), *_known_secrets())
+    # An account name counts only as a whole word, so a short one does not drop every file that contains it.
+    accounts = re.compile(rb"(?<![\w.-])(?:" + b"|".join(re.escape(user.encode()) for user in loaded.run_users) + rb")(?![\w.-])"
+                       ) if loaded.run_users else None
     entries: list[tuple[str, int, tuple[str, ...]]] = []
     left_out = total = 0
     for record in _plain_git(repository, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, "--", *paths).split(b"\0"):
@@ -856,7 +862,7 @@ def _snapshot(repository: Path, commit: str, paths: list[str], target: Path, lim
             raise Refused("savant_snapshot_refused: git cat-file returned another object")
         data = blobs[header_end + 1:header_end + 1 + size]
         offset = header_end + 2 + size
-        if _sensitive(data, needles):
+        if _sensitive(data, needles, accounts):
             left_out += 1
             continue
         destination = target.joinpath(*parts)
