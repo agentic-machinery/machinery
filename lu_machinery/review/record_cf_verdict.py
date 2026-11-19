@@ -140,7 +140,7 @@ from lu_machinery.review.role_resolution import resolve_routing_reference
 from lu_machinery.review.security_paths import git_changed_paths, is_security_sensitive_change
 from lu_machinery.review.subject_seat import prepare_subject_exclusion
 from lu_machinery.review.target_resolution import TargetResolutionError, resolve_review_repository
-from lu_machinery.review.tiers import classify_pr_files
+from lu_machinery.review.tiers import ReviewTier, classify_pr_files
 from lu_machinery.review.ukrainian_seats import (
     UKRAINIAN_SEAT_ROUTES,
     attested_author_families,
@@ -180,8 +180,8 @@ SINGLE_FAMILY_HARNESSES = {"kimi": "moonshot"}
 RUNTIME_REPORTED_MODEL_SOURCES = frozenset({"cursor-stream-json", "cursor-transcript", "cursor-stderr-json"})
 # Kimi never reviews. Native Grok requires its own runtime attestation (#9769).
 NATIVE_NON_REVIEWER_FAMILIES = frozenset({"xai", "moonshot"})
-# Review rounds per PR lineage, counted on the reviewed heads of the current PR (C-2902): three for
-# every change, security-sensitive ones included. A target repository's own policy may declare up to five.
+# Review rounds per PR lineage, counted on the reviewed heads of the current PR.
+# A target repository's own policy may declare up to five.
 DEFAULT_REVIEW_ROUNDS = 3
 MAX_DECLARED_REVIEW_ROUNDS = 5
 # A target repository whose own review policy sets another automatic budget declares it here (#12584).
@@ -2292,15 +2292,28 @@ def _review_budget_policy(policy: Path) -> dict[str, int]:
     return budgets
 
 
-def repository_review_rounds(repository: str, policy: Path | None = None) -> int:
-    """The automatic round budget the target repository's own review policy declares (#12584).
+def repository_review_rounds(
+    repository: str, policy: Path | None = None, *, tier: ReviewTier | None = "medium",
+) -> int:
+    """The repository's override or the default cap for the PR's tier.
 
-    It is the repository's ``review_rounds`` in ``scripts/config/review_budget_policy.yaml``.
-    A repository the file does not list gets ``DEFAULT_REVIEW_ROUNDS``. A file that is
-    unreadable or malformed anywhere refuses (:func:`_review_budget_policy`).
+    An unknown PR tier uses the smallest cap. A branch without a PR uses the
+    standard default. An unreadable or malformed policy file refuses.
     """
     budgets = _review_budget_policy(REVIEW_BUDGET_POLICY if policy is None else policy)
-    return budgets.get(normalize_repository(repository), DEFAULT_REVIEW_ROUNDS)
+    return budgets.get(normalize_repository(repository), 2 if tier in {None, "low"} else DEFAULT_REVIEW_ROUNDS)
+
+
+def _pr_files_and_tier(
+    adapter: GitHubAdapter, repository: str, number: int,
+) -> tuple[list[dict[str, Any]] | None, ReviewTier | None]:
+    """Use one PR file snapshot for the budget and reviewer qualifications."""
+    try:
+        rows = adapter.pr_file_rows(repository, number)
+    except SweepError:
+        # The budget uses its smallest default and reviewer qualification stays conservative.
+        return None, None
+    return rows, classify_pr_files(rows)
 
 
 def _trusted_markers(comments: Sequence[Mapping[str, Any]], login: str) -> list[tuple[int, dict[str, Any]]]:
@@ -2691,7 +2704,7 @@ def budget_admission(
     number: int,
     branch: str,
     sha: str,
-    facts: BranchReviewFacts,
+    budget: int,
     comments: Sequence[Mapping[str, Any]],
     login: str,
     task_root: Path,
@@ -2724,7 +2737,7 @@ def budget_admission(
         comments,
         sha,
         login,
-        budget=repository_review_rounds(repository),
+        budget=budget,
         pr=number,
         prove_merge_only=_clean_merge_descent_prover(review_root, sha, fetch=fetch),
         approval_context=cache(partial(head_approval_context, review_root, repository=repository, fetch=fetch)),
@@ -3347,15 +3360,8 @@ def record(
             raise RecordError("unknown history conflicts with completed review task")
     if not facts.existing_families:
         raise RecordError("PR has no attributed author commits")
-    file_rows: list[dict[str, Any]] | None
-    try:
-        file_rows = GitHubAdapter(review_root).pr_file_rows(repository, number)
-    except SweepError:
-        # Unavailable files never grant the Low-tier exception and never waive the second review.
-        file_rows = None
-    low_tier = file_rows is not None and not ukrainian and review_mode == "cross_family" and (
-        classify_pr_files(file_rows) == "low"
-    )
+    file_rows, tier = _pr_files_and_tier(GitHubAdapter(review_root), repository, number)
+    low_tier = tier == "low" and not ukrainian and review_mode == "cross_family"
     learner_content = file_rows is None or _learner_content(pr_file_paths(file_rows))
     mixed_pair = (
         review_mode == "cross_family" and not ukrainian and not low_tier and facts.mixed_family
@@ -3485,7 +3491,7 @@ def record(
             number=number,
             branch=branch,
             sha=sha,
-            facts=facts,
+            budget=repository_review_rounds(repository, tier=tier),
             comments=comments,
             login=login,
             task_root=task_root,
@@ -3688,9 +3694,11 @@ def budget_check(
     if head is not None and head != sha:
         raise RecordError(f"PR #{number} head is {sha[:12]}, not the review head {head[:12]}")
     review_root = _review_repository_root(repository, root)
-    # Read-only: the default-branch ref is read as it is, never fetched; a stale or missing one refuses.
-    facts = pr_review_facts(repository, number, head_sha=sha, task_root=task_root, repo_root=review_root, fetch=False)
-    adapter = GitHubAdapter(Path.cwd())
+    adapter = GitHubAdapter(review_root)
+    _, tier = _pr_files_and_tier(adapter, repository, number)
+    # Verify the head again after reading the PR files. A stale or missing default ref refuses.
+    pr_review_facts(repository, number, head_sha=sha, task_root=task_root, repo_root=review_root, fetch=False)
+    budget = repository_review_rounds(repository, tier=tier)
     login = adapter.identity()
     try:
         comments = adapter.comments(repository, number)
@@ -3713,7 +3721,7 @@ def budget_check(
         number=number,
         branch=branch,
         sha=sha,
-        facts=facts,
+        budget=budget,
         comments=comments,
         login=login,
         task_root=task_root,
@@ -3734,7 +3742,7 @@ def budget_check(
         "admitted": True,
         "reviewed_heads": len(heads | set(unrecorded)),
         "unrecorded_rounds": [{"head": head, "tasks": tasks} for head, tasks in sorted(unrecorded.items())],
-        "budget": repository_review_rounds(repository),
+        "budget": budget,
         "head_already_reviewed": already,
         **receipt,
     }
@@ -3776,11 +3784,9 @@ def dispatch_budget_check(
     (``review_lineage.dispatched_rounds``). A dispatch that names only one of PR and branch has
     the other read from GitHub first, so runs recorded under either count; with no review run of
     the repository on record, no round has been spent and nothing more is read. A head that
-    already has a run opens no round, and while the other dispatched heads stay under the
-    repository's budget (:func:`repository_review_rounds`) the round is admitted. From there the
-    recorder's own decision at the PR's current head applies (:func:`budget_check`), so the PR's
-    budget, a clean base merge or the lineage's repair round may still admit it.
-    A branch with no open PR gets the repository's budget.
+    already has a run opens no round. When the dispatched heads reach the smallest applicable
+    cap, defer to :func:`budget_check` for the PR's actual tier and round exemptions.
+    A branch with no open PR uses the repository's standard budget.
     """
     from lu_machinery.review.review_lineage import (
         capability_candidates_only,
@@ -3800,7 +3806,7 @@ def dispatch_budget_check(
         elif number is not None and branch is None:
             branch = _pr(repository, "", number)["headRefName"]
         runs = lineage_runs(task_root, repository=repository, number=number, branch=branch, records=records)
-    budget = repository_review_rounds(repository)
+    budget = repository_review_rounds(repository, tier=None if number is not None else "medium")
     heads = dispatched_rounds(runs=runs, comments=(), login="")
     if len(heads) < budget:
         return None
