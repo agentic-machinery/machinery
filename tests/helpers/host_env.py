@@ -18,9 +18,11 @@ The allowlist has two parts.
   and the ``CLAUDE_CONFIG_DIR``/``CODEX_HOME`` defaults then resolve inside that home), ``PATH``, no system Git
   configuration, no bytecode files and the test interpreter (``LEARN_UKRAINIAN_PYTHON``).
 
-``PATH`` holds the directories the suite created under this session's base temporary directory (its ``gh``,
-Cursor and ``claude doctor`` stubs, in the order the suite put them on ``PATH``), then this interpreter's
-directory, then the platform default ``os.defpath``. No caller entry, agent shim included, remains.
+``PATH`` holds the suite's stub directories, taken from the fixtures that create them (the ``claude doctor``
+stub of ``tests/dispatcher/conftest.py``, and the failing ``gh`` and the fake Cursor of ``tests/conftest.py``
+and ``tests/cursor_process_guard.py``), then this interpreter's directory, then the platform default
+``os.defpath``. No caller entry, agent shim included, remains. The ``claude_doctor`` dependency ties the fixture
+to modules under ``tests/dispatcher``; any other module that imports it fails at setup with a missing fixture.
 
 The suite's cursor tripwire (``tests/cursor_exec_tripwire.py``) adds its ``PYTHONPATH`` entry and session token to
 each child's environment when the child is spawned, so neither is kept here. ``monkeypatch`` restores the
@@ -71,25 +73,22 @@ SUITE_SETTINGS = frozenset({
 })
 
 
-def suite_stub_directories(search_path: str, base: Path) -> list[str]:
-    """The absolute ``search_path`` entries that resolve inside ``base``, in order: the suite's stub directories."""
-    return [
-        entry
-        for entry in search_path.split(os.pathsep)
-        if os.path.isabs(entry) and Path(os.path.realpath(entry)).is_relative_to(base)
-    ]
-
-
 @pytest.fixture(autouse=True)
-def host_isolated_env(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+def host_isolated_env(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_doctor: Path,
+    _fake_github_bin: Path,
+    fake_cursor_bin: Path,
+) -> None:
     """Empty the environment but for the suite's settings and this fixture's own values."""
-    stubs = suite_stub_directories(os.environ.get("PATH", ""), Path(os.path.realpath(tmp_path_factory.getbasetemp())))
+    stubs = [claude_doctor.parent, _fake_github_bin, fake_cursor_bin]
     for name in [name for name in os.environ if name not in SUITE_SETTINGS]:
         monkeypatch.delenv(name)
     own = {
         "HOME": str(tmp_path_factory.mktemp("home")),
         "TMPDIR": str(tmp_path_factory.mktemp("tmpdir")),
-        "PATH": os.pathsep.join([*stubs, str(Path(sys.executable).parent), os.defpath]),
+        "PATH": os.pathsep.join([*map(str, stubs), str(Path(sys.executable).parent), os.defpath]),
         "GIT_CONFIG_NOSYSTEM": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "LEARN_UKRAINIAN_PYTHON": sys.executable,
