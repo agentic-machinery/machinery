@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install bubblewrap and grant user namespaces on disposable CI VMs only.
-# Optional package arguments keep shard dependencies in the same apt transaction.
+# Optional package arguments share the apt transaction with the pinned bubblewrap build.
 # Use image package lists first; switch to fallback mirrors only if that fails.
 set -euo pipefail
 
@@ -61,33 +61,93 @@ dpkg_with_lock_wait() {
   ' _ "$cap" "$@"
 }
 
-sudo rm -f /etc/apt/sources.list.d/*chrome* /etc/apt/sources.list.d/*google* \
-  /var/lib/apt/lists/*chrome* /var/lib/apt/lists/*google*
+apt_install() {
+  local cap="$1" lock_wait="$2" rc=0
+  shift 2
+  # The runner owns the log under RUNNER_TEMP.
+  # shellcheck disable=SC2024
+  sudo timeout --kill-after=5 "$cap" env LC_ALL=C apt-get "${apt_opts[@]}" \
+    -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-install-recommends -- "$@" \
+    >"$install_log" 2>&1 || rc=$?
+  cat "$install_log" || return "$?"
+  if [ "$rc" -ne 0 ]; then
+    echo "apt-get install failed (exit ${rc})" >&2
+  fi
+  return "$rc"
+}
+
+apt_reports_interrupted_dpkg() {
+  grep -Fq 'E: dpkg was interrupted' "$install_log"
+}
+
 missing=()
-for pkg in bubblewrap "$@" apparmor; do
+for pkg in "$@" apparmor; do
   dpkg -s "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 done
+
+# The write boundary uses --overlay-src (bubblewrap 0.10 and later), which the
+# Ubuntu 24.04 package lacks. Add the verified local build to the apt transaction
+# instead of installing the older package first.
+has_overlay_src() {
+  local help
+  help="$(bwrap --help 2>&1 || true)"
+  case "$help" in *--overlay-src*) return 0 ;; *) return 1 ;; esac
+}
+if ! has_overlay_src; then
+  deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+  digest=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
+  fetched=
+  for mirror in https://mirrors.edge.kernel.org/ubuntu https://archive.ubuntu.com/ubuntu \
+    https://snapshot.ubuntu.com/ubuntu/20261113T000000Z; do
+    if curl -fsSL --connect-timeout 4 --max-time 12 -o "${RUNNER_TEMP}/${deb}" \
+      "${mirror}/pool/main/b/bubblewrap/${deb}"; then
+      fetched=1
+      break
+    fi
+  done
+  if [ -z "$fetched" ]; then
+    echo "::error::${deb} could not be fetched from any mirror"
+    exit 1
+  fi
+  echo "${digest}  ${RUNNER_TEMP}/${deb}" | sha256sum -c -
+  missing+=("${RUNNER_TEMP}/${deb}")
+fi
+
 if [ "${#missing[@]}" -gt 0 ]; then
+  sudo rm -f /etc/apt/sources.list.d/*chrome* /etc/apt/sources.list.d/*google* \
+    /var/lib/apt/lists/*chrome* /var/lib/apt/lists/*google*
   echo "Installing missing native packages: ${missing[*]}"
-  # Lock waits sit inside the process caps. apt reports the lock itself;
-  # a longer wait would be cut off by timeout(1) and look like a mirror failure.
-  apt_opts=(-o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o DPkg::Lock::Timeout=30)
-  # Hard process-level budgets include the 5 s kill grace. The two paths do not stack.
-  #   mirror failure: 40 s + 15 s + 65 s + 55 s = 175 s
-  #   dpkg lock:      40 s + 135 s = 175 s (one retry in place of the mirror fallback)
-  # Either path leaves 65 s of test_env.sh's 240 s wait; the pinned package
-  # fetch/install below uses at most 56 s of that remaining budget.
+  apt_opts=(-o Acquire::Retries=1 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10)
+  # Keep 60 s for refreshing lists and 50 s for installing on fallback
+  # mirrors. With 5 s kill grace per command, that path takes at most
+  # 60 + 15 + 65 + 55 = 195 s. The pinned download adds at most 36 s.
+  apt_deadline=$((SECONDS + 195))
   install_log="${RUNNER_TEMP}/bwrap-apt-install.log"
-  set +e
-  sudo timeout --kill-after=5 35 apt-get "${apt_opts[@]}" install -y --no-install-recommends "${missing[@]}" 2>&1 | tee "$install_log"
-  install_rc=${PIPESTATUS[0]}
-  set -e
+  install_rc=0
+  apt_install 55 40 "${missing[@]}" || install_rc=$?
+  if [ "$install_rc" -ne 0 ] && ! apt_reports_interrupted_dpkg &&
+    apt_failure_is_dpkg_lock "$install_rc" "$install_log"; then
+    echo 'Retrying apt install after dpkg lock contention'
+    install_rc=0
+    apt_install 115 100 "${missing[@]}" || install_rc=$?
+    # Apt checks the journal only after it acquires the lock. A lock retry
+    # can therefore be the first attempt to report an interrupted journal.
+    if [ "$install_rc" -ne 0 ] && ! apt_reports_interrupted_dpkg; then
+      exit "$install_rc"
+    fi
+  fi
   if [ "$install_rc" -ne 0 ]; then
-    if apt_failure_is_dpkg_lock "$install_rc" "$install_log"; then
-      echo 'apt install failed because the dpkg lock was held; not switching mirrors'
-      # 130 s + 5 s kill grace = 135 s, the mirror path's 15 s + 65 s + 55 s.
-      # Lock::Timeout=110 leaves the rest of the cap for the install once the lock clears.
-      sudo timeout --kill-after=5 130 apt-get "${apt_opts[@]}" -o DPkg::Lock::Timeout=110 install -y --no-install-recommends "${missing[@]}"
+    if apt_reports_interrupted_dpkg; then
+      # Reserve 15 s for configure and 5 s kill grace per remaining command.
+      retry_cap=$((apt_deadline - SECONDS - 25))
+      if [ "$retry_cap" -lt 3 ]; then
+        echo 'apt install ran out of time for interrupted dpkg recovery' >&2
+        exit "$install_rc"
+      fi
+      [ "$retry_cap" -le 70 ] || retry_cap=70
+      echo 'Repairing the interrupted dpkg transaction before retrying apt install'
+      dpkg_with_lock_wait 15 --configure -a
+      apt_install "$retry_cap" "$((retry_cap / 2))" "${missing[@]}"
     else
       # During the 2026-11-11 Canonical *.ubuntu.com DNS outage (status.canonical.com),
       # azure.archive.ubuntu.com, archive.ubuntu.com and security.ubuntu.com all failed to
@@ -112,44 +172,14 @@ if [ "${#missing[@]}" -gt 0 ]; then
           /etc/apt/sources.list
       fi
       sudo timeout --kill-after=5 60 apt-get "${apt_opts[@]}" update -qq
-      sudo timeout --kill-after=5 50 apt-get "${apt_opts[@]}" install -y --no-install-recommends "${missing[@]}"
+      apt_install 50 30 "${missing[@]}"
     fi
   fi
 fi
 
-# The write boundary's private Git and HOME layers use bubblewrap's --overlay-src (0.10 and later);
-# Ubuntu 24.04 ships 0.9.0. Install Ubuntu's own 0.11.1 build, pinned by digest (its dependencies,
-# libc6 >= 2.38, libcap2 and libselinux1, are on the image), before the userns grant below applies to
-# /usr/bin/bwrap. The 51 KB fetch tries kernel.org first (outside *.ubuntu.com, see the outage note
-# above); the snapshot URL keeps the pinned file reachable after the archive pool drops it. Worst case
-# 3 x 12 s + 20 s = 56 s on top of the 175 s above stays inside test_env.sh's 240 s wait budget.
-has_overlay_src() {
-  local help
-  help="$(bwrap --help 2>&1 || true)"
-  case "$help" in *--overlay-src*) return 0 ;; *) return 1 ;; esac
-}
 if ! has_overlay_src; then
-  deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
-  digest=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
-  fetched=
-  for mirror in https://mirrors.edge.kernel.org/ubuntu https://archive.ubuntu.com/ubuntu \
-    https://snapshot.ubuntu.com/ubuntu/20261113T000000Z; do
-    if curl -fsSL --connect-timeout 4 --max-time 12 -o "${RUNNER_TEMP}/${deb}" \
-      "${mirror}/pool/main/b/bubblewrap/${deb}"; then
-      fetched=1
-      break
-    fi
-  done
-  if [ -z "$fetched" ]; then
-    echo "::error::${deb} could not be fetched from any mirror"
-    exit 1
-  fi
-  echo "${digest}  ${RUNNER_TEMP}/${deb}" | sha256sum -c -
-  dpkg_with_lock_wait 15 -i "${RUNNER_TEMP}/${deb}"
-  if ! has_overlay_src; then
-    echo "::error::bubblewrap still lacks --overlay-src after installing ${deb}"
-    exit 1
-  fi
+  echo "::error::bubblewrap still lacks --overlay-src after native package setup"
+  exit 1
 fi
 
 # Ubuntu-hosted runners require an application-specific userns grant. This
