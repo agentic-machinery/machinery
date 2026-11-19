@@ -39,7 +39,7 @@ from .state_helpers import SWR_DORMANT_READ_WAIT_S, PeriodicSnapshot, swr_route
 def active_snapshot(ctx: MonitorContext) -> PeriodicSnapshot[dict[str, Any]]:
     snapshot: PeriodicSnapshot[dict[str, Any]] = ctx.runtime.get_or_create_derived(
         "delegate-active-snapshot",
-        lambda: PeriodicSnapshot(lambda: active_delegate_tasks(ctx=ctx), DELEGATE_LIST_TTL_S),
+        lambda: PeriodicSnapshot(lambda: _active_snapshot_tasks(ctx), DELEGATE_LIST_TTL_S),
     )
     return snapshot
 
@@ -565,6 +565,82 @@ def _task_generation_token(newest_mtime_ns: int, files: list[tuple[str, os.stat_
     return f"{len(files)}:{newest_mtime_ns}:{digest}"
 
 
+def _task_summary(path: Path, task: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "task_id": str(task.get("task_id") or path.stem),
+        "agent": task.get("agent"),
+        "model": task.get("model"),
+        **recorded_model_accounting_fields(task),
+        "effort": task.get("effort"),
+        "cli_version": task.get("cli_version"),
+        "substitution": task.get("substitution"),
+        "status": str(task.get("status") or ""),
+        "started_at": task.get("started_at"),
+        "duration_s": task.get("duration_s"),
+        "run_nonce": task.get("run_nonce"),
+        **_task_observations(task),
+    }
+    linked_issues = _linked_issues_from_dor(task)
+    if linked_issues is not None:
+        summary["linked_issues"] = linked_issues
+    return summary
+
+
+def _task_summary_row(
+    summary: dict[str, Any], status: str, alive: bool, mtime: float,
+) -> dict[str, Any]:
+    return {
+        **summary,
+        **recorded_model_accounting_fields(summary),
+        **_task_observations(summary),
+        "status": status,
+        "age_s": _task_age_seconds(summary.get("started_at")),
+        "updated_at": datetime.fromtimestamp(mtime, UTC).isoformat().replace("+00:00", "Z"),
+        "alive": alive,
+    }
+
+
+def _sort_public_task_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows.sort(
+        key=lambda item: _parse_iso_datetime(item.get("started_at"))
+        or datetime.min.replace(tzinfo=UTC),
+        reverse=True,
+    )
+    return [_public_task_metadata(row) for row in rows]
+
+
+def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
+    """Read hot records without waiting for the history scan or writing its cache."""
+    tasks_dir = _tasks_dir(ctx)
+    rows = []
+    for path in iter_task_records(tasks_dir, include_archive=False):
+        try:
+            file_stat = path.stat()
+            entry = _TASK_STATE_CACHE.get(str(path))
+            if entry is not None and entry[0] == _task_file_fingerprint(path.name, file_stat):
+                # Cache entries are replaced as a unit. Recheck live PIDs even
+                # when the record is unchanged.
+                _, summary, status, alive, _, pid = entry
+                if summary is None or status not in ACTIVE_TASK_STATUSES:
+                    continue
+                if status == "running" and pid:
+                    alive = _pid_alive(pid)
+                    if not alive:
+                        continue
+            else:
+                task = _read_task_state(str(path), tasks_dir=tasks_dir)
+                if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
+                    continue
+                status, alive = _derived_task_status(task)
+                if status not in ACTIVE_TASK_STATUSES:
+                    continue
+                summary = _task_summary(path, task)
+        except (OSError, ValueError):
+            continue
+        rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
+    return {"total": len(rows), "tasks": _sort_public_task_rows(rows)}
+
+
 def _delegate_task_rows_locked(
     statuses: set[str] | None = None,
     *,
@@ -680,27 +756,9 @@ def _delegate_task_rows_locked(
             claimed_repo = _authoritative_task_repository(task)
             pid = task.get("pid")
             pid_int = _task_pid(pid)
-            task_id = str(task.get("task_id") or path.stem)
-            raw_status = str(task.get("status") or "")
-            subst = task.get("substitution")
-            run_nonce = task.get("run_nonce")
-            linked_issues = _linked_issues_from_dor(task)
-            summary = {
-                "task_id": task_id,
-                "agent": task.get("agent"),
-                "model": task.get("model"),
-                **recorded_model_accounting_fields(task),
-                "effort": task.get("effort"),
-                "cli_version": task.get("cli_version"),
-                "substitution": subst,
-                "status": raw_status,
-                "started_at": task.get("started_at"),
-                "duration_s": task.get("duration_s"),
-                "run_nonce": run_nonce,
-                **_task_observations(task),
-            }
-            if linked_issues is not None:
-                summary["linked_issues"] = linked_issues
+            summary = _task_summary(path, task)
+            subst = summary["substitution"]
+            linked_issues = summary.get("linked_issues")
             cached_tuple = (
                 fingerprint,
                 summary,
@@ -719,8 +777,8 @@ def _delegate_task_rows_locked(
                 (
                     path_str,
                     file_stat.st_mtime,
-                    task_id,
-                    raw_status,
+                    summary["task_id"],
+                    summary["status"],
                     derived_status,
                     pid_int,
                     1 if alive else 0,
@@ -732,7 +790,7 @@ def _delegate_task_rows_locked(
                     summary["cli_version"],
                     subst_str,
                     claimed_repo,
-                    run_nonce,
+                    summary["run_nonce"],
                     json.dumps(linked_issues) if linked_issues is not None else None,
                     json.dumps(recorded_model_accounting_fields(summary)),
                     json.dumps(fingerprint),
@@ -749,27 +807,7 @@ def _delegate_task_rows_locked(
         ):
             continue
 
-        task_id = summary["task_id"]
-        row = {
-            "task_id": task_id,
-            "agent": summary.get("agent"),
-            "model": summary.get("model"),
-            **recorded_model_accounting_fields(summary),
-            "effort": summary.get("effort"),
-            "cli_version": summary.get("cli_version"),
-            "substitution": summary.get("substitution"),
-            "status": derived_status,
-            "started_at": summary.get("started_at"),
-            "duration_s": summary.get("duration_s"),
-            "age_s": _task_age_seconds(summary.get("started_at")),
-            "updated_at": datetime.fromtimestamp(file_stat.st_mtime, UTC).isoformat().replace("+00:00", "Z"),
-            "alive": alive,
-            "run_nonce": summary.get("run_nonce"),
-            **_task_observations(summary),
-        }
-        if "linked_issues" in summary:
-            row["linked_issues"] = summary["linked_issues"]
-        rows.append(row)
+        rows.append(_task_summary_row(summary, derived_status, alive, file_stat.st_mtime))
 
     if task_generation is not None and generation_observed:
         task_generation.append(_task_generation_token(newest_mtime_ns, task_files))
@@ -797,12 +835,7 @@ def _delegate_task_rows_locked(
             }
         )
 
-    rows.sort(
-        key=lambda item: _parse_iso_datetime(item.get("started_at"))
-        or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
-    return [_public_task_metadata(row) for row in rows]
+    return _sort_public_task_rows(rows)
 
 
 def list_delegate_tasks(

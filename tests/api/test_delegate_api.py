@@ -181,6 +181,53 @@ def test_active_lists_only_live_running_tasks(tmp_path, monkeypatch):
     assert data["tasks"][0]["task_id"] == "running"
 
 
+def test_active_refresh_completes_while_large_history_is_writing(tmp_path, monkeypatch):
+    """Defect class: a history-wide cache write blocks fresh active membership."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    tasks = tmp_path / "tasks"
+    ctx = _pin_tasks_dir(monkeypatch, tasks)
+    archive = tasks / delegate_router.TASK_ARCHIVE_DIR_NAME
+    archive.mkdir()
+    for index in range(17_490):
+        task_id = f"settled-{index}"
+        root = tasks if index < 5_886 else archive
+        (root / f"{task_id}.json").write_text(json.dumps({"task_id": task_id, "status": "done"}))
+    for index in range(13):
+        task_id = f"active-{index}"
+        _write_task(tasks / f"{task_id}.json", _task_payload(task_id, status="spawning", pid=None))
+
+    saving = Event()
+    release = Event()
+    save = delegate_router._save_task_cache_entries
+
+    def hold_history_write(*args, **kwargs):
+        saving.set()
+        assert release.wait(10), "history writer was never released"
+        return save(*args, **kwargs)
+
+    monkeypatch.setattr(delegate_router, "_save_task_cache_entries", hold_history_write)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        history = workers.submit(delegate_router.recent_finished_tasks, ctx=ctx)
+        try:
+            assert saving.wait(10), "history scan did not reach its cache write"
+            _write_task(tasks / "active-0.json", _task_payload("active-0", status="done"))
+            _write_task(tasks / "new-task.json", _task_payload("new-task", status="spawning", pid=None))
+            active = workers.submit(delegate_router.active_snapshot(ctx).refresh)
+            active.result(timeout=5)
+            response = client.get("/api/delegate/active")
+            assert response.status_code == 200
+            result = response.json()
+            assert result["total"] == 13
+            assert {row["task_id"] for row in result["tasks"]} == {
+                "new-task", *(f"active-{index}" for index in range(1, 13)),
+            }
+        finally:
+            release.set()
+        assert history.result(timeout=5)["total"] == 17_490
+
+
 def test_task_state_path_stays_under_tasks_dir(tmp_path, monkeypatch):
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
@@ -730,13 +777,14 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
     _write_task(tasks / "live.json", _task_payload("live", status="spawning", pid=None))
     snapshot = delegate_router.active_snapshot(ctx)
     snapshot.interval = 0.01
+    collect_active = snapshot.compute
     entered = threading.Event()
     release = threading.Event()
     calls = []
     def collect():
         calls.append(True)
         if len(calls) == 1:
-            return delegate_router.active_delegate_tasks(ctx=ctx)
+            return collect_active()
         entered.set()
         assert release.wait(5), "refresh was never released"
         return {"total": 0, "tasks": []}
@@ -748,7 +796,7 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         assert expected_http["total"] == 1
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
-        monkeypatch.setattr(delegate_router, "active_delegate_tasks", forbidden)
+        monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)
         monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1e12)
         # Reads join the held wake-up refresh only briefly, then answer from the snapshot.
         monkeypatch.setattr(state_helpers, "DORMANT_READ_WAIT_S", 0.05)
