@@ -334,8 +334,9 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
         sandbox, monkeypatch, deploy_agents):
     """Defect classes: a write worker of an enrolled checkout launched without the product's guards, because
     Claude Code loads project settings only from the worktree it runs in and the checkout tracks none of them,
-    or because the sparse checkout hid a source the descriptor declares; and a read-only (review) worktree
-    widened by settings the dispatch did not ask for."""
+    or because the sparse checkout hid a source the descriptor declares; a worker's edit to a source, even one
+    Git status cannot see, reaching the guards; a deployed output the checkout tracks, which could enter the
+    worker's commit; and a read-only (review) worktree widened by settings the dispatch did not ask for."""
     import sys
 
     from lu_machinery.dispatcher import git
@@ -346,30 +347,32 @@ def test_an_enrolled_write_worktree_gets_its_product_guards_and_no_other_worktre
     tree = primary / ".worktrees/dispatch/codex/enrolled"
     git.create_worktree(primary, tree, "codex/enrolled", sha, deploy_agents=deploy_agents)
     deployed = tree / ".claude/settings.json"
+    assert not (tree / "wiki").exists()  # the source stays hidden: the deployment reads the commit, not the tree
     if not deploy_agents:
         assert not (tree / ".claude").exists() and not (tree / ".deploy-state").exists()
-        assert not (tree / "wiki").exists()
-        # A write task attached later (--cwd) to this tree refuses: the sparse tree hides a declared source.
-        with pytest.raises(ValueError, match="^agent_deploy_failed: exit 2: .*missing required source: wiki/"):
-            git.deploy_agent_extensions(tree)
-        return
+        # A write task attached later (--cwd) to this sparse tree gets the same deployment.
+        assert git.deploy_agent_extensions(tree) is True
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == ""
-    # A write task attached later (--cwd) applies again; the worker's own change is not a deployment output.
+    # An attachment applies again; the worker's own change is not a deployment output.
     (tree / ".gitignore").write_text((tree / ".gitignore").read_text() + "# worker edit\n")
     deployed.unlink()
     assert git.deploy_agent_extensions(tree) is True
     assert json.loads(deployed.read_text())["hooks"]["PreToolUse"] == settings["hooks"]["PreToolUse"]
     assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
-    # Guards come from committed sources: an uncommitted edit to one refuses the attachment before anything is
-    # written, so the earlier deployment keeps its bytes.
+    # Guards come from the commit: a worker's edit to a source never reaches them, even one status hides.
     before = {name: (tree / name).read_bytes() for name in (".claude/settings.json", ".claude/README.md",
                                                              ".deploy-state/agent-deploy.v1.json")}
+    run_git(tree, "update-index", "--assume-unchanged", "agents_extensions/shared/README.md")
     (tree / "agents_extensions/shared/README.md").write_text("worker edit\n")
-    with pytest.raises(ValueError, match="^agent_deploy_failed: deployment inputs differ from HEAD: "
-                                         "agents_extensions/shared/README.md"):
-        git.deploy_agent_extensions(tree)
+    assert run_git(tree, "status", "--porcelain", "--untracked-files=all") == "M .gitignore"
+    assert git.deploy_agent_extensions(tree) is True
     assert {name: (tree / name).read_bytes() for name in before} == before
+    # A tracked output refuses, however clean it is.
+    run_git(tree, "add", "--force", ".claude/README.md")
+    with pytest.raises(ValueError, match="^agent_deploy_outputs_not_ignored: the checkout does not ignore "
+                                         r"\.claude/README\.md$"):
+        git.deploy_agent_extensions(tree)
 
 
 @pytest.mark.parametrize("broken, global_excludes, reason", [
@@ -387,8 +390,9 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
     """Defect class: a write worker launched unguarded, or with generated outputs it could commit, after its
     checkout's agent deployment failed: a broken or dangling descriptor skipped, or outputs only the
     dispatcher's own user-level excludes file hides, which the worker does not share, or a validation the
-    commit selects but the sparse checkout hid from the apply. A read-only task of the
-    same checkout is never deployed, so the same breakage cannot refuse it."""
+    commit selects but the sparse checkout hid from the apply; a refused creation that leaves its tree, branch
+    or task record behind; or an attached (--cwd) write task launched undeployed. A read-only task of the same
+    checkout is never deployed, so the same breakage cannot refuse it."""
     sandbox.env["LEARN_UKRAINIAN_PYTHON"] = sandbox.python
     if global_excludes:
         (tmp_path / "excludes").write_text("/.claude/\n")
@@ -404,10 +408,21 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
                           "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
                           "--task-id", "refused", expected=2)
     assert refused.stderr.splitlines()[-1].startswith("dispatcher: " + reason), refused.stderr
-    # An invalid commit plan refuses before the apply writes anything into the tree.
-    assert (primary / ".worktrees/dispatch/codex/refused/.claude").exists() == ("exit 2" not in reason)
-    # Never launched; as for any creation failure, the hold keeps the surviving tree attributed (#490).
-    hold = json.loads((sandbox.tasks / "refused.json").read_text())
-    assert (hold["status"], hold["pid"], hold["admission_hold"]["run_nonce"]) == ("spawning", None, hold["run_nonce"])
+    # Never launched, and nothing outlives the refusal: no tree, branch or task record, so the id stays free.
+    assert not (primary / ".worktrees/dispatch/codex/refused").exists()
+    assert run_git(primary, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "main"
+    assert not (sandbox.tasks / "refused.json").exists()
     record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--base", "origin/main", "--task-id", "read"))
     assert (record["status"], record["mode"]) == ("done", "read-only")
+    # A task attached (--cwd) to a tree created without the deployment: read-only runs as it is; a write task
+    # refuses with the same reason before its record is published.
+    tree = primary / ".worktrees/dispatch/codex/attached"
+    run_git(primary, "worktree", "add", "-b", "attached", str(tree), "main")
+    record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--cwd", str(tree), "--base", "origin/main",
+                                             "--task-id", "read-attached"))
+    assert (record["status"], record["mode"], (tree / ".claude").exists()) == ("done", "read-only", False)
+    attached = sandbox.cli("dispatch", "--agent", "sol", "--model", "echo", "--prompt", "never launched",
+                           "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
+                           "--cwd", str(tree), "--task-id", "attached", expected=2)
+    assert attached.stderr.splitlines()[-1].startswith("dispatcher: " + reason), attached.stderr
+    assert not (sandbox.tasks / "attached.json").exists()

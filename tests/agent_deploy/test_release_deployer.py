@@ -953,7 +953,7 @@ def test_print_manifest_is_the_recomposed_plan_not_the_checkout_copy(deployed):
 
 
 def test_inputs_commit_plans_from_the_commit_not_the_checkout(deployed):
-    """The plan printed with --inputs-commit must come from the commit, never from checkout inputs."""
+    """The plan printed or applied with --inputs-commit must come from the commit, never from checkout inputs."""
     head = subprocess.run(["git", "-C", str(deployed), "rev-parse", "HEAD"], capture_output=True, text=True,
                           check=True, env=git_environment()).stdout.strip()
     committed = deploy_cli(deployed, "--check", "--print-manifest", "--inputs-commit", head)
@@ -962,6 +962,12 @@ def test_inputs_commit_plans_from_the_commit_not_the_checkout(deployed):
     descriptor_path.write_bytes(descriptor_path.read_bytes().replace(b'"required": true', b'"required": false'))
     (deployed / "agents_extensions/claude/hooks/product.py").write_bytes(GATE_PRODUCT_HOOK + b"print('edit')\n")
     write(deployed, "agents_extensions/claude/hooks/added.py", GATE_PRODUCT_HOOK, 0o755)
+    assert deploy_cli(deployed, "--check", "--print-manifest", "--inputs-commit", head) == committed
+    # An apply from the commit restores what an apply of the edited checkout wrote.
+    deploy_cli(deployed)
+    assert (deployed / plan.STATE).read_bytes() != committed.encode()
+    deploy_cli(deployed, "--inputs-commit", head)
+    assert (deployed / plan.STATE).read_bytes() == committed.encode()
     assert deploy_cli(deployed, "--check", "--print-manifest", "--inputs-commit", head) == committed
     tree = subprocess.run(["git", "-C", str(deployed), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True,
                           check=True, env=git_environment()).stdout.strip()

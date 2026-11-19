@@ -481,8 +481,8 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
     """Create a task worktree; ``registration`` (see register_worktree) also keeps its registry entry true.
 
     ``deploy_agents`` (write tasks) applies the checkout's agent deployment (``deploy_agent_extensions``) under
-    the same locks, so an attachment waits for it; the sources its descriptor declares stay in the sparse tree.
-    A deployment that cannot be applied raises, so the task never launches.
+    the same locks, so an attachment waits for it. A deployment that refuses removes the new tree and its
+    branch again before it raises, so the task never launches and leaves nothing behind.
 
     The entry is written before the tree exists and confirmed after, all under the worktree lock that
     settlement removes (and archives) under, so a later dispatch to the same path cannot interleave.
@@ -490,9 +490,7 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
     reserves it. Thus even a death immediately after ``mkdir`` leaves attribution. A failure removes the
     reservation only while it is still empty; attribution must survive until the tree is verifiably gone.
     """
-    sources = deployment_sources(repo, sha) if deploy_agents else None
-    excluded = [tree for tree in sparse_excludes(sparse_include) if not any(
-        source == tree or source.startswith(tree + "/") or tree.startswith(source + "/") for source in sources or ())]
+    excluded = sparse_excludes(sparse_include)
     # A published start is checked out as that exact object, not a shared replacement.
     no_replace = ("--no-replace-objects",) if exact else ()
 
@@ -522,6 +520,12 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             else:
                 run_git(path, "sparse-checkout", "set", "--no-cone", "--", "/*", *(f"!/{name}/" for name in excluded))
             run_git(path, "reset", "--hard", sha)
+            if deploy_agents:
+                try:
+                    deploy_agent_extensions(path)
+                except ValueError:
+                    _discard_refused_worktree(repo, path, branch, sha)
+                    raise
             from lu_machinery.orchestration.worktree_claims import new_helper_creator, publish_helper_creator
 
             receipt_path, receipt = new_helper_creator(
@@ -533,8 +537,6 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
             if registration:
                 confirm_worktree(registration["registry"], path)
                 _install_refresh_hooks(path, registration["registry"])
-            if sources is not None:
-                deploy_agent_extensions(path)
         except BaseException as exc:
             if reserved:
                 with suppress(OSError):
@@ -557,28 +559,15 @@ def create_worktree(repo: Path, path: Path, branch: str, sha: str, *, full_check
     site_deps.provision(repo, path)
 
 
-def deployment_sources(repo: Path, commit: str) -> list[str] | None:
-    """The source paths the agent deployment descriptor at ``commit`` declares, or None when it tracks none.
-
-    Enrollment is the committed entry, whatever the working tree holds. A present entry that is not a readable
-    descriptor yields no paths, and the deployer then refuses it with its own reason.
-    """
-    def read(*args: str) -> str:
-        return _git(repo, "--no-replace-objects", *args, isolate=True, strip=False)
-    if not read("ls-tree", "--name-only", commit, "--", AGENT_DEPLOY_DESCRIPTOR):
-        return None
-    try:
-        descriptor = json_depth.loads(read("cat-file", "blob", f"{commit}:{AGENT_DEPLOY_DESCRIPTOR}"), max_depth=16)
-        return [str(source["path"]).strip("/") for source in descriptor["sources"].values()]
-    except (subprocess.CalledProcessError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
-        return []
+def _git_failure(step: str, exc: BaseException) -> ValueError:
+    """``agent_deploy_failed`` for a Git step of the deployment that could not run or failed."""
+    detail = (f"exit {exc.returncode}" if isinstance(exc, subprocess.CalledProcessError)
+              else "timed out" if isinstance(exc, subprocess.TimeoutExpired) else type(exc).__name__)
+    return ValueError(f"agent_deploy_failed: git {step} failed ({detail})")
 
 
-def _agent_deploy(root: Path, *args: str, drift_ok: bool = False) -> None:
-    """Run the deployer on the checkout at ``root``; any failure is ``agent_deploy_failed`` with its last line.
-
-    ``drift_ok`` accepts a check's exit 1 (outputs differ from the plan), never its exit 2 (invalid input).
-    """
+def _agent_deploy(root: Path, *args: str) -> str:
+    """Run the deployer on the checkout at ``root`` and return its stdout; any failure is ``agent_deploy_failed``."""
     try:
         interpreter = project_interpreter(env=os.environ)
         # The interpreter is the configured project interpreter every worker hook runs (child_env), not task input.
@@ -591,9 +580,10 @@ def _agent_deploy(root: Path, *args: str, drift_ok: bool = False) -> None:
         raise ValueError(f"agent_deploy_failed: no result within {AGENT_DEPLOY_TIMEOUT} s") from None
     except (OSError, ValueError) as exc:
         raise ValueError(f"agent_deploy_failed: project interpreter unavailable ({type(exc).__name__})") from None
-    if result.returncode and not (drift_ok and result.returncode == 1):
+    if result.returncode:
         reason = (result.stderr.strip().splitlines() or ["no diagnostic"])[-1][:300]
         raise ValueError(f"agent_deploy_failed: exit {result.returncode}: {reason}")
+    return result.stdout
 
 
 def deploy_agent_extensions(path: Path) -> bool:
@@ -603,47 +593,55 @@ def deploy_agent_extensions(path: Path) -> bool:
     enrolled checkout tracks none of its generated outputs: without this a headless worker runs without the
     product's guards. This is the checkout's own apply contract (``agent_deploy --project-root``, as
     ``npm run agents:deploy`` or ``agents_extensions/deploy.sh`` run it), under the project interpreter the
-    worker's hooks use. The deployer's own check then recomposes the plan from the HEAD commit's objects
-    (``--check --inputs-commit``) and verifies the written outputs against it, so a sparse checkout that hides
-    an input from the apply (a source, or a product marker that selects a validation) refuses instead of
-    deploying less. Before anything is written, the same check refuses a commit whose plan is invalid (its
-    drift is what the apply then fixes), and an attached tree's deployment inputs must equal HEAD's. Applying
-    again is
-    idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it is (False). Each
-    refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed`` when the
-    deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its outputs is
-    not ignored by the repository's own rules (its ignore files and ``info/exclude``; no user-level excludes
-    file, which the worker may not share), so the worker could commit it.
+    worker's hooks use, composed from the HEAD commit's objects (``--inputs-commit``), never from the checkout:
+    no working-tree edit (even one Git status cannot see), file the sparse checkout hides or concurrent write
+    by a task that borrows the tree changes the plan. The deployer's own check then verifies
+    the written outputs against that same plan and prints its manifest, which names the outputs checked here.
+    Applying again is idempotent. A checkout whose HEAD tracks no descriptor is not enrolled and is left as it
+    is (False). Each refusal is a ``ValueError`` whose first word is its typed reason: ``agent_deploy_failed``
+    when the deployment cannot be applied or verified, ``agent_deploy_outputs_not_ignored`` when one of its
+    outputs is tracked or not ignored by the repository's own rules (its ignore files and ``info/exclude``; no
+    user-level excludes file, which the worker may not share), so the worker could commit it.
     """
-    sources = deployment_sources(path, "HEAD")
-    if sources is None:
-        return False
     root = path.resolve()  # the deployer takes only the canonical checkout root
-    # The apply composes from the working tree. Refuse before anything is written when an input there differs
-    # from HEAD (a change, or an untracked or ignored file the deployer would read; it skips bytecode caches),
-    # so a refused attachment leaves the tree's earlier deployment as it was.
-    pending = [line[3:] for line in _git(
-        root, "status", "--porcelain", "--ignored=matching", "--untracked-files=all", "--",
-        AGENT_DEPLOY_DESCRIPTOR, *sources, isolate=True, strip=False, env={"GIT_LITERAL_PATHSPECS": "1"},
-    ).splitlines() if "__pycache__" not in PurePosixPath(line[3:]).parts]
-    if pending:
-        raise ValueError(f"agent_deploy_failed: deployment inputs differ from HEAD: {', '.join(pending[:3])}")
-    verify = ("--check", "--inputs-commit", _git(root, "rev-parse", "--verify", "HEAD^{commit}", isolate=True))
-    _agent_deploy(root, *verify, drift_ok=True)  # an invalid commit plan refuses before anything is written
-    _agent_deploy(root)
-    _agent_deploy(root, *verify)
-    # Only the deployment's own outputs are checked: an attached worktree may hold the worker's own changes.
     try:
-        manifest = json_depth.loads((root / AGENT_DEPLOY_STATE).read_text(encoding="utf-8"), max_depth=16)
-        outputs = [AGENT_DEPLOY_STATE, *manifest["files"]]
-    except (OSError, ValueError, RecursionError, KeyError, TypeError):
-        raise ValueError("agent_deploy_failed: the ownership manifest cannot be read after apply") from None
-    changed = _git(root, "-c", "core.excludesFile=/dev/null", "status", "--porcelain", "--untracked-files=all",
-                   "--", *outputs, isolate=True, strip=False, env={"GIT_LITERAL_PATHSPECS": "1"}).splitlines()
-    if changed:
-        listed = ", ".join(line[3:] for line in changed[:3])
-        raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {listed}")
+        head = _git(root, "--no-replace-objects", "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
+        # Enrollment is the descriptor entry of that commit, whatever the working tree holds.
+        if not _git(root, "--no-replace-objects", "ls-tree", "--name-only", head, "--", AGENT_DEPLOY_DESCRIPTOR,
+                    isolate=True):
+            return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("enrollment read", exc) from None
+    _agent_deploy(root, "--inputs-commit", head)
+    verified = _agent_deploy(root, "--check", "--print-manifest", "--inputs-commit", head)
+    try:
+        outputs = [AGENT_DEPLOY_STATE, *(str(name) for name in json_depth.loads(verified, max_depth=16)["files"])]
+    except (ValueError, RecursionError, KeyError, TypeError):
+        raise ValueError("agent_deploy_failed: the verified manifest cannot be read") from None
+    # Only the deployment's own outputs are listed: an attached worktree may hold the worker's own changes.
+    try:
+        listed = _git(root, "-c", "core.excludesFile=/dev/null", "ls-files", "-z", "--cached", "--others",
+                      "--exclude-standard", "--", *outputs, isolate=True, strip=False,
+                      env={"GIT_LITERAL_PATHSPECS": "1"}).split("\0")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _git_failure("output listing", exc) from None
+    if names := [name for name in listed if name]:
+        raise ValueError(f"agent_deploy_outputs_not_ignored: the checkout does not ignore {', '.join(names[:3])}")
     return True
+
+
+def _discard_refused_worktree(repo: Path, path: Path, branch: str, sha: str) -> None:
+    """Remove a tree this creation checked out after its agent deployment refused, so the refusal leaves none.
+
+    No worker has run in it, and the creation still holds the lock every attachment and removal take. The
+    branch goes only while it still names the start commit. A removal that fails keeps the tree, attributed
+    like any other failed creation.
+    """
+    try:
+        _git(repo, "worktree", "remove", "--force", str(path), isolate=True)
+        _git(repo, "update-ref", "-d", f"refs/heads/{branch}", sha, isolate=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.getLogger(__name__).warning("refused worktree kept: %s", f"{type(exc).__name__}: {exc}"[:300])
 
 
 def registry_path(repo: Path, repository: dict) -> Path | None:
