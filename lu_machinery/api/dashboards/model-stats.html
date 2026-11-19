@@ -97,6 +97,8 @@
     <div id="matrix">Loading…</div></section>
   <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
     <div id="write">Loading…</div></section>
+  <section><h2>Never started</h2>
+    <div id="never-started">Loading…</div></section>
   <section><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
     <div id="review">Loading…</div>
     <div id="unparsed-samples"></div></section>
@@ -124,7 +126,7 @@ const ciText = (ci) => ci ? `${num(ci[0] * 100)}–${num(ci[1] * 100)}%` : "—"
 const PALETTE = ["#0969da", "#1a7f37", "#9a6700", "#cf222e", "#8250df", "#bf3989", "#1b7c83", "#bc4c00"];
 const colorOf = (name) => { let h = 0; for (const c of String(name)) h = (h * 33 + c.charCodeAt(0)) >>> 0; return PALETTE[h % PALETTE.length]; };
 const STATUS_COLOR = {done: "#1a7f37", no_deliverable: "#9a6700", failed: "#cf222e", timeout: "#bc4c00",
-  rate_limited: "#8250df", cancelled: "#646a73", crashed: "#bf3989", other: "#8c959f"};
+  rate_limited: "#8250df", cancelled: "#646a73", crashed: "#bf3989", never_started: "#1b7c83", other: "#8c959f"};
 const picked = () => $("model").value;
 
 function table(head, rows) {
@@ -168,6 +170,19 @@ function reviewRow(r, kind) {
     + `${cell(pct(r.approve_rate) + ` (n=${r.approve_rate.n})`)}`
     + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review) + ` (n=${r.p0_p2_per_review.n})`)}`
     + `${cell(mins(r.wall_seconds.median) + timedOf(r))}${cell(mins(r.wall_seconds.p90))}</tr>`;
+}
+function neverStarted(models) {
+  const causes = new Map();
+  for (const model of models.filter((m) => keepModel(m.model))) {
+    for (const [cause, count] of Object.entries(model.never_started_reasons || {})) {
+      const totals = causes.get(cause) || {write: 0, review: 0};
+      totals[model.role] += count;
+      causes.set(cause, totals);
+    }
+  }
+  const rows = [...causes].sort(([a], [b]) => a.localeCompare(b)).map(([cause, counts]) =>
+    `<tr><td>${esc(cause.replaceAll("_", " "))}</td>${cell(counts.write)}${cell(counts.review)}</tr>`);
+  return rows.length ? table(["Cause", "Write tasks", "Reviews"], rows) : "<p>No recorded pre-start refusals.</p>";
 }
 function unparsedSamples(reviews) {
   const items = [];
@@ -249,7 +264,7 @@ function jobs(data) {
 function failures(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
   if (!shown.length) return '<p class="muted">No write tasks in this window.</p>';
-  const keys = ["done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", "other"];
+  const keys = Object.keys(STATUS_COLOR);
   const W = 680, rowH = 22, L = 160, T = 8;
   const H = T + shown.length * rowH + 8;
   const max = Math.max(...shown.map((item) => item.tasks), 1);
@@ -432,6 +447,7 @@ function render() {
   $("write").innerHTML = table(["Model / effort", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
     "Wall h per landed", "Median min", "p90 min"], withClasses(data.models, "write", writeRow, 10));
   $("reviews-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
+  $("never-started").innerHTML = neverStarted(data.models);
   $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approved / changes / blocked", "Unparsed",
     "Missing result", "Too big", "Bad format", "Bad fields",
     "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 14));

@@ -43,7 +43,10 @@ def ledger(tmp_path):
 
 
 def test_hand_counted_model_agent_and_window_denominators(ledger):
-    """Hot/archive copies must not inflate counts or lose separate nonces/statuses."""
+    """Duplicate records and typed pre-start refusals must not inflate the run denominator."""
+    _write(ledger, {"task_id": "refused-at-admission", "agent": "codex", "model": "gpt-6.1-terra",
+                    "status": "failed", "started_at": "2026-10-28T10:00:00Z",
+                    "never_started_reason": "admission_capacity", "duration_s": 0})
     report = collect_agent_success(tasks_dir=ledger, until=NOW)
     assert report["complete"] is True
     assert report["tasks"] == 21

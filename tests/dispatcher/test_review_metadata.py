@@ -38,13 +38,23 @@ def dispatch(tmp_path, monkeypatch):
     ))
     monkeypatch.setattr(worker, "start", start)
 
-    def invoke(*flags, agent="sol", model=CURRENT_SOL, expected=0):
+    def invoke(*flags, agent="sol", model=CURRENT_SOL, expected=0, refusal=None):
+        before = {record["task_id"] for record in store.list_tasks()}
         assert cli.main(["dispatch", "--agent", agent, "--model", model, "--task-id", "review",
                          "--prompt", "Review this change", *flags]) == expected
         if expected:
             start.assert_not_called()
             git.create_worktree.assert_not_called()
-            assert not (tmp_path / "tasks").exists()
+            new = [record for record in store.list_tasks() if record["task_id"] not in before]
+            assert store.read("review", missing_ok=True) is None
+            if refusal is None or "--dry-run" in flags:
+                assert new == []
+            else:
+                [record] = new
+                assert (record["requested_task_id"], record["status"], record["never_started_reason"]) == (
+                    "review", "failed", refusal)
+                assert record["provider_pgid"] is None and record["usage"] is None
+                assert "admission_hold" not in record and "prompt_file" not in record
             return None
         return store.read("review")
 
@@ -95,7 +105,12 @@ def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, mo
     ("cursor", "grok-4.7-high", "--owned-path", "lu_machinery/dispatcher/providers/cursor.py"),
 ])
 def test_subject_self_review_effective_identity_or_unknown_refused_before_launch(dispatch, capsys, agent, model, flag, value):
-    dispatch(flag, value, agent=agent, model=model, expected=2)
+    refusal = "review_setup_refusal"
+    if agent == "cursor" and model in (CURRENT_SOL, "auto"):
+        refusal = "route_eligibility"
+    elif flag == "--owned-path":
+        refusal = None
+    dispatch(flag, value, agent=agent, model=model, expected=2, refusal=refusal)
     err = capsys.readouterr().err
     if agent == "cursor" and model == CURRENT_SOL:
         assert "CURSOR_MODEL_NOT_APPROVED" in err
@@ -112,7 +127,7 @@ def test_subject_self_review_effective_identity_or_unknown_refused_before_launch
 ])
 def test_effective_identity_does_not_overexclude_cursor_without_matching_subject(dispatch, capsys, model, flags):
     # C-5307 restores only the exact Grok wire pin, not other known models or Auto.
-    dispatch(*flags, agent="cursor", model=model, expected=2)
+    dispatch(*flags, agent="cursor", model=model, expected=2, refusal="route_eligibility")
     expected = "cursor_auto_outside_coding_task" if model == "auto" else "CURSOR_MODEL_NOT_APPROVED"
     assert expected in capsys.readouterr().err
 
@@ -121,7 +136,7 @@ def test_unapproved_cursor_identity_fails_closed_before_fallback(dispatch, monke
     from lu_machinery.review import model_catalog
 
     monkeypatch.setattr(model_catalog, "substitution_default_model", lambda _: "unknown-model")
-    dispatch("--subject-seat", "claude", agent="cursor", expected=2)
+    dispatch("--subject-seat", "claude", agent="cursor", expected=2, refusal="route_eligibility")
     assert "CURSOR_MODEL_NOT_APPROVED" in capsys.readouterr().err
 
 
@@ -158,7 +173,8 @@ def test_unpublishable_language_subject_review_refused_before_launch(dispatch, c
 @pytest.mark.parametrize("flags", [("--review-profile", "code"), ("--subject-seat", "grok"),
                                   ("--subject-family", "xai")])
 def test_ambiguous_provider_refused_for_review_only(dispatch, capsys, flags):
-    dispatch("--owned-path", "lu_machinery/dispatcher/providers/unknown.py", *flags, expected=2)
+    dispatch("--owned-path", "lu_machinery/dispatcher/providers/unknown.py", *flags, expected=2,
+             refusal="review_setup_refusal")
     assert "ambiguous review subject path" in capsys.readouterr().err
 
 
@@ -249,7 +265,7 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
     monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path, "claude/branch", head))
     monkeypatch.setattr(checks, "check_branch_author_families", BRANCH_AUTHOR_FAMILIES)
     review = ("--mode", "read-only", *flags)
-    dispatch(*review, agent=reviewer[0], model=reviewer[1], expected=2)
+    dispatch(*review, agent=reviewer[0], model=reviewer[1], expected=2, refusal="review_setup_refusal")
     assert refusal in capsys.readouterr().err
     # A reviewer from a third family (Google; Grok is retired, GROK-CANCEL-1110) is outside every author family.
     outside = ("agy", "gemini-4-neon-high")
@@ -261,7 +277,7 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
             assert dispatch(*review, agent=outside[0], model=outside[1])["model"] == outside[1]
     else:
         # Unresolvable authorship and an empty range refuse every reviewer family.
-        dispatch(*review, agent=outside[0], model=outside[1], expected=2)
+        dispatch(*review, agent=outside[0], model=outside[1], expected=2, refusal="review_setup_refusal")
 
 
 @pytest.mark.parametrize("flags", [("--language-lane", "ukrainian"), ("--risk", "low"), ("--review-profile", "ukrainian")])
@@ -327,7 +343,7 @@ def test_mixed_family_head_refuses_neon(dispatch, monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(checks, "check_branch_author_families", BRANCH_AUTHOR_FAMILIES)
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
     review = ("--mode", "read-only", "--branch", "review/target", "--review-profile", "infra", "--risk", "critical")
-    dispatch(*review, agent="agy", model="gemini-4-neon-high", expected=2)
+    dispatch(*review, agent="agy", model="gemini-4-neon-high", expected=2, refusal="review_setup_refusal")
     assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
-    dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2)
+    dispatch(*review, agent="agy", model="gemini-3.8-flash-high", expected=2, refusal="route_eligibility")
     assert "holds no review" in capsys.readouterr().err

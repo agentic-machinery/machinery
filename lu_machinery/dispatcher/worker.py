@@ -23,6 +23,7 @@ import psutil
 
 from lu_machinery.agent_runtime import bounded_advisory, model_pause
 from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, resolve_codex_account_label
+from lu_machinery.agent_runtime.env_sanitize import CLAUDE_LAUNCH_GUARD_EXIT
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
 from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.repo_root import in_tree_source, machinery_path, primary_root, state_root
@@ -41,7 +42,7 @@ from lu_machinery.dispatcher import (
     write_boundary,
 )
 from lu_machinery.dispatcher.environment import child_env
-from lu_machinery.dispatcher.types import ParsedResult, TaskSpec
+from lu_machinery.dispatcher.types import ParsedResult, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import (
     TERMINAL_EXIT_GRACE_S,
     DeadlineExpired,
@@ -507,6 +508,10 @@ def _record_failed_launch(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
                   "spawn_setup_failed" if current.get("pid") is None else "supervisor_launch_failed")
         if not isinstance(exc, admission.LaunchRefused):
             fields["error"] = f"{reason}: {type(exc).__name__}"
+        if reason in {"spawn_setup_failed", "dispatch_fallback_refused", "dispatch_isolation_failed", "worker_spawn_failed"}:
+            # start() sends the launch payload only after placement returns and the PID is recorded.
+            fields.update(usage=None, never_started_reason=(
+                StartRefusal.SETUP if reason == "spawn_setup_failed" else StartRefusal.PLACEMENT))
         if cleanup_error is not None:
             fields["launch_cleanup_error"] = _launch_cleanup_text(cleanup_error)
         current.update(fields, finished_at=store.now(), returncode_reason=reason)
@@ -1672,6 +1677,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         **({"hard_timeout": hard_timeout} if hard_timeout is not None else {}),
     })
     child, status, returncode, error, usage, text = None, "crashed", None, None, None, None
+    start_refusal = None
     slots = None
     resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
@@ -1717,19 +1723,23 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             git.pin_settlement_registry()
         except (OSError, ValueError) as exc:
             status, error = "failed", f"settlement_registry_unavailable: {type(exc).__name__}"
+            start_refusal = StartRefusal.SETUP
             return
         if record.get("launch_mode") == "popen-fallback" and not _adopt_orphans():
             # Without it a double-forked descendant would escape settlement's sweep unseen.
             status, error = "failed", "fallback_adoption_unavailable: PR_SET_CHILD_SUBREAPER was refused"
+            start_refusal = StartRefusal.PLACEMENT
             return
         try:
             headroom.check_plan(spec.agent, spec.model, record, review=admission.review_typed(record))
             headroom.check_runtime(spec.agent, spec.model, codex_account=record.get("codex_account"))
         except ValueError as exc:
             status, error = "failed", str(exc)
+            start_refusal = StartRefusal.ACCOUNT if error.startswith("CLAUDE_ACCOUNT_REFUSED:") else StartRefusal.HEADROOM
             return
         except headroom.RateLimitedError as exc:
             status, error = "rate_limited", str(exc)
+            start_refusal = StartRefusal.HEADROOM
             return
         if record.get("review_attempt"):
             # A bound formal attempt runs only inside the agent runtime's attempt boundary, with the rendered
@@ -1747,6 +1757,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             finally:
                 interruptible = False
             status, error, text, sources_calls = outcome.status, outcome.error, outcome.text, outcome.sources_calls
+            start_refusal = outcome.start_refusal
             record.update(outcome.identity)
             if outcome.trace:
                 # The runtime keeps the seat's stream to itself; its redacted tool-call trace takes the stream's
@@ -1764,6 +1775,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 schema = load(options)
             except (OSError, ValueError):
                 status, error = "failed", "output schema binding invalid"
+                start_refusal = StartRefusal.SETUP
                 return
         provider = providers.load(spec.agent)
         if spec.mode == "workspace-write":
@@ -1774,8 +1786,17 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 store.replace(record, path, require_existing=True)
             except (OSError, ValueError) as exc:
                 status, error = "failed", f"task_scratch_unavailable: {exc}"
+                start_refusal = StartRefusal.SETUP
                 return
-        invocation = runtime_context.build(spec, _provider_env(spec))
+        try:
+            invocation = runtime_context.build(spec, _provider_env(spec))
+        except CodexAccountRefused as exc:
+            status, error, start_refusal = "failed", str(exc), StartRefusal.ACCOUNT
+            return
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            status, error = "failed", f"provider_setup_refused: {type(exc).__name__}"
+            start_refusal = StartRefusal.SETUP
+            return
         record["runtime_input_sha256"] = hashlib.sha256(invocation.stdin or b"").hexdigest()
         pending_conversation = None
         pending_correction = None
@@ -1792,11 +1813,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 record["claude_account_auth"] = claude_account_auth_receipt(
                     spec.claude_account, source=record.get("claude_account_source")
                 )
-            # Checked again with the launch's own environment: a managed policy may appear after dispatch.
-            if spec.mode == "read-only" and (refusal := providers.read_only_refusal(spec.agent, invocation.env)):
-                raise ValueError(refusal)
         except ValueError as exc:
-            status, error = "failed", str(exc)
+            status, error, start_refusal = "failed", str(exc), StartRefusal.ACCOUNT
+            return
+        # The launch's own environment can contain a managed policy that appeared after dispatch.
+        if spec.mode == "read-only" and (refusal := providers.read_only_refusal(spec.agent, invocation.env)):
+            status, error, start_refusal = "failed", refusal, StartRefusal.BOUNDARY
             return
         if spec.agent == "codex" and spec.mode == "read-only":
             try:
@@ -1806,6 +1828,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 create_dispatch_lease(spec.task_id, spec.worktree)
             except (OSError, ValueError) as exc:
                 status, error = "failed", f"read_only_scratch_unavailable: {exc}"
+                start_refusal = StartRefusal.SETUP
                 return
         # The slot queue can wait for an hour and discards its ticket on any exception, so cancel stops it in place.
         interruptible = True
@@ -1852,6 +1875,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         invocation = replace(invocation, argv=write_boundary.launcher(spec, invocation, path))
                     except ValueError as exc:
                         status, error = "failed", str(exc)
+                        if child is None:
+                            start_refusal = StartRefusal.BOUNDARY
                         return
                 child = subprocess.Popen(
                     invocation.argv,
@@ -1892,10 +1917,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             final = invocation.final_file
             final_text = final.read_text(errors="replace") if final and final.exists() else None
             stdout = stdout_path.read_text(errors="replace")
+            stderr = stderr_path.read_text(errors="replace")
             parse_options = (
                 {"output_schema": schema} if spec.agent in {"agy", "claude"} and schema is not None else {}
             )
-            parsed = provider.parse(stdout, stderr_path.read_text(errors="replace"), exit_code, final_text, **parse_options)
+            parsed = provider.parse(stdout, stderr, exit_code, final_text, **parse_options)
             text, usage, sources_calls = parsed.text, parsed.usage, parsed.sources_mcp_call_count
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
             resolved_model = parsed.resolved_model
@@ -1913,6 +1939,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 correction_launches += 1
                 continue
             break
+        if spec.agent == "agy":
+            # These logs live under the task store even when there is no final reply or the record is archived.
+            record["retained_stream"] = {
+                "stdout": stdout_path.relative_to(path.parent).as_posix(),
+                "stderr": stderr_path.relative_to(path.parent).as_posix(),
+            }
         store.begin_settlement(record)
         if _read_only_boundary(spec):
             # Only the receipt the launcher writes outside the sandbox proves the run was contained (#423).
@@ -1920,6 +1952,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             record["write_boundary"] = boundary
             if refusal:
                 status, error = "failed", refusal
+                if (returncode == write_boundary.REFUSED and boundary.get("status") == "refused"
+                        and not (text or usage or final_text or resolved_model)
+                        and refusal.startswith("write_boundary_refused:") and not (continuations or correction_launches)):
+                    start_refusal = StartRefusal.BOUNDARY
                 return
         if spec.agent == "agy" and spec.mode == "read-only":
             # Only the boundary's receipt, written outside the sandbox, proves the run read-only and
@@ -1928,6 +1964,20 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             record["read_only_boundary"] = boundary
             if refusal:
                 status, error = "failed", refusal
+                if (returncode == agy_sandbox.REFUSED and boundary.get("status") == "refused"
+                        and not (text or usage or final_text or resolved_model)
+                        and not (continuations or correction_launches)):
+                    start_refusal = StartRefusal.BOUNDARY
+                return
+        if not (continuations or correction_launches):
+            guard_refusal = "CLAUDE_ACCOUNT_REFUSED: claude_account_settings_changed"
+            if (spec.agent == "claude" and record.get("claude_account_auth") and returncode == CLAUDE_LAUNCH_GUARD_EXIT
+                    and not (stdout or final_text)
+                    and stderr.splitlines()[-1:] == [guard_refusal]):
+                status, error, start_refusal = "failed", guard_refusal, StartRefusal.ACCOUNT
+                return
+            if parsed.start_refusal is not None:
+                status, error, start_refusal = "failed", parsed.error, parsed.start_refusal
                 return
         if parsed.rate_limited and exit_code >= 0:
             # Before the schema check, which would record the same terminal failure as invalid output.
@@ -2021,6 +2071,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         status, error = "timeout", "process deadline exceeded"
     except store.TaskRecordError as exc:
         status, error = "crashed", exc.code
+    except OSError as exc:
+        if child is None and not record.get("review_attempt"):
+            status, error, start_refusal = "failed", f"provider_setup_refused: {type(exc).__name__}", StartRefusal.SETUP
+        else:
+            status, error = "crashed", "supervisor or provider processing failed"
     except Exception:
         status, error = "crashed", "supervisor or provider processing failed"
     finally:
@@ -2036,6 +2091,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.begin_settlement(record)
                 except store.TaskRecordError as exc:
                     status, error = "crashed", exc.code
+                    start_refusal = None
             # A killed launcher leaves its scratch; residue is recorded, never raised.
             if _read_only_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
                 record["write_boundary_cleanup"] = residue
@@ -2059,7 +2115,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 # The hold is the supervisor's: a killed supervisor ends it, and the governed runs in flight
                 # keep their slots shared until they exit (test_slots).
                 slots.release()
-            if text is not None:
+            if start_refusal is None and text is not None:
                 spec.final_file.write_text(text)
                 spec.final_file.chmod(0o600)
                 if record.get("advisory_role") is not None:
@@ -2069,7 +2125,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status=status,
                 returncode=returncode,
                 error=error,
-                usage=usage,
+                usage=None if start_refusal is not None else usage,
                 finished_at=store.now(),
                 duration_s=round(time.monotonic() - started, 3),
                 result_sha256=store.digest(spec.final_file.read_bytes()) if spec.final_file.exists() else None,
@@ -2101,6 +2157,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     if cancel_requested and record["status"] != "cancelled":
                         record.pop("no_deliverable_reason", None)
                         record.update(status="cancelled", error="cancelled by client")
+                    if start_refusal is not None and record["status"] in {"failed", "rate_limited"}:
+                        record["never_started_reason"] = start_refusal
                     if transport_warning and record["status"] == "done":
                         record["transport_warning"] = transport_warning
                     if (children := record.get("orphaned_child_tasks")) and record["status"] != "done":

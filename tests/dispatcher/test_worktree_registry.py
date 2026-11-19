@@ -422,23 +422,22 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
                           "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
                           "--task-id", "refused", expected=2)
     assert refused.stderr.splitlines()[-1].startswith("dispatcher: " + reason), refused.stderr
-    # Never launched; as for any creation failure, the hold keeps the surviving tree attributed (#490).
+    # Never launched: the hold becomes a terminal setup refusal that keeps the surviving tree attributed (#490).
     hold = json.loads((sandbox.tasks / "refused.json").read_text())
-    assert (hold["status"], hold["pid"], hold["admission_hold"]["run_nonce"]) == ("spawning", None, hold["run_nonce"])
+    assert (hold["status"], hold["pid"], hold["never_started_reason"]) == ("failed", None, "setup_refusal")
     record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--base", "origin/main", "--task-id", "read"))
     assert (record["status"], record["mode"]) == ("done", "read-only")
-    # That dispatch's admission sweep marked the orphaned hold crashed (#8717); settlement then hands the tree to
-    # the guarded remover, which removes it and its branch, or keeps it with its disposition recorded (here only
-    # when a user-level excludes file the settlement shares hides its outputs).
+    # Settlement hands the refused tree to the guarded remover, which removes it and its branch, or keeps it with
+    # its disposition recorded (here only when a user-level excludes file the settlement shares hides outputs).
     sandbox.sweep()
     settled = json.loads((sandbox.tasks / "refused.json").read_text())
-    assert settled["status"] == "crashed"
+    assert settled["status"] == "failed"
     assert (primary / ".worktrees/dispatch/codex/refused").exists() == (settled["worktree_disposition"] != "removed")
     if not global_excludes:
         assert settled["worktree_disposition"] == "removed"
         assert run_git(primary, "for-each-ref", "--format=%(refname:short)", "refs/heads") == "main"
     # A task borrowing (--cwd) a tree without the deployment: read-only runs as it is; a write task refuses
-    # before its record is published, and nothing is written into the tree.
+    # before it starts, recorded as a setup refusal under its own id, and nothing is written into the tree.
     tree = primary / ".worktrees/dispatch/codex/attached"
     run_git(primary, "worktree", "add", "-b", "attached", str(tree), "main")
     record = sandbox.settle(sandbox.dispatch("echo", "--repo", "declared", "--cwd", str(tree), "--base", "origin/main",
@@ -448,4 +447,7 @@ def test_a_deployment_that_cannot_be_applied_refuses_the_launch_with_its_reason(
                            "--repo", "declared", "--base", "origin/main", "--mode", "workspace-write",
                            "--cwd", str(tree), "--task-id", "attached", expected=2)
     assert attached.stderr.splitlines()[-1].startswith("dispatcher: agent_deploy_failed: exit "), attached.stderr
+    refusals = [entry for entry in (json.loads(path.read_text()) for path in sandbox.tasks.glob("*.json"))
+                if entry.get("requested_task_id") == "attached"]
+    assert [(entry["status"], entry["never_started_reason"]) for entry in refusals] == [("failed", "setup_refusal")]
     assert not (sandbox.tasks / "attached.json").exists() and not (tree / ".claude").exists()

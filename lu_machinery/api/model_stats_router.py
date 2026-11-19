@@ -31,7 +31,7 @@ import subprocess
 import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -43,8 +43,17 @@ from prometheus_client.core import GaugeMetricFamily
 
 from lu_machinery.agent_runtime.model_pause import _newest_claude
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
+from lu_machinery.orchestration.agent_ledger import TASK_FAMILIES
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo
-from lu_machinery.review.model_catalog import VARIANT_SUFFIX, load_model_catalog
+from lu_machinery.review.language_lane import UKRAINIAN_TASK_FAMILIES
+from lu_machinery.review.model_catalog import (
+    MECHANICAL_FAMILIES,
+    VALID_REVIEW_PROFILES,
+    VALID_RISKS,
+    VARIANT_SUFFIX,
+    load_model_catalog,
+)
 
 from .model_stats_rows import (
     NATIVE_ALIASES,
@@ -71,7 +80,8 @@ WINDOWS: dict[str, int | None] = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "all"
 METRIC_WINDOWS = ("7d", "30d", "90d", "all")
 PAGE_DROP = frozenset({
     "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed"})
-STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed")
+STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
+START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
 ALL_EFFORTS = "all"
 # Review policy blocks on P0 and P1 (fleet_comms.review_publication.BLOCKING_PRIORITIES); the
@@ -302,7 +312,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         verdict = review.get("verdict") if review else None
         priorities = review.get("priorities") if review else None
         row_review: tuple[str, Counter[str] | None, str | None, str | None] | None = None
-        if role == "review":
+        if role == "review" and row_status != NEVER_STARTED:
             if verdict in VERDICTS[:3]:
                 row_review = (verdict, Counter(priorities) if isinstance(priorities, Mapping) else None, None, None)
             elif row_status != "done":
@@ -319,7 +329,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
             effort=str(raw.get("effort") or "unset"),
             role=role, task_class=str(raw.get("class") or "unclassified"),
             status=row_status, moment=moment, started=timestamp(raw.get("started_at")),
-            duration=_number(raw.get("duration_s")),
+            duration=None if row_status == NEVER_STARTED else _number(raw.get("duration_s")),
             tokens=(_count(counts, "fresh_input"), _count(counts, "cached_input"), _count(counts, "output")),
             trailer=raw["task_id"] in landing.task_ids, delivery=bool(raw.get("landing")),
             review=row_review,
@@ -336,6 +346,7 @@ class _Group:
         self.tokens = [0, 0, 0]
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
+        self.never_started_reasons: Counter[str] = Counter()
         self.unparsed_reasons: Counter[str] = Counter()
         self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str]] = {}
         self.priorities: Counter[str] = Counter()
@@ -345,6 +356,10 @@ class _Group:
 
     def add(self, row: _Row) -> None:
         self.status[row.status] += 1
+        if row.status == NEVER_STARTED:
+            reason = row.raw.get("never_started_reason")
+            code = reason if isinstance(reason, str) and reason in START_REFUSAL_CODES else "unknown"
+            self.never_started_reasons[code] += 1
         if row.duration is not None:
             self.durations.append(row.duration)
         self.tokens = [a + b for a, b in zip(self.tokens, row.tokens, strict=True)]
@@ -378,6 +393,7 @@ class _Group:
         self.tokens = [a + b for a, b in zip(self.tokens, other.tokens, strict=True)]
         self.landed += other.landed
         self.verdicts.update(other.verdicts)
+        self.never_started_reasons.update(other.never_started_reasons)
         self.unparsed_reasons.update(other.unparsed_reasons)
         for reason, item in other.unparsed_samples.items():
             prev = self.unparsed_samples.get(reason)
@@ -393,12 +409,13 @@ class _Group:
         tasks = sum(self.status.values())
         seconds = sum(self.durations)
         hours = seconds / 3600
-        # A task with no recorded duration makes the total, and so the cost per landed task, unknown, never zero.
-        timed = len(self.durations) == tasks
-        untimed = tasks - len(self.durations)
+        # Only started attempts belong in the runtime denominator.
+        started = tasks - self.status[NEVER_STARTED]
+        untimed = started - len(self.durations)
         out: dict[str, Any] = {
             "tasks": tasks, "low_sample": tasks < LOW_SAMPLE,
             "status": {name: self.status[name] for name in (*STATUSES, "other")},
+            "never_started_reasons": dict(sorted(self.never_started_reasons.items())),
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
             "wall_seconds": {"p25": _percentile(self.durations, 0.25), "median": _median(self.durations),
@@ -413,8 +430,8 @@ class _Group:
             observed = round(hours / self.landed, 2) if self.landed and self.durations else None
             out.update(
                 landed=self.landed, landed_rate=_rate(self.landed, tasks),
-                wall_hours_per_landed={**_rate(hours, self.landed, 2), **({} if timed else {"value": None})},
-                wall_hours_observed={"value": observed if _timing_shown(tasks, untimed) else None,
+                wall_hours_per_landed={**_rate(hours, self.landed, 2), **({"value": None} if untimed else {})},
+                wall_hours_observed={"value": observed if _timing_shown(started, untimed) else None,
                                      "n": self.landed, "timed_tasks": len(self.durations),
                                      "untimed_tasks": untimed},
                 output_tokens_per_landed=_rate(self.tokens[2], self.landed, 0),
@@ -788,7 +805,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
         head = row.raw.get("pinned_head")
         if row.landed and row.delivery:
             landed.add((row.raw["repo"], row.raw["landing"]["pr"]))
-        if row.role == "review" and (pr := _reviewed_pr(row)) is not None:
+        if row.review is not None and (pr := _reviewed_pr(row)) is not None:
             if head:
                 prs_by_head[(pr[0], head)].add(pr)
             if pr not in first or _review_order(row) < _review_order(first[pr]):
@@ -796,7 +813,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
 
     linked: dict[tuple[str, str], list[tuple[_PrKey, _Row]]] = defaultdict(list)
     for row in rows:
-        if row.role != "review":
+        if row.review is None:
             continue
         pr = _reviewed_pr(row)
         head = row.raw.get("pinned_head")
@@ -1100,6 +1117,12 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
 OTHER = "other"
 ALL_CLASSES = "all"
 _KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
+_PAGE_CLASSES = frozenset({
+    *TASK_FAMILIES, *MECHANICAL_FAMILIES, *UKRAINIAN_TASK_FAMILIES,
+    "code", "infra", "docs", "difficulty-gate", "bounded", "bounded_implementation",
+    "review", "code-review", "review-routing", "unclassified",
+    *(f"{profile}/{risk}" for profile in VALID_REVIEW_PROFILES | {"ukrainian"} for risk in VALID_RISKS | {"unknown"}),
+})
 
 
 @lru_cache(maxsize=1)
@@ -1162,6 +1185,25 @@ def metric_effort(effort: str) -> str:
     return effort if effort in _KNOWN_EFFORTS or VARIANT_SUFFIX.fullmatch(effort) else OTHER
 
 
+def _page_model(model: str) -> str:
+    return model if model in _NOT_CONCRETE else metric_model(model)
+
+
+def _page_class(task_class: str) -> str:
+    return task_class if task_class in _PAGE_CLASSES else OTHER
+
+
+def _page_landing(landing: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
+        repos = {}
+    counts: Counter[str] = Counter()
+    for repo, count in landing["trailer_task_ids_by_repository"].items():
+        counts[repo if repo in repos else OTHER] += count
+    return {**landing, "trailer_task_ids_by_repository": dict(sorted(counts.items()))}
+
+
 def week_of(moment: datetime) -> str:
     year, week, _ = moment.isocalendar()
     return f"{year}-W{week:02d}"
@@ -1196,15 +1238,23 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     if landing is None:
         landing = scan_landing(primary_root, first)
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows)) if row.moment < until]
-    windows, metric_windows = {}, {}
+    # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
+    page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
+                         task_class=_page_class(row.task_class)) for row in rows]
+    windows, metric_windows, page_windows = {}, {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         selected = [row for row in rows if since <= row.moment]
         fine, prs = _fine(selected), _prs(selected)
-        windows[name] = {
-            "window": {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
-                       "cohort": "finished_at, else started_at, in [since, until)"},
-            **summarize(selected, fine, prs, history=rows),
+        window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
+                  "cohort": "finished_at, else started_at, in [since, until)"}
+        windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows)}
+        # Bound the combined author id after deriving PR outcomes, so a joint author cannot become a known model.
+        page_prs = [{**pr, "author": _page_model(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
+                     "class": _page_class(pr["class"])} for pr in prs]
+        page_selected = [row for row in page_rows if since <= row.moment]
+        page_windows[name] = {
+            "window": window, **page_window(summarize(page_selected, prs=page_prs, history=page_rows)),
         }
         # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
         # 24h stays off this label set.
@@ -1222,6 +1272,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "low_sample_below": LOW_SAMPLE,
         "first_record": first.isoformat() if moments else None,
         "windows": windows,
+        "page_windows": page_windows,
         "weeks": _weeks(weeks),
         "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict()},
@@ -1319,10 +1370,14 @@ async def model_stats(
                                 headers=snapshot_headers(None, FRESHNESS_BOUND_SECONDS, unavailable=True))
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
-    body = {name: value for name, value in snapshot.items() if name not in ("windows", "metrics")}
-    payload = {**body, **snapshot["windows"][window], "status": "ok", "age_seconds": round(age, 1)}
+    body = {name: value for name, value in snapshot.items() if name not in ("windows", "page_windows", "metrics")}
+    window_key = "windows"
     if view == "page":
-        payload = page_window(payload)
+        window_key = "page_windows"
+        del body["weeks"]
+        coverage = body["coverage"]
+        body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
+    payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}
     return JSONResponse(payload, headers=snapshot_headers(age, FRESHNESS_BOUND_SECONDS))
 
 

@@ -62,6 +62,51 @@ def _row(payload: dict, model: str, role: str) -> dict:
     return next(r for r in payload["models"] if r["model"] == model and r["role"] == role)
 
 
+def test_never_started_refusals_survive_backfill_and_keep_failed_review_counts_separate(tmp_path):
+    """Pre-start refusals must stay out of failed reviews and runtime observations (#889)."""
+    batch_state, tasks = _state(tmp_path)
+    boundary = {"returncode": 125, "error": "write_boundary_refused: local diagnostic", "provider_pgid": 321}
+    cases = {
+        "account": {"never_started_reason": "account_check", "duration_s": 0},
+        "capacity": {"never_started_reason": "admission_capacity"},
+        "eligibility": {"never_started_reason": "route_eligibility"},
+        "headroom": {"status": "rate_limited", "never_started_reason": "headroom"},
+        "placement": {"returncode_reason": "dispatch_fallback_refused"},
+        "setup": {"never_started_reason": "setup_refusal"},
+        "review-setup": {"never_started_reason": "review_setup_refusal"},
+        "model-selection": {"error": "agy_model_unavailable: unavailable"},
+        "boundary-refused": {**boundary, "write_boundary": {"status": "refused"}, "duration_s": 99},
+        "boundary-continuation": {**boundary, "write_boundary": {"status": "refused"}, "never_started_reason": None},
+        "boundary-interrupted": {**boundary, "write_boundary": {"status": "interrupted"}},
+        "boundary-missing": boundary,
+        "model-ran": {"never_started_reason": "setup_refusal", "duration_s": 12,
+                      "usage": {"input_tokens": 7, "cached_input_tokens": 0}},
+    }
+    for task_id, fields in cases.items():
+        record = _record(tasks, task_id, **{"mode": "read-only", "status": "failed", **fields})
+        path = tasks / f"{task_id}.json"
+        old_row = rows.summary_row(path, record, path.stat().st_mtime_ns)
+        assert old_row is not None
+        old_row["status"] = record["status"]
+        del old_row["never_started_reason"]
+        rows.append_row(batch_state, old_row)
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 9
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 0
+    payload = _row(_window(batch_state, stats.Landing()), "gpt-6.1-sol", "review")
+    assert payload["status"]["never_started"] == 9
+    assert payload["status"]["failed"] == payload["verdicts"]["unparsed"] == 4
+    assert payload["wall_seconds"]["n"] == 1
+    assert payload["wall_seconds"]["total_seconds"] == payload["wall_seconds"]["median"] == 12
+    assert payload["never_started_reasons"] == {
+        "account_check": 1, "admission_capacity": 1, "boundary_refusal": 1, "headroom": 1,
+        "model_unavailable": 1, "review_setup_refusal": 1, "route_eligibility": 1,
+        "setup_refusal": 1, "worker_placement": 1,
+    }
+    stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
+    assert stored["boundary-refused"]["tokens"] == {"fresh_input": 0, "cached_input": 0, "output": 0}
+    assert "local diagnostic" not in rows.rows_path(batch_state).read_text()
+
+
 def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, monkeypatch):
     """Defect class: wrong aggregation, or a summary row lost, stale, corrupted or dropped by record retention."""
     batch_state, tasks = _state(tmp_path)
@@ -444,6 +489,60 @@ def test_pr_reviewed_for_two_author_models_exports_other_on_metrics(tmp_path, mo
     assert [a["model"] for a in snapshot["windows"]["7d"]["authors"]] == ["claude-sonnet-5-5+gpt-6.1-sol"]
     assert 'model="other",role="author",window="7d"} 2.0' in metrics
     assert "claude-sonnet-5-5+gpt-6.1-sol" not in metrics
+
+
+def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
+    """Defect class: grammar-valid hostnames relayed as page labels or aliased into duplicate buckets."""
+    batch_state, tasks = _state(tmp_path)
+    model, effort, task_class = "worker.example.invalid", "effort.example.invalid", "class.example.invalid"
+    author, reviewer, risk = "author.example.invalid", "reviewer.example.invalid", "risk.example.invalid"
+    repo = "repository.example.invalid"
+    for i in range(10):
+        _record(tasks, f"w{i}", resolved_model=model, resolved_model_known=True, effort=effort,
+                research_task_family=task_class, duration_s=3600)
+    _record(tasks, "w10", model="second-worker.example.invalid", effort="second-effort.example.invalid",
+            research_task_family="second-class.example.invalid", duration_s=3600)
+    for i in range(10):
+        _record(tasks, f"known{i}", research_task_family="bounded", duration_s=3600)
+    _record(tasks, "cursor-auto", agent="cursor", model="auto")
+    _record(tasks, "agy-unreported", agent="agy", resolved_model="unrecognized", resolved_model_known=True)
+    _review(tasks, "r1-review", "correct", [], pr=1, repo=repo, review_author_model=author,
+            resolved_model=reviewer, effort=effort, review_risk=risk)
+    _review(tasks, "r2-review", "incorrect", [], pr=2, repo="public", review_author_model="gpt-6.1-sol")
+    rows.backfill(tasks, batch_state)
+    landing = stats.Landing(task_ids={"w0", "w10", "known0"})
+    landing.by_repository.update({"public": 1, repo: 2, "second-repository.example.invalid": 3})
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    ctx = SimpleNamespace(roots=SimpleNamespace(project_root=tmp_path, batch_state_dir=batch_state,
+                                                live_repo_root=tmp_path))
+    monkeypatch.setattr(stats, "_compute", lambda _ctx: lambda: snapshot)
+    app = FastAPI()
+    app.include_router(stats.router, prefix="/api/fleet/model-stats")
+    app.dependency_overrides[get_ctx] = lambda: ctx
+    with TestClient(app) as client:
+        full = client.get("/api/fleet/model-stats?view=full")
+        page = client.get("/api/fleet/model-stats?view=page")
+
+    assert full.status_code == page.status_code == 200
+    assert all(label in full.text for label in (model, effort, task_class, author, reviewer, risk, repo))
+    assert ".example.invalid" not in page.text
+    payload = page.json()
+    assert _row(payload, "other", "write")["tasks"] == 11
+    assert [(e["effort"], e["tasks"]) for e in _row(payload, "other", "write")["by_effort"]] == [("other", 11)]
+    assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 10
+    assert _row(payload, "auto", "write")["identity"] == "harness_choice"
+    assert _row(payload, "unrecognized", "write")["identity"] == "unreported"
+    assert [(a["model"], a["prs"]) for a in payload["authors"]] == [("gpt-6.1-sol", 1), ("other", 1)]
+    assert {(c["author"], c["reviewer"], c["class"]) for c in payload["first_round_matrix"]} == {
+        ("other", "other", "all"), ("other", "other", "other"),
+        ("gpt-6.1-sol", "claude-opus-5-5", "all"), ("gpt-6.1-sol", "claude-opus-5-5", "code/medium"),
+    }
+    assert [(r["model"], [level["effort"] for level in r["levels"]])
+            for r in payload["review_levels"] if r["model"] == "other"] == [("other", ["other"])]
+    assert [(job["class"], job["tasks"], job["models"][0]["model"]) for job in payload["charts"]["jobs"]] == [
+        ("other", 11, "other"), ("bounded", 10, "gpt-6.1-sol"),
+    ]
+    assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
 
 
 def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):

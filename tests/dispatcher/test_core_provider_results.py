@@ -225,12 +225,8 @@ def test_agy_stream_from_another_model_family_settles_as_a_failure(sandbox, term
         server.server_close()
 
 
-@pytest.mark.parametrize("failure", [
-    None, "unclassified", "missing", "truncated", "schema", "over_deep", "dirty_stream", "wrong_model",
-    "linger", "model_selection", "incomplete", "unknown_status",
-])
-def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monkeypatch, failure):
-    """Defect: AGY exit 0 with terminal ERROR discarded a complete Carbon review."""
+@pytest.fixture
+def supervise_agy(tmp_path, monkeypatch):
     tasks = tmp_path / "tasks"
     tasks.mkdir()
     (tasks / "logs").mkdir()
@@ -247,6 +243,66 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
     monkeypatch.setattr(worker.agy_sandbox, "verify", lambda *_args: ({}, None, None))
     monkeypatch.setattr(worker.agy_sandbox, "unavailable", lambda: None)
     monkeypatch.setattr(worker.agy_sandbox, "scratch", lambda _task_id: tmp_path / "provider-scratch")
+    head = run_git(repo, "rev-parse", "HEAD")
+
+    def run(code, model="gemini-4-neon-high"):
+        monkeypatch.setattr(worker.runtime_context, "build", lambda _spec, env: Invocation(
+            [sys.executable, "-c", code], None, env, None,
+        ))
+        spec = TaskSpec(
+            "agy-terminal-error", "agy", model, None, "read-only", repo,
+            tmp_path / "source.prompt", tasks / "agy-terminal-error.result",
+        )
+        prompt = b"Review the fixture."
+        spec.prompt_file.write_bytes(prompt)
+        record = worker.store.new_record(spec, {"key": "public", "github": "example/fixture"}, "main", head,
+                                         {"research_owned_path": []})
+        record["prompt_file"] = str(tasks / "agy-terminal-error.prompt")
+        path = worker.store.create(record, prompt)
+        worker.supervise(path)
+        return json.loads(path.read_text()), spec.final_file
+
+    return run
+
+
+@pytest.mark.parametrize(("status_code", "expected_status", "terminal_error", "stderr", "diagnostic"), [
+    (
+        3, "rate_limited", "API error: capacity limit",
+        (
+            'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true,'
+            '"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h43m57s."}\n'
+        ),
+        "Individual quota reached. Resets in 1h43m57s.",
+    ),
+    (1, "failed", None, "Error: invalid --json-schema: invalid regular expression\n\nUsage of agy:\n",
+     "invalid regular expression"),
+], ids=["quota", "schema"])
+def test_agy_stderr_diagnostic_is_findable_from_the_task_record(
+    supervise_agy, status_code, expected_status, terminal_error, stderr, diagnostic,
+):
+    """Defect class: an AGY quota or schema refusal points to an unlisted diagnostic stream."""
+    stdout = "" if terminal_error is None else json.dumps({
+        "event": "result", "result": {"status": "ERROR", "error": terminal_error},
+    }) + "\n"
+    record, result = supervise_agy(
+        f"import sys\nprint({stdout!r}, end='')\nsys.stderr.write({stderr!r})\nsys.exit({status_code})"
+    )
+
+    assert (record["status"], record["returncode"]) == (expected_status, status_code)
+    assert "the task's retained stream" in record["error"]
+    assert not result.exists()
+    # The supervisor already captures the bytes in the task log directory.
+    assert (result.parent / "logs" / f"{result.stem}.stderr.log").read_text() == stderr
+    assert (result.parent / record["retained_stream"]["stderr"]).read_text() == stderr
+    assert diagnostic not in json.dumps(record)
+
+
+@pytest.mark.parametrize("failure", [
+    None, "unclassified", "missing", "truncated", "schema", "over_deep", "dirty_stream", "wrong_model",
+    "linger", "model_selection", "incomplete", "unknown_status",
+])
+def test_agy_terminal_error_settles_only_a_valid_read_only_review(supervise_agy, monkeypatch, failure):
+    """Defect: AGY exit 0 with terminal ERROR discarded a complete Carbon review."""
     valid = json.dumps({
         "schema_version": "code-review-findings.v1",
         "overall": {"correctness": "correct", "confidence": 0.9, "explanation": "No defects."},
@@ -281,23 +337,7 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
         monkeypatch.setattr(watchdog, "TERMINAL_EXIT_GRACE_S", 0.1)
         monkeypatch.setattr(worker, "TERMINAL_EXIT_GRACE_S", 0.1)
         code += "\nimport signal\nsignal.pause()"
-    monkeypatch.setattr(worker.runtime_context, "build", lambda _spec, env: Invocation(
-        [sys.executable, "-c", code], None, env, None,
-    ))
-    spec = TaskSpec(
-        "agy-terminal-error", "agy", model, None, "read-only", repo,
-        tmp_path / "source.prompt", tasks / "agy-terminal-error.result",
-    )
-    prompt = b"Review the fixture."
-    spec.prompt_file.write_bytes(prompt)
-    head = run_git(repo, "rev-parse", "HEAD")
-    record = worker.store.new_record(spec, {"key": "public", "github": "example/fixture"}, "main", head,
-                                     {"research_owned_path": []})
-    record["prompt_file"] = str(tasks / "agy-terminal-error.prompt")
-    path = worker.store.create(record, prompt)
-    worker.supervise(path)
-
-    settled = json.loads(path.read_text())
+    settled, result = supervise_agy(code, model)
     error_class = {"unclassified": "unclassified", "model_selection": "model_selection"}.get(failure, "transport")
     terminal_status = "unrecognized" if failure == "unknown_status" else "ERROR"
     terminal_error = (
@@ -313,12 +353,13 @@ def test_agy_terminal_error_settles_only_a_valid_read_only_review(tmp_path, monk
         assert settled["error"] is None
         assert settled["provider_terminal_failure"] is False
         assert settled["transport_warning"] == terminal_error
-        assert spec.final_file.read_text() == valid
+        assert result.read_text() == valid
     else:
         assert settled["status"] == "failed"
         assert "transport_warning" not in settled
         if failure != "wrong_model":
             assert settled["error"] == terminal_error
+    assert (result.parent / settled["retained_stream"]["stdout"]).read_text() == stream
 
 
 @pytest.mark.parametrize(

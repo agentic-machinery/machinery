@@ -279,7 +279,10 @@ def test_delegate_dispatch_without_the_core_refuses(tmp_path, monkeypatch, missi
     err = capsys.readouterr().err
     assert "dispatch refused" in err
     assert "agents_extensions/shared/rules/core.md" in err
-    assert not tasks.exists()
+    [record] = tasks.glob("*.json")
+    refusal = json.loads(record.read_text())
+    assert (refusal["status"], refusal["never_started_reason"], refusal["usage"]) == ("failed", "setup_refusal", None)
+    assert refusal["provider_pgid"] is None and "admission_hold" not in refusal
 
 
 def test_delegate_content_seat_without_the_addendum_refuses(
@@ -292,7 +295,10 @@ def test_delegate_content_seat_without_the_addendum_refuses(
     assert cli.main(["dispatch", "--agent", "codex", "--model", "m", "--prompt", "the source prompt"]) == 2
 
     assert "core-curriculum.md" in capsys.readouterr().err
-    assert not tasks.exists()
+    [record] = tasks.glob("*.json")
+    refusal = json.loads(record.read_text())
+    assert refusal["never_started_reason"] == "setup_refusal"
+    assert refusal["provider_pgid"] is None and refusal["usage"] is None
 
 
 # ----------------------------------------------------------------- plan headroom and runtime exhaustion (unit D6)
@@ -429,6 +435,8 @@ def test_paused_or_exhausted_lane_never_silently_substitutes(headroom_box, capsy
         assert list(box.tasks.glob("*.json")) == []
     record = box.supervise(agent=agent, model=model)
     assert record["status"] == ("rate_limited" if block == "runtime" else "failed")
+    assert record["never_started_reason"] == "headroom"
+    assert record["provider_pgid"] is None and record["usage"] is None
     assert record["agent"] == agent and record["model"] == model
     assert record["returncode"] is None
     assert record["finished_at"] is not None
@@ -442,6 +450,8 @@ def test_worker_admission_reads_the_records_claude_account(headroom_box, label, 
     assert record["status"] == ("failed" if refused else "done"), record.get("error")
     if refused:
         assert record["error"] == "MODEL_HEADROOM: claude-opus-5-5 is held for plan headroom"
+        assert record["never_started_reason"] == "headroom"
+        assert record["provider_pgid"] is None and record["usage"] is None
         assert headroom_box.launches == []
     else:
         assert headroom_box.launches == [("claude", "claude-opus-5-5", "b")]
