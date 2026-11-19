@@ -1419,8 +1419,8 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "charts": _charts(models, prs, selected), "records": len(selected),
-        # Every model the catalog still routes (not retired) that ran no task in this window.
-        "idle_catalog_models": sorted(_routed_models() - used),
+        # Every model the catalog still routes (not retired) that ran no task in this window; None without a catalog.
+        "idle_catalog_models": sorted(_routed_models() - used) if model_catalog_reading() is not None else None,
         # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
         "landed_by": dict(sorted(Counter(
             "both" if row.trailer and row.delivery else "trailer" if row.trailer else "delivery"
@@ -1497,6 +1497,12 @@ def metric_effort(effort: str) -> str:
 
 def _page_model(model: str) -> str:
     return model if model in _NOT_CONCRETE else metric_model(model)
+
+
+def _page_author(author: str) -> str:
+    """An author label on the page: each member of a joint author (``a+b``) bounded as a model label, so the page
+    keeps who wrote the PR and each catalog member can pick it; members that all bound to ``other`` are ``other``."""
+    return "+".join(sorted({_page_model(member) for member in author.split("+")}))
 
 
 def _page_class(task_class: str) -> str:
@@ -1577,9 +1583,9 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                   "cohort": "finished_at, else started_at, in [since, until)"}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
                                                        record_prs=record_prs)}
-        # Bound the combined author id after deriving PR outcomes, so a joint author cannot become a known model.
+        # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
         page_prs, page_record_prs = (
-            [{**pr, "author": _page_model(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
+            [{**pr, "author": _page_author(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
               "class": _page_class(pr["class"])} for pr in cohort]
             for cohort in (prs, record_prs))
         page_selected = [row for row in page_rows if since <= row.moment]

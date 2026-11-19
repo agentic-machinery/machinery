@@ -106,7 +106,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   catalog models first and groups the rest under "Not a concrete model id". The full view retains the recorded
   model labels.
 - **Idle catalog models**: `idle_catalog_models` lists every catalog model the catalog still routes (lifecycle
-  not `retired`) that ran no task in the window, so a routed model never silently drops off the page.
+  not `retired`) that ran no task in the window, so a routed model never silently drops off the page. It is
+  `null` when the model catalog cannot be read, and the page then says the list is unknown.
 - **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
   `high`, `gemini-3.8-flash-medium` is `medium`); else `unset`. A catalog id that merely ends in an effort word
   (`gemini-3.8-flash-high`) is `unset` without a recorded effort. Legacy values such as `not-exposed` stay as
@@ -168,7 +169,8 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   ordered by the start of each head's first review; the first round is the earliest review of the earliest head.
   "Approved eventually" means any parsed review approved. They split by author model only: a review records its author's model but not the author's
   effort. A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
-  exports as `other`.
+  exports as `other`. The page keeps the join with each member bounded like a model label (`gpt-6.1-sol+other`),
+  and its model picker selects a joint author's PRs by any of its members.
 - **After a blocked first round** (`after_blocked_first_round`, per author): of the PRs whose first round did not
   approve, the share where a later review approved a new head (the author changed the code), approved the same
   head (no change), or where nothing approved yet in the window.

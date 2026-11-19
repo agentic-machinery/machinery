@@ -575,6 +575,9 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
         ("other", 11, "other"), ("bounded", 10, "gpt-6.1-sol"),
     ]
     assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
+    # A joint author keeps its join on the page, each member bounded like a model label.
+    assert stats._page_author(f"{author}+gpt-6.1-sol") == "gpt-6.1-sol+other"
+    assert stats._page_author(f"{author}+{model}") == "other"
 
 
 def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
@@ -1387,6 +1390,9 @@ def test_author_results_split_by_risk_tier(tmp_path):
     # (PR 17 is a joint author's, PR 19 started before the week, PR 20 is unparsed, PR 21's row names no PR).
     (legacy,) = [a for a in snapshot["windows"]["7d"]["authors"] if a["model"] == "grok-4.7"]
     assert legacy["prs"] == 7
+    # PR 17's joint author stays joint on the page too, so either member's picker selection finds it.
+    for view in ("windows", "page_windows"):
+        assert ("gpt-6.1-sol+grok-4.7", 1) in [(a["model"], a["prs"]) for a in snapshot[view]["7d"]["authors"]]
 
 
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):
@@ -1459,7 +1465,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
         (found,) = snapshot["windows"]["7d"]["reviewer_accuracy"]["findings"]
         return (found["blocking_reviews"], found["reviews_unknown_publication"],
                 snapshot["coverage"]["rows"].get("malformed_lines", 0),
-                bool(snapshot["windows"]["7d"]["idle_catalog_models"]))
+                snapshot["windows"]["7d"]["idle_catalog_models"] is not None)
 
     unreadable, valid = (0, 1, 1, True), (1, 0, 0, True)
     for text, expected in (
@@ -1468,7 +1474,7 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
         catalog.write_text(text, encoding="utf-8")
         assert collected() == expected, text[:40]
     # The model catalog through its own loader's cache: unreadable, it admits no public data class (the sample row
-    # is skipped) and names no idle model, in that collection only.
+    # is skipped) and leaves the idle models unknown (null, never an empty list), in that collection only.
     from lu_machinery.review import model_catalog
 
     models_file = tmp_path / "model_catalog.yaml"

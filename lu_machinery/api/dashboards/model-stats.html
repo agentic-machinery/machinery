@@ -725,7 +725,9 @@ function render() {
     `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>${cell(nOf({n: a.tasks, low_sample: a.tasks < lowBelow()}))}${cell(a.landed)}`
     + `${cell(num(a.pct_points_spent, 1))}${cell(rate(a.pct_points_per_landed))}${cell(a.overlapped_tasks, a.overlapped_tasks ? "warn" : "")}${cell(a.reset_crossed, a.reset_crossed ? "warn" : "")}</tr>`), [0, 1, 2])
     : '<p class="muted">No write task in this window has both readings.</p>';
-  $("idle").textContent = (data.idle_catalog_models || []).length
+  $("idle").textContent = data.idle_catalog_models == null
+    ? "Routed catalog models with no task in this window: unknown, because the model catalog could not be read."
+    : data.idle_catalog_models.length
     ? `Routed catalog models with no task in this window: ${data.idle_catalog_models.join(", ")}.`
     : "Every routed catalog model ran at least one task in this window.";
   updateTableScroll();
