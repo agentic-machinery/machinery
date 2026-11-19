@@ -948,6 +948,7 @@ def test_savant_write_run_edits_only_its_view_and_leaves_a_patch(primary, monkey
      "a path of the start commit that the view left out"),
     ("secret", "printf 'k = ghp_%s\\n' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA > docs/guide.md", "a private key, a token"),
     ("oversize", "head -c 70000 /dev/zero > docs/big.bin", "more than 65536 bytes"),
+    ("too-deep", "mkdir -p docs/" + "d/" * 64 + " && printf 'x\\n' > docs/" + "d/" * 64 + "f", "nests deeper than 64"),
 ])
 def test_savant_write_run_refuses_any_other_edit(primary, monkeypatch, tmp_path, case, script, reason):
     """Defect class (#898): an edit outside the owned paths, a link, an excluded or filtered path, a secret or an

@@ -160,6 +160,9 @@ _SNAPSHOT_SECRET = re.compile(
     rb"|sk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}|AKIA[0-9A-Z]{16}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})")
 MAX_READ_PATHS = 64
 MAX_SNAPSHOT_FILES = 20_000
+# A write run's view nests at most this deep; the draft reopens each directory from the root one component at a
+# time, so this keeps the host's work after the run linear in the entry count.
+MAX_VIEW_DEPTH = 64
 # The recursive tree listing, excluded and skipped entries included, is read up to this size (about 16 times what
 # MAX_SNAPSHOT_FILES records of ordinary paths need), so the launcher's memory before the caps apply is bounded too.
 MAX_TREE_LISTING_BYTES = 16 * 1024 * 1024
@@ -2024,6 +2027,8 @@ class _Boundary:
                             try:
                                 info = os.fstat(descriptor)
                                 if stat.S_ISDIR(info.st_mode):
+                                    if relative.count("/") + 1 >= MAX_VIEW_DEPTH:
+                                        raise Refused(f"{refusal}: the view nests deeper than {MAX_VIEW_DEPTH} levels")
                                     pending.append(relative + "/")
                                     continue
                                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
