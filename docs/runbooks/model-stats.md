@@ -46,7 +46,9 @@ makes no changes. The command leaves task records intact. A row shows only what 
 current `.result` file prove: nothing is carried over from a stored row. A result that is gone, replaced or
 unreadable when the backfill runs, or when the dispatcher rewrites the record, leaves the row with the record's
 own verdict (no findings count), else `missing_result` and no sample; a later run restores the row once the
-file reads cleanly again.
+file reads cleanly again. Every review row is computed from a reading made under `rows.lock` (the dispatcher's,
+and the backfill's for each review row it writes), so an older reading is never stored after a newer one. While
+a backfill holds the lock, a settlement that waits longer than 5 s skips its row; the next backfill adds it.
 
 ## Speed
 
@@ -122,11 +124,13 @@ it raised (a timeout inside the collect included), answers 503 and the page show
 - **Review figures** use structured findings and recorded verdicts from every reviewer. The unparsed count
   includes every settled review task without a readable verdict, split by `unparsed_reasons`: `missing_result`
   (no result file bound to the record: absent, not a regular file, unreadable, or not matching the record's
-  `result_sha256`), `too_big` (over 4 MB), `bad_format` (not UTF-8 or no review JSON), `bad_fields` (review JSON
-  that breaks the review contract), `not_done` (the task did not finish `done`) and `unknown` (a row written
-  before the split). The HTTP route also gives, per model and reason, the first 200 escaped characters of the
-  earliest failing reply (`unparsed_samples`), only for public repositories and data classes and only when the
-  text passes the OPSEC and secret scans; `missing_result` has no sample, and `/metrics` never carries one. The approval rate uses parsed verdicts,
+  `result_sha256`), `too_big` (over 4 MB, not read whole), `bad_format` (not UTF-8 or no review JSON),
+  `bad_fields` (review JSON that breaks the review contract), `not_done` (the task did not finish `done`) and
+  `unknown` (a row written before the split). The HTTP route also gives, per model and reason, the first 200
+  escaped characters of the earliest failing reply (`unparsed_samples`): only for public repositories and data
+  classes, only for a reply of at most 16 KiB, and only when no OPSEC or secret match in the whole reply starts
+  inside those characters. `missing_result` and `too_big` have no sample, and `/metrics` never carries one.
+  The approval rate uses parsed verdicts,
   while findings rates use results with a recorded findings count. A verdict alone leaves the findings count
   unknown. The author figures and first-round matrix use **reviews of record**, which name the PR and the
   author's model.

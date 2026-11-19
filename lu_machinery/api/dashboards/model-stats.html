@@ -163,7 +163,7 @@ function reviewRow(r, kind) {
   const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(notDone)}`
     + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(totalUnparsed)}`
-    + `${reasonCell(u.missing_result)}${reasonCell(u.too_big, samples.too_big)}`
+    + `${reasonCell(u.missing_result)}${reasonCell(u.too_big)}`
     + `${reasonCell(u.bad_format, samples.bad_format)}${reasonCell(u.bad_fields, samples.bad_fields)}`
     + `${cell(pct(r.approve_rate) + ` (n=${r.approve_rate.n})`)}`
     + `${cell(rate(r.blocking_per_review))}${cell(rate(r.p0_p2_per_review) + ` (n=${r.p0_p2_per_review.n})`)}`

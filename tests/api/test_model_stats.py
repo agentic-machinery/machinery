@@ -248,6 +248,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
         {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "bidi\u202e"}},
         {**base_row, "review": {"verdict": "unparsed", "priorities": None, "unparsed_reason": "bad_format", "unparsed_sample": "/home/ops/secret"}},
         {**base_row, "data_class": "private-code"},
+        {**base_row, "data_class": ["private-code"]},
         {**base_row, "review": {"verdict": "correct", "priorities": {}, "unparsed_reason": "bad_format", "unparsed_sample": None}},
     ]
     assert all(not rows._well_formed(bad) for bad in bad_rows)
@@ -258,8 +259,8 @@ def test_each_sidecar_outcome_yields_one_review_and_never_carries_older_evidence
     from an earlier sidecar survives a sidecar that is now absent, a link, a special file, unreadable or replaced."""
     batch_state, tasks = _state(tmp_path)
     monkeypatch.setattr(rows, "MAX_RESULT_BYTES", 128)
-    monkeypatch.setattr(rows, "MAX_DIGEST_STREAM_BYTES", 256)  # a sample comes from the 129 bytes read
-    body, big, huge = b"prose reply, not JSON", b"BIG\n" + b"A" * 156, b"HUGE\n" + b"A" * 300
+    monkeypatch.setattr(rows, "MAX_SAMPLE_SCAN_BYTES", 64)
+    body, big, long_prose = b"prose reply, not JSON", b"BIG\n" + b"A" * 156, b"long prose " * 9
     gone = {"verdict": "unparsed", "priorities": None, "unparsed_reason": "missing_result", "unparsed_sample": None}
 
     def sampled(reason: str, sample: str | None) -> dict:
@@ -288,11 +289,10 @@ def test_each_sidecar_outcome_yields_one_review_and_never_carries_older_evidence
         "unreadable": (unreadable, {}, gone),
         "replaced-bytes": (lambda p: p.write_bytes(b"replacement"), {"result_sha256": hashlib.sha256(body).hexdigest()},
                            gone),
-        "too-big": (lambda p: p.write_bytes(big), {}, sampled("too_big", r"BIG\n" + "A" * 125)),
-        "too-big-digested": (lambda p: p.write_bytes(big), {"result_sha256": hashlib.sha256(big).hexdigest()},
-                             sampled("too_big", r"BIG\n" + "A" * 125)),
-        "digest-cap": (lambda p: p.write_bytes(huge), {"result_sha256": hashlib.sha256(huge).hexdigest()},
-                       sampled("too_big", None)),
+        "over-scan-budget": (lambda p: p.write_bytes(long_prose), {}, sampled("bad_format", None)),
+        "too-big": (lambda p: p.write_bytes(big), {}, sampled("too_big", None)),
+        "too-big-replaced": (lambda p: p.write_bytes(big), {"result_sha256": hashlib.sha256(body).hexdigest()},
+                             sampled("too_big", None)),
     }
     for outcome, (_, fields, _) in table.items():
         _record(tasks, f"{outcome}-review", mode="read-only", **fields)

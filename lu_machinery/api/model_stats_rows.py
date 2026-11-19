@@ -56,8 +56,9 @@ ROWS_DIR = "model-stats"
 ROWS_FILE = "rows.jsonl"
 LOCK_FILE = "rows.lock"
 MAX_RESULT_BYTES = 4 * 1024 * 1024
-MAX_DIGEST_STREAM_BYTES = 256 * 1024 * 1024
 MAX_SAMPLE_CHARS = 200
+# A reply is scanned whole before any of it is shown; a longer one gives no sample, so a scan stays short.
+MAX_SAMPLE_SCAN_BYTES = 16 * 1024
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
 UNPARSED_REASONS = ("missing_result", "too_big", "bad_format", "bad_fields")
@@ -351,6 +352,8 @@ def _sample(raw: bytes) -> str | None:
     The scans run over the whole reply as read, never the cut prefix alone: a credential or host detail that starts
     in the prefix and ends past the cut is found in full, and any match that starts in the prefix withholds it.
     """
+    if len(raw) > MAX_SAMPLE_SCAN_BYTES:
+        return None
     text = raw.decode("utf-8", errors="replace")
     prefix = text[:MAX_SAMPLE_CHARS]
     redacted = redact_text(text) or ""
@@ -385,24 +388,12 @@ def _sidecar_path(path: Path, record: Mapping[str, Any]) -> Path | None:
     return path.with_name(expected_name)
 
 
-def _digest_matches(initial: bytes, stream: Any, expected: str) -> bool | None:
-    """Whether the whole sidecar hashes to ``expected``, read in bounded chunks; None past the digest cap."""
-    hasher = hashlib.sha256(initial)
-    total = len(initial)
-    while chunk := stream.read(65536):
-        total += len(chunk)
-        if total > MAX_DIGEST_STREAM_BYTES:
-            return None
-        hasher.update(chunk)
-    return hasher.hexdigest() == expected
-
-
 def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
     """Verdict and finding priorities from the record's bound ``.result`` sidecar, or a typed unparsed cause.
 
     Only a regular file, opened without following a link, whose bytes match the record's ``result_sha256`` (when
     declared) is a result. Anything else (absent, a symlink, directory, socket or FIFO, unreadable, replaced bytes)
-    is ``missing_result`` with no sample. A reply past the digest cap is ``too_big`` with no sample.
+    is ``missing_result`` with no sample. A file past ``MAX_RESULT_BYTES`` is not read whole: ``too_big``, no sample.
     """
     sidecar = _sidecar_path(path, record)
     expected = record.get("result_sha256")
@@ -417,17 +408,15 @@ def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
             return _unparsed("missing_result")
         with os.fdopen(fd, "rb", closefd=False) as stream:
             raw = stream.read(MAX_RESULT_BYTES + 1)
-            verified = True if expected is None else _digest_matches(raw, stream, expected)
     except OSError:
         return _unparsed("missing_result")
     finally:
         os.close(fd)
-    if verified is False:
-        return _unparsed("missing_result")
-    allow_sample = verified is True and _record_allows_sample(record)
     if len(raw) > MAX_RESULT_BYTES:
-        return _unparsed("too_big", _sample(raw) if allow_sample else None)
-    return review_summary(raw, allow_sample=allow_sample)
+        return _unparsed("too_big")
+    if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
+        return _unparsed("missing_result")
+    return review_summary(raw, allow_sample=_record_allows_sample(record))
 
 
 def _recorded_review(verdict: object) -> dict[str, Any] | None:
@@ -731,8 +720,8 @@ def _review_ok(review: object, *, role: object, status: object, repo: object, da
     if not isinstance(reason, str) or reason not in UNPARSED_REASONS:
         return False
     # The writer's eligibility rule again: a public repository, and a catalogued public data class when one is named.
-    if reason == "missing_result" or not _repo_is_public(repo) or (
-            data_class is not None and data_class not in _public_data_classes()):
+    if reason in ("missing_result", "too_big") or not _repo_is_public(repo) or (
+            data_class is not None and (not isinstance(data_class, str) or data_class not in _public_data_classes())):
         return sample is None
     return _optional(sample, _sample_ok)
 
@@ -851,8 +840,8 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
         written = []
         for source, record, row in candidates:
             stored = present.get(row["task_id"])
-            if stored is not None and stored.get("source_mtime_ns") == row["source_mtime_ns"] and _stale(stored, row):
-                # The stored row may come from a reading newer than this run's: read the sidecar again, under the lock.
+            if row["review"] is not None and _stale(stored, row):
+                # Another writer may have stored a newer reading since: every review row written is read under the lock.
                 row = summary_row(source, record, row["source_mtime_ns"]) or row  # the same record gives a row again
             if _stale(stored, row):
                 written.append(row)
