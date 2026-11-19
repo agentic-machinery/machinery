@@ -656,11 +656,11 @@ def _prs(rows: Iterable[_Row]) -> list[dict[str, Any]]:
         if row.review is None or row.author is None or (row.review[0] == "unparsed" and row.published is None):
             continue
         entry = prs[(str(row.raw.get("repo") or "public"), str(row.raw.get("pr")))]
-        entry["authors"].add(row.author)
         head = row.raw.get("pinned_head") or row.task_id
         review = (row.started or never, row.task_id, row.review[0], row.review[1], row.model, row.task_class,
                   row.moment)
         if row.review[0] != "unparsed":
+            entry["authors"].add(row.author)
             entry["heads"][head].append(review)
         if row.published is not None:
             entry["record"][head].append((*review[:2], _OF_RECORD[row.published], *review[3:]))

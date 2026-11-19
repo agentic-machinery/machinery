@@ -3027,12 +3027,12 @@ def _store_publication(task_root: Path, *, repository: str, number: int, comment
     """
     from lu_machinery.api import model_stats_rows
 
-    entry, reason = publication_of(repository, number, comment)
-    if entry is None:
-        return f"not stored: {reason}"
     try:
+        entry, reason = publication_of(repository, number, comment)
+        if entry is None:
+            return f"not stored: {reason}"
         model_stats_rows.record_publications(task_root.parent, [entry], wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:  # the verdict is already published; name the failure, never raise past it
         return f"failed: {type(exc).__name__}; store it with: {_recovery_command(repository, number)}"
     return "stored"
 
@@ -3155,11 +3155,13 @@ def import_publications_main(argv: list[str]) -> int:
     if (args.repository is None) != (args.pr is None) or (args.pr is not None and (
             args.pr < 1 or not REPOSITORY_SLUG.fullmatch(args.repository))):
         parser.error("--repository owner/name and --pr N go together, with a PR number of at least 1")
+    from lu_machinery.common.github_client import GitHubRateLimited
+
     try:
         counts = import_publications(
             days=args.days, dry_run=args.dry_run, only=None if args.pr is None else (args.repository, args.pr),
         )
-    except (RecordError, SweepError, FleetRepoError, OSError) as exc:
+    except (RecordError, SweepError, FleetRepoError, GitHubRateLimited, OSError, ValueError) as exc:
         print(f"publication import refused: {type(exc).__name__}: {exc}")
         return 1
     print(json.dumps(counts, sort_keys=True))
@@ -3565,9 +3567,6 @@ def record(
             record_consumption(
                 _repair_receipts(task_root), repair, comment=str(posted_comment["id"] if posted else existing.get("id"))
             )
-        publication_marker = _store_publication(
-            task_root, repository=repository, number=number, comment=posted_comment if posted else existing or {},
-        )
         state = "failure"
         pending_reason = ""
         if verdict == "APPROVED" or (chunk is not None and chunk.void):
@@ -3627,6 +3626,10 @@ def record(
             status = "posted"
         except Exception as exc:
             status = f"failed: {exc}"
+        # After the status, so a marker problem never stands between the verdict and its status.
+        publication_marker = _store_publication(
+            task_root, repository=repository, number=number, comment=posted_comment if posted else existing or {},
+        )
     result = {
         "pr": number,
         "head": sha,
