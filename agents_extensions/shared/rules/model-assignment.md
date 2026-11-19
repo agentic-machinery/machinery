@@ -34,7 +34,8 @@ handles consultation.
 or Gemini with the Sources MCP. Review and judging seats are GPT or Gemini. Review of historical
 Grok-authored work stays cross-family and non-xAI.
 Critical and security final sign-off retain the review admission limits above.
-`review_scheduler.risk_reviewer_models` admits Opus 5.5 and Sol 6.2 at high;
+`review_scheduler.risk_reviewer_models` admits Sol 6.2, Opus 5.5 and Gemini 4 Neon at high
+(GEMINI-TIERS-1119);
 critical eligibility requires the catalog's `critical_review` role. These eligibility gates
 apply to automatic ladders, explicit pins, custom ladders and surviving reviewer admission.
 The legacy force-agent and budget substitution switches are retired. DeepSeek V4.1 Flash coding
