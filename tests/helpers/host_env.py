@@ -26,9 +26,10 @@ A module opts in by importing the fixture; it is autouse, so it runs before the 
 An exported setting is one whose current value is the value this process inherited (``/proc/self/environ``). The
 values the suite publishes itself, such as the telemetry redirect, scratch root and task store, differ from the
 inherited ones and stay, so a child never loses a redirect and writes to production. Equal values cannot show who
-set a variable, so two kinds of name are never dropped: ``SUITE_PUBLISHED``, which the shared autouse fixtures that
-run before this one set for every test (whatever the caller exported), and the ``LU_TEST_*`` switches, which only a
-test harness sets (CI passes ``LU_TEST_WHEEL``). The test interpreter (``LEARN_UKRAINIAN_PYTHON``) is set to this
+set a variable, so the names in ``SUITE_PUBLISHED`` are never dropped: the suite publishes each of them for every
+test, whatever the caller exported. Every other caller value goes, ``LU_TEST_*`` harness settings included: a
+caller's test-slot pool (``LU_TEST_SLOTS_DIR``) would otherwise steer a sandbox child's dispatch admission to that
+pool. The test interpreter (``LEARN_UKRAINIAN_PYTHON``) is set to this
 interpreter, so a test needs no caller-provided value. ``monkeypatch`` restores everything after the test.
 """
 
@@ -46,15 +47,16 @@ GIT_PREFIX = "GIT_"
 XDG_PREFIX = "XDG_"
 CONFIG_DIR_VARIABLES = ("CODEX_HOME", "CLAUDE_CONFIG_DIR")
 EXPORTED_PREFIXES = ("LU_", "LEARN_UKRAINIAN_", "AGENT_", "PYTHON")
-HARNESS_SWITCH_PREFIX = "LU_TEST_"
-# Constant values that tests/conftest.py publishes for every test before this fixture runs: the session fixture
-# ``no_free_disk_floor`` and the autouse ``_no_host_claude_default_account``, ``_no_host_usage_cache`` and
-# ``_hermetic_dispatch_admission_host`` (the last is also a ``LU_TEST_*`` switch).
+# Values tests/conftest.py publishes for every test before this fixture runs that can equal an inherited value: the
+# constants of the session fixture ``no_free_disk_floor`` and of the autouse ``_no_host_claude_default_account``,
+# ``_no_host_usage_cache`` and ``_hermetic_dispatch_admission_host``, and the write-guard anchor
+# ``_protected_store_paths`` sets once and xdist workers and nested sessions inherit on purpose.
 SUITE_PUBLISHED = frozenset({
     "LU_EVIDENCE_FREE_DISK_FLOOR_BYTES",
     "LU_CLAUDE_DEFAULT_ACCOUNT_FILE",
     "LU_USAGE_CACHE_FILE",
     "LU_TEST_DISPATCH_HEALTHY_HOST",
+    "LU_TEST_PROTECTED_STORES",
 })
 INTERPRETER_VARIABLE = "LEARN_UKRAINIAN_PYTHON"
 
@@ -74,7 +76,7 @@ def inherited_environment() -> dict[str, str]:
 
 def caller_exported(name: str, value: str, inherited: dict[str, str]) -> bool:
     """True for a machinery, shim or Python setting that still holds the caller's value and the suite does not own."""
-    if not name.startswith(EXPORTED_PREFIXES) or name in SUITE_PUBLISHED or name.startswith(HARNESS_SWITCH_PREFIX):
+    if not name.startswith(EXPORTED_PREFIXES) or name in SUITE_PUBLISHED:
         return False
     return inherited.get(name) == value
 
