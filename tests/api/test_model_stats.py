@@ -54,6 +54,8 @@ def test_model_value_sections_explain_how_to_read_the_figures():
         "Reviews": ("includes settled reviews", "fewer unreadable or unfinished results"),
         "Compare reviewer levels": ("readable results, first-round approval", "lower time or allowance cost"),
         "Reviewed PRs": ("reviewed PRs for the shown authors", "higher first-round approval and fewer rounds"),
+        "Reviewer accuracy": ("counts as fixed when the author changed its file", "check the settled count"),
+        "Authors by risk tier": ("risk tier of each PR's first review", "Compare authors within one tier"),
     }
     for section, phrases in explanations.items():
         rendered = next(fragment for fragment in sections if f"<h2>{section}" in fragment
