@@ -230,7 +230,7 @@ def test_overview_caches_plane_root_without_repeated_git_rev_parse(
     """Defect class: GET /api/fleet/overview spawns git rev-parse twice per request when FLEET_COMMS_ROOT is unset."""
     state_repo = tmp_path / "state-repo"
     state_repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(state_repo)], check=True)
+    subprocess.run(["git", "init", "-q", str(state_repo)], check=True, timeout=15)
     plane_root = state_repo / "batch_state" / "fleet-comms" / "v1"
     _seed_plane_db(plane_root)
 
