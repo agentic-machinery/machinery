@@ -420,7 +420,9 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return summary, "write_boundary_unproven: the receipt names another mode"
     if receipt.get("status") != "ran" or not summary["canary_passed"]:
         return summary, f"write_boundary_refused: {receipt.get('reason') or receipt.get('status')}"
-    imported = receipt.get("import") if isinstance(receipt.get("import"), dict) else {}
+    imported = receipt.get("import")
+    if not isinstance(imported, dict):
+        imported = {}
     # Only a write run (Savant's) can leave a draft patch; every other run changes nothing.
     if imported.get("status") not in ("unchanged", *(("drafted",) if mode == "workspace-write" else ())):
         reason = f": {imported['reason']}" if isinstance(imported.get("reason"), str) else ""
