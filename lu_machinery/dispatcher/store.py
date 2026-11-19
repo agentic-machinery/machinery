@@ -8,6 +8,7 @@ import re
 import subprocess
 import unicodedata
 import uuid
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 
@@ -21,8 +22,10 @@ from lu_machinery.orchestration.task_record_store import (
     iter_task_records,
     locate_task_record,
     misnamed_record_refusal,
-    read_task_record,
+    parse_task_record,
+    read_task_record_bytes,
     relocated_result_file,
+    task_archive_lock,
     task_state_lock,
 )
 
@@ -550,26 +553,33 @@ def begin_settlement(record: dict) -> None:
 
 def list_tasks(status: str | None = None, include_archive=False, *, strict=False) -> list[dict]:
     root = tasks_dir()
-    paths = iter_task_records(root, include_archive=include_archive)
     records = []
-    for path in paths:
-        try:
-            record = read_task_record(path)
-            if record is None or "task_id" not in record:
+    relocated = set()
+    with task_archive_lock(root) if strict else nullcontext():
+        for listed in iter_task_records(root, include_archive=include_archive):
+            if listed in relocated:
                 continue
-            if status is None or record.get("status") == status:
-                if relocated_result_file:
-                    record["result_file"] = relocated_result_file(path, record.get("result_file"))
-                records.append(record)
-        except TaskIdentityMismatch as exc:
-            # An exact copy of the named record is no run of its own; any other misnamed file refuses.
-            if strict and not is_identical_copy(exc):
-                raise ValueError(
-                    f"unreadable task record {path}; review attempt reuse cannot be excluded; "
-                    f"{misnamed_record_refusal(path)}"
-                ) from None
-        except (OSError, ValueError):
-            if strict:
-                raise ValueError(f"unreadable task record {path}; review attempt reuse cannot be excluded") from None
-            continue
+            try:
+                path, raw = read_task_record_bytes(listed, tasks_dir=root)
+                if path != listed:
+                    relocated.add(path)
+                    if not include_archive:
+                        continue
+                record = parse_task_record(path, raw)
+                if record is None or "task_id" not in record:
+                    continue
+                if status is None or record.get("status") == status:
+                    if relocated_result_file:
+                        record["result_file"] = relocated_result_file(path, record.get("result_file"))
+                    records.append(record)
+            except TaskIdentityMismatch as exc:
+                # An exact copy of the named record is no run of its own; any other misnamed file refuses.
+                if strict and not is_identical_copy(exc):
+                    raise ValueError(
+                        f"unreadable task record {exc.path}; review attempt reuse cannot be excluded; "
+                        f"{misnamed_record_refusal(exc.path)}"
+                    ) from None
+            except (OSError, ValueError):
+                if strict:
+                    raise ValueError(f"unreadable task record {listed}; review attempt reuse cannot be excluded") from None
     return records

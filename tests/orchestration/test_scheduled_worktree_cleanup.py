@@ -1927,6 +1927,27 @@ def test_terminal_record_without_worktree_is_skipped(rescue_repo, monkeypatch, s
     assert result["rescue"] == {"summary": {"candidate": 0}, "tasks": []}
 
 
+def test_rescue_report_survives_a_listed_terminal_record_moving(tmp_path, monkeypatch):
+    """Defect class: archiving a listed terminal task yields a false rescue error."""
+    monkeypatch.setattr(cleanup.worktree_git, "control_plane_root", lambda repo: repo)
+    tasks = tmp_path / "batch_state" / "tasks"
+    hot = tasks / "retired.json"
+    archived = tasks / "archive" / hot.name
+    archived.parent.mkdir(parents=True)
+    hot.write_text(json.dumps({"task_id": "retired", "status": "done"}))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    assert cleanup.report_terminal_worktrees(tmp_path) == {"summary": {"candidate": 0}, "tasks": []}
+    assert archived.is_file()
+
+
 @pytest.mark.parametrize("failure", ["json", "recursion", "path_type", "read", "git", "finished_at"])
 def test_rescue_read_errors_reach_caller_without_crashing(rescue_repo, monkeypatch, failure: str) -> None:
     """Defect classes: unreadable records, failed Git probes, and suppressed unknown finish metadata on real targets."""

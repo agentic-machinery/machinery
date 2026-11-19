@@ -96,7 +96,8 @@ from lu_machinery.orchestration.task_record_store import (
     TaskIdentityMismatch,
     is_identical_copy,
     misnamed_record_refusal,
-    read_task_record,
+    read_listed_task_record,
+    task_archive_lock,
 )
 from lu_machinery.publish.github import CfVerdictRecord, Request, request_run
 from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT, listing_app_bot_login, verified_app_bot_login
@@ -724,16 +725,20 @@ def _attribute_trailer(commit_sha: str | None, trailer: str, *, repository: str,
         raise RecordError("author model unknown")
     # Task provenance wins over family tokens embedded in the trailer's task id.
     task_file = None
-    if TASK_ID.fullmatch(model):
-        task_file = _hot_or_archived(task_root, f"{model}.json")
-        if not task_file.resolve().is_relative_to(task_root.resolve()):
-            raise RecordError("author task provenance unavailable")
-    if task_file is not None and task_file.exists():
-        # Resolve the recorded model only after validating the task provenance.
+    # Release parsing uses os.devnull when no task store is configured.
+    if TASK_ID.fullmatch(model) and task_root != Path(os.devnull):
         try:
-            author_task = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
+            with task_archive_lock(task_root):
+                candidate = _hot_or_archived(task_root, f"{model}.json")
+                if not candidate.resolve().is_relative_to(task_root.resolve()):
+                    raise RecordError("author task provenance unavailable")
+                if candidate.exists():
+                    task_file = candidate
+                    author_task = json_depth.loads(task_file.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
         except (OSError, ValueError) as exc:
             raise RecordError("author task provenance unavailable") from exc
+    if task_file is not None:
+        # Resolve the recorded model only after validating the task provenance.
         if (
             not isinstance(author_task, dict)
             or author_task.get("repository") != repository
@@ -1572,52 +1577,56 @@ def admitted_unknown_history(
     """
     allowed: set[str] = set()
     deadline = time.monotonic() + BRANCH_FACTS_TIMEOUT_S
+    receipts = []
     try:
-        paths = (*task_root.glob("*.json"), *(task_root / ARCHIVE_DIR_NAME).glob("*.json"))
+        with task_archive_lock(task_root):
+            paths = (*task_root.glob("*.json"), *(task_root / ARCHIVE_DIR_NAME).glob("*.json"))
+            for path in paths:
+                try:
+                    task = read_listed_task_record(path, tasks_dir=task_root)
+                except TaskIdentityMismatch as exc:
+                    # An exact copy of the named record adds nothing; any other misnamed file refuses.
+                    if is_identical_copy(exc):
+                        continue
+                    raise BranchFactsError(
+                        FACTS_AUTHORSHIP_UNKNOWN, f"task record {path} unreadable; {misnamed_record_refusal(path)}"
+                    ) from exc
+                except (OSError, ValueError) as exc:
+                    raise BranchFactsError(FACTS_AUTHORSHIP_UNKNOWN, f"task record {path} unreadable") from exc
+                if not isinstance(task, dict) or task.get("status") == "dry_run":
+                    continue
+                receipt = task.get("authoring_review_admission")
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("repository") != repository
+                    or receipt.get("head_branch") != branch
+                ):
+                    continue
+                if receipt.get("review_plan") != "red_team" or not receipt.get("unknown_history") or receipt.get("refusal"):
+                    continue
+                history = receipt["unknown_history"]
+                admitted = receipt.get("head_sha")
+                remote = receipt.get("history_remote_head_sha")
+                reviewer = receipt.get("reviewer")
+                if (
+                    receipt.get("check") != "structural"
+                    or receipt.get("applicable") is not True
+                    or "assumed_model" not in receipt
+                    or receipt["assumed_model"] is not None
+                    or not isinstance(reviewer, dict)
+                    or reviewer.get("review_mode") != "red_team"
+                    or not isinstance(history, list)
+                    or not all(isinstance(sha, str) and SHA.fullmatch(sha) for sha in history)
+                    or not isinstance(admitted, str)
+                    or not SHA.fullmatch(admitted)
+                    or not isinstance(remote, str)
+                    or not SHA.fullmatch(remote)
+                ):
+                    raise BranchFactsError(FACTS_AUTHORSHIP_UNKNOWN, "historical authorship admission receipt malformed")
+                receipts.append((history, admitted, remote))
     except OSError as exc:
         raise BranchFactsError(FACTS_AUTHORSHIP_UNKNOWN, "RED_TEAM_REFUSED: task ledger unavailable") from exc
-    for path in paths:
-        try:
-            task = read_task_record(path)
-        except TaskIdentityMismatch as exc:
-            # An exact copy of the named record adds nothing; any other misnamed file refuses.
-            if is_identical_copy(exc):
-                continue
-            raise BranchFactsError(
-                FACTS_AUTHORSHIP_UNKNOWN, f"task record {path} unreadable; {misnamed_record_refusal(path)}"
-            ) from exc
-        except (OSError, ValueError) as exc:
-            raise BranchFactsError(FACTS_AUTHORSHIP_UNKNOWN, f"task record {path} unreadable") from exc
-        if not isinstance(task, dict) or task.get("status") == "dry_run":
-            continue
-        receipt = task.get("authoring_review_admission")
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("repository") != repository
-            or receipt.get("head_branch") != branch
-        ):
-            continue
-        if receipt.get("review_plan") != "red_team" or not receipt.get("unknown_history") or receipt.get("refusal"):
-            continue
-        history = receipt["unknown_history"]
-        admitted = receipt.get("head_sha")
-        remote = receipt.get("history_remote_head_sha")
-        reviewer = receipt.get("reviewer")
-        if (
-            receipt.get("check") != "structural"
-            or receipt.get("applicable") is not True
-            or "assumed_model" not in receipt
-            or receipt["assumed_model"] is not None
-            or not isinstance(reviewer, dict)
-            or reviewer.get("review_mode") != "red_team"
-            or not isinstance(history, list)
-            or not all(isinstance(sha, str) and SHA.fullmatch(sha) for sha in history)
-            or not isinstance(admitted, str)
-            or not SHA.fullmatch(admitted)
-            or not isinstance(remote, str)
-            or not SHA.fullmatch(remote)
-        ):
-            raise BranchFactsError(FACTS_AUTHORSHIP_UNKNOWN, "historical authorship admission receipt malformed")
+    for history, admitted, remote in receipts:
         ancestors = set(
             _facts_git(
                 repo_root,
@@ -2084,12 +2093,11 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
     """
     if not REVIEW_TASK_ID.fullmatch(task_id) or ".." in task_id:
         raise RecordError("invalid canonical task identity")
-    task_path = _hot_or_archived(task_root, f"{task_id}.json")
-    # An archived review keeps its reply beside its record.
-    result_path = task_path.with_suffix(".result")
     try:
-        task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
-        raw_reply = result_path.read_bytes()
+        with task_archive_lock(task_root):
+            task_path = _hot_or_archived(task_root, f"{task_id}.json")
+            task = json_depth.loads(task_path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)
+            raw_reply = task_path.with_suffix(".result").read_bytes()
     except (OSError, ValueError) as exc:
         raise RecordError("review task record or reply unavailable") from exc
     if not isinstance(task, dict):
@@ -2744,70 +2752,71 @@ def budget_admission(
 def require_no_outside_review_in_flight(task_root: Path, repository: str, sha: str) -> None:
     """Read the active task ledger before red-team admission or publication."""
     try:
-        # The shared iterator suppresses enumeration errors. Read locally so
-        # both an unreadable directory and a failed glob refuse this guard.
-        list(task_root.iterdir())
-        for path in sorted(path for path in task_root.glob("*.json") if path.is_file()):
-            try:
-                task = read_task_record(path)
-            except TaskIdentityMismatch as exc:
-                # An exact copy of the named record adds nothing; any other misnamed file refuses.
-                if is_identical_copy(exc):
+        with task_archive_lock(task_root):
+            # The shared iterator suppresses enumeration errors. Read locally so
+            # both an unreadable directory and a failed glob refuse this guard.
+            list(task_root.iterdir())
+            for path in sorted(path for path in task_root.glob("*.json") if path.is_file()):
+                try:
+                    task = read_listed_task_record(path, tasks_dir=task_root)
+                except TaskIdentityMismatch as exc:
+                    # An exact copy of the named record adds nothing; any other misnamed file refuses.
+                    if is_identical_copy(exc):
+                        continue
+                    raise RecordError(
+                        f"RED_TEAM_REFUSED: task ledger unavailable; {misnamed_record_refusal(path)}"
+                    ) from exc
+                if task is None:
                     continue
-                raise RecordError(
-                    f"RED_TEAM_REFUSED: task ledger unavailable; {misnamed_record_refusal(path)}"
-                ) from exc
-            if task is None:
-                continue
-            if any(task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")):
-                continue
-            prep = task.get("worktree_prep")
-            prep_sha = prep.get("base_sha") if isinstance(prep, dict) else None
-            prep_matches = (
-                isinstance(prep_sha, str)
-                and SHA.fullmatch(prep_sha.casefold())
-                and prep_sha.casefold() == sha.casefold()
-            )
-            # Prep rows lack review typing and repository metadata. Fail closed:
-            # even non-review dispatches preparing this head briefly block red-team.
-            review = (
-                task.get("review")
-                or task.get("pr") is not None
-                or task.get("review_attempt")
-                or task.get("require_review_verdict")
-                or task.get("review_profile")
-                or task.get("review_author_model")
-                or task.get("review_risk")
-                or task.get("type") == "review"
-            )
-            if (
-                (review or prep_matches)
-                and (
-                    (
-                        isinstance(task.get("repository"), str)
-                        and normalize_repository(task["repository"]) == normalize_repository(repository)
-                    )
-                    or (prep_matches and task.get("repository") is None)
+                if any(task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")):
+                    continue
+                prep = task.get("worktree_prep")
+                prep_sha = prep.get("base_sha") if isinstance(prep, dict) else None
+                prep_matches = (
+                    isinstance(prep_sha, str)
+                    and SHA.fullmatch(prep_sha.casefold())
+                    and prep_sha.casefold() == sha.casefold()
                 )
-                and task.get("status") in {"spawning", "running", "queued"}
-                and task.get("review_mode", "cross_family") != "red_team"
-                and (
-                    prep_matches
-                    or sha
-                    in {
-                        task.get(field)
-                        for field in (
-                            "pinned_head",
-                            "worktree_base_sha",
-                            "review_head",
-                            "review_head_sha",
-                            "pr_head_sha",
-                            "head_sha",
+                # Prep rows lack review typing and repository metadata. Fail closed:
+                # even non-review dispatches preparing this head briefly block red-team.
+                review = (
+                    task.get("review")
+                    or task.get("pr") is not None
+                    or task.get("review_attempt")
+                    or task.get("require_review_verdict")
+                    or task.get("review_profile")
+                    or task.get("review_author_model")
+                    or task.get("review_risk")
+                    or task.get("type") == "review"
+                )
+                if (
+                    (review or prep_matches)
+                    and (
+                        (
+                            isinstance(task.get("repository"), str)
+                            and normalize_repository(task["repository"]) == normalize_repository(repository)
                         )
-                    }
-                )
-            ):
-                raise RecordError("RED_TEAM_REFUSED: outside-family review in flight for this head")
+                        or (prep_matches and task.get("repository") is None)
+                    )
+                    and task.get("status") in {"spawning", "running", "queued"}
+                    and task.get("review_mode", "cross_family") != "red_team"
+                    and (
+                        prep_matches
+                        or sha
+                        in {
+                            task.get(field)
+                            for field in (
+                                "pinned_head",
+                                "worktree_base_sha",
+                                "review_head",
+                                "review_head_sha",
+                                "pr_head_sha",
+                                "head_sha",
+                            )
+                        }
+                    )
+                ):
+                    raise RecordError("RED_TEAM_REFUSED: outside-family review in flight for this head")
     except (OSError, ValueError, TypeError) as exc:
         raise RecordError("RED_TEAM_REFUSED: task ledger unavailable") from exc
 
@@ -3587,17 +3596,18 @@ def dispatch_budget_check(
         review_records,
     )
 
-    records = review_records(task_root, repository=repository)
-    if not records:
-        # No review of the repository on record, so no round is spent: round 1 fits every budget the
-        # policy can declare (1 at least) and nothing here depends on it. The verdict still reads it first.
-        return None
+    with task_archive_lock(task_root):
+        records = review_records(task_root, repository=repository)
+        if not records:
+            # No review of the repository on record, so no round is spent: round 1 fits every budget the
+            # policy can declare (1 at least) and nothing here depends on it. The verdict still reads it first.
+            return None
+        if number is None and branch is not None:
+            number = _open_pr_number(repository, branch)
+        elif number is not None and branch is None:
+            branch = _pr(repository, "", number)["headRefName"]
+        runs = lineage_runs(task_root, repository=repository, number=number, branch=branch, records=records)
     budget = repository_review_rounds(repository)
-    if number is None and branch is not None:
-        number = _open_pr_number(repository, branch)
-    elif number is not None and branch is None:
-        branch = _pr(repository, "", number)["headRefName"]
-    runs = lineage_runs(task_root, repository=repository, number=number, branch=branch, records=records)
     heads = dispatched_rounds(runs=runs, comments=(), login="")
     if len(heads) < budget:
         return None

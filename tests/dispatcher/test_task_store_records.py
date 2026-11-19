@@ -3,10 +3,11 @@
 import json
 import re
 import signal
+from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from lu_machinery.dispatcher import store, worker
-from lu_machinery.dispatcher.types import TaskSpec
+from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review import review_lineage
@@ -32,6 +33,36 @@ def admission_readers(root):
         ),
         lambda: recorder.require_no_outside_review_in_flight(root, "org/repo", HEAD),
     ]
+
+
+def test_strict_attempt_scan_keeps_a_moved_record_and_its_reply_once(tmp_path, monkeypatch):
+    """Defect class: archive relocation refuses attempt checks or counts one run twice."""
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path))
+    hot = tmp_path / "review.json"
+    archived = tmp_path / "archive" / hot.name
+    archived.parent.mkdir()
+    reply = hot.with_suffix(".result")
+    archived_reply = archived.with_suffix(".result")
+    reply.write_text("VERDICT: APPROVE")
+    binding = ReviewAttempt(review_id="review-id", attempt_id="attempt-id", manifest_sha256="b" * 64)
+    hot.write_text(json.dumps({
+        "task_id": "review", "schema_version": 2, "status": "done",
+        "review_attempt": binding, "result_file": str(reply),
+    }))
+    read_bytes = Path.read_bytes
+
+    def archive_before_read(path):
+        if path == hot and hot.exists():
+            hot.rename(archived)
+            reply.rename(archived_reply)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", archive_before_read)
+
+    records = store.list_tasks(include_archive=True, strict=True)
+    assert [(record["task_id"], record["result_file"]) for record in records] == [("review", str(archived_reply))]
+    with pytest.raises(ValueError, match="review attempt already spent"):
+        store.check_review_attempt(binding)
 
 
 @pytest.mark.parametrize("archived", [False, True])

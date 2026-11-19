@@ -13,6 +13,7 @@ import os
 import subprocess
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dead_worker_state, task_record_store, worktree_claims
 from lu_machinery.orchestration import stale_task_records as str_mod
+from lu_machinery.review import record_cf_verdict
 from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
@@ -998,6 +1000,100 @@ def test_archive_round_trip_moves_record_with_sidecars(tasks_dir):
     after = {key: value[0] for key, value in _snapshot(tasks_dir).items() if not key.endswith(".lock")}
     assert after == {key: value[0] for key, value in before.items()}
     assert task_record_store.locate_task_record(tasks_dir, "old-done") == tasks_dir / "old-done.json"
+
+
+@pytest.mark.parametrize("operation", ["archive", "restore"])
+def test_recorder_reads_a_complete_archive_group(tasks_dir, monkeypatch, operation):
+    """Defect class: publishing a record before its reply refuses verdict recording."""
+    hot = _terminal(tasks_dir, "review", worktree_branch="codex/topic")
+    hot.with_suffix(".result").write_text("VERDICT: APPROVE")
+    archived = tasks_dir / "archive" / hot.name
+    if operation == "restore":
+        assert str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)["actions"] == {"archived": 1}
+        source, destination = archived, hot
+    else:
+        source, destination = hot, archived
+
+    def move_record():
+        if operation == "restore":
+            return str_mod.restore_archived(tasks_dir, ["review"], apply=True)
+        return str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
+
+    staged = threading.Event()
+    reader_entered = threading.Event()
+    finish_move = threading.Event()
+    move = str_mod._move_no_replace
+    flock = fcntl.flock
+
+    def pause_before_publishing_reply(src, dst):
+        if dst == destination.with_suffix(".result"):
+            staged.set()
+            assert finish_move.wait(timeout=10)
+        return move(src, dst)
+
+    def observe_reader_lock(descriptor, operation):
+        if operation == fcntl.LOCK_SH:
+            reader_entered.set()
+        return flock(descriptor, operation)
+
+    monkeypatch.setattr(str_mod, "_move_no_replace", pause_before_publishing_reply)
+    monkeypatch.setattr(fcntl, "flock", observe_reader_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        archive = pool.submit(move_record)
+        try:
+            assert staged.wait(timeout=10)
+            assert destination.is_file() and not source.exists()
+            assert not destination.with_suffix(".result").exists()
+            if operation == "archive":
+                assert not source.with_suffix(".result").exists()
+            read = pool.submit(record_cf_verdict._task, "review", tasks_dir)
+            read.add_done_callback(lambda _: reader_entered.set())
+            assert reader_entered.wait(timeout=10)
+        finally:
+            finish_move.set()
+        action = "restored" if operation == "restore" else "archived"
+        assert archive.result(timeout=10)["actions"] == {action: 1}
+        record, response = read.result(timeout=10)
+    assert record["task_id"] == "review"
+    assert response == "VERDICT: APPROVE"
+
+
+def test_restore_rechecks_sidecars_published_by_a_concurrent_archive(tasks_dir, monkeypatch):
+    """Defect class: restore freezes an incomplete sidecar list while archive publishes a reply."""
+    hot = _terminal(tasks_dir, "review", worktree_branch="codex/topic")
+    hot.with_suffix(".result").write_text("VERDICT: APPROVE")
+    archived_reply = tasks_dir / "archive" / "review.result"
+    reply_staged = threading.Event()
+    restore_started = threading.Event()
+    finish_archive = threading.Event()
+    move = str_mod._move_no_replace
+    restore_group = str_mod._restore_group
+
+    def pause_archive_reply(source, destination):
+        if destination == archived_reply:
+            reply_staged.set()
+            assert finish_archive.wait(timeout=10)
+        return move(source, destination)
+
+    def observe_restore(*args, **kwargs):
+        restore_started.set()
+        return restore_group(*args, **kwargs)
+
+    monkeypatch.setattr(str_mod, "_move_no_replace", pause_archive_reply)
+    monkeypatch.setattr(str_mod, "_restore_group", observe_restore)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        archive = pool.submit(str_mod.archive_terminal, tasks_dir, now=NOW, apply=True)
+        try:
+            assert reply_staged.wait(timeout=10)
+            restore = pool.submit(str_mod.restore_archived, tasks_dir, ["review"], apply=True)
+            assert restore_started.wait(timeout=10)
+        finally:
+            finish_archive.set()
+        assert archive.result(timeout=10)["actions"] == {"archived": 1}
+        assert restore.result(timeout=10)["records"][0]["files"] == ["review.json", "review.result"]
+
+    record, reply = record_cf_verdict._task("review", tasks_dir)
+    assert (record["task_id"], reply) == ("review", "VERDICT: APPROVE")
 
 
 def test_archive_preserves_stable_lock_anchors(tasks_dir):
