@@ -588,6 +588,77 @@ def setup_record(monkeypatch, tmp_path, **kwargs):
     return result
 
 
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+@pytest.mark.parametrize(
+    "risk,path,default_cap",
+    [
+        ("low", "tests/example.py", 2),
+        ("medium", "lu_machinery/common/unit.py", 3),
+        ("high", ".github/workflows/ci.yml", 3),
+        ("critical", "lu_machinery/review/record_cf_verdict.py", 3),
+    ],
+)
+@pytest.mark.parametrize("override", [None, 1, 5], ids=["default", "lower-override", "higher-override"])
+@pytest.mark.parametrize("exhausted", [False, True], ids=["below-cap", "at-cap"])
+def test_round_cap_applies_to_preflight_dispatch_and_record(
+    monkeypatch, tmp_path, capsys, risk, path, default_cap, override, exhausted,
+):
+    """Defect class: one admission entry point permits a review beyond the PR's round cap."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from lu_machinery.dispatcher import checks
+    from tests.review.record_support import BRANCH, REPOSITORY, facts_for, recorded_verdict
+
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    facts = facts_for({"google"}, changed_paths=(path,))
+    facts = replace(facts, commits=tuple(replace(commit, task_id="agy/author") for commit in facts.commits))
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts)
+    monkeypatch.setattr(
+        recorder.GitHubAdapter, "pr_file_rows", lambda *_a: [{"filename": path, "status": "modified"}],
+    )
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    policy = tmp_path / "review-budget.yaml"
+    repositories = {REPOSITORY.upper(): {"review_rounds": override}} if override is not None else {}
+    policy.write_text(json.dumps({"version": 1, "repositories": repositories}))
+    monkeypatch.setattr(recorder, "REVIEW_BUDGET_POLICY", policy)
+
+    cap = default_cap if override is None else override
+    spent = cap if exhausted else cap - 1
+    for round_number in range(1, spent + 1):
+        head = f"{round_number:040x}"
+        task_id = f"previous-{round_number}"
+        write_task(tasks, task_id=task_id, pr=42, worktree_base_sha=head, review_risk=risk,
+                   agent="claude", model="claude-opus-5-5", reply="VERDICT: REQUEST_CHANGES")
+        comments.append(recorded_verdict(head, "CHANGES_REQUESTED", task_id=task_id))
+
+    args = SimpleNamespace(pr=42, branch=BRANCH)
+    cli_status = recorder.budget_check_main(["--repository", REPOSITORY, "--pr", "42"])
+    preflight = json.loads(capsys.readouterr().out)
+    assert cli_status == int(exhausted)
+    assert preflight["admitted"] is not exhausted
+
+    if exhausted:
+        refusal = rf"REVIEW_BUDGET_EXHAUSTED: PR #42.*budget is {cap} rounds"
+        assert f"budget is {cap} rounds" in preflight["refusal"]
+        with pytest.raises(ValueError, match=refusal):
+            checks.check_review_budget(args, {"github": REPOSITORY}, SHA)
+    else:
+        assert (preflight["budget"], preflight["reviewed_heads"], preflight["unrecorded_rounds"]) == (cap, spent, [])
+        checks.check_review_budget(args, {"github": REPOSITORY}, SHA)
+
+    # The review task exists by publication time. Its own head must not count toward the cap.
+    write_task(tasks, pr=42, review_risk=risk, review_mode="cross_family")
+    if exhausted:
+        with pytest.raises(recorder.RecordError, match=refusal):
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert calls == {"posts": 0, "statuses": 0}
+    else:
+        published = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert published["verdict"] == "APPROVED"
+        assert calls == {"posts": 1, "statuses": 1}
+
+
 def captured_source_trace(tasks, *, task_id="review-one", tool="verify_word", arguments=None, output="VESUM"):
     """A provider's completed Sources event, separate from the reviewer's reply."""
     path = tasks / "logs" / f"{task_id}.stdout.log"
