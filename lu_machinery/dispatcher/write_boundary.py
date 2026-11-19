@@ -98,10 +98,13 @@ _MAX_PROBES_PER_DIRECTORY = 128
 _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_GITHUB_SLUG", "LEARN_UKRAINIAN_STATE_ROOT",
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
-    "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "GH_CONFIG_DIR",
-    "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
-
+    "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+    "XDG_CACHE_HOME", "XDG_DATA_HOME", "GH_CONFIG_DIR", "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
 })
+# A provider may point these at its own private, empty roots (the Savant route does). The launcher's host steps
+# (gh and the masks of its credential stores) always take the dispatcher's values, an empty value meaning unset;
+# the provider keeps its own.
+_HOST_ROOTS = frozenset({"XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"})
 
 # Native read-only reviewers use the host's login for named GitHub reads only.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
@@ -320,9 +323,15 @@ def launcher(spec, invocation, task_file: Path) -> list[str]:
         from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 
         argv += ["--runtime", str(dispatch_lease(spec.task_id))]
-    for name in sorted(_HOST_CONTEXT):
-        if os.environ.get(name) and name not in invocation.env:
-            argv += ["--host-env", f"{name}={os.environ[name]}"]
+    host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
+            if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
+    # The launcher starts with the provider's environment. Its own GitHub reads (the published address ranges, the
+    # github-read relay) use the dispatcher's gh login, never gh under a provider's private config root, where it
+    # reads anonymously and the client refuses it below the landing reserve. No GH_* variable reaches the provider.
+    host["GH_CONFIG_DIR"] = os.environ.get("GH_CONFIG_DIR") or str(
+        Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "gh")
+    for name in sorted(host):
+        argv += ["--host-env", f"{name}={host[name]}"]
     return [*argv, "--", str(Path(found).absolute()), *invocation.argv[1:]]
 
 
@@ -545,15 +554,17 @@ def _package_roots(path_env: str, executables: list[str]) -> list[Path]:
     return sorted(roots)
 
 
-def _pre_commit_store(home: Path) -> Path | None:
-    """pre-commit's hook store, found as pre-commit finds it: ``PRE_COMMIT_HOME``, else ``pre-commit`` below
-    ``XDG_CACHE_HOME`` or HOME's ``.cache``. None when the configured value is not absolute."""
-    store = os.environ.get("PRE_COMMIT_HOME") or os.path.join(os.environ.get("XDG_CACHE_HOME") or home / ".cache",
-                                                              "pre-commit")
+def _pre_commit_store(home: Path, env: dict[str, str]) -> Path | None:
+    """pre-commit's hook store, found as the provider's pre-commit finds it in ``env``: ``PRE_COMMIT_HOME``, else
+    ``pre-commit`` below ``XDG_CACHE_HOME`` or HOME's ``.cache``. None when the configured value is not absolute.
+
+    ``env`` is the provider's own environment, never the launcher's host context: a provider with a private cache
+    root has no host store restored."""
+    store = env.get("PRE_COMMIT_HOME") or os.path.join(env.get("XDG_CACHE_HOME") or home / ".cache", "pre-commit")
     return Path(store) if os.path.isabs(store) else None
 
 
-def _toolchain(home: Path, executable: str) -> list[Path]:
+def _toolchain(home: Path, executable: str, env: dict[str, str]) -> list[Path]:
     """Read-only restores below HOME and the data roots: the provider's toolchain and this launcher's own
     interpreter and installation (decision A4). Nothing of a provider's configuration is one of them.
 
@@ -562,7 +573,7 @@ def _toolchain(home: Path, executable: str) -> list[Path]:
     a hook whose environment is not installed fails the commit instead of installing one."""
     path_env = os.environ.get("PATH", os.defpath)
     candidates = [home / name for name in _HOME_TOOLCHAIN]
-    if (store := _pre_commit_store(home)) is not None:
+    if (store := _pre_commit_store(home, env)) is not None:
         candidates.append(store)
     candidates += [Path(entry) for entry in path_env.split(os.pathsep) if entry and os.path.isabs(entry)]
     candidates += _package_roots(path_env, [executable, sources_command()[0]])
@@ -648,11 +659,21 @@ def github_networks() -> tuple:
 
     from lu_machinery.common import github_client
 
+    why = "the reply lacks complete web, api, git and packages ranges"
     try:
         proc = github_client.run(["gh", "api", "meta"], capture_output=True, text=True, check=False, timeout=60)
         meta = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        meta = None
+        if proc.returncode:
+            # The client's typed refusal (for example github_rate_limited: core_below_landing_reserve), never gh's text.
+            try:
+                typed = json_depth.loads(proc.stdout or "{}", max_depth=8)
+            except ValueError:
+                typed = None
+            typed = typed if isinstance(typed, dict) else {}
+            code = ": ".join(str(typed[key])[:60] for key in ("error", "reason") if isinstance(typed.get(key), str))
+            why = f"gh api meta exited {proc.returncode}" + (f": {code}" if code else "")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        meta, why = None, f"gh api meta failed: {type(exc).__name__}"
     networks = []
     ranges: dict = meta if isinstance(meta, dict) else {}
     complete = all(isinstance(ranges.get(key), list) and ranges[key] for key in _GITHUB_META_KEYS)
@@ -663,7 +684,7 @@ def github_networks() -> tuple:
             except (TypeError, ValueError):
                 complete = False
     if not complete or not any(network.version == 4 for network in networks):
-        raise Refused("GitHub's published address ranges cannot be read; the boundary could not refuse GitHub")
+        raise Refused(f"GitHub's published address ranges cannot be read ({why}); the boundary could not refuse GitHub")
     return tuple(dict.fromkeys(networks))
 
 
@@ -1137,7 +1158,7 @@ class _Boundary:
 
         product = _product_checkout()
         checkouts = [repository, *([product] if product is not None and product != repository else [])]
-        toolchain = _toolchain(home, command[0])
+        toolchain = _toolchain(home, command[0], self.args.provider_env)
         data = list(dict.fromkeys(found for root in _DATA_ROOTS if (found := _resolved(root)) is not None
                                   and found.is_dir() and found != Path("/")))
         own = task_reads(self.args.task_id)
@@ -1272,9 +1293,9 @@ class _Boundary:
                  interpreter, "-I", str(boundary / "forwarder.py"), str(boundary / "egress.sock"), *command]
         self.receipt["bwrap"] = str(bwrap)
         self.receipt["argv_sha256"] = __import__("hashlib").sha256(json.dumps(argv).encode()).hexdigest()
-        env = {key: value for key, value in os.environ.items()
+        env = {key: value for key, value in self.args.provider_env.items()
                if key not in {"SSH_AUTH_SOCK", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "TMUX", "TMUX_PANE"}
-               and key not in self.args.host_only and not _github_credential_variable(key)}
+               and not _github_credential_variable(key)}
         (tmp / "scratch").mkdir(mode=0o700)
         (tmp / "run").mkdir(mode=0o700)
         # The namespace has no DNS or route out; Node's own fetch uses the forwarder's proxy only when told to.
@@ -1287,7 +1308,7 @@ class _Boundary:
             env["CODEX_HOME"] = str(codex_home)
         if self.args.sources_mcp == "opencode":
             env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
-        if (store := _pre_commit_store(home)) is not None and (found := _resolved(store)) is not None and found.is_dir():
+        if (store := _pre_commit_store(home, self.args.provider_env)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
             env["PRE_COMMIT_HOME"] = str(found)
@@ -1705,15 +1726,18 @@ def main(argv: list[str]) -> int:
         receipt["reason"] = "unsafe task id"
         _write_receipt(Path(args.receipt), receipt)
         return REFUSED
-    args.host_only = set()
+    args.provider_env = dict(os.environ)  # the provider's own environment, before the host context is applied
     for item in args.host_env:
         name, equals, value = item.partition("=")
         if name not in _HOST_CONTEXT or not equals or "\0" in value:
             receipt["reason"] = f"--host-env names an unknown variable: {name[:40]}"
             _write_receipt(Path(args.receipt), receipt)
             return REFUSED
-        os.environ[name] = value  # the launcher's own host steps read it; the provider never sees it
-        args.host_only.add(name)
+        # The launcher's own host steps read it; the provider keeps its own environment.
+        if value:
+            os.environ[name] = value
+        else:
+            os.environ.pop(name, None)
     boundary = None
 
     def cancelled(_signum, _frame):
