@@ -201,6 +201,7 @@ const PANELS = [
     sourceLabels: ["Usage", "API balances", "Sign-in"],
     render: renderUsage,
     onData: (data, latest) => { latest.logins = data[2]; },
+    onError: latest => { latest.logins = null; },
     retry: (subs, budget, logins) => !budget || !logins || logins.state === "pending",
   },
 ];

@@ -161,6 +161,142 @@ assert.equal(M.safeHttpUrl('data:text/html,x'), null);
 assert.equal(M.prLink('machinery', {number: 9, url: 'javascript:alert(1)'}), 'machinery#9');
 assert.equal(M.ageSpan('not-a-date'), null);
 assert.equal(M.ageSpan(null), null);
+
+// Regression checks for F1 (Fleet PR enrichment clears on failure), F2 (Overview keeps unknown reset forecast
+// in attention list), and F3 (Overview qualifies merge queue when PR coverage is unreadable or truncated).
+const fs = require('node:fs');
+const path = require('node:path');
+const dashboardsDir = path.dirname(process.argv[1]);
+const extractScript = (file, until) => {
+  const html = fs.readFileSync(path.join(dashboardsDir, file), 'utf8');
+  const marker = '<script src="/machinery.js"></script>';
+  const after = html.slice(html.indexOf(marker) + marker.length);
+  const inline = after.slice(after.indexOf('<script>') + '<script>'.length, after.indexOf('</script>'));
+  return inline.slice(0, inline.indexOf(until));
+};
+
+// F2 + F3 against Overview (index.html)
+const overviewBody = extractScript('index.html', '\nconst PANELS = [');
+const overview = new Function('Machinery', overviewBody + '\nreturn {renderCapacitySummary, renderQueueSummary};')(M);
+
+const unknownForecastSubs = {
+  stale_after_s: 900,
+  providers: [{
+    provider: 'claude',
+    accounts: [{
+      account: 'Claude a',
+      reading: {status: 'fresh', age_s: 30, read_at: '2030-01-01T00:00:00Z'},
+      weekly: {status: 'ok', left_pct: 65, resets_at: '2030-01-05T00:00:00Z'},
+      pace: {status: 'ok', state: 'on_pace', lasts_to_reset: null},
+      plan: {status: 'ok'},
+    }],
+  }],
+};
+const signedIn = {state: 'ok', accounts: [{account: 'Claude a', logged_in: true}]};
+const capUnknown = overview.renderCapacitySummary(unknownForecastSubs, signedIn);
+assert.match(capUnknown, /Claude a/);
+assert.match(capUnknown, /1<\/b> unknown \/ stale/);
+assert.doesNotMatch(capUnknown, /All 1 active subscriptions are on pace/);
+
+const knownForecastSubs = {
+  ...unknownForecastSubs,
+  providers: [{
+    provider: 'claude',
+    accounts: [{
+      ...unknownForecastSubs.providers[0].accounts[0],
+      pace: {status: 'ok', state: 'on_pace', lasts_to_reset: true},
+    }],
+  }],
+};
+const capHealthy = overview.renderCapacitySummary(knownForecastSubs, signedIn);
+assert.match(capHealthy, /All 1 active subscriptions are on pace with fresh readings\./);
+
+const unreadableRepoPrs = {
+  status: 'ok',
+  repositories: [
+    {name: 'machinery', status: 'ok', open_total: 1, pull_requests: [{number: 1, ci: 'success', review: 'success', queue: null}]},
+    {name: 'infra-private', status: 'unknown', reason: 'not_readable', open_total: null, pull_requests: []},
+  ],
+};
+const queueUnreadable = overview.renderQueueSummary(unreadableRepoPrs);
+assert.doesNotMatch(queueUnreadable, /No PRs currently in the merge queue/);
+assert.match(queueUnreadable, /0<\/b> queued observed/);
+assert.match(queueUnreadable, /coverage is incomplete/i);
+assert.match(M.prChips(unreadableRepoPrs).join(''), /0 queued observed.*a repository is unknown/);
+
+const fiftyPrs = Array.from({length: 50}, (_, i) => ({number: i + 1, ci: 'success', review: 'success', queue: null}));
+const truncatedRepoPrs = {
+  status: 'ok',
+  repositories: [{name: 'machinery', status: 'ok', open_total: 51, pull_requests: fiftyPrs}],
+};
+const queueTruncated = overview.renderQueueSummary(truncatedRepoPrs);
+assert.doesNotMatch(queueTruncated, /No PRs currently in the merge queue/);
+assert.match(queueTruncated, /showing 50 of 51/);
+assert.match(queueTruncated, /0<\/b> queued observed/);
+assert.match(M.prChips(truncatedRepoPrs).join(''), /0 queued observed.*coverage truncated/);
+
+const completeEmptyPrs = {
+  status: 'ok',
+  repositories: [{name: 'machinery', status: 'ok', open_total: 1, pull_requests: [{number: 1, ci: 'success', review: 'success', queue: null}]}],
+};
+assert.match(overview.renderQueueSummary(completeEmptyPrs), /No PRs currently in the merge queue\./);
+
+// F1 against Fleet (fleet.html): PR enrichment clears when PR endpoint later fails with HTTP 503.
+(async () => {
+  const elements = new Map();
+  globalThis.document = {
+    querySelectorAll() { return []; },
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, {textContent: '', innerHTML: '', className: '', hidden: true, setAttribute() {}, dataset: {}});
+      return elements.get(id);
+    },
+  };
+  let prFails = false;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/api/git/pull-requests')) {
+      if (prFails) return {ok: false, status: 503, text: async () => '{}', headers: {get: () => null}};
+      return {
+        ok: true,
+        status: 200,
+        headers: {get: () => null},
+        text: async () => JSON.stringify({
+          status: 'ok',
+          observed_at: new Date().toISOString(),
+          repositories: [{
+            name: 'machinery',
+            status: 'ok',
+            open_total: 1,
+            pull_requests: [{number: 42, url: 'https://github.com/learn-ukrainian/machinery/pull/42', ci: 'success', queue: {position: 1}, task_reference: 't1'}],
+          }],
+        }),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: {get: () => null},
+      text: async () => JSON.stringify({
+        tasks: [{task_id: 't1', agent: 'codex', model: 'gpt-6.2-sol', age_s: 10, delivery_pr: '#42'}],
+        deliveries: {queued: 0},
+        jobs: {queued: 0},
+        store: {reachable: true},
+      }),
+    };
+  };
+  const fleetBody = extractScript('fleet.html', '\nrunner.start();');
+  const fleetRunner = new Function('Machinery', fleetBody + '\nreturn runner;')(M);
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(document.getElementById('workers-content').innerHTML, /CI green/);
+  assert.match(document.getElementById('workers-content').innerHTML, /queued 1/);
+  prFails = true;
+  await fleetRunner.refreshAll();
+  await new Promise(resolve => setImmediate(resolve));
+  const afterFailure = document.getElementById('workers-content').innerHTML;
+  assert.doesNotMatch(afterFailure, /CI green/);
+  assert.doesNotMatch(afterFailure, /queued 1/);
+  assert.match(afterFailure, /#42/);
+})().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(
         ["node", "-e", node_script, str(dashboards / "machinery.js"), json.dumps(urls)],

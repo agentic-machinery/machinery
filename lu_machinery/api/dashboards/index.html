@@ -54,7 +54,7 @@ const {
   escapeHtml, toDate, ageSpan, table, td, text, unknown, chip,
   readingState, windowLeft, paceCell, readingCell, signInCell,
   liveAccounts, summarizeSubscriptions, subscriptionChips,
-  ciLabel, reviewLabel, prLink, prChips, createPanelRunner,
+  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, prChips, createPanelRunner,
 } = Machinery;
 
 function alertIdentity(alert) {
@@ -128,7 +128,7 @@ function renderCapacitySummary(subs, logins) {
     const fresh = state === "fresh";
     const usage = fresh ? row : {};
     const pace = usage.pace;
-    const paceRisk = !fresh || !pace || pace.status !== "ok" || pace.lasts_to_reset === false || pace.state === "deficit";
+    const paceRisk = !fresh || !pace || pace.status !== "ok" || pace.lasts_to_reset !== true || pace.state === "deficit";
     if (!paceRisk && !signInNeedsAttention(row.account, logins)) continue;
     attentionRows.push([
       text(row.account),
@@ -141,11 +141,16 @@ function renderCapacitySummary(subs, logins) {
   const notes = [];
   if (logins === null || logins === undefined) notes.push("Sign-in state unknown: the sign-in reader did not answer.");
   else if (logins.state === "pending") notes.push("Sign-in state is refreshing…");
+  const allClear = summary.total > 0 && attentionRows.length === 0
+    && summary.unknownCount === 0 && summary.runsOut === 0
+    && summary.deficitCount === 0 && summary.signedOut === 0;
   const body = attentionRows.length
     ? table(["Account", "Weekly left", "Pace", "Sign-in", "Reading"], attentionRows)
-    : summary.total
+    : allClear
       ? `<p class="ok">All ${summary.total} active subscriptions are on pace with fresh readings.</p>`
-      : '<p class="muted">No active subscriptions reported.</p>';
+      : summary.total
+        ? '<p class="warn">Subscription attention status is incomplete; open Full subscriptions for details.</p>'
+        : '<p class="muted">No active subscriptions reported.</p>';
   return `<div class="summary-stats">${stats.join("")}</div>`
     + body + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("");
 }
@@ -153,7 +158,7 @@ function renderCapacitySummary(subs, logins) {
 function renderQueueSummary(prs) {
   if (prs.status !== "ok") return unknown(prs.reason);
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
-  let totalOpen = 0, totalRed = 0, unknownRepos = 0;
+  let totalOpen = 0, totalRed = 0, unknownRepos = 0, truncatedRepos = 0;
   const queuedRows = [];
   const repoRows = [];
   for (const repo of repos) {
@@ -163,17 +168,21 @@ function renderQueueSummary(prs) {
       continue;
     }
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
-    const open = typeof repo.open_total === "number" ? repo.open_total : list.length;
+    const truncated = repoCoverageIncomplete(repo);
+    if (truncated) truncatedRepos += 1;
+    const open = typeof repo.open_total === "number" ? repo.open_total : null;
     const queued = list.filter(pr => pr.queue);
     const red = list.filter(pr => pr.ci === "failure" || pr.ci === "error").length;
-    totalOpen += open;
+    if (open !== null) totalOpen += open;
     totalRed += red;
     repoRows.push([
       text(repo.name),
-      text(open, "num"),
-      text(queued.length, queued.length ? "num ok" : "num"),
-      text(red, red ? "num bad" : "num"),
-      text("ok", "ok"),
+      text(open ?? "?", open === null ? "num warn" : "num"),
+      text(truncated ? `${queued.length} observed` : queued.length, truncated ? "num warn" : queued.length ? "num ok" : "num"),
+      text(truncated ? `${red} observed` : red, red ? "num bad" : truncated ? "num warn" : "num"),
+      truncated
+        ? text(open !== null ? `showing ${list.length} of ${open}` : "open total unknown", "warn")
+        : text("ok", "ok"),
     ]);
     for (const pr of queued) {
       const [ci, ciClass] = ciLabel(pr.ci);
@@ -187,15 +196,21 @@ function renderQueueSummary(prs) {
       ]);
     }
   }
+  const incomplete = repos.length === 0 || unknownRepos > 0 || truncatedRepos > 0;
   const stats = [
-    `<span><b>${totalOpen}</b> open PRs</span>`,
-    `<span class="${queuedRows.length ? "ok" : "muted"}"><b>${queuedRows.length}</b> queued</span>`,
-    totalRed ? `<span class="bad"><b>${totalRed}</b> CI red</span>` : "",
+    `<span><b>${totalOpen}</b> ${unknownRepos || truncatedRepos ? "open PRs observed" : "open PRs"}</span>`,
+    `<span class="${queuedRows.length ? "ok" : incomplete ? "warn" : "muted"}"><b>${queuedRows.length}</b> ${incomplete ? "queued observed" : "queued"}</span>`,
+    totalRed ? `<span class="bad"><b>${totalRed}</b> ${incomplete ? "CI red observed" : "CI red"}</span>` : "",
     unknownRepos ? `<span class="warn"><b>${unknownRepos}</b> repo unknown</span>` : "",
+    truncatedRepos ? `<span class="warn"><b>${truncatedRepos}</b> repo truncated</span>` : "",
   ].filter(Boolean);
   const queueBlock = queuedRows.length
-    ? "<h3>In merge queue</h3>" + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
-    : '<p class="muted">No PRs currently in the merge queue.</p>';
+    ? `<h3>In merge queue${incomplete ? " (observed — coverage incomplete)" : ""}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
+    : !repos.length
+      ? '<p class="warn">No repositories reported; merge queue status is unknown.</p>'
+      : incomplete
+        ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
+        : '<p class="muted">No PRs currently in the merge queue.</p>';
   return `<div class="summary-stats">${stats.join("")}</div>`
     + queueBlock
     + "<h3>By repository</h3>"
@@ -223,6 +238,7 @@ const PANELS = [
     sourceLabels: ["Usage", "Sign-in"],
     render: renderCapacitySummary,
     onData: (data, latest) => { latest.logins = data[1]; },
+    onError: latest => { latest.logins = null; },
     retry: (subs, logins) => !logins || logins.state === "pending",
   },
   {id: "prs", label: "Merge queue", urls: ["/api/git/pull-requests"], render: renderQueueSummary},

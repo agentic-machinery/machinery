@@ -49,7 +49,7 @@
 "use strict";
 const {
   escapeHtml, fetchJson, span, relative, table, td, text, unknown, chip,
-  ciLabel, prLink, createPanelRunner,
+  ciLabel, prLink, freshnessOf, freshnessState, createPanelRunner,
 } = Machinery;
 
 const ACTIVE = new Set(["spawning", "running", "settling", "needs_finalize"]);
@@ -70,7 +70,9 @@ function modelOf(task) {
 
 function prIndex(prs) {
   const index = [];
-  for (const repo of Array.isArray(prs?.repositories) ? prs.repositories : []) {
+  if (!prs || prs.status !== "ok") return index;
+  for (const repo of Array.isArray(prs.repositories) ? prs.repositories : []) {
+    if (repo.status !== "ok") continue;
     for (const pr of Array.isArray(repo.pull_requests) ? repo.pull_requests : []) {
       if (pr.task_reference) index.push({repo: repo.name, ...pr});
     }
@@ -169,25 +171,32 @@ function renderChips(latest) {
 }
 
 // Optional non-blocking enrichment so the PR column of active workers shows CI and queue state.
+// Clears enrichment and repaints workers whenever the optional fetch fails or returns unusable/stale data.
 let prsInFlight = false;
+function repaintWorkers() {
+  if (!runner.latest.workers) return;
+  const box = document.getElementById("workers-content");
+  if (box) box.innerHTML = renderWorkers(runner.latest.workers, latestPrs);
+}
+
 function enrichWorkerPrs() {
   if (prsInFlight) return;
   prsInFlight = true;
   fetchJson("/api/git/pull-requests").then(reading => {
-    latestPrs = reading.data;
-    if (runner.latest.workers) {
-      const box = document.getElementById("workers-content");
-      if (box) box.innerHTML = renderWorkers(runner.latest.workers, latestPrs);
-    }
+    const state = freshnessState(freshnessOf(reading));
+    latestPrs = reading?.data?.status === "ok" && state !== "stale" && state !== "unavailable"
+      ? reading.data : null;
+    repaintWorkers();
   }).catch(() => {
-    // PR enrichment is optional on the Fleet page; worker rows fall back to delivery_pr.
+    latestPrs = null;
+    repaintWorkers();
   }).finally(() => {
     prsInFlight = false;
   });
 }
 
 const PANELS = [
-  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs()},
+  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onError: () => { latestPrs = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
 ];

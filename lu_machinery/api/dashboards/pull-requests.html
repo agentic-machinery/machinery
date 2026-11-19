@@ -49,7 +49,11 @@ function renderPrs(prs) {
   return (Array.isArray(prs.repositories) ? prs.repositories : []).map(repo => {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
     if (repo.status !== "ok") return title + unknown(repo.reason);
-    const rows = (Array.isArray(repo.pull_requests) ? repo.pull_requests : []).map(pr => {
+    const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
+    const truncatedNote = typeof repo.open_total === "number" && repo.open_total > list.length
+      ? `<p class="warn">Showing newest ${list.length} of ${repo.open_total} open PRs; older open PRs are not listed.</p>`
+      : "";
+    const rows = list.map(pr => {
       const [ci, ciClass] = ciLabel(pr.ci);
       const [review, reviewClass] = reviewLabel(pr.review);
       const name = text(pr.draft ? "draft" : "ready for review");
@@ -64,7 +68,7 @@ function renderPrs(prs) {
         text(ageSpan(pr.created_at), "num"),
       ];
     });
-    return title + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
+    return title + truncatedNote + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
   }).join("");
 }
 
