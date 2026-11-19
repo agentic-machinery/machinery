@@ -10,6 +10,7 @@ failure output.
 
 from __future__ import annotations
 
+import bisect
 import ipaddress
 import re
 from collections.abc import Iterable, Mapping
@@ -75,9 +76,13 @@ _FILESYSTEM_PATH_RE = re.compile(
 # scheme always opens an authority (RFC 8089), and the authority excludes "/",
 # so a host such as "home.example" is never re-read as a path.  Only a letter
 # or digit before "file:" makes it another scheme's suffix ("profile:");
-# punctuation ("...file:", a diff's "+file:") does not.
-_FILE_URI_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):(?://[^/\s\"'<>?#]*|(?!//))(?P<path>/[^\s\"'<>]*)")
-_FILE_URI_SEGMENT_RE = re.compile(r"/*(?P<segment>[^/?#]*)")
+# punctuation ("...file:", a diff's "+file:") does not.  Each scheme start is
+# found on its own, so a rejected URI never hides a later one; the head match
+# stops at the first segment and the token runs to the end of its path run.
+_FILE_SCHEME_RE = re.compile(r"(?<![A-Za-z0-9])(?i:file):")
+_FILE_URI_HEAD_RE = re.compile(r"(?://[^/\s\"'<>?#]*|(?!//))(?P<path>/+)(?P<segment>[^/?#\s\"'<>]*)")
+_PATH_RUN_RE = re.compile(r"[^\s\"'<>]+")
+_PATH_TRAILING_PUNCTUATION = ".,;:!?)]}"
 _BOUNDED_ROOT_NAMES = frozenset(root[1:] for root in BOUNDED_FILESYSTEM_ROOTS)
 _USER_AT_HOST_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
@@ -337,9 +342,33 @@ def _ip_version(candidate: str) -> int | None:
 
 def _trim_path_token(match: re.Match[str]) -> tuple[int, int, str]:
     raw = match.group(0)
-    token = raw.rstrip(".,;:!?)]}")
+    token = raw.rstrip(_PATH_TRAILING_PUNCTUATION)
     end = match.start() + len(token)
     return match.start(), end, token
+
+
+def _file_uri_candidates(text: str) -> tuple[list[_Candidate], set[int]]:
+    """Return flagged file URIs and the path start of every file URI.
+
+    A URI is flagged whole when its first path segment, after trailing prose
+    or Markdown punctuation is trimmed from the token, is exactly a bounded
+    root ("file:///tmp.backup/..." and "file:///tmp./x" are not under /tmp).
+    """
+    candidates: list[_Candidate] = []
+    path_starts: set[int] = set()
+    runs = [(match.start(), match.end()) for match in _PATH_RUN_RE.finditer(text)]
+    run_starts = [start for start, _ in runs]
+    for scheme in _FILE_SCHEME_RE.finditer(text):
+        head = _FILE_URI_HEAD_RE.match(text, scheme.end())
+        if head is None:
+            continue
+        path_starts.add(head.start("path"))
+        run_end = runs[bisect.bisect_right(run_starts, scheme.start()) - 1][1]
+        token = text[scheme.start() : run_end].rstrip(_PATH_TRAILING_PUNCTUATION)
+        end = scheme.start() + len(token)
+        if text[head.start("segment") : min(head.end("segment"), end)] in _BOUNDED_ROOT_NAMES:
+            candidates.append(_Candidate(scheme.start(), end, "filesystem-root", token, 80))
+    return candidates, path_starts
 
 
 def _is_css_numeric_property(text: str, match: re.Match[str]) -> bool:
@@ -385,16 +414,10 @@ def scan_text(
         for match in re.finditer(re.escape(canary), text):
             candidates.append(_Candidate(match.start(), match.end(), "canary", match.group(0), 100))
 
-    # A file URI is flagged whole when its first path segment is exactly a
-    # bounded root ("file:///tmp.backup/..." is not under /tmp).  The bare rule
-    # never re-reads that first segment, whatever the verdict on the URI.
-    file_uri_paths: set[int] = set()
-    for match in _FILE_URI_RE.finditer(text):
-        file_uri_paths.add(match.start("path"))
-        segment = _FILE_URI_SEGMENT_RE.match(match.group("path"))
-        if segment is not None and segment.group("segment") in _BOUNDED_ROOT_NAMES:
-            start, end, token = _trim_path_token(match)
-            candidates.append(_Candidate(start, end, "filesystem-root", token, 80))
+    # The bare rule never re-reads a file URI's first segment, whatever the
+    # verdict on the URI.
+    file_uri_candidates, file_uri_paths = _file_uri_candidates(text)
+    candidates.extend(file_uri_candidates)
 
     # Only a bare hash route ("#/home") exempts a path, and only when it covers
     # the root itself.  A SHA, timestamp or duration in the tail, or an /api
