@@ -157,6 +157,7 @@ def test_host_port_scanner_ignores_css_but_keeps_bare_hostnames() -> None:
         ("file:///tmp.#anchor", "file:///tmp.#anchor"),
         ("/api/fixture?source=file:///etc/fixture.conf,file:/tmp.backup/x", "file:/tmp.backup/x"),
         ("/api/fixture?source=/tmp.backup/fixture.conf", "/tmp.backup/fixture.conf"),
+        ("/api/fixture/{id}/home/view?source=/home/fixture-user/data", "/home/fixture-user/data"),
     ],
 )
 def test_home_path_file_uris_and_identifier_tails_are_flagged(text: str, token: str) -> None:
