@@ -248,8 +248,8 @@ def test_untimed_landed_task_leaves_wall_hours_per_landed_unknown(tmp_path):
 
 def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch):
     """Defect class: fabricated allowance (a missing reading recorded or aggregated as 0), telemetry that blocks
-    launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, or overlapping
-    tasks on one pool each charged the pool's whole drop."""
+    launch or settlement on an unready Monitor, the wrong window recorded as the weekly allowance, overlapping
+    tasks on one pool each charged the pool's whole drop, or a nested reset reported as zero spend."""
     readings = iter([None, 35.0])
     monkeypatch.setattr(worker.model_pause, "weekly_used_pct_reading", lambda lane, *, account: next(readings))
     record = {"agent": "codex", "codex_account": "sub", "model": "gpt-6.1-sol"}
@@ -321,14 +321,42 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
             started_at=(NOW - timedelta(hours=7)).isoformat(),
             finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
             allowance={"pool": "agy_claude", "start": {"remaining_pct": 75.0}, "finish": {"remaining_pct": 95.0}})
+    # The reset is a different effort from the task it runs inside. Dropping it used to report 0 points spent.
+    _record(tasks, "cross-outer", model="claude-sonnet-5-5", effort="high",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "claude:a", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 75.0}})
+    _record(tasks, "cross-inner", model="claude-sonnet-5-5", effort="medium",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "claude:a", "start": {"remaining_pct": 75.0}, "finish": {"remaining_pct": 95.0}})
+    # The inner reading rises, but stays below the cluster's first reading. That is still a reset.
+    _record(tasks, "buried-outer", model="claude-haiku-5-5",
+            started_at=(NOW - timedelta(hours=8)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6)).isoformat(),
+            allowance={"pool": "claude:b", "start": {"remaining_pct": 80.0}, "finish": {"remaining_pct": 70.0}})
+    _record(tasks, "buried-inner", model="claude-haiku-5-5",
+            started_at=(NOW - timedelta(hours=7)).isoformat(),
+            finished_at=(NOW - timedelta(hours=6, minutes=30)).isoformat(),
+            allowance={"pool": "claude:b", "start": {"remaining_pct": 40.0}, "finish": {"remaining_pct": 55.0}})
     rows.backfill(tasks, batch_state)
-    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer", "inner"}
+    landed = {"both", "half", "overlap-a", "overlap-b", "shared-a", "shared-b", "reset-a", "reset-b", "outer",
+              "inner", "cross-outer", "cross-inner", "buried-outer", "buried-inner"}
     window = _window(batch_state, stats.Landing(task_ids=landed))
     unknown = {"value": None, "n": 1, "low_sample": True}
     assert window["allowance"] == [
-        {"pool": "agy_claude", "model": "claude-opus-5-5", "effort": "high", "tasks": 1, "landed": 1,
+        {"pool": "agy_claude", "model": "claude-opus-5-5", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
+        {"pool": "claude:a", "model": "claude-sonnet-5-5", "effort": "high", "tasks": 1, "landed": 1,
+         "reset_crossed": 0, "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
+         "pct_points_per_landed": unknown},
+        {"pool": "claude:a", "model": "claude-sonnet-5-5", "effort": "medium", "tasks": 1, "landed": 1,
          "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 1, "pct_points_spent": None,
          "pct_points_per_landed": unknown},
+        {"pool": "claude:b", "model": "claude-haiku-5-5", "effort": "high", "tasks": 2, "landed": 2,
+         "reset_crossed": 1, "low_sample": True, "overlapped_tasks": 2, "pct_points_spent": None,
+         "pct_points_per_landed": {"value": None, "n": 2, "low_sample": True}},
         {"pool": "codex:a", "model": "gpt-6.1-sol", "effort": "high", "tasks": 1, "landed": 1, "reset_crossed": 0,
          "low_sample": True, "overlapped_tasks": 0, "pct_points_spent": 5.5,
          "pct_points_per_landed": {"value": 5.5, "n": 1, "low_sample": True}},
@@ -346,6 +374,15 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
          "pct_points_per_landed": {"value": 10.0, "n": 2, "low_sample": True}},
     ]
     assert _row(window, "gpt-6.1-sol", "write")["allowance_pct_points_per_landed"]["value"] == 5.5
+    # view=page is what the dashboard prints. None is a dash; 0.0 would be shown as measured spend.
+    page = stats.page_window(window)
+    medium = next(row for row in page["allowance"] if row["model"] == "claude-sonnet-5-5" and row["effort"] == "medium")
+    assert medium["pct_points_spent"] is None and medium["tasks"] == 1 and medium["overlapped_tasks"] == 1
+    sonnet = {item["effort"]: item for item in _row(window, "claude-sonnet-5-5", "write")["by_effort"]}
+    assert sonnet["medium"]["allowance_pct_points_per_landed"]["value"] is None
+    assert sonnet["high"]["allowance_pct_points_per_landed"]["value"] is None
+    assert _row(window, "claude-haiku-5-5", "write")["allowance_pct_points_per_landed"] == {
+        "value": None, "n": 2, "low_sample": True}
 
 
 def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):

@@ -571,9 +571,10 @@ class _Cluster:
 def _clusters(rows: list[_Row]) -> list[_Cluster]:
     """One cluster per overlapping run, built once per pool across every model.
 
-    A later reading above the earliest start means the weekly window reset inside the cluster. That cluster's
-    points stay unknown. A cluster shared by more than one model, effort or class cannot be split from these
-    rows, so a subgroup that only partly owns it is unknown too.
+    A finish reading above that task's own start, or any reading above the cluster's first start, means the
+    weekly window reset inside the cluster. That cluster's points stay unknown. A cluster shared by more than
+    one model, effort or class cannot be split from these rows, so a subgroup that only partly owns it is
+    unknown too.
     """
     by_pool: dict[str, list[tuple[_Meter, _Row]]] = defaultdict(list)
     for row in rows:
@@ -600,8 +601,9 @@ def _clusters(rows: list[_Row]) -> list[_Cluster]:
             members = tuple(row for _meter, row in group)
             earliest = min(meters, key=lambda meter: (meter.start, meter.end))
             latest = max(meters, key=lambda meter: meter.end)
-            reset = any(meter.start_pct > earliest.start_pct or meter.finish_pct > earliest.start_pct
-                        for meter in meters)
+            # A rise above this task's own start is a reset even when it stays below the first reading.
+            reset = any(meter.finish_pct > meter.start_pct or meter.start_pct > earliest.start_pct
+                        or meter.finish_pct > earliest.start_pct for meter in meters)
             net = earliest.start_pct - latest.finish_pct
             built.append(_Cluster(pool, members, None if reset or net < 0 else net))
     return built
@@ -637,6 +639,7 @@ def _apply_allowance(entry: dict[str, Any], facts: dict[str, Any]) -> None:
 
 
 def _selected(rows: list[_Row], predicate: Callable[[_Row], bool]) -> tuple[set[int], int]:
+    """Ids the predicate admits. A reset stays in the set, so its effort still touches the cluster."""
     chosen: set[int] = set()
     resets = 0
     for row in rows:
@@ -644,8 +647,7 @@ def _selected(rows: list[_Row], predicate: Callable[[_Row], bool]) -> tuple[set[
             continue
         if row.allowance[1] < 0:
             resets += 1
-        else:
-            chosen.add(id(row))
+        chosen.add(id(row))
     return chosen, resets
 
 
@@ -1006,7 +1008,8 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             "savant": "No Savant model is in the catalog, and no row names one.",
             "links": "This snapshot does not include task ids.",
             "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
-                     "that pool's net drop once. A cluster shared by more than one model or effort stays unknown.",
+                     "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
+                     "contains a reset, stays unknown. It is never reported as zero.",
             "difficulty": "There is no difficulty weight. Compare models inside one task class.",
             "wall_hours": "Wall hours per landed stay blank when any task has no duration. The observed figure "
                           "uses the recorded hours when at most one task, or one percent, is untimed.",
