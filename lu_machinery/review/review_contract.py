@@ -42,6 +42,7 @@ from lu_machinery.review.target_resolution import ReviewTarget
 
 # Deepest JSON this module reads (json_depth): reviewer replies.
 _JSON_MAX_DEPTH = 512
+_JSON_PROPERTY_START = re.compile(r'[ \t\r\n]*"')
 
 SCHEMA_VERSION = "code-review-findings.v1"
 RECEIPT_SCHEMA_VERSION = "code-review-receipt.v1"
@@ -357,6 +358,10 @@ def _json_objects(text: str) -> list[dict[str, Any]]:
         try:
             payload, end = json_depth.raw_decode(text, start, max_depth=_JSON_MAX_DEPTH, decoder=decoder)
         except json.JSONDecodeError:
+            # A broken object can contain the decision or explain why it was
+            # incomplete. Its nested objects cannot attest what it said.
+            if _JSON_PROPERTY_START.match(text, start + 1):
+                raise
             index = start + 1
             continue
         if isinstance(payload, dict):
@@ -442,8 +447,10 @@ def decision_lock(raw: str) -> dict[str, Any]:
 
     try:
         objects = _json_objects(_outside_blockquotes(raw))
-        incomplete = declares_incomplete_review(raw, findings_payloads=objects) or any(
-            MISSING_CAPABILITIES_FIELD in payload for payload in objects
+        incomplete = (
+            declares_incomplete_review("", findings_payloads=objects)
+            or declares_incomplete_review(raw)
+            or any(MISSING_CAPABILITIES_FIELD in payload for payload in objects)
         )
         verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     except (ValueError, RecursionError):
