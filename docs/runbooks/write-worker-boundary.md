@@ -43,12 +43,23 @@ The host login reads only a registered repository with a `public-` role in `conf
 a flag cluster and URL operands are refused) and refuses a private, unknown or unresolved one before `gh` runs; the argv it runs names that
 repository first, so `gh` never chooses one itself. A bare `--` is refused.
 The launcher's broker (one Unix socket bound inside at `/run/lu-write-boundary/broker.sock`, named by
-`LU_WRITE_BOUNDARY_BROKER`) serves a read-only seat `github-read` only: one of the publisher's fixed GET
+`LU_WRITE_BOUNDARY_BROKER`) serves named `github-read` requests using the publisher's fixed GET
 templates (`pull`, `pr-files`, `commits`, `commit`, `comments`, `reviews`, `timeline`, `issue`, `checks`,
 `check-annotations`, `run`, `jobs`) of the registered repository, never security alerts. For a registered
-private repository the existing scope is only the authorized PR and its head checks. Every write verb is
-absent, including `push`, `pr-create`, `pr-edit`, `pr-comment`, `pr-merge` and `record-verdict`. A connection is served only when its peer descends from this run's bubblewrap, and
-each request id is accepted once per run.
+private repository the existing scope is only the authorized PR and its head checks. GitHub writes are refused.
+The broker serves only descendants of this run's bubblewrap process and accepts each request ID once.
+
+Read-only Codex and Claude workers can write files under
+`$LU_TASKS_DIR/$LEARN_UKRAINIAN_DISPATCH_TASK_ID.artifacts/`. The launcher mounts that directory alone
+and settlement retains it. A format-correction launch reuses the directory after verifying its identity
+against the prior boundary receipt. The task store around it stays read-only.
+
+Use `fleet_comms channel publish` with the task ID as `--sender` and exactly one `--recipient`.
+The dispatcher binds that recipient from the parent task ID or, for a top-level dispatch, from
+`dispatch --initiator`. The broker permits one plain message per run, up to 64 KiB of UTF-8 text. Fleet
+uses a key bound to the run even when the CLI caller supplies a different `--idempotency-key`. Repeating
+the same publication returns the same message. Changing the publication after a success is refused.
+The host publishes through the installed Fleet CLI while the Fleet store remains masked.
 
 The owning write worker records the finished review through `record_cf_verdict.py`. The reviewer supplies its structured result and cannot publish a verdict or act for a child task.
 The boundary receipt includes the launch mode and GitHub read-relay outcomes. Setup or canary failure

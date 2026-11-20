@@ -961,6 +961,25 @@ def cmd_channel_publish(args: argparse.Namespace) -> int:
     from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServiceError
 
     _refuse_kimi_recipients(args.recipient)
+    if os.environ.get("LU_WRITE_BOUNDARY_BROKER"):
+        from lu_machinery.dispatcher.write_boundary import broker_call
+
+        if (args.kind != "message" or len(args.recipient) != 1
+                or any(value is not None for value in (
+                    args.conversation_id, args.in_reply_to, args.correlation_id, args.deadline_at, args.root,
+                ))):
+            raise FleetCommsCliError("a read-only worker can publish one plain final message to its dispatcher")
+        try:
+            reply = broker_call("fleet-publish", {
+                "channel": args.name, "body": _body_argument(args.body), "sender": args.sender,
+                "recipient": args.recipient[0],
+            })
+        except OSError as exc:
+            raise FleetCommsCliError("the final Fleet delivery relay is unavailable") from exc
+        sys.stdout.write(reply["stdout"])
+        sys.stderr.write(reply["stderr"])
+        return EXIT_OK if reply["returncode"] == 0 else EXIT_ERROR
+
     try:
         with AuthorityService(root=_authority_root(args)) as service:
             message = service.publish_message(
