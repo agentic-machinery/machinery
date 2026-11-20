@@ -1948,7 +1948,8 @@ def test_builtin_discussion_seats_are_fixed_active_only_and_confined(
         )
 
     assert adapter.name == f"acpx-{participant}-shadow"
-    assert plan.cmd[-4:] == [acpx_agent, "exec", "-f", "-"]
+    mode_args = ["--config-option", "mode=default"] if participant == "claude" else []
+    assert plan.cmd[-(4 + len(mode_args)) :] == [acpx_agent, "exec", *mode_args, "-f", "-"]
     _assert_acpx_env_overrides(
         plan.env_overrides,
         expected=({} if auth_env is None else {auth_env: "1"}),
@@ -2364,6 +2365,40 @@ def test_claude_sealed_review_exposes_only_required_stream(tmp_path, monkeypatch
     ]
     assert policy["defaultAction"] == "deny"
     assert plan.metadata["model"] == model
+
+
+@pytest.mark.parametrize("sealed", [False, True], ids=["ask", "sealed-review"])
+def test_claude_session_starts_in_manual_mode_not_the_adapter_auto_default(tmp_path, monkeypatch, sealed):
+    """Defect class: a Claude ACP session left to the adapter default runs Auto,
+    which approves tools without the ACP permission request --deny-all refuses."""
+    _stub_binary(monkeypatch, tmp_path)
+    monkeypatch.setenv(acpx_module.TRANSPORT_ENV, "active")
+    tool_config = {
+        "acpx_discussion": True,
+        "target_agent": "claude",
+        "correlation_id": "corr-claude",
+        "idempotency_key": "idem-claude",
+    }
+    if sealed:
+        monkeypatch.setattr(acpx_module, "_validate_sealed_review_mcp_config", lambda raw, *, adapter_label: str(raw))
+        monkeypatch.setattr(acpx_module, "_claude_sealed_review_max_turns", lambda _config: 9)
+        tool_config["sealed_review_mcp_config"] = str(tmp_path / "sealed-config.json")
+
+    with acpx_module.active_discussion_scope():
+        plan = AcpxClaudeShadowAdapter().build_invocation(
+            prompt="ping",
+            mode="read-only",
+            cwd=tmp_path,
+            model="claude-sonnet-5-5",
+            task_id="t-claude-mode",
+            session_id=None,
+            tool_config=tool_config,
+        )
+
+    exec_index = plan.cmd.index("exec")
+    assert plan.cmd[exec_index:] == ["exec", "--config-option", "mode=default", "-f", "-"]
+    assert plan.cmd.count("--config-option") == 1
+    assert plan.metadata["session_mode"] == "default"
 
 
 def test_claude_sealed_review_turn_budget_rejects_intermediate_symlink_escape(

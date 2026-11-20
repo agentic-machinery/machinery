@@ -3758,6 +3758,8 @@ class _AcpxDiscussionAdapter:
     default_model: str = "acpx-built-in-default"
     supported_modes: frozenset[str] = frozenset({"read-only"})
     sealed_review_tool_names: tuple[str, ...] = _SEALED_REVIEW_TOOL_NAMES
+    # ACP session mode set before the prompt; None keeps the participant's own.
+    session_mode: str | None = None
 
     def _custom_agent_command(self, cwd: Path) -> tuple[str, dict[str, Any]] | None:
         _ = cwd
@@ -3874,15 +3876,21 @@ class _AcpxDiscussionAdapter:
                     cursor_acp_executed = executed
                     cmd_model = executed
             cmd.extend(["--model", cmd_model])
+        # ACPX sends session/set_config_option before the prompt and fails the
+        # exec when the agent rejects it.
+        exec_args = ["exec"]
+        if self.session_mode is not None:
+            exec_args.extend(["--config-option", f"mode={self.session_mode}"])
+        exec_args.extend(["-f", "-"])
         if custom_agent is None:
             if self.target_agent in {"claude", "codex"} and _ACPX_BINARY is None:
-                cmd.extend(["--agent", _node_adapter_command(self.target_agent), "exec", "-f", "-"])
+                cmd.extend(["--agent", _node_adapter_command(self.target_agent), *exec_args])
             else:
-                cmd.extend([self.target_agent, "exec", "-f", "-"])
+                cmd.extend([self.target_agent, *exec_args])
             custom_metadata: dict[str, Any] = {}
         else:
             custom_command, custom_metadata = custom_agent
-            cmd.extend(["--agent", custom_command, "exec", "-f", "-"])
+            cmd.extend(["--agent", custom_command, *exec_args])
         metadata: dict[str, Any] = {
             "acpx_discussion": True,
             "acpx_cli_version": acpx_version,
@@ -3905,6 +3913,8 @@ class _AcpxDiscussionAdapter:
                 metadata["model"] = model or self.default_model
         if self.fixed_effort is not None:
             metadata["effort"] = self.fixed_effort
+        if self.session_mode is not None:
+            metadata["session_mode"] = self.session_mode
         metadata.update(custom_metadata)
         metadata.update(participant_runtime_metadata)
         if sealed_review_mcp_config is not None:
@@ -3945,6 +3955,10 @@ class AcpxClaudeShadowAdapter(_AcpxDiscussionAdapter):
     allowed_models = CLAUDE_ACP_MODELS
     default_model = CLAUDE_ACP_MODEL
     fixed_effort = "high"
+    # Manual: every tool needs an ACP permission request, which --deny-all
+    # refuses. Since 0.101.0 the adapter starts in Auto when settings name no
+    # defaultMode, and Auto approves tools without asking.
+    session_mode = "default"
     sealed_review_tool_names = _CLAUDE_SEALED_REVIEW_TOOL_NAMES
 
     def _max_turns(self, sealed_review_mcp_config: str | None) -> int:
