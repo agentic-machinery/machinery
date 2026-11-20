@@ -1001,23 +1001,87 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert "samples.window.until === pageWindow.until" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
+    assert all(token in html for token in ("pareto-class", "pareto-x", "trends-metric", "quota-alerts",
+                                           "Not enough data", "pool_pace", "/subscriptions"))
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
     rank_tasks = rank_root / "tasks"
     rank_tasks.mkdir(parents=True)
     for index in range(10):
-        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3)
+        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3, research_task_family="code")
         _review(rank_tasks, f"short-review-{index}", "correct", [], pr=100 + index,
                 review_author_model="gpt-6.2-sol")
-        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600)
+        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600, research_task_family="code")
         _review(rank_tasks, f"long-review-{index}", "correct" if index < 5 else "incorrect", [], pr=200 + index,
                 review_author_model="gpt-6.1-sol")
+    # Per-class Pareto frontier: a faster model with lower landed share stays on the frontier beside the higher-rate
+    # model, a dominated model does not, and a low-sample model never joins or dominates the frontier (#875).
+    for index in range(10):
+        _record(rank_tasks, f"fast-{index}", model="claude-sonnet-5-5", duration_s=600, research_task_family="code")
+        _record(rank_tasks, f"slow-{index}", model="claude-opus-5-5", duration_s=7200, research_task_family="code")
+    for index in range(4):
+        _record(rank_tasks, f"tiny-{index}", model="grok-4.7", duration_s=1, research_task_family="code")
+    for index in range(5):
+        _record(rank_tasks, f"doc-a-{index}", model="gpt-6.2-sol", duration_s=300, research_task_family="docs")
+        _record(rank_tasks, f"doc-b-{index}", model="grok-4.7", duration_s=300, research_task_family="docs")
     rows.backfill(rank_tasks, rank_root)
-    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(
-        task_ids={f"short-{index}" for index in range(10)} | {f"long-{index}" for index in range(10)}))
-    recommendation = ranked["windows"]["7d"]["charts"]["recommendation"]
+    landed_ids = (
+        {f"short-{index}" for index in range(10)}
+        | {f"long-{index}" for index in range(10)}
+        | {f"fast-{index}" for index in range(8)}
+        | {f"slow-{index}" for index in range(7)}
+        | {f"tiny-{index}" for index in range(4)}
+        | {f"doc-a-{index}" for index in range(5)}
+    )
+    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(task_ids=landed_ids))
+    charts = ranked["windows"]["7d"]["charts"]
+    recommendation = charts["recommendation"]
     assert recommendation["model"] == "gpt-6.2-sol"
     assert recommendation["approvals"] == 10
+    pareto_by_model = {p["model"]: p for p in charts["pareto"]}
+    assert pareto_by_model["gpt-6.2-sol"]["median_seconds"] == 3.0
+    assert pareto_by_model["gpt-6.2-sol"]["timed_n"] == 15
+    assert pareto_by_model["gpt-6.2-sol"]["speed_low_sample"] is False
+    assert pareto_by_model["gpt-6.2-sol"]["speed_frontier"] is True
+    assert pareto_by_model["gpt-6.1-sol"]["median_seconds"] == 3600.0
+    assert pareto_by_model["gpt-6.1-sol"]["timed_n"] == 10
+    assert pareto_by_model["gpt-6.1-sol"]["speed_low_sample"] is False
+    assert pareto_by_model["gpt-6.1-sol"]["speed_frontier"] is False
+    durations_by_model = {d["model"]: d for d in charts["durations"]}
+    assert (durations_by_model["claude-sonnet-5-5"]["tasks"], durations_by_model["claude-sonnet-5-5"]["landed"],
+            durations_by_model["claude-sonnet-5-5"]["landed_rate"],
+            durations_by_model["claude-sonnet-5-5"]["landed_ci"]) == (10, 8, 0.8, stats._wilson(8, 10))
+    jobs_by_class = {j["class"]: {m["model"]: m for m in j["models"]} for j in charts["jobs"]}
+    # In code: gpt-6.2-sol is 100% @ 3s (frontier); gpt-6.1-sol is 100% @ 3600s (dominated by gpt-6.2-sol);
+    # claude-sonnet-5-5 is 80% @ 750s (dominated by gpt-6.2-sol's 100% @ 3s); claude-opus-5-5 is 70% @ 10286s
+    # (dominated); grok-4.7 is 100% @ 1s but n=4 (low_sample, never frontier).
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["frontier"] is True
+    assert jobs_by_class["code"]["gpt-6.1-sol"]["frontier"] is False
+    assert jobs_by_class["code"]["claude-sonnet-5-5"]["frontier"] is False
+    assert jobs_by_class["code"]["claude-opus-5-5"]["frontier"] is False
+    assert jobs_by_class["code"]["grok-4.7"]["frontier"] is False
+    # In docs: 10 total tasks, max n=5 per model, so no model reaches the frontier.
+    assert all(m["frontier"] is False for m in jobs_by_class["docs"].values())
+    # Two eligible non-dominated models in one class: higher-rate slower vs lower-rate faster both sit on the frontier.
+    split_root = tmp_path / "split_frontier"
+    split_tasks = split_root / "tasks"
+    split_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(split_tasks, f"hi-{index}", model="claude-opus-5-5", duration_s=3600, research_task_family="infra")
+        _record(split_tasks, f"fast-{index}", model="grok-4.7", duration_s=600, research_task_family="infra")
+        _record(split_tasks, f"dom-{index}", model="gpt-6.1-sol", duration_s=7200, research_task_family="infra")
+    rows.backfill(split_tasks, split_root)
+    split_landed = (
+        {f"hi-{index}" for index in range(9)}
+        | {f"fast-{index}" for index in range(7)}
+        | {f"dom-{index}" for index in range(6)}
+    )
+    split_jobs = {j["class"]: {m["model"]: m for m in j["models"]}
+                  for j in stats.collect(split_root, tmp_path, NOW,
+                                         landing=stats.Landing(task_ids=split_landed))["windows"]["7d"]["charts"]["jobs"]}
+    assert split_jobs["infra"]["claude-opus-5-5"]["frontier"] is True
+    assert split_jobs["infra"]["grok-4.7"]["frontier"] is True
+    assert split_jobs["infra"]["gpt-6.1-sol"]["frontier"] is False
     # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
     fine = tmp_path / "fine"
     fine_tasks = fine / "tasks"
@@ -1119,7 +1183,18 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     assert author["after_blocked_first_round"]["blocked"] == 0
     neon_chart = window["charts"]["neon"]
     assert neon_chart["enough"] is False
-    assert {arm["effort"]: arm["review_results"] for arm in neon_chart["arms"]} == {"medium": 1, "high": 1}
+    arms = {arm["effort"]: arm for arm in neon_chart["arms"]}
+    assert {effort: arm["review_results"] for effort, arm in arms.items()} == {"medium": 1, "high": 1}
+    assert (arms["medium"]["review_tasks"], arms["medium"]["blocking_per_review"], arms["medium"]["p0_p2_per_review"],
+            arms["medium"]["findings_n"], arms["medium"]["review_median_seconds"],
+            arms["medium"]["review_p90_seconds"], arms["medium"]["review_timed_n"],
+            arms["medium"]["write_median_seconds"], arms["medium"]["write_timed_n"]) == (
+                2, 0.0, 0.0, 1, 90.0, 120.0, 2, None, 0)
+    assert (arms["high"]["review_tasks"], arms["high"]["blocking_per_review"], arms["high"]["p0_p2_per_review"],
+            arms["high"]["findings_n"], arms["high"]["review_median_seconds"],
+            arms["high"]["review_p90_seconds"], arms["high"]["review_timed_n"],
+            arms["high"]["write_median_seconds"], arms["high"]["write_timed_n"]) == (
+                1, None, None, 0, 180.0, 180.0, 1, None, 0)
 
 
 def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):
