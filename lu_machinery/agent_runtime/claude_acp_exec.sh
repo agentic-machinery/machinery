@@ -32,14 +32,4 @@ case $identity in *:*:*:*:*) ;; *) echo "claude_acp_exec: pinned Claude Code ide
 stat=/usr/bin/gnustat
 [ -x "$stat" ] || stat=/usr/bin/stat
 [ "$("$stat" -c %d:%i:%s:%.9Y:%.9Z -- "$host" 2>/dev/null)" = "$identity" ] || { echo "claude_acp_exec: pinned Claude Code changed since its version probe, or this host lacks GNU stat" >&2; exit 126; }
-# The SDK starts Claude before acpx applies its session config options. Set
-# Manual mode for the startup process too, replacing the SDK's flag.
-for arg do
-    shift
-    case $arg in
-        --permission-mode=*) ;;
-        --permission-mode|--) echo "claude_acp_exec: unexpected SDK permission arguments" >&2; exit 126 ;;
-        *) set -- "$@" "$arg" ;;
-    esac
-done
-exec "$host" --permission-mode=default --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow "$@"
+exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow "$@"

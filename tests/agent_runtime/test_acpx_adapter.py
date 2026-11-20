@@ -1999,10 +1999,7 @@ def test_builtin_discussion_seats_are_fixed_active_only_and_confined(
         )
 
     assert adapter.name == f"acpx-{participant}-shadow"
-    exec_argv = [acpx_agent, "exec", "-f", "-"]
-    if participant == "claude":
-        exec_argv.extend(["--config-option", "mode=default"])
-    assert plan.cmd[-len(exec_argv) :] == exec_argv
+    assert plan.cmd[-4:] == [acpx_agent, "exec", "-f", "-"]
     _assert_acpx_env_overrides(
         plan.env_overrides,
         expected=({} if auth_env is None else {auth_env: "1"}),
@@ -2950,40 +2947,6 @@ def _launch_env(host: Path, **extra: str) -> dict[str, str]:
         acpx_module.CLAUDE_ACP_HOST_IDENTITY_ENV: acpx_module._claude_code_launch_identity(host.stat()),
         **extra,
     }
-
-
-def test_claude_acp_selects_manual_mode_before_prompt_and_at_child_start(tmp_path, monkeypatch, leased_copies):
-    require_launcher = acpx_module._require_claude_acp_launcher
-    _stub_binary(monkeypatch, tmp_path)
-    monkeypatch.setattr(acpx_module, "_require_claude_acp_launcher", require_launcher)
-    monkeypatch.setenv(acpx_module.TRANSPORT_ENV, "active")
-    adapter = AcpxClaudeShadowAdapter()
-    with acpx_module.active_discussion_scope():
-        plan = adapter.build_invocation(
-            prompt="ping",
-            mode="read-only",
-            cwd=tmp_path,
-            model=None,
-            task_id="claude-mode-test",
-            session_id=None,
-            tool_config={
-                "acpx_discussion": True, "target_agent": "claude", "correlation_id": "corr", "idempotency_key": "idem",
-            },
-        )
-    assert plan.cmd[plan.cmd.index("exec") + 1 :] == ["-f", "-", "--config-option", "mode=default"]
-
-    launcher = Path(plan.env_overrides[acpx_module.CLAUDE_CODE_EXECUTABLE_ENV])
-    host = _fake_host(tmp_path / "native-host", 'printf "%s\\n" "$@"\n')
-    result = subprocess.run(
-        [str(launcher), "--permission-mode=auto", "--model", "name with spaces"],
-        env=_launch_env(host), capture_output=True, text=True, timeout=10,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [
-        "--permission-mode=default", "--disallowedTools", "Monitor,ScheduleWakeup,CronCreate,Workflow",
-        "--model", "name with spaces",
-    ]
-    adapter.cleanup_invocation(plan)
 
 
 def _process_gone(pid: int) -> bool:

@@ -4055,7 +4055,6 @@ class AcpxClaudeShadowAdapter(_AcpxDiscussionAdapter):
             raise
         return replace(
             plan,
-            cmd=[*plan.cmd, "--config-option", "mode=default"],
             env_overrides={
                 **plan.env_overrides,
                 # One-shot exec ends with the turn: no background work or advisor (#9690, #10083).
