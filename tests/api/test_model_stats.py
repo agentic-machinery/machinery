@@ -175,6 +175,7 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
     The planning view then missed a live worker in the named repository and marked the issue ready.
     """
     product, machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
+    lookalike = "sample/ma\u212ainery/src/owned/file.py"
     snap = planning.IssueSnapshot(
         frozenset({product, machinery, private}),
         {"product": product, "machinery": machinery, "private": private},
@@ -187,13 +188,22 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
             (product, 6): planning.Issue("case and letters", "## In scope\nSample/Machinery/файл.py\n"),
             (machinery, 7): planning.Issue("own prefix", f"## In scope\n{machinery}/src/owned/file.py\n"),
             (machinery, 8): planning.Issue("own plain", "## In scope\nsrc/elsewhere.py\n"),
+            (product, 9): planning.Issue("lookalike", f"## In scope\n{lookalike}\n"),
+            (product, 10): planning.Issue(
+                "parent segment",
+                f"## In scope\n{machinery}/docs/../src/owned/file.py\n{machinery}/src/owned/file.py\n",
+            ),
+            (product, 11): planning.Issue("dotted directory", f"## In scope\n{machinery}/release.v2/file.py\n"),
+            (product, 12): planning.Issue("dotted subtree", f"## In scope\n{machinery}/release.v2/docs/**\n"),
+            (product, 13): planning.Issue("repeated slash", f"## In scope\n{machinery}//src/owned/worker.py\n"),
         },
         {}, frozenset(), 3,
     )
     workers = {
-        machinery: planning.expand_claim("src/owned") + planning.expand_claim("файл.py"),
+        machinery: (planning.expand_claim("src/owned") + planning.expand_claim("файл.py")
+                    + planning.expand_claim("release.v2/file.py") + planning.expand_claim("release.v2")),
         private: planning.expand_claim("docs"),
-        product: [],
+        product: planning.expand_claim(lookalike),
     }
     ready = {row["ref"]: row["path_status"] for row in planning.project_issues(snap, workers, stale=False)["ready"]}
     assert ready == {
@@ -205,6 +215,11 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
         f"{product}#6": "path_conflicts",
         f"{machinery}#7": "path_conflicts",
         f"{machinery}#8": "ready_now",
+        f"{product}#9": "path_conflicts",
+        f"{product}#10": "scope_unknown",
+        f"{product}#11": "path_conflicts",
+        f"{product}#12": "path_conflicts",
+        f"{product}#13": "scope_unknown",
     }
     withheld = planning.project_issues(snap, {machinery: None, private: [], product: []}, stale=False)
     assert {"ref": f"{product}#1", "path_status": "worker_scope_unknown"} in withheld["ready"]

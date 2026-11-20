@@ -229,33 +229,37 @@ def collect_issues() -> IssueSnapshot | None:
 def _registered_prefix(token: str, repositories: Collection[str]) -> tuple[str | None, str]:
     """Split a registered ``owner/name/`` prefix. A plain path stays in the issue's repository.
 
-    A registered slug is exactly ``owner/name``, so at most one prefix matches. ``./`` is an
-    explicit relative path and is not a repository prefix.
+    The original two segments must match the ASCII slug grammar before case is folded.
+    A character that becomes a slug letter only after case folding cannot select a repository.
+    ``./`` is an explicit relative path and is not a repository prefix.
     """
     if token.startswith("./"):
         return None, token
-    found: tuple[str, str] | None = None
-    for repo in repositories:
-        slug = repo.lower()
-        prefix = f"{slug}/"
-        if not _SLUG.fullmatch(slug) or len(token) <= len(prefix) or not token.lower().startswith(prefix):
-            continue
-        relative = token[len(prefix):]
-        # ``owner/name//file`` is not a prefix plus a relative path; leave the whole token.
-        if relative.startswith("/") or (found is not None and len(found[0]) >= len(slug)):
-            continue
-        found = (slug, relative)
-    return found if found is not None else (None, token)
+    owner, slash, rest = token.partition("/")
+    name, slash2, relative = rest.partition("/")
+    if not slash or not slash2 or not relative or relative.startswith("/"):
+        return None, token
+    candidate = f"{owner}/{name}"
+    if not _SLUG.fullmatch(candidate):
+        return None, token
+    slug = candidate.lower()
+    if slug not in {repo.lower() for repo in repositories}:
+        return None, token
+    return slug, relative
 
 
-def _relative_scope_rejected(token: str, repositories: Collection[str]) -> bool:
-    """The prose checks that used to run on the whole scope token, applied to the path we keep."""
+def _relative_scope_rejected(token: str, repositories: Collection[str], *, prefixed: bool) -> bool:
+    """The prose checks that used to run on the whole scope token, applied to the path we keep.
+
+    A dotted first segment marks prose only on an unqualified path. Once a registered
+    repository prefix is recognized, ``release.v2/file.py`` is a path in that repository.
+    """
     if token.startswith("./"):
         return False
     root, separator, _ = token.partition("/")
     return bool(
         token.lower().removesuffix("/**").removesuffix("/") in repositories
-        or (separator and "." in root.lstrip("."))
+        or (not prefixed and separator and "." in root.lstrip("."))
         or (not token.endswith(("/", "/**")) and not _FILE_SUFFIX.search(token))
     )
 
@@ -279,10 +283,16 @@ def _scope(body: str, repositories: Collection[str]) -> list[tuple[str | None, P
                 if len(item) > 2 * len(wrapper) and item.startswith(wrapper) and item.endswith(wrapper):
                     item = item[len(wrapper):-len(wrapper)]
             token = _SOURCE_LINE.sub("", item)
-            if token.startswith("-") or token.endswith(".") or not _PATH.fullmatch(token):
+            # A repeated slash is not a relative path. Normalizing it would keep the claim
+            # in the issue's repository and hide a worker in the repository the slug names.
+            if token.startswith("-") or token.endswith(".") or "//" in token or not _PATH.fullmatch(token):
                 return []
             repo, path = _registered_prefix(token, repositories)
-            if _relative_scope_rejected(path, repositories):
+            # A parent segment is not a relative path we can reassign. Collapsing it would
+            # hide the bad item and could mark the issue ready in another repository.
+            if repo is not None and ".." in path.split("/"):
+                return []
+            if _relative_scope_rejected(path, repositories, prefixed=repo is not None):
                 return []
             claims = expand_claim(path)
             if any(claim.kind == ClaimKind.UNKNOWN for claim in claims):
