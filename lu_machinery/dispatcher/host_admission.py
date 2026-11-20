@@ -122,7 +122,7 @@ def check(mode, *, dry_run, disk_guard, force_reason=None):
     return decision
 
 
-def credit_period_refusal(agent, model):
+def credit_period_refusal(agent, model, *, codex_account=None):
     """Import errors propagate; only the reader owns unknown-state policy."""
     from lu_machinery.fleet import credit_lane
 
@@ -131,11 +131,11 @@ def credit_period_refusal(agent, model):
         from lu_machinery.review.model_catalog import substitution_default_model
 
         model = substitution_default_model(agent) or _default_model_for(agent)
-    return credit_lane.dispatch_refusal(agent, model)
+    return credit_lane.dispatch_refusal(agent, model, codex_account=codex_account)
 
 
-def check_credit(agent, model):
-    if refusal := credit_period_refusal(agent, model):
+def check_credit(agent, model, codex_account=None):
+    if refusal := credit_period_refusal(agent, model, codex_account=codex_account):
         raise Refused(f"❌ dispatch refused: {refusal}", 2)
 
 
