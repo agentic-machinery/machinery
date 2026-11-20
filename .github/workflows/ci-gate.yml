@@ -1260,9 +1260,6 @@ jobs:
     name: Installed wheel (pinned Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      PRODUCT_UV_VERSION: "0.13.1"
-      PRODUCT_UV_LINUX_X86_64_SHA256: eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1578,14 +1575,6 @@ jobs:
           ref: ${{ steps.pin.outputs.commit }}
           path: product
           persist-credentials: false
-
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
-        with:
-          version: ${{ env.PRODUCT_UV_VERSION }}
-          checksum: ${{ env.PRODUCT_UV_LINUX_X86_64_SHA256 }}
-          download-from-astral-mirror: 'false'
-          enable-cache: 'false'
-          no-project: 'true'
 
       - name: Build the product environment at the pin
         env:
