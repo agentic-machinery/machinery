@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from itertools import accumulate
 from typing import Any
 
@@ -248,7 +248,7 @@ def _findings_json_verdicts(response: str, *, stated: str | None = None) -> list
     verdicts: list[str] = []
     for candidate in candidates:
         try:
-            payload = json_depth.loads(candidate, max_depth=_JSON_MAX_DEPTH)
+            payload = load_findings_json(candidate)
         except ValueError:
             continue
         if not isinstance(payload, dict):
@@ -327,14 +327,14 @@ def _top_level_json_values(response: str) -> Iterator[Any]:
     lines = _commonmark_lines(response)
     text = "\n".join(lines)
     starts = list(accumulate((len(line) + 1 for line in lines), initial=0))
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_object, parse_constant=_not_json_constant)
     consumed = 0
     for token in MarkdownIt("commonmark").parse(text):
         if token.level:
             continue
         if token.type == "fence" and token.info.strip() in {"", "json"}:
             try:
-                value = json_depth.loads(token.content, max_depth=_JSON_MAX_DEPTH)
+                value = load_findings_json(token.content)
             except ValueError:
                 if _looks_like_findings(token.content):
                     raise _UnreadableFindings("inconclusive: findings JSON cannot be decoded") from None
@@ -461,16 +461,14 @@ def _completion_prose(response: str) -> list[str]:
     return prose
 
 
-def declares_incomplete_review(response: str, *, findings_payload: dict[str, Any] | None = None) -> bool:
+def declares_incomplete_review(response: str, *, findings_payloads: Iterable[dict[str, Any]] | None = None) -> bool:
     """Whether own prose or a findings explanation declares the review unfinished.
 
     Quoted blocks, code and inline examples are not reviewer declarations.
     No new completion field is required of existing complete replies.
     """
-    # A caller that already parsed a bare or fenced receipt can supply the
-    # findings directly. An envelope still has its own prose outside the fence.
-    prose = _completion_prose(response) if findings_payload is None or response.startswith("VERDICT:") else []
-    values = _top_level_json_values(response) if findings_payload is None else (findings_payload,)
+    prose = _completion_prose(response) if response else []
+    values = _top_level_json_values(response) if findings_payloads is None else findings_payloads
     for payload in values:
         if isinstance(payload, dict) and _FINDINGS_ENVELOPE_KEYS & payload.keys():
             overall = payload.get("overall")

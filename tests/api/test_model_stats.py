@@ -1060,7 +1060,7 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
             options={"pinned_head": "1" * 40}, status="rate_limited", started_at=_at(4), duration_s=60)
     _record(tasks, "neon-later-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
             options={"pinned_head": "2" * 40}, duration_s=180)
-    (tasks / "neon-later-review.result").write_text("VERDICT: APPROVE\nReviewed the complete diff.")
+    (tasks / "neon-later-review.result").write_text("VERDICT: APPROVE\nSCORE: 9/10\n\nReviewed the complete diff.")
     _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
             status="failed")
     _record(tasks, "landed", delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)

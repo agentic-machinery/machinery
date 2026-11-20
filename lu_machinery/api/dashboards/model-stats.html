@@ -258,7 +258,8 @@ function samplesOf(model) {
 }
 function reviewRow(r, kind) {
   const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : samplesOf(r.model);
-  const notDone = pct(r.not_done) + (u.not_done ? ` <span class="muted">(${num(u.not_done)})</span>` : "");
+  const unfinished = r.tasks - r.status.done;
+  const notDone = pct(r.not_done) + (unfinished ? ` <span class="muted">(${num(unfinished)})</span>` : "");
   const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
   const absent = Object.entries(r.review_evidence_absent || {});
   const absentTotal = absent.reduce((total, [, count]) => total + count, 0);

@@ -333,11 +333,12 @@ def canonical_receipt_payload(raw: str) -> dict[str, Any]:
 
     text = raw.strip(" \t\r\n")
     payload = parse_reviewer_json(raw)
-    if not text.startswith("VERDICT:"):
+    envelope = text.startswith("VERDICT:")
+    if not envelope:
         validate_reviewer_payload(payload)
         if _effective_verdict(payload) is None:
             raise ContractError("review_invalid_verdict")
-    if declares_incomplete_review(text, findings_payload=payload):
+    if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
         raise ContractError("review_declares_incomplete", exit_code=EXIT_INCOMPLETE)
     return payload
 
@@ -433,11 +434,17 @@ def decision_lock(raw: str) -> dict[str, Any]:
     only when exactly one findings object is readable, even if it does not
     yet validate.
     """
-    from lu_machinery.review.verdict_parser import declares_incomplete_review, recognized_verdicts
+    from lu_machinery.review.verdict_parser import (
+        MISSING_CAPABILITIES_FIELD,
+        declares_incomplete_review,
+        recognized_verdicts,
+    )
 
     try:
         objects = _json_objects(_outside_blockquotes(raw))
-        incomplete = declares_incomplete_review(raw)
+        incomplete = declares_incomplete_review(raw, findings_payloads=objects) or any(
+            MISSING_CAPABILITIES_FIELD in payload for payload in objects
+        )
         verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     except (ValueError, RecursionError):
         return {"ambiguous": True, "verdicts": [], "payload": None}

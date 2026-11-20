@@ -57,7 +57,11 @@ from lu_machinery.orchestration.fleet_repos import FleetRepo, clear_repository_c
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
-from lu_machinery.review.verdict_parser import checked_findings_payload, unsupported_verdict_tokens
+from lu_machinery.review.verdict_parser import (
+    checked_findings_payload,
+    declares_incomplete_review,
+    unsupported_verdict_tokens,
+)
 from lu_machinery.secret_redactor import redact_text
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
@@ -523,7 +527,10 @@ def review_summary(raw: bytes, *, allow_sample: bool = False, allow_markdown: bo
     try:
         payload = parse_reviewer_json(text)
     except ContractError as exc:
-        if allow_markdown and str(exc).startswith(("non_json_or_chatter:", "review_envelope_invalid_headers")):
+        if allow_markdown and str(exc).startswith((
+            "non_json_or_chatter:", "review_envelope_invalid_headers", "review_envelope_requires_one_json_block",
+            "review_envelope_invalid_json_fence",
+        )):
             # The existing recorder checks visibility and refuses conflicting
             # tokens or malformed findings blocks in historical text replies.
             from lu_machinery.review import record_cf_verdict  # noqa: PLC0415  The recorder also loads these rows.
@@ -539,6 +546,9 @@ def review_summary(raw: bytes, *, allow_sample: bool = False, allow_markdown: bo
     except (ValueError, RecursionError, TypeError):
         return fail("bad_format")
     try:
+        envelope = text.lstrip(" \t\r\n").startswith("VERDICT:")
+        if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
+            return fail("bad_fields")
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
