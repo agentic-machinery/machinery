@@ -56,10 +56,10 @@ against the prior boundary receipt. The task store around it stays read-only.
 
 Use `fleet_comms channel publish` with the task ID as `--sender` and exactly one `--recipient`.
 The dispatcher binds that recipient from the parent task ID or, for a top-level dispatch, from
-`dispatch --initiator`. The broker permits one plain message per run, up to 64 KiB of UTF-8 text. Fleet
-uses a key bound to the run even when the CLI caller supplies a different `--idempotency-key`. Repeating
-the same publication returns the same message. Changing the publication after a success is refused.
-The host publishes through the installed Fleet CLI while the Fleet store remains masked.
+`dispatch --initiator`. A valid plain message of up to 64 KiB of UTF-8 text gets one host publication
+attempt per launch. Subsequent requests are refused at the broker. Fleet uses a key bound to the run
+across format corrections, regardless of the CLI caller's `--idempotency-key`. The host publishes through
+the installed Fleet CLI while the Fleet store remains masked.
 
 The owning write worker records the finished review through `record_cf_verdict.py`. The reviewer supplies its structured result and cannot publish a verdict or act for a child task.
 The boundary receipt includes the launch mode and GitHub read-relay outcomes. Setup or canary failure

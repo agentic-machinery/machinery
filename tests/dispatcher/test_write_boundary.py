@@ -175,12 +175,12 @@ def test_protected_primary_git_state_cannot_be_changed(primary):
 _BROKER_CLIENT = """
 import json, os, socket, sys
 
-def send(verb, payload, request_id):
+def send(verb, payload, request_id, field="returncode"):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(os.environ["LU_WRITE_BOUNDARY_BROKER"])
         connection.sendall(json.dumps({"verb": verb, "request_id": request_id, "payload": payload}).encode())
         connection.shutdown(socket.SHUT_WR)
-        return json.loads(b"".join(iter(lambda: connection.recv(65536), b"")))["returncode"]
+        return json.loads(b"".join(iter(lambda: connection.recv(65536), b"")))[field]
 
 good = {"name": "pull", "number": 7}
 print(json.dumps({
@@ -421,9 +421,12 @@ verbs = sys.argv[2].split(",")
 results = {verb: send(verb, {}, f"{index:032x}") for index, verb in enumerate(verbs)}
 results["github-read"] = send("github-read", {"name": "pull", "number": 7}, "f" * 32)
 final = {"channel": "cto", "sender": "wb-test", "recipient": "dispatch-owner", "body": "result"}
-for index, changes in enumerate(({}, {"recipient": "different-label"}, {"sender": "dispatch-owner"},
+for index, changes in enumerate(({"recipient": "different-label"}, {"sender": "dispatch-owner"},
                                  {"channel": "--root"}, {"body": "é" * 32769}, {"root": "/outside"}), start=20):
     results[f"final-{index}"] = send("fleet-publish", {**final, **changes}, f"{index:032x}")
+results["final-allowed"] = send("fleet-publish", final, f"{25:032x}")
+results["final-repeat"] = send("fleet-publish", final, f"{26:032x}")
+results["final-changed"] = send("fleet-publish", {**final, "body": "second"}, f"{27:032x}")
 for name, path in (("worktree", "a.txt"), ("git", sys.argv[3]), ("other-task", sys.argv[4])):
     try:
         with open(path, "a") as stream:
@@ -444,8 +447,9 @@ open(sys.argv[1], "w").write(json.dumps(results))
     assert code == 0 and evidence["canary"]["passed"], evidence
     assert json.loads(report.read_text()) == {
         **dict.fromkeys(verbs, 2),
-        **{f"final-{index}": 2 for index in range(21, 26)},
-        "final-20": 0, "github-read": 0, "worktree": True, "git": True, "other-task": True,
+        **{f"final-{index}": 2 for index in range(20, 25)},
+        "final-allowed": 0, "final-repeat": 2, "final-changed": 2,
+        "github-read": 0, "worktree": True, "git": True, "other-task": True,
     }
     assert steps == [
         ("publish.github", ["read", "pull", "--repo", "owner/repo", "--number", "7"]),
@@ -461,8 +465,22 @@ open(sys.argv[1], "w").write(json.dumps(results))
     assert write_boundary.verify(task_file, "wb-test", "read-only")[1] is None
     assert write_boundary.verify(task_file, "wb-test", "workspace-write")[1] == (
         "write_boundary_unproven: the receipt names another mode")
-    code, correction = _run(primary, f'test -s "{report}"', "--task-artifacts")
+    steps.clear()
+    monkeypatch.setattr(write_boundary._Broker, "_run", lambda self, argv, timeout_key, stdin: steps.append(
+        (timeout_key, argv, stdin)) or {"returncode": 3, "stdout": "", "stderr": "channel_not_found\n"})
+    probe.write_text(_BROKER_CLIENT[:_BROKER_CLIENT.index("good =")] + '''
+assert os.path.getsize(sys.argv[1]) > 0
+final = {"channel": "cto", "sender": "wb-test", "recipient": "dispatch-owner", "body": "result"}
+assert send("fleet-publish", final, "a" * 32, "stderr") == "Fleet final publication did not return success\\n"
+assert send("fleet-publish", final, "b" * 32) == 2
+''')
+    code = write_boundary.main([
+        "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
+        "--receipt", str(receipt), "--task-artifacts", "--", sys.executable, "-I", str(probe), str(report),
+    ])
+    correction = json.loads(receipt.read_text())
     assert code == 0 and correction["task_artifacts"] == evidence["task_artifacts"], correction
+    assert len(steps) == 1
 
 
 @pytest.mark.parametrize("login_root", ["home", "emptied-root"])

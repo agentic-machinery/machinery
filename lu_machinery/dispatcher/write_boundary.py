@@ -1094,6 +1094,7 @@ class _Broker:
 
         self.boundary = boundary
         self.final_delivery = final_delivery
+        self.final_publish_attempted = False
         self.records: list[dict] = []
         self.seen: set[str] = set()
         self.children: set[subprocess.Popen[bytes]] = set()
@@ -1339,6 +1340,8 @@ class _Broker:
     def _fleet_publish(self, payload: dict) -> dict:
         if self.final_delivery is None:
             raise _BrokerRefusal("this launch has no final Fleet delivery target")
+        if self.final_publish_attempted:
+            raise _BrokerRefusal("the final Fleet publication has already been attempted")
         if set(payload) != {"channel", "body", "sender", "recipient"}:
             raise _BrokerRefusal("fleet-publish takes channel, body, sender and one recipient")
         recipient, key = self.final_delivery
@@ -1354,12 +1357,17 @@ class _Broker:
             encoded = b""
         if not 0 < len(encoded) <= _MAX_FINAL_BODY:
             raise _BrokerRefusal(f"body must be non-empty UTF-8 text of at most {_MAX_FINAL_BODY} bytes")
-        # Fleet owns durable idempotency. The installed authority accepts one message at this key even if
-        # a caller retries after losing the reply or tries another body or channel.
+        # The broker serializes requests, so even a host failure consumes this launch's one attempt.
+        # Fleet's run key also prevents another publication from a format-correction launch.
+        self.final_publish_attempted = True
         argv = [str(project_interpreter()), "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish",
                 channel, "-", "--sender", task_id, "--source", "read-only-worker", "--recipient", recipient,
                 "--idempotency-key", key]
-        return self._run(argv, "fleet-publish", stdin=encoded)
+        reply = self._run(argv, "fleet-publish", stdin=encoded)
+        if reply["returncode"] != 0:
+            return {"returncode": reply["returncode"], "stdout": "",
+                    "stderr": "Fleet final publication did not return success\n"}
+        return reply
 
     def _github_read(self, payload: dict) -> dict:
         """A named read of this repository through the publisher's fixed GET templates (no write is possible)."""
