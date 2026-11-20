@@ -32,7 +32,8 @@ def dispatch(tmp_path, monkeypatch):
     monkeypatch.setattr(git, "create_worktree", Mock())
     monkeypatch.setattr(checks, "check_resources", lambda _: None)
     # The synthetic head has no Git history; branch authorship is exercised against a real repository below.
-    monkeypatch.setattr(checks, "check_branch_author_families", lambda *a: None)
+    monkeypatch.setattr(checks, "check_branch_author_families", lambda *a, **k: None)
+    monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", lambda *_a: [])
     start = Mock(side_effect=lambda spec, record, prompt, timeout: store.create(
         {**record, "pid": os.getpid(), "process_start": worker._identity(os.getpid())}, prompt,
     ))
@@ -62,11 +63,13 @@ def dispatch(tmp_path, monkeypatch):
 
 
 def test_review_metadata_loss_round_trip_enforces_risk_and_subjects(dispatch, monkeypatch):
+    monkeypatch.setattr(cf, "_pr", lambda *_a: dict(headRefName="review/target", headRefOid="a" * 40))
     record = dispatch("--risk", "high", "--review-profile", "code", "--review-mode", "cross_family",
                       "--review-author-model", "claude-opus-5-5", "--language-lane", "", "--pr", "42",
                       "--subject-seat", "GROK_build", "--subject-seat", "claude-infra",
                       "--subject-seat", "grok", "--subject-family", " XAI ", "--require-review-verdict")
     assert record["schema_version"] == 2
+    assert (record["review_branch"], record["pinned_head"]) == ("review/target", "a" * 40)
     assert {key: record[key] for key in ("review_risk", "review_profile", "review_mode", "review_author_model",
                                        "language_lane", "pr", "require_review_verdict")} == dict(
         review_risk="high", review_profile="code", review_mode="cross_family",
@@ -269,12 +272,7 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
     assert refusal in capsys.readouterr().err
     # A reviewer from a third family (Google; Grok is retired, GROK-CANCEL-1110) is outside every author family.
     outside = ("agy", "gemini-4-neon-high")
-    if refusal == "['anthropic', 'openai']":
-        # A mixed-family head needs the Anthropic/OpenAI pair whatever the profile label: the recorder's rule binds
-        # at dispatch, so a Google seat is refused before a round is spent (#58).
-        dispatch(*review, agent=outside[0], model=outside[1], expected=2, refusal="review_setup_refusal")
-        assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
-    elif trailers and refusal.startswith("["):
+    if trailers and refusal.startswith("["):
         if "--dry-run" in flags:
             assert cli.main(["dispatch", "--agent", outside[0], "--model", outside[1],
                              "--prompt", "Review this change", *review]) == 0
@@ -304,7 +302,7 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     review = ("--mode", "read-only", "--branch", "codex/fix", "--pr", "42", "--risk", "medium",
               "--require-review-verdict", "--prompt", "Review this change")
     # GitHub knows the Medium-tier diff, with no recorded verdicts at the third or fourth head.
-    current_head = "3" * 40
+    current_head = "1" * 40
     monkeypatch.setattr(cf, "_run_json", lambda args, **_k: dict(headRefOid=current_head, headRefName="codex/fix",
                                                                  state="OPEN"))
     monkeypatch.setattr(cf, "_review_repository_root", lambda *_a: Path("/nonexistent"))
@@ -316,6 +314,7 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
     monkeypatch.setattr(cf.GitHubAdapter, "identity", lambda self: "fleet")
     monkeypatch.setattr(cf.GitHubAdapter, "comments", lambda self, repository, number: [])
     for round_number in (1, 2, 3):
+        current_head = str(round_number) * 40
         assert cli.main(["dispatch", "--agent", "sol", "--model", CURRENT_SOL, "--task-id", f"round-{round_number}",
                          *review]) == 0
     current_head = "4" * 40
@@ -328,15 +327,21 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
 
-@pytest.mark.parametrize("agent,model,profile,refusal", [
+@pytest.mark.parametrize("agent,model,flags,refusal", [
     ("claude", "claude-sonnet-5-5", ("--review-profile", "ukrainian"), "Ukrainian review needs a Gemini or Sol seat"),
     ("agy", "gemini-4-neon-high", ("--review-profile", " Ukrainian "), "protected scope needs a code-profile review"),
     ("claude", "claude-sonnet-5-5", ("--review-profile", "Code"), "Sonnet is excluded from security review"),
     ("claude", "claude-sonnet-5-5", (), "Sonnet is excluded from security review"),
+    ("claude", "claude-sonnet-5-5", ("--review-mode", "red_team"), "Sonnet is excluded from security review"),
     ("claude", "claude-opus-5-5", ("--review-profile", "code"), None),
+    ("claude", "claude-opus-5-5", ("--pr", "42"), None),
+    ("claude", "claude-opus-5-5", ("--pr", "43"), "--branch does not match the PR head branch"),
+    ("claude", "claude-opus-5-5", ("--pr", "42", "--pinned-head", "b" * 40), "checkout does not match the PR head SHA"),
+    ("agy", "gemini-4-neon-high", ("--pr", "44"), None),
+    ("codex", CURRENT_SOL, ("--pr", "44", "--review-author-model", CURRENT_SOL), None),
 ])
 def test_mislabelled_review_dispatch_cannot_avoid_the_critical_floor(dispatch, monkeypatch, tmp_path, capsys,
-                                                                  agent, model, profile, refusal):
+                                                                  agent, model, flags, refusal):
     """Defect class: mislabelled review dispatch avoids the critical floor (#58)."""
     repo, origin = tmp_path / "repo", tmp_path / "origin.git"
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -352,20 +357,38 @@ def test_mislabelled_review_dispatch_cannot_avoid_the_critical_floor(dispatch, m
     run("commit", "-q", "--allow-empty", "-m", "base")
     run("clone", "-q", "--bare", str(repo), str(origin))
     run("remote", "add", "origin", str(origin))
-    secure = repo / "lu_machinery" / "dispatcher" / "example.py"
-    secure.parent.mkdir(parents=True)
-    secure.write_text("VALUE = 1\n")
-    run("add", "lu_machinery/dispatcher/example.py")
-    run("commit", "-q", "-m", f"work\n\nX-Agent: codex/{CURRENT_SOL}")
+    low = "44" in flags
+    path = "docs/example.md" if low else "lu_machinery/dispatcher/example.py"
+    changed = repo / path
+    changed.parent.mkdir(parents=True)
+    changed.write_text("Example content\n")
+    run("add", path)
+    task_root = store.tasks_dir()
+    task_root.mkdir(exist_ok=True)
+    (task_root / "test-codex-author.json").write_text(json.dumps({
+        "repository": "example/public", "task_id": "test-codex-author", "agent": "codex", "model": CURRENT_SOL,
+    }))
+    run("commit", "-q", "-m", "work\n\nX-Agent: codex/test-codex-author")
+    if low:
+        (task_root / "test-claude-author.json").write_text(json.dumps({
+            "repository": "example/public", "task_id": "test-claude-author", "agent": "claude", "model": "claude-opus-5-5",
+        }))
+        run("commit", "-q", "--allow-empty", "-m", "work\n\nX-Agent: claude/test-claude-author")
     head = run("rev-parse", "HEAD")
     monkeypatch.setattr(git, "resolve_repo", lambda _: (repo, dict(key="public", github="example/public")))
     monkeypatch.setattr(git, "review_branch_start", lambda *a, **k: head)
-    monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path, "claude/branch", head))
+    monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path, "claude/branch", a[3]))
     monkeypatch.setattr(checks, "check_branch_author_families", BRANCH_AUTHOR_FAMILIES)
     monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
-    review = ("--mode", "read-only", "--branch", "review/target", "--risk", "low", *profile)
+    monkeypatch.setattr(cf, "_pr", lambda _repo, _branch, number: dict(
+        headRefName="other/branch" if number == 43 else "review/target", headRefOid=head,
+    ))
+    monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", lambda *_a: [{"filename": path, "status": "added"}])
+    branch = () if flags == ("--pr", "42") else ("--branch", "review/target")
+    review = ("--mode", "read-only", "--risk", "low", *branch, *flags)
     if refusal is None:
-        assert dispatch(*review, agent=agent, model=model)["model"] == model
+        record = dispatch(*review, agent=agent, model=model)
+        assert (record["model"], record["review_branch"], record["pinned_head"]) == (model, "review/target", head)
     else:
         dispatch(*review, agent=agent, model=model, expected=2, refusal="review_setup_refusal")
         assert refusal in capsys.readouterr().err

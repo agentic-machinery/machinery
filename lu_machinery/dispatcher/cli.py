@@ -516,6 +516,23 @@ def _dispatch(args) -> int:
             raise host_admission.Refused("❌ --force-admission requires a non-empty reason", 2)
     if args.branch is not None:
         args.branch = validate_plain_branch_name(args.branch, repo_root=repo)
+    review_pr = None
+    if args.mode == "read-only" and args.pr is not None:
+        from lu_machinery.review.language_lane import is_ukrainian_review
+        from lu_machinery.review.record_cf_verdict import GitHubAdapter, RecordError, _pr, _pr_files_and_tier
+
+        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            try:
+                review_pr = _pr(info["github"], args.branch or "", args.pr)
+            except RecordError as exc:
+                raise ValueError(f"review admission: {exc}") from None
+            pr_branch = review_pr.get("headRefName")
+            if not isinstance(pr_branch, str):
+                raise ValueError("review admission: PR head branch is unavailable")
+            pr_branch = validate_plain_branch_name(pr_branch, repo_root=repo)
+            if args.branch is not None and args.branch != pr_branch:
+                raise ValueError("review admission: --branch does not match the PR head branch")
+            args.branch = pr_branch
     # Settlement can verify only an origin/<branch> base, and only when that branch
     # is not the publish branch. Refuse either case before a workspace-write task
     # is created, so it does not run and then settle no_deliverable (#12420, #12667).
@@ -611,9 +628,23 @@ def _dispatch(args) -> int:
     # with these ids, its tools are granted and its pins are the commit's bytes (#12114).
     with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
         review_contract = review_attempt.admit(args, prompt, binding, repo, sha) if binding and not args.dry_run else None
+        low_tier = False
+        if review_pr is not None:
+            if review_pr.get("headRefOid") != sha:
+                raise ValueError("review admission: checkout does not match the PR head SHA")
+            if args.review_mode != "red_team" and not args.trial_role and not is_ukrainian_review(vars(args)):
+                _, tier = _pr_files_and_tier(GitHubAdapter(repo), info["github"], args.pr)
+                low_tier = tier == "low"
+                if low_tier:
+                    try:
+                        current_pr = _pr(info["github"], args.branch, args.pr)
+                    except RecordError as exc:
+                        raise ValueError(f"review admission: {exc}") from None
+                    if (current_pr.get("headRefOid"), current_pr.get("headRefName")) != (sha, args.branch):
+                        raise ValueError("review admission: PR head changed while resolving the review tier")
         if args.review_mode == "red_team":
             checks.check_review_family(args.review_author_model, args.model, review_mode=args.review_mode)
-        else:
+        elif not low_tier:
             checks.check_review_family(args.review_author_model, args.model)
     # Every read-only review of a change, dry runs included, whichever review flag types it (F10). A change is
     # named by --branch (stored as review_branch, the only identity the verdict recorder publishes for), a PR, or a
@@ -625,7 +656,7 @@ def _dispatch(args) -> int:
         or any((args.risk, args.review_mode, args.language_lane, args.subject_seat, args.subject_family, args.branch))
     ):
         with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
-            checks.check_branch_author_families(args, repo, info, sha, args.model)
+            checks.check_branch_author_families(args, repo, info, sha, args.model, low_tier)
     review = any((args.review_profile, args.language_lane, args.review_author_model, args.risk,
                   args.review_mode, args.pr, args.require_review_verdict, args.subject_seat,
                   args.subject_family))
