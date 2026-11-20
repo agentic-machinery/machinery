@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import time
 import unicodedata
 from collections.abc import Mapping
@@ -30,7 +31,13 @@ def _openai_structured_output_forbidden_keywords() -> frozenset[str]:
 # Failure codes (agent_runtime) for a provider that cannot take the run now: usage limits and no capacity.
 _OUT_OF_CAPACITY = frozenset({"rate_limited", "provider_overloaded"})
 _STDERR_EXCERPT = 500
-
+_STDERR_CAUSE_PATTERNS = {
+    "rate_limit": r"\b(?:hit your usage limit|rate limit exceeded|unexpected status 429)\b",
+    "auth": r"\b(?:not logged in|authentication failed|unexpected status 401)\b",
+    "network": r"\b(?:temporary failure in name resolution|failed to resolve host|connection refused)\b",
+    "permission": r"\b(?:permission denied|operation not permitted|sandbox refused)\b",
+    "process_terminated": r"\b(?:killed by signal\b|signal: (?:9 \(SIGKILL\)|15 \(SIGTERM\)))",
+}
 
 
 def _provider_literal_type(value: object) -> str:
@@ -286,6 +293,12 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
         sanitized = stderr.strip()
         if any(unicodedata.category(char) in {"Cc", "Cf"} for char in sanitized):
             excerpt = "[stderr excerpt withheld: control or format characters]"
+            causes = [
+                cause for cause, pattern in _STDERR_CAUSE_PATTERNS.items()
+                if re.search(pattern, sanitized, re.IGNORECASE)
+            ]
+            cause = causes[0] if len(causes) == 1 else "unknown"
+            excerpt += f" [stderr_cause={cause}]"
         else:
             excerpt = " ".join(redact_paths(redact_text(sanitized) or "").split())
         if excerpt:

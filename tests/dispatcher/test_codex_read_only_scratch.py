@@ -437,12 +437,12 @@ def test_invalid_schema_result_cannot_settle_done(dispatch, monkeypatch, output,
 def test_codex_stderr_excerpt_redacts_secret_and_home_path():
     secret = "key_" + "aB09" * 16
     home_path = "/home/fixture/.codex/config.toml"
-    failed = codex.parse("", f"open {home_path} failed\nwith {secret}  rejected", 1, None)
+    failed = codex.parse("", f"open {home_path} failed with {secret}  rejected", 1, None)
     assert failed.error is not None
     assert secret not in failed.error
     assert home_path not in failed.error
     assert "/home/" not in failed.error
-    assert failed.error.startswith("codex: exited with status 1: ")
+    assert failed.error == "codex: exited with status 1: open <path> failed with [REDACTED_SECRET] rejected"
     assert len(failed.error) <= len("codex: exited with status 1: ") + 500
 
 
@@ -464,12 +464,45 @@ def test_control_format_characters_removed_from_stderr_excerpt(character, placem
     if placement == "trailing" and character in {"\t", "\r", "\n", "\r\n", "\x85"}:
         expected = "codex: exited with status 1: notice [REDACTED_SECRET]"
     else:
-        expected = "codex: exited with status 1: [stderr excerpt withheld: control or format characters]"
+        expected = "codex: exited with status 1: [stderr excerpt withheld: control or format characters] [stderr_cause=unknown]"
     assert parsed.error == expected
     assert character not in parsed.error
     assert secret[:8] not in parsed.error
     assert secret[8:] not in parsed.error
     assert secret[4:12] not in parsed.error
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.parametrize(("diagnostic", "cause"), [
+    ("You've hit your usage limit", "rate_limit"),
+    ("rate limit exceeded", "rate_limit"),
+    ("unexpected status 429", "rate_limit"),
+    ("Not logged in", "auth"),
+    ("Authentication failed", "auth"),
+    ("unexpected status 401", "auth"),
+    ("Temporary failure in name resolution", "network"),
+    ("Failed to resolve host", "network"),
+    ("Connection refused", "network"),
+    ("Permission denied", "permission"),
+    ("Operation not permitted", "permission"),
+    ("Sandbox refused", "permission"),
+    ("process killed by signal", "process_terminated"),
+    ("signal: 9 (SIGKILL)", "process_terminated"),
+    ("signal: 15 (SIGTERM)", "process_terminated"),
+    ("an unrecognized diagnostic", "unknown"),
+    ("Permission denied\nAuthentication failed", "unknown"),
+    ("unexpected status 4290", "unknown"),
+])
+def test_codex_withheld_stderr_records_only_a_fixed_cause(diagnostic, cause):
+    """Withheld stderr must retain a cause without copying raw diagnostic text."""
+    raw = f"{diagnostic}\nsource /home/fixture/config.toml TOKEN: private fixture value"
+    parsed = codex.parse("", raw, 1, None)
+    assert parsed.error == (
+        "codex: exited with status 1: [stderr excerpt withheld: control or format characters] "
+        f"[stderr_cause={cause}]"
+    )
+    assert not parsed.rate_limited
 
 
 @pytest.mark.usefixtures('configured_roots')
