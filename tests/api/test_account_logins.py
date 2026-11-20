@@ -511,6 +511,207 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     assert collected[("codex:b", "hot")] == 1.0 and collected[("codex:b", "cool")] == 0.0
     assert collected[("claude:b", "hot")] == 1.0
 
+    # Defect class: an on-pace reading is hot because the cumulative rate misses reset, and a cap
+    # reading is near_cap even when the remainder lasts. Fixed rows, not the cache clock.
+    def reading(used: float, delta: float, expected: float, lasts: bool, *, seconds: int | bool | None = 3600):
+        state = "on_pace" if abs(delta) <= 2 else "deficit" if delta > 0 else "reserve"
+        return {
+            "reading": {"status": "fresh"},
+            "weekly": {"status": "ok", "used_pct": used, "resets_at": "2030-01-08T00:00:00Z"},
+            "pace": {
+                "status": "ok", "state": state, "headroom_pct": round(-delta, 1),
+                "expected_used_pct": round(expected, 1), "lasts_to_reset": lasts,
+                "runs_out_in_s": seconds, "runs_out_at": "2030-01-02T00:00:00Z",
+            },
+        }
+
+    on_pace = subscriptions.pool_status(reading(15.5, 1.2, 14.3, False))
+    assert (on_pace["status"], on_pace["pace_reason"]) == ("cool", "on_pace")
+    hot = subscriptions.pool_status(reading(68.0, 8.0, 60.0, False, seconds=7200))
+    assert (hot["status"], hot["pace_reason"], hot["runs_out_in_s"]) == ("hot", "runs_out_before_reset", 7200)
+    lasts = subscriptions.pool_status(reading(99.0, -0.5, 99.5, True))
+    assert (lasts["status"], lasts["pace_reason"]) == ("cool", "lasts_to_reset")
+    # The same edges the verdict uses: the cap that will not last, a deficit already out, the band
+    # boundary, and a boolean duration that is not a number of seconds.
+    assert subscriptions.pool_status(reading(99.0, 8.0, 91.0, False))["status"] == "near_cap"
+    assert subscriptions.pool_status(reading(80.0, 8.0, 72.0, False, seconds=0))["pace_reason"] == "ran_out_before_reset"
+    assert subscriptions.pool_status(reading(42.0, 2.0, 40.0, False))["status"] == "cool"
+    assert subscriptions.pool_status(reading(42.0, 2.01, 39.99, False))["status"] == "hot"
+    assert subscriptions.pool_status(reading(40.0, 8.0, 32.0, False, seconds=False))["status"] == "hot"
+
+    # The visibility floor sees the provider percentage, before display rounding can
+    # lift 0.96 to 1.0 and call an early window hot.
+    assert subscriptions._pace(8.0, 0.96, False, None, None, _fixture_now())["reason"] == "too_early_in_window"
+    assert subscriptions._pace(0.4, 0.70, False, None, None, _fixture_now())["reason"] == "too_early_in_window"
+    assert subscriptions._pace(8.0, 1.0, False, None, None, _fixture_now())["status"] == "ok"
+    cache = json.loads(usage_files.cache.read_text())
+    report = cache["pools"]["Codex b"]["usage"]
+    report["pace"]["secondary"].update(expectedUsedPercent=0.96, deltaPercent=8.0, willLastToReset=False)
+    report["usage"]["secondary"]["usedPercent"] = 8.96
+    usage_files.cache.write_text(json.dumps(cache))
+    early_pool = _pool_pace_at_fixture_time()
+    assert (early_pool["pools"]["codex:b"]["status"], early_pool["pools"]["codex:b"]["pace_reason"]) == (
+        "cool", "too_early_in_window")
+    lane = {"codex:b": {"status": "cool"}}
+    state_router._apply_pool_pace(lane, early_pool, [])
+    assert lane["codex:b"]["status"] == "cool"
+    report["pace"]["secondary"].update(expectedUsedPercent=0.70, deltaPercent=0.4)
+    usage_files.cache.write_text(json.dumps(cache))
+    assert _pool_pace_at_fixture_time()["pools"]["codex:b"]["pace_reason"] == "too_early_in_window"
+
+    # A provider pace that omits the expected percentage uses the reset's elapsed
+    # fraction: a mid-window deficit stays hot, and an early window stays too early.
+    omitted = report["pace"]["secondary"]
+    omitted.pop("expectedUsedPercent", None)
+    omitted.update(deltaPercent=10.0, willLastToReset=False, etaSeconds=7200)
+    report["usage"]["secondary"]["usedPercent"] = 60.0
+    report["usage"]["secondary"]["resetsAt"] = "2030-01-05T00:00:00Z"
+    usage_files.cache.write_text(json.dumps(cache))
+    omitted_pool = _pool_pace_at_fixture_time()["pools"]["codex:b"]
+    assert (omitted_pool["status"], omitted_pool["pace_reason"]) == ("hot", "runs_out_before_reset")
+    omitted["deltaPercent"] = 0.48
+    report["usage"]["secondary"]["usedPercent"] = 1.0
+    report["usage"]["secondary"]["resetsAt"] = "2030-01-08T11:08:00Z"
+    usage_files.cache.write_text(json.dumps(cache))
+    assert _pool_pace_at_fixture_time()["pools"]["codex:b"]["pace_reason"] == "too_early_in_window"
+
+    # A boolean, string, or out-of-range percentage is unknown before any hot or cool verdict.
+    # An absent pace at the cap stays near_cap. A missing expected percentage is not malformed.
+    malformed = reading(68.0, 8.0, 60.0, False)
+    for bad_used in (True, "68", float("nan"), 101):
+        malformed["weekly"]["used_pct"] = bad_used
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed = reading(68.0, 8.0, 60.0, False)
+    for bad_headroom in (True, "8", 100.1):
+        malformed["pace"]["headroom_pct"] = bad_headroom
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed = reading(15.5, 1.2, 14.3, False)
+    for bad_expected in (True, "14.3", 100.1):
+        malformed["pace"]["expected_used_pct"] = bad_expected
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed["pace"]["expected_used_pct"] = None
+    assert subscriptions.pool_status(malformed)["status"] == "cool"
+    absent_pace = reading(99.0, 8.0, 91.0, False)
+    absent_pace["pace"] = {"status": "unknown", "reason": "not_reported"}
+    assert subscriptions.pool_status(absent_pace)["pace_reason"] == "weekly_used_up"
+
+    # A supplied expected percentage that is not a percentage stays unknown. Only a
+    # missing one is filled from the reset, and that fill uses the reset the window
+    # reader already accepted. A cap that says it lasts stays cool when the pace is early.
+    supplied = cache["pools"]["Codex b"]
+    supplied["usage"]["pace"]["secondary"].update(deltaPercent=10.0, willLastToReset=False, etaSeconds=7200)
+    supplied["usage"]["usage"]["secondary"]["usedPercent"] = 60.0
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = "2030-01-05T00:00:00Z"
+    for bad_expected in (False, "60", [], {}, 150, -1, float("nan"), float("inf")):
+        supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = bad_expected
+        row = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+        assert row["pace"]["reason"] == "not_reported"
+        assert subscriptions.pool_status(row)["status"] == "unknown"
+    supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = None
+    filled = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert subscriptions.pool_status(filled)["status"] == "hot"
+    supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = 0.96
+    supplied["usage"]["pace"]["secondary"]["willLastToReset"] = True
+    supplied["usage"]["usage"]["secondary"]["usedPercent"] = 99.0
+    lasting = subscriptions.pool_status(subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))
+    assert lasting["status"] == "cool" and lasting["pace_reason"] != "weekly_used_up"
+    supplied["usage"]["pace"]["secondary"]["willLastToReset"] = False
+    assert subscriptions.pool_status(
+        subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))["pace_reason"] == "weekly_used_up"
+    del supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"]
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = "0001-01-01T00:00:00+01:00"
+    unreadable_reset = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert unreadable_reset["reading"]["reason"] != "unreadable_reading"
+    assert subscriptions.pool_status(unreadable_reset)["pace_reason"] == "weekly_used_up"
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = 10**400
+    huge_reset = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert huge_reset["reading"]["reason"] != "unreadable_reading"
+    assert subscriptions.pool_status(huge_reset)["pace_reason"] == "weekly_used_up"
+    supplied["usage"]["usage"]["secondary"].update(usedPercent=1.0, resetsAt="2030-01-08T11:30:00Z")
+    supplied["usage"]["pace"]["secondary"]["deltaPercent"] = 0.48
+    assert subscriptions.pool_status(
+        subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))["pace_reason"] == "too_early_in_window"
+
+    # Defect class: an omitted or null expected percentage is filled from the
+    # whole-second display timestamp. A weekly reset at 10:19:12.500, read at
+    # 12:00:00, is just under one percent elapsed. The display timestamp makes
+    # that 1.0, so a deficit of 8 with eta 7200 is hot. Epoch seconds and epoch
+    # milliseconds truncate the same way. The display timestamp stays whole seconds.
+    def fractional_pool(resets_at, *, expected_key: bool):
+        pace_row = {"deltaPercent": 8, "willLastToReset": False, "etaSeconds": 7200}
+        if expected_key:
+            pace_row["expectedUsedPercent"] = None
+        return {
+            "read_at": "2030-01-01T12:00:00Z",
+            "usage": {"usage": {"secondary": {"windowMinutes": 10080, "usedPercent": 9.0, "resetsAt": resets_at}},
+                      "pace": {"secondary": pace_row}},
+        }
+
+    epoch_seconds = 1894097952.5
+    for resets_at in ("2030-01-08T10:19:12.500Z", "2030-01-08T11:19:12.500+01:00",
+                      epoch_seconds, epoch_seconds * 1000, int(epoch_seconds * 1000)):
+        for keep_null in (False, True):
+            row = subscriptions._cache_account(
+                fractional_pool(resets_at, expected_key=keep_null), _fixture_now(), provider="codex")
+            assert row["reading"]["reason"] != "unreadable_reading"
+            assert row["weekly"]["resets_at"] == "2030-01-08T10:19:12Z"
+            assert (subscriptions.pool_status(row)["status"], subscriptions.pool_status(row)["pace_reason"]) == (
+                "cool", "too_early_in_window"), (resets_at, keep_null)
+
+    # Defect class: a supplied non-percentage drops an explicit lasts-to-reset
+    # flag, so a pool at the cap that will last becomes near_cap. Below the cap
+    # the same rejection stays unknown. A rejected pace whose flag is not true
+    # stays near_cap at the cap.
+    def rejected_pool(used: float, lasts, expected, *, delta=8):
+        return {
+            "read_at": "2030-01-01T12:00:00Z",
+            "usage": {"usage": {"secondary": {"windowMinutes": 10080, "usedPercent": used,
+                                              "resetsAt": "2030-01-05T00:00:00Z"}},
+                      "pace": {"secondary": {"deltaPercent": delta, "expectedUsedPercent": expected,
+                                             "willLastToReset": lasts, "etaSeconds": 7200}}},
+        }
+
+    for bad_expected in (False, True, "60", [], {}, 150, -1, float("nan"), float("inf"), 10**400):
+        lasting = subscriptions._cache_account(rejected_pool(99.0, True, bad_expected), _fixture_now(), provider="codex")
+        assert lasting["pace"]["reason"] == "not_reported"
+        assert lasting["pace"].get("lasts_to_reset") is True
+        assert (subscriptions.pool_status(lasting)["status"], subscriptions.pool_status(lasting)["pace_reason"]) == (
+            "cool", "lasts_to_reset"), bad_expected
+        below = subscriptions._cache_account(rejected_pool(60.0, True, bad_expected), _fixture_now(), provider="codex")
+        assert below["pace"].get("lasts_to_reset") is True
+        assert subscriptions.pool_status(below)["status"] == "unknown", bad_expected
+        capped = subscriptions._cache_account(rejected_pool(99.0, False, bad_expected), _fixture_now(), provider="codex")
+        assert "lasts_to_reset" not in capped["pace"]
+        assert subscriptions.pool_status(capped)["pace_reason"] == "weekly_used_up", bad_expected
+    not_a_flag = subscriptions._cache_account(rejected_pool(99.0, 1, False), _fixture_now(), provider="codex")
+    assert "lasts_to_reset" not in not_a_flag["pace"]
+    assert subscriptions.pool_status(not_a_flag)["pace_reason"] == "weekly_used_up"
+    bad_delta = subscriptions._cache_account(
+        rejected_pool(99.0, True, 40, delta=False), _fixture_now(), provider="codex")
+    assert bad_delta["pace"].get("lasts_to_reset") is True
+    assert subscriptions.pool_status(bad_delta)["pace_reason"] == "lasts_to_reset"
+
+    # Defect class: the cap compared the one-decimal display percent. 98.99 and
+    # 98.95 display as 99.0, so a rejected pace below the cap became cool when
+    # the flag was true and near_cap when it was not. A percent that is at the
+    # cap, including one whose display is also 99.0, keeps the cap verdict.
+    for below_cap in (98.99, 98.95):
+        for lasts in (True, False):
+            row = subscriptions._cache_account(
+                rejected_pool(below_cap, lasts, "60"), _fixture_now(), provider="codex")
+            assert (row["weekly"]["used_pct"], row["weekly"]["used_pct_exact"]) == (99.0, below_cap)
+            assert row["pace"]["reason"] == "not_reported"
+            assert subscriptions.pool_status(row)["status"] == "unknown", (below_cap, lasts)
+    at_cap = subscriptions._cache_account(rejected_pool(99.04, True, "60"), _fixture_now(), provider="codex")
+    assert at_cap["weekly"]["used_pct"] == 99.0
+    assert subscriptions.pool_status(at_cap)["pace_reason"] == "lasts_to_reset"
+    over = subscriptions._cache_account(rejected_pool(99.04, False, "60"), _fixture_now(), provider="codex")
+    assert subscriptions.pool_status(over)["pace_reason"] == "weekly_used_up"
+    on_pace = subscriptions._cache_account(
+        rejected_pool(98.99, False, 98.4, delta=0.5), _fixture_now(), provider="codex")
+    assert (subscriptions.pool_status(on_pace)["status"], subscriptions.pool_status(on_pace)["pace_reason"]) == (
+        "cool", "on_pace")
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no
