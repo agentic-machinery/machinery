@@ -111,7 +111,6 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             "/api/git/pull-requests",
         },
         "subscriptions.html": {
-            "/api/runtime/subscriptions",
             "/api/state/routing-budget",
             "/api/runtime/logins",
         },

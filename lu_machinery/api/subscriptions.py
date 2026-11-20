@@ -566,6 +566,24 @@ def subscriptions_snapshot(*, now: datetime | None = None, monitor_reader: Monit
     }
 
 
+def age_snapshot(snapshot: dict[str, Any], elapsed_s: float) -> dict[str, Any]:
+    """Age the routing-budget copy without changing the cached account snapshot."""
+    providers = []
+    for provider in snapshot["providers"]:
+        accounts = []
+        for account in provider["accounts"]:
+            reading = account["reading"]
+            if reading["age_s"] is not None:
+                age_s = reading["age_s"] + elapsed_s
+                status = reading["status"]
+                if status == "fresh" and age_s > snapshot["stale_after_s"]:
+                    status = "stale"
+                reading = {**reading, "age_s": age_s, "status": status}
+            accounts.append({**account, "reading": reading})
+        providers.append({**provider, "accounts": accounts})
+    return {**snapshot, "providers": providers}
+
+
 # --- one pace verdict per pool, for routing, alerts and the page -----------------------------------
 
 

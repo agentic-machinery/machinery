@@ -198,10 +198,10 @@
     <label>Review class <select id="matrix-class"><option value="all">all classes</option></select></label>
     <div id="matrix">Loading…</div></section>
   <section class="wide"><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
-    <p class="note">The count above includes settled writes for this selection. Compare models or effort levels on higher landed share, fewer failed runs and fewer hours per merge for similar work.</p>
+    <p class="note">The count above includes settled writes with known effort. The unknown effort rows show the excluded tasks. Compare similar work for a higher landed share and fewer hours per merge.</p>
     <div id="write">Loading…</div></section>
   <section class="wide"><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
-    <p class="note">The count above includes settled reviews and other read-only tasks. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results. Compare approval and findings with the sample size and type of review in mind.</p>
+    <p class="note">The count above includes settled reviews and other read-only tasks with known effort. PR comparisons list reviewer effort and include PRs with known effort across the counted reviews. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results.</p>
     <div id="review">Loading…</div>
     <div id="unparsed-samples"></div></section>
   <section class="wide"><h2>Reviewed PRs <span class="meta" id="author-meta"></span></h2>
@@ -264,8 +264,16 @@ function values(summary, head, rows, textColumns) {
 const IDENTITY = {alias: "harness alias, version not observed", harness_choice: "Cursor Auto: the harness chose the model",
   unreported: "the harness reported no model", not_in_catalog: "spelling outside the model catalog",
   joint: "PR reviewed for two author models"};
-const named = (r) => `<b>${esc(r.model)}</b>${r.identity && r.identity !== "catalog" ? ` <span class="muted">(${esc(IDENTITY[r.identity] || r.identity)})</span>` : ""}`;
-function rowName(r, kind) { return kind === "eff" ? `effort ${esc(r.effort)}` : kind === "cls" ? esc(r.class) : named(r); }
+const effortText = (levels, label = "effort") => levels?.length ? `${label} ${levels.join(", ")}` : "";
+const effortsOf = r => [effortText(r.efforts, r.review_efforts?.length ? "write effort" : "effort"),
+  effortText(r.review_efforts, "review effort")].filter(Boolean).join(" · ");
+const effortNote = r => effortsOf(r) ? ` <span class="muted">(${esc(effortsOf(r))})</span>` : "";
+const named = (r) => `<b>${esc(r.model)}</b>${r.identity && r.identity !== "catalog" ? ` <span class="muted">(${esc(IDENTITY[r.identity] || r.identity)})</span>` : ""}${effortNote(r)}`;
+function rowName(r, kind) {
+  if (kind === "eff") return `Effort ${esc(r.effort)}${r.effort === "unknown" ? " (excluded from total)" : ""}`;
+  if (kind === "cls") return esc(r.class) + effortNote(r);
+  return named(r) + (r.efforts?.length ? "" : ' <span class="muted">(no known effort)</span>');
+}
 function grouped(items, render, width) {
   const concrete = items.filter((r) => r.identity === "catalog"), rest = items.filter((r) => r.identity !== "catalog");
   return [...concrete.flatMap(render), ...(rest.length
@@ -291,7 +299,7 @@ function reasonCell(count, sample) {
 }
 function samplesOf(model) {
   const found = current && current.samples && current.samples.get(model);
-  return found || {};
+  return found?.unparsed_samples || {};
 }
 function reviewRow(r, kind) {
   const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : samplesOf(r.model);
@@ -327,16 +335,17 @@ function unparsedSamples(reviews) {
   const items = [];
   for (const m of (reviews || []).filter((r) => keepModel(r.model))) {
     const u = m.unparsed_reasons || {}, samples = samplesOf(m.model);
+    const levels = current.samples.get(m.model)?.unparsed_sample_efforts || {};
     for (const reason of UNPARSED_REASONS) {
       if (samples[reason] !== undefined && samples[reason] !== null) {
-        items.push(`<tr><td><b>${esc(m.model)}</b></td><td>${esc(reason)}</td>${cell(num(u[reason] || 0))}<td class="sample">${esc(samples[reason])}</td></tr>`);
+        items.push(`<tr><td><b>${esc(m.model)}</b></td><td>${esc(levels[reason] || "unknown")}</td><td>${esc(reason)}</td>${cell(num(u[reason] || 0))}<td class="sample">${esc(samples[reason])}</td></tr>`);
       }
     }
   }
   if (!items.length) return "";
   return `<details><summary>First failing replies (${items.length} model and reason pairs)</summary>`
     + '<p class="note">The count shows how often each format problem occurred. The table shows the first 200 characters of one reply so you can recognize the problem.</p>'
-    + table(["Model", "Reason", "Count", "First failing reply"], items, [0, 1, 3]) + "</details>";
+    + table(["Model", "Sample effort", "Reason", "Count", "First failing reply"], items, [0, 1, 2, 4]) + "</details>";
 }
 function withClasses(models, role, render, width) {
   return grouped(models.filter((m) => m.role === role && (!picked() || m.model === picked() || role === "keep")), (m) =>
@@ -361,7 +370,7 @@ function pickerModels(data) {
 function recommend(rec) {
   const sample = `Ranking requires at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per catalog model.`;
   if (!rec || !rec.model) return `<strong class="warn">Best value needs more data</strong><p>${sample}</p>`;
-  return `<strong>Best value in this window <span class="good">${esc(rec.model)}</span></strong>`
+  return `<strong>Best value in this window <span class="good">${esc(rec.model)}</span></strong>${effortNote(rec)}`
     + `<p><b class="good">${num(rec.score, 2)}</b> first-round approvals per recorded hour, from ${num(rec.approvals)} approvals in ${num(rec.recorded_hours, 2)} hours.</p>`
     + `<p>${num(rec.approval * 100)}% approved first time across ${num(rec.approval_n)} reviewed PRs (interval ${ciText(rec.approval_ci)}). The model spent ${num(rec.hours, 2)} recorded hours per merge across ${num(rec.landed)} landed tasks.</p>`
     + `<p class="note">Higher scores mean more approvals for the same recorded time. ${sample} <a href="#jobs">Compare within each job class</a>.</p>`;
@@ -369,7 +378,7 @@ function recommend(rec) {
 function wasteList(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
   if (!shown.length) return "";
-  return shown.map((item) => `<span class="alert">${esc(item.model)}: landed ${item.landed}/${item.tasks} `
+  return shown.map((item) => `<span class="alert">${esc(item.model)}${effortNote(item)}: landed ${item.landed}/${item.tasks} `
     + `(${num(item.rate * 100)}%, ${ciText(item.ci)})</span>`).join("");
 }
 const PALETTE_SIZE = 8;
@@ -406,8 +415,8 @@ function marker(name, x, y, hollow = false) {
   if (shape === 3) return `<path d="M ${x} ${y - 5} l 5 5 -5 5 -5 -5 Z" ${attrs}/>`;
   return `<circle cx="${x}" cy="${y}" r="4" ${attrs}/>`;
 }
-function modelKey(name, hollow) {
-  return `<svg class="symbol" width="14" height="14" aria-hidden="true">${marker(name, 7, 7, hollow)}</svg>${esc(name)}`;
+function modelKey(row, hollow) {
+  return `<svg class="symbol" width="14" height="14" aria-hidden="true">${marker(row.model, 7, 7, hollow)}</svg>${esc(row.model)}${effortNote(row)}`;
 }
 function svgChart(width, height, label, body) {
   return `<svg class="chart" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${label}">${body}</svg>`;
@@ -459,9 +468,9 @@ function scatter(points, id, yLabel, xLabel, connect = false, yMetric = "approva
       ? `<circle cx="${x}" cy="${y}" r="6" fill="var(--card)" stroke="var(--fg)" stroke-width="2"/>`
         + `<path d="M${x - 3} ${y}h6 M${x} ${y - 3}v6" stroke="var(--fg)" stroke-width="2"/>`
       : marker(first.model, x, y, first.low_sample);
-    return `<g${coincident ? ' class="shared-point"' : ""}><title>${group.map((p) => esc(p.model)).join(", ")}</title>${ring}${dot}</g>`;
+    return `<g${coincident ? ' class="shared-point"' : ""}><title>${group.map((p) => esc(`${p.model} ${effortsOf(p)}`)).join(", ")}</title>${ring}${dot}</g>`;
   }).join("");
-  const legend = points.map((p) => `<span>${modelKey(p.model, p.low_sample)}</span>`).join("");
+  const legend = points.map((p) => `<span>${modelKey(p, p.low_sample)}</span>`).join("");
   const shared = groups.filter((group) => group.length > 1).map((group) =>
     `<li>At ${num(group[0].x, 3)} on the horizontal axis and ${num(group[0].y * 100, 1)}% ${esc(yMetric)}, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
   return svgChart(W, H, `${yLabel} against ${xLabel}`,
@@ -512,7 +521,7 @@ function pareto(data) {
       : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
         : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
           : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
-    const rows = shown.map((m) => `<tr><td>${modelKey(m.model, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
+    const rows = shown.map((m) => `<tr><td>${modelKey(m, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
       + cell(displayHours(m)) + cell(share(m.rate, m.tasks)) + cell(ciText(m.ci))
       + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((m) => ({...m, x: exactHours(m), y: m.rate, ci: m.ci})),
@@ -534,7 +543,7 @@ function pareto(data) {
       : frontier.length === 1 ? `${frontierNames} alone is on the speed/approval frontier among the models shown.`
         : shownHasEligible ? "None of the models shown is on the window's speed/approval frontier."
           : `Not enough data for a speed/approval frontier (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
-    const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
+    const rows = shown.map((p) => `<tr><td>${modelKey(p, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
       + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
       + cell(num(p.prs)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((p) => ({...p, x: p.median_seconds / 60, y: p.approval, ci: p.approval_ci})),
@@ -552,7 +561,7 @@ function pareto(data) {
     : frontier.length === 1 ? `${frontierNames} alone is on the window's frontier among the models shown.`
       : shownHasEligible ? "None of the models shown is on the window's frontier."
         : `Not enough data for a frontier in this window (needs at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per model).`;
-  const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
+  const rows = shown.map((p) => `<tr><td>${modelKey(p, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
     + cell(displayHours(p)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
     + cell(num(p.prs)) + cell(num(p.landed)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
   return scatter(shown.map((p) => ({...p, x: exactHours(p), y: p.approval, ci: p.approval_ci})),
@@ -592,8 +601,8 @@ function jobs(data) {
           + `${cell("—")}${cell("—")}<td>—</td></tr>`);
       } else {
         const pickNames = winners.length === 1
-          ? `<b>${esc(best.model)}</b> <strong class="good">★ Best</strong>`
-          : winners.map((w) => `<div><b>${esc(w.model)}</b> <strong class="good">★ Best</strong></div>`).join("");
+          ? `${named(best)} <strong class="good">★ Best</strong>`
+          : winners.map((w) => `<div>${named(w)} <strong class="good">★ Best</strong></div>`).join("");
         const pickShare = winners.length === 1
           ? `${num(best.rate * 100)}% <span class="muted">(${num(best.landed)}/${num(best.tasks)}, ${ciText(best.ci)})</span>`
           : winners.map((w) => `<div>${esc(w.model)}: ${num(w.rate * 100)}% <span class="muted">(${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)})</span></div>`).join("");
@@ -610,7 +619,7 @@ function jobs(data) {
               : ` <span class="low">CI overlaps ${overlapping.map((w) => esc(w.model)).join(", ")}</span>`;
         }
         const runnerText = runnerUp
-          ? `${esc(runnerUp.model)} · ${num(runnerUp.rate * 100)}% <span class="muted">(${num(runnerUp.landed)}/${num(runnerUp.tasks)}, ${ciText(runnerUp.ci)})</span>${overlap}`
+          ? `${named(runnerUp)} · ${num(runnerUp.rate * 100)}% <span class="muted">(${num(runnerUp.landed)}/${num(runnerUp.tasks)}, ${ciText(runnerUp.ci)})</span>${overlap}`
           : '<span class="muted">None with n ≥ ' + lowBelow() + "</span>";
         matrixRows.push(`<tr class="best"><td><b>${esc(job.class)}</b></td>${cell(num(job.tasks))}`
           + `<td>${pickNames}</td>`
@@ -622,7 +631,7 @@ function jobs(data) {
       const classBest = best
         ? winners.map((w) => {
           const hrs = displayHours(w);
-          return `${esc(w.model)} (${num(w.rate * 100)}%, ${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)}${hrs !== "—" ? `, ${hrs} h/merge` : ""})`;
+          return `${named(w)} (${num(w.rate * 100)}%, ${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)}${hrs !== "—" ? `, ${hrs} h/merge` : ""})`;
         }).join("; ")
         : totalLanded === 0
           ? '<span class="warn">No landed tasks</span>'
@@ -630,7 +639,7 @@ function jobs(data) {
             ? `<span class="warn">No eligible pick</span> <span class="muted">(landings only in n &lt; ${lowBelow()})</span>`
             : '<span class="warn">Not enough data</span>';
       matrixRows.push(`<tr class="${winner ? "best" : ""}"><td><b>${esc(job.class)}</b></td>`
-        + `<td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
+        + `<td>${named(m)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
         + `${cell(nOf({n: m.tasks, low_sample: m.low_sample}))}`
         + `${cell(`${share(m.rate, m.tasks)} <span class="muted">(${ciText(m.ci)})</span>`, winner ? "good" : "")}`
         + `${cell(displayHours(m))}<td>${classBest}</td></tr>`);
@@ -639,7 +648,7 @@ function jobs(data) {
     for (const m of models) {
       const winner = best && m.tasks >= lowBelow() && landedShare(m) === landedShare(best);
       detailCount += 1;
-      detailRows.push(`<tr class="${winner ? "best" : ""}"><td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
+      detailRows.push(`<tr class="${winner ? "best" : ""}"><td>${named(m)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
         + cell(nOf({n: m.tasks, low_sample: m.low_sample})) + cell(m.landed) + cell(share(m.rate, m.tasks), winner ? "good" : "")
         + cell(ciText(m.ci)) + cell(displayHours(m)) + "</tr>");
     }
@@ -656,18 +665,18 @@ function jobs(data) {
 function statusColor(key) { return `--status-color:var(${STATUS[key][1]})`; }
 function failures(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
-  if (!shown.length) return '<p class="muted">No write tasks in this window.</p>';
+  if (!shown.length) return '<p class="muted">No write tasks with known effort in this window.</p>';
   const keys = Object.keys(STATUS).filter((key) => shown.some((item) => item.status[key]));
   const max = Math.max(...shown.map((item) => item.tasks));
   const bars = shown.map((item) => {
     const segments = keys.filter((key) => item.status[key]).map((key) =>
       `<span class="status-fill" data-status="${key}" style="${statusColor(key)};width:${100 * item.status[key] / max}%"></span>`).join("");
-    return `<div class="status-row"><div class="status-label"><b>${esc(item.model)}</b>`
+    return `<div class="status-row"><div class="status-label">${named(item)}`
       + `<span>${num(item.tasks)} tasks · ${share((item.status.done || 0) / item.tasks, item.tasks)} done</span></div>`
       + `<div class="status-bar" aria-hidden="true">${segments}</div></div>`;
   }).join("");
   const legend = keys.map((key) => `<span><i class="swatch status-fill" data-status="${key}" style="${statusColor(key)}"></i>${STATUS[key][0]}</span>`).join("");
-  const rows = shown.map((item) => `<tr><td>${esc(item.model)}</td>${cell(item.tasks)}`
+  const rows = shown.map((item) => `<tr><td>${named(item)}</td>${cell(item.tasks)}`
     + keys.map((key) => cell(item.status[key] || 0)).join("") + "</tr>");
   return `<div class="status-bars">${bars}<div class="legend">${legend}</div></div>`
     + values("Task counts by status", ["Model", "Tasks", ...keys.map((key) => STATUS[key][0])], rows);
@@ -716,13 +725,13 @@ function trends(items, window) {
       return `<line x1="${px(prev)}" x2="${px(p)}" y1="${py(prev)}" y2="${py(p)}" stroke="${seriesColor(name)}"`
         + ` stroke-width="2" stroke-dasharray="${SERIES_DASHES[index]}"/>`;
     }).join("");
-    return lines + points.map((p) => `<g><title>${esc(name)} ${esc(p.week)}</title>${marker(name, px(p), py(p), low(p))}</g>`).join("");
+    return lines + points.map((p) => `<g><title>${esc(name)} ${esc(p.week)} ${esc(effortsOf(p))}</title>${marker(name, px(p), py(p), low(p))}</g>`).join("");
   }).join("");
   const legend = names.map((name, i) => `<span><svg class="symbol" width="24" height="14" aria-hidden="true">`
     + `<path d="M0 7 H24" stroke="${seriesColor(name)}" stroke-width="2" stroke-dasharray="${SERIES_DASHES[i]}"/>`
     + `${marker(name, 12, 7)}</svg>${esc(name)}</span>`).join("");
   const rows = shown.sort((a, b) => b.week.localeCompare(a.week) || a.model.localeCompare(b.model)).map((p) =>
-    `<tr><td>${modelKey(p.model, low(p))}</td><td>${esc(p.week)}${partial(p.week) ? " (partial)" : ""}</td>`
+    `<tr><td>${modelKey(p, low(p))}</td><td>${esc(p.week)}${partial(p.week) ? " (partial)" : ""}</td>`
     + cell(num(p.landed)) + cell(num(p.tasks))
     + cell(p.tasks ? `${num(p.landed / p.tasks * 100)}% <span class="muted">(n=${num(p.tasks)})</span>${p.tasks < lowBelow() ? LOW : ""}` : "—")
     + cell(num(p.first_approved)) + cell(num(p.prs))
@@ -739,7 +748,7 @@ function neon(data) {
       || block.arms.some((arm) => !arm || typeof arm !== "object" || typeof arm.review_tasks !== "number")) {
     return '<p class="muted">Not enough data yet for Neon effort comparison.</p>';
   }
-  const rows = block.arms.map((arm) => {
+  const rows = [...block.arms, ...(block.unknown_effort ? [block.unknown_effort] : [])].map((arm) => {
     const revCount = `${num(arm.review_results)} / ${num(arm.review_tasks)}`;
     const revTiming = arm.review_timed_n
       ? `${mins(arm.review_median_seconds)} / ${mins(arm.review_p90_seconds)} <span class="muted">(${num(arm.review_timed_n)})</span>${arm.review_timed_n < lowBelow() ? LOW : ""}`
@@ -751,7 +760,7 @@ function neon(data) {
       ? withSample(num(arm.blocking_per_review, 2), arm.findings_n) : "—";
     const p0p2 = arm.p0_p2_per_review !== null && arm.p0_p2_per_review !== undefined
       ? withSample(num(arm.p0_p2_per_review, 2), arm.findings_n) : "—";
-    return `<tr><td>${esc(arm.effort)}${arm.low_sample ? LOW : ""}</td>`
+    return `<tr><td>${esc(arm.effort)}${arm.effort === "unknown" ? " (excluded from comparison)" : ""}${arm.low_sample ? LOW : ""}</td>`
       + cell(arm.write_tasks ? `${num(arm.write_landed)} / ${num(arm.write_tasks)}${arm.write_tasks < lowBelow() ? LOW : ""}` : "0")
       + cell(`${revCount}${arm.review_results < lowBelow() ? LOW : ""}`)
       + cell(arm.review_results ? `${share(arm.approval, arm.review_results)} <span class="muted">(${ciText(arm.approval_ci)})</span>` : "—")
@@ -768,14 +777,14 @@ function neon(data) {
     ? `Compare each measure only when both levels have enough observations for that measure.${overlapNote}`
     : `Both levels need ${lowBelow()} review results or ${lowBelow()} write tasks of the same kind for a comparison.`;
   const hydrogen = data.charts.hydrogen;
-  const context = hydrogen ? `<p class="note">For context, Hydrogen landed ${num(hydrogen.landed)} of ${num(hydrogen.tasks)} write tasks in this window. Tasks by effort ${hydrogen.efforts.map((e) => `${esc(e.effort)} ${num(e.tasks)}`).join(", ")}.${hydrogen.tasks < lowBelow() ? LOW : ""}</p>` : "";
+  const context = hydrogen ? `<p class="note">Hydrogen landed ${num(hydrogen.landed)} of ${num(hydrogen.tasks)} write tasks with known effort. Tasks by effort ${hydrogen.efforts.map((e) => `${esc(e.effort)} ${num(e.tasks)}`).join(", ")}.${hydrogen.tasks < lowBelow() ? LOW : ""}</p>` : "";
   return `<p class="note${block.enough ? "" : " warn"}">${sample}</p>`
     + table(["Effort", "Writes (landed/total)", "Reviews (parsed/total)", "Approval (95% CI)", "Blocking / rev", "P0–P2 / rev", "Review med / p90 min", "Write med min"], rows) + context;
 }
 function strictness(items) {
   const shown = (items || []).filter((p) => p.approve !== null && p.p0_p2 !== null && keepModel(p.model));
   if (!shown.length) return '<p class="muted">No model has both an approval rate and a findings count.</p>';
-  const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
+  const rows = shown.map((p) => `<tr><td>${modelKey(p, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
     + cell(share(p.approve, p.approve_n)) + cell(ciText(p.approve_ci)) + cell(p.approve_n)
     + cell(num(p.p0_p2, 3)) + cell(p.findings_n) + "</tr>");
   return scatter(shown.map((p) => ({...p, x: p.p0_p2, y: p.approve, ci: p.approve_ci})),
@@ -805,7 +814,7 @@ function accuracy(data) {
 // A findings rate counts only PRs with a known findings count, so it carries its own low-sample mark.
 const rateOf = (r) => r && r.value !== null && r.value !== undefined ? `${num(r.value, 2)}${r.low_sample ? LOW : ""}` : "—";
 function risks(authors) {
-  const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}</td>`
+  const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}${effortNote(r)}</td>`
     + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
     + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
   const without = authors.filter((a) => a.prs_without_review_of_record)
@@ -818,7 +827,7 @@ function risks(authors) {
 function boxes(items) {
   const timed = (items || []).filter((item) => item.p90 !== null && keepModel(item.model));
   const shown = timed.slice(0, 12).sort((a, b) => a.median - b.median || a.model.localeCompare(b.model));
-  if (!shown.length) return '<p class="muted">No timed write tasks in this window.</p>';
+  if (!shown.length) return '<p class="muted">No timed write tasks with known effort in this window.</p>';
   const W = chartWidth("boxes"), left = 14, right = W - 26;
   const scale = niceScale(Math.max(...shown.map((item) => item.p90 / 60), 1), W);
   const sx = (value) => left + value / scale.max * (right - left);
@@ -836,13 +845,13 @@ function boxes(items) {
     const landedNote = item.tasks
       ? ` · ${share(item.landed_rate, item.tasks)} landed (${num(item.tasks)}${landedCi})`
       : "";
-    return `<div class="duration-row" style="width:${W}px"><b>${esc(item.model)}</b>`
+    return `<div class="duration-row" style="width:${W}px">${named(item)}`
       + `<span>${mins(item.median)} min median${landedNote}${item.low_sample ? LOW : ""}</span></div>`
       + `<svg class="chart" width="${W}" height="20" viewBox="0 0 ${W} 20" aria-hidden="true">${bar}</svg>`;
   }).join("");
   const axis = svgChart(W, 43, "Write task duration in minutes", verticalTicks(scale, sx, 0, 5)
     + `<text x="${(left + right) / 2}" y="37" text-anchor="middle">Minutes →</text>`);
-  const rows = shown.map((item) => `<tr><td>${esc(item.model)}</td>${cell(nOf(item))}`
+  const rows = shown.map((item) => `<tr><td>${named(item)}</td>${cell(nOf(item))}`
     + [item.p25, item.median, item.p75, item.p90].map((v) => cell(mins(v))).join("")
     + cell(item.tasks ? share(item.landed_rate, item.tasks) : "—")
     + cell(item.tasks && item.landed_ci ? ciText(item.landed_ci) : "—")
@@ -856,29 +865,36 @@ function ukrainian(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
   if (!shown.length) return '<p class="muted">No Ukrainian class in this window.</p>';
   return table(["Model", "Role", "Class", "Tasks", "Landed %", "Approval"], shown.map((item) =>
-    `<tr><td>${esc(item.model)}</td><td>${esc(item.role)}</td><td>${esc(item.class)}</td>${cell(nOf({n: item.tasks, low_sample: item.low_sample}))}`
+    `<tr><td>${named(item)}</td><td>${esc(item.role)}</td><td>${esc(item.class)}</td>${cell(nOf({n: item.tasks, low_sample: item.low_sample}))}`
     + `${cell(share(item.rate, item.tasks), item.landed ? "good" : "")}${cell(share(item.approve, item.approve_n || 0))}</tr>`), [0, 1, 2]);
 }
 function matrix(data, cls) {
   const cells = (data.first_round_matrix || []).filter((c) => c.class === cls && (keepAuthor(c.author) || keepModel(c.reviewer)));
   if (!cells.length) return '<p class="muted">No parsed review of record in this window and class.</p>';
+  const empty = () => ({ok: 0, n: 0, efforts: new Set()});
+  const add = (t, c) => {
+    t.ok += c.approved;
+    t.n += c.first_round_approved.n;
+    for (const effort of c.review_efforts || []) t.efforts.add(effort);
+    return t;
+  };
   const tally = (key) => {
     const totals = new Map();
     for (const c of cells) {
-      const t = totals.get(c[key]) || {ok: 0, n: 0};
-      t.ok += c.approved; t.n += c.first_round_approved.n; totals.set(c[key], t);
+      totals.set(c[key], add(totals.get(c[key]) || empty(), c));
     }
     return [...totals.entries()].sort((a, b) => b[1].n - a[1].n || (a[0] < b[0] ? -1 : 1));
   };
   const authors = tally("author"), reviewers = tally("reviewer");
   const at = new Map(cells.map((c) => [`${c.author}\u0000${c.reviewer}`, c]));
-  const text = (ok, sample) => sample ? `${num(ok / sample * 100)}% <span class="muted">${ok}/${sample}</span>${sample < lowBelow() ? LOW : ""}` : "—";
-  const all = cells.reduce((t, c) => ({ok: t.ok + c.approved, n: t.n + c.first_round_approved.n}), {ok: 0, n: 0});
+  const text = ({ok, n, efforts}) => n ? `${num(ok / n * 100)}% <span class="muted">${ok}/${n}</span>${n < lowBelow() ? LOW : ""}`
+    + effortNote({review_efforts: [...efforts].sort()}) : "—";
+  const all = cells.reduce(add, empty());
   const rows = authors.map(([author, t]) => `<tr><td><b>${esc(author)}</b></td>${reviewers.map(([reviewer]) => {
     const c = at.get(`${author}\u0000${reviewer}`);
-    return cell(c ? text(c.approved, c.first_round_approved.n) : "—");
-  }).join("")}${cell(text(t.ok, t.n))}</tr>`);
-  rows.push(`<tr class="total"><td>All authors</td>${reviewers.map(([, t]) => cell(text(t.ok, t.n))).join("")}${cell(text(all.ok, all.n))}</tr>`);
+    return cell(c ? text(add(empty(), c)) : "—");
+  }).join("")}${cell(text(t))}</tr>`);
+  rows.push(`<tr class="total"><td>All authors</td>${reviewers.map(([, t]) => cell(text(t))).join("")}${cell(text(all))}</tr>`);
   return table(["Author / first reviewer", ...reviewers.map(([r]) => r), "All reviewers"], rows);
 }
 function matrixClasses(data) {
@@ -900,7 +916,7 @@ function renderLevels() {
       + `${cell(`${num(r.results)} / ${num(r.tasks)}`, r.results < r.tasks ? "warn" : "")}${cell(withSample(pct(approval), approval.n))}`
       + `${cell(mins(r.median_seconds))}${cell(withSample(rate(r.wall_minutes_per_landed, 1), r.wall_minutes_per_landed.n))}${cell(quota)}</tr>`;
   });
-  $("levels").innerHTML = table(["Runtime level", "Results / tasks", "First-round approval", "Median min", "Min per landed", "Quota points per landed"], rows);
+  $("levels").innerHTML = table(["Effort", "Results / tasks", "First-round approval", "Median min", "Min per landed", "Quota points per landed"], rows);
   updateTableScroll();
 }
 function renderCoverage(data) {
@@ -1094,7 +1110,7 @@ async function loadSamples(name) {
     for (const model of body.models) {
       if (!model || typeof model.model !== "string" || !model.unparsed_samples
           || typeof model.unparsed_samples !== "object") continue;
-      map.set(model.model, model.unparsed_samples);
+      map.set(model.model, model);
     }
     return {map, window: sampleStamp(body.window)};
   } catch {

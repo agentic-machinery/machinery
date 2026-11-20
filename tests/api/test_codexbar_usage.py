@@ -1118,6 +1118,11 @@ def test_compute_routing_budget_includes_api_accounts(monkeypatch, tmp_path):
     monkeypatch.setattr(
         state_router, "get_cursor_lane_usage", lambda **kwargs: {"lane": "cursor", "probe_state": "NEED_PROBE"}
     )
+    subscription_snapshot = _home_subs(
+        plan={"status": "ok", "name": "private plan prose"},
+        reading={"status": "fresh", "read_at": "2026-08-26T11:59:30Z", "age_s": 30},
+    )
+    monkeypatch.setattr(state_router.subscriptions, "subscriptions_snapshot", lambda **kwargs: subscription_snapshot)
     monkeypatch.setattr(state_router, "summarize_fleet_burn", lambda *args, **kwargs: {"windows": {}})
     monkeypatch.setattr(state_router, "summarize_lane_runtime", lambda *args, **kwargs: {"headroom_blocked": False})
 
@@ -1158,6 +1163,7 @@ def test_compute_routing_budget_includes_api_accounts(monkeypatch, tmp_path):
         project_root=tmp_path,
         curriculum_root=tmp_path,
         batch_state_dir=tmp_path,
+        include_subscriptions=True,
     )
     assert "api_accounts" in data
     assert data["api_accounts"]["openrouter"]["limit_remaining_usd"] == 49.0
@@ -1165,6 +1171,18 @@ def test_compute_routing_budget_includes_api_accounts(monkeypatch, tmp_path):
     ranked_api = [row for row in data["ranked_by_headroom"] if row["type"] == "api"]
     assert len(ranked_api) == 2
     assert ranked_api[0]["remaining_usd"] == 49.0
+    aged = state_router._aged_routing_budget(data, 880, claude_fields={})
+    assert "subscriptions" not in state_router._public_routing_budget(aged)
+    public = state_router._public_routing_budget(aged, subscription_age_s=880)
+    account = public["subscriptions"]["providers"][0]["accounts"][0]
+    assert account["account"] == "Codex a"
+    assert account["reading"]["status"] == "stale" and account["reading"]["age_s"] == 910
+    assert subscription_snapshot["providers"][0]["accounts"][0]["reading"]["status"] == "fresh"
+    assert "private plan prose" not in json.dumps(public)
+    assert public["agents"]["cursor"]["probe_state"] == "NEED_PROBE"
+    assert state_router._public_routing_budget(
+        {"allowed_models": ["kimi-code/k3-256k", "glm-5.3", "deepseek-v4.1-flash"]}
+    )["allowed_models"] == ["deepseek-v4.1-flash"]
 
 
 # --- routing-budget stale/wrong lane state regressions (#7646) --------------
@@ -2217,6 +2235,26 @@ def test_home_usage_missing_stale_and_unavailable_are_explicit():
     unknown = _home_row(_render_home_usage(_home_subs(
         reading={'status': 'fresh', 'read_at': '2030-01-01T11:00:00Z', 'age_s': 'bad'})), 'Codex a')
     assert 'FRESHNESS UNKNOWN, age unknown' in unknown
+    budget = {'agents': {'cursor': {'probe_state': 'NEED_PROBE'}}}
+    rendered = _render_home_usage(_home_subs(), budget)
+    assert '<td>Cursor Auto</td>' in rendered and '<td>Cursor API</td>' in rendered
+    assert rendered.count('Unavailable (no current usage reading)') == 2
+
+    cursor = {
+        'probe_state': 'healthy', 'freshness': 'fresh', 'age_s': 30,
+        'provider_windows': {'auto': {'used_pct': 23}, 'api': {'remaining_pct': 0}},
+    }
+    budget['agents']['cursor'] = cursor
+    rendered = _render_home_usage(_home_subs(), budget)
+    assert '77% left' in rendered and '<td>Cursor API</td><td data-label="Remaining">0% left' in rendered
+    cursor['provider_windows']['api'] = {'used_pct': -5, 'remaining_pct': True}
+    rendered = _render_home_usage(_home_subs(), budget)
+    assert '77% left' in rendered and rendered.count('Unavailable (no current usage reading)') == 1
+    cursor['age_s'] = 901
+    assert _render_home_usage(_home_subs(), budget).count('Unavailable (last reading is stale)') == 2
+    cursor['age_s'] = 30
+    cursor['login_state'] = 'NEED_LOGIN'
+    assert _render_home_usage(_home_subs(), budget).count('Unavailable (sign-in required)') == 2
 
 
 @pytest.mark.parametrize('timestamp', [1893628800, 1893628800000], ids=['seconds', 'milliseconds'])

@@ -93,6 +93,7 @@ _FIELD_CONTRACT_ERRORS = (
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _PATH_DIGEST = re.compile(r"[0-9a-f]{16}\Z")
 UNSET = "unset"
+UNKNOWN_EFFORT = "unknown"
 # Native Claude harness aliases that name a family but no version; stored as recorded, never given one here (the
 # statistics map one to a catalog id only where the rows make it unambiguous).
 NATIVE_ALIASES = ("opus", "sonnet", "haiku", "fable")
@@ -105,6 +106,7 @@ _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 # The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _EFFORT_SUFFIX = re.compile(rf"-({VARIANT_SUFFIX.pattern})\Z")
+_RETIRED_SUBSCRIPTION_MODEL = re.compile(r"(?<![a-z0-9])(?:glm|kimi)(?:cc)?(?![a-z])", re.I)
 # Plan-metered pools only; an API-key account label names no allowance and is never stored.
 POOLS = frozenset({*(f"claude:{label}" for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS),
                    "codex:a", "codex:b", "agy_claude", "gemini", "cursor"})
@@ -245,6 +247,12 @@ def current_catalog_model_ids(catalog: Mapping[str, Any] | None) -> frozenset[st
                      if info.get("lifecycle") != "retired" and model_label(model_id, ""))
 
 
+@lru_cache(maxsize=256)
+def retired_subscription_model(value: str) -> bool:
+    """GLM and Kimi labels, including catalog aliases and pre-catalog ledger spellings."""
+    return bool(_RETIRED_SUBSCRIPTION_MODEL.search(value) or _RETIRED_SUBSCRIPTION_MODEL.search(model_id(value)))
+
+
 def _spelling(raw: object) -> str:
     """A model spelling without its bracketed context suffix (``claude-opus-5-5[1m]``)."""
     return raw.split("[", 1)[0].strip() if isinstance(raw, str) else ""
@@ -309,6 +317,12 @@ def effective_effort(record: Mapping[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return label(value.strip().lower())
     return UNSET
+
+
+def comparison_effort(value: object) -> str:
+    """A recorded effort level, or the common bucket for unreported and invalid levels."""
+    effort = value.strip().lower() if isinstance(value, str) else ""
+    return effort if VARIANT_SUFFIX.fullmatch(effort) else UNKNOWN_EFFORT
 
 
 def role_of(record: Mapping[str, Any]) -> str:
@@ -891,6 +905,7 @@ def refresh_readings() -> None:
     """
     load_model_catalog.cache_clear()
     model_catalog_reading.cache_clear()
+    retired_subscription_model.cache_clear()
     _fleet_repo_visibility.cache_clear()
     _public_data_classes.cache_clear()
     clear_repository_cache()
