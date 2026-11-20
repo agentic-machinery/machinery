@@ -119,6 +119,21 @@ is seven days old. The first-party `lu-machinery = false` entry lets the
 release cut adopt a newly published machinery wheel in the product.
 See [uv's package cutoff settings](https://docs.astral.sh/uv/reference/settings/#exclude-newer-package).
 
+`.github/dependabot.yml` applies the same seven-day cooldown (`cooldown.default-days: 7`)
+to scheduled weekly grouped updates for `npm` and `github-actions` (`uv` is left out until
+`dependabot-core` bundles `uv >= 0.13.9`), and ignores the actions pinned in
+`.github/workflows/pins.txt` so coupled workflow pins always move together. No dependency PR
+auto-merges. For an urgent CVE fix that cannot wait for the cooldown or that affects a
+`pins.txt`-coupled tool or action, open a manual PR updating the affected manifest and
+lockfile, and land it through the usual exact-head review and green `CI Gate`:
+
+- Inside the seven-day `uv` cooldown window, add the dated `[tool.uv].exclude-newer-package`
+  override above.
+- For a `pins.txt`-coupled tool or action, bump `.github/workflows/pins.txt` and its matching
+  workflow, gate, and baseline pins together.
+- When a `pins.txt`-coupled `uv` tool needs an urgent fix inside the seven-day window, apply
+  both the dated `[tool.uv].exclude-newer-package` override and the coordinated pin bump.
+
 The release wheelhouse includes core and the `api`, `postgres`, and
 `pytest` extras. This export excludes the project, development groups, and
 the `test` extra:
