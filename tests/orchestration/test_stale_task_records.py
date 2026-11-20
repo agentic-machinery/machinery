@@ -1364,13 +1364,20 @@ def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_ch
     assert record_path.is_file()
 
 
-def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
+def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeypatch):
     reattached = tmp_path / "reattached-wt"
     _terminal(tasks_dir, "revived")
     _terminal(tasks_dir, "touched")
     _terminal(tasks_dir, "reattached", worktree_path=str(reattached))
     _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
+    anchors = {
+        "lost-before-lock": iter((tmp_path, None)),
+        "lost-under-lock": iter((tmp_path, tmp_path, tmp_path, None)),
+    }
+    for slug in anchors:
+        _terminal(tasks_dir, slug, repository=slug, worktree_path="~nonexistent archive user/missing")
+    monkeypatch.setattr(str_mod, "_repository_checkout", lambda slug: next(anchors[slug], None))
 
     def live_writer(path: Path) -> None:
         stat = path.stat()
@@ -1394,6 +1401,8 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
 
     rows = {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]}
     assert rows == {
+        "lost-before-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
+        "lost-under-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
         "revived.json": ("skipped", "record no longer terminal"),
         "touched.json": ("skipped", "record changed since selection"),
         "reattached.json": ("skipped", "worktree path still exists"),
@@ -1401,11 +1410,12 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
         "untouched.json": ("archived", None),
     }
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
-        "reattached.json", "replaced.json", "revived.json", "touched.json",
+        "lost-before-lock.json", "lost-under-lock.json", "reattached.json", "replaced.json", "revived.json",
+        "touched.json",
     ]
 
 
-def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
+def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path, monkeypatch):
     half_removed = tmp_path / "half-removed"  # a checkout directory without its .git file
     half_removed.mkdir()
     acp_runtime = tmp_path / "acp-runtime"
@@ -1419,13 +1429,48 @@ def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
         acp_runtime_paths=[str(tmp_path / "acp-gone"), str(acp_runtime)],
     )
     _terminal(tasks_dir, "acp-gone", acp_runtime_paths=[str(tmp_path / "acp-gone")])
+    # An alias can start pointing at a live directory after ENOENT from the leaf probe.
+    alias = tmp_path / "alias"
+    live_runtime = tmp_path / "real" / "runtime"
+    live_runtime.mkdir(parents=True)
+    aliased_runtime = alias / live_runtime.name
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    alias.symlink_to(empty, target_is_directory=True)
+    _terminal(tasks_dir, "acp-retargeted", acp_runtime_paths=[str(aliased_runtime)])
+    original_lstat = os.lstat
+    armed = False
 
-    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
+    def retarget_on_missing(path, *args, **kwargs):
+        nonlocal armed
+        try:
+            return original_lstat(path, *args, **kwargs)
+        except FileNotFoundError:
+            if armed and path == aliased_runtime:
+                armed = False
+                replacement = alias.with_suffix(".new")
+                replacement.symlink_to(live_runtime.parent, target_is_directory=True)
+                replacement.replace(alias)
+            raise
 
-    assert [row["file"] for row in report["records"]] == ["acp-gone.json"]
+    def arm_retarget(path: Path) -> None:
+        nonlocal armed
+        if path.name == "acp-retargeted.json":
+            armed = True
+
+    monkeypatch.setattr(os, "lstat", retarget_on_missing)
+
+    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=arm_retarget)
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "acp-gone.json": ("archived", None),
+        "acp-retargeted.json": ("skipped", "ACP runtime path state unknown"),
+    }
+    assert aliased_runtime.is_dir()
     assert report["kept_hot"] == {"worktree path still exists": 2, "ACP runtime path still exists": 1}
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
         "acp-owner.json",
+        "acp-retargeted.json",
         "cwd-owner.json",
         "half-removed.json",
     ]

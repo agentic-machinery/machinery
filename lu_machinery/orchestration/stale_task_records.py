@@ -1682,14 +1682,16 @@ def _path_state(path: str) -> bool | None:
     """Whether a recorded path exists: ``True``, ``False``, or ``None`` when that is unknown.
 
     A dangling leaf symlink counts as present. After ENOENT, establish that
-    the nearest existing parent is a traversable directory. An unresolved
-    parent symlink or ``..`` can conceal a different canonical path, so the
-    record stays hot. An unattributed or unreadable path is also unknown.
+    the first missing component is absent under a pinned parent directory.
+    An unresolved or retargeted parent symlink or ``..`` can conceal a
+    different canonical path, so the record stays hot. An unattributed or
+    unreadable path is also unknown.
     """
     candidate = Path(path)
     if not candidate.is_absolute():
         return None
     prefix = candidate
+    missing: Path | None = None
     try:
         while True:
             try:
@@ -1697,11 +1699,21 @@ def _path_state(path: str) -> bool | None:
             except FileNotFoundError:
                 if ".." in candidate.parts or prefix == prefix.parent:
                     return None
-                prefix = prefix.parent
+                missing, prefix = prefix, prefix.parent
             else:
-                if prefix == candidate:
-                    return True
-                return False if prefix.is_dir() else None
+                break
+        if missing is None:
+            return True
+        fd = os.open(prefix, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            try:
+                os.stat(missing.name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if os.path.samestat(os.fstat(fd), prefix.stat()):
+                    return False
+            return None
+        finally:
+            os.close(fd)
     except (OSError, ValueError):
         return None
 
@@ -1735,7 +1747,10 @@ def _record_lock_target(record: Mapping[str, Any], record_path: Path, *, anchore
     removes one. A record that names no checkout locks its own file, so two
     runs of this tool never move the same record at once.
     """
-    return _owned_checkout(record, anchored=anchored) or str(record_path)
+    target = _owned_checkout(record, anchored=anchored) or str(record_path)
+    if anchored and not os.path.isabs(target):
+        raise worktree_claims.WorktreeLockError("archive lock target is not absolute")
+    return target
 
 
 def _read_pinned(path: Path) -> tuple[dict[str, Any] | None, os.stat_result]:
@@ -1897,7 +1912,7 @@ def _archive_one(
     row: dict[str, Any],
     *,
     selected_mtime_ns: int,
-    lock_target: str,
+    record: Mapping[str, Any],
     archive_dir: Path,
     stamp: str,
     lock_timeout_s: float,
@@ -1905,6 +1920,7 @@ def _archive_one(
 ) -> None:
     """Move one record under its lock after re-checking it, or record why not."""
     try:
+        lock_target = _record_lock_target(record, path, anchored=True)
         lock_dir = worktree_claims.repository_lock_dir(state_root())
         with worktree_claims.worktree_lock_with_path(lock_target, lock_dir=lock_dir, timeout_s=lock_timeout_s) as held_lock:
             if before_move is not None:
@@ -1914,10 +1930,11 @@ def _archive_one(
                 row["action"], row["skip_reason"] = "skipped", "record changed since selection"
             elif current is None or current.get("status") not in worktree_claims.RELEASED_TASK_STATUSES:
                 row["action"], row["skip_reason"] = "skipped", "record no longer terminal"
-            elif (reason := keep_hot_reason(current)) is not None:
-                row["action"], row["skip_reason"] = "skipped", reason
             else:
                 with task_record_store.task_archive_lock(path.parent, moving=True):
+                    if (reason := keep_hot_reason(current)) is not None:
+                        row["action"], row["skip_reason"] = "skipped", reason
+                        return
                     _, current_lock = worktree_claims.lock_path(
                         _record_lock_target(current, path, anchored=True),
                         lock_dir=worktree_claims.repository_lock_dir(state_root()),
@@ -1997,7 +2014,7 @@ def archive_terminal(
                 path,
                 row,
                 selected_mtime_ns=mtime_ns,
-                lock_target=_record_lock_target(record, path, anchored=True),
+                record=record,
                 archive_dir=archive_dir,
                 stamp=stamp,
                 lock_timeout_s=lock_timeout_s,
