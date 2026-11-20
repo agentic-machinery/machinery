@@ -1211,6 +1211,132 @@ def test_cli_defaults_to_dry_run_json(tasks_dir, capsys):
     assert str_mod.main(["archive", "--tasks-dir", str(tasks_dir / "missing")]) == str_mod.EXIT_USAGE
 
 
+def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_claim(tasks_dir, tmp_path, monkeypatch):
+    """Defect class: a legacy repo-relative ``worktree_path`` read relative to the caller's cwd.
+
+    Its lock refused it as not absolute ("worktree lock unavailable"), so archive
+    skipped every such record while live tasks ran, and its keep-hot check looked
+    in the wrong directory. A relative path belongs to the checkout of the fleet
+    repository its record names, from any cwd, with another task's claim held. A
+    path whose repository has no usable checkout, or whose state cannot be read,
+    keeps the record hot rather than counting as gone.
+    """
+    public, sibling_slug, looped_slug = (
+        "learn-ukrainian/learn-ukrainian.github.io",
+        "learn-ukrainian/machinery",
+        "learn-ukrainian/ukrainian-llm-eval",
+    )
+    fleet = tmp_path / "fleet"
+    primary, sibling = fleet / "learn-ukrainian", fleet / "machinery"
+    first, second = fleet / "first-checkout", fleet / "second-checkout"
+    for checkout in (primary, first, second):
+        (checkout / ".git").mkdir(parents=True)
+    sibling.symlink_to(first, target_is_directory=True)
+    (fleet / "ukrainian-llm-eval").symlink_to(fleet / "ukrainian-llm-eval")  # a sibling that cannot resolve
+    monkeypatch.setattr(str_mod, "state_root", lambda: primary)
+    codex = Path(".worktrees") / "dispatch" / "codex"
+    live = primary / codex / "live"
+    live.mkdir(parents=True)
+    (primary / codex / "kept").mkdir()
+    (primary / "alias").symlink_to("missing/../.worktrees", target_is_directory=True)
+    (primary / "valid-alias").symlink_to(".worktrees", target_is_directory=True)
+    for checkout in (first, second):
+        (checkout / codex / "sibling-kept").mkdir(parents=True)
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    (tmp_path / "dangling").symlink_to(tmp_path / "no-target")
+    _terminal(tasks_dir, "live-task", status="running", age_days=0, repository=public, worktree_path=str(live))
+    old = {"status": "failed", "repository": public}
+    _terminal(tasks_dir, "old-gone", **old, worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-kept", **old, worktree_path=str(codex / "kept"))
+    _terminal(tasks_dir, "old-canonical-kept", **old, worktree_path=str(codex / "missing" / ".." / "kept"))
+    alias_path = "alias/dispatch/codex/kept"
+    _terminal(tasks_dir, "old-alias-kept", **old, worktree_path=alias_path)
+    _terminal(tasks_dir, "old-alias-acp", **old, acp_runtime_paths=[alias_path])
+    _terminal(tasks_dir, "old-dangling-slash", **old, worktree_path=f"{tmp_path / 'dangling'}/")
+    _terminal(tasks_dir, "old-sibling-kept", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "sibling-kept"))
+    _terminal(tasks_dir, "old-retargeted", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "retargeted"))
+    _terminal(tasks_dir, "old-unattributed", status="failed", repository="owner/elsewhere",
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-looped-sibling", status="failed", repository=looped_slug,
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-loop", **old, worktree_path=str(tmp_path / "loop" / "gone"))
+    _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[str(tmp_path / "acp\x00gone")])
+    _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[42, " ", "", None, "valid-alias/missing/child"])
+    blocked = primary / "blocked"
+    blocked.mkdir(mode=0o000)
+    _terminal(tasks_dir, "old-blocked-cwd", **old, cwd="blocked/child")
+    # The caller's cwd holds the gone path and the junk names and lacks the kept one: none may decide.
+    elsewhere = tmp_path / "elsewhere"
+    for name in (codex / "gone", Path("42"), Path(" ")):
+        (elsewhere / name).mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    held, release = threading.Event(), threading.Event()
+
+    def live_worker() -> None:
+        with (
+            str_mod.worktree_lock(str(live), timeout_s=1),
+            str_mod.worktree_lock(str(second / codex / "retargeted"), timeout_s=1),
+        ):
+            held.set()
+            release.wait(10)
+
+    def retarget_sibling(path: Path) -> None:
+        if path.name == "old-retargeted.json":
+            replacement = sibling.with_suffix(".new")
+            replacement.symlink_to(second, target_is_directory=True)
+            replacement.replace(sibling)
+
+    thread = threading.Thread(target=live_worker)
+    thread.start()
+    try:
+        assert held.wait(5)
+        report = str_mod.archive_terminal(
+            tasks_dir, now=NOW, apply=True, lock_timeout_s=0.1, before_move=retarget_sibling,
+        )
+        live_still_held = worktree_claims.existing_worktree_lock_refusal(
+            live, lock_dir=worktree_claims.repository_lock_dir(primary)
+        )
+    finally:
+        release.set()
+        thread.join()
+        blocked.chmod(0o700)
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "old-gone.json": ("archived", None),
+        "old-acp-junk.json": ("archived", None),
+        "old-retargeted.json": ("skipped", "worktree lock target changed since selection"),
+    }
+    assert report["kept_hot"] == {
+        "worktree path still exists": 3,
+        "worktree path state unknown": 6,
+        "ACP runtime path state unknown": 2,
+    }
+    assert live_still_held == worktree_claims.LOCK_BUSY
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "live-task.json",
+        "old-acp-nul.json",
+        "old-alias-acp.json",
+        "old-alias-kept.json",
+        "old-blocked-cwd.json",
+        "old-canonical-kept.json",
+        "old-dangling-slash.json",
+        "old-kept.json",
+        "old-loop.json",
+        "old-looped-sibling.json",
+        "old-retargeted.json",
+        "old-sibling-kept.json",
+        "old-unattributed.json",
+    ]
+    assert (tasks_dir / "archive" / "old-gone.json").is_file()
+    # Without a configured primary, a library dry run reads every relative path as unattributed.
+    monkeypatch.setattr(str_mod, "state_root", lambda: (_ for _ in ()).throw(str_mod.MachineryConfigError("unset")))
+    assert str_mod.archive_terminal(tasks_dir, now=NOW)["selected"] == 0
+
+
 @pytest.mark.parametrize("names_checkout", [True, False])
 def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_checkout):
     """Archive takes the canonical task lock: the checkout's, else the record file's own."""
@@ -1238,12 +1364,20 @@ def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_ch
     assert record_path.is_file()
 
 
-def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
+def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeypatch):
     reattached = tmp_path / "reattached-wt"
     _terminal(tasks_dir, "revived")
     _terminal(tasks_dir, "touched")
     _terminal(tasks_dir, "reattached", worktree_path=str(reattached))
+    _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
+    anchors = {
+        "lost-before-lock": iter((tmp_path, None)),
+        "lost-under-lock": iter((tmp_path, tmp_path, tmp_path, None)),
+    }
+    for slug in anchors:
+        _terminal(tasks_dir, slug, repository=slug, worktree_path="~nonexistent archive user/missing")
+    monkeypatch.setattr(str_mod, "_repository_checkout", lambda slug: next(anchors[slug], None))
 
     def live_writer(path: Path) -> None:
         stat = path.stat()
@@ -1255,20 +1389,33 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         elif path.name == "reattached.json":
             reattached.mkdir()
+        elif path.name == "replaced.json":
+            replacement = path.with_suffix(".pending")
+            record = json.loads(path.read_text())
+            record["worktree_path"] = str(tmp_path / "replacement-worktree")
+            replacement.write_text(json.dumps(record))
+            os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            replacement.replace(path)
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=live_writer)
 
     rows = {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]}
     assert rows == {
+        "lost-before-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
+        "lost-under-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
         "revived.json": ("skipped", "record no longer terminal"),
         "touched.json": ("skipped", "record changed since selection"),
         "reattached.json": ("skipped", "worktree path still exists"),
+        "replaced.json": ("skipped", "worktree lock target changed since selection"),
         "untouched.json": ("archived", None),
     }
-    assert sorted(path.name for path in tasks_dir.glob("*.json")) == ["reattached.json", "revived.json", "touched.json"]
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "lost-before-lock.json", "lost-under-lock.json", "reattached.json", "replaced.json", "revived.json",
+        "touched.json",
+    ]
 
 
-def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
+def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path, monkeypatch):
     half_removed = tmp_path / "half-removed"  # a checkout directory without its .git file
     half_removed.mkdir()
     acp_runtime = tmp_path / "acp-runtime"
@@ -1282,13 +1429,48 @@ def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
         acp_runtime_paths=[str(tmp_path / "acp-gone"), str(acp_runtime)],
     )
     _terminal(tasks_dir, "acp-gone", acp_runtime_paths=[str(tmp_path / "acp-gone")])
+    # An alias can start pointing at a live directory after ENOENT from the leaf probe.
+    alias = tmp_path / "alias"
+    live_runtime = tmp_path / "real" / "runtime"
+    live_runtime.mkdir(parents=True)
+    aliased_runtime = alias / live_runtime.name
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    alias.symlink_to(empty, target_is_directory=True)
+    _terminal(tasks_dir, "acp-retargeted", acp_runtime_paths=[str(aliased_runtime)])
+    original_lstat = Path.lstat
+    armed = False
 
-    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
+    def retarget_on_missing(path: Path) -> os.stat_result:
+        nonlocal armed
+        try:
+            return original_lstat(path)
+        except FileNotFoundError:
+            if armed and path == aliased_runtime:
+                armed = False
+                replacement = alias.with_suffix(".new")
+                replacement.symlink_to(live_runtime.parent, target_is_directory=True)
+                replacement.replace(alias)
+            raise
 
-    assert [row["file"] for row in report["records"]] == ["acp-gone.json"]
+    def arm_retarget(path: Path) -> None:
+        nonlocal armed
+        if path.name == "acp-retargeted.json":
+            armed = True
+
+    monkeypatch.setattr(Path, "lstat", retarget_on_missing)
+
+    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=arm_retarget)
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "acp-gone.json": ("archived", None),
+        "acp-retargeted.json": ("skipped", "ACP runtime path state unknown"),
+    }
+    assert aliased_runtime.is_dir()
     assert report["kept_hot"] == {"worktree path still exists": 2, "ACP runtime path still exists": 1}
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
         "acp-owner.json",
+        "acp-retargeted.json",
         "cwd-owner.json",
         "half-removed.json",
     ]
