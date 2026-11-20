@@ -854,7 +854,8 @@ def test_release_prefix_admission_rejects_untrusted_node_dependency(tmp_path, mo
         # CTO's two additional cases pin both positive and negated npm constraints.
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         monkeypatch.setattr(platform, "machine", lambda: "x86_64")
-        shutil.copytree(package, optional)
+        if not defect.startswith("omitted"):
+            shutil.copytree(package, optional)
         lock["packages"]["node_modules/optional-platform"] = {
             **lock["packages"]["node_modules/acpx"], "optional": True,
             "os": ["!linux"] if defect.startswith("omitted") else ["linux"], "cpu": ["x64"],
@@ -932,12 +933,62 @@ def test_release_prefix_admission_rejects_untrusted_node_dependency(tmp_path, mo
             assert acpx_module._resolve_acpx_binary(adapter_label="test") == str(binary)
             return
     else:
-        shutil.rmtree(optional)
         if defect == "omitted-inapplicable-optional":
-            assert acpx_module._resolve_acpx_binary(adapter_label="test") == str(binary)
             return
+        shutil.rmtree(optional)
     with pytest.raises(AcpxShadowRefusalError, match="without an applicable provider|reviewed peer exemption" if "peer" in defect else None):
         acpx_module._resolve_acpx_binary(adapter_label="test")
+
+
+@pytest.mark.parametrize("cpu", ["x64", "arm64"])
+@pytest.mark.parametrize("libc", ["glibc", "musl"])
+def test_node_seal_requires_the_package_matching_the_selected_node(tmp_path, monkeypatch, cpu, libc):
+    """The wrong libc package cannot substitute for the required Linux package."""
+    import base64
+    import hashlib
+    import platform
+    import shutil
+    import tarfile
+
+    prefix = tmp_path / "release"
+    package = prefix / "node_modules" / f"native-{cpu}-{libc}"
+    package.mkdir(parents=True)
+    manifest = package / "package.json"
+    manifest.write_text('{"version":"1.0.0"}')
+    archive = tmp_path / "native.tgz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(manifest, arcname="package/package.json")
+    digest = hashlib.sha512(archive.read_bytes()).digest()
+    archives = prefix / "archives"
+    archives.mkdir()
+    archive.rename(archives / (digest.hex() + ".tgz"))
+    other_libc = "musl" if libc == "glibc" else "glibc"
+    packages = {
+        f"node_modules/native-{cpu}-{family}": {
+            "version": "1.0.0", "optional": True, "os": ["linux"], "cpu": [cpu], "libc": [family],
+            "integrity": "sha512-" + base64.b64encode(digest).decode(),
+        }
+        for family in (libc, other_libc)
+    }
+    (prefix / "package.json").write_text('{"dependencies":{}}')
+    (prefix / "package-lock.json").write_text(json.dumps({"packages": packages}))
+    (prefix / ".nvmrc").write_text("22\n")
+    node = tmp_path / "node with spaces"
+    node.write_text(f'#!/bin/sh\n[ "$1" = "--eval" ] && printf "%s" {libc}\n')
+    node.chmod(0o700)
+    monkeypatch.setattr(acpx_module, "_NODE_PREFIX", prefix)
+    monkeypatch.setattr(acpx_module, "_NODE_CONTRACT", prefix)
+    monkeypatch.setattr(acpx_module, "_resolve_host_node_binary", lambda *, adapter_label: node)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: {"x64": "x86_64", "arm64": "aarch64"}[cpu])
+    monkeypatch.setattr(platform, "libc_ver", lambda: (other_libc, ""))
+    assert acpx_module.validate_node_dependencies() == prefix
+
+    wrong_package = package.with_name(f"native-{cpu}-{other_libc}")
+    shutil.copytree(package, wrong_package)
+    with pytest.raises(AcpxShadowRefusalError, match="does not match the runtime platform") as exc:
+        acpx_module.validate_node_dependencies()
+    assert exc.value.failure_code == "acp_adapter_incompatible"
 
 
 # ---------------------------------------------------------------------------

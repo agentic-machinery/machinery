@@ -11,8 +11,6 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    cooldown:
-      default-days: 7
     commit-message:
       prefix: "deps"
     labels:
@@ -37,9 +35,6 @@ updates:
           - "0.99.1"
           - "0.100.0"
           - ">=0.101.0 <=0.109.0"
-      # debug reads the CommonJS .stderr export. The ESM releases put it under .default.
-      - dependency-name: "supports-color"
-        versions: [">=9.0.0 <=11.0.0"]
 
   # GitHub Actions (.github/workflows/ and any root action.yml or action.yaml for directory: "/")
   - package-ecosystem: "github-actions"
@@ -47,8 +42,6 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    cooldown:
-      default-days: 7
     commit-message:
       prefix: "ci"
     labels:
