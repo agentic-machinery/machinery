@@ -17,7 +17,7 @@ import re
 import sqlite3
 import time
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -51,7 +51,6 @@ from .state_helpers import (
 )
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
-_conninfo_to_dict: Callable[..., dict[str, Any]] | None = None
 try:
     from psycopg import Error as PostgresError
 except ModuleNotFoundError as exc:
@@ -59,10 +58,6 @@ except ModuleNotFoundError as exc:
         raise
 else:
     _DATABASE_ERRORS += (PostgresError,)
-    try:
-        from psycopg.conninfo import conninfo_to_dict as _conninfo_to_dict
-    except ImportError:
-        _conninfo_to_dict = None
 _OVERVIEW_ERRORS: tuple[type[Exception], ...] = (*_DATABASE_ERRORS, storage.ControlPlaneError)
 
 router = APIRouter(tags=["fleet"])
@@ -834,6 +829,9 @@ def fleet_health(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
 # Bound cold overview misses below the 1 s route alert budget, leaving headroom
 # for JSON serialization while the single shielded refresh finishes in the background.
 OVERVIEW_COLD_DEADLINE_S = 0.75
+# Held back from the collector so the off-loop final routing check still has a
+# slice of this same absolute deadline. A check that cannot finish returns 503.
+_OVERVIEW_FINAL_VALIDATION_RESERVE_S = 0.02
 
 _REQUIRED_SQLITE_OVERVIEW_TABLES_BASE = frozenset(
     {
@@ -884,6 +882,16 @@ def _remaining_deadline(deadline: float) -> float:
     if remaining <= 0:
         raise TimeoutError
     return remaining
+
+
+async def _await_within_deadline(make: Callable[[], Awaitable[Any]], deadline: float) -> Any:
+    """Await one coroutine only when time remains before ``deadline``.
+
+    ``make`` runs after the remaining-time check, so an expired deadline does
+    not construct a coroutine that nobody awaits.
+    """
+    timeout = _remaining_deadline(deadline)
+    return await asyncio.wait_for(make(), timeout=timeout)
 
 
 def _decode_count_pairs(raw: Any) -> dict[str, int]:
@@ -956,23 +964,12 @@ def _overview_routing_matches(ctx: MonitorContext, expected: _OverviewRouting) -
     return _capture_overview_routing(current_root) == expected
 
 
-def _pg_connection_matches_dsn(connection: Any, expected_dsn: str) -> bool:
-    """When a real psycopg connection exposes ``info``, verify it connected to ``expected_dsn``."""
-    info = getattr(connection, "info", None)
-    if info is None or not expected_dsn or _conninfo_to_dict is None:
-        return True
-    try:
-        expected = _conninfo_to_dict(expected_dsn)
-    except Exception:
-        return True
-    for attr in ("host", "port", "dbname", "user"):
-        wanted = expected.get(attr)
-        if wanted is None:
-            continue
-        actual = getattr(info, attr, None)
-        if actual is not None and str(actual) != str(wanted):
-            return False
-    return True
+def _overview_final_routing_ok(ctx: MonitorContext, expected: _OverviewRouting) -> bool:
+    """Re-read the fast plane root and routing snapshot. False when either moved."""
+    after_root = _revalidate_overview_plane_root_fast(ctx)
+    if after_root is None:
+        return False
+    return _capture_overview_routing(after_root) == expected
 
 
 async def _overview_cache_key(ctx: MonitorContext, routing: _OverviewRouting) -> str:
@@ -1097,27 +1094,43 @@ async def fleet_overview(
     resolved_ctx = resolve_context(ctx)
     routing: _OverviewRouting | None = None
     key: str | None = None
+    final_validation_timed_out = False
     try:
-        plane_root = await asyncio.wait_for(
-            _resolve_overview_plane_root(resolved_ctx),
-            timeout=_remaining_deadline(deadline),
+        plane_root = await _await_within_deadline(
+            lambda: _resolve_overview_plane_root(resolved_ctx),
+            deadline,
         )
-        routing = _capture_overview_routing(plane_root)
-        key = await asyncio.wait_for(
-            _overview_cache_key(resolved_ctx, routing),
-            timeout=_remaining_deadline(deadline),
+        routing = await _await_within_deadline(
+            lambda: asyncio.to_thread(_capture_overview_routing, plane_root),
+            deadline,
         )
-        (payload, _complete), age, stored = await asyncio.wait_for(
-            cache_read_swr(
-                key,
-                FACADE_TTL_S,
-                lambda: _collect_fleet_overview(resolved_ctx, expected_routing=routing),
-                storable=_overview_is_storable,
-            ),
-            timeout=_remaining_deadline(deadline),
+        captured_routing = routing
+        key = await _await_within_deadline(
+            lambda: _overview_cache_key(resolved_ctx, captured_routing),
+            deadline,
         )
-        after_root = _revalidate_overview_plane_root_fast(resolved_ctx)
-        if after_root is None or _capture_overview_routing(after_root) != routing:
+        remaining = _remaining_deadline(deadline)
+        collect_timeout = remaining - _OVERVIEW_FINAL_VALIDATION_RESERVE_S
+        if collect_timeout <= 0:
+            raise TimeoutError
+        collect = cache_read_swr(
+            key,
+            FACADE_TTL_S,
+            lambda: _collect_fleet_overview(resolved_ctx, expected_routing=captured_routing),
+            storable=_overview_is_storable,
+        )
+        (payload, _complete), age, stored = await asyncio.wait_for(collect, timeout=collect_timeout)
+        try:
+            routing_ok = await _await_within_deadline(
+                lambda: asyncio.to_thread(
+                    _overview_final_routing_ok, resolved_ctx, captured_routing
+                ),
+                deadline,
+            )
+        except TimeoutError:
+            final_validation_timed_out = True
+            raise
+        if not routing_ok:
             raise _OverviewRoutingChangedError("routing changed before returning overview")
     except _OverviewRoutingChangedError as exc:
         raise HTTPException(
@@ -1125,13 +1138,25 @@ async def fleet_overview(
             detail="fleet overview routing changed during read",
         ) from exc
     except TimeoutError:
-        if routing is None:
+        if routing is None or final_validation_timed_out:
             raise HTTPException(
                 status_code=503,
                 detail="fleet overview target validation timed out",
             ) from None
-        after_root = _revalidate_overview_plane_root_fast(resolved_ctx)
-        if after_root is None or _capture_overview_routing(after_root) != routing:
+        captured_routing = routing
+        try:
+            routing_ok = await _await_within_deadline(
+                lambda: asyncio.to_thread(
+                    _overview_final_routing_ok, resolved_ctx, captured_routing
+                ),
+                deadline,
+            )
+        except TimeoutError:
+            raise HTTPException(
+                status_code=503,
+                detail="fleet overview target validation timed out",
+            ) from None
+        if not routing_ok:
             raise HTTPException(
                 status_code=503,
                 detail="fleet overview routing changed during read",
@@ -1162,14 +1187,11 @@ def _collect_fleet_overview(
     expected_routing: _OverviewRouting | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Collect one overview snapshot and whether all backend-required tables were readable."""
-    expected_pg_dsn = ""
     if expected_routing is not None:
         if not _overview_routing_matches(ctx, expected_routing):
             raise _OverviewRoutingChangedError("routing changed before overview collection")
         effective_root = expected_routing.plane_root
         telemetry_path: Path | None = expected_routing.telemetry_path
-        if expected_routing.authority == storage.Authority.PG.value:
-            expected_pg_dsn = (os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or "").strip()
     else:
         effective_root = _plane_root(ctx)
         telemetry_path = None
@@ -1207,7 +1229,6 @@ def _collect_fleet_overview(
             status,
             ctx,
             plane_root=effective_root,
-            expected_pg_dsn=expected_pg_dsn,
         )
     except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
@@ -1420,7 +1441,6 @@ def _populate_fleet_overview(
     ctx: MonitorContext,
     *,
     plane_root: Path | None = None,
-    expected_pg_dsn: str = "",
 ) -> tuple[dict[str, Any], bool]:
     with _read_connection(ctx, pg_supported=True, plane_root=plane_root) as (
         connection,
@@ -1436,8 +1456,6 @@ def _populate_fleet_overview(
                 return _populate_fleet_overview_per_table(
                     result, status, connection, fallback_from_error=True
                 )
-        if expected_pg_dsn and not _pg_connection_matches_dsn(connection, expected_pg_dsn):
-            raise _OverviewRoutingChangedError("postgres connection target drifted from expected DSN")
         return _populate_fleet_overview_per_table(result, status, connection)
 
 

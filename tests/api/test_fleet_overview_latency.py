@@ -6,6 +6,8 @@ import asyncio
 import sqlite3
 import subprocess
 import threading
+import time
+import warnings
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -767,6 +769,120 @@ def test_overview_deadline_bounds_slow_git_anchor_resolution(
         assert r2.headers["X-Snapshot-State"] == "fresh"
 
 
+def _runs_on_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def test_overview_blocking_routing_work_stays_off_loop_and_times_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (F2): routing capture and final validation stay off the loop and 503 on timeout."""
+    plane_root = tmp_path / "plane"
+    _seed_plane_db(plane_root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.2)
+
+    real_capture = fleet_router._capture_overview_routing
+    entered = threading.Event()
+    release = threading.Event()
+    on_loop: list[bool] = []
+
+    def _slow_capture(root: Path) -> fleet_router._OverviewRouting:
+        on_loop.append(_runs_on_event_loop())
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_capture(root)
+
+    monkeypatch.setattr(fleet_router, "_capture_overview_routing", _slow_capture)
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        started = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            blocked = client.get("/api/fleet/overview")
+        elapsed = time.perf_counter() - started
+    release.set()
+    assert entered.is_set()
+    assert on_loop == [False]
+    assert blocked.status_code == 503
+    assert blocked.json()["detail"] == "fleet overview target validation timed out"
+    assert elapsed < 1.0
+
+    monkeypatch.setattr(fleet_router, "_capture_overview_routing", real_capture)
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.75)
+    state_helpers.cache_invalidate()
+    release.clear()
+    entered.clear()
+    on_loop.clear()
+
+    real_revalidate = fleet_router._revalidate_overview_plane_root_fast
+
+    def _slow_revalidate(ctx: MonitorContext) -> Path | None:
+        on_loop.append(_runs_on_event_loop())
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_revalidate(ctx)
+
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        warm = client.get("/api/fleet/overview")
+        assert warm.status_code == 200
+        assert warm.headers["X-Snapshot-State"] == "fresh"
+        monkeypatch.setattr(fleet_router, "_revalidate_overview_plane_root_fast", _slow_revalidate)
+        monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.2)
+        started = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            timed_out = client.get("/api/fleet/overview")
+        elapsed = time.perf_counter() - started
+    release.set()
+    assert entered.is_set()
+    assert on_loop == [False]
+    assert timed_out.status_code == 503
+    assert timed_out.json()["detail"] == "fleet overview target validation timed out"
+    assert elapsed < 1.0
+
+    # The collect-timeout return path must also keep final validation off the loop.
+    monkeypatch.setattr(fleet_router, "_revalidate_overview_plane_root_fast", real_revalidate)
+    state_helpers.cache_invalidate()
+    release.clear()
+    entered.clear()
+    on_loop.clear()
+    collect_entered = threading.Event()
+    real_collect = fleet_router._collect_fleet_overview
+
+    def _slow_collect(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        collect_entered.set()
+        assert release.wait(timeout=5)
+        return real_collect(ctx, expected_routing=expected_routing)
+
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _slow_collect)
+    monkeypatch.setattr(fleet_router, "_revalidate_overview_plane_root_fast", _slow_revalidate)
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        started = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            cold = client.get("/api/fleet/overview")
+        elapsed = time.perf_counter() - started
+    release.set()
+    assert collect_entered.is_set()
+    assert entered.is_set()
+    assert on_loop == [False]
+    assert cold.status_code == 503
+    assert cold.json()["detail"] == "fleet overview target validation timed out"
+    assert elapsed < 1.0
+
+
 def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -889,11 +1005,14 @@ def test_overview_pg_supported_schema_caches_without_sqlite_only_tables(
         assert r4.headers["X-Snapshot-State"] == "fresh"
         assert connect_calls == 3
 
-        # Real-connection info mismatch (connected to wrong PG dbname) must fail closed with 503.
+        # Connection info is not matched to the DSN (C-6210). A selected endpoint
+        # whose dbname differs from the configured string still serves.
         state_helpers.cache_invalidate()
         monkeypatch.setattr(_FakePgInfo, "dbname", "other_db")
         r5 = client.get("/api/fleet/overview")
-        assert r5.status_code == 503
+        assert r5.status_code == 200
+        assert r5.headers["X-Snapshot-State"] == "fresh"
+        assert connect_calls == 4
 
 
 def test_overview_preserves_dependency_override_and_background_tasks(
