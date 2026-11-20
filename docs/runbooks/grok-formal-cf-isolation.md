@@ -22,9 +22,9 @@ eligibility for resolver-selected review.
 
 - Pin `grok-4.7-high` and require Cursor's runtime model attestation.
 - Exclude xAI-authored work and the reviewer's own subject seat.
-- Supply the diff and CI evidence. Grok reviewers read tracked files and do not
-  run shell commands, tests or scripts. Use Opus 5.5 or Sol 6.2 for reviews that
-  require execution.
+- Supply the diff and exact-head CI evidence. Cursor allows shell commands
+  inside the read-only dispatch boundary. Name any interpreter probes, scripts,
+  or tests the reviewer needs. See the [review brief capability table](../../agents_extensions/shared/skills/review-loop/references/brief.md#commands-a-read-only-reviewer-can-run).
 - Record the exact reviewed head and concrete model, family and transport.
   Follow `review-loop` and the same-head CI gate before landing.
 - Cursor Grok stays off Ukrainian language seats. Security final sign-off stays

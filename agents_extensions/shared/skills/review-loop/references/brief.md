@@ -112,25 +112,30 @@ diff since the last reviewed head ([policy](policy.md#4-convergence)), and repli
 
 ## Commands a read-only reviewer can run
 
-The reviewer's worktree is already checked out at the exact head and the base ref is present, so
-the brief says no fetch is needed (`git fetch` writes refs and is not a read-only command), and
-`git show <merge-base>:<path>` reads a judge file as the merge-base holds it. A
-compound line runs only when every part is read-only, so one denied part denies the whole line
-(https://code.claude.com/docs/en/permissions, "Read-only commands"). The brief tells the reviewer
-to run read-only git commands one per call (`git rev-parse HEAD`, `git diff <merge-base>..HEAD`,
-`git show <merge-base>:<path>`, `git log`), that `gh pr view`, `gh pr diff` and `gh pr checks` are allowed, and that after a
-denial it retries once with a simple literal read-only form before it replies BLOCKED.
+The dispatcher checks out the exact head and provides the base ref. Use
+`git show <merge-base>:<path>` to read judge files and `git diff <merge-base>..HEAD` to inspect
+the change. The read-only checkout and Git metadata prevent fetches and other Git writes.
+Use one command per call so a denied command does not obscure the result of another.
 
-A review gets a shell and the project interpreter only inside an OS boundary (decision
-REVIEW-BOUNDARY-1101, #12378). Today there are two such routes. A read-only AGY dispatch runs
-whole in bubblewrap with a read-only checkout and scratch-only writes. A read-only native Claude
-dispatch runs each shell command in the same boundary. Both shells reach any public host over
-HTTPS through the parent egress proxy (operator decision 2026-11-10); host, loopback and private
-addresses stay unreachable. In both, `gh pr view`, `gh pr diff`, `gh pr checks`, `gh issue view`
-and `gh run view` run through the host's gh relay, with `--repo OWNER/REPO` allowed. Either brief
-may name `.venv/bin/python` probes and test files (for example
-`.venv/bin/python -m pytest -q -p no:cacheprovider tests/x.py`) and ask for their actual output.
-Every other route keeps the read-only command set above.
+| Read-only dispatch route | Execution available to the brief |
+| --- | --- |
+| Native Claude Code | Bash inside the whole-process read-only boundary. Claude's tool policy also denies file edits and selected Git and GitHub writes. |
+| Native Codex | Shell inside the whole-process read-only boundary, which provides the filesystem sandbox. |
+| Cursor (including Grok) | Shell and file reads inside the whole-process read-only boundary. Cursor denies file writes, selected Git and GitHub write commands, and Sources tools that persist data. |
+| Native AGY | Shell inside AGY's own bubblewrap boundary, with a read-only checkout and writable scratch. |
+| OpenCode (DeepSeek) | Check the deployed Bash policy in `lu_machinery/dispatcher/providers/opencode.py` before naming a probe. The Git-only profile admits `git diff`, `git log`, `git show`, and `git status` inside the read-only boundary and denies redirections, `--output`, and `--ext-diff`. |
+
+For Claude, Codex, Cursor, and AGY, name the probes, scripts, or test files the reviewer needs
+and ask for their actual output. The boundary makes the project interpreter available at
+`.venv/bin/python`. When a test needs the shared pool, check the boundary receipt if pytest
+refuses to start. A targeted test command can use
+`.venv/bin/python -m pytest -q -p no:cacheprovider tests/x.py`, with temporary output in scratch.
+
+Shell HTTPS goes through the boundary's public egress proxy. The proxy blocks direct GitHub,
+host, loopback, and private access. Use admitted GitHub reads through the relay, such as
+`gh pr view`, `gh pr diff`, and `gh pr checks`. Inline exact-head CI log excerpts when the
+reviewer's relay cannot retrieve them. After a denial, retry once with a literal permitted form
+if one exists. If required evidence is still unavailable, name the missing capability.
 
 ## Wording that read-only admission accepts
 

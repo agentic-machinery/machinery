@@ -7,6 +7,7 @@ file only points there and adds what the CTO seat learned on top.
 
 - Delivery follows the `full-send` and `full-stop` skills; publishing follows
   `workflow.md` § Public GitHub publishing; CI recovery follows `docs/runbooks/ci-gate.md`.
+- Report an action's result only after checking its output; never build the report from an unchecked result in the same step.
 - The merge-queue keeper usually enqueues on its own; check its log before enqueueing by
   hand.
 - When the CTO rules that a PR must not land yet (for example until a review covers every item), it applies a hold the merge-queue keeper reads,
@@ -64,8 +65,8 @@ diff; follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
 Seat, run and record every code or infra review with the `review-loop` skill; the reviewer
 follows `local-code-review`. A review dispatch alone publishes nothing, and the merge-queue
 keeper waits for the published verdict.
-Name allowed read tools per harness: Codex uses read-only shell; Cursor/Grok uses tracked-file
-reads. Read attestation from the task JSON's top-level `resolved_model_known`, `resolved_model`
+Name the commands the review route can run. See the [review brief's route table](../../review-loop/references/brief.md#commands-a-read-only-reviewer-can-run).
+Read attestation from the task JSON's top-level `resolved_model_known`, `resolved_model`
 and `resolved_model_source`; never grep nested status output for these fields.
 
 ## Test grants
