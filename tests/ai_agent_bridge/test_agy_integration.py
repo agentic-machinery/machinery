@@ -29,6 +29,14 @@ def test_delegate_dispatch_accepts_agy_agent(tmp_path, monkeypatch, capsys):
     """The v2 parser and dry-run accept AGY regardless of checkout refs."""
     from lu_machinery.dispatcher import cli, git
 
+    home = tmp_path / "home"
+    mcp_cfg = home / ".gemini" / "config" / "mcp_config.json"
+    mcp_cfg.parent.mkdir(parents=True)
+    mcp_cfg.write_text(
+        json.dumps({"mcpServers": {"sources": {"url": "http://127.0.0.1:8766/mcp"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
     task_id = f"test-agy-argparse-probe-{uuid.uuid4().hex}"
     monkeypatch.setattr(
         git, "worktree_plan", lambda *args, **kwargs: (tmp_path / task_id, f"agy/{task_id}", "a" * 40),

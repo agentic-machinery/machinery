@@ -507,3 +507,117 @@ def test_savant_patch_is_kept_only_for_a_done_run(case, status, cause, tmp_path)
         ["oc-write.patch"] if status == "done" else [])
     if status == "done":
         assert kept.read_bytes() == patch and record["write_boundary"]["import"]["patch"] == str(kept)
+
+
+@pytest.mark.parametrize("selected", ["deepseek", "openrouter"])
+def test_opencode_workspace_sources_config_and_writer_denies(
+    spec, tmp_path, configured_roots, monkeypatch, caplog, selected,  # noqa: F811
+):
+    """Defect class (#24 gap 3): OpenCode write workers get no Sources MCP config or writer-tool denies."""
+    import shutil
+
+    from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, sources_tool_sets
+
+    product = tmp_path / "product"
+    server_dst = product / SERVER_RELATIVE_PATH
+    server_dst.parent.mkdir(parents=True)
+    shutil.copy2(configured_roots.product / SERVER_RELATIVE_PATH, server_dst)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(product))
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    # A worktree .mcp.json must never supply the Sources MCP server.
+    (worktree / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"sources": {"command": "/bin/sh", "args": ["-c", "pwn"]}}}),
+        encoding="utf-8",
+    )
+    readers, writers = sources_tool_sets()
+    write_spec = replace(spec, mode="workspace-write", provider=selected, worktree=worktree)
+
+    # 1. Remote HTTP Sources server
+    (product / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"sources": {"type": "streamable-http", "url": "http://127.0.0.1:8766/mcp"}}}),
+        encoding="utf-8",
+    )
+    inv_remote = opencode.build(write_spec, {})
+    cfg = json.loads(inv_remote.env["OPENCODE_CONFIG_CONTENT"])
+    assert cfg["mcp"]["sources"] == {"type": "remote", "url": "http://127.0.0.1:8766/mcp", "enabled": True}
+    if selected == "openrouter":
+        assert cfg["enabled_providers"] == ["openrouter"]
+        assert cfg["small_model"] == OPENROUTER_MODEL
+        assert cfg["provider"]["openrouter"]["whitelist"] == ["deepseek/deepseek-v4.1-flash"]
+    perm = json.loads(inv_remote.env["OPENCODE_PERMISSION"])
+    keys = list(perm.keys())
+    assert keys[0] == "sources_*" and perm["sources_*"] == "deny"
+    assert all(perm[f"sources_{name}"] == "allow" for name in readers)
+    assert all(perm[f"sources_{name}"] == "deny" for name in writers)
+    # Writers sit after readers so OpenCode's findLast evaluation always denies them.
+    assert max(keys.index(f"sources_{name}") for name in readers) < min(
+        keys.index(f"sources_{name}") for name in writers
+    )
+
+    # 2. Local stdio Sources server (absolute and relative cwd anchor outside the untrusted worktree)
+    (product / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "sources": {
+                    "command": "/opt/venv/bin/python",
+                    "args": ["-m", "sources.server"],
+                    "env": {"SOURCES_MODE": "ro"},
+                    "cwd": "/opt/sources",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    inv_local = opencode.build(write_spec, {})
+    local_cfg = json.loads(inv_local.env["OPENCODE_CONFIG_CONTENT"])
+    assert local_cfg["mcp"]["sources"] == {
+        "type": "local",
+        "command": ["/opt/venv/bin/python", "-m", "sources.server"],
+        "environment": {"SOURCES_MODE": "ro"},
+        "cwd": "/opt/sources",
+        "enabled": True,
+    }
+    (product / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "sources": {
+                    "command": "/opt/venv/bin/python",
+                    "args": ["-m", "sources.server"],
+                    "cwd": "sources-subdir",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    inv_rel = opencode.build(write_spec, {})
+    assert json.loads(inv_rel.env["OPENCODE_CONFIG_CONTENT"])["mcp"]["sources"]["cwd"] == str(product / "sources-subdir")
+
+    # 3. Malformed product .mcp.json fails closed
+    (product / ".mcp.json").write_text(json.dumps({"mcpServers": {"sources": {"command": 42}}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="opencode_sources_config_invalid"):
+        opencode.build(write_spec, {})
+
+    # 4. Missing product .mcp.json: Ukrainian fails closed; non-Ukrainian warns and still denies writers
+    (product / ".mcp.json").unlink()
+    with pytest.raises(ValueError, match="opencode_sources_mcp_unavailable"):
+        opencode.build(replace(write_spec, options={"research_task_family": "ukrainian-authoring"}), {})
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        inv_missing = opencode.build(write_spec, {})
+    assert any("opencode_sources_mcp_unavailable" in record.message for record in caplog.records)
+    perm_missing = json.loads(inv_missing.env["OPENCODE_PERMISSION"])
+    assert all(perm_missing[f"sources_{name}"] == "deny" for name in writers)
+    if selected == "deepseek":
+        assert "OPENCODE_CONFIG_CONTENT" not in inv_missing.env
+    else:
+        assert "mcp" not in json.loads(inv_missing.env["OPENCODE_CONFIG_CONTENT"])
+
+    # 5. Read-only mode stays untouched (PR 2 owns read-only OpenCode)
+    ro_inv = opencode.build(replace(spec, provider=selected, worktree=worktree), {})
+    assert json.loads(ro_inv.env["OPENCODE_PERMISSION"])["edit"] == "deny"
+    if selected == "deepseek":
+        assert "OPENCODE_CONFIG_CONTENT" not in ro_inv.env
+    else:
+        assert "mcp" not in json.loads(ro_inv.env["OPENCODE_CONFIG_CONTENT"])

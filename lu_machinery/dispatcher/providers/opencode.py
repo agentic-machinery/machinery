@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import stat
 import subprocess
 from pathlib import Path
 
+from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_MODEL, SAVANT_PROVIDER, savant_request_store
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.safe_open import safe_open_below
+from lu_machinery.dispatcher.providers import is_ukrainian_content_task, load_product_sources_server
+from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from lu_machinery.orchestration import dispatch_isolation
+
+_LOG = logging.getLogger(__name__)
 
 # OpenCode allows edits and every shell command by default and has no OS sandbox, so read-only
 # carries its own permission rules (https://opencode.ai/docs/permissions/): ``edit`` covers the
@@ -398,17 +404,69 @@ def endpoint_refusal(
     return None
 
 
+def _workspace_sources_entry(spec: TaskSpec) -> dict[str, object] | None:
+    """OpenCode ``mcp.sources`` definition from ``product_root()/.mcp.json``, or None when absent."""
+    server = load_product_sources_server("opencode")
+    if server is None:
+        if is_ukrainian_content_task(spec.options):
+            raise ValueError(
+                f"opencode_sources_mcp_unavailable: product .mcp.json declares no active {SOURCES_SERVER!r} "
+                "MCP server for this Ukrainian-content write task"
+            )
+        _LOG.warning(
+            "opencode_sources_mcp_unavailable: product .mcp.json declares no active %r MCP server; "
+            "continuing with writer-tool denies only",
+            SOURCES_SERVER,
+        )
+        return None
+    if server.url is not None:
+        entry: dict[str, object] = {"type": "remote", "url": server.url, "enabled": True}
+        if server.headers:
+            entry["headers"] = dict(server.headers)
+        return entry
+    assert server.command is not None
+    entry = {"type": "local", "command": [server.command, *server.args], "enabled": True}
+    if server.env:
+        entry["environment"] = dict(server.env)
+    if server.cwd is not None:
+        entry["cwd"] = server.cwd
+    return entry
+
+
+def _workspace_sources_permission() -> str:
+    """OpenCode ``OPENCODE_PERMISSION`` allowing only Sources readers and denying writers (findLast wins)."""
+    readers, writers = sources_tool_sets()
+    permission: dict[str, str] = {f"{SOURCES_SERVER}_*": "deny"}
+    for name in readers:
+        permission[f"{SOURCES_SERVER}_{name}"] = "allow"
+    for name in writers:
+        permission[f"{SOURCES_SERVER}_{name}"] = "deny"
+    return json.dumps(permission, separators=(",", ":"))
+
+
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     selected = endpoint(spec.provider)
     if selected == SAVANT_PROVIDER:
         return _savant_build(spec, env)
     argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", "high"]
     child_env = env.copy()
-    if selected == "openrouter":
-        child_env["OPENCODE_CONFIG_CONTENT"] = _OPENROUTER_CONFIG
     if spec.mode == "workspace-write":
         argv.append("--auto")
+        sources_entry = _workspace_sources_entry(spec)
+        child_env["OPENCODE_PERMISSION"] = _workspace_sources_permission()
+        if selected == "openrouter":
+            config = json_depth.loads(_OPENROUTER_CONFIG, max_depth=512)
+            assert isinstance(config, dict)
+            if sources_entry is not None:
+                config["mcp"] = {SOURCES_SERVER: sources_entry}
+            child_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+        elif sources_entry is not None:
+            child_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                {"mcp": {SOURCES_SERVER: sources_entry}}, separators=(",", ":")
+            )
     elif spec.mode == "read-only":
+        if selected == "openrouter":
+            child_env["OPENCODE_CONFIG_CONTENT"] = _OPENROUTER_CONFIG
         child_env["OPENCODE_PERMISSION"] = _READ_ONLY_PERMISSION
     else:
         raise ValueError(f"opencode: unsupported mode {spec.mode!r}")
