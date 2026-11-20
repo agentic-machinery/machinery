@@ -169,6 +169,48 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         assert {"ref": f"{machinery}#505"} in closed["ready_now"]
 
 
+def test_planning_reads_a_registered_repository_prefix_as_that_repository():
+    """Defect class: a registered owner/name prefix was a path in the issue's own repository.
+
+    The planning view then missed a live worker in the named repository and marked the issue ready.
+    """
+    product, machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
+    snap = planning.IssueSnapshot(
+        frozenset({product, machinery, private}),
+        {"product": product, "machinery": machinery, "private": private},
+        {
+            (product, 1): planning.Issue("prefixed", f"## In scope\n{machinery}/src/owned/worker.py\n"),
+            (product, 2): planning.Issue("plain", "## In scope\nsrc/owned/worker.py\n"),
+            (product, 3): planning.Issue("explicit relative", f"## In scope\n./{machinery}/src/owned/worker.py\n"),
+            (product, 4): planning.Issue("unregistered", "## In scope\nother/tree/src/file.py\n"),
+            (product, 5): planning.Issue("dotted slug", f"## In scope\n{private}/docs/guide.md\n"),
+            (product, 6): planning.Issue("case and letters", "## In scope\nSample/Machinery/файл.py\n"),
+            (machinery, 7): planning.Issue("own prefix", f"## In scope\n{machinery}/src/owned/file.py\n"),
+            (machinery, 8): planning.Issue("own plain", "## In scope\nsrc/elsewhere.py\n"),
+        },
+        {}, frozenset(), 3,
+    )
+    workers = {
+        machinery: planning.expand_claim("src/owned") + planning.expand_claim("файл.py"),
+        private: planning.expand_claim("docs"),
+        product: [],
+    }
+    ready = {row["ref"]: row["path_status"] for row in planning.project_issues(snap, workers, stale=False)["ready"]}
+    assert ready == {
+        f"{product}#1": "path_conflicts",
+        f"{product}#2": "ready_now",
+        f"{product}#3": "ready_now",
+        f"{product}#4": "ready_now",
+        f"{product}#5": "path_conflicts",
+        f"{product}#6": "path_conflicts",
+        f"{machinery}#7": "path_conflicts",
+        f"{machinery}#8": "ready_now",
+    }
+    withheld = planning.project_issues(snap, {machinery: None, private: [], product: []}, stale=False)
+    assert {"ref": f"{product}#1", "path_status": "worker_scope_unknown"} in withheld["ready"]
+    assert all(row["ref"] != f"{product}#1" for row in withheld["ready_now"])
+
+
 def test_planning_forecast_matches_two_meter_readings(tmp_path, monkeypatch):
     """Recent burn comes from two observations of one reset window, independent of the reported average."""
     now = datetime.now(UTC)
