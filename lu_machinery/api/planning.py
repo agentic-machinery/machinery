@@ -226,12 +226,58 @@ def collect_issues() -> IssueSnapshot | None:
     )
 
 
-def _scope(body: str, repositories: Collection[str]) -> list[PathClaim]:
-    """Read explicit path lists. A prose or unreadable item makes the scope unknown."""
+def _registered_prefix(token: str, repositories: Collection[str]) -> tuple[str | None, str]:
+    """Split a registered ``owner/name/`` prefix. A plain path stays in the issue's repository.
+
+    The original two segments must match the ASCII slug grammar before case is folded.
+    A character that becomes a slug letter only after case folding cannot select a repository.
+    ``./`` is an explicit relative path and is not a repository prefix.
+    """
+    if token.startswith("./"):
+        return None, token
+    owner, slash, rest = token.partition("/")
+    name, slash2, relative = rest.partition("/")
+    if not slash or not slash2 or not relative or relative.startswith("/"):
+        return None, token
+    candidate = f"{owner}/{name}"
+    if not _SLUG.fullmatch(candidate):
+        return None, token
+    slug = candidate.lower()
+    if slug not in {repo.lower() for repo in repositories}:
+        return None, token
+    return slug, relative
+
+
+def _relative_scope_rejected(token: str, repositories: Collection[str], *, prefixed: bool) -> bool:
+    """The prose checks that used to run on the whole scope token, applied to the path we keep.
+
+    A dotted first segment marks prose only on an unqualified path. Once a registered
+    repository prefix is recognized, ``release.v2/file.py`` is a path in that repository.
+    """
+    if token.startswith("./"):
+        return False
+    root, separator, _ = token.partition("/")
+    bare = token.removesuffix("/**").removesuffix("/")
+    # A qualified remainder names a repository only when the original text matches the
+    # ASCII slug grammar. Folding case first would hide a path a worker still holds.
+    names_repository = bare.lower() in repositories and (not prefixed or _SLUG.fullmatch(bare) is not None)
+    return bool(
+        names_repository
+        or (not prefixed and separator and "." in root.lstrip("."))
+        or (not token.endswith(("/", "/**")) and not _FILE_SUFFIX.search(token))
+    )
+
+
+def _scope(body: str, repositories: Collection[str]) -> list[tuple[str | None, PathClaim]]:
+    """Read explicit path lists. A prose or unreadable item makes the scope unknown.
+
+    A path that starts with a registered ``owner/name/`` is that repository plus the
+    remaining relative path. None means the issue's own repository.
+    """
     section = _SCOPE.search(body)
     if section is None:
         return []
-    paths = []
+    paths: list[tuple[str | None, PathClaim]] = []
     for raw in section[1].splitlines():
         line = raw.strip()
         if not line or line.lower() == "paths:":
@@ -241,19 +287,21 @@ def _scope(body: str, repositories: Collection[str]) -> list[PathClaim]:
                 if len(item) > 2 * len(wrapper) and item.startswith(wrapper) and item.endswith(wrapper):
                     item = item[len(wrapper):-len(wrapper)]
             token = _SOURCE_LINE.sub("", item)
-            if token.startswith("-") or token.endswith(".") or not _PATH.fullmatch(token):
+            # A repeated slash is not a relative path. Normalizing it would keep the claim
+            # in the issue's repository and hide a worker in the repository the slug names.
+            if token.startswith("-") or token.endswith(".") or "//" in token or not _PATH.fullmatch(token):
                 return []
-            root, separator, _ = token.partition("/")
-            if not token.startswith("./") and (
-                token.lower().removesuffix("/**").removesuffix("/") in repositories
-                or (separator and "." in root.lstrip("."))
-                or (not token.endswith(("/", "/**")) and not _FILE_SUFFIX.search(token))
-            ):
+            repo, path = _registered_prefix(token, repositories)
+            # A parent segment is not a relative path we can reassign. Collapsing it would
+            # hide the bad item and could mark the issue ready in another repository.
+            if repo is not None and ".." in path.split("/"):
                 return []
-            claims = expand_claim(token)
+            if _relative_scope_rejected(path, repositories, prefixed=repo is not None):
+                return []
+            claims = expand_claim(path)
             if any(claim.kind == ClaimKind.UNKNOWN for claim in claims):
                 return []
-            paths.extend(claims)
+            paths.extend((repo, claim) for claim in claims)
     return paths
 
 
@@ -315,15 +363,26 @@ def project_issues(
         elif ref not in snap.unresolved:
             states["ready"] += 1
             scope = _scope(issue.body, repositories)
-            live = workers.get(ref[0], []) if workers is not None and not stale else None
             if not scope:
                 path_status = "scope_unknown"
-            elif live is None:
+            elif workers is None or stale:
                 path_status = "worker_scope_unknown"
-            elif any(claims_conflict(path, worker) for path in scope for worker in live):
-                path_status = "path_conflicts"
             else:
-                path_status = "ready_now"
+                # A prefixed path is compared with the repository it names. Unknown claims
+                # withhold ready; a proven overlap still reports the conflict.
+                conflict = unknown = False
+                for repo, path in scope:
+                    live = workers.get(repo or ref[0], [])
+                    if live is None:
+                        unknown = True
+                    elif any(claims_conflict(path, worker) for worker in live):
+                        conflict = True
+                if conflict:
+                    path_status = "path_conflicts"
+                elif unknown:
+                    path_status = "worker_scope_unknown"
+                else:
+                    path_status = "ready_now"
             states[path_status] += 1
             if ref[0] in snap.public:
                 ready.append({"ref": _ref_text(ref), "path_status": path_status})
