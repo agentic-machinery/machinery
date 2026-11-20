@@ -2281,6 +2281,39 @@ def test_unbound_ukrainian_source_claims_refused_before_publication(
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
+def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp_path):
+    """Defect: a Codex mcp_tool_call names its call only by server and tool, so its Sources output went uncaptured."""
+    from lu_machinery.review.review_contract import build_item_packet
+    from lu_machinery.review.review_contract import render_item_packet
+    from tests.helpers.codex_exec_stream import completed_stream, item_started, mcp_call
+
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    packet = build_item_packet([{"id": "item-a", "text": "example"}])
+    prompt = tmp_path / "brief.md"
+    prompt.write_text(render_item_packet(packet))
+    claim = "Rule 8 classifies this suffix as soft-group."
+    reply = "VERDICT: APPROVE\n```ukrainian-item-judgments\n" + json.dumps({
+        "schema": "ukrainian-item-judgments.v1",
+        "items": [{"id": "item-a", "verdict": "APPROVE", "finding": claim, "sources": "none"}],
+    }) + "\n```\n"
+    # The event pair `codex exec --json` writes for one MCP call, as in a real Ukrainian-profile review trace.
+    arguments = {"query": "suffix"}
+    log = tasks / "logs" / "review-one.stdout.log"
+    log.parent.mkdir(exist_ok=True)
+    log.write_text(completed_stream(
+        item_started("item_7", "mcp_tool_call", server="sources", tool="search_style_guide", arguments=arguments,
+                     result=None, error=None, status="in_progress"),
+        mcp_call("sources", "search_style_guide", arguments, text=claim, item_id="item_7"),
+    ))
+    write_task(tasks, reply=reply, review_profile="ukrainian", sources_mcp_call_count=1,
+               prompt_file=str(prompt), prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest())
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == "APPROVED"
+    assert len(comments) == 1 and calls == {"posts": 1, "statuses": 1}
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_mixed_family_branch_resolves_one_seat_per_family(tmp_path, monkeypatch):
     """Defect: a mixed-family branch has no eligible reviewer without a third family."""
     from tests.agent_runtime.test_authoring_review_feasibility import OPUS, REPOSITORY, SOL, mini_repo

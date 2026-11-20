@@ -284,6 +284,17 @@ def _tool_name(payload: Mapping[str, Any]) -> str:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    # ``codex exec --json`` reports an MCP call as an ``mcp_tool_call`` item
+    # with the server and tool in separate fields and no name, e.g.
+    # ``{"type": "item.completed", "item": {"type": "mcp_tool_call",
+    # "server": "sources", "tool": "verify_words", "arguments": {...},
+    # "result": {"content": [...]}, "status": "completed"}}``. Name it the way
+    # the Codex adapter does (``codex_events.tool_calls_from_items``) so trace
+    # readers such as the review recorder see the call.
+    if _payload_type(payload) == "mcp_tool_call":
+        server, tool = payload.get("server"), payload.get("tool")
+        if isinstance(server, str) and server.strip() and isinstance(tool, str) and tool.strip():
+            return f"mcp__{server.strip()}__{tool.strip()}"
     return ""
 
 
