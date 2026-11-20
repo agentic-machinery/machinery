@@ -101,6 +101,7 @@ guarded remover.
 
 ## Dispatch helpers
 
+- Before dispatching an issue, read its latest comments for holds and decisions, not only the body.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
 - Before amending a live worker's brief, check its PR and put the change in a separate task if review has started.
 - Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.

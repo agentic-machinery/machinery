@@ -26,7 +26,8 @@ Read-only native Claude, Codex, Cursor and OpenCode also run through `write_boun
 are read-only mounts, with no branch import. Codex uses these mounts
 as its filesystem sandbox: its inner sandbox cannot start under `--disable-userns`. Its dispatch keeps
 the private scratch lease. Other native providers keep their read-only permission profiles.
-Provider credential files retain writable binds so rotating provider logins persist; GitHub credentials remain masked.
+GitHub credentials remain masked. The HOME mounts below describe how the launcher binds each
+provider's selected credential.
 Muse retains its existing self-contained filesystem sandbox.
 Read-only AGY retains its existing filesystem boundary and uses
 the same GitHub domain and address refusal rules, without nesting two boundaries.
@@ -35,6 +36,11 @@ The launcher links the project virtual environment at the review worktree's `.ve
 link during cleanup when it created it. Governed pytest can use `.venv/bin/python` and queue against
 the [host test pool](test-slots.md#sandboxed-reviews). The boundary receipt reports whether the launcher
 bound the pool and gives the pool size or the refusal reason.
+
+Read-only OpenCode through DeepSeek direct or OpenRouter enables Bash and the project interpreter
+inside the boundary. The Sources relay exposes reader tools only. Launch refuses Ukrainian-content
+tasks when required Sources setup fails. Native `webfetch` uses the boundary's public HTTPS proxy.
+OpenCode denies edit and task tools and disables project config and sharing.
 
 Both paths withhold the host's GitHub login and refuse direct GitHub egress. The existing read-only
 `gh` relay admits `pr view`, `pr diff`, `pr checks`, `pr list`, `issue view` and `run view`, each with its
@@ -95,9 +101,10 @@ One bubblewrap invocation per launch, built in full by the launcher:
   Restored read-only: the toolchain (`~/.local/bin`, `~/.local/lib`, `~/.local/share/claude`,
   `~/.local/share/cursor-agent`, `~/.local/share/uv/python`, `~/.local/share/uv/tools`, every `PATH`
   directory under HOME), the launcher's own interpreter, virtual environment and package, and the
-  public checkouts below. The selected provider's credential file (Claude `.credentials.json`, Codex
-  `auth.json`, the AGY token, OpenCode `auth.json`) is a writable bind, so a token refresh is kept. The
-  selected Claude login, wherever it lives, is a private directory of the run's scratch bound at its
+  public checkouts below. The selected Claude `.credentials.json`, Codex `auth.json`, or AGY token
+  is a writable bind so a token refresh persists. The launcher binds the selected OpenCode
+  `auth.json` read-only when present. The selected Claude login, wherever it lives, is a private
+  directory of the run's scratch bound at its
   resolved path. It holds copies of the state its launch guard binds (#10619), which the CLI may
   rewrite there: `settings.json`, the legacy `.config.json`, the policy caches, and `.claude.json`
   reduced to its `env` map and account and organisation ids. The selected credential is bound on top.
