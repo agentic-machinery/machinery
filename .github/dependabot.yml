@@ -3,36 +3,7 @@
 # No auto-merge anywhere: every Dependabot PR must pass CI Gate and review as usual.
 version: 2
 updates:
-  # uv (Python: pyproject.toml and uv.lock)
-  - package-ecosystem: "uv"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    # Wait 7 days after a release before opening a version-update PR (matches
-    # [tool.uv].exclude-newer = "7 days" in pyproject.toml and satisfies
-    # zizmor's dependabot-cooldown >= 7 rule).
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: "deps"
-    labels:
-      - "dependencies"
-    open-pull-requests-limit: 5
-    # One grouped PR per ecosystem.
-    groups:
-      uv:
-        patterns:
-          - "*"
-    ignore:
-      # Tools pinned in .github/workflows/pins.txt that must move together with
-      # pins.txt, ci-gate.yml, tests.yml, prepublication-gate.sh, and/or
-      # lu_machinery/lint/mypy_baseline.json.
-      - dependency-name: "mypy"
-      - dependency-name: "pip-audit"
-      - dependency-name: "ruff"
-      - dependency-name: "semgrep"
-      - dependency-name: "zizmor"
+  # uv is left out until dependabot-core bundles uv >= 0.13.9 (pyproject.toml required-version ==0.13.9).
 
   # npm (machinery-owned package.json and package-lock.json)
   - package-ecosystem: "npm"
@@ -53,7 +24,7 @@ updates:
         patterns:
           - "*"
 
-  # GitHub Actions (.github/workflows/ and .github/actions/)
+  # GitHub Actions (.github/workflows/ and any root action.yml or action.yaml for directory: "/")
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
