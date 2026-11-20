@@ -736,8 +736,8 @@ function trends(items, window) {
 }
 function neon(data) {
   const block = data.charts?.neon;
-  if (!block || !Array.isArray(block.arms) || !block.arms.length) return '<p class="muted">Neon is absent from this window.</p>';
-  if (block.arms.some((arm) => typeof arm.review_tasks !== "number")) {
+  if (!block || !Array.isArray(block.arms) || !block.arms.length
+      || block.arms.some((arm) => !arm || typeof arm !== "object" || typeof arm.review_tasks !== "number")) {
     return '<p class="muted">Not enough data yet for Neon effort comparison.</p>';
   }
   const rows = block.arms.map((arm) => {
