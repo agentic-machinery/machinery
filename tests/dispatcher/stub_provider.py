@@ -39,7 +39,6 @@ def parse(stdout, stderr, returncode, final_text):
     )
 
 
-# The provider environment carries no pool override, so the run selects the pool its marker names.
 # Two descendants the provider's process group cannot reach: one that moved to its own session and process group
 # (what GNU ``timeout`` does to its child), and one double-forked so that init, not the provider, is its parent.
 DOUBLE_FORK = """import os, sys, time
@@ -55,9 +54,9 @@ os.wait()
 GOVERNED_RUN = """import os, sys, time
 from pathlib import Path
 from lu_machinery.common import test_slots
-pool = Path(os.environ[test_slots.HOLDER_ENV].split(":", 2)[2]).parent.parent
-hold = test_slots.join_inherited({**os.environ, test_slots.DIR_ENV: str(pool)}, wait_s=5)
-Path(sys.argv[1]).write_text("joined" if hold is not None else "refused")
+pool = {**os.environ, test_slots.DIR_ENV: sys.argv[3], test_slots.COUNT_ENV: "4", test_slots.ENABLE_ENV: "on"}
+hold = test_slots.acquire(2, kind="pytest", environ=pool, wait_s=5)
+Path(sys.argv[1]).write_text("held")
 while not Path(sys.argv[2]).exists():
     time.sleep(0.02)
 """
@@ -84,9 +83,9 @@ def main():
             process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
             prompt.with_suffix(".grandchild.tmp").write_text(str(process.pid))
             prompt.with_suffix(".grandchild.tmp").replace(prompt.with_suffix(".grandchild"))
-        if model == "governed":  # a governed test run of this turn, holding its slots until released
+        if model == "governed":  # a stand-in for pytest inside the boundary, holding its own slots
             signals = (str(prompt.with_suffix(suffix)) for suffix in (".joined", ".child-release"))
-            process = subprocess.Popen([sys.executable, "-c", GOVERNED_RUN, *signals])
+            process = subprocess.Popen([sys.executable, "-c", GOVERNED_RUN, *signals, str(prompt.parent.parent / "pool")])
             prompt.with_suffix(".grandchild.tmp").write_text(str(process.pid))
             prompt.with_suffix(".grandchild.tmp").replace(prompt.with_suffix(".grandchild"))
         while not prompt.with_suffix(".release").exists():
