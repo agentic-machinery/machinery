@@ -559,6 +559,22 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     usage_files.cache.write_text(json.dumps(cache))
     assert _pool_pace_at_fixture_time()["pools"]["codex:b"]["pace_reason"] == "too_early_in_window"
 
+    # A provider pace that omits the expected percentage uses the reset's elapsed
+    # fraction: a mid-window deficit stays hot, and an early window stays too early.
+    omitted = report["pace"]["secondary"]
+    omitted.pop("expectedUsedPercent", None)
+    omitted.update(deltaPercent=10.0, willLastToReset=False, etaSeconds=7200)
+    report["usage"]["secondary"]["usedPercent"] = 60.0
+    report["usage"]["secondary"]["resetsAt"] = "2030-01-05T00:00:00Z"
+    usage_files.cache.write_text(json.dumps(cache))
+    omitted_pool = _pool_pace_at_fixture_time()["pools"]["codex:b"]
+    assert (omitted_pool["status"], omitted_pool["pace_reason"]) == ("hot", "runs_out_before_reset")
+    omitted["deltaPercent"] = 0.48
+    report["usage"]["secondary"]["usedPercent"] = 1.0
+    report["usage"]["secondary"]["resetsAt"] = "2030-01-08T11:08:00Z"
+    usage_files.cache.write_text(json.dumps(cache))
+    assert _pool_pace_at_fixture_time()["pools"]["codex:b"]["pace_reason"] == "too_early_in_window"
+
     # A boolean, string, or out-of-range percentage is unknown before any hot or cool verdict.
     # An absent pace at the cap stays near_cap. A missing expected percentage is not malformed.
     malformed = reading(68.0, 8.0, 60.0, False)

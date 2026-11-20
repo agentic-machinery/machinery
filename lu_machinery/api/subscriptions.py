@@ -357,8 +357,20 @@ def _cache_usage(entry: Mapping[str, Any], read_at: datetime, now: datetime, *, 
 
     pace = _dict(report.get("pace")).get(weekly_key) if weekly_key else None
     if isinstance(pace, dict):
+        # A provider pace that omits the expected percentage still has one: the same
+        # elapsed fraction ``compute_usage_pace`` uses, so the visibility floor and
+        # ``pace_is_deficit`` see it. Rounding happens only after that.
+        expected = _number(pace.get("expectedUsedPercent"))
+        if expected is None and weekly_key is not None:
+            raw_window = windows[weekly_key]
+            minutes = _number(raw_window.get("windowMinutes"))
+            computed = compute_usage_pace(
+                _number(raw_window.get("usedPercent")) or 0.0, raw_window.get("resetsAt"),
+                window_minutes=None if minutes is None else int(minutes), now=read_at)
+            if isinstance(computed, dict):
+                expected = _number(computed.get("expected_pct"))
         runs_out = _after(read_at, _number(pace.get("etaSeconds")))
-        result["pace"] = _pace(_number(pace.get("deltaPercent")), _number(pace.get("expectedUsedPercent")),
+        result["pace"] = _pace(_number(pace.get("deltaPercent")), expected,
                                pace.get("willLastToReset"), runs_out, pace.get("summary"), now)
     else:  # CodexBar gives no pace for this window (AGY): the same algorithm, computed here
         result["pace"] = _computed_pace(result["weekly"], read_at, now)
