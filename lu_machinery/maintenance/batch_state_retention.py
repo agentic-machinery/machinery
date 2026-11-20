@@ -110,13 +110,14 @@ def _record_age_days(record: dict[str, Any], mtime_ns: int, now: datetime) -> fl
 
 
 def _record_lock_target(record: Mapping[str, Any], record_path: Path) -> str:
-    raw = record.get("worktree_path")
-    if isinstance(raw, str) and raw.strip():
-        return raw
-    cwd = record.get("cwd")
-    if isinstance(cwd, str) and cwd.strip() and not (Path(cwd) / ".git").is_dir():
-        return cwd
-    return str(record_path)
+    """The checkout lock archive uses, so a relative recorded path is not read from the cwd.
+
+    An unattributed relative path raises :class:`WorktreeLockError`. Callers
+    report that record unknown and leave it in place.
+    """
+    from lu_machinery.orchestration.stale_task_records import _record_lock_target as anchored_lock_target
+
+    return anchored_lock_target(record, record_path)
 
 
 def _component(name: str) -> bool:
@@ -434,12 +435,14 @@ def _eligible(
     min_age_days: float,
     now: datetime,
 ) -> bool:
-    if (
-        record is None
-        or info is None
-        or record.get("status") not in RELEASED_TASK_STATUSES
-        or not _explicit_clean(record)
-    ):
+    if record is None or info is None or not _explicit_clean(record):
+        return False
+    status = record.get("status")
+    try:
+        released = status in RELEASED_TASK_STATUSES
+    except TypeError:
+        return False
+    if not released:
         return False
     if not stat.S_ISREG(info.st_mode):
         return False
@@ -508,8 +511,12 @@ def _apply_one(
     One record's ``OSError`` is that record's error; it does not abort the sweep.
     """
     try:
+        held_target = _record_lock_target(observed, logical_record)
+    except WorktreeLockError:
+        return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+    try:
         with (
-            worktree_lock(_record_lock_target(observed, logical_record), timeout_s=DEFAULT_LOCK_TIMEOUT_S),
+            worktree_lock(held_target, timeout_s=DEFAULT_LOCK_TIMEOUT_S),
             _task_record_lock(parent_fd, record_name),
         ):
             if not _is_regular(parent_fd, record_name):
@@ -524,6 +531,12 @@ def _apply_one(
                 info = _lstat_at(parent_fd, record_name)
                 if current is None:
                     return None
+                try:
+                    current_target = _record_lock_target(current, logical_record)
+                except WorktreeLockError:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+                if current_target != held_target:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
                 if current.get("status") != observed_status or current.get("run_nonce") != observed_nonce:
                     return None
                 if not _eligible(current, info, min_age_days=min_age_days, now=now):
@@ -578,6 +591,18 @@ def _measure_candidate(
     record = _read_record_at(parent_fd, record_name)
     if not _eligible(record, info, min_age_days=min_age_days, now=now) or record is None:
         return None
+    logical_record = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
+    try:
+        _record_lock_target(record, logical_record)
+    except WorktreeLockError:
+        return {
+            "snapshot_dir": f"{rel_dir}/{snapshot_name}",
+            "task_id": record.get("task_id") if record else record_name[: -len(".json")],
+            "status": record.get("status") if record else None,
+            "reclaimable_bytes": 0,
+            "action": "skipped",
+            "skip_reason": "worktree path state unknown",
+        }, 0
     snap_fd = _open_dir(parent_fd, snapshot_name)
     if snap_fd is None:
         return None
@@ -617,6 +642,10 @@ def _measure_candidate(
         if outcome is None:
             return None
         row["action"] = outcome["action"]
+        if outcome.get("skip_reason"):
+            row["skip_reason"] = outcome["skip_reason"]
+            row["reclaimable_bytes"] = 0
+            return row, 0
         if outcome["action"] == "error":
             row["error"] = outcome["error"]
             return row, 0
