@@ -539,6 +539,46 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     assert subscriptions.pool_status(reading(42.0, 2.01, 39.99, False))["status"] == "hot"
     assert subscriptions.pool_status(reading(40.0, 8.0, 32.0, False, seconds=False))["status"] == "hot"
 
+    # The visibility floor sees the provider percentage, before display rounding can
+    # lift 0.96 to 1.0 and call an early window hot.
+    assert subscriptions._pace(8.0, 0.96, False, None, None, _fixture_now())["reason"] == "too_early_in_window"
+    assert subscriptions._pace(0.4, 0.70, False, None, None, _fixture_now())["reason"] == "too_early_in_window"
+    assert subscriptions._pace(8.0, 1.0, False, None, None, _fixture_now())["status"] == "ok"
+    cache = json.loads(usage_files.cache.read_text())
+    report = cache["pools"]["Codex b"]["usage"]
+    report["pace"]["secondary"].update(expectedUsedPercent=0.96, deltaPercent=8.0, willLastToReset=False)
+    report["usage"]["secondary"]["usedPercent"] = 8.96
+    usage_files.cache.write_text(json.dumps(cache))
+    early_pool = _pool_pace_at_fixture_time()
+    assert (early_pool["pools"]["codex:b"]["status"], early_pool["pools"]["codex:b"]["pace_reason"]) == (
+        "cool", "too_early_in_window")
+    lane = {"codex:b": {"status": "cool"}}
+    state_router._apply_pool_pace(lane, early_pool, [])
+    assert lane["codex:b"]["status"] == "cool"
+    report["pace"]["secondary"].update(expectedUsedPercent=0.70, deltaPercent=0.4)
+    usage_files.cache.write_text(json.dumps(cache))
+    assert _pool_pace_at_fixture_time()["pools"]["codex:b"]["pace_reason"] == "too_early_in_window"
+
+    # A boolean, string, or out-of-range percentage is unknown before any hot or cool verdict.
+    # An absent pace at the cap stays near_cap. A missing expected percentage is not malformed.
+    malformed = reading(68.0, 8.0, 60.0, False)
+    for bad_used in (True, "68", float("nan"), 101):
+        malformed["weekly"]["used_pct"] = bad_used
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed = reading(68.0, 8.0, 60.0, False)
+    for bad_headroom in (True, "8", 100.1):
+        malformed["pace"]["headroom_pct"] = bad_headroom
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed = reading(15.5, 1.2, 14.3, False)
+    for bad_expected in (True, "14.3", 100.1):
+        malformed["pace"]["expected_used_pct"] = bad_expected
+        assert subscriptions.pool_status(malformed)["status"] == "unknown"
+    malformed["pace"]["expected_used_pct"] = None
+    assert subscriptions.pool_status(malformed)["status"] == "cool"
+    absent_pace = reading(99.0, 8.0, 91.0, False)
+    absent_pace["pace"] = {"status": "unknown", "reason": "not_reported"}
+    assert subscriptions.pool_status(absent_pace)["pace_reason"] == "weekly_used_up"
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no

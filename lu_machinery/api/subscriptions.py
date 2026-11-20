@@ -213,6 +213,10 @@ def _pace(delta: float | None, expected: float | None, lasts: Any, runs_out: dat
     raw_expected = _number(expected)
     if raw_expected is None or not 0 <= raw_expected <= 100:
         raw_expected = None
+    elif not pace_is_visible({"expected_pct": raw_expected}):
+        # The visibility floor sees the provider's percentage. Rounding it onto
+        # the floor would publish an early window as a pace verdict.
+        return _unknown("too_early_in_window")
     # ``state`` keeps the unrounded delta's side of the band. Headroom is rounded for display.
     state = "on_pace" if abs(delta) <= ON_PACE_BAND_PCT else "deficit" if delta > 0 else "reserve"
     lasts_to_reset = lasts if isinstance(lasts, bool) else None
@@ -554,6 +558,19 @@ POOL_PACE_REASONS = frozenset({
 _EXHAUSTED_USED_PCT = 99.0  # the routing near-cap line (``credit_lane.SUBSCRIPTION_NEAR_CAP_USED_PCT``)
 
 
+def _percent_in_range(value: Any, *, low: float = 0.0, high: float = 100.0) -> bool:
+    number = _number(value)
+    return number is not None and low <= number <= high
+
+
+def _pace_row_readable(pace: Mapping[str, Any]) -> bool:
+    """An ``ok`` pace row carries numeric percentages. A boolean or string is not a verdict."""
+    if not _percent_in_range(pace.get("headroom_pct"), low=-100.0, high=100.0):
+        return False
+    expected = pace.get("expected_used_pct")
+    return expected is None or _percent_in_range(expected)
+
+
 def _routing_deficit(pace: Mapping[str, Any]) -> bool | None:
     """The routing pace verdict for a page pace row: :func:`pace_is_deficit`, not a second band.
 
@@ -606,11 +623,12 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
     if weekly.get("status") != "ok":
         return verdict("unknown", weekly.get("reason") or "no_weekly_window")
     used = weekly.get("used_pct")
+    if not _percent_in_range(used):
+        return verdict("unknown", "unreadable_reading")
+    if pace.get("status") == "ok" and not _pace_row_readable(pace):
+        return verdict("unknown", "unreadable_reading")
     # Missing pace is not evidence the remainder lasts, so the cap stays near_cap.
-    if (
-        isinstance(used, (int, float)) and not isinstance(used, bool) and used >= _EXHAUSTED_USED_PCT
-        and pace.get("lasts_to_reset") is not True
-    ):
+    if used >= _EXHAUSTED_USED_PCT and pace.get("lasts_to_reset") is not True:
         return verdict("near_cap", "weekly_used_up")
     if pace.get("status") != "ok":
         if pace.get("reason") == "too_early_in_window":
