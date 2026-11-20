@@ -772,9 +772,14 @@ def _classify_one(candidate: Candidate, facts: RepoFacts | None) -> None:
         candidate.klass, candidate.skip_reason = "D", "record names no worktree branch"
         return
 
-    path_state = _path_state(worktree_raw) if worktree_raw else False
-    worktree_exists = path_state is True
-    dirty = worktree_claims.worktree_is_dirty(Path(worktree_raw)) if worktree_exists else False
+    if isinstance(worktree_raw, str) and worktree_raw:
+        path_state = _path_state(worktree_raw)
+        worktree_exists = path_state is True
+        dirty = worktree_claims.worktree_is_dirty(Path(worktree_raw)) if worktree_exists else False
+    else:
+        path_state = False
+        worktree_exists = False
+        dirty = False
     on_origin = branch in facts.remote_heads
     matching_remote = sorted(name for name in facts.remote_heads if name == branch or candidate.task_id in name)
     evidence["origin_heads_matching_task"] = matching_remote
@@ -840,15 +845,15 @@ def _unrecoverable_work(candidate: Candidate, facts: RepoFacts) -> bool:
     branch = candidate.evidence.get("branch")
     if facts.checkout is None or facts.all_refs is None:
         return False
-    for raw in _anchored_record_paths(candidate.record):
-        state = _path_state(raw)
+    for recorded_path in _anchored_record_paths(candidate.record):
+        state = _path_state(recorded_path)
         if state is False:
             continue
         if state is None:
             candidate.skip_reason = "worktree path state unknown"
             return False
-        candidate.evidence.setdefault("surviving_paths", []).append(raw)
-        candidate.skip_reason = "work survives at " + raw
+        candidate.evidence.setdefault("surviving_paths", []).append(recorded_path)
+        candidate.skip_reason = "work survives at " + recorded_path
         return False
     # Rescue refs append the head SHA to the original branch. Match conservatively
     # in every namespace, including tags, remote tracking and temporary refs.
@@ -1231,15 +1236,15 @@ def _close_abandoned(candidate: Candidate, facts: RepoFacts, index: PullIndex) -
                    if not any(_is_ancestor(facts.checkout, sha, ref) for ref in default_refs)]
     # Check even records missing a branch name, which the original classifier
     # returns before inspecting the checkout. Unreadable paths remain unknown.
-    for raw in _anchored_record_paths(candidate.record):
-        state = _path_state(raw)
+    for recorded_path in _anchored_record_paths(candidate.record):
+        state = _path_state(recorded_path)
         if state is False:
             continue
         if state is None:
             candidate.skip_reason = "worktree path state unknown"
             return
-        candidate.evidence.setdefault("surviving_paths", []).append(raw)
-        candidate.skip_reason = "work survives at " + raw
+        candidate.evidence.setdefault("surviving_paths", []).append(recorded_path)
+        candidate.skip_reason = "work survives at " + recorded_path
         return
     listing = (_git(["worktree", "list", "--porcelain", "-z"], cwd=facts.checkout,
                     timeout=DEFAULT_GIT_TIMEOUT_S) if facts.checkout else None)
@@ -1764,15 +1769,13 @@ def _record_lock_target(record: Mapping[str, Any], record_path: Path) -> str:
     return target
 
 
-def _released_status(record: Mapping[str, Any] | None) -> bool | None:
+def _released_status(record: Mapping[str, Any]) -> bool | None:
     """Whether ``status`` is a released terminal value.
 
     ``None`` means the status cannot be tested for membership. A list or other
     unhashable value would abort the batch; the caller reports that record and
     continues. A missing or non-terminal status is ``False``.
     """
-    if record is None:
-        return False
     status = record.get("status")
     try:
         return status in worktree_claims.RELEASED_TASK_STATUSES
@@ -1955,6 +1958,8 @@ def _archive_one(
             current, stat = _read_pinned(path)
             if stat.st_mtime_ns != selected_mtime_ns:
                 row["action"], row["skip_reason"] = "skipped", "record changed since selection"
+            elif not isinstance(current, dict):
+                row["action"], row["skip_reason"] = "skipped", "record no longer terminal"
             elif (released := _released_status(current)) is None:
                 row["action"], row["skip_reason"] = "skipped", "malformed status"
             elif not released:
@@ -2022,12 +2027,14 @@ def archive_terminal(
         except OSError:
             continue
         record = _read_state_json(path)
+        if not isinstance(record, dict):
+            continue
         released = _released_status(record)
         if released is None:
             rows.append(
                 {
                     "file": path.name,
-                    "status": record.get("status") if record is not None else None,
+                    "status": record.get("status"),
                     "action": "skipped",
                     "skip_reason": "malformed status",
                 }
