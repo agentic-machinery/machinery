@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -286,14 +287,19 @@ P3_SCANNER_WITHHELD = "publication scanner withheld the reply"
 P3_STANDING_REJECTION = "head has a standing rejection or an unknown reading"
 P3_REPAIR_WITHHELD = "repair round withholds the P3 mapping"
 P3_NO_AC_CONFIRMATION = "reviewer does not confirm that no acceptance criterion is unmet"
-P3_AC_DECLARATION_INVALID = "acceptance-criteria declaration is not exactly the confirmation line"
+P3_AC_DECLARATION_INVALID = "acceptance criteria are named other than in exactly one confirmation line"
 _AC_REFUSALS = frozenset({P3_NO_AC_CONFIRMATION, P3_AC_DECLARATION_INVALID})
-# The whole line of ``overall.explanation`` by which the reviewer confirms that no acceptance criterion is
-# unmet; only with it are P3 findings carried (review-loop policy, KNOWN-ISSUES-1119). Any other line, in
-# any string of the object, that names the acceptance-criteria key refuses, as a security verdict other
-# than PASS does.
+# The one line of ``overall.explanation``, exactly as decoded, by which the reviewer confirms that no
+# acceptance criterion is unmet; only with it are P3 findings carried (review-loop policy,
+# KNOWN-ISSUES-1119). The reply names acceptance criteria nowhere else: any other mention, in any
+# string of the object and however it is spelled, refuses, so no conflicting statement can stand beside it.
 AC_CONFIRMATION_LINE = "ACCEPTANCE_CRITERIA: NONE_UNMET"
-_AC_DECLARATION = re.compile(r"(?i)acceptance[\s_\-]+criteria[\s*_`]*[:=\uff1a\u2014\u2013\-]")
+# Cyrillic, Greek and dotless letters that look like the key's Latin letters.
+_AC_HOMOGLYPHS = str.maketrans(
+    "\u0430\u0441\u0435\u0440\u0456\u043e\u0410\u0421\u0415\u0420\u0422\u0406\u041e"
+    "\u0391\u0395\u03a1\u03a4\u0399\u039d\u039f\u03bf\u03c1\u0131",
+    "acepioACEPTIOAEPTINOopi",
+)
 
 
 @dataclass(frozen=True)
@@ -378,15 +384,28 @@ def _security_sensitive(*, task: Mapping[str, Any], reply: str, pr: Mapping[str,
     return profile == "security" or _SECURITY_VERDICT.search(reply) is not None or _security_labeled(pr)
 
 
+def _ac_mentions(text: str) -> int:
+    """How often a string names acceptance criteria, read on its letters alone.
+
+    Compatibility forms and look-alike letters fold to Latin, and every character that is not a letter
+    (spacing, punctuation, accents, format characters, line breaks) is dropped, so no spelling hides one.
+    """
+    folded = unicodedata.normalize("NFKD", text).translate(_AC_HOMOGLYPHS)
+    return "".join(char for char in folded if char.isalpha()).casefold().count("acceptancecriteri")
+
+
 def _ac_refusal(payload: Mapping[str, Any]) -> str | None:
-    """Why a findings object does not confirm that no acceptance criterion is unmet, or None when it does."""
-    # ``splitlines`` is the one line rule for both reads, so no line separator hides a declaration.
-    lines = [line.strip() for text in _strings(payload) for line in text.splitlines()]
-    if any(line != AC_CONFIRMATION_LINE and _AC_DECLARATION.search(line) for line in lines):
-        return P3_AC_DECLARATION_INVALID
-    if AC_CONFIRMATION_LINE not in (line.strip() for line in payload["overall"]["explanation"].splitlines()):
+    """Why a findings object does not confirm that no acceptance criterion is unmet, or None when it does.
+
+    The confirmation line itself is one mention, so any count but one refuses.
+    """
+    count = sum(_ac_mentions(text) for text in _strings(payload))
+    if not count:
         return P3_NO_AC_CONFIRMATION
-    return None
+    # ``splitlines`` is the line rule, so the confirmation is the decoded line exactly, without padding.
+    if count == 1 and AC_CONFIRMATION_LINE in payload["overall"]["explanation"].splitlines():
+        return None
+    return P3_AC_DECLARATION_INVALID
 
 
 def p3_reading(reply: str, *, legacy: bool = False) -> P3Reading:
@@ -3583,6 +3602,13 @@ def record(
                     ):
                         raise RecordError("existing verdict marker was edited or conflicts with task")
                     if marker["verdict"] == verdict:
+                        existing = item
+                        break
+                    # An all-P3 approval this task recorded before the acceptance confirmation was required:
+                    # the retry reconciles its status and adds no approval.
+                    if marker["verdict"] == "APPROVED" and p3_refused in _AC_REFUSALS:
+                        residuals, p3_refused, verdict = p3_reading(reply, legacy=True).ids, None, "APPROVED"
+                        comment_fields.update(verdict=verdict, residuals=residuals)
                         existing = item
                         break
                     # The same reply recorded before P3 findings were accepted as residuals.

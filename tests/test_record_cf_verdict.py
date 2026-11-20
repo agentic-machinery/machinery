@@ -578,6 +578,12 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
         with monkeypatch.context() as legacy:
             legacy.setattr(recorder, "p3_reading", lambda reply: recorder.P3Reading(ids=("F1",)))
             recorded = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+        # A retry by today's recorder (after a failed status write, say) reuses that approval for the status.
+        retried = recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+        assert retried["comment"] == "existing" and retried["verdict"] == "APPROVED"
+        assert retried["residuals"] == ["F1"] and len(comments) == 1
+        assert [status["state"] for status in statuses] == ["success", "success"]
+        del statuses[1:]
     withheld = comments[-1]["body"]
     assert recorded["verdict"] == "APPROVED" and recorded.get("residuals") == ["F1"]
     assert "Withheld findings: 1\n" in withheld and _FINDING not in withheld
@@ -1238,12 +1244,11 @@ def _p3_with(*, explanation="One P3 residual.", body="Synthetic finding body."):
 
 @pytest.mark.parametrize(("reply", "reason"), [
     pytest.param(_all_p3_object(), None, id="confirmed"),
-    pytest.param(_p3_with(explanation="Residual.\r\n  " + _AC_LINE + "\t\r\nMore prose."), None,
-                 id="confirmed-padded-crlf"),
+    pytest.param(_p3_with(explanation="Residual.\r\n" + _AC_LINE + "\r\nMore prose."), None, id="confirmed-crlf"),
     pytest.param(_p3_with(), "P3_NO_AC_CONFIRMATION", id="missing"),
-    pytest.param(_p3_with(explanation="No acceptance criterion is unmet."), "P3_NO_AC_CONFIRMATION",
-                 id="missing-prose-only"),
-    pytest.param(_p3_with(body="Residual.\n" + _AC_LINE), "P3_NO_AC_CONFIRMATION", id="missing-line-in-finding-only"),
+    pytest.param(_p3_with(explanation="No acceptance criterion is unmet."), "P3_AC_DECLARATION_INVALID",
+                 id="malformed-prose-only"),
+    pytest.param(_p3_with(body="Residual.\n" + _AC_LINE), "P3_AC_DECLARATION_INVALID", id="malformed-line-in-finding-only"),
     pytest.param(_p3_with(explanation="ACCEPTANCE_CRITERIA: SOME_UNMET"), "P3_AC_DECLARATION_INVALID",
                  id="malformed-other-value"),
     pytest.param(_p3_with(explanation=_AC_LINE.lower()), "P3_AC_DECLARATION_INVALID", id="malformed-case"),
@@ -1251,6 +1256,48 @@ def _p3_with(*, explanation="One P3 residual.", body="Synthetic finding body."):
                  id="malformed-spelling"),
     pytest.param(_p3_with(explanation="ACCEPTANCE_CRITERIA:NONE_UNMET"), "P3_AC_DECLARATION_INVALID",
                  id="malformed-spacing"),
+    *(
+        pytest.param(_p3_with(explanation="Residual.\n" + pad + _AC_LINE + end), "P3_AC_DECLARATION_INVALID",
+                     id=f"malformed-padded-{name}")
+        for name, pad, end in (("space", "  ", ""), ("tab", "", "\t"), ("nbsp", "\u00a0", ""),
+                               ("ideographic-space", "", "\u3000"))
+    ),
+    pytest.param(_p3_with(explanation=_AC_LINE + "\n" + _AC_LINE), "P3_AC_DECLARATION_INVALID",
+                 id="malformed-duplicate-line"),
+    pytest.param(_p3_with(explanation=_AC_LINE, body="Residual.\n" + _AC_LINE), "P3_AC_DECLARATION_INVALID",
+                 id="malformed-duplicate-in-finding"),
+    *(
+        pytest.param(_p3_with(explanation=_AC_LINE, body=declaration), "P3_AC_DECLARATION_INVALID",
+                     id=f"malformed-obscured-{name}")
+        for name, declaration in (
+            ("zero-width-before-colon", "Acceptance criteria\u200b: AC2 unmet"),
+            ("format-char-in-key", "Accep\u00adtance criteria: AC2 unmet"),
+            ("emphasis-second-word", "Acceptance **criteria**: AC2 unmet"),
+            ("nonbreaking-hyphen-key", "acceptance\u2011criteria = AC2 unmet"),
+            ("nonbreaking-hyphen-delimiter", "Acceptance criteria \u2011 AC2 unmet"),
+            ("small-colon", "Acceptance criteria\ufe55 AC2 unmet"),
+            ("singular-key", "Acceptance criterion: AC2 unmet"),
+            ("cyrillic-homoglyphs", "\u0410\u0441\u0441\u0435\u0440t\u0430n\u0441\u0435 \u0441r\u0456t\u0435r\u0456\u0430: AC2 unmet"),
+            ("combining-accent", "Acce\u0301ptance criteria: AC2 unmet"),
+            ("key-across-lines", "Acceptance\ncriteria: AC2 unmet"),
+            ("ratio-colon", "Acceptance criteria\u2236 AC2 unmet"),
+            ("modifier-colon", "Acceptance criteria\ua789 AC2 unmet"),
+        )
+    ),
+    *(
+        pytest.param(_p3_with(explanation=_AC_LINE, body=mention), "P3_AC_DECLARATION_INVALID",
+                     id=f"malformed-mention-{name}")
+        for name, mention in (
+            ("prose", "All acceptance criteria are met."),
+            ("quote-then-colon", "Acceptance criteria\": AC2 unmet"),
+            ("period-then-colon", "Acceptance criteria.: AC2 unmet"),
+            ("comma-clause", "Acceptance criteria, unmet: AC2"),
+            ("letter-spaced", "A c c e p t a n c e criteria: AC2 unmet"),
+            ("dotless-i", "Acceptance cr\u0131teria: AC2 unmet"),
+        )
+    ),
+    pytest.param(_p3_with(explanation=_AC_LINE, body="AC-2 holds; criteria for acceptance are in the brief."), None,
+                 id="confirmed-other-wording"),
     pytest.param(_p3_with(explanation=_AC_LINE + " (pending CI)"), "P3_AC_DECLARATION_INVALID",
                  id="malformed-trailing-text"),
     pytest.param(_p3_with(explanation="I confirm " + _AC_LINE), "P3_AC_DECLARATION_INVALID", id="malformed-mid-line"),
