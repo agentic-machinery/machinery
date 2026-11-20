@@ -281,6 +281,28 @@ def test_overview_caches_git_anchor_and_revalidates_default_symlink_target(
         assert r3.json()["counts"]["messages"]["total"] == 2
         assert len(anchor_calls) == 1
 
+        # A root change during the mode read must not return the snapshot from the previous root.
+        real_mode = fleet_router._resolve_effective_plane_mode
+
+        def _switch_root_during_mode() -> str:
+            mode = real_mode()
+            if default_link.is_symlink():
+                default_link.unlink()
+            default_link.symlink_to(fixture_a)
+            return mode
+
+        monkeypatch.setattr(fleet_router, "_resolve_effective_plane_mode", _switch_root_during_mode)
+        switched = client.get("/api/fleet/overview")
+        assert switched.status_code == 503
+        assert switched.json()["detail"] == "fleet overview routing changed during read"
+        monkeypatch.setattr(fleet_router, "_resolve_effective_plane_mode", real_mode)
+        if default_link.is_symlink() or default_link.exists():
+            default_link.unlink()
+        default_link.symlink_to(fixture_b)
+        restored = client.get("/api/fleet/overview")
+        assert restored.status_code == 200
+        assert restored.json()["counts"]["messages"]["total"] == 2
+
         # Marking B retired must refuse immediately even with cached git anchor and warm cache.
         (fixture_b / fleet_paths.RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
         r4 = client.get("/api/fleet/overview")
@@ -374,6 +396,20 @@ def test_overview_swr_fresh_stale_and_dormant_headers_and_refresh(
         assert r5.headers["X-Snapshot-State"] == "fresh"
         assert r5.json()["counts"]["messages"]["total"] == 2
         assert collect_count == 3
+
+        # A dormant refresh that observes a routing change must not fall back to the stored snapshot.
+        def _drift(
+            ctx: MonitorContext,
+            *,
+            expected_routing: fleet_router._OverviewRouting | None = None,
+        ) -> tuple[dict[str, Any], bool]:
+            raise fleet_router._OverviewRoutingChangedError("routing changed during dormant refresh")
+
+        monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _drift)
+        clock[0] += fleet_router.FACADE_TTL_S + state_helpers.DEMAND_WINDOW_S + 10.0
+        drifted = client.get("/api/fleet/overview")
+        assert drifted.status_code == 503
+        assert drifted.json()["detail"] == "fleet overview routing changed during read"
 
 
 def test_overview_missing_required_table_is_not_cached_and_recovers_immediately(
@@ -471,7 +507,8 @@ def test_overview_retirement_blocks_counts_store_open_and_cached_reads(
     app, _ctx = _make_app(tmp_path)
     with TestClient(app, raise_server_exceptions=False) as client:
         r1 = client.get("/api/fleet/overview")
-        assert r1.status_code == 500
+        assert r1.status_code == 503
+        assert r1.json()["detail"] == "fleet overview routing changed during read"
         assert open_calls == 0
 
         # Shadow override permits reading the retired local fixture.
@@ -808,7 +845,7 @@ def test_overview_blocking_routing_work_stays_off_loop_and_times_out(
         elapsed = time.perf_counter() - started
     release.set()
     assert entered.is_set()
-    assert on_loop == [False]
+    assert on_loop and all(flag is False for flag in on_loop)
     assert blocked.status_code == 503
     assert blocked.json()["detail"] == "fleet overview target validation timed out"
     assert elapsed < 1.0
@@ -842,7 +879,7 @@ def test_overview_blocking_routing_work_stays_off_loop_and_times_out(
         elapsed = time.perf_counter() - started
     release.set()
     assert entered.is_set()
-    assert on_loop == [False]
+    assert on_loop and all(flag is False for flag in on_loop)
     assert timed_out.status_code == 503
     assert timed_out.json()["detail"] == "fleet overview target validation timed out"
     assert elapsed < 1.0
@@ -877,9 +914,41 @@ def test_overview_blocking_routing_work_stays_off_loop_and_times_out(
     release.set()
     assert collect_entered.is_set()
     assert entered.is_set()
-    assert on_loop == [False]
+    assert on_loop and all(flag is False for flag in on_loop)
     assert cold.status_code == 503
     assert cold.json()["detail"] == "fleet overview target validation timed out"
+    assert elapsed < 1.0
+
+    # Explicit-root resolution is filesystem work and stays off the loop too.
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", real_collect)
+    monkeypatch.setattr(fleet_router, "_revalidate_overview_plane_root_fast", real_revalidate)
+    monkeypatch.setattr(fleet_router, "_capture_overview_routing", real_capture)
+    state_helpers.cache_invalidate()
+    release.clear()
+    entered.clear()
+    on_loop.clear()
+    real_resolve = fleet_router._resolve_overview_plane_root
+
+    def _slow_resolve(ctx: MonitorContext) -> Path:
+        on_loop.append(_runs_on_event_loop())
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_resolve(ctx)
+
+    monkeypatch.setattr(fleet_router, "_resolve_overview_plane_root", _slow_resolve)
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.2)
+    app, _ctx = _make_app(tmp_path)
+    with TestClient(app) as client:
+        started = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            resolved = client.get("/api/fleet/overview")
+        elapsed = time.perf_counter() - started
+    release.set()
+    assert entered.is_set()
+    assert on_loop and all(flag is False for flag in on_loop)
+    assert resolved.status_code == 503
+    assert resolved.json()["detail"] == "fleet overview target validation timed out"
     assert elapsed < 1.0
 
 

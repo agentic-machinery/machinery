@@ -907,8 +907,12 @@ def _decode_count_pairs(raw: Any) -> dict[str, int]:
     return counts
 
 
-async def _resolve_overview_plane_root(ctx: MonitorContext) -> Path:
-    """Resolve the current plane root without running the one-time git subprocess on the event loop."""
+def _resolve_overview_plane_root(ctx: MonitorContext) -> Path:
+    """Resolve the current plane root. Callers run this off the event loop.
+
+    An explicit root and a cached git anchor both touch the filesystem. Those
+    checks stay in this function so none of them run on the event loop.
+    """
     if os.environ.get(fleet_paths.ENV_ROOT):
         return _plane_root(ctx)
     cache_key = f"fleet-git-anchor:{ctx.roots.state_root}"
@@ -917,7 +921,7 @@ async def _resolve_overview_plane_root(ctx: MonitorContext) -> Path:
         root = fleet_paths.validate_plane_root(anchor / fleet_paths.DEFAULT_ROOT_REL)
         _check_not_retired(root)
         return root
-    return await asyncio.to_thread(_plane_root, ctx)
+    return _plane_root(ctx)
 
 
 def _revalidate_overview_plane_root_fast(ctx: MonitorContext) -> Path | None:
@@ -960,16 +964,26 @@ def _capture_overview_routing(plane_root: Path) -> _OverviewRouting:
 
 def _overview_routing_matches(ctx: MonitorContext, expected: _OverviewRouting) -> bool:
     """Verify the live plane target, retirement status, and routing inputs still match ``expected``."""
-    current_root = _plane_root(ctx)
+    try:
+        current_root = _plane_root(ctx)
+    except fleet_paths.PlaneRootAnchorError:
+        return False
     return _capture_overview_routing(current_root) == expected
 
 
 def _overview_final_routing_ok(ctx: MonitorContext, expected: _OverviewRouting) -> bool:
-    """Re-read the fast plane root and routing snapshot. False when either moved."""
-    after_root = _revalidate_overview_plane_root_fast(ctx)
-    if after_root is None:
+    """Re-read the root after the blocking mode capture. False when either moved."""
+    try:
+        before = _revalidate_overview_plane_root_fast(ctx)
+        if before is None:
+            return False
+        captured = _capture_overview_routing(before)
+        after = _revalidate_overview_plane_root_fast(ctx)
+    except fleet_paths.PlaneRootAnchorError:
         return False
-    return _capture_overview_routing(after_root) == expected
+    if after is None or after != before:
+        return False
+    return captured == expected
 
 
 async def _overview_cache_key(ctx: MonitorContext, routing: _OverviewRouting) -> str:
@@ -1095,9 +1109,10 @@ async def fleet_overview(
     routing: _OverviewRouting | None = None
     key: str | None = None
     final_validation_timed_out = False
+    routing_drifted = [False]
     try:
         plane_root = await _await_within_deadline(
-            lambda: _resolve_overview_plane_root(resolved_ctx),
+            lambda: asyncio.to_thread(_resolve_overview_plane_root, resolved_ctx),
             deadline,
         )
         routing = await _await_within_deadline(
@@ -1113,13 +1128,30 @@ async def fleet_overview(
         collect_timeout = remaining - _OVERVIEW_FINAL_VALIDATION_RESERVE_S
         if collect_timeout <= 0:
             raise TimeoutError
+
+        def _collect_for_request() -> tuple[dict[str, Any], bool]:
+            try:
+                return _collect_fleet_overview(
+                    resolved_ctx, expected_routing=captured_routing
+                )
+            except fleet_paths.PlaneRootAnchorError as exc:
+                routing_drifted[0] = True
+                raise _OverviewRoutingChangedError(
+                    "plane root invalidated during overview read"
+                ) from exc
+            except _OverviewRoutingChangedError:
+                routing_drifted[0] = True
+                raise
+
         collect = cache_read_swr(
             key,
             FACADE_TTL_S,
-            lambda: _collect_fleet_overview(resolved_ctx, expected_routing=captured_routing),
+            _collect_for_request,
             storable=_overview_is_storable,
         )
         (payload, _complete), age, stored = await asyncio.wait_for(collect, timeout=collect_timeout)
+        if routing_drifted[0]:
+            raise _OverviewRoutingChangedError("routing changed during overview read")
         try:
             routing_ok = await _await_within_deadline(
                 lambda: asyncio.to_thread(
@@ -1138,6 +1170,11 @@ async def fleet_overview(
             detail="fleet overview routing changed during read",
         ) from exc
     except TimeoutError:
+        if routing_drifted[0]:
+            raise HTTPException(
+                status_code=503,
+                detail="fleet overview routing changed during read",
+            ) from None
         if routing is None or final_validation_timed_out:
             raise HTTPException(
                 status_code=503,
