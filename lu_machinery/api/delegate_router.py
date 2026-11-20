@@ -30,7 +30,7 @@ from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.work.sources_public import public_repository_id
 
-from . import panel_values
+from . import config, panel_values
 from .lane_health import sanitize_error_excerpt
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
@@ -107,8 +107,6 @@ def _tasks_dir(ctx: MonitorContext | None = None) -> Path:
     # historically read BATCH_STATE_DIR / "tasks". Keep that cheap fallback
     # so they do not construct a production MonitorContext (and its git
     # session-streams probe) just to resolve a directory.
-    from lu_machinery.api import config  # noqa: PLC0415  # lazy-ok: cheap BATCH_STATE_DIR fallback without production_context
-
     return Path(config.BATCH_STATE_DIR) / "tasks"
 
 
@@ -632,7 +630,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     """Read hot records without waiting for the history scan or writing its cache."""
     tasks_dir = _tasks_dir(ctx)
     rows = []
-    claims = []
+    claims: list[tuple[str | None, list[str]]] = []
     for path in iter_task_records(tasks_dir, include_archive=False):
         try:
             file_stat = path.stat()

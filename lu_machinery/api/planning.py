@@ -40,7 +40,7 @@ ISSUE_LIMIT = 2000  # The shared REST client's page ceiling.
 FORGE_TIMEOUT_S = 20.0
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 _SCOPE = re.compile(r"^##[ \t]+In scope[ \t]*$(.*?)(?=^#{1,2}[ \t]|\Z)", re.M | re.S)
-_SCOPE_TOKEN = re.compile(r"`([^`\n]+)`|(?<!\S)([^\s`,;()<>]+)")
+_SCOPE_TOKEN = re.compile(r"`([^`\n]+)`|(?<![^\s,;()<>])([^\s`,;()<>]+)")
 _PATH = re.compile(r"(?:\./)?[\w.@+-][\w.@+*/?\[\]-]*")
 _SCORECARD_POOLS = {"claude-a": "claude:a", "claude-b": "claude:b", "codex": "codex:a", "grok": "grok"}
 _ALLOWANCE_POOLS = {"grok": "cursor", "agy:gemini": "gemini", "agy:claude_gpt": "agy_claude"}
@@ -230,7 +230,7 @@ def _scope(body: str) -> list[PathClaim]:
     paths = []
     for quoted, bare in _SCOPE_TOKEN.findall(section[1]):
         # Accept written paths, not action words or URLs. A bare token needs a path separator or a file extension.
-        token = (quoted or bare).rstrip(".:")
+        token = quoted or bare.rstrip(".:")
         if not ("/" in token or "." in token or quoted) or not _PATH.fullmatch(token):
             continue
         paths.extend(expand_claim(token))
