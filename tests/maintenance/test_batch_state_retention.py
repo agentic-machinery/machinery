@@ -66,10 +66,46 @@ def test_retention_contends_on_the_shared_worktree_lock(tmp_path: Path, record: 
                 pytest.fail("retention acquired a lock held by another record writer")
 
 
-def test_retention_record_age_and_primary_checkout_fallback(tmp_path: Path) -> None:
+def test_retention_record_age_and_primary_checkout_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / ".git").mkdir()
     path = tmp_path / "task.json"
     assert retention._record_lock_target({"cwd": str(tmp_path)}, path) == str(path)
+    checkout = tmp_path / "fleet-checkout"
+    relative = Path(".worktrees") / "dispatch" / "kept"
+    (checkout / relative).mkdir(parents=True)
+    decoy = tmp_path / "caller-cwd"
+    (decoy / relative).mkdir(parents=True)
+    monkeypatch.chdir(decoy)
+    monkeypatch.setattr(
+        stale_task_records, "_repository_checkout", lambda slug: checkout if slug == "owner/repo" else None
+    )
+    anchored = {"repository": "owner/repo", "worktree_path": relative.as_posix()}
+    assert retention._record_lock_target(anchored, path) == str(checkout / relative)
+    with pytest.raises(retention.WorktreeLockError):
+        retention._record_lock_target({"repository": "owner/missing", "worktree_path": relative.as_posix()}, path)
+    root = _batch(tmp_path)
+    tasks = root / "tasks"
+    _write_record(
+        tasks, "rel-unknown", status="done", age_days=10, repository="owner/missing", worktree_path=relative.as_posix()
+    )
+    snapshot = _write_full_sidecars(tasks, "rel-unknown", entries=1)
+    _write_record(tasks, "listed", status="done", age_days=10)
+    listed = tasks / "listed.json"
+    listed.write_text(json.dumps({**json.loads(listed.read_text()), "status": ["done"]}), encoding="utf-8")
+    _write_full_sidecars(tasks, "listed", entries=1)
+    unknown_report = plan_retention(root, min_age_days=0, apply=True, now=NOW)
+    assert unknown_report["selected"] == [
+        {
+            "snapshot_dir": "tasks/rel-unknown.snapshots",
+            "task_id": "rel-unknown",
+            "status": "done",
+            "reclaimable_bytes": 0,
+            "action": "skipped",
+            "skip_reason": "worktree path state unknown",
+        }
+    ]
+    assert _names(snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    assert _names(tasks / "listed.snapshots") == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
     mtime = int((NOW - timedelta(days=3)).timestamp() * 1e9)
     for finished in (None, "bad", " "):
         assert retention._record_age_days({"finished_at": finished}, mtime, NOW) == 3

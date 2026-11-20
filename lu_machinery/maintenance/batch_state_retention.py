@@ -110,13 +110,14 @@ def _record_age_days(record: dict[str, Any], mtime_ns: int, now: datetime) -> fl
 
 
 def _record_lock_target(record: Mapping[str, Any], record_path: Path) -> str:
-    raw = record.get("worktree_path")
-    if isinstance(raw, str) and raw.strip():
-        return raw
-    cwd = record.get("cwd")
-    if isinstance(cwd, str) and cwd.strip() and not (Path(cwd) / ".git").is_dir():
-        return cwd
-    return str(record_path)
+    """The checkout lock archive uses, so a relative recorded path is not read from the cwd.
+
+    An unattributed relative path raises :class:`WorktreeLockError`. Callers
+    report that record unknown and leave it in place.
+    """
+    from lu_machinery.orchestration.stale_task_records import _record_lock_target as anchored_lock_target
+
+    return anchored_lock_target(record, record_path)
 
 
 def _component(name: str) -> bool:
@@ -434,12 +435,14 @@ def _eligible(
     min_age_days: float,
     now: datetime,
 ) -> bool:
-    if (
-        record is None
-        or info is None
-        or record.get("status") not in RELEASED_TASK_STATUSES
-        or not _explicit_clean(record)
-    ):
+    if record is None or info is None or not _explicit_clean(record):
+        return False
+    status = record.get("status")
+    try:
+        released = status in RELEASED_TASK_STATUSES
+    except TypeError:
+        return False
+    if not released:
         return False
     if not stat.S_ISREG(info.st_mode):
         return False
@@ -598,6 +601,14 @@ def _measure_candidate(
         "reclaimable_bytes": reclaimed,
         "action": "would_digest",
     }
+    logical_record = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
+    try:
+        _record_lock_target(record, logical_record)
+    except WorktreeLockError:
+        row["action"] = "skipped"
+        row["skip_reason"] = "worktree path state unknown"
+        row["reclaimable_bytes"] = 0
+        return row, 0
     if apply:
         if on_before_lock is not None:
             on_before_lock()

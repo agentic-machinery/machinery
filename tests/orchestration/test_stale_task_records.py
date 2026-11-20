@@ -913,7 +913,7 @@ def test_abandoned_preserved_refs_settle_without_changing_refs(tasks_dir, repo):
     assert newer.is_dir()
 
 
-def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir, repo, tmp_path):
+def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir, repo, tmp_path, monkeypatch):
     """Defect class: abandoned-ref closure terminalizes an open PR, an existing directory, or a young record."""
     head = _git(repo, "rev-parse", "HEAD")
     tree = tmp_path / "interrupted-tree"
@@ -949,6 +949,45 @@ def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir
     assert raced["actions"] == {"report": 2, "skipped": 2}
     assert _snapshot(tasks_dir) == before
     assert all(json.loads(path.read_text())["status"] == "needs_finalize" for path in (raced_open, raced_tree))
+
+    # A repo-relative worktree_path is the checkout of the record's repository, never the caller's cwd.
+    rel_tasks = tmp_path / "rel-tasks"
+    rel_tasks.mkdir()
+    decoy = tmp_path / "caller-cwd"
+    decoy.mkdir()
+    live_rel, gone_rel = Path("dispatch-live"), Path("dispatch-gone")
+    (repo / live_rel).mkdir()
+    (decoy / gone_rel).mkdir()
+    (decoy / live_rel).mkdir()
+    monkeypatch.chdir(decoy)
+    fetch = str_mod.fleet_fetch_target(SLUG)
+    unanchored = "owner/unanchored"
+    monkeypatch.setattr(
+        str_mod, "fleet_fetch_target", lambda slug, _fetch=fetch: _fetch if slug in {SLUG, unanchored} else None
+    )
+    monkeypatch.setattr(str_mod, "_repository_checkout", lambda slug: repo if slug == SLUG else None)
+    live = _record(rel_tasks, "rel-live", worktree_path=live_rel.as_posix(), commits_ahead=0, worktree_dirty_on_exit=False)
+    gone = _record(rel_tasks, "rel-gone", worktree_path=gone_rel.as_posix(), commits_ahead=0, worktree_dirty_on_exit=False)
+    unknown = _record(
+        rel_tasks, "rel-unknown", repository=unanchored, worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+    anchored = str_mod.settle_stale(
+        rel_tasks, repo_checkouts={SLUG: repo, unanchored: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True,
+    )
+    rel_rows = _by_file(anchored)
+    assert rel_rows["rel-live.json"]["evidence"]["worktree_path"] == str(repo / live_rel)
+    assert rel_rows["rel-live.json"]["evidence"]["worktree_exists"] is True
+    assert rel_rows["rel-live.json"]["class"] == "D"
+    assert json.loads(live.read_text())["status"] == "needs_finalize"
+    assert rel_rows["rel-gone.json"]["evidence"]["worktree_path"] == str(repo / gone_rel)
+    assert rel_rows["rel-gone.json"]["outcome"] == "no_deliverable"
+    assert json.loads(gone.read_text())["status"] == "no_deliverable"
+    assert (decoy / gone_rel).is_dir()
+    assert rel_rows["rel-unknown.json"]["skip_reason"] == "worktree path state unknown"
+    assert rel_rows["rel-unknown.json"]["evidence"]["worktree_path"] == gone_rel.as_posix()
+    assert json.loads(unknown.read_text())["status"] == "needs_finalize"
 
 
 # ---------------------------------------------------------------------------
@@ -1155,15 +1194,35 @@ def test_archive_selects_only_old_terminal_records_without_a_live_worktree(tasks
     _terminal(tasks_dir, "old-queued", status="queued")
     _terminal(tasks_dir, "old-with-worktree", worktree_path=str(linked))
     _terminal(tasks_dir, "old-read-only", status="failed", cwd=str(primary))
+    # A list or dict status is unhashable. Membership in the released-status set
+    # used to abort the whole batch; the record is reported and the rest still move.
+    for name, status in (("old-list-status", ["done"]), ("old-dict-status", {"value": "done"}), ("old-number-status", 1)):
+        path = _terminal(tasks_dir, name)
+        body = json.loads(path.read_text())
+        body["status"] = status
+        path.write_text(json.dumps(body))
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
 
-    assert sorted(row["file"] for row in report["records"]) == ["old-done.json", "old-read-only.json"]
+    rows = {row["file"]: row for row in report["records"]}
+    assert rows["old-done.json"]["action"] == "archived"
+    assert rows["old-read-only.json"]["action"] == "archived"
+    assert (tasks_dir / "archive" / "old-done.json").is_file()
+    assert (tasks_dir / "archive" / "old-read-only.json").is_file()
+    for name in ("old-list-status.json", "old-dict-status.json"):
+        assert rows[name]["action"] == "skipped"
+        assert rows[name]["skip_reason"] == "malformed status"
+        assert (tasks_dir / name).is_file()
+    assert "old-number-status.json" not in rows
+    assert (tasks_dir / "old-number-status.json").is_file()
     assert report["kept_hot"] == {"worktree path still exists": 1}
     assert report["younger_left_alone"] == 1
     hot = sorted(path.name for path in tasks_dir.glob("*.json"))
     assert hot == [
+        "old-dict-status.json",
+        "old-list-status.json",
         "old-needs-finalize.json",
+        "old-number-status.json",
         "old-queued.json",
         "old-running.json",
         "old-with-worktree.json",
@@ -1371,6 +1430,7 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
     _terminal(tasks_dir, "reattached", worktree_path=str(reattached))
     _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
+    _terminal(tasks_dir, "listed")
     anchors = {
         "lost-before-lock": iter((tmp_path, None)),
         "lost-under-lock": iter((tmp_path, tmp_path, tmp_path, None)),
@@ -1396,6 +1456,9 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
             replacement.write_text(json.dumps(record))
             os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
             replacement.replace(path)
+        elif path.name == "listed.json":
+            path.write_text(json.dumps({**json.loads(path.read_text()), "status": ["done"]}))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=live_writer)
 
@@ -1407,11 +1470,12 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
         "touched.json": ("skipped", "record changed since selection"),
         "reattached.json": ("skipped", "worktree path still exists"),
         "replaced.json": ("skipped", "worktree lock target changed since selection"),
+        "listed.json": ("skipped", "malformed status"),
         "untouched.json": ("archived", None),
     }
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
-        "lost-before-lock.json", "lost-under-lock.json", "reattached.json", "replaced.json", "revived.json",
-        "touched.json",
+        "listed.json", "lost-before-lock.json", "lost-under-lock.json", "reattached.json", "replaced.json",
+        "revived.json", "touched.json",
     ]
 
 
