@@ -32,4 +32,27 @@ case $identity in *:*:*:*:*) ;; *) echo "claude_acp_exec: pinned Claude Code ide
 stat=/usr/bin/gnustat
 [ -x "$stat" ] || stat=/usr/bin/stat
 [ "$("$stat" -c %d:%i:%s:%.9Y:%.9Z -- "$host" 2>/dev/null)" = "$identity" ] || { echo "claude_acp_exec: pinned Claude Code changed since its version probe, or this host lacks GNU stat" >&2; exit 126; }
-exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow "$@"
+# Claude Code starts in Manual whatever mode the adapter asks for: since
+# claude-agent-acp 0.101.0 its default is Auto, which approves tools without an
+# ACP permission request. The ACP seat only reads, so its built-in tools are an
+# allowlist, which holds in every mode (an adapter can still switch a running
+# session to Accept edits) and against tools a newer Claude Code adds: Read,
+# Glob and Grep read the worktree; ToolSearch finds the sealed review MCP tool,
+# and --tools leaves MCP tools as they are. The SDK sends --permission-mode=<mode>
+# and --tools=<list> as one argument each (option values that start with "-" are
+# joined the same way), so both are replaced. Their two-argument forms, which the
+# SDK never sends, are refused, as is --dangerously-skip-permissions.
+# The word list is expanded once, before the loop rebuilds "$@".
+for arg in "$@"; do
+    shift
+    case $arg in
+        --permission-mode=* | --tools=*) ;;
+        --permission-mode | --tools | --dangerously-skip-permissions | --dangerously-skip-permissions=*)
+            echo "claude_acp_exec: refusing the SDK argument ${arg%%=*}" >&2
+            exit 126
+            ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow \
+    --tools=Read,Glob,Grep,ToolSearch --permission-mode=default "$@"

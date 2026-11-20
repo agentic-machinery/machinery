@@ -21,20 +21,6 @@ updates:
       npm:
         patterns:
           - "*"
-    ignore:
-      # The six exact versions write SDK libc constraints that break dependency
-      # sealing on musl Linux with Python 3.12.
-      # 0.101.0 through 0.109.0 can select Auto mode and approve tools
-      # without an ACP permission request.
-      - dependency-name: "@agentclientprotocol/claude-agent-acp"
-        versions:
-          - "0.96.0"
-          - "0.97.0"
-          - "0.98.0"
-          - "0.99.0"
-          - "0.99.1"
-          - "0.100.0"
-          - ">=0.101.0 <=0.109.0"
 
   # GitHub Actions (.github/workflows/ and any root action.yml or action.yaml for directory: "/")
   - package-ecosystem: "github-actions"
