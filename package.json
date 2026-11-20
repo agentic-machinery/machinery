@@ -13,6 +13,6 @@
     "@modelcontextprotocol/server": "2.4.0",
     "acpx": "0.22.0",
     "bare-abort-controller": "1.1.2",
-    "supports-color": "8.1.1"
+    "supports-color": "11.0.0"
   }
 }
