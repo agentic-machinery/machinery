@@ -1,10 +1,10 @@
 # Clean-machine release drill
 
 This kit checks that a published lu-machinery release works by itself on a machine that has never
-seen a machinery checkout. It installs the release from GitHub into a fresh virtual environment,
-runs every consumer row against that install, rolls back to the previous release, runs every row
-again, and writes one JSON receipt per row per phase. It selects the same `api`, `postgres`, and
-`pytest` extras as the deployed consumer. The Monitor API needs Uvicorn, Fleet plane status needs
+seen a machinery checkout. It installs each release from that release's consumer lock into a fresh
+virtual environment, runs every consumer row against that install, rolls back to the previous
+release, runs every row again, and writes one JSON receipt per row per phase. It selects the same
+`api`, `postgres`, and `pytest` extras as the deployed consumer. The Monitor API needs Uvicorn, Fleet plane status needs
 psycopg, and the data-tier probe runs pytest.
 
 Rows that need things only a production host has run against mocks instead: a synthetic product
@@ -61,11 +61,16 @@ On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bu
 
    Replace the placeholders with version numbers, without angle brackets.
 
-   The kit downloads both wheels and `SHA256SUMS` from the GitHub release, checks the sums,
-   installs the release, checks every installed file against the wheel's RECORD, runs all rows, rolls
-   back to the previous release (RECORD check again), runs all rows again, then rolls forward and
-   checks RECORD once more. At the end it deletes the venv, the mock world, the wheels and the
-   traces of rows that passed, and keeps `out/` (pass `--keep-work` to keep everything).
+   The kit downloads both wheels and `SHA256SUMS` from the GitHub release and checks the sums.
+   It installs each release from that release's consumer lock: the `consumer.lock` text in the
+   release notes, checked so its one `lu-machinery` pin is the wheel just verified, then
+   `pip install --require-hashes` on that lock. The wheel comes from disk. The lock's other
+   pins come from PyPI. It checks every installed file against the wheel's RECORD, runs all
+   rows, rolls back to the previous release (RECORD check again), runs all rows again, then
+   rolls forward and checks RECORD once more. An offline `--wheel-dir` must include
+   `consumer.lock` next to that release's wheel and `SHA256SUMS`. At the end it deletes the
+   venv, the mock world, the wheels and the traces of rows that passed, and keeps `out/`
+   (pass `--keep-work` to keep everything).
 
 4. Read the result. The kit prints `out/summary.txt` last: one screen of text, always under
    16 KiB, with the per-phase counts, each failed row with its reason, the RECORD checks, the
