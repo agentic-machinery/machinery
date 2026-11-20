@@ -58,7 +58,7 @@ _MAX_WARMING_RETRY_DELAY_S = 2  # Monitor's routing-budget warming response adve
 
 # Hard-wired minimal policy for a policy file that cannot be read: only these
 # lanes stay restricted, to these models. A test pins it to the shipped yaml.
-DEFAULT_ALLOWED_MODELS: dict[str, tuple[str, ...]] = {"codex": ("gpt-6.2-sol", "gpt-6-luna")}
+DEFAULT_ALLOWED_MODELS: dict[str, tuple[str, ...]] = dict.fromkeys(("codex", "codex:b"), ("gpt-6.2-sol", "gpt-6-luna"))
 
 NOT_CONFIGURED = "not_configured"
 POLICY_ERROR = "policy_error"
@@ -190,9 +190,13 @@ def policy_error_state(lane: str, error: str) -> dict[str, Any]:
 
 
 def _number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _field(info: dict[str, Any], key: str) -> Any:
@@ -1398,15 +1402,26 @@ def _policy_error_refusal(lane: str, model: str | None, error: str) -> str | Non
     )
 
 
-def dispatch_refusal(lane: str, model: str | None, *, policy: CreditPolicy | None = None) -> str | None:
+def dispatch_refusal(
+    lane: str, model: str | None, *, codex_account: str | None = None, policy: CreditPolicy | None = None
+) -> str | None:
     """Check an off-allowlist model against the credit policy and the routing-budget snapshot.
 
     ``model`` is the model the dispatch launches (the caller resolves the
     lane default first). The snapshot is read only for an off-allowlist model
     on a configured lane. An unreadable snapshot prevents admission. An
     unreadable policy restricts only :data:`DEFAULT_ALLOWED_MODELS` lanes.
+    The Codex subscription uses its own meter. API-key routes have no plan window.
     """
     lane_key = lane.strip().lower()
+    if lane_key == "codex":
+        from lu_machinery.agent_runtime.codex_accounts import CODEX_SUBSCRIPTION_ACCOUNTS, resolve_codex_account_label
+
+        account = resolve_codex_account_label(codex_account)
+        if account not in CODEX_SUBSCRIPTION_ACCOUNTS:
+            return None
+        if account == "b-sub":
+            lane_key = "codex:b"
     if policy is None:
         try:
             policy = load_policy()
@@ -1421,10 +1436,29 @@ def dispatch_refusal(lane: str, model: str | None, *, policy: CreditPolicy | Non
     # enters, and the claude lane is never read without its account (#10630, #10770).
     if raw is not None:
         budget = bind_snapshot(raw, account=no_claude_account())
-        record = other_lane_record(budget, lane_key)
-        freshness, _ = snapshot_freshness(budget.get("diagnostics"))
+        now = datetime.now(UTC)
+        if lane_key == "codex:b":
+            accounts = budget.get("codex_accounts")
+            row = accounts.get(lane_key) if isinstance(accounts, Mapping) else None
+            record = dict(row) if isinstance(row, Mapping) else {}
+            remaining = plan_remaining_pct(record)
+            # Aggregate diagnostics describe other lanes too. Account b needs its own fresh
+            # provider reading because the account row can also carry a ledger estimate.
+            freshness = (
+                FRESH
+                if record.get("codex_account") == "b-sub"
+                and record.get("status_source") == "weekly_pace"
+                and probe_freshness(record, policy.credit_max_age_s)[0] == FRESH
+                and _fresh_at(_field(record, "fetched_at"), now, policy.credit_max_age_s) is not None
+                and remaining is not None
+                and 0 <= remaining <= 100
+                else UNKNOWN
+            )
+        else:
+            record = dict(other_lane_record(budget, lane_key))
+            freshness, _ = snapshot_freshness(budget.get("diagnostics"))
         if isinstance(record.get("status"), str) and freshness != UNKNOWN:
-            state = lane_credit_state(lane_key, dict(record), policy, snapshot_stale=freshness == STALE)
+            state = lane_credit_state(lane_key, record, policy, now=now, snapshot_stale=freshness == STALE)
             return refusal_text(lane_key, model, state, policy) if allowlist_applies(state) else None
     return (
         f"{REFUSAL_CODE}: lane {lane_key} is routing_snapshot_unavailable "

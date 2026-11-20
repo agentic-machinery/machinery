@@ -375,7 +375,8 @@ def test_read_only_dispatch_is_exempt(admission_dispatch, monkeypatch, capsys):
 ])
 def test_pre_start_checks_do_not_reserve_a_worker(tmp_path, monkeypatch, gate, cause, rc):
     """A missing boundary or exhausted runtime meter used to be caught after reserving a worker."""
-    from lu_machinery.dispatcher import admission, agy_sandbox, cli, headroom, host_admission
+    from lu_machinery.agent_runtime import codex_accounts
+    from lu_machinery.dispatcher import agy_sandbox, cli, headroom, host_admission
 
     def forbidden(*_args, **_kwargs):
         pytest.fail("admission allocated a hold or worktree for a refused task")
@@ -383,9 +384,13 @@ def test_pre_start_checks_do_not_reserve_a_worker(tmp_path, monkeypatch, gate, c
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.setattr(git, "resolve_repo", lambda _repo: (tmp_path, {"key": "public", "github": "fixture/repo"}))
     monkeypatch.setattr(git, "worktree_plan", lambda *_a, **_kw: (tmp_path / "planned", "fixture", "1" * 40))
-    monkeypatch.setattr(admission, "codex_account", lambda *_a: {"codex_account": "sub"})
+    monkeypatch.setattr(codex_accounts, "codex_account_env", lambda _label, env: dict(env))
     monkeypatch.setattr(headroom, "check_plan", lambda *_a, **_kw: None)
-    monkeypatch.setattr(host_admission, "check_credit", lambda *_a: None)
+
+    def check_credit(agent, model, *, codex_account):
+        assert (agent, model, codex_account) == ("codex", CURRENT_SOL, "b-sub")
+
+    monkeypatch.setattr(host_admission, "check_credit", check_credit)
     monkeypatch.setattr(host_admission, "check", lambda *_a, **_kw: None)
     monkeypatch.setattr(host_admission, "reserve", forbidden)
     monkeypatch.setattr(git, "create_worktree", forbidden)
@@ -394,11 +399,11 @@ def test_pre_start_checks_do_not_reserve_a_worker(tmp_path, monkeypatch, gate, c
         monkeypatch.setattr(agy_sandbox, "native_unavailable", lambda: "fixture boundary is unavailable")
     else:
         def refused(agent, model, *, codex_account):
-            assert codex_account == "sub"
+            assert codex_account == "b-sub"
             raise headroom.RateLimitedError(agent, model, "fixture headroom exhausted")
 
         monkeypatch.setattr(headroom, "check_runtime", refused)
-    args = ["dispatch", "--agent", "codex", "--model", CURRENT_SOL, "--mode", "read-only",
+    args = ["dispatch", "--agent", "codex", "--codex-account", "b", "--model", CURRENT_SOL, "--mode", "read-only",
             "--task-id", "adm-worker", "--prompt", "Fixture prompt"]
     assert cli.main(args) == rc
     _assert_pre_start_refusal(_admission_refusal("adm-worker"), cause)

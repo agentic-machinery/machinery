@@ -93,6 +93,8 @@ def _row(budget: dict, lane: str = "codex") -> dict:
 def test_policy_reads_codex_allowlist_from_config():
     assert POLICY.path.name == "credit_lanes.yaml"
     assert POLICY.lane_models("codex") == (CURRENT_SOL, "gpt-6-luna")
+    assert POLICY.lane_models("codex:b") == (CURRENT_SOL, "gpt-6-luna")
+    assert POLICY.allowed_models == credit_lane.DEFAULT_ALLOWED_MODELS
     assert POLICY.lane_models("claude") is None
     assert (
         POLICY.near_cap_remaining_pct,
@@ -1031,6 +1033,58 @@ def test_allowlist_gate_table(snapshot, monkeypatch, tmp_path, scenario, lane, m
 
 
 # --- the gate on the real dispatch path --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "a_remaining,b_remaining,snapshot_stale,restricted",
+    [(1.0, 63.0, False, {None: "codex", "sub": "codex", "a-sub": "codex"}),
+     (63.0, 10.0, True, {"b-sub": "codex:b", "b": "codex:b"})],
+    ids=["account-a-credit-period", "account-b-credit-period"],
+)
+def test_dispatch_credit_gate_selects_codex_account(snapshot, a_remaining, b_remaining, snapshot_stale, restricted):
+    """A credit period restricts only the subscription whose plan allowance is low."""
+    budget = snapshot["budget"]
+    budget["diagnostics"]["stale"] = snapshot_stale
+    a_row = budget["agents"]["codex"]
+    b_row = _live(_codex(codex_account="b-sub", status_source="weekly_pace"))
+    for row, remaining in ((a_row, a_remaining), (b_row, b_remaining)):
+        row["remaining_pct"] = remaining
+        row["codexbar"]["weekly_remaining_pct"] = remaining
+    budget["codex_accounts"] = {"codex:a": a_row, "codex:b": b_row}
+
+    for account in (None, "sub", "a-sub", "b-sub", "b", "api", "a-api", "b-api"):
+        before = snapshot["reads"]
+        assert credit_lane.dispatch_refusal("codex", _ALLOWLISTED, codex_account=account) is None
+        assert snapshot["reads"] == before
+        refusal = credit_lane.dispatch_refusal("codex", "gpt-6.1-terra", codex_account=account)
+        if account in restricted:
+            assert refusal is not None
+            assert refusal.startswith(f"CREDIT_PERIOD_MODEL_REFUSED: lane {restricted[account]} is credit_balance_present")
+        else:
+            assert refusal is None
+        if account in {"api", "a-api", "b-api"}:
+            assert snapshot["reads"] == before
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [None, {"codex_account": "sub"}, {"status_source": "ledger_burn"}, {"age_s": 901.0},
+     {"fetched_at": "2026-10-01T17:00:00Z"}, {"remaining_pct": 101.0, "codexbar": {}},
+     {"remaining_pct": 10**350, "codexbar": {}}],
+    ids=["missing", "wrong-account", "ledger-estimate", "stale", "old-timestamp", "out-of-range", "overflow"],
+)
+def test_dispatch_credit_gate_refuses_unreadable_selected_account(snapshot, edits):
+    """A readable account a cannot grant admission when account b's plan reading is unavailable."""
+    budget = snapshot["budget"]
+    budget["agents"]["codex"] = _codex(status="cool", remaining_pct=63.0, codexbar={"weekly_remaining_pct": 63.0})
+    if edits is not None:
+        row = _live(_codex(codex_account="b-sub", status_source="weekly_pace"))
+        row.update(edits)
+        budget["codex_accounts"] = {"codex:b": row}
+
+    refusal = credit_lane.dispatch_refusal("codex", "gpt-6.1-terra", codex_account="b-sub")
+    assert refusal is not None
+    assert refusal.startswith("CREDIT_PERIOD_MODEL_REFUSED: lane codex:b is routing_snapshot_unavailable")
 
 
 @pytest.mark.parametrize("warming", [False, True], ids=["unreadable", "warming-then-ready"])

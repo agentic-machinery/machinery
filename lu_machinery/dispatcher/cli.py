@@ -504,7 +504,7 @@ def _dispatch(args) -> int:
                                 review=admission.review_typed(vars(args)) or bool(args.risk))
         except headroom.model_pause.ModelPausedRefused as exc:
             raise host_admission.Refused(f"❌ {exc}", 2) from None
-        host_admission.check_credit(agent, args.model)
+        host_admission.check_credit(agent, args.model, codex_account=args.codex_account)
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         checks.check_model_admission(agent, args.model, args.mode, vars(args), prompt)
         advisory_fields = checks.check_bounded_advisory(args, args.model, repo, prompt)
