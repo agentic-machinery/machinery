@@ -1438,13 +1438,13 @@ def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path, monkey
     empty.mkdir()
     alias.symlink_to(empty, target_is_directory=True)
     _terminal(tasks_dir, "acp-retargeted", acp_runtime_paths=[str(aliased_runtime)])
-    original_lstat = os.lstat
+    original_lstat = Path.lstat
     armed = False
 
-    def retarget_on_missing(path, *args, **kwargs):
+    def retarget_on_missing(path: Path) -> os.stat_result:
         nonlocal armed
         try:
-            return original_lstat(path, *args, **kwargs)
+            return original_lstat(path)
         except FileNotFoundError:
             if armed and path == aliased_runtime:
                 armed = False
@@ -1458,7 +1458,7 @@ def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path, monkey
         if path.name == "acp-retargeted.json":
             armed = True
 
-    monkeypatch.setattr(os, "lstat", retarget_on_missing)
+    monkeypatch.setattr(Path, "lstat", retarget_on_missing)
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=arm_retarget)
 
