@@ -31,7 +31,7 @@
   }
   section { overflow-x: visible; }
   @media (min-width: 641px) {
-    section[id] { scroll-margin-top: 96px; }
+    section[id] { scroll-margin-top: var(--sticky-offset, 96px); }
   }
   @media (max-width: 640px) {
     header { position: static; }
@@ -509,10 +509,10 @@ function pareto(data) {
     if (!shown.length) return `<p class="muted">Not enough data in ${esc(cls)}: no model has both timed wall hours and a landed task in this selection.</p>`;
     const frontier = shown.filter((m) => m.frontier);
     const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
-    const hasEligible = allTimed.some((m) => m.frontier) || shown.some((m) => !m.low_sample);
+    const shownHasEligible = shown.some((m) => !m.low_sample);
     const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
       : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
-        : hasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
+        : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
           : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
     const rows = shown.map((m) => `<tr><td>${modelKey(m.model, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
       + cell(displayHours(m)) + cell(share(m.rate, m.tasks)) + cell(ciText(m.ci))
@@ -523,15 +523,22 @@ function pareto(data) {
       + values(`Landed share and cost values in ${esc(cls)}`, ["Model", "Hours per merge", "Landed %", "Interval", "Tasks", "Landed", "Ranking"], rows, [0, 6]);
   }
   if (axis === "speed") {
-    const allSpeed = (charts.speed_quality || []).filter((p) => p.median_seconds !== null && p.median_seconds !== undefined && p.median_seconds > 0);
+    const rawSpeed = Array.isArray(charts.speed_quality)
+      ? charts.speed_quality
+      : (charts.pareto || []).map((p) => ({
+        ...p,
+        low_sample: p.speed_low_sample !== undefined ? p.speed_low_sample : p.low_sample,
+        frontier: p.speed_frontier !== undefined ? p.speed_frontier : false,
+      }));
+    const allSpeed = rawSpeed.filter((p) => p.median_seconds !== null && p.median_seconds !== undefined && p.median_seconds > 0);
     const shown = allSpeed.filter((p) => keepModel(p.model));
     if (!shown.length) return '<p class="muted">No model has both timed write durations and a reviewed PR in this window.</p>';
     const frontier = shown.filter((p) => p.frontier);
     const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
-    const hasEligible = allSpeed.some((p) => p.frontier) || shown.some((p) => !p.low_sample);
+    const shownHasEligible = shown.some((p) => !p.low_sample);
     const frontierNote = frontier.length > 1 ? `The dashed line connects the speed/approval frontier models (${frontierNames}).`
       : frontier.length === 1 ? `${frontierNames} alone is on the speed/approval frontier among the models shown.`
-        : hasEligible ? "None of the models shown is on the window's speed/approval frontier."
+        : shownHasEligible ? "None of the models shown is on the window's speed/approval frontier."
           : `Not enough data for a speed/approval frontier (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
     const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
       + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
@@ -546,10 +553,10 @@ function pareto(data) {
   if (!shown.length) return '<p class="muted">No model has both timed wall hours and a reviewed PR in this window.</p>';
   const frontier = shown.filter((p) => p.frontier);
   const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
-  const hasEligible = points.some((p) => p.frontier) || shown.some((p) => !p.low_sample);
+  const shownHasEligible = shown.some((p) => !p.low_sample);
   const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models (${frontierNames}).`
     : frontier.length === 1 ? `${frontierNames} alone is on the window's frontier among the models shown.`
-      : hasEligible ? "None of the models shown is on the window's frontier."
+      : shownHasEligible ? "None of the models shown is on the window's frontier."
         : `Not enough data for a frontier in this window (needs at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per model).`;
   const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
     + cell(displayHours(p)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
@@ -618,7 +625,10 @@ function jobs(data) {
       const m = models[0];
       const winner = best && m.tasks >= lowBelow() && landedShare(m) === landedShare(best);
       const classBest = best
-        ? winners.map((w) => `${esc(w.model)} (${num(w.rate * 100)}%, ${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)})`).join("; ")
+        ? winners.map((w) => {
+          const hrs = displayHours(w);
+          return `${esc(w.model)} (${num(w.rate * 100)}%, ${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)}${hrs !== "—" ? `, ${hrs} h/merge` : ""})`;
+        }).join("; ")
         : totalLanded === 0
           ? '<span class="warn">No landed tasks</span>'
           : hasQualifiedSample
@@ -1042,7 +1052,9 @@ async function loadPools(allowance, generation) {
       const laneFresh = !responseStale && freshness === "fresh" && !info.stale;
       const paceObj = info.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
       const paceFresh = !responseStale && Boolean(paceObj) && paceObj.stale !== true;
-      const stalePacePromoted = Boolean(paceObj && paceObj.stale === true && ["hot", "near_cap"].includes(paceObj.status));
+      const stalePacePromoted = Boolean(
+        paceObj && paceObj.stale === true && ["hot", "near_cap"].includes(paceObj.status) && paceObj.status === status,
+      );
       const statusFresh = laneFresh && !stalePacePromoted;
       const pace = formatPace(paceObj, responseStale);
       const tone = statusFresh && status === "cool" ? "good" : statusFresh && ["hot", "near_cap"].includes(status) ? "warn" : "";
@@ -1175,7 +1187,20 @@ $("pareto-x").addEventListener("change", () => { if (current) { renderCharts(); 
 $("trends-metric").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
 $("matrix-class").addEventListener("change", render);
 $("level-model").addEventListener("change", renderLevels);
+function updateStickyOffset() {
+  const header = document.querySelector("header");
+  if (!header) return;
+  const sticky = getComputedStyle(header).position === "sticky";
+  const offset = sticky ? Math.ceil(header.getBoundingClientRect().height) + 12 : 0;
+  document.documentElement.style.setProperty("--sticky-offset", `${offset}px`);
+}
+updateStickyOffset();
+if (typeof ResizeObserver !== "undefined") {
+  const header = document.querySelector("header");
+  if (header) new ResizeObserver(updateStickyOffset).observe(header);
+}
 window.addEventListener("resize", () => {
+  updateStickyOffset();
   if (current) renderCharts();
   updateTableScroll();
 });

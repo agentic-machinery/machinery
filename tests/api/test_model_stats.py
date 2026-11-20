@@ -1079,6 +1079,10 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         _record(split_tasks, f"tie-a-{index}", model="gpt-6.2-sol", duration_s=1.001, research_task_family="docs")
         _record(split_tasks, f"tie-b-{index}", model="claude-sonnet-5-5", duration_s=1.002, research_task_family="docs")
         _review(split_tasks, f"pr-only-{index}", "correct", [], pr=500 + index, review_author_model="claude-haiku-5-5")
+    # Sub-cutoff counts on models qualifying in the other metric stay preserved, never zeroed out (F9).
+    for index in range(3):
+        _record(split_tasks, f"haiku-w-{index}", model="claude-haiku-5-5", duration_s=60, research_task_family="docs")
+        _review(split_tasks, f"opus-pr-{index}", "correct", [], pr=700 + index, review_author_model="claude-opus-5-5")
     for index in range(20):
         _record(split_tasks, f"spd-t-{index}", model="gemini-4-hydrogen", duration_s=120, research_task_family="code")
     for index in range(2):
@@ -1092,6 +1096,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         | {f"dom-{index}" for index in range(6)}
         | {f"tie-a-{index}" for index in range(10)}
         | {f"tie-b-{index}" for index in range(10)}
+        | {f"haiku-w-{index}" for index in range(2)}
         | {f"spd-t-{index}" for index in range(10)}
     )
     split_charts = stats.collect(split_root, tmp_path, NOW,
@@ -1104,10 +1109,13 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert split_jobs["docs"]["gpt-6.2-sol"]["frontier"] is True
     assert split_jobs["docs"]["claude-sonnet-5-5"]["frontier"] is False
     assert split_jobs["docs"]["gpt-6.2-sol"]["hours_exact"] < split_jobs["docs"]["claude-sonnet-5-5"]["hours_exact"]
-    # Weekly approval trends admit a PR-only author with 10 reviewed PRs and 0 write tasks (F4).
+    # Weekly trends admit a model qualifying in either metric and keep its sub-cutoff counts in the other (F4, F9).
     haiku_trends = [t for t in split_charts["trends"] if t["model"] == "claude-haiku-5-5"]
     assert len(haiku_trends) == 1 and haiku_trends[0]["prs"] == 10 and haiku_trends[0]["first_approved"] == 10
-    assert haiku_trends[0]["tasks"] == 0
+    assert haiku_trends[0]["tasks"] == 3 and haiku_trends[0]["landed"] == 2
+    opus_trends = [t for t in split_charts["trends"] if t["model"] == "claude-opus-5-5"]
+    assert len(opus_trends) == 1 and opus_trends[0]["tasks"] == 10 and opus_trends[0]["prs"] == 3
+    assert opus_trends[0]["first_approved"] == 3
     # Speed/quality keeps gemini-4-hydrogen (20 timed + 2 untimed writes -> no hours_observed, 10 PRs, F5).
     assert "gemini-4-hydrogen" not in {p["model"] for p in split_charts["pareto"]}
     split_speed = {p["model"]: p for p in split_charts["speed_quality"]}

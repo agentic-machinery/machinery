@@ -1350,15 +1350,16 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
 
     week_write: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     busy_writes = {model["model"] for model in writes if model["tasks"] >= LOW_SAMPLE}
+    busy_prs = {author for author, count in reviewed.items() if count >= LOW_SAMPLE}
+    busy = busy_writes | busy_prs
     for row in rows:
-        if row.role == "write" and row.model in busy_writes:
+        if row.role == "write" and row.model in busy:
             slot = week_write[(week_of(row.moment), row.model)]
             slot[0] += 1
             slot[1] += row.landed
     week_review: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    busy_prs = {author for author, count in reviewed.items() if count >= LOW_SAMPLE}
     for pr in prs:
-        if pr["author"] in busy_prs:
+        if pr["author"] in busy:
             slot = week_review[(pr["week"], pr["author"])]
             slot[0] += 1
             slot[1] += pr["first"] == "correct"
