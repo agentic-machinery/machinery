@@ -6,7 +6,7 @@ Type=oneshot
 WorkingDirectory=@REPO_ROOT@
 Environment="LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=@REPO_ROOT@"
 Environment="LU_PRODUCT_ROOT=@REPO_ROOT@"
-ExecStart="@PYTHON@" -m lu_machinery.orchestration.issue_quality_report --publish --sender devops
+ExecStart="@PYTHON@" -I -m lu_machinery.orchestration.issue_quality_report --publish --sender devops
 TimeoutStartSec=1800
 Nice=15
 IOSchedulingClass=idle
