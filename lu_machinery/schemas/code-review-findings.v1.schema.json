@@ -103,10 +103,6 @@
         },
         "confidence": {
           "$ref": "#/$defs/confidence"
-        },
-        "acceptance_criteria_met": {
-          "type": "boolean",
-          "description": "Optional. true confirms that no acceptance criterion of the change is unmet. A reply whose open findings are all P3 is recorded as an approval carrying them only when this is true; absent or false keeps CHANGES_REQUESTED."
         }
       }
     },

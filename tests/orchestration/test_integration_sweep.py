@@ -231,8 +231,8 @@ def test_carbon_rejection_blocks_even_with_p3_only_findings(repository, tokened)
 
     reply = json.dumps({
         "schema_version": "code-review-findings.v1",
-        "overall": {"correctness": "incorrect", "explanation": "Minor finding remains.", "confidence": 0.9,
-                    "acceptance_criteria_met": True},
+        "overall": {"correctness": "incorrect", "explanation": "Minor finding remains.\nACCEPTANCE_CRITERIA: NONE_UNMET",
+                    "confidence": 0.9},
         "findings": [{
             "id": "F1", "title": "Minor finding", "body": "A minor finding remains.",
             "priority": "P3", "confidence": 0.9, "category": "correctness",
