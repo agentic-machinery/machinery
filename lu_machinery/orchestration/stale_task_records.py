@@ -757,6 +757,15 @@ def _classify_one(candidate: Candidate, facts: RepoFacts | None) -> None:
             "recorded_commits": recorded_work_commits(record),
         }
     )
+    # An unattributed relative path is unknown before any repository guard. Those
+    # guards would otherwise report a missing checkout and never say why the path
+    # was not read.
+    if isinstance(worktree_raw, str) and worktree_raw and not os.path.isabs(worktree_raw):
+        candidate.klass = "D"
+        candidate.skip_reason = "worktree path state unknown"
+        if facts is not None and facts.error:
+            evidence["repository_error"] = facts.error
+        return
     if not isinstance(slug, str) or facts is None:
         candidate.klass, candidate.skip_reason = "D", "record has no known repository"
         return
@@ -1434,7 +1443,8 @@ def apply_settlement(
     Does not delete a worktree, branch, or ``refs/reaper-rescue/`` ref.
     """
     try:
-        with worktree_lock(_record_lock_target(candidate.record, candidate.path), timeout_s=lock_timeout_s):
+        lock_target = _record_lock_target(candidate.record, candidate.path)
+        with worktree_lock(lock_target, timeout_s=lock_timeout_s):
             try:
                 mtime_ns = candidate.path.stat().st_mtime_ns
             except FileNotFoundError:
@@ -1447,9 +1457,17 @@ def apply_settlement(
             if current is None or current.get("status") != NEEDS_FINALIZE:
                 candidate.action, candidate.skip_reason = "skipped", "record no longer needs_finalize"
                 return
-            worktree_raw = candidate.evidence.get("worktree_path")
-            if isinstance(worktree_raw, str) and worktree_raw.strip():
-                state = _path_state(worktree_raw)
+            try:
+                current_target = _record_lock_target(current, candidate.path)
+            except worktree_claims.WorktreeLockError:
+                candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
+                return
+            if current_target != lock_target:
+                candidate.action, candidate.skip_reason = "skipped", "worktree lock target changed since classification"
+                return
+            owned = _owned_checkout(current)
+            if isinstance(owned, str) and owned.strip():
+                state = _path_state(owned)
                 if state is None:
                     candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
                     return
@@ -1686,11 +1704,19 @@ def _anchored(raw: str, record: Mapping[str, Any]) -> str:
     ``lstat`` follow a final symlink); ``..`` and symlinks are not resolved and
     ``~`` is not expanded.
     """
-    path = Path(raw)
+    try:
+        path = Path(raw)
+    except ValueError:
+        return raw
     if path.is_absolute():
         return str(path)
     checkout = _repository_checkout(record.get("repository"))
-    return raw if checkout is None else str(checkout / path)
+    if checkout is None:
+        return raw
+    try:
+        return str(checkout / path)
+    except ValueError:
+        return raw
 
 
 def _path_state(path: str) -> bool | None:
@@ -1702,7 +1728,10 @@ def _path_state(path: str) -> bool | None:
     different canonical path, so the record stays hot. An unattributed or
     unreadable path is also unknown.
     """
-    candidate = Path(path)
+    try:
+        candidate = Path(path)
+    except ValueError:
+        return None
     if not candidate.is_absolute():
         return None
     prefix = candidate
@@ -1763,9 +1792,16 @@ def _record_lock_target(record: Mapping[str, Any], record_path: Path) -> str:
     runs never move the same record at once. A relative path is read through
     :func:`_anchored`; one that is still not absolute cannot be attributed.
     """
-    target = _owned_checkout(record) or str(record_path)
-    if not os.path.isabs(target):
-        raise worktree_claims.WorktreeLockError("worktree lock target is not absolute")
+    try:
+        target = _owned_checkout(record) or str(record_path)
+        if not os.path.isabs(target):
+            raise worktree_claims.WorktreeLockError("worktree lock target is not absolute")
+        try:
+            Path(target).lstat()
+        except (FileNotFoundError, OSError):
+            pass
+    except ValueError as exc:
+        raise worktree_claims.WorktreeLockError("worktree lock target is not absolute") from exc
     return target
 
 
@@ -1956,13 +1992,12 @@ def _archive_one(
             if before_move is not None:
                 before_move(path)
             current, stat = _read_pinned(path)
-            if stat.st_mtime_ns != selected_mtime_ns:
-                row["action"], row["skip_reason"] = "skipped", "record changed since selection"
-            elif not isinstance(current, dict):
-                row["action"], row["skip_reason"] = "skipped", "record no longer terminal"
-            elif (released := _released_status(current)) is None:
+            released = _released_status(current) if isinstance(current, dict) else False
+            if released is None:
                 row["action"], row["skip_reason"] = "skipped", "malformed status"
-            elif not released:
+            elif stat.st_mtime_ns != selected_mtime_ns:
+                row["action"], row["skip_reason"] = "skipped", "record changed since selection"
+            elif not isinstance(current, dict) or not released:
                 row["action"], row["skip_reason"] = "skipped", "record no longer terminal"
             else:
                 with task_record_store.task_archive_lock(path.parent, moving=True):

@@ -989,6 +989,50 @@ def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir
     assert rel_rows["rel-unknown.json"]["evidence"]["worktree_path"] == gone_rel.as_posix()
     assert json.loads(unknown.read_text())["status"] == "needs_finalize"
 
+    # A missing checkout reports the path, and a checkout retargeted under the lock is not the path that was classified.
+    nocheck_tasks = tmp_path / "nocheck-tasks"
+    nocheck_tasks.mkdir()
+    (decoy / "lost").mkdir()
+    missing = _record(
+        nocheck_tasks, "rel-nocheck", repository="owner/no-checkout", worktree_path="lost",
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+    missing_report = str_mod.settle_stale(
+        nocheck_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True,
+    )
+    missing_row = _by_file(missing_report)["rel-nocheck.json"]
+    assert missing_row["skip_reason"] == "worktree path state unknown"
+    assert missing_row["evidence"]["worktree_path"] == "lost"
+    assert json.loads(missing.read_text())["status"] == "needs_finalize"
+    assert (decoy / "lost").is_dir()
+
+    moved_tasks = tmp_path / "moved-tasks"
+    moved_tasks.mkdir()
+    repo_b = tmp_path / "repo-b"
+    (repo_b / gone_rel).mkdir(parents=True)
+    holder = {"checkout": repo}
+    monkeypatch.setattr(
+        str_mod, "_repository_checkout", lambda slug, _holder=holder: _holder["checkout"] if slug == SLUG else None
+    )
+    shifted = _record(
+        moved_tasks, "rel-shifted", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def retarget(_candidates, _holder=holder, _repo_b=repo_b) -> None:
+        _holder["checkout"] = _repo_b
+
+    shifted_report = str_mod.settle_stale(
+        moved_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=retarget,
+    )
+    shifted_row = _by_file(shifted_report)["rel-shifted.json"]
+    assert shifted_row["action"] == "skipped"
+    assert shifted_row["skip_reason"] == "worktree path reappeared since classification"
+    assert json.loads(shifted.read_text())["status"] == "needs_finalize"
+    assert (repo_b / gone_rel).is_dir()
+
 
 # ---------------------------------------------------------------------------
 # archive / restore
@@ -1431,6 +1475,7 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
     _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
     _terminal(tasks_dir, "listed")
+    _terminal(tasks_dir, "listed-moved")
     anchors = {
         "lost-before-lock": iter((tmp_path, None)),
         "lost-under-lock": iter((tmp_path, tmp_path, tmp_path, None)),
@@ -1459,6 +1504,9 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
         elif path.name == "listed.json":
             path.write_text(json.dumps({**json.loads(path.read_text()), "status": ["done"]}))
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        elif path.name == "listed-moved.json":
+            path.write_text(json.dumps({**json.loads(path.read_text()), "status": {"value": "done"}}))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=live_writer)
 
@@ -1471,11 +1519,12 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeyp
         "reattached.json": ("skipped", "worktree path still exists"),
         "replaced.json": ("skipped", "worktree lock target changed since selection"),
         "listed.json": ("skipped", "malformed status"),
+        "listed-moved.json": ("skipped", "malformed status"),
         "untouched.json": ("archived", None),
     }
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
-        "listed.json", "lost-before-lock.json", "lost-under-lock.json", "reattached.json", "replaced.json",
-        "revived.json", "touched.json",
+        "listed-moved.json", "listed.json", "lost-before-lock.json", "lost-under-lock.json",
+        "reattached.json", "replaced.json", "revived.json", "touched.json",
     ]
 
 

@@ -93,19 +93,45 @@ def test_retention_record_age_and_primary_checkout_fallback(tmp_path: Path, monk
     listed = tasks / "listed.json"
     listed.write_text(json.dumps({**json.loads(listed.read_text()), "status": ["done"]}), encoding="utf-8")
     _write_full_sidecars(tasks, "listed", entries=1)
+    _write_record(
+        tasks, "nul-path", status="done", age_days=10, repository="owner/repo",
+        worktree_path=relative.as_posix() + "\0",
+    )
+    nul_snapshot = _write_full_sidecars(tasks, "nul-path", entries=1)
+    digests = {"n": 0}
+    original_digest = retention._digest_bytes
+
+    def _counting_digest(*args, **kwargs):
+        digests["n"] += 1
+        return original_digest(*args, **kwargs)
+
+    monkeypatch.setattr(retention, "_digest_bytes", _counting_digest)
     unknown_report = plan_retention(root, min_age_days=0, apply=True, now=NOW)
-    assert unknown_report["selected"] == [
-        {
-            "snapshot_dir": "tasks/rel-unknown.snapshots",
-            "task_id": "rel-unknown",
-            "status": "done",
-            "reclaimable_bytes": 0,
-            "action": "skipped",
-            "skip_reason": "worktree path state unknown",
-        }
-    ]
+    by_task = {row["task_id"]: row for row in unknown_report["selected"]}
+    assert set(by_task) == {"rel-unknown", "nul-path"}
+    assert by_task["rel-unknown"]["skip_reason"] == "worktree path state unknown"
+    assert by_task["nul-path"]["skip_reason"] == "worktree path state unknown"
+    assert by_task["rel-unknown"]["reclaimable_bytes"] == 0
+    assert digests["n"] == 0
     assert _names(snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    assert _names(nul_snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
     assert _names(tasks / "listed.snapshots") == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    _write_record(
+        tasks, "rel-race", status="done", age_days=10, repository="owner/repo", worktree_path=relative.as_posix()
+    )
+    race_snapshot = _write_full_sidecars(tasks, "rel-race", entries=1)
+
+    def lose_checkout() -> None:
+        record_path = tasks / "rel-race.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["repository"] = "owner/missing"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    race_report = plan_retention(root, min_age_days=0, apply=True, now=NOW, on_before_lock=lose_checkout)
+    race_rows = {row["task_id"]: row for row in race_report["selected"]}
+    assert race_rows["rel-race"]["action"] == "skipped"
+    assert race_rows["rel-race"]["skip_reason"] == "worktree path state unknown"
+    assert _names(race_snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
     mtime = int((NOW - timedelta(days=3)).timestamp() * 1e9)
     for finished in (None, "bad", " "):
         assert retention._record_age_days({"finished_at": finished}, mtime, NOW) == 3

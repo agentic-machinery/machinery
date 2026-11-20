@@ -511,8 +511,12 @@ def _apply_one(
     One record's ``OSError`` is that record's error; it does not abort the sweep.
     """
     try:
+        held_target = _record_lock_target(observed, logical_record)
+    except WorktreeLockError:
+        return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+    try:
         with (
-            worktree_lock(_record_lock_target(observed, logical_record), timeout_s=DEFAULT_LOCK_TIMEOUT_S),
+            worktree_lock(held_target, timeout_s=DEFAULT_LOCK_TIMEOUT_S),
             _task_record_lock(parent_fd, record_name),
         ):
             if not _is_regular(parent_fd, record_name):
@@ -527,6 +531,12 @@ def _apply_one(
                 info = _lstat_at(parent_fd, record_name)
                 if current is None:
                     return None
+                try:
+                    current_target = _record_lock_target(current, logical_record)
+                except WorktreeLockError:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+                if current_target != held_target:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
                 if current.get("status") != observed_status or current.get("run_nonce") != observed_nonce:
                     return None
                 if not _eligible(current, info, min_age_days=min_age_days, now=now):
@@ -581,6 +591,18 @@ def _measure_candidate(
     record = _read_record_at(parent_fd, record_name)
     if not _eligible(record, info, min_age_days=min_age_days, now=now) or record is None:
         return None
+    logical_record = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
+    try:
+        _record_lock_target(record, logical_record)
+    except WorktreeLockError:
+        return {
+            "snapshot_dir": f"{rel_dir}/{snapshot_name}",
+            "task_id": record.get("task_id") if record else record_name[: -len(".json")],
+            "status": record.get("status") if record else None,
+            "reclaimable_bytes": 0,
+            "action": "skipped",
+            "skip_reason": "worktree path state unknown",
+        }, 0
     snap_fd = _open_dir(parent_fd, snapshot_name)
     if snap_fd is None:
         return None
@@ -601,14 +623,6 @@ def _measure_candidate(
         "reclaimable_bytes": reclaimed,
         "action": "would_digest",
     }
-    logical_record = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
-    try:
-        _record_lock_target(record, logical_record)
-    except WorktreeLockError:
-        row["action"] = "skipped"
-        row["skip_reason"] = "worktree path state unknown"
-        row["reclaimable_bytes"] = 0
-        return row, 0
     if apply:
         if on_before_lock is not None:
             on_before_lock()
@@ -628,6 +642,10 @@ def _measure_candidate(
         if outcome is None:
             return None
         row["action"] = outcome["action"]
+        if outcome.get("skip_reason"):
+            row["skip_reason"] = outcome["skip_reason"]
+            row["reclaimable_bytes"] = 0
+            return row, 0
         if outcome["action"] == "error":
             row["error"] = outcome["error"]
             return row, 0
