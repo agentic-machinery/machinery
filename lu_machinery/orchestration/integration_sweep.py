@@ -222,8 +222,9 @@ def _field(comment: Mapping[str, Any], *keys: str) -> Any:
     return next((comment[key] for key in keys if key in comment), None)
 
 
-def _author_login(comment: Mapping[str, Any]) -> str | None:
-    author = _field(comment, "user", "author")
+def _author_login(comment: Mapping[str, Any], *, rest_only: bool = False) -> str | None:
+    """Return a string login. REST-only readers require the ``user`` field."""
+    author = comment.get("user") if rest_only else _field(comment, "user", "author")
     if isinstance(author, Mapping):
         login = author.get("login")
         return login if isinstance(login, str) else None

@@ -82,6 +82,7 @@ from lu_machinery.orchestration.integration_sweep import (
     TRUSTED_ASSOCIATIONS,
     GitHubAdapter,
     SweepError,
+    _author_login,
     is_second_review,
     is_second_review_only,
     is_second_reviewer_model,
@@ -2273,7 +2274,7 @@ def _trusted_markers(
         body = item.get("body") if isinstance(item, Mapping) else None
         if not isinstance(body, str) or MARKER_PREFIX not in body:
             continue
-        if item.get("user", {}).get("login") != login or item.get("author_association") not in TRUSTED_ASSOCIATIONS:
+        if _author_login(item, rest_only=True) != login or item.get("author_association") not in TRUSTED_ASSOCIATIONS:
             continue
         marker = parse_marker(body)
         if marker is None:
@@ -2955,7 +2956,7 @@ def _post_verdict(repository: str, number: int, comment: str, login: str) -> dic
     if (
         not isinstance(readback, dict)
         or readback.get("body") != comment
-        or readback.get("user", {}).get("login") != login
+        or _author_login(readback, rest_only=True) != login
         or readback.get("author_association") not in TRUSTED_ASSOCIATIONS
         or readback.get("created_at") != readback.get("updated_at")
     ):
@@ -3010,12 +3011,6 @@ def _store_publication(task_root: Path, *, repository: str, number: int, comment
     except Exception as exc:  # the verdict is already published; name the failure, never raise past it
         return f"failed: {type(exc).__name__}; store it with: {_recovery_command(repository, number)}"
     return "stored"
-
-
-def _comment_login(item: Mapping[str, Any]) -> str | None:
-    user = item.get("user")
-    login = user.get("login") if isinstance(user, Mapping) else None
-    return login if isinstance(login, str) else None
 
 
 def import_publications(
@@ -3078,7 +3073,7 @@ def import_publications(
             association = item.get("author_association")
             created = item.get("created_at")
             if (
-                _comment_login(item) != login
+                _author_login(item, rest_only=True) != login
                 or not isinstance(association, str)
                 or association not in TRUSTED_ASSOCIATIONS
                 or not isinstance(created, str)
@@ -3439,7 +3434,7 @@ def record(
                     marker
                     and marker["sha"] == sha
                     and marker["task"] == task_id
-                    and item.get("user", {}).get("login") == login
+                    and _author_login(item, rest_only=True) == login
                     and item.get("author_association") in TRUSTED_ASSOCIATIONS
                 ):
                     if (

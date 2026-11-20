@@ -367,6 +367,15 @@ def test_damaged_or_untrusted_events_never_classify():
     assert cf.events([quoted], "fleet") == []
 
 
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_capability_failure_events_ignore_malformed_author(user):
+    """Defect class: a malformed event author crashes capability failure lookup."""
+    _, failure = blocked_run()
+    comment = {**event_comment(failure), "user": user, "author": {"login": "fleet"}}
+
+    assert cf.events([comment], "fleet") == []
+
+
 def test_the_round_being_recorded_drops_its_own_events():
     approve, verdict = approving_run()
     blocked, failure = blocked_run(sha=OTHER)
@@ -434,6 +443,25 @@ def test_the_verb_appends_one_event_and_is_idempotent(monkeypatch, tmp_path, ops
     assert record_failure(tasks, tmp_path)["comment"] == "existing" and calls["posts"] == 1
     # The run's record and reply are never edited.
     assert before == {suffix: (tasks / f"review-blocked.{suffix}").read_bytes() for suffix in ("json", "result")}
+
+
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_capability_failure_refuses_malformed_readback_author(monkeypatch, tmp_path, opsec_rules, user):
+    """Defect class: a malformed event readback author crashes before reporting unknown publication state."""
+    tasks, _comments, calls = verb_case(monkeypatch, tmp_path)
+    run_json = recorder._run_json
+
+    def readback_with_malformed_user(request, **kwargs):
+        response = run_json(request, **kwargs)
+        if isinstance(request, recorder.Request) and request.verb == "read-comment":
+            return {**response, "user": user, "author": {"login": "fleet"}}
+        return response
+
+    monkeypatch.setattr(recorder, "_run_json", readback_with_malformed_user)
+
+    with pytest.raises(recorder.RecordError, match="comment readback mismatch; publication state unknown"):
+        record_failure(tasks, tmp_path)
+    assert calls == {"posts": 1, "statuses": 0}
 
 
 def test_the_verb_refuses_an_ineligible_run_before_any_post(monkeypatch, tmp_path, opsec_rules):
