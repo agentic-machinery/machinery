@@ -35,8 +35,10 @@ from lu_machinery.fleet_comms import message_plane
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_module, open_readonly
 from lu_machinery.orchestration import codex_transport_health
+from lu_machinery.review.model_catalog import load_model_catalog
 
 from . import account_logins, panel_values, subscriptions
+from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
 from .state_helpers import swr_route
@@ -1721,8 +1723,13 @@ def _public_subscriptions(raw: object) -> dict[str, Any]:
             rows.append(row)
         providers.append({"provider": provider["provider"], "label": label, "accounts": rows})
     sources = panel_values.mapping(snapshot.get("sources"))
+    try:
+        catalog_model_ids = current_catalog_model_ids(load_model_catalog())
+    except (OSError, ValueError):
+        catalog_model_ids = None
     return {**panel_values.scalars(snapshot, numbers=("stale_after_s",), times=("generated_at",)),
             "sources": {key: _subscription_section(sources.get(key)) for key in ("usage_cache", "plan_facts")},
+            "catalog_models": sorted(catalog_model_ids) if catalog_model_ids is not None else None,
             "providers": providers}
 
 
@@ -1774,7 +1781,9 @@ def runtime_subscriptions():
     the home page and for dispatch planning. Built by
     ``subscriptions.subscriptions_snapshot`` from the host's usage cache, the
     Monitor's Claude readings and the operator's plan-facts file; it
-    never calls a provider. A missing value is ``null`` in a section
+    never calls a provider. ``catalog_models`` lists the fleet catalog's
+    non-retired model IDs, or is ``null`` if the catalog cannot be read.
+    A missing usage value is ``null`` in a section
     whose ``status`` is ``unknown`` with a ``reason_code``; a reading older than
     15 minutes is ``stale``. The heading is ``unavailable`` only when no
     non-ended account has a fresh or stale reading. Fresh readings beside an

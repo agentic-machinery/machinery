@@ -860,7 +860,7 @@ def _parser() -> argparse.ArgumentParser:
             "  ~/.cache/lu-usage/codexbar.json, the usage cache (override: LU_USAGE_CACHE_FILE)\n"
             "  ~/.config/learn-ukrainian/subscription_ends.json, the plan facts (override: LU_SUBSCRIPTION_ENDS_FILE)\n"
             "\n"
-            "Outputs: the table, or with --json the same JSON as GET /api/runtime/subscriptions, on stdout.\n"
+            "Outputs: the table, or with --json the underlying usage snapshot, on stdout.\n"
             "Writes no file and changes no state.\n"
             "\n"
             "Exit codes: 0 printed (missing values print as unknown); 2 bad arguments.\n"
@@ -872,8 +872,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
-    parser.add_argument("--json", action="store_true",
-                        help="print the snapshot as JSON (same structure as GET /api/runtime/subscriptions); default: a table")
+    parser.add_argument("--json", action="store_true", help="print the usage snapshot as JSON instead of a table")
     args = parser.parse_args(argv)
     snapshot = subscriptions_snapshot()
     sys.stdout.write(json.dumps(snapshot, indent=1) + "\n" if args.json else render_text(snapshot))

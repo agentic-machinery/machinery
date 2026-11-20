@@ -237,6 +237,14 @@ def model_catalog_reading() -> dict[str, Any] | None:
         return None
 
 
+def current_catalog_model_ids(catalog: Mapping[str, Any] | None) -> frozenset[str] | None:
+    """Non-retired catalog IDs for display, or None when the catalog is unavailable."""
+    if catalog is None:
+        return None
+    return frozenset(model_id for model_id, info in catalog["models"].items()
+                     if info.get("lifecycle") != "retired" and model_label(model_id, ""))
+
+
 def _spelling(raw: object) -> str:
     """A model spelling without its bracketed context suffix (``claude-opus-5-5[1m]``)."""
     return raw.split("[", 1)[0].strip() if isinstance(raw, str) else ""
