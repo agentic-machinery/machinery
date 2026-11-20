@@ -727,8 +727,10 @@ def _enforce_delivery(record: dict) -> None:
         if cause:
             record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
         return
-    # With no commits ahead there is nothing to verify, and the remote branch may never have existed.
-    if owned and (record.get("commits_ahead") or 0) > 0:
+    # An unmatched branch cannot prove delivery. A merged PR can supply separate proof below.
+    # A dirty snapshot can still have a matching remote ref whose commits need checking.
+    branch_observed = record.get("push_state") == "pushed" or record.get("remote_ref") is not None
+    if owned and branch_observed and (record.get("commits_ahead") or 0) > 0:
         try:
             with git.ownership_git(record) as run:
                 base_sha = run("rev-parse", "--verify", "refs/heads/base^{commit}")
