@@ -46,7 +46,6 @@ from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot, require_account
 from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
 from lu_machinery.review.capacity import ReviewCapacity, review_capacity, review_capacity_action
-from lu_machinery.review.family_exclusions import GEMINI_CODE_REVIEW_RISKS
 from lu_machinery.review.model_catalog import (
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
@@ -1125,12 +1124,11 @@ def _evaluate_candidate(
                 capacity=capacity,
             )
 
-    # #10073: Gemini code review runs only through AGY at GEMINI_CODE_REVIEW_RISKS. Pins,
-    # custom ladders, advisory evaluation and forged roles cannot bypass the risk boundary.
+    # #10073 / NEON-SOLTIER-1120: Gemini code/infra review runs only through native AGY.
+    # Pins, custom ladders, advisory evaluation and forged roles cannot bypass the transport boundary.
     if (model_family == "google" or (candidate.route == "agy" and model_family != "anthropic")) and (
         candidate.route != "agy"
-        or inputs.risk.strip().casefold() not in GEMINI_CODE_REVIEW_RISKS
-        or is_security_sensitive_change(inputs.changed_paths, inputs.owned_paths)
+        or candidate.transport != "agy"
     ):
         return CandidateResult(
             name=candidate.name,
@@ -1142,7 +1140,7 @@ def _evaluate_candidate(
             quality_tier=candidate.quality_tier,
             requires_silence_timeout=candidate.requires_silence_timeout,
             status="excluded",
-            reason="Gemini code review requires AGY at low, medium or high risk and excludes security-sensitive paths (#10073)",
+            reason="Gemini code review requires the native AGY route (#10073)",
             health=health,
             capacity=capacity,
         )

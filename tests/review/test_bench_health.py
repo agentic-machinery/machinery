@@ -72,9 +72,9 @@ def test_bench_health_default_snapshot_closes_the_anthropic_shortfall_below_crit
         assert len(results[family]) >= 2, f"Family {family} has < 2 eligible seats: {results[family]}"
         assert all(REVIEW_CANDIDATES[name].family != family for name in results[family])
         assert not set(results[family]) & {"composer-2.5", "pool", "pool-xs"}
-    # With Cursor Grok retired, Sol alone reviews Anthropic-authored critical work: the accepted single seat.
+    # NEON-SOLTIER-1120 adds Neon to critical review after Sol and Opus.
     critical = check_bench_health(routing_snapshot=snapshot, data_egress_policy="local_interactive", risk="critical")
-    assert critical["anthropic"] == ["openai_frontier"]
+    assert critical["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
     assert GROK not in {name for seats in critical.values() for name in seats}
     automatic = resolve_reviewer(ResolverInputs(author_model="claude", data_egress_policy="local_interactive", routing_snapshot=snapshot, claude_account=HOST_ACCOUNT))
     assert automatic.selected.name == "openai_frontier"
@@ -88,22 +88,13 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
         {}, data_egress_policy="local_interactive", review_profile=profile, risk=risk
     )
     assert results == check_bench_health(routing_snapshot={}, review_profile=profile, risk=risk)
-    insufficient = profile == "infra" and risk in {"low", "medium"}
-    assert main(["--risk", risk, "--profile", profile], routing_snapshot={}) == (1 if insufficient else 0)
+    assert main(["--risk", risk, "--profile", profile], routing_snapshot={}) == 0
     captured = capsys.readouterr()
-    if insufficient:
-        finding, = _findings(captured)
-        assert finding["author_family"] == "anthropic"
-        assert finding["minimum"] == 2
-        assert finding["counted_seats"] == ["openai_frontier"]
-        assert "BENCH HEALTH FAIL" in captured.err
-    else:
-        assert captured.err == ""
-        assert "BENCH HEALTH PASS" in captured.out
-    # Sol alone reviews Anthropic-authored critical work since Cursor Grok retired (GROK-CANCEL-1110);
-    # at high Neon is the second code-review seat (GEMINI-TIERS-1119); it holds no infra profile.
-    neon = ["gemini-4-neon-high"] if profile == "code" else []
-    assert captured.out.count("[EXPECTED single seat]") == (1 if risk == "critical" or (risk == "high" and not neon) else 0)
+    assert captured.err == ""
+    assert "BENCH HEALTH PASS" in captured.out
+    # NEON-SOLTIER-1120 admits Neon for code and infra at every risk tier, so every family has >= 2 seats.
+    neon = ["gemini-4-neon-high"]
+    assert captured.out.count("[EXPECTED single seat]") == 0
     for family, seats in results.items():
         resolution = resolve_reviewer(
             ResolverInputs(
@@ -133,9 +124,9 @@ def test_bench_exclusions_match_automatic_resolver(risk, profile, capsys):
         return
     if risk != "critical":
         return
-    assert results["anthropic"] == ["openai_frontier"]
-    assert results["openai"] == ["claude-opus-5-5", "claude-opus-5-5-agy"]
-    assert set(exclusions["anthropic"]) == set(REVIEW_CANDIDATES) - {"openai_frontier"}
+    assert results["anthropic"] == ["openai_frontier", "gemini-4-neon-high"]
+    assert results["openai"] == ["claude-opus-5-5", "claude-opus-5-5-agy", "gemini-4-neon-high"]
+    assert set(exclusions["anthropic"]) == set(REVIEW_CANDIDATES) - {"openai_frontier", "gemini-4-neon-high"}
     assert not {"glm-5.3", "composer-2.5", "pool", "pool-xs"} & set(exclusions["anthropic"])
     assert "missing required review role suitability" in exclusions["anthropic"][GROK]
 
@@ -210,11 +201,11 @@ def test_retired_route_never_counts_even_if_pin_eligible_on_ladder(monkeypatch, 
     results = check_bench_health(routing_snapshot={"glm": "healthy"})
     assert all("glm-5.3" not in seats for seats in results.values())
     assert results["anthropic"] == DEFAULT_COUNTS["anthropic"]
-    # Removing Sol leaves zero seats (Cursor Grok is retired); still list the retired route.
+    # Removing Sol and AGY leaves zero seats (Cursor Grok is retired); still list the retired route.
     assert (
         main(
             ["--risk", "critical"],
-            routing_snapshot={"glm": "healthy", "codex": "unhealthy", "grok": "unhealthy", "cursor": "unhealthy"},
+            routing_snapshot={"glm": "healthy", "codex": "unhealthy", "agy": "unhealthy", "grok": "unhealthy", "cursor": "unhealthy"},
         )
         == 1
     )
@@ -306,8 +297,8 @@ def test_accepted_single_seat_still_requires_available_reviewer(risk, status, ro
             "diagnostics": {"stale": False}}
     if route == "claude":
         data["agents"]["agy"] = {"status": "unhealthy"}
-    # Neon on AGY still reviews Anthropic-authored high-risk code when Codex is out (GEMINI-TIERS-1119).
-    neon_fills = route == "codex" and risk == "high"
+    # Neon on AGY still reviews Anthropic-authored high and critical work when Codex is out (NEON-SOLTIER-1120).
+    neon_fills = route == "codex"
     expected_exit = 0 if neon_fills else (1 if status == "unhealthy" or route == "claude" else 0)
     assert main(["--risk", risk], routing_snapshot=data) == expected_exit
     captured = capsys.readouterr()

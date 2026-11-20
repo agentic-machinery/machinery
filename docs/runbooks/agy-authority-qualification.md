@@ -66,10 +66,10 @@ qualification gate below is read against them; they do not qualify Gemini 4.
 | Role | Admission |
 | --- | --- |
 | Epic driver | Admitted. `start-gemini-driver.sh --epic <lane>` enters the shared driver path. The driver default is `gemini-3.1-pro-high`; `gemini-3.8-flash-high` is also certified. Every other Gemini model id is refused. |
-| Low-risk and medium-risk code review | Admitted as formal review through native AGY (Gemini 4 Neon High). Infra review still excludes Gemini. |
+| Low-risk and medium-risk code/infra review | Admitted as formal review through native AGY (Gemini 4 Neon High; NEON-SOLTIER-1120). |
 | Ukrainian review | Admitted as formal review when the reviewer uses the Sources MCP. |
-| High-risk code review | Admitted for Gemini 4 Neon High through native AGY, after the OpenAI and Anthropic seats (operator order GEMINI-TIERS-1119, 2026-11-19). |
-| Critical code review | Not admitted. Critical review stays with Opus 5.5 or Sol 6.2. |
+| High-risk code/infra review | Admitted for Gemini 4 Neon High through native AGY alongside the Opus seats (operator orders GEMINI-TIERS-1119 and NEON-SOLTIER-1120). |
+| Critical code/infra review | Admitted for Gemini 4 Neon High through native AGY after the Sol and Opus seats, including security paths (operator order NEON-SOLTIER-1120, 2026-11-20). |
 | Design input and designated approval | Not admitted. Designated approval stays with Opus 5.5 and Sol 6.2. |
 
 ## Current source evidence and unresolved prerequisites
@@ -85,7 +85,7 @@ they are not a provider forecast or lasting health attestation.
 | [AGY adapter](../../scripts/agent_runtime/adapters/agy.py), `build_invocation` and `_resolve_model_flag` | Emits a resolved `--model` slug and rejects unknown explicit models. Effort remains a no-op with the `not yet wired through CLI` diagnostic. Historical docstrings about display-label-only invocation are not current argv evidence. |
 | Same adapter, native `review_isolation` branch | Raises `agy_isolated_review_unsupported` without `review_attempt_boundary`. Existing content attempts with that boundary are a distinct route; their success cannot establish native formal code/infra isolation. |
 | [AGY permission runbook](agy-review-permissions.md), [attempt isolation runbook](formal-review-attempt-isolation.md), [review MCP provisioner](../../scripts/agent_runtime/review_mcp.py) and [receipt ledger](../../scripts/review/receipts/ledger.py) | Source implements scoped Sources exposure, exact tool grants and attempt boundaries for content review. Configuration, unit tests and fixture success do not prove all required tools work for a new candidate/runtime. |
-| [Formal AGY isolation runbook](agy-formal-cf-isolation.md), [catalog](../../scripts/config/model_catalog.yaml), [catalog validation](../../scripts/review/model_catalog.py), [resolver](../../scripts/review/reviewer_resolver.py) and [target admission](../../scripts/agent_runtime/target_admission.py) | Native AGY formal eligibility admits low-, medium- and high-risk code review through resolver and target admission. Critical, infra and security reviews exclude Gemini, including explicit pins and injected ladders. The ACP bridge refuses code review. This admission does not prove authority-seat qualification; qualification cannot override the production gates. |
+| [Formal AGY isolation runbook](agy-formal-cf-isolation.md), [catalog](../../scripts/config/model_catalog.yaml), [catalog validation](../../scripts/review/model_catalog.py), [resolver](../../scripts/review/reviewer_resolver.py) and [target admission](../../scripts/agent_runtime/target_admission.py) | Native AGY formal eligibility admits code and infra review at every risk tier, including critical and security paths, through resolver and target admission (operator order NEON-SOLTIER-1120, 2026-11-20). Non-AGY routes and the ACP bridge refuse Gemini code review. This admission does not confer designated approval; qualification cannot override the production gates. |
 | [Historical benchmark](../../scripts/audit/code_review_benchmark.py), case fields, `score_case` and `aggregate` | Prior art for case/gold structure and TP/FP/FN accounting only. Its historical model/transport matrix, heuristic matching and lack of blind adjudication do not implement this qualification protocol. Do not execute that matrix. |
 
 Four prerequisite proof rows must be complete **before any AGY qualification
@@ -104,10 +104,11 @@ actual qualification. Infra owns #9302 role migration. The installed CLI has an
 effort flag but the inspected adapter does not wire it; actual identity proof
 has not been established here. Content-review tooling is not a substitute for
 the missing native authority-review proof. The 2026-10-08 approval lifts the
-driver exclusion and admits low-risk and medium-risk code review; operator order
-GEMINI-TIERS-1119 (2026-11-19) also admits Gemini 4 Neon High for high-risk code
-review after the OpenAI and Anthropic seats. The design input, designated
-approval, infra review and critical code/infra exclusions
+driver exclusion and admits low-risk and medium-risk code review; operator orders
+GEMINI-TIERS-1119 (2026-11-19) and NEON-SOLTIER-1120 (2026-11-20) admit Gemini 4
+Neon High for code and infra review at every risk tier, including critical and
+security paths, as a peer of Opus 5.5 and Sol 6.2. Design input and designated
+approval exclusions
 remain binding until Gemini 4 qualifies here, the necessary explicit policy
 clearance is given, and the implementation is reviewed. No fallback, guessed model ID, release
 date, synthetic pass or prototype capability proof closes these gaps.

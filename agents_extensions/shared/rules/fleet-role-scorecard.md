@@ -19,18 +19,18 @@
 
 ---
 
-## 1. Current role → models (updated 2026-09-28)
+## 1. Current role → models (updated 2026-11-20)
 
 | Role | Primary | Secondary / volume | Effort | Confidence |
 |---|---|---|---|---|
 | Ceiling advisor/designer | Claude Opus 5.5 / GPT-6.2 Sol | — | `high` | provisional |
-| Accountable orchestrator | GPT-6.2 Sol, Claude Opus 5.5 | — | `high` | provisional |
-| General implementer | GPT-6.2 Sol, Claude Sonnet 5.5 for well-scoped non-security code, Grok 4.7 | GPT-6 Luna for bounded work under a Sol advisory envelope; Gemini 4 Hydrogen for well-defined work; Cursor (**pin family**). Kimi is retired (OO-58). Security-sensitive code authoring goes to Opus 5.5 or Codex Sol; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude). | `high` by task fit | provisional |
+| Accountable orchestrator | GPT-6.2 Sol, Claude Opus 5.5, Gemini 4 Neon High (operator 2026-11-20, NEON-SOLTIER-1120) | Gemini 4 Hydrogen Medium | `high` | provisional |
+| General implementer | GPT-6.2 Sol, Claude Sonnet 5.5 for well-scoped non-security code, Grok 4.7 | GPT-6 Luna for bounded work under a Sol advisory envelope; Gemini 4 Hydrogen for well-defined work; Cursor (**pin family**). Kimi is retired (OO-58). Security-sensitive code authoring goes to Opus 5.5, Codex Sol or Gemini 4 Neon High; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude). | `high` by task fit | provisional |
 | Polished written deliverables in English | Claude Sonnet 5.5 | Reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, and design review of pages/artifacts | By task fit | provisional |
-| Hard implementer | GPT-6.2 Sol, Claude Opus 5.5 | Escalate hard design judgment to Opus 5.5 / Sol 6.2 | `high` | provisional |
+| Hard implementer | GPT-6.2 Sol, Claude Opus 5.5, Gemini 4 Neon High (operator 2026-11-20, NEON-SOLTIER-1120) | Escalate hard design judgment to Opus 5.5 / Sol 6.2 | `high` | provisional |
 | UI / visual product design | Claude Opus 5.5 / GPT-6.2 Sol | Cursor or Sonnet implements the approved design. Kimi is retired (OO-58) and is not an implementer. | `high` | provisional |
 | Code/security CF review | **Author-family-conditional** (see §3); for security-sensitive diffs (hooks/guards, launchers, credential or secret handling, dispatch admission, sandbox/permission logic), the resolver raises the review to `--risk critical` whatever risk is passed (`lu_machinery/review/security_paths.py`, #9125), which excludes Sonnet 5.5 | — | `high`+ | provisional |
-| Critical CF review | GPT-6.2 Sol ↔ Opus 5.5 **cross-family** | — | `high` | provisional |
+| Critical CF review | GPT-6.2 Sol ↔ Opus 5.5 ↔ Gemini 4 Neon High **cross-family** (peer seat, operator 2026-11-20, NEON-SOLTIER-1120) | — | `high` | provisional |
 | Ukrainian language | Gemini 3.8 Flash High (AGY) | LANGUAGE-LANES: GPT-6.2 Sol / Claude Opus 5.5 + sources | `high` | provisional (morphology remains VESUM-gated) |
 | Recon / triage | GPT-6 Luna, Claude Haiku, Gemini 4 Hydrogen | — | Luna `high` with exact owned paths + objective scope ceiling, from a Sol advisory envelope (always required, #9275); others by task fit; never sole release | provisional |
 
@@ -45,9 +45,10 @@
 | **Fable 5.1** | Active catalog entry | High cost; explicit pin only | Anthropic | Parked: not routed by default; reintroduction or a successor model is an operator decision |
 | **GPT-6.2 Sol** | Accountable driving, coding, adversarial review, and hard OpenAI advisory judgment | Same-family review of OpenAI work is not independent | OpenAI / native Codex | Regular driver, coder, reviewer and advisor @ high; designated approver with Opus 5.5 (#9583, #9616) |
 | **Claude Opus 5.5** | Hard Claude-lane coding, deep code review and hard advisory judgment | Costly as bulk worker | Anthropic / native Claude or verified Cursor slug | Hard coding, review and advisor @ high; designated approver with Sol 6.2 (#9583, #9616) |
+| **Gemini 4 Neon High** | Peer of Opus 5.5 and Sol 6.2 for hard/security coding, stream driving, and code/infra CF review at every risk tier (including critical and security paths); 1M context; VESUM-backed Ukrainian review | Provisional (operator 2026-11-20, NEON-SOLTIER-1120); designated approval remains Opus 5.5 + Sol 6.2; same-family review of Google work is not independent | Google / native AGY | Hard/security coder, driver peer, code/infra/critical/security CF reviewer @ high, and Ukrainian reviewer with Sources MCP |
 | **GPT-6 Luna** | Fast bounded implementation, recon, and mechanical checks | Never sole architecture/security/language/release authority | OpenAI / native Codex | Bounded worker / recon @ high |
 | **Claude Haiku** | Fast cheap recon/triage on Anthropic lane; good for log/search skim | Never sole architecture/security/language/release authority | Anthropic | Recon (with Luna / 3.5 Flash) |
-| **Sonnet 5.5** | Well-scoped everyday coding and bug fixes; polished English reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, design review of pages/artifacts; faster and uses fewer tokens than Sonnet 5 | Weaker than Opus 5.5 on complex, open-ended work; security-sensitive code authoring (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions) goes to Opus 5.5 or Codex Sol; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude); escalate hard judgment to Opus 5.5 / Sol 6.2; designated approval remains separate | Anthropic | Provisional practical worker: after 10 recorded Sonnet 5.5 review or implementation outcomes, adopt or demote with evidence (#9111) |
+| **Sonnet 5.5** | Well-scoped everyday coding and bug fixes; polished English reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, design review of pages/artifacts; faster and uses fewer tokens than Sonnet 5 | Weaker than Opus 5.5 on complex, open-ended work; security-sensitive code authoring (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions) goes to Opus 5.5, Codex Sol or Gemini 4 Neon High; Ukrainian curriculum content stays with sanctioned language lanes (Opus 5.5 for Claude); escalate hard judgment to Opus 5.5 / Sol 6.2; designated approval remains separate | Anthropic | Provisional practical worker: after 10 recorded Sonnet 5.5 review or implementation outcomes, adopt or demote with evidence (#9111) |
 | **Grok 4.7** | Strong coding agent; token-efficient; good CF review value | No driver or high/critical review seat; formal review requires the exact Cursor pin and runtime attestation | xAI; SuperGrok Heavy = capacity entitlement (re-verify) | Worker; eligible for low/medium code/infra CF review through attested Cursor `grok-4.7-high` when admitted by the resolver; outside the ordinary review ladders (C-5307) |
 | **Gemini 3.8 Flash High** | Multilingual / designated UA language seat; semantic review | Not bulk CRUD default; language outputs need sources | Google / AGY | Language lane (3.1 Pro is retired, not subscribed, operator 2026-10-23) |
 | **K3** | Retired (OO-58, #11327) | No executable route and no substitution | Moonshot | Not a lane |
@@ -119,8 +120,8 @@ Store bakeoff notes under `docs/best-practices/fleet-bakeoffs/` (create when fir
 
 ```
 GPT-6 Luna / Claude Haiku / Gemini 4 Hydrogen recon
-  → GPT-6.2 Sol / Opus 5.5 / Sonnet 5.5 (well-scoped everyday work and polished English deliverables) / Grok 4.7 implement (worktree)
-    → security-sensitive code (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions): Opus 5.5 or Codex Sol, never Sonnet 5.5
+  → GPT-6.2 Sol / Opus 5.5 / Gemini 4 Neon High / Sonnet 5.5 (well-scoped everyday work and polished English deliverables) / Grok 4.7 implement (worktree)
+    → security-sensitive code (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions): Opus 5.5, Codex Sol or Gemini 4 Neon High, never Sonnet 5.5
     → Ukrainian curriculum content: sanctioned language lanes (Opus 5.5 for Claude), never Sonnet 5.5
     → escalate immediately if security / high blast radius / unclear invariants / multi-architecture
     → otherwise escalate after evidence-backed root-cause attempts fail
@@ -154,11 +155,11 @@ Re-verify capacity and routing when the subscription plan or API routing changes
 
 ```text
 Routine code/fix          → GPT-6.2 Sol high | GPT-6 Luna high when bounded (Sol envelope) | Sonnet 5.5 for well-scoped non-security work | Grok 4.7
-Security-sensitive code  → Claude Opus 5.5 | Codex Sol (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions; never Sonnet 5.5)
+Security-sensitive code  → Claude Opus 5.5 | Codex Sol | Gemini 4 Neon High (hooks/guards, launchers, credentials/secrets, dispatch admission, sandbox/permissions; never Sonnet 5.5)
 Polished English work     → Sonnet 5.5 (reports, runbooks, write-ups, PR/issue prose, decks, spreadsheets, design review)
 Ukrainian curriculum      → sanctioned language lanes; Opus 5.5 for Claude (never Sonnet 5.5)
-Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high; Opus/Sol advice
-Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high (exactly one)
+Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High; Opus/Sol advice
+Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
 UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
 UA language                 → Gemini 3.8 Flash High (AGY) + VESUM/sources (3.1 Pro is retired, not subscribed, operator 2026-10-23)
 Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)

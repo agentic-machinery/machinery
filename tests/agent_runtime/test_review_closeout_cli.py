@@ -846,7 +846,25 @@ def test_resolve_reviewer_excludes_every_branch_author_and_agrees_with_the_recor
     )
     assert retarget.returncode == 0, retarget.stderr
     critical = _run_cli(state, "resolve-reviewer", *common, "--risk", "critical")
-    assert critical.returncode == 1 and json.loads(critical.stdout)["selected"] is None
+    assert critical.returncode == 0 and json.loads(critical.stdout)["selected"]["name"] == "gemini-4-neon-high"
+
+    # Adding a Google author leaves no critical reviewer at all.
+    repo.commit("agy/gemini-4-neon-high", message="fourth author")
+    retarget_google = _run_cli(
+        state,
+        "target",
+        "--mode",
+        "branch",
+        "--branch",
+        "feature",
+        "--base",
+        "origin/main",
+        "--repo-root",
+        str(repo.root),
+    )
+    assert retarget_google.returncode == 0, retarget_google.stderr
+    exhausted = _run_cli(state, "resolve-reviewer", *common, "--risk", "critical")
+    assert exhausted.returncode == 1 and json.loads(exhausted.stdout)["selected"] is None
 
 
 def test_resolve_reviewer_fails_closed_on_an_unattributed_commit(tmp_path, monkeypatch):
@@ -1139,6 +1157,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
 # Sol 6.2 (2026-11-17) re-pins all three: the only change is gpt-6.1-sol -> gpt-6.2-sol;
 # restoring that spelling in the stdout reproduces the previous digests.
 # The Neon seat replaces the Flash trace row for low and medium risk.
+# NEON-SOLTIER-1120 (2026-11-20) adds Neon as an eligible critical trace row on security paths; Opus stays selected.
 @pytest.mark.parametrize(
     "author,risk,path,digest",
     [
@@ -1148,7 +1167,7 @@ def test_pr_mode_target_keeps_the_base_name_for_authorship_exclusion(tmp_path, m
             CURRENT_SOL,
             "low",
             "lu_machinery/agent_runtime/target_admission.py",
-            "c295a7a555f348503986eba12569d9f04a081401f0bb37c044ece4d836dcfb9d",
+            "f030e59d4e634e9a0b6acc3f34b47f7b0911734a1bae8287ea6203a55306a2c1",
         ),
     ],
 )

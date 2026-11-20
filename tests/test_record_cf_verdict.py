@@ -1410,11 +1410,29 @@ def test_gemini_code_verdict_refused_before_publication(monkeypatch, tmp_path, r
 
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"anthropic"}, changed_paths=(path,)))
+    # NEON-SOLTIER-1120: native AGY Gemini 4 Neon High is admitted at critical and on security paths.
     write_task(tasks, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
-    with pytest.raises(recorder.RecordError, match="Gemini code review requires AGY at low, medium or high risk"):
-        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
-    assert not comments
-    assert calls == {"posts": 0, "statuses": 0}
+    result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert result["verdict"] == "APPROVED"
+    assert calls == {"posts": 1, "statuses": 1}
+
+    # Non-native routes carrying a Gemini model remain refused before publication.
+    tasks2, comments2, calls2 = setup_record(monkeypatch, tmp_path / "non-native")
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"anthropic"}, changed_paths=(path,)))
+    write_task(tasks2, agent="codex", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
+    with pytest.raises(recorder.RecordError, match="not a catalog review candidate"):
+        recorder.record("review-one", pr_number=42, task_root=tasks2, lock_root=tmp_path / "locks2")
+    assert not comments2
+    assert calls2 == {"posts": 0, "statuses": 0}
+
+    # Same-family Google author remains refused before publication.
+    tasks3, comments3, calls3 = setup_record(monkeypatch, tmp_path / "same-family")
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_args, **_kwargs: facts_for({"google"}, changed_paths=(path,)))
+    write_task(tasks3, agent="agy", model="gemini-4-neon-high", review_profile="code", review_risk=risk)
+    with pytest.raises(recorder.RecordError, match="reviewer family equals an author family"):
+        recorder.record("review-one", pr_number=42, task_root=tasks3, lock_root=tmp_path / "locks3")
+    assert not comments3
+    assert calls3 == {"posts": 0, "statuses": 0}
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

@@ -431,7 +431,9 @@ def test_mixed_family_critical_branch_has_no_reviewer_whatever_the_order_or_writ
     fact = facts(repo, tasks, writer=writer)
 
     assert fact.existing_families == {"anthropic", "openai", "xai"}
-    assert selected(fact, "critical") is None
+    assert selected(fact, "critical") == "gemini-4-neon-high"
+    repo.commit("agy/gemini-4-neon-high", message="google commit")
+    assert selected(facts(repo, tasks, writer=writer), "critical") is None
 
 
 def test_mixed_family_at_lower_risk_keeps_a_third_family(repo, tasks, monkeypatch, tmp_path):
@@ -474,8 +476,10 @@ def test_recorder_holds_a_below_critical_reviewer_to_the_recorded_risk(repo, tas
 def test_incoming_family_joins_the_authors(repo, tasks):
     repo.commit(OPUS)
     repo.commit(GROK)
-    assert selected(facts(repo, tasks, writer=SOL), "critical") is None
+    assert selected(facts(repo, tasks, writer=SOL), "critical") == "gemini-4-neon-high"
     assert selected(facts(repo, tasks, writer="claude/claude-sonnet-5-5"), "critical") == "openai_frontier"
+    repo.commit("agy/gemini-4-neon-high")
+    assert selected(facts(repo, tasks, writer=SOL), "critical") is None
 
 
 def test_cursor_auto_incoming_writer_adds_only_cursor_family(repo, tasks):
@@ -526,7 +530,7 @@ def test_claude_adapter_raises_risk_and_excludes_every_claude_reviewer(repo, tas
     resolution = recorder.structural_review_route(fact, risk="low", claude_account=HOST_ACCOUNT)
 
     assert fact.subject_seats == {"claude"}
-    assert resolution.resolved_risk == "critical" and resolution.selected is None
+    assert resolution.resolved_risk == "critical" and resolution.selected.name == "gemini-4-neon-high"
     reasons = {entry.name: entry.reason for entry in resolution.trace}
     assert "subject exclusion" in reasons["claude-opus-5-5"]
     # D-129 (#10464): no Claude model reviews through Cursor, so no such trace row exists.
@@ -546,12 +550,13 @@ def test_protected_changes_stay_in_scope_beyond_a_narrow_latest_packet(repo, tas
     fact = facts(repo, tasks, writer=SOL, owned=("docs/a.md",))
 
     assert CLAUDE_ADAPTER in fact.scope_paths and fact.subject_seats == {"claude"}
-    assert selected(fact, "low") is None
+    assert selected(fact, "low") == "gemini-4-neon-high"
 
 
 def test_explicit_subjects_and_ambiguous_shared_hooks(repo, tasks, monkeypatch, tmp_path):
     repo.commit(OPUS)
-    assert selected(facts(repo, tasks, writer=OPUS, seats=("codex", "grok")), "critical") is None
+    assert selected(facts(repo, tasks, writer=OPUS, seats=("codex", "grok")), "critical") == "gemini-4-neon-high"
+    assert selected(facts(repo, tasks, writer=OPUS, seats=("codex", "grok", "agy")), "critical") is None
     unknown = facts(repo, tasks, writer=OPUS, owned=(SHARED_HOOK,))
     assert unknown.subject_seats == unknown.subject_families == frozenset()
     assert unknown.subject_evidence == ()

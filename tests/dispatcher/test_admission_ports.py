@@ -301,6 +301,54 @@ def test_delegate_content_seat_without_the_addendum_refuses(
     assert refusal["provider_pgid"] is None and refusal["usage"] is None
 
 
+def test_review_admission_refusal_persists_reason_text_in_task_record(tmp_path, monkeypatch):
+    """CTO-approved NEON-SOLTIER-1120 defect class: review admission refusal loses exception reason text."""
+    from lu_machinery.dispatcher.types import StartRefusal
+
+    tasks = tmp_path / "tasks"
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    args = SimpleNamespace(
+        task_id="review-refused-1",
+        dry_run=False,
+        print_advisory_binding=False,
+        model="gemini-4-neon-high",
+        effort="high",
+        mode="read-only",
+        repo="machinery",
+        pr=999,
+        pinned_head="a" * 40,
+        research_task_family=None,
+        data_class=None,
+        review_profile="infra",
+        risk="critical",
+        review_author_model="claude-opus-5-5",
+    )
+
+    with (
+        pytest.raises(ValueError, match="no eligible reviewer"),
+        admission.record_refusal(args, "agy", StartRefusal.REVIEW_SETUP),
+    ):
+        raise ValueError("REVIEW_ATTEMPT_IDENTITY_REFUSED:\n  no eligible reviewer\x1b[0m for critical")
+
+    [record_file] = sorted(tasks.glob("*.json"))
+    recorded = json.loads(record_file.read_text(encoding="utf-8"))
+    assert recorded["status"] == "failed"
+    assert recorded["never_started_reason"] == "review_setup_refusal"
+    assert recorded["error"] == (
+        "review_setup_refusal: REVIEW_ATTEMPT_IDENTITY_REFUSED: no eligible reviewer [0m for critical"
+    )
+    assert recorded["requested_task_id"] == "review-refused-1"
+    assert recorded["review_profile"] == "infra" and recorded["review_risk"] == "critical"
+
+    # Empty, already-prefixed, and oversized details stay typed, non-duplicated, and bounded.
+    assert store._format_refusal_error(StartRefusal.REVIEW_SETUP, "") == "review_setup_refusal"
+    assert store._format_refusal_error(
+        StartRefusal.REVIEW_SETUP, "review_setup_refusal: exact reason"
+    ) == "review_setup_refusal: exact reason"
+    oversized = store._format_refusal_error(StartRefusal.REVIEW_SETUP, "x" * 700)
+    assert len(oversized) == store._MAX_REFUSAL_ERROR_CHARS and oversized.endswith("...")
+
+
 # ----------------------------------------------------------------- plan headroom and runtime exhaustion (unit D6)
 
 

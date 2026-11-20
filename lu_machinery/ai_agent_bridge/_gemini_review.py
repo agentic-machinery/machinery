@@ -6,19 +6,19 @@ from pathlib import Path, PurePosixPath
 
 from lu_machinery.common import github_client, json_depth
 
-# Native AGY admits low, medium and high risk code review through the reviewer resolver.
+# Native AGY admits code and infra review at every risk tier through the reviewer resolver.
 # ACP bridge reviews remain restricted to Ukrainian content.
 GEMINI_REVIEW_PROFILE_CHOICES = ("code", "ukrainian")
 GEMINI_REVIEW_AGENTS = frozenset({"agy", "gemini"})
 GEMINI_CODE_REVIEW_FORBIDDEN = (
     "gemini_code_review_forbidden: this route requires Ukrainian content. "
-    "Code review requires native AGY dispatch at low, medium or high risk "
-    "through the reviewer resolver (model-assignment.md)"
+    "Code review requires native AGY dispatch through the reviewer resolver "
+    "(model-assignment.md)"
 )
 AGY_REVIEW_PROFILE_REQUIRED = (
     "agy_review_profile_required: a review request to agy/gemini requires "
     "--review-profile {code,ukrainian}. "
-    "Native AGY code review requires low, medium or high risk and resolver admission; "
+    "Native AGY code review requires resolver admission; "
     "the ACP bridge refuses code review. "
     "Ukrainian content review must pass --review-profile ukrainian."
 )

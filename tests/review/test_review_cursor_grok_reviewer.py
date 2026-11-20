@@ -117,7 +117,12 @@ def test_catalog_lists_no_cursor_grok_after_opus(risk):
     catalog = load_model_catalog()
     ladder = [name for rung in catalog["review_ladders"][risk] for name in rung]
     opus = ladder.index("claude-opus-5-5")
-    assert ladder[opus:opus + 2] == ["claude-opus-5-5", "claude-opus-5-5-agy"]
+    expected_opus_slice = (
+        ["claude-opus-5-5", "gemini-4-neon-high", "claude-opus-5-5-agy"]
+        if risk == "high"
+        else ["claude-opus-5-5", "claude-opus-5-5-agy"]
+    )
+    assert ladder[opus:opus + len(expected_opus_slice)] == expected_opus_slice
     for name in GROK_SEATS:
         assert name not in ladder
         assert catalog["review_candidates"][name]["transport"] == "cursor"

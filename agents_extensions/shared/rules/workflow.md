@@ -650,7 +650,7 @@ Strong success criteria enable independent looping. Weak criteria ("make it work
 
 **Adversarial code review command** (steps 2 & 6). Use a current cross-family
 review lane per `model-assignment.md` Code review row and document findings on the GH issue.
-Gemini/AGY joins at low, medium and high risk (high after the OpenAI and Anthropic seats, GEMINI-TIERS-1119); critical and security paths remain excluded (#10073). Two residuals are accepted there:
+Gemini/AGY joins code and infra review at every risk tier, including critical and security paths, with Neon as a peer of Sol 6.2 and Opus 5.5 (NEON-SOLTIER-1120). Two residuals are accepted there:
 `--review-profile ukrainian` without `--pr` or `--branch` is a self-assertion
 with no path check, and `delegate --agent agy` with no review-typing flag
 is not gated.

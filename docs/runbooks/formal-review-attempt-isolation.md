@@ -373,9 +373,9 @@ PR, reviewed by `gpt-6.1-sol`.
 At high and critical risk the automatic bench (`lu_machinery.review.bench_health`,
 #9394) accepts a single automatic cross-family reviewer for Anthropic-authored
 code (`openai_frontier`) and OpenAI-authored code (`claude-opus-5-5`) under
-#9423 AC-02. High is limited to Sol, Opus and Gemini 4 Neon High by #9538 and
-GEMINI-TIERS-1119, so a high-risk code bench for those authors also counts
-`gemini-4-neon-high` (Neon holds no infra profile); critical is limited by the
+#9423 AC-02. High and critical admit Sol, Opus and Gemini 4 Neon High for both
+code and infra (#9538, NEON-SOLTIER-1120), so non-Google benches count
+`gemini-4-neon-high` alongside Sol and Opus; critical is limited by the
 catalog's `critical_review` role (#9583). OpenAI's single Opus seat also depends on
 Cursor-routed Claude staying unpinned (#9488). These rows display
 `[EXPECTED single seat]` and satisfy the bench minimum. Zero seats or any other

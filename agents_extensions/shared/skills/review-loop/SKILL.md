@@ -80,8 +80,8 @@ interpreter does not select the primary checkout's Python modules.
    govern them; `code` for any other code change. A change that spans both is `infra`.
    A change to learner-facing Ukrainian is `ukrainian`: seat it from
    [ukrainian](references/ukrainian.md), not the resolver.
-   `infra` walks a different ladder and excludes code-only seats (Gemini Flash is
-   `review_profiles: [code]` in `lu_machinery/config/model_catalog.yaml`), so the same value goes to
+   `infra` walks its own profile suitability order in `lu_machinery/config/model_catalog.yaml`
+   (including native AGY Gemini 4 Neon High, which holds `review_profiles: [code, infra]`), so the same value goes to
    the resolver (`--review-profile` and `--domain`) and to the dispatch below.
 
    ```bash

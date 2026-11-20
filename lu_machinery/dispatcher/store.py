@@ -340,8 +340,29 @@ def create(record: dict, prompt: bytes) -> Path:
     return path
 
 
+_MAX_REFUSAL_ERROR_CHARS = 500
+
+
+def _format_refusal_error(reason: StartRefusal, detail: str | None) -> str:
+    """Keep the typed refusal code and a bounded single-line detail message."""
+    reason_text = str(reason)
+    cleaned = " ".join("".join(ch if ch.isprintable() else " " for ch in (detail or "")).split())
+    if not cleaned or cleaned == reason_text:
+        return reason_text
+    message = cleaned if cleaned.startswith(f"{reason_text}:") else f"{reason_text}: {cleaned}"
+    if len(message) > _MAX_REFUSAL_ERROR_CHARS:
+        return f"{message[:_MAX_REFUSAL_ERROR_CHARS - 3]}..."
+    return message
+
+
 def record_admission_refusal(
-    requested_task_id: str | None, agent: str, metadata: dict, reason: StartRefusal, *, hold: dict | None = None,
+    requested_task_id: str | None,
+    agent: str,
+    metadata: dict,
+    reason: StartRefusal,
+    *,
+    hold: dict | None = None,
+    detail: str | None = None,
 ) -> None:
     """Record the refusal without consuming the requested id or losing an attributed worktree."""
     when = now()
@@ -352,7 +373,8 @@ def record_admission_refusal(
     record.update(
         schema_version=2, task_id=refusal_id, requested_task_id=requested_task_id,
         agent=agent, run_nonce=uuid.uuid4().hex, status="failed", never_started_reason=reason,
-        started_at=when, finished_at=when, duration_s=0, pid=None, provider_pgid=None, usage=None, error=reason,
+        started_at=when, finished_at=when, duration_s=0, pid=None, provider_pgid=None, usage=None,
+        error=_format_refusal_error(reason, detail),
         review_profile=metadata.get("review_profile"), review_risk=metadata.get("risk"),
         review_author_model=metadata.get("review_author_model"),
     )
