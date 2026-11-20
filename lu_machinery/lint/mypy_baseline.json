@@ -1,6 +1,6 @@
 {
   "schema": "mypy-ratchet-baseline.v1",
-  "mypy": "2.1.0",
+  "mypy": "2.4.0",
   "entries": [
     {
       "path": "lu_machinery/agent_runtime/accounting.py",
@@ -1216,11 +1216,6 @@
       "path": "lu_machinery/api/resilience.py",
       "code": "override",
       "message": "Signature of \"cursor\" incompatible with supertype \"sqlite3.Connection\""
-    },
-    {
-      "path": "lu_machinery/api/runtime_router.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"get\" of \"dict\" has incompatible type \"Any | None\"; expected \"str\""
     },
     {
       "path": "lu_machinery/api/runtime_router.py",
@@ -3584,11 +3579,6 @@
     },
     {
       "path": "lu_machinery/dispatcher/store.py",
-      "code": "literal-required",
-      "message": "TypedDict key must be a string literal; expected one of (\"attempt_id\", \"manifest_sha256\", \"review_id\")"
-    },
-    {
-      "path": "lu_machinery/dispatcher/store.py",
       "code": "truthy-function",
       "message": "Function \"locate_task_record\" could always be true in boolean context"
     },
@@ -3646,11 +3636,6 @@
       "path": "lu_machinery/dispatcher/worker.py",
       "code": "arg-type",
       "message": "Argument 1 to \"_spawn_expired\" has incompatible type \"None | dict[Any, Any]\"; expected \"dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/dispatcher/worker.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"claude_account_auth_receipt\" has incompatible type \"None | str\"; expected \"str\""
     },
     {
       "path": "lu_machinery/dispatcher/worker.py",
