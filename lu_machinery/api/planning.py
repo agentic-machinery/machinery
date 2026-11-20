@@ -257,8 +257,12 @@ def _relative_scope_rejected(token: str, repositories: Collection[str], *, prefi
     if token.startswith("./"):
         return False
     root, separator, _ = token.partition("/")
+    bare = token.removesuffix("/**").removesuffix("/")
+    # A qualified remainder names a repository only when the original text matches the
+    # ASCII slug grammar. Folding case first would hide a path a worker still holds.
+    names_repository = bare.lower() in repositories and (not prefixed or _SLUG.fullmatch(bare) is not None)
     return bool(
-        token.lower().removesuffix("/**").removesuffix("/") in repositories
+        names_repository
         or (not prefixed and separator and "." in root.lstrip("."))
         or (not token.endswith(("/", "/**")) and not _FILE_SUFFIX.search(token))
     )

@@ -175,10 +175,12 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
     The planning view then missed a live worker in the named repository and marked the issue ready.
     """
     product, machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
+    work, tools = "oak/work", "oak/tools.dev"
     lookalike = "sample/ma\u212ainery/src/owned/file.py"
+    folded = "oa\u212a/tools.dev"
     snap = planning.IssueSnapshot(
-        frozenset({product, machinery, private}),
-        {"product": product, "machinery": machinery, "private": private},
+        frozenset({product, machinery, private, work, tools}),
+        {"product": product, "machinery": machinery, "private": private, "work": work, "tools": tools},
         {
             (product, 1): planning.Issue("prefixed", f"## In scope\n{machinery}/src/owned/worker.py\n"),
             (product, 2): planning.Issue("plain", "## In scope\nsrc/owned/worker.py\n"),
@@ -196,14 +198,19 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
             (product, 11): planning.Issue("dotted directory", f"## In scope\n{machinery}/release.v2/file.py\n"),
             (product, 12): planning.Issue("dotted subtree", f"## In scope\n{machinery}/release.v2/docs/**\n"),
             (product, 13): planning.Issue("repeated slash", f"## In scope\n{machinery}//src/owned/worker.py\n"),
+            (product, 14): planning.Issue("folded remainder", f"## In scope\n{work}/{folded}\n"),
+            (product, 15): planning.Issue("folded subtree", f"## In scope\n{work}/{folded}/**\n"),
+            (product, 16): planning.Issue("ascii remainder", f"## In scope\n{work}/{tools}\n"),
+            (product, 17): planning.Issue("bare slug", f"## In scope\n{tools}\n"),
         },
-        {}, frozenset(), 3,
+        {}, frozenset(), 5,
     )
     workers = {
         machinery: (planning.expand_claim("src/owned") + planning.expand_claim("файл.py")
                     + planning.expand_claim("release.v2/file.py") + planning.expand_claim("release.v2")),
         private: planning.expand_claim("docs"),
         product: planning.expand_claim(lookalike),
+        work: planning.expand_claim(folded),
     }
     ready = {row["ref"]: row["path_status"] for row in planning.project_issues(snap, workers, stale=False)["ready"]}
     assert ready == {
@@ -220,6 +227,10 @@ def test_planning_reads_a_registered_repository_prefix_as_that_repository():
         f"{product}#11": "path_conflicts",
         f"{product}#12": "path_conflicts",
         f"{product}#13": "scope_unknown",
+        f"{product}#14": "path_conflicts",
+        f"{product}#15": "path_conflicts",
+        f"{product}#16": "scope_unknown",
+        f"{product}#17": "scope_unknown",
     }
     withheld = planning.project_issues(snap, {machinery: None, private: [], product: []}, stale=False)
     assert {"ref": f"{product}#1", "path_status": "worker_scope_unknown"} in withheld["ready"]
