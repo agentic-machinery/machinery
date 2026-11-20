@@ -387,7 +387,7 @@ def test_pre_start_checks_do_not_reserve_a_worker(tmp_path, monkeypatch, gate, c
     monkeypatch.setattr(codex_accounts, "codex_account_env", lambda _label, env: dict(env))
     monkeypatch.setattr(headroom, "check_plan", lambda *_a, **_kw: None)
 
-    def check_credit(agent, model, *, codex_account):
+    def check_credit(agent, model, codex_account):
         assert (agent, model, codex_account) == ("codex", CURRENT_SOL, "b-sub")
 
     monkeypatch.setattr(host_admission, "check_credit", check_credit)

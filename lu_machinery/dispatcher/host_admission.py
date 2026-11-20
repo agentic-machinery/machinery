@@ -134,7 +134,7 @@ def credit_period_refusal(agent, model, *, codex_account=None):
     return credit_lane.dispatch_refusal(agent, model, codex_account=codex_account)
 
 
-def check_credit(agent, model, *, codex_account):
+def check_credit(agent, model, codex_account=None):
     if refusal := credit_period_refusal(agent, model, codex_account=codex_account):
         raise Refused(f"❌ dispatch refused: {refusal}", 2)
 
