@@ -471,7 +471,7 @@ def _launch_server(*, provider: str, model: str, binary: Path, extra_env: dict[s
             node,
             str(_SERVER),
             "--sdk-url",
-            (validate_node_dependencies() / "node_modules/@agentclientprotocol/sdk/dist/acp.js").as_uri(),
+            (validate_node_dependencies() / "node_modules/@agentclientprotocol/sdk/dist/v1/stable/acp.js").as_uri(),
             "--provider",
             provider,
             "--model",

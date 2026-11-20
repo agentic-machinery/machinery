@@ -22,7 +22,7 @@ import { Readable, Writable } from 'node:stream';
 
 // The Python admission boundary validates the entire locked prefix before spawn.
 const sdkUrl = new URL(parseArgs(process.argv.slice(2))['sdk-url']);
-if (sdkUrl.protocol !== 'file:' || !fileURLToPath(sdkUrl).endsWith('/node_modules/@agentclientprotocol/sdk/dist/acp.js')) {
+if (sdkUrl.protocol !== 'file:' || !fileURLToPath(sdkUrl).endsWith('/node_modules/@agentclientprotocol/sdk/dist/v1/stable/acp.js')) {
   throw new Error('an absolute machinery SDK module URL is required');
 }
 const acp = await import(sdkUrl.href);

@@ -236,7 +236,7 @@ _CLAUDE_ACP_MAX_VERSION = (1, 0, 0)
 _CLAUDE_ACP_MANIFEST_LIMIT_BYTES = 64 * 1024
 _STRICT_SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _TEXT_AGENT_PATH = machinery_path("agent_runtime/acp_text_agent.mjs")
-_TEXT_AGENT_SHA256 = "f2d37082f30f7d53e1064c54e4469378ad731703b8915408d311947ed98b1b01"
+_TEXT_AGENT_SHA256 = "df357d04e33a15efce1c436ac6a9655586073c48f77677109f34bb249d797116"
 _OPENCODE_DENY_ALL_CONFIG = json.dumps(
     {"permission": {"*": "deny"}, "tools": {"*": False}},
     separators=(",", ":"),
@@ -3172,12 +3172,13 @@ def _build_text_agent_command(
     node_path = Path(node_binary).resolve()
     if not node_path.is_file():
         raise AcpxShadowRefusalError(f"{adapter_label}: resolved node path {node_path} is not a file")
+    sdk_entrypoint = validate_node_dependencies() / "node_modules/@agentclientprotocol/sdk/dist/v1/stable/acp.js"
     command = shlex.join(
         [
             str(node_path),
             _require_text_agent(adapter_label=adapter_label),
             "--sdk-url",
-            (validate_node_dependencies() / "node_modules" / "@agentclientprotocol" / "sdk" / "dist" / "acp.js").as_uri(),
+            sdk_entrypoint.as_uri(),
             "--provider",
             provider,
             "--model",

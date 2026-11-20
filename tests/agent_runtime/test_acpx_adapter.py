@@ -2528,6 +2528,8 @@ def test_new_fleet_discussion_seats_use_fixed_confined_commands(
         ] == plan.env_overrides["OPENCODE_CONFIG_CONTENT"]
     else:
         assert "--model" not in plan.cmd
+        expected_sdk = tmp_path / "release/node_modules/@agentclientprotocol/sdk/dist/v1/stable/acp.js"
+        assert command_tokens[command_tokens.index("--sdk-url") + 1] == expected_sdk.as_uri()
         _assert_acpx_env_overrides(plan.env_overrides, expected={})
 
 
