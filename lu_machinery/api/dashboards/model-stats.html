@@ -507,8 +507,8 @@ function pareto(data) {
     const shown = allTimed.filter((m) => keepModel(m.model));
     if (!shown.length) {
       return !hasHoursExact && jobModels.length
-        ? `<p class="muted">Not enough data in ${esc(cls)} from this cached snapshot: no model has a non-zero rounded hours-per-merge value (cached snapshots round short durations to 0 and omit unrounded hours).</p>`
-        : `<p class="muted">Not enough data in ${esc(cls)}: no model has both timed wall hours and a landed task in this selection.</p>`;
+        ? `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has a positive rounded hours-per-merge value in this cached snapshot (cached snapshots round short durations to 0 and omit unrounded hours).</p>`
+        : `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has both timed wall hours and a landed task.</p>`;
     }
     const frontier = shown.filter((m) => m.frontier);
     const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
@@ -546,8 +546,8 @@ function pareto(data) {
     const shown = allSpeed.filter((p) => keepModel(p.model));
     if (!shown.length) {
       return legacySpeed
-        ? '<p class="muted">No model in this cached snapshot\'s cost chart has both timed write durations and a reviewed PR (models without hours per merge may be omitted).</p>'
-        : '<p class="muted">No model has both timed write durations and a reviewed PR in this window.</p>';
+        ? '<p class="muted">No model in the current selection has both timed write durations and a reviewed PR in this cached snapshot\'s cost chart (models without hours per merge may be omitted).</p>'
+        : '<p class="muted">No model in the current selection has both timed write durations and a reviewed PR in this window.</p>';
     }
     const frontier = shown.filter((p) => p.frontier);
     const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
@@ -575,7 +575,7 @@ function pareto(data) {
   }
   const points = charts.pareto || [];
   const shown = points.filter((p) => keepModel(p.model));
-  if (!shown.length) return '<p class="muted">No model has both timed wall hours and a reviewed PR in this window.</p>';
+  if (!shown.length) return '<p class="muted">No model in the current selection has both timed wall hours and a reviewed PR in this window.</p>';
   const frontier = shown.filter((p) => p.frontier);
   const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
   const shownHasEligible = shown.some((p) => !p.low_sample);
@@ -1064,7 +1064,7 @@ function formatPace(pace, responseStale = false) {
     return {text: at ? `runs out ${at}` : "runs out before reset", tone: "warn"};
   }
   if (pace.pace_reason === "weekly_used_up") {
-    return {text: at ? `ran out ${at}` : "weekly used up", tone: "warn"};
+    return {text: "weekly used up", tone: "warn"};
   }
   if (pace.pace_reason === "lasts_to_reset") return {text: "lasts to reset", tone: "good"};
   if (pace.pace_reason === "on_pace") return {text: "on pace", tone: "good"};
