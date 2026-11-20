@@ -461,14 +461,17 @@ def _completion_prose(response: str) -> list[str]:
     return prose
 
 
-def declares_incomplete_review(response: str) -> bool:
+def declares_incomplete_review(response: str, *, findings_payload: dict[str, Any] | None = None) -> bool:
     """Whether own prose or a findings explanation declares the review unfinished.
 
     Quoted blocks, code and inline examples are not reviewer declarations.
     No new completion field is required of existing complete replies.
     """
-    prose = _completion_prose(response)
-    for payload in _top_level_json_values(response):
+    # A caller that already parsed a bare or fenced receipt can supply the
+    # findings directly. An envelope still has its own prose outside the fence.
+    prose = _completion_prose(response) if findings_payload is None or response.startswith("VERDICT:") else []
+    values = _top_level_json_values(response) if findings_payload is None else (findings_payload,)
+    for payload in values:
         if isinstance(payload, dict) and _FINDINGS_ENVELOPE_KEYS & payload.keys():
             overall = payload.get("overall")
             if isinstance(overall, dict) and isinstance(overall.get("explanation"), str):
@@ -631,6 +634,12 @@ def _not_json_constant(token: str) -> Any:
     raise ValueError(f"non-JSON constant {token}")
 
 
+def load_findings_json(text: str) -> Any:
+    """Decode one review JSON value while rejecting duplicate keys and non-JSON constants."""
+    return json_depth.loads(text, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=_unique_object,
+                            parse_constant=_not_json_constant)
+
+
 def structured_finding_entries(reply: str, finding_id: str) -> list[tuple[str, str]] | None:
     """Each finding with ``finding_id`` in a schema-bound reply: its typed priority, and its title and body.
 
@@ -643,12 +652,7 @@ def structured_finding_entries(reply: str, finding_id: str) -> list[tuple[str, s
     from lu_machinery.review.review_contract import ContractError, _whole_reply_fence
 
     try:
-        payload = json_depth.loads(
-            _whole_reply_fence(reply.strip()),
-            max_depth=_JSON_MAX_DEPTH,
-            object_pairs_hook=_unique_object,
-            parse_constant=_not_json_constant,
-        )
+        payload = load_findings_json(_whole_reply_fence(reply))
         if not isinstance(payload, dict):
             return None
         _, evidence = checked_findings_payload(payload)

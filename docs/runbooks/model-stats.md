@@ -150,8 +150,11 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   Tokens per landed task are computed from total tokens over `landed`. Fresh input includes cache writes; output
   includes reasoning tokens (Codex `output_tokens` already include them; the reasoning or thinking counts of Cursor,
   AGY and OpenCode are added).
-- **Review figures** use structured findings and recorded verdicts from every reviewer. The unparsed count
-  includes every settled review task without a readable verdict, split by `unparsed_reasons`: `missing_result`
+- **Review figures** use structured findings, recorded verdicts and supported historical Markdown verdicts.
+  Task and status totals include all read-only work. A task with neither review metadata nor a readable verdict
+  contributes to Evidence absent, exposed by reason in `review_evidence_absent`. Backfill refreshes existing rows
+  while their records are retained. The unparsed count includes identified review tasks without a readable verdict,
+  split by `unparsed_reasons`: `missing_result`
   (no result file bound to the record: absent, not a regular file, unreadable, or not matching the record's
   `result_sha256`), `too_big` (over 4 MB, not read whole), `bad_format` (not UTF-8 or no review JSON),
   `bad_fields` (review JSON that breaks the review contract), `not_done` (the task did not finish `done`) and
