@@ -161,7 +161,8 @@ def test_installed_product_root_targets_configured_checkout(
 def test_linux_fs_parity_ignores_product_root_pins(
     installed: Path, probe: Probe, layout: str,
 ) -> None:
-    product_pins = probe.root / ".github/workflows/pins.txt"
+    pins_path = Path(".github/workflows/pins.txt")
+    product_pins = probe.root / pins_path
     product_pins.parent.mkdir(parents=True)
     product_pins.write_text(f"UV_VERSION=0.0.1\nUV_LINUX_X86_64_SHA256={'a' * 64}\n")
     bindir = probe.root.parent / "bin"
@@ -175,12 +176,22 @@ exec bash --noprofile --norc -c "$@"
 ''')
     # Stop at the archive download and capture the exact pins passed to it.
     executable(bindir / "python", '#!/bin/bash\nprintf "%s\\n" "$2" "$3"\nexit 42\n')
+    canonical_pins = (REPO / pins_path).read_text()
     machinery_pins = dict(
-        line.split("=", 1) for line in (REPO / ".github/workflows/pins.txt").read_text().splitlines()
+        line.split("=", 1) for line in canonical_pins.splitlines()
         if line.startswith(("UV_VERSION=", "UV_LINUX_X86_64_SHA256="))
     )
 
-    package = REPO / "lu_machinery" if layout == "checkout" else installed
+    package = installed
+    if layout == "checkout":
+        # Merge-group CI removes the source package before running wheel tests.
+        checkout = probe.root.parent / "machinery checkout"
+        package = checkout / "lu_machinery"
+        for member in ("ci/linux_fs_parity.sh", "lib/project_interpreter.sh"):
+            executable(package / member, (installed / member).read_text())
+        checkout_pins = checkout / pins_path
+        checkout_pins.parent.mkdir(parents=True)
+        checkout_pins.write_text(canonical_pins)
     result = probe.run(package, "ci/linux_fs_parity.sh")
 
     assert result.returncode == 42, result.stdout + result.stderr
