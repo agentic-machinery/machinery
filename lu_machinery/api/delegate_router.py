@@ -490,8 +490,11 @@ def _linked_issues_from_dor(task: dict[str, Any]) -> list[dict[str, Any]] | None
         for entry in raw_foreign:
             if not isinstance(entry, dict):
                 continue
+            raw_issue = entry.get("issue")
+            if raw_issue is None:
+                continue
             try:
-                number = int(entry.get("issue"))
+                number = int(raw_issue)
             except (TypeError, ValueError):
                 continue
             repo = entry.get("repo") if isinstance(entry.get("repo"), str) else entry.get("repository")

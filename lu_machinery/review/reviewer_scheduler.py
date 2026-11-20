@@ -157,8 +157,8 @@ def metrics_for(candidate: Any, snapshot: Mapping[str, object] | None) -> Routin
     failures = scheduler.get("failures", runtime.get("error", record.get("failures")))
     circuit_open = bool(scheduler.get("circuit_open", record.get("circuit_open", runtime.get("circuit_open", False))))
     return RoutingMetrics(
-        completed_input_bytes=(int(_number(completed)) if _number(completed) is not None else None),
-        active_reserved_input_bytes=(int(_number(reserved)) if _number(reserved) is not None else None),
+        completed_input_bytes=_optional_integer(completed),
+        active_reserved_input_bytes=_optional_integer(reserved),
         quota_remaining_pct=_quota_remaining(record, scheduler),
         quota_fresh=_quota_fresh(record, scheduler, diagnostics),
         inflight=_optional_integer(scheduler.get("inflight", inflight_value)),

@@ -58,6 +58,8 @@ def parse_junit(paths: list[Path]) -> list[TestResult]:
             message = ((detail.get("message", "") or detail.text or "") if detail is not None else "").strip()
             properties = {prop.get("name"): prop.get("value") for prop in case.findall("./properties/property")}
             rerun_raw = properties.get("flake.reruns", "0")
+            if rerun_raw is None:
+                raise ValueError(f"{path}: invalid flake.reruns property")
             try:
                 reruns = int(rerun_raw)
             except ValueError as exc:
