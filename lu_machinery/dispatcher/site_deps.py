@@ -46,13 +46,14 @@ INSTALL_TIMEOUT = 900
 KEEP_TREES = 3
 # The install runs in a controlled environment, so ambient variables an install script might read
 # (a custom esbuild binary path, a locale, a compiler override) cannot change its bytes behind the key.
-# Everything the install sees is in the key; nothing is passed on unkeyed.
+# The key covers the inputs; the empty scratch HOME is equivalent across runs.
 SYSTEM_PATH = ("/usr/local/bin", "/usr/bin", "/bin")
 PASSED_ENV = frozenset({
-    "HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "NODE_OPTIONS",
 })
 NPM_CONFIG_PREFIX = "npm_config_"
+NPM_HOME_SETTINGS = frozenset({"npm_config_cache", "npm_config_userconfig", "npm_config_globalconfig"})
 # Native modules build with these when no prebuilt binary exists, so their identity is part of the key.
 BUILD_TOOLS = ("python3", "make", "cc", "c++")
 # Shim directories of any checkout, under the machinery package named by this file's location.
@@ -123,10 +124,11 @@ def _tool_dirs() -> list[str]:
 
 
 def _install_env() -> dict[str, str]:
-    """The only environment node and npm see; the install key covers every value in it."""
+    """Build the allowlisted environment before assigning a scratch home."""
     env = {"PATH": os.pathsep.join(dict.fromkeys([*_tool_dirs(), *SYSTEM_PATH])), "LANG": "C.UTF-8"}
     env.update({name: os.environ[name] for name in sorted(os.environ)
-                if name in PASSED_ENV or name.lower().startswith(NPM_CONFIG_PREFIX)})
+                if name in PASSED_ENV or (
+                    name.lower().startswith(NPM_CONFIG_PREFIX) and name.lower() not in NPM_HOME_SETTINGS)})
     return env
 
 
@@ -148,12 +150,12 @@ def _run(argv, cwd, **kwargs) -> subprocess.CompletedProcess:
                           env=kwargs.pop("env", None) or _install_env(), **kwargs)
 
 
-def _runtime(site: Path) -> dict:
+def _runtime(site: Path, env: dict[str, str]) -> dict:
     probe = ("const r=process.report.getReport().header;console.log(JSON.stringify({node:process.version,"
              "abi:process.versions.modules,platform:process.platform,arch:process.arch,"
              "libc:r.glibcVersionRuntime?'glibc-'+r.glibcVersionRuntime:'other'}))")
-    runtime = _json_loads(_run(["node", "-e", probe], site).stdout, max_depth=512)
-    runtime["npm"] = _run(["npm", "--version"], site).stdout.strip()
+    runtime = _json_loads(_run(["node", "-e", probe], site, env=env).stdout, max_depth=512)
+    runtime["npm"] = _run(["npm", "--version"], site, env=env).stdout.strip()
     return runtime
 
 
@@ -161,15 +163,17 @@ def _digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def install_key(site: Path) -> tuple[str, dict]:
+def install_key(site: Path, env: dict[str, str]) -> tuple[str, dict]:
     """The key and the human-readable facts it covers; any change to them is a different install."""
-    env = _install_env()
+    # Hash effective config without making each random scratch directory a different cache key.
+    config = _json_loads(_run(["npm", "config", "ls", "-l", "--json"], site, env=env).stdout, max_depth=512)
+    normalized_config = json.dumps(config, sort_keys=True).replace(json.dumps(env["HOME"])[1:-1], "$HOME")
     facts = {
         "layout": LAYOUT,
-        "runtime": _runtime(site),
-        # Digests only: user npm configuration can hold registry credentials, and facts are stored.
-        "npm_config": _digest(_json_loads(_run(["npm", "config", "ls", "-l", "--json"], site).stdout, max_depth=512)),
-        "env": {name: _digest(value) for name, value in env.items()},
+        "runtime": _runtime(site, env),
+        # Digests only: npm configuration can hold registry credentials, and facts are stored.
+        "npm_config": hashlib.sha256(normalized_config.encode()).hexdigest(),
+        "env": {name: _digest(value) for name, value in env.items() if name not in {"HOME", "npm_config_globalconfig"}},
         "toolchain": _toolchain(env),
         "inputs": {name: _sha256(site / name) for name in INSTALL_INPUTS if (site / name).is_file()},
         "local": _local_inputs(site),
@@ -256,7 +260,7 @@ def _write_manifest(store: Path, key: str, facts: dict, tree: dict) -> None:
     os.replace(temporary, target)
 
 
-def populate(repo: Path, site: Path, key: str, facts: dict) -> None:
+def populate(repo: Path, site: Path, key: str, facts: dict, env: dict[str, str]) -> None:
     """Install once in a staging directory (never in a worktree) and move the result into the store."""
     store = store_root(repo)
     staging = store / "staging" / f"{key[:12]}-{os.getpid()}"
@@ -275,7 +279,7 @@ def populate(repo: Path, site: Path, key: str, facts: dict) -> None:
                 (staging / target).parent.mkdir(parents=True, exist_ok=True)
                 source = site / target
                 shutil.copytree(source, staging / target) if source.is_dir() else shutil.copy2(source, staging / target)
-        _run(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"], staging, timeout=INSTALL_TIMEOUT)
+        _run(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"], staging, env=env, timeout=INSTALL_TIMEOUT)
         tree = _ingest(store, staging / "node_modules")
         _write_manifest(store, key, facts, tree)
     finally:
@@ -351,9 +355,10 @@ def ensure(repo: Path, worktree: Path) -> dict:
     if (site / "node_modules").exists() or (site / "node_modules").is_symlink():
         return {"state": "present"}
     store = store_root(repo)
-    key, facts = install_key(site)
-    manifest = store / "trees" / f"{key}.json"
-    with _locked(store / "prune.lock", fcntl.LOCK_SH):
+    with tempfile.TemporaryDirectory(prefix="site-deps-home-") as home, _locked(store / "prune.lock", fcntl.LOCK_SH):
+        env = {**_install_env(), "HOME": home, "npm_config_globalconfig": str(Path(home) / "etc/npmrc")}
+        key, facts = install_key(site, env)
+        manifest = store / "trees" / f"{key}.json"
         if _altered(store, manifest) is not None:
             with _locked(store / "locks" / f"{key}.lock", fcntl.LOCK_EX):
                 altered = _altered(store, manifest)
@@ -362,7 +367,7 @@ def ensure(repo: Path, worktree: Path) -> dict:
                     for blob in altered:
                         blob.unlink(missing_ok=True)
                     manifest.unlink(missing_ok=True)
-                    populate(repo, site, key, facts)
+                    populate(repo, site, key, facts, env)
         result = materialize(repo, site, key)
     prune(repo, keep=KEEP_TREES, blocking=False)
     return {**result, "key": key}

@@ -109,6 +109,16 @@ environment. The opt-in permission test gets MCP from the `test`
 dependency group. The release build tools use hash-pinned installs. The
 product consumer check uses the job's checksum-verified `UV_VERSION`.
 
+uv gives third-party distributions a seven-day cooldown. For an urgent CVE
+fix inside that window, add a dated entry for the affected package to
+`[tool.uv].exclude-newer-package`. Choose a UTC cutoff just after the upload
+of the last distribution needed for the fix. Record the CVE and removal date
+in a comment, and regenerate the lock with `uv lock --upgrade-package NAME`.
+Remove the entry and regenerate the lock once the last required distribution
+is seven days old. The first-party `lu-machinery = false` entry lets the
+release cut adopt a newly published machinery wheel in the product.
+See [uv's package cutoff settings](https://docs.astral.sh/uv/reference/settings/#exclude-newer-package).
+
 The release wheelhouse includes core and the `api`, `postgres`, and
 `pytest` extras. This export excludes the project, development groups, and
 the `test` extra:
@@ -123,6 +133,9 @@ per-extra environments. It checks those imports on the pinned Python. Core
 still includes FastAPI, Prometheus and their
 dependency floors because routing and verification commands call into the API
 package. The wheel job calls those entry points in the core environment.
+
+The cut runs pip and uv with a scratch home. The post-release version bump
+refreshes `uv.lock` against the registry from that same environment.
 
 ## Cut a release
 

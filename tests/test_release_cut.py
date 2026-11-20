@@ -331,7 +331,7 @@ def test_release_shallow_clone_cannot_truncate_callers_linked_worktree_history(t
 
 
 def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypatch):
-    """Defect classes: missing commit attribution and a version bump with a stale lock."""
+    """Defect classes: missing attribution, stale locks and credentials in uv subprocesses."""
     machinery_seed = tmp_path / "machinery-seed"
     _init_repo(machinery_seed)
     (machinery_seed / "CHANGELOG.md").write_text(
@@ -366,7 +366,9 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     uv.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
-        '[ "$*" = "lock --offline --no-python-downloads" ]\n'
+        '[ "$HOME" = "${PWD%/*}/home" ]\n'
+        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_EXCLUDE_NEWER+x}" ]\n'
+        '[ "$*" = "lock --no-python-downloads" ]\n'
         "grep -Fqx 'version = \"0.1.23\"' pyproject.toml\n"
         "sed 's/^version = \"0.1.22\"$/version = \"0.1.23\"/' uv.lock > next.lock\n"
         "mv next.lock uv.lock\n",
@@ -374,6 +376,9 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     )
     uv.chmod(0o700)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("GH_TOKEN", "fixture-gh")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-provider")
+    monkeypatch.setenv("UV_EXCLUDE_NEWER", "2000-01-01")
     cut = Cut(
         work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
         product_remote=str(tmp_path / "product.git"), machinery_repo="learn-ukrainian/machinery",
@@ -386,6 +391,8 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
 
     def run(argv, **kwargs):
         if "push" in [str(part) for part in argv]:
+            assert kwargs.get("env") is None
+            assert cut.env()["GH_TOKEN"] == "fixture-gh"
             return subprocess.CompletedProcess([], 0, "", "")
         return original_run(argv, **kwargs)
 
@@ -416,6 +423,8 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     old_manifest = ('[project]\nname = "product"\nversion = "1.0.0"\n'
                     'dependencies = ["lu-machinery[api]==0.1.22"]\n'
                     '[dependency-groups]\nmachinery = ["lu-machinery"]\n'
+                    '[tool.uv]\nexclude-newer = "7 days"\n'
+                    'exclude-newer-package = { another-package = "2026-11-20T12:00:00Z" }\n'
                     f'[tool.uv.sources]\nlu-machinery = {{ url = "{old_url}" }}\n')
     manifest.write_text(old_manifest, encoding="utf-8")
     (product / "uv.lock").write_text("version = 1\n", encoding="utf-8")
@@ -429,9 +438,14 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
 
     def run_uv_adoption(argv, **kwargs):
         if argv[0] == str(uv):
-            assert argv[1:] == ["lock", "--upgrade-package", "lu-machinery", "--no-python-downloads"]
+            assert argv[1:] == ["lock", "--upgrade-package", "lu-machinery", "--exclude-newer-package",
+                                "lu-machinery=false", "--no-python-downloads"]
             assert kwargs["cwd"] == product
-            assert manifest.read_text(encoding="utf-8") == old_manifest.replace("0.1.22", "0.1.23")
+            assert kwargs["env"]["HOME"] == str(work / "home")
+            assert {"GH_TOKEN", "ANTHROPIC_API_KEY", "UV_EXCLUDE_NEWER"}.isdisjoint(kwargs["env"])
+            expected = old_manifest.replace("0.1.22", "0.1.23").replace(
+                "{ another-package", "{ lu-machinery = false, another-package")
+            assert manifest.read_text(encoding="utf-8") == expected
             (product / "uv.lock").write_text(
                 'version = 1\n[[package]]\nname = "lu-machinery"\nversion = "0.1.23"\n'
                 f'source = {{ url = "{new_url}" }}\nwheels = [{{ url = "{new_url}", hash = "sha256:{digest}" }}]\n',
@@ -670,18 +684,35 @@ _PREPARE_PREFIX = (
 
 
 def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeypatch, tmp_path, group_writable_umask):
-    """Defect class: under a 0002 umask the cut's Node prefix is group-writable and Node admission refuses it."""
+    """Defect classes: writable Node prefixes and ambient credentials reaching the clean install."""
     interpreter = tmp_path / "bin/python"
     interpreter.parent.mkdir()
     # `-I -m venv <path>`: venv copies activate scripts with their source mode, which the umask does not mask.
-    interpreter.write_text('#!/bin/sh\nmkdir -p "$4/bin" && : > "$4/bin/activate" && chmod 664 "$4/bin/activate"\n',
-                           encoding="utf-8")
+    interpreter.write_text(
+        '#!/bin/sh\nset -eu\n'
+        '[ "$HOME" = "$PWD/home" ]\n'
+        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${XDG_CONFIG_HOME+x}" ]\n'
+        'case "$2" in\n'
+        '  -m) case "$3" in\n'
+        '    venv) mkdir -p "$4/bin"; : > "$4/bin/activate"; chmod 664 "$4/bin/activate"; cp "$0" "$4/bin/python";;\n'
+        '    pip) printf "%s\\n" "$4" >> install-commands;;\n'
+        '    *) exit 1;;\n'
+        '  esac;;\n'
+        '  -c) printf "0.1.22 %s/accept/lu_machinery/__init__.py\\n" "$PWD";;\n'
+        '  *) exit 1;;\n'
+        'esac\n',
+        encoding="utf-8",
+    )
     interpreter.chmod(0o755)
     _host(monkeypatch, tmp_path, interpreter)
+    monkeypatch.setenv("GH_TOKEN", "fixture-gh")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-provider")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ambient-config"))
     work = tmp_path / "work"
 
     def execute(cut):
-        cut.venv(cut.work / "accept")
+        (work / "consumer.lock").write_text("lu-machinery==0.1.22\n")
+        cut.install(work / "consumer.lock", "0.1.22")
         cut.run([sys.executable, "-I", "-c", _PREPARE_PREFIX, cut.work])
         return 0
 
@@ -694,6 +725,7 @@ def test_paths_the_cut_creates_are_admitted_under_a_group_writable_umask(monkeyp
     writable = {str(path.relative_to(tmp_path)): oct(path.lstat().st_mode & 0o777)
                 for path in (work, *work.rglob("*")) if path.lstat().st_mode & 0o022}
     assert (work / "accept/bin/activate").is_file()
+    assert (work / "install-commands").read_text().splitlines() == ["install", "check"]
     assert writable == {}
     assert os.umask(0o002) == 0o002, "main() must restore the caller's umask"
 

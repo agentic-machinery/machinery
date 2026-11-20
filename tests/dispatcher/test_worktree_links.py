@@ -122,8 +122,8 @@ def test_dependency_materialization_publishes_complete_private_tree(layout, monk
 
 
 @pytest.mark.parametrize("relative", ["node_modules", "site/node_modules"])
-def test_real_npm_ci_cannot_corrupt_primary_install(layout, tmp_path, relative):
-    """A normal install must clean only its own dependencies, even without the shim."""
+def test_real_npm_ci_cannot_corrupt_primary_install(layout, tmp_path, monkeypatch, relative):
+    """Defect classes: cleaning the primary install and exposing the worker home to npm scripts."""
     primary, worktree = layout
     shim_dirs = {("agent_runtime", "shims"), ("dispatcher", "npm_shims")}
     tool_path = os.pathsep.join(
@@ -157,6 +157,33 @@ def test_real_npm_ci_cannot_corrupt_primary_install(layout, tmp_path, relative):
     assert (target / "sentinel").read_text() == "primary dependency"
     assert sorted(path.name for path in target.iterdir()) == ["sentinel"]
     assert not local.is_symlink()
+
+    if relative == "site/node_modules":
+        shutil.rmtree(local, ignore_errors=True)
+        package["scripts"] = {"preinstall": (
+            "node -e \"const fs = require('node:fs'); fs.mkdirSync('node_modules', {recursive: true}); "
+            "fs.writeFileSync('node_modules/install-env.json', JSON.stringify([process.env.HOME, "
+            "process.env.npm_config_userconfig, process.env.npm_config_globalconfig]));\""
+        )}
+        (local.parent / "package.json").write_text(json.dumps(package))
+        ambient_home = tmp_path / "ambient-home"
+        ambient_home.mkdir()
+        monkeypatch.setenv("HOME", str(ambient_home))
+        monkeypatch.setenv("NPM_CONFIG_USERCONFIG", str(ambient_home / "user.npmrc"))
+        monkeypatch.setenv("npm_config_globalconfig", str(ambient_home / "global.npmrc"))
+        monkeypatch.setenv("npm_config_cache", str(ambient_home / "npm-cache"))
+        monkeypatch.setenv("npm_config_offline", "true")
+        installed = site_deps.ensure(primary, worktree)
+        assert installed["state"] == "installed"
+        scratch, userconfig, globalconfig = map(Path, json.loads((local / "install-env.json").read_text()))
+        assert scratch != ambient_home
+        assert userconfig == scratch / ".npmrc"
+        assert globalconfig == scratch / "etc/npmrc"
+        assert not scratch.exists()
+        assert list(ambient_home.iterdir()) == []
+        second = tmp_path / "second"
+        shutil.copytree(local.parent, second / "site", ignore=shutil.ignore_patterns("node_modules"))
+        assert site_deps.ensure(primary, second)["key"] == installed["key"]
 
 
 @pytest.fixture

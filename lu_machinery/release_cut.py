@@ -404,8 +404,34 @@ def _manifest_table(container: dict, key: str) -> dict:
     return table
 
 
+def _adopt_cooldown_exemption(text: str, uv: dict) -> str:
+    """Keep the lock's command-line exemption in the manifest used by locked installs."""
+    key = "exclude-newer-package"
+    overrides = _manifest_table(uv, key)
+    for name, value in overrides.items():
+        if canonicalize_name(name) == "lu-machinery":
+            if value is not False:
+                raise CutError("pyproject.toml must exempt lu-machinery from the uv cooldown (set it to false)")
+            return text
+    if key not in uv:
+        text = text.rstrip("\n") + "\n\n[tool.uv.exclude-newer-package]\nlu-machinery = false\n"
+    else:
+        text, inserted = re.subn(
+            r"(?m)^([ \t]*\[tool\.uv\.exclude-newer-package\][ \t]*(?:#[^\n]*)?\n)",
+            r"\g<1>lu-machinery = false\n", text, count=1,
+        )
+        if not inserted:
+            separator = ", " if overrides else " "
+            text = re.sub(
+                r"(?m)^([ \t]*exclude-newer-package[ \t]*=[ \t]*\{)[ \t]*",
+                rf"\g<1> lu-machinery = false{separator}", text, count=1,
+            )
+    uv[key] = {**overrides, "lu-machinery": False}
+    return text
+
+
 def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str]:
-    """Update one release wheel source and any matching exact version constraints."""
+    """Update the release wheel pin and keep its cooldown exemption in the lock inputs."""
     manifest = tomllib.loads(text)
     uv = _manifest_table(_manifest_table(manifest, "tool"), "uv")
     source = _manifest_table(uv, "sources").get("lu-machinery")
@@ -433,8 +459,9 @@ def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str
         for quote in ("'", '"'):
             updated = updated.replace(f"{quote}{spec}{quote}", f"{quote}{new_spec}{quote}")
     source["url"] = new_url
+    updated = _adopt_cooldown_exemption(updated, uv)
     if tomllib.loads(updated) != manifest:
-        raise CutError("could not update only the lu-machinery URL and exact constraints in pyproject.toml")
+        raise CutError("could not update only the lu-machinery pin and cooldown exemption in pyproject.toml")
     return updated, new_url
 
 
@@ -505,7 +532,7 @@ class Cut:
         return env
 
     def scratch_env(self, **extra: str) -> dict[str, str]:
-        """No checkout, PYTHONPATH or Node resolution variable reaches candidate code."""
+        """Package tools and candidate code get a scratch home and no ambient credentials."""
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.work / "home"),
                "TMPDIR": str(self.work / "tmp"), "LANG": "C.UTF-8"}
         # Network configuration only: the npm install still needs the host's proxy.
@@ -519,7 +546,7 @@ class Cut:
         venv copies its activate scripts with the source's mode (shutil.copymode), which the umask
         does not mask, and some Python installs ship them 0664.
         """
-        self.run([self.host_python, "-I", "-m", "venv", path])
+        self.run([self.host_python, "-I", "-m", "venv", path], env=self.scratch_env())
         for script in (path / "bin").iterdir():
             mode = script.lstat().st_mode
             if stat.S_ISREG(mode) and mode & 0o022:
@@ -640,7 +667,7 @@ class Cut:
         build_python = self.venv(self.work / "build-venv")
         self.run([build_python, "-I", "-m", "pip", "install", "--no-cache-dir",
                   "--disable-pip-version-check", "--no-input", "--require-hashes", "--only-binary=:all:",
-                  "--requirement", pins])
+                  "--requirement", pins], env=self.scratch_env())
         self.run([build_python, "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
                   "--outdir", dist, src], env=self.scratch_env())
         files = {"wheel": dist / f"lu_machinery-{built_version}-py3-none-any.whl",
@@ -665,13 +692,13 @@ class Cut:
         lock = self.work / "runtime-requirements.txt"
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
                              "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test"],
-                            cwd=self.work / "src").stdout
+                            cwd=self.work / "src", env=self.scratch_env()).stdout
         lock.write_text(exported, encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
                   "--disable-pip-version-check",
                   "--no-input", "--require-hashes", "--only-binary=:all:", "--no-deps", "--dest", house,
-                  "--requirement", lock])
+                  "--requirement", lock], env=self.scratch_env())
         shutil.copy2(files["wheel"], house)
         consumer = self.work / "consumer.lock"
         consumer.write_text(
@@ -688,8 +715,8 @@ class Cut:
         python = self.venv(venv)
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "--only-binary=:all:",
-                  "-r", consumer_lock])
-        self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"])
+                  "-r", consumer_lock], env=self.scratch_env())
+        self.run([python, "-I", "-m", "pip", "check", "--disable-pip-version-check"], env=self.scratch_env())
         shown = self.run([python, "-I", "-c", _SHOW_LU], env=self.scratch_env()).stdout.split()
         if shown[0] != built_version or not Path(shown[1]).resolve().is_relative_to(venv.resolve()):
             raise CutError(f"clean environment imported {shown}, not {built_version} from {venv}")
@@ -735,7 +762,8 @@ class Cut:
         release_base = f"https://github.com/{self.machinery_repo}/releases/download"
         updated, url = adopt_manifest(manifest.read_text(encoding="utf-8"), release_base, self.version)
         manifest.write_text(updated, encoding="utf-8")
-        self.run([uv, "lock", "--upgrade-package", "lu-machinery", "--no-python-downloads"], cwd=product)
+        self.run([uv, "lock", "--upgrade-package", "lu-machinery", "--exclude-newer-package", "lu-machinery=false",
+                  "--no-python-downloads"], cwd=product, env=self.scratch_env())
         selected = [package for package in _uv_packages(lock) if package["name"] == "lu-machinery"]
         wheel = self.work / "published" / url.rsplit("/", 1)[-1]
         expected_hash = f"sha256:{sha256(wheel)}"
@@ -1099,7 +1127,7 @@ class Cut:
             uv = shutil.which("uv")
             if uv is None:
                 raise CutError("uv is not on PATH; cannot refresh uv.lock for the next version")
-            self.run([uv, "lock", "--offline", "--no-python-downloads"], cwd=clone)
+            self.run([uv, "lock", "--no-python-downloads"], cwd=clone, env=self.scratch_env())
             version_files.append("uv.lock")
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *version_files)
