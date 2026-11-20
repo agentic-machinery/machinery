@@ -215,15 +215,19 @@ order:
    and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when
    `$SHA` is that tag's commit, or when only post-release PRs merged since the
    last full release `v<full>` (see Changelog). It refuses when it cannot read
-   the release state of a tag it must check. Otherwise it refuses unless all
-   four of these hold:
+   the release state of a tag it must check. Otherwise preflight checks these
+   conditions.
+
    - `pyproject.toml`, `package.json` and both versions in
-     `package-lock.json` hold `$V`, the next patch version after `<previous>`;
-   - the tag `v$V` is absent;
-   - the `Unreleased` section of `CHANGELOG.md` at `$SHA` is empty;
-   - the newest `CI Gate` push run on `$SHA`
+     `package-lock.json` hold `$V`, the next patch version after `<previous>`.
+   - The tag `v$V` is absent.
+   - The `Unreleased` section of `CHANGELOG.md` at `$SHA` is empty.
+   - The newest `CI Gate` push run on `$SHA`
      (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
      `success`.
+   - The uv on `PATH` satisfies `[tool.uv] required-version` in the machinery
+     candidate and in the product `main` checkout used for adoption and test
+     collection. This check also applies to dry runs that proceed to a build.
 2. **Release notes**, generated as described under Changelog.
 3. **Build** once from `git archive "$SHA"`, outside any checkout, with the
    build pins of the `Installed wheel` job (the `build-requirements.txt`

@@ -16,6 +16,7 @@ from lu_machinery.review.review_lineage import (
     superseded_runs,
 )
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 CURRENT_SOL = current_sol()
 
@@ -109,6 +110,77 @@ def test_lineage_keeps_the_reply_when_a_listed_review_moves_to_archive(tmp_path,
     runs = lineage_runs(tmp_path, repository=repository, number=None, branch=branch)
 
     assert [(entry.task_id, entry.reply) for entry in runs] == [("review", "VERDICT: APPROVE")]
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_verification_probe_does_not_block_the_post_approval_repair_round(tmp_path, monkeypatch, capsys):
+    """Defect class: a PR-linked verification probe enters lineage and blocks a repair round (#994)."""
+    from lu_machinery.review import repair_round
+    from tests.agent_runtime.test_authoring_review_feasibility import mini_repo
+    from tests.review.record_support import write_task
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    repository = "learn-ukrainian/machinery"
+    branch = "codex/topic"
+    number = 978
+    tasks = tmp_path / "tasks"
+    path = "lu_machinery/dispatcher/admission.py"
+    first, second, approved, candidate = (
+        repo.commit(f"codex/{CURRENT_SOL}", path=path, text=f"{step}\n")
+        for step in ("first", "second", "approve", "repair")
+    )
+    common = {"schema_version": 2, "repository": repository, "review_branch": branch, "mode": "read-only"}
+    comments = []
+    for minute, sha in ((1, first), (2, second), (4, approved)):
+        reply = "VERDICT: APPROVE" if sha == approved else "VERDICT: REQUEST_CHANGES"
+        run, comment = review(f"opus-r{minute}", sha, reply, minute=minute, family="anthropic")
+        fields = {key: value for key, value in run.record.items() if key not in {"task_id", "review_profile"}}
+        typing = {"research_role": "review"} if sha == approved else {"require_review_verdict": True}
+        write_task(tasks, task_id=run.task_id, reply=reply, **common, **fields, **typing)
+        comments.append(comment)
+    write_task(
+        tasks, task_id="bound24-live-probe", reply="Behavior probe passed.", **common,
+        pr=number, pinned_head=first, worktree_base_sha=first, started_at=started(3),
+        agent="claude", model="claude-opus-5-5", research_role="verification",
+    )
+
+    monkeypatch.setattr(recorder, "_repo_root", lambda: repo.root)
+    monkeypatch.setattr(recorder, "_review_repository_root", lambda *_: repo.root)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+
+    def github_json(request):
+        if isinstance(request, recorder.Request) and request.verb == "read-commits":
+            return [[{"sha": sha} for sha in (first, second, approved, candidate)]]
+        assert request[:3] == ["gh", "pr", "view"]
+        return {"headRefOid": candidate, "headRefName": branch, "state": "OPEN"}
+
+    monkeypatch.setattr(recorder, "_run_json", github_json)
+    monkeypatch.setattr(
+        recorder.GitHubAdapter, "pr_file_rows", lambda *_: [{"filename": path, "status": "added"}],
+    )
+    monkeypatch.setattr(recorder.GitHubAdapter, "identity", lambda *_: "fleet")
+    monkeypatch.setattr(recorder.GitHubAdapter, "comments", lambda *_: comments)
+    monkeypatch.setattr(repair_round, "github_reads", lambda *_: repair_round.GitHubReads(
+        failed_runs=lambda _: [{
+            "id": 1, "head_sha": approved, "event": "pull_request", "conclusion": "failure",
+            "path": ".github/workflows/ci-gate.yml",
+        }],
+        queue_runs=list, commit_tree=lambda _: None, closing_issues=list,
+    ))
+
+    status = recorder.budget_check_main(["--repository", repository, "--pr", str(number)])
+    result = json.loads(capsys.readouterr().out)
+
+    assert status == 0, result
+    assert result["admitted"] is True
+    assert result["reviewed_heads"] == result["budget"] == 3
+    assert result["unrecorded_rounds"] == []
+    assert result["repair_round"]["approved_head"] == approved
+    assert result["repair_round"]["candidate_head"] == candidate
+    assert result["repair_round"]["class"] == "ci-fix"
+    assert sorted(run.task_id for run in lineage_runs(
+        tasks, repository=repository, number=number, branch=branch,
+    )) == ["opus-r1", "opus-r2", "opus-r4"]
 
 
 def test_a_later_same_seat_approve_supersedes_an_unpublished_rejection_and_keeps_it_listed():

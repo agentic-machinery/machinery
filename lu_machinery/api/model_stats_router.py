@@ -1210,17 +1210,33 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         approved[pr["author"]] += pr["first"] == "correct"
         reviewed[pr["author"]] += 1
 
-    # total_seconds on the model is rounded to one decimal. Ranking uses the unrounded durations.
+    # total_seconds on the model is rounded to one decimal. Ranking and frontier checks use unrounded durations.
     raw_seconds: dict[str, float] = defaultdict(float)
+    class_raw_seconds: dict[tuple[str, str], float] = defaultdict(float)
     for row in rows:
         if row.role == "write" and row.duration is not None:
             raw_seconds[row.model] += row.duration
+            class_raw_seconds[(row.model, row.task_class)] += row.duration
     pareto = []
+    speed_quality = []
     for model in writes:
         name = model["model"]
         total = raw_seconds.get(name)
         observed = model.get("wall_hours_observed") or {}
         trials = reviewed[name]
+        wall = model.get("wall_seconds") or {}
+        median_s = _number(wall.get("median"))
+        timed_n = int(wall.get("n") or 0)
+        if trials > 0 and median_s is not None and median_s >= 0 and timed_n > 0:
+            successes = approved[name]
+            speed_quality.append({
+                "model": name, "identity": model["identity"],
+                "approval_raw": successes / trials,
+                "approval": round(successes / trials, 3), "approval_n": trials,
+                "approval_ci": _wilson(successes, trials),
+                "median_seconds": median_s, "timed_n": timed_n, "prs": trials,
+                "low_sample": timed_n < LOW_SAMPLE or trials < LOW_SAMPLE,
+            })
         # Rank on the raw counts. Rounding the per-landing hours first drops a short task and
         # scales the rate by landings per reviewed PR.
         if observed.get("value") is None or total is None or total <= 0 or trials <= 0 or not model.get("landed"):
@@ -1232,6 +1248,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             "model": name, "identity": model["identity"], "approval_raw": successes / trials,
             "approval": round(successes / trials, 3), "approval_n": trials, "approvals": successes,
             "approval_ci": _wilson(successes, trials), "hours_raw": per_landed,
+            "hours_exact": per_landed,
             "hours": round(per_landed, 2), "recorded_hours": recorded,
             "landed": model["landed"], "prs": trials,
             "low_sample": model["landed"] < LOW_SAMPLE or trials < LOW_SAMPLE,
@@ -1243,6 +1260,16 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
             and other["approval_raw"] >= point["approval_raw"] and other["hours_raw"] <= point["hours_raw"]
             and (other["approval_raw"] > point["approval_raw"] or other["hours_raw"] < point["hours_raw"])
             for other in pareto)
+    for point in speed_quality:
+        med = point["median_seconds"]
+        point["frontier"] = not point["low_sample"] and not any(
+            not other["low_sample"] and other is not point
+            and other["approval_raw"] >= point["approval_raw"] and other["median_seconds"] <= med
+            and (other["approval_raw"] > point["approval_raw"] or other["median_seconds"] < med)
+            for other in speed_quality
+        )
+    for point in speed_quality:
+        del point["approval_raw"]
     eligible = [point for point in pareto if point["identity"] == "catalog" and not point["low_sample"]
                 and point["recorded_hours"] > 0]
     rule = ("most first-round approvals per recorded wall hour, among catalog models "
@@ -1273,16 +1300,44 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
     class_models: dict[str, list[dict[str, Any]]] = defaultdict(list)
     class_tasks: Counter[str] = Counter()
     for model in writes:
+        model_name = model["model"]
         for task_class in model.get("by_class", []):
-            class_tasks[task_class["class"]] += task_class["tasks"]
-            hours = _observed_hours(task_class) if task_class.get("landed") else None
-            class_models[task_class["class"]].append({
-                "model": model["model"], "tasks": task_class["tasks"], "landed": task_class["landed"],
+            tasks_n = task_class["tasks"]
+            landed_n = task_class["landed"]
+            cls_name = task_class["class"]
+            class_tasks[cls_name] += tasks_n
+            observed = task_class.get("wall_hours_observed") or {}
+            raw_cls_s = class_raw_seconds.get((model_name, cls_name))
+            if observed.get("value") is not None and landed_n and raw_cls_s is not None and raw_cls_s > 0:
+                hours: float | None = raw_cls_s / 3600 / landed_n
+            elif landed_n:
+                hours = _observed_hours(task_class)
+            else:
+                hours = None
+            class_models[cls_name].append({
+                "model": model_name, "tasks": tasks_n, "landed": landed_n,
                 "rate": task_class["landed_rate"]["value"],
-                "ci": _wilson(task_class["landed"], task_class["tasks"]),
+                "_rate_raw": landed_n / tasks_n if tasks_n else 0.0,
+                "ci": _wilson(landed_n, tasks_n),
                 "hours": round(hours, 2) if hours is not None else None,
-                "low_sample": task_class["tasks"] < LOW_SAMPLE,
+                "hours_exact": hours,
+                "low_sample": tasks_n < LOW_SAMPLE,
             })
+    for items in class_models.values():
+        for entry in items:
+            hours_raw = entry["hours_exact"]
+            eligible_pt = (not entry["low_sample"] and entry["landed"] > 0
+                           and hours_raw is not None and hours_raw > 0)
+            entry["frontier"] = eligible_pt and not any(
+                not other["low_sample"] and other["landed"] > 0
+                and other["hours_exact"] is not None and other["hours_exact"] > 0
+                and other is not entry
+                and other["_rate_raw"] >= entry["_rate_raw"] and other["hours_exact"] <= hours_raw
+                and (other["_rate_raw"] > entry["_rate_raw"] or other["hours_exact"] < hours_raw)
+                for other in items
+            )
+        for entry in items:
+            del entry["_rate_raw"]
     ranked = sorted((name for name, count in class_tasks.items() if count >= LOW_SAMPLE),
                     key=lambda name: (-class_tasks[name], name))
     jobs = [{"class": name, "tasks": class_tasks[name],
@@ -1294,7 +1349,9 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         failures.append({"model": model["model"], "tasks": model["tasks"], "status": model["status"]})
 
     week_write: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
-    busy = {model["model"] for model in writes if model["tasks"] >= LOW_SAMPLE}
+    busy_writes = {model["model"] for model in writes if model["tasks"] >= LOW_SAMPLE}
+    busy_prs = {author for author, count in reviewed.items() if count >= LOW_SAMPLE}
+    busy = busy_writes | busy_prs
     for row in rows:
         if row.role == "write" and row.model in busy:
             slot = week_write[(week_of(row.moment), row.model)]
@@ -1326,6 +1383,9 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
     durations = [{"model": model["model"], "n": model["wall_seconds"]["n"],
                   "p25": model["wall_seconds"]["p25"], "median": model["wall_seconds"]["median"],
                   "p75": model["wall_seconds"]["p75"], "p90": model["wall_seconds"]["p90"],
+                  "tasks": model.get("tasks", 0), "landed": model.get("landed", 0),
+                  "landed_rate": (model.get("landed_rate") or {}).get("value"),
+                  "landed_ci": _wilson(model.get("landed", 0), model.get("tasks", 0)),
                   "low_sample": model["wall_seconds"]["n"] < LOW_SAMPLE}
                  for model in writes if model["wall_seconds"]["n"]]
 
@@ -1335,15 +1395,29 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         write_effort = next((item for item in (write or {}).get("by_effort", []) if item["effort"] == effort), None)
         review_effort = next((item for item in (review or {}).get("by_effort", []) if item["effort"] == effort), None)
         approval = (review_effort or {}).get("approve_rate") or {"value": None, "n": 0}
+        blocking = (review_effort or {}).get("blocking_per_review") or {"value": None, "n": 0}
+        p0_p2 = (review_effort or {}).get("p0_p2_per_review") or {"value": None, "n": 0}
+        review_wall = (review_effort or {}).get("wall_seconds") or {}
+        write_wall = (write_effort or {}).get("wall_seconds") or {}
+        write_tasks = write_effort["tasks"] if write_effort else 0
         return {
             "effort": effort,
-            "write_tasks": write_effort["tasks"] if write_effort else 0,
+            "write_tasks": write_tasks,
             "write_landed": write_effort["landed"] if write_effort else 0,
+            "review_tasks": review_effort["tasks"] if review_effort else 0,
             "review_results": approval["n"],
             "approval": approval["value"],
             "approval_ci": _wilson(review_effort["verdicts"]["correct"], approval["n"]) if review_effort else None,
+            "blocking_per_review": blocking["value"],
+            "p0_p2_per_review": p0_p2["value"],
+            "findings_n": (review_effort or {}).get("findings_n", 0),
             "median_seconds": (review_effort or write_effort or {}).get("wall_seconds", {}).get("median"),
-            "low_sample": approval["n"] < LOW_SAMPLE and (write_effort["tasks"] if write_effort else 0) < LOW_SAMPLE,
+            "review_median_seconds": review_wall.get("median"),
+            "review_p90_seconds": review_wall.get("p90"),
+            "review_timed_n": review_wall.get("n", 0),
+            "write_median_seconds": write_wall.get("median"),
+            "write_timed_n": write_wall.get("n", 0),
+            "low_sample": approval["n"] < LOW_SAMPLE and write_tasks < LOW_SAMPLE,
         }
 
     neon_arms = [_arm("gemini-4-neon", effort) for effort in ("medium", "high")]
@@ -1366,6 +1440,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         "recommendation": recommendation,
         "waste": waste,
         "pareto": pareto,
+        "speed_quality": speed_quality,
         "jobs": jobs,
         "jobs_low_n": sum(1 for count in class_tasks.values() if count < LOW_SAMPLE),
         "failures": failures,
