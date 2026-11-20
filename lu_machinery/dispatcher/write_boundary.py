@@ -7,7 +7,7 @@ bubblewrap, reusing agy_sandbox's canary, Sources relay and GitHub read relay. T
 Git metadata and public checkouts are read-only mounts. HOME and temporary runtime state are
 private; only declared outputs and the selected provider's refreshable login are writable.
 GitHub credentials are masked and direct GitHub egress is refused. The host broker admits
-only named github-read requests, with launch-bound repository and private-PR scope.
+named GitHub reads with launch-bound scope and one final Fleet delivery to the dispatcher.
 
 Every containment probe must pass before the provider starts. Setup or canary failure refuses
 the run; nothing falls back to an uncontained launch. The receipt records the read-only proof.
@@ -38,7 +38,11 @@ from typing import Any
 
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path, main_checkout_root
+from lu_machinery.common.repo_root import (
+    machinery_path,
+    main_checkout_root,
+    project_interpreter,
+)
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.dispatcher.agy_sandbox import REFUSED, Refused, _now, _remove, _write_private, _write_receipt
@@ -110,9 +114,11 @@ _HOST_CONTEXT = frozenset({
 # the provider keeps its own.
 _HOST_ROOTS = frozenset({"XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME"})
 
-# Native read-only reviewers use the host's login for named GitHub reads only.
+# Native read-only workers use the host broker for named GitHub reads and a final Fleet delivery.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
-_BROKER_VERBS = ("github-read",)
+_BROKER_VERBS = ("github-read", "fleet-publish")
+_FLEET_CHANNEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_MAX_FINAL_BODY = 64 << 10
 # Named reads of the worker's own repository (the publisher's fixed GET templates); no security-alert reads.
 GITHUB_READS = frozenset({"pull", "pr-files", "commits", "commit", "comments", "reviews", "timeline", "issue",
                           "checks", "check-annotations", "run", "jobs"})
@@ -183,7 +189,7 @@ _CURSOR_SOURCES_SERVER = "sources-relay"
 # rules only from this file and rewrites it at every start through a temporary file beside it, so it is a private
 # copy in HOME's lower layer, as the Claude login's copies are: Cursor's rewrite lands in the discarded upper layer.
 _CURSOR_CLI_CONFIG_HOME = ".cursor/cli-config.json"
-_BROKER_TIMEOUTS = {"gh": 120}
+_BROKER_TIMEOUTS = {"gh": 120, "fleet-publish": 30}
 # Connections the broker serves at once; further requests wait in the listen backlog.
 _BROKER_CONNECTIONS = 8
 
@@ -346,6 +352,8 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
     ]
     for path in declared_outputs(spec, invocation):
         argv += ["--output", str(path)]
+    if spec.mode == "read-only" and spec.agent in {"claude", "codex"}:
+        argv.append("--task-artifacts")
     if not (spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER):
         for path in credential_files(spec.agent, invocation.env):
             argv += ["--credential", str(path)]
@@ -588,27 +596,32 @@ def _product_checkout() -> Path | None:
     return None
 
 
+def _fleet_plane() -> Path:
+    from lu_machinery.common.repo_root import state_root
+    from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL
+    from lu_machinery.guardrails.worktree_containment import canonicalize
+
+    override = os.environ.get("FLEET_COMMS_ROOT")
+    path = Path(override).expanduser() if override else state_root() / DEFAULT_ROOT_REL
+    if not path.is_absolute():
+        raise Refused("FLEET_COMMS_ROOT is relative; its plane depends on the reader's working directory")
+    try:
+        return canonicalize(path)
+    except (OSError, RuntimeError, ValueError):
+        raise Refused("FLEET_COMMS_ROOT cannot be resolved as Fleet resolves it") from None
+
+
 def _private_state(checkouts: list[Path]) -> list[Path]:
     """Host state no worker reads (decision A4): the task store, the Fleet Comms plane, the scratch root that
     holds every task's private layers, and each checkout's private runtime state (``_CHECKOUT_PRIVATE``)."""
     from lu_machinery.common.task_store_paths import tasks_dir
-    from lu_machinery.guardrails.worktree_containment import canonicalize
 
-    # Configured roots are emptied where their own readers resolve them: the task store and the scratch root as
-    # the paths those helpers return, the Fleet plane through Fleet's own ``canonicalize`` (``~`` and links). A
-    # relative plane root names a different plane in each process's working directory, so it, like a root that
-    # cannot be resolved, refuses the run.
-    candidates: list[Path] = []
+    # Empty each root where its readers resolve it.
+    candidates = [Path(os.path.realpath(ensure_scratch_root()))]
     with contextlib.suppress(OSError, ValueError):
         candidates.append(Path(os.path.realpath(tasks_dir())))
-    if plane := os.environ.get("FLEET_COMMS_ROOT"):
-        if not Path(plane).expanduser().is_absolute():
-            raise Refused("FLEET_COMMS_ROOT is relative; its plane depends on the reader's working directory")
-        try:
-            candidates.append(canonicalize(plane))
-        except (OSError, RuntimeError, ValueError):
-            raise Refused("FLEET_COMMS_ROOT cannot be resolved as Fleet resolves it") from None
-    candidates.append(Path(os.path.realpath(ensure_scratch_root())))
+    if os.environ.get("FLEET_COMMS_ROOT"):
+        candidates.append(_fleet_plane())
     for checkout in checkouts:
         for name in _CHECKOUT_PRIVATE:
             path = checkout / name
@@ -1062,17 +1075,26 @@ def _host_child_env(task_id: str) -> dict[str, str]:
     """The launcher's environment for a host step, minus the hosting CLI's session variables."""
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("CLAUDE", "CODEX_THREAD", "LU_WRITE_BOUNDARY")) and key != "CLAUDECODE"}
-    env["LEARN_UKRAINIAN_DISPATCH_TASK_ID"] = task_id  # attribute the host read to this review
+    env["LEARN_UKRAINIAN_DISPATCH_TASK_ID"] = task_id
     return env
 
 
-class _Broker:
-    """Launch-bound GitHub reads, served only to descendants of this run's bubblewrap process."""
+def _final_delivery(record: dict, task_id: str, nonce: str) -> tuple[str, str] | None:
+    recipient = record.get("parent_task_id", record.get("initiator"))
+    if not isinstance(recipient, str) or not _TASK_ID.fullmatch(recipient) or recipient == task_id:
+        return None
+    return recipient, f"dispatch-final:{task_id}:{nonce}"
 
-    def __init__(self, boundary: _Boundary, path: Path):
+
+class _Broker:
+    """Launch-bound requests, served only to descendants of this run's bubblewrap process."""
+
+    def __init__(self, boundary: _Boundary, path: Path, *, final_delivery: tuple[str, str] | None = None):
         import socket
 
         self.boundary = boundary
+        self.final_delivery = final_delivery
+        self.final_publish_attempted = False
         self.records: list[dict] = []
         self.seen: set[str] = set()
         self.children: set[subprocess.Popen[bytes]] = set()
@@ -1315,6 +1337,38 @@ class _Broker:
         package_parent = str(machinery_path("dispatcher/write_boundary.py").parents[2])
         return self._run([sys.executable, "-I", "-c", code, package_parent, *argv], timeout_key, stdin=stdin, cwd=cwd)
 
+    def _fleet_publish(self, payload: dict) -> dict:
+        if self.final_delivery is None:
+            raise _BrokerRefusal("this launch has no final Fleet delivery target")
+        if self.final_publish_attempted:
+            raise _BrokerRefusal("the final Fleet publication has already been attempted")
+        if set(payload) != {"channel", "body", "sender", "recipient"}:
+            raise _BrokerRefusal("fleet-publish takes channel, body, sender and one recipient")
+        recipient, key = self.final_delivery
+        task_id = self.boundary.args.task_id
+        if payload["sender"] != task_id or payload["recipient"] != recipient:
+            raise _BrokerRefusal("the sender must be this task and the recipient must be its dispatcher")
+        channel, body = payload["channel"], payload["body"]
+        if not isinstance(channel, str) or not _FLEET_CHANNEL.fullmatch(channel):
+            raise _BrokerRefusal("channel is malformed")
+        try:
+            encoded = body.encode("utf-8") if isinstance(body, str) and body.strip() else b""
+        except UnicodeEncodeError:
+            encoded = b""
+        if not 0 < len(encoded) <= _MAX_FINAL_BODY:
+            raise _BrokerRefusal(f"body must be non-empty UTF-8 text of at most {_MAX_FINAL_BODY} bytes")
+        # The broker serializes requests, so even a host failure consumes this launch's one attempt.
+        # Fleet's run key also prevents another publication from a format-correction launch.
+        self.final_publish_attempted = True
+        argv = [str(project_interpreter()), "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish",
+                channel, "-", "--sender", task_id, "--source", "read-only-worker", "--recipient", recipient,
+                "--idempotency-key", key]
+        reply = self._run(argv, "fleet-publish", stdin=encoded)
+        if reply["returncode"] != 0:
+            return {"returncode": reply["returncode"], "stdout": "",
+                    "stderr": "Fleet final publication did not return success\n"}
+        return reply
+
     def _github_read(self, payload: dict) -> dict:
         """A named read of this repository through the publisher's fixed GET templates (no write is possible)."""
         if not set(payload) <= {"name", "number", "sha", "repo", "paginate"} or "name" not in payload:
@@ -1421,6 +1475,28 @@ class _Boundary:
         # And the start commit's paths below the read paths that the view left out, sorted.
         self.left_out: list[str] = []
 
+    def _artifacts(self, path: Path, nonce: str) -> Path:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            created = False
+        else:
+            created = True
+        info = path.lstat()
+        if not (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700):
+            raise Refused("task artifacts are not a private directory owned by the dispatcher")
+        identity = {"run_nonce": nonce, "device": info.st_dev, "inode": info.st_ino}
+        if not created:
+            # A format-correction launch reuses the first launch's artifacts. The receipt is outside its view.
+            try:
+                previous = json_depth.loads(Path(self.args.receipt).read_text(), max_depth=512)
+            except (OSError, ValueError):
+                previous = None
+            if not isinstance(previous, dict) or previous.get("task_artifacts") != identity:
+                raise Refused("task artifacts already exist without this run's boundary receipt")
+        self.receipt["task_artifacts"] = identity
+        return path
+
     def run(self) -> int:
         from lu_machinery.agent_runtime.attempt_network import AttemptEgress
 
@@ -1502,6 +1578,23 @@ class _Boundary:
             elif not path.is_file():
                 raise Refused("a declared output is not a regular file")
             outputs.append(Path(os.path.realpath(path)))
+        final_delivery = None
+        if self.args.task_artifacts:
+            from lu_machinery.dispatcher import store as task_store
+
+            task_id = self.args.task_id
+            record = task_store.read(task_id, missing_ok=True) or {}
+            nonce = record.get("run_nonce")
+            if (record.get("task_id") != task_id or record.get("mode") != "read-only"
+                    or record.get("status") not in ("spawning", "running")
+                    or not isinstance(nonce, str) or not _REQUEST_ID.fullmatch(nonce)):
+                raise Refused("task artifacts require this read-only run's active task record")
+            record_path = task_store.record_path(task_id)
+            artifacts = record_path.parent.resolve(strict=True) / record_path.with_suffix(".artifacts").name
+            if any(_overlaps(artifacts, protected) for protected in (common, self.worktree, _fleet_plane())):
+                raise Refused("task artifacts overlap Git metadata, the worktree or the Fleet store")
+            outputs.append(self._artifacts(artifacts, nonce))
+            final_delivery = _final_delivery(record, task_id, nonce)
         credentials = []
         for raw in self.args.credential or []:
             path = Path(raw)
@@ -1627,7 +1720,8 @@ class _Boundary:
         for path in sockets:
             argv += ["--ro-bind", "/dev/null", str(path)]
         # A Savant run gets no GitHub relay at all: its tools read only the snapshot.
-        self.broker = None if self.args.no_github_relays else _Broker(self, boundary / "broker.sock")
+        if not self.args.no_github_relays:
+            self.broker = _Broker(self, boundary / "broker.sock", final_delivery=final_delivery)
         argv += ["--ro-bind", str(boundary), _INSIDE]
         if self.manifest is not None:
             # A write run edits its own copy of the view; only the draft taken after it exits leaves (``_draft``).
@@ -1967,7 +2061,11 @@ class _Boundary:
         for directory in (Path(os.environ.get("HOME") or Path.home()), tmp):
             expect("scratch_cycle", directory / f".write-boundary-canary-{nonce}", "OK")
         for path in outputs:
-            expect("write_open", path, "OK")
+            if path.is_dir():
+                expect("scratch_cycle", path / f".write-boundary-canary-{nonce}", "OK")
+                expect("create", path.parent / f".write-boundary-canary-{nonce}", "EROFS")
+            else:
+                expect("write_open", path, "OK")
         for port in _LOOPBACK_PORTS:
             expect("connect_tcp", "127.0.0.1", "ECONNREFUSED", "ENETUNREACH", port=port)
         # The fixed Sources command cannot be redirected: its directory is a mount point and its interpreter's
@@ -2298,7 +2396,7 @@ def call_main(argv: list[str]) -> int:
     """``call <verb>``: send one broker request from inside a write boundary; the payload is JSON on stdin."""
     parser = argparse.ArgumentParser(
         prog="python -m lu_machinery.dispatcher.write_boundary call",
-        description="Send one named GitHub read to the read-only review boundary's host broker.\n"
+        description="Send a named GitHub read or final Fleet publication to the read-only boundary's host broker.\n"
                     "The payload is one JSON object on stdin; docs/runbooks/write-worker-boundary.md lists each verb's "
                     "fields.",
         epilog="Example:\n  echo '{\"name\": \"pull\", \"number\": 123}' | python -m lu_machinery.dispatcher.write_boundary call github-read\n"
@@ -2306,7 +2404,7 @@ def call_main(argv: list[str]) -> int:
                "Exit codes: the host step's status; 2 when the broker refuses the request or no broker is present.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("verb", choices=_BROKER_VERBS, help="Named read relay verb (github-read only)")
+    parser.add_argument("verb", choices=_BROKER_VERBS, help="Named broker operation")
     args = parser.parse_args(argv)
     if broker_path() is None:
         print("write boundary broker: not inside a write boundary", file=sys.stderr)
@@ -2379,6 +2477,8 @@ def main(argv: list[str]) -> int:
                         "repository github-read acts on this PR only (default: the open PR "
                         "of the dispatched branch against the default branch, bound on first use)")
     parser.add_argument("--output", action="append", help="A declared output file the provider writes")
+    parser.add_argument("--task-artifacts", action="store_true",
+                        help="Grant this read-only task its own persistent artifacts and final Fleet delivery")
     parser.add_argument("--credential", action="append", help="A provider credential file a refresh rewrites")
     parser.add_argument("--claude-login", help="The selected Claude login directory; its guard-bound state is "
                         "projected as private copies")
@@ -2406,6 +2506,8 @@ def main(argv: list[str]) -> int:
     if len(args.read_path) > MAX_READ_PATHS or (args.read_path and args.snapshot_bytes is None):
         parser.error(f"--read-path needs --snapshot-bytes and is repeatable at most {MAX_READ_PATHS} times")
     write = args.mode == "workspace-write"
+    if args.task_artifacts and (write or args.no_github_relays):
+        parser.error("--task-artifacts requires read-only mode and the host broker")
     if write != (args.draft_patch_fd is not None) or write != bool(args.owned_path) or (
             write and (args.snapshot_bytes is None or args.upload_ceiling is None or not args.no_github_relays
                        or not args.no_sources_relay or args.sources_mcp is not None)):

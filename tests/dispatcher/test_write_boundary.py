@@ -175,12 +175,12 @@ def test_protected_primary_git_state_cannot_be_changed(primary):
 _BROKER_CLIENT = """
 import json, os, socket, sys
 
-def send(verb, payload, request_id):
+def send(verb, payload, request_id, field="returncode"):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.connect(os.environ["LU_WRITE_BOUNDARY_BROKER"])
         connection.sendall(json.dumps({"verb": verb, "request_id": request_id, "payload": payload}).encode())
         connection.shutdown(socket.SHUT_WR)
-        return json.loads(b"".join(iter(lambda: connection.recv(65536), b"")))["returncode"]
+        return json.loads(b"".join(iter(lambda: connection.recv(65536), b"")))[field]
 
 good = {"name": "pull", "number": 7}
 print(json.dumps({
@@ -393,21 +393,41 @@ class _Launch:
 
 
 def test_read_only_broker_refuses_publication_and_preserves_checkout(primary, monkeypatch, tmp_path):
-    """Defect class: a reviewer publishes through the host broker or writes reviewed files/Git metadata."""
+    """Defect class: a worker sees another task's artifacts or publishes beyond its final delivery."""
     repo, worktree, receipt = primary
-    report = tmp_path / "review-results.json"
+    tasks = repo / "batch_state" / "tasks"
+    other = tasks / "other-task.artifacts"
+    other.mkdir(parents=True)
+    (other / "protected.txt").write_text("other task")
+    nonce = "1" * 32
+    (tasks / "wb-test.json").write_text(json.dumps({
+        "task_id": "wb-test", "mode": "read-only", "status": "running", "run_nonce": nonce,
+        "parent_task_id": "dispatch-owner", "initiator": "different-label",
+    }))
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(write_boundary, "project_interpreter", lambda: Path(sys.executable))
+    report = tasks / "wb-test.artifacts" / "review-results.json"
     tip = _git(worktree, "rev-parse", "HEAD")
     before = _digest(worktree / "a.txt", repo / ".git/config", repo / ".git/refs/heads/task")
     steps = []
     monkeypatch.setattr(write_boundary._Broker, "_repository_slug", lambda self: "owner/repo")
     monkeypatch.setattr(write_boundary._Broker, "_module", lambda self, module, argv, key, stdin=None, cwd=None: steps.append(
         (module, argv)) or {"returncode": 0, "stdout": "read-ok", "stderr": ""})
+    monkeypatch.setattr(write_boundary._Broker, "_run", lambda self, argv, timeout_key, stdin: steps.append(
+        (timeout_key, argv, stdin)) or {"returncode": 0, "stdout": "publish-ok", "stderr": ""})
     probe = tmp_path / "review-probe.py"
     probe.write_text(_BROKER_CLIENT[:_BROKER_CLIENT.index("good =")] + '''
 verbs = sys.argv[2].split(",")
 results = {verb: send(verb, {}, f"{index:032x}") for index, verb in enumerate(verbs)}
 results["github-read"] = send("github-read", {"name": "pull", "number": 7}, "f" * 32)
-for name, path in (("worktree", "a.txt"), ("git", sys.argv[3])):
+final = {"channel": "cto", "sender": "wb-test", "recipient": "dispatch-owner", "body": "result"}
+for index, changes in enumerate(({"recipient": "different-label"}, {"sender": "dispatch-owner"},
+                                 {"channel": "--root"}, {"body": "é" * 32769}, {"root": "/outside"}), start=20):
+    results[f"final-{index}"] = send("fleet-publish", {**final, **changes}, f"{index:032x}")
+results["final-allowed"] = send("fleet-publish", final, f"{25:032x}")
+results["final-repeat"] = send("fleet-publish", final, f"{26:032x}")
+results["final-changed"] = send("fleet-publish", {**final, "body": "second"}, f"{27:032x}")
+for name, path in (("worktree", "a.txt"), ("git", sys.argv[3]), ("other-task", sys.argv[4])):
     try:
         with open(path, "a") as stream:
             stream.write("changed")
@@ -420,13 +440,24 @@ open(sys.argv[1], "w").write(json.dumps(results))
              "closeout-request", "push", "fetch-base", "pr-create", "pr-edit", "pr-comment", "pr-merge", "pr-ownership"]
     code = write_boundary.main([
         "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
-        "--receipt", str(receipt), "--mode", "read-only", "--output", str(report), "--", sys.executable, "-I",
-        str(probe), str(report), ",".join(verbs), str(repo / ".git/config"),
+        "--receipt", str(receipt), "--mode", "read-only", "--task-artifacts", "--", sys.executable, "-I",
+        str(probe), str(report), ",".join(verbs), str(repo / ".git/config"), str(other / "protected.txt"),
     ])
     evidence = json.loads(receipt.read_text())
     assert code == 0 and evidence["canary"]["passed"], evidence
-    assert json.loads(report.read_text()) == {**dict.fromkeys(verbs, 2), "github-read": 0, "worktree": True, "git": True}
-    assert len(steps) == 1 and steps[0][0] == "publish.github"
+    assert json.loads(report.read_text()) == {
+        **dict.fromkeys(verbs, 2),
+        **{f"final-{index}": 2 for index in range(20, 25)},
+        "final-allowed": 0, "final-repeat": 2, "final-changed": 2,
+        "github-read": 0, "worktree": True, "git": True, "other-task": True,
+    }
+    assert steps == [
+        ("publish.github", ["read", "pull", "--repo", "owner/repo", "--number", "7"]),
+        ("fleet-publish", [sys.executable, "-I", "-m", "lu_machinery.fleet_comms", "channel", "publish", "cto", "-",
+                           "--sender", "wb-test", "--source", "read-only-worker", "--recipient", "dispatch-owner",
+                           "--idempotency-key", f"dispatch-final:wb-test:{nonce}"], b"result"),
+    ]
+    assert (other / "protected.txt").read_text() == "other task"
     assert _digest(worktree / "a.txt", repo / ".git/config", repo / ".git/refs/heads/task") == before
     assert evidence["import"] == {"status": "unchanged", "before": tip, "after": tip}
     task_file = receipt.with_suffix(".task.json")
@@ -434,6 +465,22 @@ open(sys.argv[1], "w").write(json.dumps(results))
     assert write_boundary.verify(task_file, "wb-test", "read-only")[1] is None
     assert write_boundary.verify(task_file, "wb-test", "workspace-write")[1] == (
         "write_boundary_unproven: the receipt names another mode")
+    steps.clear()
+    monkeypatch.setattr(write_boundary._Broker, "_run", lambda self, argv, timeout_key, stdin: steps.append(
+        (timeout_key, argv, stdin)) or {"returncode": 3, "stdout": "", "stderr": "channel_not_found\n"})
+    probe.write_text(_BROKER_CLIENT[:_BROKER_CLIENT.index("good =")] + '''
+assert os.path.getsize(sys.argv[1]) > 0
+final = {"channel": "cto", "sender": "wb-test", "recipient": "dispatch-owner", "body": "result"}
+assert send("fleet-publish", final, "a" * 32, "stderr") == "Fleet final publication did not return success\\n"
+assert send("fleet-publish", final, "b" * 32) == 2
+''')
+    code = write_boundary.main([
+        "--task-id", "wb-test", "--worktree", str(worktree), "--scratch", str(write_boundary.scratch("wb-test")),
+        "--receipt", str(receipt), "--task-artifacts", "--", sys.executable, "-I", str(probe), str(report),
+    ])
+    correction = json.loads(receipt.read_text())
+    assert code == 0 and correction["task_artifacts"] == evidence["task_artifacts"], correction
+    assert len(steps) == 1
 
 
 @pytest.mark.parametrize("login_root", ["home", "emptied-root"])
