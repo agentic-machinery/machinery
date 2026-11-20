@@ -1,11 +1,9 @@
 """Cursor print-mode execution and assistant stream extraction."""
 
-import hashlib
 import json
 import logging
 import os
-import shutil
-import time
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -13,7 +11,11 @@ from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.common.safe_open import safe_open_below
-from lu_machinery.dispatcher.providers import has_ambient_sources_config, workspace_sources_refusal
+from lu_machinery.dispatcher.providers import (
+    SourcesServerSpec,
+    is_ukrainian_content_task,
+    load_product_sources_server,
+)
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER, one_model
 from lu_machinery.dispatcher.providers.stream_json import model_observer as _observe
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
@@ -91,7 +93,7 @@ def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> 
 def workspace_write_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> str:
     """The per-invocation ``cli-config.json`` for a workspace-write Cursor run: allow readers, deny writers.
 
-    Passed via ``CURSOR_CONFIG_DIR`` so ``~/.cursor/cli-config.json`` and ``HOME`` are never modified.
+    Passed via ``CURSOR_CONFIG_DIR`` so the host's Cursor settings are never modified.
     Cursor evaluates explicit ``permissions.deny`` before ``--force`` auto-approval.
     """
     config = {
@@ -108,62 +110,54 @@ def workspace_write_cli_config(readers: tuple[str, ...], writers: tuple[str, ...
     return json.dumps(config, indent=2) + "\n"
 
 
-def _workspace_config_dir(spec: TaskSpec, env: Mapping[str, str], *, require_server: bool) -> str | None:
-    """Create a task-local ``CURSOR_CONFIG_DIR`` carrying ``cli-config.json`` with Sources writer denies."""
+def _workspace_config_dir(
+    spec: TaskSpec, env: Mapping[str, str], server: SourcesServerSpec | None,
+) -> Path | None:
+    """Write Cursor's permissions and MCP configuration inside the dispatch scratch."""
     from lu_machinery.common.repo_root import ProductRootError
 
     try:
         readers, writers = sources_tool_sets()
     except (FileNotFoundError, ProductRootError):
-        if require_server:
+        if server is not None:
             raise
         return None
-    content = workspace_write_cli_config(readers, writers).encode("utf-8")
-    scratch_raw = env.get("LU_TASK_SCRATCH")
-    if isinstance(scratch_raw, str) and scratch_raw.strip():
-        scratch = Path(scratch_raw)
-        if not scratch.is_absolute() or scratch.is_symlink():
-            raise ValueError("cursor_config_dir_unsafe: LU_TASK_SCRATCH must be an absolute non-symlink path")
-        directory = scratch / "cursor-config"
-        prune_parent: Path | None = None
-    else:
-        parent = spec.final_file.parent / ".cursor-configs"
-        digest = hashlib.sha256(spec.task_id.encode("utf-8")).hexdigest()[:24]
-        directory = parent / digest
-        prune_parent = parent
+    scratch = Path(env.get("LU_TASK_SCRATCH", ""))
+    if not scratch.is_absolute() or scratch.is_symlink():
+        raise ValueError("cursor_config_dir_unsafe: LU_TASK_SCRATCH must be an absolute non-symlink path")
     if spec.options.get("dry_run") == "True":
-        return str(directory)
-    if prune_parent is not None:
-        if prune_parent.is_symlink():
-            raise ValueError("cursor_config_dir_unsafe: .cursor-configs parent must not be a symlink")
-        prune_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if directory.is_symlink():
-        raise ValueError("cursor_config_dir_unsafe: config directory must not be a symlink")
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        return scratch / "cursor-home" / ".cursor"
+
+    configs = {"cli-config.json": workspace_write_cli_config(readers, writers)}
+    if server is not None:
+        entry: dict[str, object]
+        if server.url is not None:
+            entry = {"url": server.url, "headers": dict(server.headers)}
+        else:
+            entry = {"command": server.command, "args": list(server.args), "env": dict(server.env)}
+            if server.cwd is not None:
+                entry["cwd"] = server.cwd
+        configs["mcp.json"] = json.dumps({"mcpServers": {SOURCES_SERVER: entry}}) + "\n"
+
+    task_home = Path(tempfile.mkdtemp(prefix="cursor-home-", dir=scratch))
+    directory = task_home / ".cursor"
+    directory.mkdir(mode=0o700)
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
-        dir_fd = os.open(directory, dir_flags)
-    except OSError as exc:
-        raise ValueError(f"cursor_config_dir_unsafe: could not open config directory: {exc}") from None
-    try:
-        try:
-            fd = safe_open_below(dir_fd, "cli-config.json", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        except OSError as exc:
-            raise ValueError(f"cursor_config_dir_unsafe: could not write cli-config.json: {exc}") from None
-        with os.fdopen(fd, "wb") as stream:
-            os.fchmod(stream.fileno(), 0o600)
-            stream.write(content)
+        for name, content in configs.items():
+            fd = safe_open_below(dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(content)
     finally:
         os.close(dir_fd)
-    if prune_parent is not None:
-        try:
-            now = time.time()
-            for stale in prune_parent.iterdir():
-                if stale != directory and not stale.is_symlink() and stale.is_dir() and stale.stat().st_mtime < now - 3600:
-                    shutil.rmtree(stale, ignore_errors=True)
-        except OSError:
-            pass
-    return str(directory)
+    if server is not None and "GIT_CONFIG_GLOBAL" not in env:
+        home = Path(env.get("HOME") or Path.home())
+        git_config = home / ".gitconfig"
+        if git_config.is_file():
+            # An include preserves the XDG layer and resolves relative includes at the original file.
+            with (task_home / ".gitconfig").open("x", encoding="utf-8") as stream:
+                stream.write(f"[include]\n\tpath = {json.dumps(str(git_config), ensure_ascii=False)}\n")
+    return directory
 
 
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
@@ -175,18 +169,24 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         # projected Sources relay; only the tools that file allows run.
         argv += ["--disable-project-configs", "--approve-mcps"]
     elif spec.mode == "workspace-write":
-        if refusal := workspace_sources_refusal(spec, env):
-            raise ValueError(refusal)
-        ambient = has_ambient_sources_config("cursor", worktree=spec.worktree, env=env)
-        if not ambient:
+        server = load_product_sources_server("cursor")
+        if server is None:
+            if is_ukrainian_content_task(spec.options):
+                raise ValueError(
+                    "cursor_sources_mcp_unavailable: product .mcp.json declares no active 'sources' "
+                    "MCP server for this Ukrainian-content write task"
+                )
             _LOG.warning(
-                "cursor_sources_mcp_unavailable: cursor-agent CLI has no per-invocation MCP server flag or env var "
-                "and neither %s/.cursor/mcp.json nor ~/.cursor/mcp.json defines an active %r server",
-                spec.worktree,
-                SOURCES_SERVER,
+                "cursor_sources_mcp_unavailable: product .mcp.json declares no active 'sources' MCP server"
             )
-        if (config_dir := _workspace_config_dir(spec, env, require_server=ambient)) is not None:
-            child_env["CURSOR_CONFIG_DIR"] = config_dir
+        if (config_dir := _workspace_config_dir(spec, env, server)) is not None:
+            child_env["CURSOR_CONFIG_DIR"] = str(config_dir)
+            if server is not None:
+                # Cursor loads mcp.json from HOME. Keep the existing Git and GitHub CLI configuration
+                # available to the write worker's shell.
+                home = Path(env.get("HOME") or Path.home())
+                child_env.setdefault("XDG_CONFIG_HOME", str(home / ".config"))
+                child_env["HOME"] = str(config_dir.parent)
         argv += ["--approve-mcps", "--sandbox", "disabled", "--force"]
     else:
         raise ValueError(f"cursor: unsupported mode {spec.mode!r}")

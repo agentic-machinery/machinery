@@ -7,15 +7,14 @@ import os
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
+
 import pytest
+
 from lu_machinery.dispatcher.providers import cursor, load, muse, opencode
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.review.verdict_parser import recognized_verdicts
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 MODELS = ("muse-spark-1.3", "muse-wonder-1.0", "muse-wonder-full-1.0")
 PROMPT = '--leading-option "quoted" $literal\nReply with exactly: ready\n'
@@ -646,7 +645,7 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
     from unittest.mock import Mock
 
     from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
-    from lu_machinery.dispatcher import checks, cli, git, worker
+    from lu_machinery.dispatcher import checks, cli, git, providers, worker
     from lu_machinery.dispatcher.providers import agy
 
     home = tmp_path / "home"
@@ -662,8 +661,17 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
     env = {"HOME": str(home), "LU_TASK_SCRATCH": str(scratch)}
     base = TaskSpec(f"{agent}-ws", agent, model, None, "workspace-write", worktree, prompt, tmp_path / "final")
     provider = agy if agent == "agy" else cursor
+    if agent == "agy":
+        cfg_file = home / ".gemini" / "config" / "mcp_config.json"
+        server = {"serverUrl": "https://sources.example.invalid/mcp"}
+    else:
+        product = tmp_path / "product"
+        product.mkdir()
+        monkeypatch.setattr(providers, "product_root", lambda: product)
+        cfg_file = product / ".mcp.json"
+        server = {"url": "https://sources.example.invalid/mcp"}
 
-    # 1. Absent ambient Sources config: Ukrainian tasks fail closed in build() and cli dispatch; non-Ukrainian warns
+    # An absent Sources config refuses Ukrainian tasks in both the builder and CLI.
     for uk_opts in (
         {"research_task_family": "ukrainian-authoring"},
         {"review_profile": "ukrainian"},
@@ -690,7 +698,7 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
     assert f"{agent}_sources_mcp_unavailable" in capsys.readouterr().err
     worker.start.assert_not_called()
 
-    # Non-Ukrainian write task with absent ambient config: warns, never edits HOME, still enforces writer denies.
+    # Other tasks still get writer denies when there is no Sources server.
     caplog.clear()
     with caplog.at_level("WARNING"):
         inv_absent = provider.build(base, env)
@@ -700,28 +708,16 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
         settings = json.loads(inv_absent.argv[inv_absent.argv.index("--settings") + 1])
         assert set(settings["permissions"]["deny"]) == {f"mcp(sources/{name})" for name in writers}
     else:
-        cfg_dir = inv_absent.env["CURSOR_CONFIG_DIR"]
-        cfg = json.loads((tmp_path / "scratch" / "cursor-config" / "cli-config.json").read_text(encoding="utf-8"))
-        assert cfg_dir == str(scratch / "cursor-config")
+        cfg_dir = Path(inv_absent.env["CURSOR_CONFIG_DIR"])
+        cfg = json.loads((cfg_dir / "cli-config.json").read_text(encoding="utf-8"))
+        assert inv_absent.env["HOME"] == str(home)
+        assert not (cfg_dir / "mcp.json").exists()
         assert all(f"Mcp(sources:{name})" in cfg["permissions"]["deny"] for name in writers)
         assert all(f"Mcp(sources:{name})" in cfg["permissions"]["allow"] for name in readers)
         assert "CURSOR_CONFIG_DIR" not in env  # caller env never mutated
 
-    # 2. Present ambient Sources config: Ukrainian write task succeeds, no warning, writer denies kept, HOME untouched.
-    if agent == "agy":
-        cfg_file = home / ".gemini" / "config" / "mcp_config.json"
-        cfg_file.parent.mkdir(parents=True)
-        cfg_file.write_text(
-            json.dumps({"mcpServers": {"sources": {"serverUrl": "http://127.0.0.1:8766/mcp", "disabled": False}}}),
-            encoding="utf-8",
-        )
-    else:
-        cfg_file = worktree / ".cursor" / "mcp.json"
-        cfg_file.parent.mkdir(parents=True)
-        cfg_file.write_text(
-            json.dumps({"mcpServers": {"sources": {"url": "http://127.0.0.1:8766/mcp"}}}),
-            encoding="utf-8",
-        )
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg_file.write_text(json.dumps({"mcpServers": {"sources": server}}), encoding="utf-8")
     before = cfg_file.read_bytes()
     caplog.clear()
     with caplog.at_level("WARNING"):
@@ -734,31 +730,80 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
     else:
         assert "CURSOR_CONFIG_DIR" in inv_present.env
 
-    # 3. Disabled AGY entry or Cursor worktree-disabled overriding user config still fails closed for Ukrainian tasks.
-    if agent == "agy":
-        cfg_file.write_text(
-            json.dumps({"mcpServers": {"sources": {"serverUrl": "http://127.0.0.1:8766/mcp", "disabled": True}}}),
-            encoding="utf-8",
-        )
-    else:
-        user_cursor = home / ".cursor" / "mcp.json"
-        user_cursor.parent.mkdir(parents=True)
-        user_cursor.write_text(
-            json.dumps({"mcpServers": {"sources": {"url": "http://127.0.0.1:8766/mcp"}}}),
-            encoding="utf-8",
-        )
-        cfg_file.write_text(
-            json.dumps({"mcpServers": {"sources": {"url": "http://127.0.0.1:8766/mcp", "disabled": True}}}),
-            encoding="utf-8",
-        )
+    cfg_file.write_text(json.dumps({"mcpServers": {"sources": {**server, "disabled": True}}}), encoding="utf-8")
     with pytest.raises(ValueError, match=f"{agent}_sources_mcp_unavailable"):
         provider.build(replace(base, options={"research_task_family": "ukrainian-authoring"}), env)
 
-    # 4. Non-UTF-8 ambient config fails closed for Ukrainian tasks and warns (never raw UnicodeDecodeError) otherwise.
+    # Invalid declarations give a typed error. AGY classifies an unreadable ambient entry as missing.
     cfg_file.write_bytes(b"\xff\xfeinvalid-utf8")
+    if agent == "cursor":
+        for spec in (base, replace(base, options={"research_task_family": "ukrainian-authoring"})):
+            with pytest.raises(ValueError, match="cursor_sources_config_invalid"):
+                provider.build(spec, env)
+        return
     with pytest.raises(ValueError, match=f"{agent}_sources_mcp_unavailable"):
         provider.build(replace(base, options={"research_task_family": "ukrainian-authoring"}), env)
     caplog.clear()
     with caplog.at_level("WARNING"):
         provider.build(base, env)
     assert any(f"{agent}_sources_mcp_unavailable" in record.message for record in caplog.records)
+
+
+def test_cursor_workspace_write_registers_product_sources_in_task_home(tmp_path, monkeypatch):
+    """Defect class (#24 AC-04): Cursor write workers put Sources where headless Cursor cannot see it."""
+    from lu_machinery.dispatcher import providers
+
+    home = tmp_path / "host home"
+    home.mkdir()
+    git_config = home / ".gitconfig"
+    git_config.write_text("[include]\n\tpath = fixture.conf\n", encoding="utf-8")
+    (home / "fixture.conf").write_text("[test]\n\thome = yes\n", encoding="utf-8")
+    xdg_git = home / ".config" / "git"
+    xdg_git.mkdir(parents=True)
+    (xdg_git / "config").write_text("[test]\n\txdg = yes\n", encoding="utf-8")
+    scratch = tmp_path / "task scratch"
+    scratch.mkdir()
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Check a Ukrainian word.", encoding="utf-8")
+    product = tmp_path / "product"
+    product.mkdir()
+    monkeypatch.setattr(providers, "product_root", lambda: product)
+    spec = TaskSpec(
+        "cursor-sources", "cursor", "grok-4.7-high", None, "workspace-write",
+        worktree, prompt, tmp_path / "final", options={"language_lane": "uk"},
+    )
+    env = {"HOME": str(home), "LU_TASK_SCRATCH": str(scratch), "PATH": os.defpath}
+    for declared, expected in (
+        (
+            {"url": "https://sources.example.invalid/mcp", "headers": {"Authorization": "fixture"}},
+            {"url": "https://sources.example.invalid/mcp", "headers": {"Authorization": "fixture"}},
+        ),
+        (
+            {"command": "sources-fixture", "args": ["arg with space"], "env": {"MODE": "test"}, "cwd": "sources"},
+            {"command": "sources-fixture", "args": ["arg with space"], "env": {"MODE": "test"},
+             "cwd": str(product / "sources")},
+        ),
+    ):
+        (product / ".mcp.json").write_text(json.dumps({"mcpServers": {"sources": declared}}), encoding="utf-8")
+        assert providers.workspace_sources_refusal(spec, env) is None
+        dry_run = replace(spec, options={**spec.options, "dry_run": "True"})
+        assert not Path(cursor.build(dry_run, env).env["HOME"]).exists()
+
+        invocation = cursor.build(spec, env)
+        task_home = Path(invocation.env["HOME"])
+        assert task_home.parent == scratch
+        mcp_file = task_home / ".cursor" / "mcp.json"
+        assert json.loads(mcp_file.read_text(encoding="utf-8")) == {"mcpServers": {"sources": expected}}
+        assert mcp_file.stat().st_mode & 0o777 == 0o600
+        assert invocation.env["CURSOR_CONFIG_DIR"] == str(mcp_file.parent)
+        assert invocation.env["XDG_CONFIG_HOME"] == str(home / ".config")
+        git_settings = subprocess.run(
+            ["git", "config", "--includes", "--get-regexp", "^test\\."],
+            env=invocation.env, cwd=worktree, capture_output=True, check=True, text=True, timeout=30,
+        )
+        assert git_settings.stdout.splitlines() == ["test.xdg yes", "test.home yes"]
+        assert not any(worktree.iterdir())
+        assert not (home / ".cursor").exists()
+        assert env == {"HOME": str(home), "LU_TASK_SCRATCH": str(scratch), "PATH": os.defpath}

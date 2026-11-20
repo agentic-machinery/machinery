@@ -241,7 +241,7 @@ def workspace_sources_refusal(spec: TaskSpec, env: Mapping[str, str] | None = No
         return None
     if spec.agent in {"claude", "muse"} or (spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER):
         return None
-    if spec.agent in {"codex", "opencode"}:
+    if spec.agent in {"codex", "cursor", "opencode"}:
         try:
             server = load_product_sources_server(spec.agent)
         except ValueError as exc:
@@ -252,18 +252,14 @@ def workspace_sources_refusal(spec: TaskSpec, env: Mapping[str, str] | None = No
                 f"{SOURCES_SERVER!r} MCP server for this Ukrainian-content write task"
             )
         return None
-    if spec.agent in {"agy", "cursor"}:
+    if spec.agent == "agy":
         if not has_ambient_sources_config(spec.agent, worktree=spec.worktree, env=env) and is_ukrainian_content_task(
             spec.options
         ):
-            location = (
-                "~/.gemini/config/mcp_config.json"
-                if spec.agent == "agy"
-                else "worktree .cursor/mcp.json or ~/.cursor/mcp.json"
-            )
             return (
                 f"{spec.agent}_sources_mcp_unavailable: {spec.agent} CLI has no per-invocation MCP server flag or "
-                f"env var and {location} defines no active {SOURCES_SERVER!r} server for this Ukrainian-content write task"
+                f"env var and ~/.gemini/config/mcp_config.json defines no active {SOURCES_SERVER!r} "
+                "server for this Ukrainian-content write task"
             )
         return None
     return None

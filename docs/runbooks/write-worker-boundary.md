@@ -20,15 +20,17 @@ project environment.
 
 `worker.supervise` launches every write route (`claude`, `codex`, `cursor`, `agy` and `opencode`,
 both its direct and OpenRouter upstreams) directly, with no wrapper and no copied or bound credential.
-`muse` refuses `workspace-write` before launch. A write-mode Claude run takes the Sources server from
-the product checkout's `.mcp.json`; the other providers use their own configuration. The native
+`muse` refuses `workspace-write` before launch. Claude, Codex, Cursor and OpenCode take the Sources
+server from the product checkout's `.mcp.json`. The native
 read-only routes run through `lu_machinery/dispatcher/write_boundary.py`; for them there is no
 unsandboxed fallback: a host without bubblewrap, a setup error or a failed canary refuses the run with
 exit 125 and the typed error `write_boundary_refused: <reason>`.
 
-The dispatcher supplies no Sources MCP server to Cursor workspace-write workers. Without an active
-Sources server in Cursor's existing configuration, those workers have no Sources MCP. The dispatcher
-refuses Ukrainian-content write tasks in that case with `cursor_sources_mcp_unavailable`.
+For Cursor workspace-write workers, the dispatcher writes the product Sources entry to
+`~/.cursor/mcp.json` under a private HOME in task scratch. Cursor also reads its permission profile
+from that directory and denies Sources writer tools. Cursor gives a workspace's own Sources entry
+precedence. If the product has no active Sources entry, the dispatcher refuses Ukrainian-content
+write tasks with `cursor_sources_mcp_unavailable` and warns on other tasks.
 
 ## Read-only review dispatches
 
