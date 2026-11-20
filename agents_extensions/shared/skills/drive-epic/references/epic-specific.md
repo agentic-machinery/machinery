@@ -68,8 +68,8 @@ Binding for this lane:
 4. The **driver does not decide Ukrainian**; the sources override any model
    (R-35). Language work and its reviews go only to sanctioned language lanes,
    cross-family to the author; Gemini Ukrainian reviews require Sources MCP. Native AGY also admits
-   low, medium and high risk code reviews; critical, infra and security reviews
-   exclude Gemini, and the bridge refuses code reviews.
+   code and infra reviews at every risk tier, including critical and security paths, with Neon as a
+   peer of Sol 6.2 and Opus 5.5 (NEON-SOLTIER-1120), while the bridge refuses code reviews.
    If an AGY run ends `agy_background_task_canceled` (#8771), retry once, then
    reroute.
 5. Review at scale is automated (review tooling WP 14–16, LU QA sweep); the

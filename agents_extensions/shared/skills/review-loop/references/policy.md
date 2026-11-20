@@ -15,7 +15,7 @@ simpler manual procedure beats new tooling.
 | Trivial | Root documentation for people (README, CHANGELOG, LICENSE, SECURITY); the product's lock bump adopting a new lu-machinery release | Required CI green only; no review of record, no review-loop |
 | Low | Deletions of unused code, test-only, data, `docs/**` | Required CI green + one quick red-team pass: one exact-head APPROVE from a qualified non-author reviewer (any family), `--risk low` |
 | Medium | Ordinary code changes | Required CI + one cross-family review |
-| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review at critical depth (Opus or Sol) |
+| High | CI workflows, launchers, publishing/merge gates, secrets/credential handling, security tooling, installers, dependency files | Required CI + one exact-head cross-family review at critical depth (Sol, Opus or Neon) |
 | Ukrainian content | Learner-facing Ukrainian text | Gemini via AGY with Sources, seated by the [Ukrainian profile](ukrainian.md); deletions of learner-facing content keep this tier |
 
 The tier comes from the files changed, never from the author. The path-to-tier table lives in
@@ -49,14 +49,15 @@ requires a recorded APPROVE and the other merge gates. The author fixes a break-
 and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
-change. At `critical` the resolver seats only Opus or Sol; at `high` it seats Sol, then Opus,
-then Gemini 4 Neon High for code (GEMINI-TIERS-1119). For `code` and `infra` reviews the
+change. At `critical` and `high` the resolver seats Sol, Opus and Gemini 4 Neon High for code and
+infra (NEON-SOLTIER-1120: Neon sits after Sol and Opus on critical and alongside the Opus seats on
+high). For `code` and `infra` reviews the
 security-path classifier (`lu_machinery/review/security_paths.py`) is a floor: a change touching
 one of its paths, either name of a rename or a deletion included, is reviewed at `critical`
 whatever risk was passed. Nothing lowers that floor.
 
 One exact-head cross-family review per change (owner decision C-5345, 2026-11-12).
-Critical risk keeps an Opus or Sol reviewer. High risk takes Sol, then Opus, then Gemini 4 Neon High (GEMINI-TIERS-1119). There is no second review.
+Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120). There is no second review.
 
 ## 3. Findings
 

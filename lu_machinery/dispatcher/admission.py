@@ -21,11 +21,16 @@ def record_refusal(args, agent: str, reason: StartRefusal, *, task_id: str | Non
     """Keep an operational admission refusal while preserving the CLI error and its exit code."""
     try:
         yield
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError) as refusal_exc:
         if agent in providers.PROVIDERS and not (args.dry_run or args.print_advisory_binding):
             try:
                 store.record_admission_refusal(
-                    task_id or args.task_id, agent, vars(args), reason, hold=hold,
+                    task_id or args.task_id,
+                    agent,
+                    vars(args),
+                    reason,
+                    hold=hold,
+                    detail=str(refusal_exc),
                 )
             except (OSError, store.TaskRecordError) as exc:
                 logging.getLogger(__name__).warning("could not record pre-start refusal: %s", type(exc).__name__)

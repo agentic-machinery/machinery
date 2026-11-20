@@ -1316,7 +1316,7 @@ def test_extracted_seat_boundary_paths_preserve_subject_exclusion(path, seat):
                     claude_account=HOST_ACCOUNT,
                 )
             )
-            assert result.selected is None and result.fail_closed_reason
+            assert result.selected is not None and result.selected.name == "gemini-4-neon-high"
             assert any(
                 entry.status == "excluded" and "subject seat claude" in (entry.reason or "")
                 for entry in result.trace
@@ -1720,8 +1720,8 @@ _SOL_UNAVAILABLE = {"codex": "unhealthy"}
 
 _HIGH_DENOMINATOR = {
     (author, sol, profile): (
-        # Neon follows Sol and Opus at high and holds no infra profile (GEMINI-TIERS-1119).
-        (CURRENT_SOL if sol == "healthy" else ("gemini-4-neon" if profile == "code" else None))
+        # Neon sits alongside Opus at high for both code and infra (NEON-SOLTIER-1120).
+        (CURRENT_SOL if sol == "healthy" else "gemini-4-neon")
         if author in {"claude-opus-5-5", "claude-sonnet-5-5"}
         else (
             CURRENT_SOL
@@ -1840,6 +1840,67 @@ def test_security_floor_cannot_be_bypassed_by_pin_custom_ladder_or_direct_evalua
     assert pinned.selected is None and pinned.fail_closed_reason
 
 
+@pytest.mark.usefixtures("configured_roots")
+@pytest.mark.parametrize("profile", ["code", "infra"])
+def test_critical_ladder_admits_neon_for_non_google_authors_and_excludes_google_authors(profile):
+    """CTO-approved NEON-SOLTIER-1120 defect class: Neon blocked on critical/security/infra or admitted same-family."""
+    critical_names = [candidate.name for rung in REVIEW_LADDERS["critical"] for candidate in rung]
+    assert critical_names == [
+        "openai_frontier_b",
+        "openai_frontier",
+        "claude-opus-5-5",
+        "claude-opus-5-5-agy",
+        "gemini-4-neon-high",
+    ]
+    high_names = [candidate.name for rung in REVIEW_LADDERS["high"] for candidate in rung]
+    assert high_names == [
+        "openai_frontier_b",
+        "openai_frontier",
+        "claude-opus-5-5",
+        "gemini-4-neon-high",
+        "claude-opus-5-5-agy",
+    ]
+    # Non-Google authors: Sol/Opus stay primary when healthy, and Neon fills critical/security when they are down.
+    anthropic_down = resolve_reviewer(
+        ResolverInputs(
+            author_model="claude-opus-5-5",
+            review_profile=profile,
+            risk="low",
+            changed_paths=("lu_machinery/dispatcher/admission.py",),
+            routing_snapshot={"codex": "unhealthy"},
+            claude_account=HOST_ACCOUNT,
+        )
+    )
+    assert anthropic_down.resolved_risk == "critical"
+    assert anthropic_down.selected is not None and anthropic_down.selected.name == "gemini-4-neon-high"
+
+    openai_claude_excluded = resolve_reviewer(
+        ResolverInputs(
+            author_model=CURRENT_SOL,
+            review_profile=profile,
+            risk="critical",
+            subject_seats=frozenset({"claude"}),
+            claude_account=HOST_ACCOUNT,
+        )
+    )
+    assert openai_claude_excluded.resolved_risk == "critical"
+    assert openai_claude_excluded.selected is not None and openai_claude_excluded.selected.name == "gemini-4-neon-high"
+
+    # Google author: Neon is still excluded as same-family.
+    google_author = resolve_reviewer(
+        ResolverInputs(
+            author_model="gemini-4-neon-high",
+            review_profile=profile,
+            risk="critical",
+            claude_account=HOST_ACCOUNT,
+        )
+    )
+    assert google_author.selected is not None and google_author.selected.family != "google"
+    neon_rows = [entry for entry in google_author.trace if entry.name == "gemini-4-neon-high"]
+    assert len(neon_rows) == 1 and neon_rows[0].status == "excluded"
+    assert "same family as author" in (neon_rows[0].reason or "")
+
+
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("launcher_path", ["lu_machinery/dispatch.py", "scripts/delegate.py"])
 def test_changed_paths_take_precedence_over_security_owned_paths(launcher_path):
@@ -1877,8 +1938,8 @@ def test_security_subject_seat_exclusion_still_binds(launcher_path):
         )
     )
     assert result.resolved_risk == "critical"
-    # Grok was the remaining critical reviewer; it is retired (GROK-CANCEL-1110), so the resolver fails closed.
-    assert result.selected is None
+    # NEON-SOLTIER-1120: Claude remains excluded by subject seat; Neon fills critical review.
+    assert result.selected is not None and result.selected.name == "gemini-4-neon-high"
     assert all(entry.status == "excluded" for entry in result.trace if entry.family == "anthropic")
 
 
@@ -2152,18 +2213,19 @@ def test_complete_author_set_excludes_every_member_not_only_the_latest():
     assert {scope.reviewer_family: scope.commits for scope in complete.review_scopes} == {
         "anthropic": ("b" * 40,), "openai": ("a" * 40,),
     }
-    # Grok is retired (GROK-CANCEL-1110); an xAI member still leaves no reviewer at critical.
-    assert _complete({"anthropic", "openai", "xai"}, risk="critical").selected is None
+    # NEON-SOLTIER-1120: Neon covers critical when Anthropic, OpenAI and xAI authored the branch; adding Google leaves none.
+    assert _complete({"anthropic", "openai", "xai"}, risk="critical").selected.name == "gemini-4-neon-high"
+    assert _complete({"anthropic", "openai", "xai", "google"}, risk="critical").selected is None
 
 
 @pytest.mark.usefixtures('configured_roots')
 def test_single_author_fields_add_to_the_complete_set_and_never_shrink_it():
     # The single field names a family outside the set; both stay excluded.
-    resolution = _complete({"anthropic", "xai"}, author_model=CURRENT_SOL, risk="critical")
+    resolution = _complete({"anthropic", "xai", "google"}, author_model=CURRENT_SOL, risk="critical")
     assert resolution.selected is None and resolution.fail_closed_reason is None
     # An explicit override cannot replace the set either.
     overridden = _complete(
-        {"openai", "xai"}, author_model="claude-opus-5-5", author_family="anthropic", risk="critical"
+        {"openai", "xai", "google"}, author_model="claude-opus-5-5", author_family="anthropic", risk="critical"
     )
     assert overridden.selected is None
 

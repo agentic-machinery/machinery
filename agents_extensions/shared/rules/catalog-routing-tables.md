@@ -30,11 +30,12 @@ Rank follows the catalog; entries at the same rank are peers.
 | critical | 2 | openai_frontier | gpt-6.2-sol |
 | critical | 3 | claude-opus-5-5 | claude-opus-5-5 |
 | critical | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
+| critical | 5 | gemini-4-neon-high | gemini-4-neon |
 | high | 1 | openai_frontier_b | gpt-6.2-sol |
 | high | 2 | openai_frontier | gpt-6.2-sol |
 | high | 3 | claude-opus-5-5 | claude-opus-5-5 |
-| high | 4 | claude-opus-5-5-agy | claude-opus-5-5 |
-| high | 5 | gemini-4-neon-high | gemini-4-neon |
+| high | 4 | gemini-4-neon-high | gemini-4-neon |
+| high | 5 | claude-opus-5-5-agy | claude-opus-5-5 |
 | medium | 1 | openai_frontier_b | gpt-6.2-sol |
 | medium | 2 | openai_frontier | gpt-6.2-sol |
 | medium | 3 | claude-opus-5-5 | claude-opus-5-5 |

@@ -330,7 +330,7 @@ def test_explicit_review_risk_selected_agy_cannot_bypass_declaration(monkeypatch
 @pytest.mark.parametrize("risk", ["low", "medium"])
 @pytest.mark.parametrize("path_kind", ["changed", "owned"])
 def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
-    """D5/D6: declared low risk never bypasses a security floor or attempt identity."""
+    """D5/D6: declared low risk raises security paths to critical; Neon is admitted while Sonnet stays refused."""
     request = {
         "model": "gemini-4-neon-high",
         "mode": "read-only",
@@ -346,9 +346,16 @@ def test_explicit_review_risk_security_floor_excludes_agy(risk, path_kind):
     )
     assert (ordinary_target.recipient, ordinary_target.model) == ("agy", "gemini-4-neon-high")
 
+    (security_target,) = resolve_and_admit(
+        ("agy",), **request, **{scope_argument: ("scripts/delegate.py",)},
+    )
+    assert (security_target.recipient, security_target.model) == ("agy", "gemini-4-neon-high")
+
     with pytest.raises(ReviewAdmissionRefused, match="REVIEW_ATTEMPT_IDENTITY_REFUSED"):
         resolve_and_admit(
-            ("agy",), **request, **{scope_argument: ("scripts/delegate.py",)},
+            ("claude",),
+            **{**request, "model": "claude-sonnet-5-5"},
+            **{scope_argument: ("scripts/delegate.py",)},
         )
 
 

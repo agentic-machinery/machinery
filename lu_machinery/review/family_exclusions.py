@@ -6,9 +6,8 @@ no role resolver invents a second family policy or ranking engine.
 
 from __future__ import annotations
 
-# #10073, GEMINI-TIERS-1119: native AGY Gemini code review admits these risks.
-# Critical risk, and security paths (raised to critical), exclude Gemini.
-GEMINI_CODE_REVIEW_RISKS = frozenset({"low", "medium", "high"})
+# #10073, NEON-SOLTIER-1120: native AGY Gemini code review is admitted at every
+# risk tier, including critical and security paths; non-AGY routes stay excluded.
 
 
 def family_exclusion(
@@ -27,9 +26,9 @@ def family_exclusion(
         if family in {"moonshot", "deepseek"}:
             return "excluded", "code-review family exclusions"
         if (family == "google" or (route == "agy" and family != "anthropic")) and not (
-            family == "google" and route == "agy" and transport == "agy" and risk in GEMINI_CODE_REVIEW_RISKS
+            family == "google" and route == "agy" and transport == "agy"
         ):
-            return "excluded", "Gemini code review requires AGY at low, medium or high risk (#10073)"
+            return "excluded", "Gemini code review requires the native AGY route (#10073)"
         return None
     reviewer_family = family
     family = author_family

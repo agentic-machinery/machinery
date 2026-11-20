@@ -104,8 +104,8 @@ review_scheduler:
   profile_risk_role_order:
     code:
       critical: [critical_review]
-      # GEMINI-TIERS-1119: critical_review precedes long_context_review so
-      # Neon reviews high-risk code only after the OpenAI and Anthropic seats.
+      # NEON-SOLTIER-1120 (operator 2026-11-20): Neon holds critical_review
+      # alongside Opus 5.5 and Sol 6.2.
       high: [strong_review, standard_review, critical_review, long_context_review]
       medium: [standard_review, strong_review, long_context_review, routine_review, critical_review]
       low: [routine_review, standard_review, strong_review, long_context_review, critical_review]
@@ -149,9 +149,9 @@ review_scheduler:
   # performed only by these models, on any catalogued review route (Opus 5.5
   # natively; no Claude model through Cursor, #10464). This is an eligibility gate: ladders, explicit
   # pins, custom ladders and delegate review admission all apply it.
-  # GEMINI-TIERS-1119 (operator 2026-11-19): Gemini 4 Neon is an Opus-tier
-  # seat and reviews high-risk code after the OpenAI and Anthropic seats.
-  # Critical and security-path reviews still exclude Gemini.
+  # NEON-SOLTIER-1120 (operator 2026-11-20): Gemini 4 Neon High is a peer of
+  # Opus 5.5 and Sol 6.2 for code and infra review at every risk tier,
+  # including critical and security paths.
   risk_reviewer_models:
     high:
     - {role: openai_frontier_coder}
@@ -731,8 +731,8 @@ models:
       Use for well-scoped everyday work, bug fixes, and polished English reports,
       runbooks, write-ups, PR/issue prose, decks, spreadsheets, and design review.
       Route authoring of security-sensitive code (hooks/guards, launchers, credential or secret
-      handling, dispatch admission, sandbox/permission logic) to Opus 5.5 or
-      Codex Sol. Ukrainian curriculum content stays with sanctioned language
+      handling, dispatch admission, sandbox/permission logic) to Opus 5.5,
+      Codex Sol or Gemini 4 Neon High. Ukrainian curriculum content stays with sanctioned language
       lanes; use Opus 5.5 for the Claude lane. For security-sensitive diffs
       (hooks/guards, launchers, credential or secret handling, dispatch admission,
       sandbox/permission logic), resolve the reviewer with --risk critical, which
@@ -817,7 +817,7 @@ models:
     tier: frontier_practical
     lifecycle: active
     runtime_model_ids: [gemini-4-neon-low, gemini-4-neon-medium, gemini-4-neon-xhigh]
-    roles: [advisory, long_context_review, ukrainian_review]
+    roles: [orchestration, implementation, agentic_coding, advisory, long_context_review, critical_review, ukrainian_review]
     transports: [agy]
     strengths: [listed_agy_selector, one_million_token_context, four_thinking_levels]
     weaknesses: [provider_listing_is_not_qualification]
@@ -828,9 +828,13 @@ models:
       medium for even PR numbers. For non-PR work, use the first hex digit of
       the stable task ID's SHA-256, with the same parity rule. Without a stable
       ID use high, the AGY wire default. Pass the exact selector in each
-      dispatch for supplemental work. Native formal code review uses Neon High
-      at low, medium or high risk (high after the OpenAI and Anthropic seats,
-      GEMINI-TIERS-1119) and excludes critical and security paths. Ukrainian review uses
+      dispatch for supplemental work. NEON-SOLTIER-1120 (operator 2026-11-20):
+      native formal review admits Neon High for code and infra at every risk
+      tier, including critical and security paths, as a peer of Opus 5.5 and
+      Sol 6.2 (after Sol and Opus on critical, alongside the Opus seats on high,
+      unchanged on medium and low). Neon is also a peer of Opus 5.5 and Sol 6.2
+      for hard coding, security-sensitive code authoring and stream driving;
+      designated approval stays Opus 5.5 and Sol 6.2. Ukrainian review uses
       Neon High with the Sources MCP and VESUM. ACP consultation pins Neon High.
       Google's
       AA Index v5.0.1 chart shows Neon high
@@ -1367,7 +1371,7 @@ review_candidates:
 
 # Fleet-comms stream orchestrator seats (#5512 / #4707 / #5703). These lanes may own a
 # cold-start loop (prioritize → delegate → CF → merge-in-lane).
-# Native AGY reviews low/medium/high code in an exact-head worktree; its ACP wrapper cannot consume the
+# Native AGY reviews code and infra at every risk tier in an exact-head worktree; its ACP wrapper cannot consume the
 # parent-owned sealed MCP. Grok reviews through Cursor and holds no driver seat;
 # Kimi: web, UI and backend coding only, never review.
 # Parallel escalate ladder (user 2026-07-22): practical default + authority deep.
@@ -1440,7 +1444,7 @@ formal_cf_defaults:
       - {role: legacy_reviewers, seat: anthropic_practical}
       - {role: anthropic_authority_reviewer}
   agy:
-    # #10073, GEMINI-TIERS-1119: native low/medium/high code review; Ukrainian review needs Sources MCP.
+    # #10073, NEON-SOLTIER-1120: native code/infra review at every risk tier; Ukrainian review needs Sources MCP.
     model_id: {role: legacy_reviewers, seat: google_bounded}
     effort: high
     formal_review_eligible: true
@@ -1456,15 +1460,16 @@ review_ladders:
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}]
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}]
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}]
+    - [{role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}]
   # High lists only review_scheduler.risk_reviewer_models.high (#9538): when
   # no seat is eligible the resolver returns no reviewer with a stated reason.
-  # Neon follows the OpenAI and Anthropic seats (GEMINI-TIERS-1119).
+  # Neon sits alongside the Opus seats (NEON-SOLTIER-1120).
   high:
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}]
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}]
     - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: native, field: legacy_label}]
-    - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}]
     - [{role: legacy_reviewers, seat: google_bounded, route_name: native, field: legacy_label}]
+    - [{role: anthropic_authority_reviewer, seat: anthropic_authority, route_name: agy, field: legacy_label}]
   medium: &practical_first_code_review
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native_b, field: legacy_label}]
     - [{role: openai_frontier_coder, seat: openai_frontier, route_name: native, field: legacy_label}]
@@ -1646,7 +1651,7 @@ seats:
     routes:
       native:
         legacy_name: gemini-4-neon-high
-        review_profiles: [code]
+        review_profiles: [code, infra]
         capabilities: [code_review]
         health_keys: [agy, gemini]
         route: agy
@@ -1715,8 +1720,8 @@ roles:
     - openai_frontier/native_b
     - openai_frontier/native
     - anthropic_authority/native
-    - anthropic_authority/agy
     - google_bounded/native
+    - anthropic_authority/agy
     cardinality: many
     risk: high
   code_review_critical:
@@ -1725,6 +1730,7 @@ roles:
     - openai_frontier/native
     - anthropic_authority/native
     - anthropic_authority/agy
+    - google_bounded/native
     cardinality: many
     risk: critical
     required_model_roles:

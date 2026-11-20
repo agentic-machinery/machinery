@@ -45,8 +45,7 @@ chosen from the "Code review" row of `model-assignment.md`
 (GLM from the Cloud catalog, Grok, GPT, … — never Kimi; whatever the
 live catalog lists that is outside the author's family and meets
 that Code review routing). Dispatch v2 runs bound review attempts; the procedure is in
-[`formal-review-attempt-isolation.md` § Running a bound attempt](../../../../../docs/runbooks/formal-review-attempt-isolation.md#running-a-bound-attempt). Critical, infra and security
-reviews exclude Gemini; at high risk native AGY Neon follows the OpenAI and Anthropic seats. Ukrainian reviews
+[`formal-review-attempt-isolation.md` § Running a bound attempt](../../../../../docs/runbooks/formal-review-attempt-isolation.md#running-a-bound-attempt). Native AGY Gemini 4 Neon High is admitted for code and infra review at every risk tier, including critical and security paths, as a peer of Sol 6.2 and Opus 5.5 for non-Google authors (NEON-SOLTIER-1120). Ukrainian reviews
 require Sources MCP. The bridge refuses Gemini code reviews. **VPS drivers** may still
 use the existing `ask-<lane>` / `dispatch.py` review path below; the landing order
 in §7 is the same.
