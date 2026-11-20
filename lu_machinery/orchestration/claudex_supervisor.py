@@ -609,7 +609,7 @@ class ClaudexSupervisor:
         current: dict[str, Any] = {}
         if self.runtime_path.exists():
             current = load_runtime(self.state_root, self.run_id)
-        payload = {
+        payload: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "run_id": self.run_id,
             "state": state,

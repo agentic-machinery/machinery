@@ -101,7 +101,7 @@ env:
   # uv-managed CPython only, the build the host runs; never the runner's own.
   UV_PYTHON_PREFERENCE: only-managed
   RUFF_VERSION: "0.15.21"
-  MYPY_VERSION: "2.1.0"
+  MYPY_VERSION: "2.4.0"
   ZIZMOR_VERSION: "1.31.1"
   PIP_AUDIT_VERSION: "2.10.1"
   ACTIONLINT_VERSION: "1.7.12"
