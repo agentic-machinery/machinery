@@ -226,8 +226,8 @@ def test_py_test_and_pytest_dedupe_to_one_package(tmp_path: Path, monkeypatch: p
         repo, tasks_dir=tmp_path / "no-tasks", state_dir=tmp_path / "state", python_exe=bin_dir / "python"
     )
     assert ok is False
-    assert "py.test" not in message.split("force-reinstall", 1)[1]  # not suggested as an install target
-    assert message.count(" pytest") >= 1
+    listed = message.split("includes ", 1)[1].split(":", 1)[0].split()
+    assert listed == ["pytest"]
 
 
 # ---------------------------------------------------------------------------

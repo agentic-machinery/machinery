@@ -68,14 +68,8 @@ _RELEASE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 _REQUIREMENT_HEAD = re.compile(
     r"([A-Za-z0-9_.-]+)(\[[A-Za-z0-9_,.-]+\])?==([A-Za-z0-9.*!+_]+)$"
 )
-_REQUIREMENT_HASH = re.compile(r"sha256:([0-9a-fA-F]{64})")
-_LOCK_OPTION = (
-    "--index-url",
-    "--extra-index-url",
-    "--find-links",
-    "--trusted-host",
-    "://",
-)
+_REQUIREMENT_HASH = re.compile(r"--hash=sha256:[0-9a-fA-F]{64}\Z")
+_COMMENT = re.compile(r"(^|\s+)#.*$")
 DIST = "lu_machinery"
 RECEIPT_SCHEMA = "lu-clean-machine-drill-receipt/1"
 SUMMARY_SCHEMA = "lu-clean-machine-drill-summary/1"
@@ -231,15 +225,39 @@ def create_venv(python: str, venv: Path, home: Path) -> Path:
     return venv / "bin" / "python"
 
 
+def _pep503_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _lock_stanzas(text: str) -> list[str]:
+    """Logical lines in pip's order: a comment does not swallow the next line."""
     if "\x00" in text:
         raise DrillError("consumer lock contains NUL")
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", " ")
-    return [
-        line.strip()
-        for line in normalized.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    pending: list[str] = []
+    logical: list[str] = []
+    for line in normalized.splitlines():
+        if line.endswith("\\") and not line.lstrip().startswith("#"):
+            pending.append(line[:-1])
+            continue
+        pending.append(line)
+        joined = _COMMENT.sub("", "".join(pending)).strip()
+        pending = []
+        if joined:
+            logical.append(joined)
+    if pending:
+        joined = _COMMENT.sub("", "".join(pending)).strip()
+        if joined:
+            logical.append(joined)
+    return logical
+
+
+def _requirement_and_options(stanza: str) -> tuple[str, list[str]]:
+    tokens = stanza.split()
+    for index, token in enumerate(tokens):
+        if token.startswith("-"):
+            return " ".join(tokens[:index]), tokens[index:]
+    return stanza.strip(), []
 
 
 def extract_consumer_lock(body: str) -> str:
@@ -261,22 +279,33 @@ def extract_consumer_lock(body: str) -> str:
 
 
 def check_consumer_lock(text: str, version: str, wheel_sha256: str) -> None:
-    """Every pin has a sha256, and lu-machinery's hash is the wheel we verified."""
+    """Every pin is hashed, and the one lu-machinery hash is the verified wheel.
+
+    Lines are split the way pip splits a requirements file. A name pip would
+    treat as lu-machinery counts as that pin, and the only options are sha256
+    hashes. The project pin itself has no extras and no environment marker.
+    """
     stanzas = _lock_stanzas(text)
     if not stanzas:
         raise DrillError("consumer lock is empty")
     project: list[str] = []
     for stanza in stanzas:
-        if any(option in stanza for option in _LOCK_OPTION):
+        requirement, options = _requirement_and_options(stanza)
+        if "://" in requirement or any(
+            _REQUIREMENT_HASH.fullmatch(token) is None for token in options
+        ):
             raise DrillError("consumer lock contains a URL or an index option")
-        head = stanza.split()[0]
-        match = _REQUIREMENT_HEAD.fullmatch(head)
-        hashes = [item.lower() for item in _REQUIREMENT_HASH.findall(stanza)]
-        if match is None or not hashes or stanza.count("--hash=") != len(hashes):
+        head, separator, _marker = requirement.partition(";")
+        match = _REQUIREMENT_HEAD.fullmatch(head.strip())
+        hashes = [token.split(":", 1)[1].lower() for token in options]
+        if match is None or match.group(2) or not hashes:
             raise DrillError("consumer lock requirement is not a hashed pin")
-        name = match.group(1).replace("_", "-").lower()
-        if name == "lu-machinery":
-            if match.group(3) != version or hashes != [wheel_sha256.lower()]:
+        if _pep503_name(match.group(1)) == "lu-machinery":
+            if (
+                separator
+                or match.group(3) != version
+                or hashes != [wheel_sha256.lower()]
+            ):
                 raise DrillError(
                     "consumer lock lu-machinery pin does not match this wheel"
                 )
