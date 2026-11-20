@@ -124,8 +124,8 @@ Every Russianism check queries both `search_style_guide` and `search_text` with
 ## P7 — Continuity
 
 - Read the handoff first; its housekeeping and in-flight lines are to-dos. <!-- p7-start: Eo06 -->
-- Run the SessionStart detector's exact commands and never auto-resume. End on the seat's handoff signal. For Gemini/Codex, use the corresponding `session_canary.{gemini,codex}_lane` mint and score procedure within the `thread-rollover` skill and end on FAIL-HANDOFF below 8/10. Claude/Sonnet use native SessionStart/PostCompact and thread-handoff. Stop on a failed handoff. <!-- p7-health: W29 -->
-- Before ending, record the handoff, lessons and Fleet receipt in one full-content `handoff_note` for the lane. The newest active lane DB note is the handoff content authority through every plane mode. Run `lu-driver-state render --lane <lane>`, then `lu-driver-state show <id>` to read it. Obtain every timestamp from `date -u`. <!-- p7-end: W28 -->
+- Run the SessionStart detector's exact commands and never auto-resume. End on the seat's handoff signal, not compact count. For Gemini/Codex, use the corresponding `session_canary.{gemini,codex}_lane` mint and score procedure only within the `thread-rollover` skill and end on FAIL-HANDOFF below 8/10. Claude/Sonnet use native SessionStart/PostCompact and thread-handoff. Stop on a failed handoff. <!-- p7-health: W29 -->
+- Before ending, record the handoff, lessons and Fleet receipt in a full-content lane DB `handoff_note`. The newest active note is authoritative through every plane mode. Read it with `lu-driver-state render --lane <lane>` and `lu-driver-state show <id>`. Write supplemental briefs as `docs/session-state/<date>-<slug>-brief.md` (2–5 KB, YAML frontmatter, bullet list). Never use tracked scratch. HTML companions need an explicit request or major milestone. Use `current.md` only to find the agent-specific brief. Read its `.html` only if the brief points there. Use `date -u` for timestamps. <!-- p7-end: W28 -->
 
 ## P8 — Operational security
 

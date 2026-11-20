@@ -280,8 +280,8 @@ def test_2026_11_02_relaunch_resumes_the_lane_packet_and_mints_ten_anchors(tmp_p
     assert "no readable active DB handoff note for lane curriculum-upgrade" in capsys.readouterr().err
 
     monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane) or note)
-    monkeypatch.setattr(handoff_select, "_read_driver_state", lambda _cli, verb, note_id: note
-                        if (verb, note_id) == ("show", "C-4170") else None)
+    monkeypatch.setattr(handoff_select, "_read_driver_state", lambda _cli, *args: note
+                        if args == ("show", "--", "C-4170") else None)
     assert codex_lane.main(mint) == 0
     assert reads == ["curriculum-upgrade"] * 2
     facts = json.loads((epic / "canary/facts.json").read_text())

@@ -673,7 +673,7 @@ def test_fetch_newest_handoff_note_reads_one_lane(tmp_path: Path, monkeypatch: p
         _note("C-0001", "2026-11-01 10:00:00+00:00"),
         _note("C-0003", "2026-11-03 10:00:00+00:00", status="dropped"),
         _note("C-0006", "2026-11-06 10:00:00+00:00", status="done"),
-        _note("C-0004", "2026-11-04 10:00:00+00:00", owner="claude-atlas"),
+        _note("C-0004", "2026-11-04 10:00:00+00:00", owner="claude-atlas", status="paused"),
         _note("C-0005", "2026-11-05 10:00:00+00:00", lane="infra"),
         _note("C-0002", "2026-11-02 20:23:39.965370+00:00"),
     ]
@@ -723,7 +723,7 @@ def _assert_db_note_mint(lane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     assert calls == [
         ("list", "--lane", "atlas", "--kind", "handoff_note", "--json"),
-        ("show", "C-4170"),
+        ("show", "--", "C-4170"),
     ]
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
     assert meta["handoff"] is None

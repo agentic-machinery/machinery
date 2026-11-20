@@ -304,12 +304,12 @@ def _note_created(note: Mapping[str, object]) -> datetime | None:
 
 
 def _read_driver_state(cli: str, *args: str) -> object:
+    command = [cli, *args]
     try:
         result = subprocess.run(
-            [cli, *args], capture_output=True, text=True, encoding="utf-8",
-            timeout=DRIVER_STATE_TIMEOUT_SECONDS, check=False,
+            command, capture_output=True, text=True, timeout=DRIVER_STATE_TIMEOUT_SECONDS, check=False
         )
-    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         _warn(f"driver-state handoff_note unavailable ({type(exc).__name__})")
         return None
     if result.returncode != 0:
@@ -326,9 +326,9 @@ def _active_lane_note(item: dict[str, object], lane: str) -> bool:
     return (
         item.get("lane") == lane
         and item.get("kind") == "handoff_note"
-        and item.get("status") in ("open", "in_progress", "blocked")
-        and isinstance(note_id := item.get("id"), str)
-        and bool(re.fullmatch(r"C-[0-9]+", note_id))
+        and isinstance(status := item.get("status"), str)
+        and status not in ("done", "dropped")
+        and isinstance(item.get("id"), str)
         and isinstance(statement := item.get("statement"), str)
         and bool(statement.strip())
         and _note_created(item) is not None
@@ -399,7 +399,7 @@ def _read_newest_handoff_note(lane: str) -> dict[str, object] | None:
     if listed is None or cli is None:
         return None
     note_id = str(listed["id"])
-    note = _read_driver_state(cli, "show", note_id)
+    note = _read_driver_state(cli, "show", "--", note_id)
     if isinstance(note, dict) and note.get("id") == note_id and _active_lane_note(note, lane):
         return note
     return None
