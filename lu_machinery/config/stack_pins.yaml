@@ -1,6 +1,6 @@
 ---
 # Components Dependabot does not update. review_by is the next review, not an expiry.
-# Agent CLIs: 2026-10-30. Every other row: 2026-11-16.
+# Agent CLIs: 2026-10-30. uv: 2026-12-20 (reviewed 2026-11-20). Every other row: 2026-11-16.
 # pinned: unknown and source: host means the repository does not pin a version.
 pins:
   - name: claude-code
@@ -40,11 +40,11 @@ pins:
     review_by: "2026-11-16"
     note: The GitHub CLI is installed on the host. The repo does not pin a version.
   - name: uv
-    pinned: "0.12.9"
-    source: .github/actions/python-ci-env/action.yml
+    pinned: "0.13.9"
+    source: .github/workflows/pins.txt
     owner: DevOps
-    review_by: "2026-11-16"
-    note: version input of astral-sh/setup-uv. The action SHA is Dependabot's.
+    review_by: "2026-12-20"
+    note: UV_VERSION in .github/workflows/pins.txt and required-version in pyproject.toml (reviewed 2026-11-20); passed to .github/actions/uv-python/action.yml.
   - name: python
     pinned: "3.12.15"
     source: .python-version
