@@ -44,9 +44,9 @@ policy calls learner content, is never Trivial.
 
 **Low is one quick red-team pass.** The reviewer tries to break the change and reports only
 break-it findings, each a P0-P2 reproducible failure (command, input, wrong output), never style
-or "consider". A recorded APPROVE, or a reply with no break-it finding (recorded as an approval),
-lets the PR land. A break-it finding is fixed, and the same reviewer confirms the fix in one delta round; that is the whole Low
-budget.
+or "consider". If the reviewer finds no break-it failure, the reviewer gives APPROVE. Landing
+requires a recorded APPROVE and the other merge gates. The author fixes a break-it finding,
+and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
 change. At `critical` the resolver seats only Opus or Sol; at `high` it seats Sol, then Opus,
