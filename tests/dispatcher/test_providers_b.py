@@ -1325,15 +1325,16 @@ def test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant(tm
             (tmp_path / "repo/data" / name).unlink()
     shared, tasks = read_roots()
     tasks.mkdir(parents=True, exist_ok=True)
-    prior = tasks / "context.result"
-    prior.write_text("prior evidence\n")
+    own = tasks / "holds.inputs" / "context.txt"
+    own.parent.mkdir()
+    own.write_text("task input\n")
     skill = shlex.quote(str(shared / "skills/takeover/SKILL.md"))
     attempts = (
         "echo x >> README.md; echo x >> data/sources.db; touch new; rm -f README.md; "
         "git -c user.email=s@example.invalid -c user.name=S commit -q --allow-empty -m x; "
         "git config --get-regexp 'remote|credential' >&2; git log --oneline -1 >/dev/null || echo nolog >&2; "
         f"cat {skill} >/dev/null || exit 5; "
-        'cat "$LU_TASKS_DIR/context.result"; echo overwrite >> "$LU_TASKS_DIR/context.result"; '
+        'cat "$LU_TASKS_DIR/holds.inputs/context.txt"; echo overwrite >> "$LU_TASKS_DIR/holds.inputs/context.txt"; '
         "echo scratch > $TMPDIR/ok && cat $TMPDIR/ok"
     )
     argv, env = _launch(tmp_path, worktree, "holds", ["/bin/sh", "-c", attempts])
@@ -1341,8 +1342,8 @@ def test_agy_read_only_boundary_holds_the_worktree_and_kills_every_descendant(tm
     receipt = json.loads((tmp_path / "holds.sandbox.json").read_text())
     assert (run.returncode, receipt["status"]) == (0, "ran"), (receipt.get("reason"), run.stderr)
     assert receipt["canary"]["passed"] is True
-    assert run.stdout.splitlines() == ["prior evidence", "scratch"]
-    assert prior.read_text() == "prior evidence\n"
+    assert run.stdout.splitlines() == ["task input", "scratch"]
+    assert own.read_text() == "task input\n"
     assert run.stderr.count("Read-only file system") >= 4
     assert "marker" not in run.stderr and "nolog" not in run.stderr
     assert receipt["input"] == {"start": {"head": head, "clean": True}, "end": {"head": head, "clean": True}}

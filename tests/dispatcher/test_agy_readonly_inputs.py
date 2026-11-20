@@ -403,6 +403,33 @@ def test_ro_bind_records_digest(tmp_path, monkeypatch, capsys, configured_roots)
     assert count is None and error == "agy_read_only_boundary: input digest mismatch"
 
 
+def test_read_only_agy_cannot_read_sibling_task_records(tmp_path, monkeypatch, configured_roots):  # noqa: F811
+    """Defect class: the task store exposes sibling records, results, or artifacts."""
+    if not _bwrap_usable():
+        pytest.skip("needs a usable unprivileged bubblewrap")
+    _, worktree = _linked_worktree(tmp_path)
+    tasks = tmp_path / "tasks with spaces"
+    tasks.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    own = tasks / "agy-mask.inputs" / "packet.txt"
+    own.parent.mkdir()
+    own.write_text("own packet\n")
+    for entry in ("agy-mask.json", "sibling.json", "sibling.result", "sibling.artifacts/notes.txt"):
+        path = tasks / entry
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("fixture\n")
+
+    script = (
+        'set -eu; '
+        'test "$(ls -A "$LU_TASKS_DIR")" = agy-mask.inputs; '
+        'cat "$LU_TASKS_DIR/agy-mask.inputs/packet.txt" README.md'
+    )
+    argv, env = _launch(tmp_path, worktree, "agy-mask", ["/bin/sh", "-c", script], [])
+    run = subprocess.run(argv, env=env, cwd=worktree, capture_output=True, text=True, timeout=90, check=False)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "own packet\nreviewed\n"
+
+
 def test_refuses_when_digest_changes_before_start(tmp_path, monkeypatch):
     """Defect class: a swapped file is still mounted."""
     repo, worktree = _linked_worktree(tmp_path)
