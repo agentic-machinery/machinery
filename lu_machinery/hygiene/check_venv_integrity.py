@@ -287,10 +287,18 @@ def check_venv_integrity(
     if broken_scripts:
         detail = ", ".join(f"{b['script']} -> {b['interpreter']}" for b in broken_scripts)
         packages = sorted({_SCRIPT_PACKAGE_ALIASES.get(b["script"], b["script"]) for b in broken_scripts})
+        # The export is the locked closure, not a name on PyPI. pip then refuses
+        # every requirement that has no hash. This function only prints it.
+        repair = (
+            "uv export --locked --format requirements.txt --no-emit-project "
+            "--no-default-groups --all-extras --all-groups --no-header -o repair.txt && "
+            f"{exe} -m pip install --require-hashes --only-binary=:all: "
+            "--force-reinstall --no-deps -r repair.txt"
+        )
         reasons.append(
             f"{len(broken_scripts)} console-script launcher(s) don't match the venv's own interpreter: "
-            f"{detail}. Repair (operator-run, never automated against the primary): "
-            f"{exe} -m pip install --force-reinstall {' '.join(packages)}"
+            f"{detail}. Repair (operator-run, never automated against the primary) "
+            f"reinstalls the locked closure, which includes {' '.join(packages)}: {repair}"
         )
     return False, (
         f"ALERT: venv integrity issue(s) — {'; '.join(reasons)}. "

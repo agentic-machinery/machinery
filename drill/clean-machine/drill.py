@@ -10,7 +10,8 @@ Replace the placeholders with version numbers, without angle brackets.
 
 Steps (``all``):
   1. setup     download both release wheels and SHA256SUMS from GitHub, check the sums,
-               create a fresh venv and install the forward version (dependencies from PyPI);
+               take each release's consumer lock from its notes, and install that lock
+               with ``--require-hashes`` (the wheel from disk, its dependencies from PyPI);
                check every installed file against the wheel's RECORD.
   2. world     build the mock world: a synthetic product checkout with its own bare remote,
                fixture stores, stub command-line tools (gh, systemctl, tmux, sudo, provider CLIs)
@@ -26,7 +27,8 @@ file (``.py``, ``.pyc``, ``.so``, ``.pth``, ``.sh`` or an executed file) whose p
 (accidental dependence on a machinery copy outside the release).
 
 Exit codes: 0 every row passed in both phases; 1 at least one row failed; 2 setup or usage error.
-Network: GitHub release downloads and PyPI only; rows talk only to the loopback stubs.
+Network: GitHub release downloads (wheels, SHA256SUMS, release notes) and PyPI only;
+rows talk only to the loopback stubs.
 This script imports nothing from lu_machinery; it only drives the venv's interpreter.
 """
 
@@ -46,6 +48,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
@@ -56,6 +59,22 @@ from typing import Any, ClassVar
 KIT = Path(__file__).resolve().parent
 RELEASE_URL = (
     "https://github.com/learn-ukrainian/machinery/releases/download/v{version}/{name}"
+)
+RELEASE_API = (
+    "https://api.github.com/repos/learn-ukrainian/machinery/releases/tags/v{version}"
+)
+NOTES_LIMIT = 2 * 1024 * 1024
+_RELEASE_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_REQUIREMENT_HEAD = re.compile(
+    r"([A-Za-z0-9_.-]+)(\[[A-Za-z0-9_,.-]+\])?==([A-Za-z0-9.*!+_]+)$"
+)
+_REQUIREMENT_HASH = re.compile(r"sha256:([0-9a-fA-F]{64})")
+_LOCK_OPTION = (
+    "--index-url",
+    "--extra-index-url",
+    "--find-links",
+    "--trusted-host",
+    "://",
 )
 DIST = "lu_machinery"
 RECEIPT_SCHEMA = "lu-clean-machine-drill-receipt/1"
@@ -108,8 +127,21 @@ def fetch(url: str, dest: Path) -> None:
         shutil.copyfileobj(response, out)
 
 
+def require_release_version(version: str) -> str:
+    """Reject a version that could change the release URL or the wheel path."""
+    if not isinstance(version, str):
+        raise DrillError("release version must be digits.digits.digits")
+    if _RELEASE_VERSION.fullmatch(version) is None:
+        shown = "".join(ch for ch in version[:40] if ch.isprintable())
+        raise DrillError(
+            f"release version must be digits.digits.digits, got {shown!r}"
+        )
+    return version
+
+
 def obtain_wheel(version: str, wheel_dir: Path, offline_dir: Path | None) -> Path:
     """Download (or copy) one release wheel with its SHA256SUMS and check the wheel's sum."""
+    version = require_release_version(version)
     target = wheel_dir / f"v{version}"
     target.mkdir(parents=True, exist_ok=True)
     name = wheel_name(version)
@@ -199,7 +231,125 @@ def create_venv(python: str, venv: Path, home: Path) -> Path:
     return venv / "bin" / "python"
 
 
-def install_wheel(py: Path, wheel: Path, home: Path) -> None:
+def _lock_stanzas(text: str) -> list[str]:
+    if "\x00" in text:
+        raise DrillError("consumer lock contains NUL")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\\\n", " ")
+    return [
+        line.strip()
+        for line in normalized.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def extract_consumer_lock(body: str) -> str:
+    """Return the one consumer-lock fence from a GitHub release body."""
+    normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+    marker = "Consumer lock:\n"
+    if normalized.count(marker) != 1:
+        raise DrillError("release notes must contain one consumer lock")
+    rest = normalized.split(marker, 1)[1].lstrip("\n")
+    fence = "```text\n"
+    if not rest.startswith(fence):
+        raise DrillError("release consumer lock must be a text fence")
+    locked, separator, _after = rest[len(fence) :].partition("\n```")
+    if separator == "":
+        raise DrillError("release consumer lock fence is not closed")
+    if not locked.endswith("\n"):
+        locked += "\n"
+    return locked
+
+
+def check_consumer_lock(text: str, version: str, wheel_sha256: str) -> None:
+    """Every pin has a sha256, and lu-machinery's hash is the wheel we verified."""
+    stanzas = _lock_stanzas(text)
+    if not stanzas:
+        raise DrillError("consumer lock is empty")
+    project: list[str] = []
+    for stanza in stanzas:
+        if any(option in stanza for option in _LOCK_OPTION):
+            raise DrillError("consumer lock contains a URL or an index option")
+        head = stanza.split()[0]
+        match = _REQUIREMENT_HEAD.fullmatch(head)
+        hashes = [item.lower() for item in _REQUIREMENT_HASH.findall(stanza)]
+        if match is None or not hashes or stanza.count("--hash=") != len(hashes):
+            raise DrillError("consumer lock requirement is not a hashed pin")
+        name = match.group(1).replace("_", "-").lower()
+        if name == "lu-machinery":
+            if match.group(3) != version or hashes != [wheel_sha256.lower()]:
+                raise DrillError(
+                    "consumer lock lu-machinery pin does not match this wheel"
+                )
+            project.append(stanza)
+    if len(project) != 1:
+        raise DrillError(
+            f"consumer lock must pin lu-machinery once, found {len(project)}"
+        )
+
+
+def fetch_release_body(version: str) -> str:
+    """Download one public release body. The URL is the fixed releases API."""
+    version = require_release_version(version)
+    request = urllib.request.Request(
+        RELEASE_API.format(version=version),
+        headers={
+            "User-Agent": "lu-clean-machine-drill",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected - fixed https GitHub API URL
+            request, timeout=120
+        ) as response:
+            final = urllib.parse.urlparse(response.geturl())
+            if final.scheme != "https" or final.hostname != "api.github.com":
+                raise DrillError("release notes left api.github.com")
+            raw = response.read(NOTES_LIMIT + 1)
+    except urllib.error.HTTPError as exc:
+        raise DrillError(
+            f"release notes for v{version} returned HTTP {exc.code}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise DrillError(f"release notes for v{version} were not fetched") from exc
+    if len(raw) > NOTES_LIMIT:
+        raise DrillError(f"release notes for v{version} exceed {NOTES_LIMIT} bytes")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise DrillError(f"release notes for v{version} are not JSON") from exc
+    body = payload.get("body") if isinstance(payload, dict) else None
+    if not isinstance(body, str):
+        raise DrillError(f"release notes for v{version} have no body")
+    return body
+
+
+def obtain_consumer_lock(
+    version: str, wheel: Path, wheel_dir: Path, offline_dir: Path | None
+) -> Path:
+    """Copy or download the release consumer lock and bind it to this wheel."""
+    version = require_release_version(version)
+    target = wheel_dir / f"v{version}" / "consumer.lock"
+    if not target.exists():
+        if offline_dir is not None:
+            source = offline_dir / f"v{version}" / "consumer.lock"
+            if not source.is_file():
+                raise DrillError(f"--wheel-dir has no {source}")
+            shutil.copyfile(source, target)
+        else:
+            log(f"download v{version} consumer lock")
+            target.write_text(
+                extract_consumer_lock(fetch_release_body(version)), encoding="utf-8"
+            )
+    try:
+        text = target.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise DrillError("consumer lock is not UTF-8") from exc
+    check_consumer_lock(text, version, sha256_file(wheel))
+    return target
+
+
+def install_wheel(py: Path, wheel: Path, lock: Path, home: Path) -> None:
+    """Install the release consumer lock. The local wheel satisfies its pin."""
     run_checked(
         [
             str(py),
@@ -207,15 +357,22 @@ def install_wheel(py: Path, wheel: Path, home: Path) -> None:
             "-m",
             "pip",
             "install",
+            "--disable-pip-version-check",
             "--quiet",
             "--no-input",
+            "--require-hashes",
+            "--only-binary=:all:",
             "--index-url",
             PYPI_INDEX,
-            f"lu-machinery[api,postgres,pytest] @ {wheel.as_uri()}",
+            "--find-links",
+            str(wheel.parent),
+            "--force-reinstall",
+            "--requirement",
+            str(lock),
         ],
         env=base_env(home),
         cwd=py.parent,
-        what=f"pip install {wheel.name}",
+        what=f"pip install --require-hashes {wheel.name}",
     )
 
 
@@ -1863,7 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--wheel-dir",
         type=Path,
-        help="Offline: directory with v<version>/<wheel> and SHA256SUMS",
+        help="Offline: directory with v<version>/<wheel>, SHA256SUMS and consumer.lock",
     )
     parser.add_argument(
         "--python",
@@ -1946,6 +2103,10 @@ def main(argv: list[str] | None = None) -> int:
         wheels = workdir / "wheels"
         forward = obtain_wheel(args.version, wheels, offline)
         previous = obtain_wheel(args.rollback_to, wheels, offline)
+        forward_lock = obtain_consumer_lock(args.version, forward, wheels, offline)
+        previous_lock = obtain_consumer_lock(
+            args.rollback_to, previous, wheels, offline
+        )
         venv = workdir / "venv"
         if venv.exists() and not args.reuse_venv:
             shutil.rmtree(venv)
@@ -1956,7 +2117,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"setup: venv from {base_py}")
             py = create_venv(base_py, venv, home)
         log(f"setup: install v{args.version}")
-        install_wheel(py, forward, home)
+        install_wheel(py, forward, forward_lock, home)
         site = Path(
             run_checked(
                 [
@@ -2003,13 +2164,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not args.forward_only:
             log(f"rollback: install v{args.rollback_to}")
-            install_wheel(py, previous, home)
+            install_wheel(py, previous, previous_lock, home)
             integrity["rollback"] = check_integrity(py, args.rollback_to, home)
             phases["rollback"] = run_isolated_phase(
                 workdir, "rollback", args.rollback_to, isolation, args.only
             )
             log(f"roll-forward: install v{args.version}")
-            install_wheel(py, forward, home)
+            install_wheel(py, forward, forward_lock, home)
             integrity["roll_forward"] = check_integrity(py, args.version, home)
     except (
         DrillError,

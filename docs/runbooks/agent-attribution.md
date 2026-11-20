@@ -42,8 +42,9 @@ The check applies this grammar (the module docstring of
      or prose such as `"-->" in a name`. Write *HTML comment marker* in prose instead.
    - `HTML_BLOCK`: any raw HTML block (`<div>`, `<pre>`, `<details>`, a tag alone on a
      line, …).
-2. **Parse** the LF-normalised message with markdown-it-py's CommonMark preset (pinned
-   `markdown-it-py==4.2.0`, `mdurl==0.1.2`). A **declaration paragraph** is a top-level
+2. **Parse** the LF-normalised message with markdown-it-py's CommonMark preset
+   (`markdown-it-py` 4.2.0 and `mdurl` 0.1.2; the wheel hashes are in `uv.lock`,
+   and the install commands below pass them with `--require-hashes`). A **declaration paragraph** is a top-level
    paragraph (not inside a list, quote, heading, code block or link reference) whose every
    source line is `Key: value` (`[A-Za-z][A-Za-z0-9-]*`, colon, one space, no leading or
    trailing whitespace). Lines come from the parser's line map over `text.split("\n")`,
@@ -238,11 +239,20 @@ and Python setup.
 | `merge_group` | `--merge-group` | `merge_group.base_sha` | `merge_group.head_sha` |
 | `pull_request` | `--pr` | `pull_request.base.sha` | `pull_request.head.sha` |
 
-A missing SHA fails the step in every mode. The job has no project environment, so the
-step installs exactly the locked parser first:
-`pip install --no-deps --only-binary=:all: markdown-it-py==4.2.0 mdurl==0.1.2` (keep in
-step with `requirements-lock.txt`; a test pins the pair). The rest of the checker's import
-closure is the standard library and `scripts/` itself.
+A missing SHA fails the step in every mode. The job has no project environment.
+Install the locked parser with the wheel hashes from machinery `uv.lock`, not by
+version alone. Those hashes are the `wheels` entries for `markdown-it-py` 4.2.0 and
+`mdurl` 0.1.2; replace them when the lock changes:
+
+```bash
+pip install --no-deps --only-binary=:all: --require-hashes \
+  "markdown-it-py==4.2.0" \
+  --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a \
+  "mdurl==0.1.2" \
+  --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+```
+
+The rest of the checker's import closure is the standard library and `scripts/` itself.
 
 - Permissions stay `contents: read`. History comes from the checkout (`fetch-depth: 0`),
   never from API calls. The repository is public, so `refs/pull/N/head` fetches
@@ -261,9 +271,10 @@ closure is the standard library and `scripts/` itself.
 Machinery's required check is the `CI Gate` job in `.github/workflows/ci-gate.yml`.
 That job only reads the other jobs' results, so the checker is its own job,
 `verified-trailer`, and the gate requires it on every event. The job checks out
-full history, installs the pinned `markdown-it-py==4.2.0` and `mdurl==0.1.2`
-wheels, and runs `python -m lu_machinery.ci.check_agent_attribution` with
-`--verified-mode observe`.
+full history, installs the declaration parser with
+`uv sync --locked --no-build --only-group attribution` (the `attribution` group
+in `uv.lock`, which hash-pins `markdown-it-py` 4.2.0 and `mdurl` 0.1.2), and runs
+`python -m lu_machinery.ci.check_agent_attribution` with `--verified-mode observe`.
 
 | Event | Invocation |
 | --- | --- |
