@@ -307,9 +307,9 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     elif case in {"outside", "rename-outside", "history-outside"}:
         assert (record["status"], record["error"]) == ("no_deliverable", "outside_owned_paths: outside.md")
     else:
-        reason = "remote delivery tip does not match snapshot" if replacement else "git fetch failed"
+        reason = "work_not_pushed_or_unknown" if tree == "clean" else "worktree_dirty_or_unknown"
         expected = (("failed", "provider failed") if provider_status == "failed" else
-                    ("no_deliverable", f"owned_paths_verification_failed: {reason}"))
+                    ("no_deliverable", reason))
         assert (record["status"], record["error"]) == expected
         assert "delivery_pr" not in record
         if tree == "clean":
