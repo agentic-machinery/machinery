@@ -57,6 +57,7 @@ report names; no failure leaves a file at its hidden staging name.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import errno
 import json
@@ -1443,7 +1444,13 @@ def apply_settlement(
     Does not delete a worktree, branch, or ``refs/reaper-rescue/`` ref.
     """
     try:
-        lock_target = _record_lock_target(candidate.record, candidate.path)
+        try:
+            lock_target = _record_lock_target(candidate.record, candidate.path)
+        except worktree_claims.WorktreeLockError as exc:
+            if str(exc) == "worktree lock target is not absolute":
+                candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
+                return
+            raise
         with worktree_lock(lock_target, timeout_s=lock_timeout_s):
             try:
                 mtime_ns = candidate.path.stat().st_mtime_ns
@@ -1457,17 +1464,25 @@ def apply_settlement(
             if current is None or current.get("status") != NEEDS_FINALIZE:
                 candidate.action, candidate.skip_reason = "skipped", "record no longer needs_finalize"
                 return
+            owned = _owned_checkout(current)
+            probed = owned if isinstance(owned, str) and owned.strip() else ""
             try:
-                current_target = _record_lock_target(current, candidate.path)
+                fresh = probed or str(candidate.path)
+                if not os.path.isabs(fresh):
+                    raise worktree_claims.WorktreeLockError("worktree lock target is not absolute")
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    Path(fresh).lstat()
+            except ValueError:
+                candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
+                return
             except worktree_claims.WorktreeLockError:
                 candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
                 return
-            if current_target != lock_target:
+            if fresh != lock_target:
                 candidate.action, candidate.skip_reason = "skipped", "worktree lock target changed since classification"
                 return
-            owned = _owned_checkout(current)
-            if isinstance(owned, str) and owned.strip():
-                state = _path_state(owned)
+            if probed:
+                state = _path_state(probed)
                 if state is None:
                     candidate.action, candidate.skip_reason = "skipped", "worktree path state unknown"
                     return
@@ -1796,10 +1811,8 @@ def _record_lock_target(record: Mapping[str, Any], record_path: Path) -> str:
         target = _owned_checkout(record) or str(record_path)
         if not os.path.isabs(target):
             raise worktree_claims.WorktreeLockError("worktree lock target is not absolute")
-        try:
+        with contextlib.suppress(FileNotFoundError, OSError):
             Path(target).lstat()
-        except (FileNotFoundError, OSError):
-            pass
     except ValueError as exc:
         raise worktree_claims.WorktreeLockError("worktree lock target is not absolute") from exc
     return target

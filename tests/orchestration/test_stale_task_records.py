@@ -1033,6 +1033,72 @@ def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir
     assert json.loads(shifted.read_text())["status"] == "needs_finalize"
     assert (repo_b / gone_rel).is_dir()
 
+    # The existence check uses the same anchored string as the lock comparison.
+    # A later checkout answer must not make an absent path authorize the write.
+    split_tasks = tmp_path / "split-tasks"
+    split_tasks.mkdir()
+    repo_empty, repo_live, repo_other = (tmp_path / name for name in ("repo-empty", "repo-live", "repo-other"))
+    repo_empty.mkdir()
+    (repo_live / gone_rel).mkdir(parents=True)
+    repo_other.mkdir()
+    phase = {"apply": False, "n": 0}
+
+    def split_checkout(slug, _phase=phase):
+        if slug != SLUG:
+            return None
+        if not _phase["apply"]:
+            return repo_empty
+        _phase["n"] += 1
+        return repo_live if _phase["n"] <= 2 else repo_other
+
+    monkeypatch.setattr(str_mod, "_repository_checkout", split_checkout)
+    split = _record(
+        split_tasks, "rel-split", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def arm(_candidates, _phase=phase) -> None:
+        _phase["apply"] = True
+
+    split_report = str_mod.settle_stale(
+        split_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=arm,
+    )
+    split_row = _by_file(split_report)["rel-split.json"]
+    assert split_row["action"] == "skipped"
+    assert split_row["skip_reason"] == "worktree path reappeared since classification"
+    assert json.loads(split.read_text())["status"] == "needs_finalize"
+    assert (repo_live / gone_rel).is_dir()
+
+    lost_tasks = tmp_path / "lost-tasks"
+    lost_tasks.mkdir()
+    repo_gone = tmp_path / "repo-gone"
+    repo_gone.mkdir()
+    lost_holder = {"checkout": repo_gone}
+
+    def lost_checkout(slug, _holder=lost_holder):
+        if slug != SLUG:
+            return None
+        return _holder["checkout"]
+
+    monkeypatch.setattr(str_mod, "_repository_checkout", lost_checkout)
+    lost = _record(
+        lost_tasks, "rel-lost", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def drop(_candidates, _holder=lost_holder) -> None:
+        _holder["checkout"] = None
+
+    lost_report = str_mod.settle_stale(
+        lost_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=drop,
+    )
+    lost_row = _by_file(lost_report)["rel-lost.json"]
+    assert lost_row["action"] == "skipped"
+    assert lost_row["skip_reason"] == "worktree path state unknown"
+    assert json.loads(lost.read_text())["status"] == "needs_finalize"
+
 
 # ---------------------------------------------------------------------------
 # archive / restore
