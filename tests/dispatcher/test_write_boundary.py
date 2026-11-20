@@ -65,8 +65,9 @@ def _run(primary, script: str, *extra: str) -> tuple[int, dict]:
 
 def test_review_runs_named_pytest_with_a_real_shared_slot_and_task_local_interpreter(primary, tmp_path, monkeypatch, capfd):
     """Defect: a shared-boundary review lacks the project interpreter or cannot acquire a real host slot."""
-    _, worktree, _ = primary
+    repo, worktree, _ = primary
     pool = tmp_path / "host-pool"
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
     monkeypatch.setenv(test_slots.DIR_ENV, str(pool))
     monkeypatch.setenv(test_slots.COUNT_ENV, "1")
     monkeypatch.setenv(test_slots.ENABLE_ENV, "on")
