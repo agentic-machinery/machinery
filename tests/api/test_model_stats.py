@@ -1001,8 +1001,10 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert "samples.window.until === pageWindow.until" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
-    assert all(token in html for token in ("pareto-class", "pareto-x", "trends-metric", "quota-alerts",
-                                           "Not enough data", "pool_pace", "/subscriptions"))
+    assert all(token in html for token in ("pareto-class", "pareto-x", "trends-metric",
+                                           "Not enough data", "pool_pace", "/subscriptions",
+                                           "Cached snapshot fallback:"))
+    assert "quota-alerts" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
     rank_tasks = rank_root / "tasks"
@@ -1079,6 +1081,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         _record(split_tasks, f"tie-a-{index}", model="gpt-6.2-sol", duration_s=1.001, research_task_family="docs")
         _record(split_tasks, f"tie-b-{index}", model="claude-sonnet-5-5", duration_s=1.002, research_task_family="docs")
         _review(split_tasks, f"pr-only-{index}", "correct", [], pr=500 + index, review_author_model="claude-haiku-5-5")
+        _review(split_tasks, f"pr-zero-{index}", "correct", [], pr=800 + index, review_author_model="gpt-6-luna")
     # Sub-cutoff counts on models qualifying in the other metric stay preserved, never zeroed out (F9).
     for index in range(3):
         _record(split_tasks, f"haiku-w-{index}", model="claude-haiku-5-5", duration_s=60, research_task_family="docs")
@@ -1109,10 +1112,14 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert split_jobs["docs"]["gpt-6.2-sol"]["frontier"] is True
     assert split_jobs["docs"]["claude-sonnet-5-5"]["frontier"] is False
     assert split_jobs["docs"]["gpt-6.2-sol"]["hours_exact"] < split_jobs["docs"]["claude-sonnet-5-5"]["hours_exact"]
-    # Weekly trends admit a model qualifying in either metric and keep its sub-cutoff counts in the other (F4, F9).
+    # Weekly trends admit a model qualifying in either metric, including zero-write authors (F4, F11), and keep
+    # sub-cutoff counts in the other metric (F9).
     haiku_trends = [t for t in split_charts["trends"] if t["model"] == "claude-haiku-5-5"]
     assert len(haiku_trends) == 1 and haiku_trends[0]["prs"] == 10 and haiku_trends[0]["first_approved"] == 10
     assert haiku_trends[0]["tasks"] == 3 and haiku_trends[0]["landed"] == 2
+    luna_trends = [t for t in split_charts["trends"] if t["model"] == "gpt-6-luna"]
+    assert len(luna_trends) == 1 and luna_trends[0]["prs"] == 10 and luna_trends[0]["first_approved"] == 10
+    assert luna_trends[0]["tasks"] == 0 and luna_trends[0]["landed"] == 0
     opus_trends = [t for t in split_charts["trends"] if t["model"] == "claude-opus-5-5"]
     assert len(opus_trends) == 1 and opus_trends[0]["tasks"] == 10 and opus_trends[0]["prs"] == 3
     assert opus_trends[0]["first_approved"] == 3

@@ -69,8 +69,6 @@
   .coverage dd { margin: 0; font-weight: 600; }
   .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
   .alert { border: 1px solid var(--bad); color: var(--bad); border-radius: 6px; padding: 4px 8px; font-size: 13px; }
-  .alert.quota { border-color: var(--warn); color: var(--warn); text-decoration: none; }
-  .alert.quota.bad { border-color: var(--bad); color: var(--bad); font-weight: 500; }
   .jump-links { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 0; font-size: 13px; }
   details { margin-block: 8px; }
   details summary { cursor: pointer; color: var(--link); font-size: 13px; }
@@ -124,8 +122,6 @@
     <div class="banner" id="recommend">Loading…</div>
     <p class="note" id="waste-note" hidden>Delivery alerts show models that landed under 15% of at least 10 write tasks. Use the interval and job class to judge how much weight to give the alert.</p>
     <div class="alerts" id="waste"></div>
-    <p class="note" id="quota-alerts-note" hidden>Live quota pressure alerts come directly from fresh routing-budget readings (hot, near cap, or projected to run out before reset).</p>
-    <div class="alerts" id="quota-alerts"></div>
     <nav class="jump-links" aria-label="Jump to section">
       <a href="#jobs">Best picks</a>
       <a href="#frontier-section">Value frontier</a>
@@ -523,29 +519,46 @@ function pareto(data) {
       + values(`Landed share and cost values in ${esc(cls)}`, ["Model", "Hours per merge", "Landed %", "Interval", "Tasks", "Landed", "Ranking"], rows, [0, 6]);
   }
   if (axis === "speed") {
-    const rawSpeed = Array.isArray(charts.speed_quality)
+    const legacySpeed = !Array.isArray(charts.speed_quality);
+    const legacyPareto = charts.pareto || [];
+    const hasSpeedLowSample = !legacySpeed || legacyPareto.some((p) => p.speed_low_sample !== undefined);
+    const hasSpeedFrontier = !legacySpeed || legacyPareto.some((p) => p.speed_frontier !== undefined);
+    const rawSpeed = !legacySpeed
       ? charts.speed_quality
-      : (charts.pareto || []).map((p) => ({
+      : legacyPareto.map((p) => ({
         ...p,
         low_sample: p.speed_low_sample !== undefined ? p.speed_low_sample : p.low_sample,
         frontier: p.speed_frontier !== undefined ? p.speed_frontier : false,
       }));
     const allSpeed = rawSpeed.filter((p) => p.median_seconds !== null && p.median_seconds !== undefined && p.median_seconds > 0);
     const shown = allSpeed.filter((p) => keepModel(p.model));
-    if (!shown.length) return '<p class="muted">No model has both timed write durations and a reviewed PR in this window.</p>';
+    if (!shown.length) {
+      return legacySpeed
+        ? '<p class="muted">No model in this cached snapshot\'s cost chart has both timed write durations and a reviewed PR (models without hours per merge may be omitted).</p>'
+        : '<p class="muted">No model has both timed write durations and a reviewed PR in this window.</p>';
+    }
     const frontier = shown.filter((p) => p.frontier);
     const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
     const shownHasEligible = shown.some((p) => !p.low_sample);
-    const frontierNote = frontier.length > 1 ? `The dashed line connects the speed/approval frontier models (${frontierNames}).`
-      : frontier.length === 1 ? `${frontierNames} alone is on the speed/approval frontier among the models shown.`
-        : shownHasEligible ? "None of the models shown is on the window's speed/approval frontier."
-          : `Not enough data for a speed/approval frontier (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
+    const scopeLabel = legacySpeed ? "cost-chart speed/approval frontier" : "speed/approval frontier";
+    const frontierNote = !hasSpeedFrontier
+      ? "This cached snapshot does not include a precomputed speed/approval frontier."
+      : frontier.length > 1 ? `The dashed line connects the ${scopeLabel} models (${frontierNames}).`
+        : frontier.length === 1 ? `${frontierNames} alone is on the ${scopeLabel} among the models shown.`
+          : shownHasEligible ? `None of the models shown is on the window's ${scopeLabel}.`
+            : `Not enough data for a ${scopeLabel} (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
+    const hollowNote = hasSpeedLowSample
+      ? `Hollow markers have fewer than ${lowBelow()} timed writes or reviewed PRs.`
+      : "Hollow markers have a low sample.";
+    const coverageNote = legacySpeed
+      ? "Cached snapshot fallback: limited to models in the cost chart, so this frontier may omit models without landings or usable hours per merge; no composite speed/quality score is computed."
+      : "Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.";
     const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
       + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
       + cell(num(p.prs)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((p) => ({...p, x: p.median_seconds / 60, y: p.approval, ci: p.approval_ci})),
       "chart", "First-round approval", "Median write minutes →", frontier.length > 1)
-      + `<p class="note">Hollow markers have fewer than ${lowBelow()} timed writes or reviewed PRs. ${frontierNote} Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.</p>`
+      + `<p class="note">${hollowNote} ${frontierNote} ${coverageNote}</p>`
       + values("Approval and speed values by model", ["Model", "Median min", "Timed writes", "Approval", "Interval", "Reviewed PRs", "Ranking"], rows, [0, 6]);
   }
   const points = charts.pareto || [];
@@ -1031,8 +1044,6 @@ function routingResponseStale(response, body) {
 }
 async function loadPools(allowance, generation) {
   const node = $("pools");
-  const alertNode = $("quota-alerts");
-  const alertNote = $("quota-alerts-note");
   try {
     const response = await fetch("/api/state/routing-budget", {cache: "no-store"});
     const body = await response.json();
@@ -1042,7 +1053,6 @@ async function loadPools(allowance, generation) {
     const landed = new Map();
     for (const row of allowance || []) landed.set(row.pool, (landed.get(row.pool) || 0) + (row.landed || 0));
     const agents = body.agents || {};
-    const quotaAlerts = [];
     const rows = Object.entries(agents).map(([name, info]) => {
       if (!info || typeof info !== "object") return "";
       const remaining = typeof info.remaining_pct === "number" ? info.remaining_pct : null;
@@ -1051,40 +1061,21 @@ async function loadPools(allowance, generation) {
       const freshness = typeof info.freshness === "string" ? info.freshness : "unknown";
       const laneFresh = !responseStale && freshness === "fresh" && !info.stale;
       const paceObj = info.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
-      const paceFresh = !responseStale && Boolean(paceObj) && paceObj.stale !== true;
-      const stalePacePromoted = Boolean(
-        paceObj && paceObj.stale === true && ["hot", "near_cap"].includes(paceObj.status) && paceObj.status === status,
-      );
-      const statusFresh = laneFresh && !stalePacePromoted;
       const pace = formatPace(paceObj, responseStale);
-      const tone = statusFresh && status === "cool" ? "good" : statusFresh && ["hot", "near_cap"].includes(status) ? "warn" : "";
-      const statusPressure = statusFresh && (status === "near_cap" || status === "hot");
-      const pacePressure = paceFresh && paceObj.pace_reason === "runs_out_before_reset";
-      if (statusPressure || pacePressure) {
-        const parts = [];
-        if (statusPressure) parts.push(status.replaceAll("_", " "));
-        if (laneFresh && remaining !== null) parts.push(`${num(remaining, 1)}% left`);
-        if (pacePressure) parts.push(pace.text);
-        const severe = statusFresh && status === "near_cap";
-        quotaAlerts.push(`<a class="alert quota${severe ? " bad" : ""}" href="#pools-section">${esc(name)}: ${esc(parts.join(" · "))}</a>`);
-      }
+      const tone = laneFresh && status === "cool" ? "good" : laneFresh && ["hot", "near_cap"].includes(status) ? "warn" : "";
       const remCell = remaining === null ? '<span class="muted">unknown</span>' : `${num(remaining, 1)}%`;
-      const staleTag = responseStale ? "stale" : stalePacePromoted ? "stale pace" : !laneFresh ? freshness : null;
+      const staleTag = responseStale || info.stale ? "stale" : !laneFresh ? freshness : null;
       const statusText = `${esc(status.replaceAll("_", " "))}${staleTag ? ` <span class="low">${esc(staleTag)}</span>` : ""}`;
       return `<tr><td>${esc(name)}</td>${cell(remCell)}<td class="${pace.tone}">${esc(pace.text)}</td>`
         + `<td>${esc(resets ? String(resets).slice(0, 16).replace("T", " ") : "—")}</td>`
         + `<td class="${tone}">${statusText}</td>${cell(landed.get(name) || 0)}</tr>`;
     }).filter(Boolean);
-    alertNode.innerHTML = quotaAlerts.join("");
-    alertNote.hidden = !quotaAlerts.length;
-    const staleNote = responseStale ? '<p class="note warn">Quota snapshot is past its freshness bound; live quota alerts are suppressed.</p>' : "";
+    const staleNote = responseStale ? '<p class="note warn">Quota snapshot is past its freshness bound; readings below are stale.</p>' : "";
     node.innerHTML = rows.length ? staleNote + table(["Pool", "Remaining", "Pace", "Resets (UTC)", "Status", "Landed tasks with a reading"], rows, [0, 2, 3, 4])
       + '<p class="note">The landed count is for this window and uses the exact pool name recorded for each task. A task reading can use a different name from the live meter.</p>'
       : '<p class="muted">The quota snapshot named no pool.</p>';
   } catch (err) {
     if (generation !== loadGeneration) return;
-    alertNode.innerHTML = "";
-    alertNote.hidden = true;
     node.innerHTML = `<p class="muted">Quota snapshot unavailable (${esc(err.message)}).</p>`;
   }
   updateTableScroll();
