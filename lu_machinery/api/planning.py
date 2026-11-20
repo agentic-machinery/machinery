@@ -40,8 +40,11 @@ ISSUE_LIMIT = 2000  # The shared REST client's page ceiling.
 FORGE_TIMEOUT_S = 20.0
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 _SCOPE = re.compile(r"^##[ \t]+In scope[ \t]*$(.*?)(?=^#{1,2}[ \t]|\Z)", re.M | re.S)
-_SCOPE_TOKEN = re.compile(r"`([^`\n]+)`|(?<![^\s,;()<>])([^\s`,;()<>]+)")
+_SCOPE_ITEM = re.compile(r"^(?:(?:[-*+]|\d+[.)])\s+)?(?:\[[ xX]\]\s+)?(?:Paths:[ \t]*)?", re.I)
+_SCOPE_SEPARATOR = re.compile(r"\s*(?:[,;]\s*(?:and\s+)?|\s+and\s+)\s*")
+_SOURCE_LINE = re.compile(r":[1-9][0-9]*(?:-[1-9][0-9]*)?$")
 _PATH = re.compile(r"(?:\./)?[\w.@+-][\w.@+*/?\[\]-]*")
+_ROOT_FILE = re.compile(r"[\w.-]+\.[A-Za-z][A-Za-z0-9_-]*")
 _SCORECARD_POOLS = {"claude-a": "claude:a", "claude-b": "claude:b", "codex": "codex:a", "grok": "grok"}
 _ALLOWANCE_POOLS = {"grok": "cursor", "agy:gemini": "gemini", "agy:claude_gpt": "agy_claude"}
 _METRICS = frozenset(f"lu_cto_pool_{field}" for field in (
@@ -224,16 +227,27 @@ def collect_issues() -> IssueSnapshot | None:
 
 
 def _scope(body: str) -> list[PathClaim]:
+    """Read explicit path lists. A prose or unreadable item makes the scope unknown."""
     section = _SCOPE.search(body)
     if section is None:
         return []
     paths = []
-    for quoted, bare in _SCOPE_TOKEN.findall(section[1]):
-        # Accept written paths, not action words or URLs. A bare token needs a path separator or a file extension.
-        token = quoted or bare.rstrip(".:")
-        if not ("/" in token or "." in token or quoted) or not _PATH.fullmatch(token):
+    for raw in section[1].splitlines():
+        line = raw.strip()
+        if not line or line.lower() == "paths:":
             continue
-        paths.extend(expand_claim(token))
+        for item in _SCOPE_SEPARATOR.split(_SCOPE_ITEM.sub("", line, count=1)):
+            for wrapper in ("**", "`"):
+                if len(item) > 2 * len(wrapper) and item.startswith(wrapper) and item.endswith(wrapper):
+                    item = item[len(wrapper):-len(wrapper)]
+            token = _SOURCE_LINE.sub("", item)
+            if (token.startswith("-") or token.endswith(".") or not _PATH.fullmatch(token)
+                    or ("/" not in token and not _ROOT_FILE.fullmatch(token))):
+                return []
+            claims = expand_claim(token)
+            if any(claim.kind == ClaimKind.UNKNOWN for claim in claims):
+                return []
+            paths.extend(claims)
     return paths
 
 
@@ -272,8 +286,6 @@ def project_issues(
             reverse[blocker].add(dependent_ref)
     ranking: list[tuple[int, int, Ref]] = []
     for blocker, direct in reverse.items():
-        if blocker[0] not in snap.public:
-            continue
         seen = {blocker}
         pending = list(direct)
         while pending:
@@ -284,7 +296,7 @@ def project_issues(
         if len(seen) > 1:
             ranking.append((len(seen) - 1, len(direct - {blocker}), blocker))
 
-    blocked, ready_now = [], []
+    blocked, ready, ready_now = [], [], []
     states: Counter[str] = Counter()
     for ref, issue in sorted(snap.issues.items()):
         if deps := snap.dependencies.get(ref):
@@ -297,15 +309,18 @@ def project_issues(
             states["ready"] += 1
             scope = _scope(issue.body)
             live = workers.get(ref[0], []) if workers is not None and not stale else None
-            if not scope or any(claim.kind == ClaimKind.UNKNOWN for claim in scope):
-                states["scope_unknown"] += 1
+            if not scope:
+                path_status = "scope_unknown"
             elif live is None:
-                states["worker_scope_unknown"] += 1
+                path_status = "worker_scope_unknown"
             elif any(claims_conflict(path, worker) for path in scope for worker in live):
-                states["path_conflicts"] += 1
+                path_status = "path_conflicts"
             else:
-                states["ready_now"] += 1
-                if ref[0] in snap.public:
+                path_status = "ready_now"
+            states[path_status] += 1
+            if ref[0] in snap.public:
+                ready.append({"ref": _ref_text(ref), "path_status": path_status})
+                if path_status == "ready_now":
                     ready_now.append({"ref": _ref_text(ref)})
     total = len(snap.aliases)
     status = "stale" if stale else "unknown" if not snap.issues and not snap.repositories_read else (
@@ -315,9 +330,10 @@ def project_issues(
         "coverage": {"repositories_read": snap.repositories_read, "repositories_total": total,
                      "open_issues": len(snap.issues), "dependency_unknown": len(snap.unresolved),
                      "private_open_issues": sum(repo not in snap.public for repo, _ in snap.issues), **states},
-        "blockers": [{"ref": _ref_text(ref), "direct": direct_count, "total": blocked_count}
+        "blockers": [{"ref": _ref_text(ref) if ref[0] in snap.public else None,
+                      "direct": direct_count, "total": blocked_count}
                      for blocked_count, direct_count, ref in sorted(ranking, key=lambda row: (-row[0], -row[1], row[2]))],
-        "ready_now": ready_now, "blocked": blocked,
+        "ready": ready, "ready_now": ready_now, "blocked": blocked,
     }
 
 

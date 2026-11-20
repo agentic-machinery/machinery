@@ -96,12 +96,14 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
             issue(505, "Remove duplicate API", product_ref),
             issue(519, "Remove mirrored readers", "#503; #505"),
             issue(525, "Run issue checks", "#519"),
-            issue(584, "Ready card with collision", "#581", "Update src/elsewhere.py,src/owned/worker.py."),
+            issue(584, "Ready card with collision", "#581", "- src/elsewhere.py, **`src/owned/worker.py:12`**"),
             issue(585, "Ready card on a sibling prefix", "#581", "src/owned-extra/file.py"),
             issue(586, "Unknown dependency", "#404", "docs/guide.md"),
-            issue(587, "Scope is in prose", "None", "Refine the reader"),
+            issue(587, "Scope is in prose", "None", "Refine the reader, use `owned_paths`, e.g. Ruff 0.15.21."),
             issue(588, "Unresolved cycle", "#589"),
             issue(589, "Unresolved cycle partner", "#588"),
+            issue(590, "Blocked by a private issue", f"{private}#999"),
+            issue(591, "Ready card with partial scope", "None", "- src/elsewhere.py\n- Its callers and tests"),
         ],
         private: [issue(999, "Private work", product_ref)],
     }
@@ -141,13 +143,16 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         response = client.get("/api/fleet/model-stats/planning")
         assert response.status_code == 200
         result = response.json()["issues"]
-        assert result["coverage"]["open_issues"] == 12
+        assert result["coverage"]["open_issues"] == 14
         assert result["coverage"]["dependency_unknown"] == 1
-        assert result["blockers"][0] == {"ref": product_ref, "direct": 3, "total": 5}
+        assert result["blockers"][0] == {"ref": product_ref, "direct": 3, "total": 6}
+        assert {"ref": None, "direct": 1, "total": 1} in result["blockers"]
         assert result["blocked"][0] == {"ref": f"{machinery}#503", "blocked_by": [product_ref], "private_blockers": 0}
         assert result["ready_now"] == [{"ref": f"{machinery}#585"}, {"ref": product_ref}]
         assert result["coverage"]["path_conflicts"] == 1
-        assert result["coverage"]["scope_unknown"] == 1
+        assert result["coverage"]["scope_unknown"] == 2
+        assert {"ref": f"{machinery}#584", "path_status": "path_conflicts"} in result["ready"]
+        assert {"ref": f"{machinery}#591", "path_status": "scope_unknown"} in result["ready"]
         assert private not in response.text
         assert "src/owned" not in response.text
 

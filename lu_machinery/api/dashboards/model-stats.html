@@ -1105,6 +1105,7 @@ async function loadPools(allowance, generation) {
   updateTableScroll();
 }
 function planningIssue(issue) {
+  if (issue.ref === null) return "Private issue";
   const label = esc(issue.ref);
   if (!/^[\w.-]+\/[\w.-]+#[1-9][0-9]*$/.test(issue.ref)) return label;
   const [repo, number] = issue.ref.split("#");
@@ -1131,7 +1132,7 @@ function renderPlanning(data) {
   };
   fill("planning-blockers", ["Issue", "Directly blocked", "Total blocked"], (issues.blockers || [])
     .map(row => `<tr><td>${planningIssue(row)}</td>${cell(row.direct)}${cell(row.total)}</tr>`),
-    "No public blockers in the current snapshot.", [0]);
+    "No ranked blockers in the current snapshot.", [0]);
   fill("planning-ready", ["Issue"], (issues.ready_now || [])
     .map(row => `<tr><td>${planningIssue(row)}</td></tr>`),
     "No public issues with closed dependencies and clear paths in the current snapshot.", [0]);

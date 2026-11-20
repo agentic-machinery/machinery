@@ -494,7 +494,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "The live-worker snapshot must be at most 10 seconds old to show ready-now entries. "
         "Meter reads refresh every 30 seconds. Unmeasured forecasts are unknown.",
         ("model-stats.html", "operators"),
-        "Private issue identities, issue text and worker paths stay internal. Private issues count toward the graph.",
+        "Private issue identities, issue text and worker paths stay internal. Private blockers have anonymous ranks. "
+        "Ready-now requires an explicit comparable path list in the card's scope.",
         "medium if incomplete inputs are mistaken for complete planning data",
         "keep as a read-only planning view",
         response_schema_version="model-planning.v1",
