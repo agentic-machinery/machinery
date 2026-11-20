@@ -34,7 +34,7 @@ def _allowed_capsule() -> dict[str, object]:
 def test_score_pass_hydrates_then_continues(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(codex_lane, "_with_codex_handoffs", lambda function, args: 0)
+    monkeypatch.setattr(codex_lane._gl, "cmd_score", lambda args: 0)
     monkeypatch.setattr(
         codex_lane.shared_hydration, "build_hydration_capsule", lambda stream, lane, **_: _allowed_capsule()
     )
@@ -46,7 +46,7 @@ def test_score_pass_hydrates_then_continues(
 def test_score_fail_handoff_closes_exact_lease_and_exits(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr(codex_lane, "_with_codex_handoffs", lambda function, args: 2)
+    monkeypatch.setattr(codex_lane._gl, "cmd_score", lambda args: 2)
     monkeypatch.setattr(codex_lane, "_close_exact_lease", lambda repo, epic: True)
 
     assert codex_lane.main(["score", "--epic", "harness", "--answers", "answers.json"]) == 2
@@ -68,7 +68,7 @@ def test_hydrate_refuses_to_continue_when_capsule_is_blocked(
 
 def test_score_closes_lease_when_post_pass_hydration_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     closed: list[tuple[object, str]] = []
-    monkeypatch.setattr(codex_lane, "_with_codex_handoffs", lambda function, args: 0)
+    monkeypatch.setattr(codex_lane._gl, "cmd_score", lambda args: 0)
     monkeypatch.setattr(codex_lane, "cmd_hydrate", lambda args: 2)
     monkeypatch.setattr(codex_lane, "_close_exact_lease", lambda repo, epic: closed.append((repo, epic)) or True)
 

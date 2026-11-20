@@ -24,7 +24,7 @@ handoff
     up to 10 seconds in the same tick and answers an exit dialog with
     "Exit and stop tasks", with the same human and snapshot guards; the next
     tick's dialog check remains the fallback. A failing anchor check sends the
-    lane back with the missing sections and counts instead of exiting; the check
+    lane back with the shortfall and repair instructions instead of exiting; the check
     is bounded and alerts ``claude-cto`` once per distinct failure. A check error or a missing handoff fails
     open, with one alert, so the anchor check can never wedge a lane. Once
     HANDOFF-DONE has been seen and the agent and its launcher have exited, the
@@ -500,6 +500,9 @@ class Guard:
     # ---- helpers -------------------------------------------------------
     def _prompt(self, lane: Lane, reason: str, reminder: int) -> str:
         again = f"reminder {reminder}, " if reminder > 1 else ""
+        handoff = (
+            f"record a DB handoff_note for lane {lane.epic}" if lane.kind == "codex" else f"write the top of {lane.goal}"
+        )
         stop_tasks = (
             "stop every background task you started (background Bash tasks and Monitor streams), "
             if lane.kind == "claude"
@@ -507,7 +510,7 @@ class Guard:
         )
         return (
             f"HANDOFF NOW ({again}CTO automated, {iso(self.now())}): {reason} Finish the current step only, "
-            f"write the top of {lane.goal} (in-flight workers with task ids, waits with nonces, PRs, holds, "
+            f"{handoff} (in-flight workers with task ids, waits with nonces, PRs, holds, "
             f"orders and their status, next actions), {stop_tasks}post 'HANDOFF-DONE {lane.name} {lane.goal}' to Fleet "
             "Comms recipient claude-cto, then stop. The guard exits and relaunches your seat; running workers keep "
             "running and the fresh session adopts them."
@@ -595,16 +598,8 @@ class Guard:
     def _anchor_verdict(self, lane: Lane) -> Any:
         """The launcher's own anchor verdict for this lane's handoff.
 
-        The lane registry gives the epic (``lane.epic``); the handoff candidates
-        and stream entries are resolved exactly as the Codex launcher does in
-        ``scripts/launchers/codex.sh`` -> ``codex_lane mint``: candidates from
-        ``handoff_select.load_codex_mint_candidates`` (the lane's DB note,
-        its newest driver-state ``handoff_note`` that is not done or dropped,
-        then the markdown handoffs under ``.claude/<epic>-epic/``; #12567,
-        #511), the stream from ``handoff_select.launcher_stream_id``, and entries from
-        ``handoff_select.load_stream_entries``. Only the Codex launcher mints
-        anchors (the Claude adapter canary is a no-op), so other kinds are not
-        checked.
+        Read the newest active DB handoff note for the lane and the stream
+        entries the Codex launcher passes to its minter.
 
         The stream comes from ``handoff_select.launcher_stream_id``, which is the
         shell SSOT the launcher itself passes as ``--stream``, not
@@ -614,13 +609,11 @@ class Guard:
         """
         from lu_machinery.session_canary import handoff_select
 
-        candidates = handoff_select.load_codex_mint_candidates(self.repo_root, lane.epic)
         stream_id = handoff_select.launcher_stream_id(lane.epic)
         stream_entries = handoff_select.load_stream_entries(stream_id)
         return handoff_select.check_handoff_anchors(
             repo=self.repo_root,
             epic=lane.epic,
-            candidates=candidates,
             stream_id=stream_id,
             stream_entries=stream_entries,
         )
@@ -668,11 +661,11 @@ class Guard:
             return True
         if verdict.no_handoff:
             if not s.get("anchor_check_failed"):
-                self.log(f"{lane.name} handoff: no handoff file to check; exiting as before")
+                self.log(f"{lane.name} handoff: no readable DB handoff note; exiting as before")
                 self._anchor_alert(
                     lane,
                     s,
-                    f"CTO-ALERT {iso(self.now())}: {lane.name} has no handoff file to anchor-check; "
+                    f"CTO-ALERT {iso(self.now())}: {lane.name} has no readable DB handoff note to anchor-check; "
                     "exiting as before (fail-open)",
                     f"anchor-fail-open-{lane.name}",
                 )
@@ -691,17 +684,10 @@ class Guard:
                 )
                 s["anchor_blocked"] = True
             return False
-        missing = [
-            name for name, count in (("Next", verdict.next_count), ("Hands-off", verdict.hands_off_count)) if count == 0
-        ]
-        fix = (
-            f"restore the {' and '.join(missing)} heading{'s' if len(missing) != 1 else ''}"
-            if missing
-            else ("restore the Next and Hands-off headings")
-        )
         message = (
             f"{ANCHOR_SENDBACK_PREFIX}: handoff would give {verdict.anchors}/{verdict.target} anchors: "
-            f"next={verdict.next_count} hands-off={verdict.hands_off_count}; {fix}, then post HANDOFF-DONE again"
+            f"next={verdict.next_count}. Add numbered next actions and working-set details to the lane's DB note "
+            "or record missing facts in the stream, then post HANDOFF-DONE again."
         )
         self.tmux.type_into(lane.target, message)
         s["anchor_sendbacks"] = sendbacks + 1
