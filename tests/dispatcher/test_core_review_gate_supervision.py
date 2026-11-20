@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -20,6 +21,7 @@ import pytest
 import yaml
 from lu_machinery.dispatcher import environment, scratch, store, worker
 from lu_machinery.dispatcher.types import TaskSpec
+from lu_machinery.dispatcher.write_boundary import verify as verify_write_boundary
 from tests.dispatcher.conftest import SOURCE, await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
@@ -1136,6 +1138,39 @@ def test_fallback_run_fails_before_any_provider_when_orphan_adoption_fails(sandb
     assert settled["status"] == "failed" and settled["error"].startswith("fallback_adoption_unavailable")
 
 
+def test_shared_boundary_sources_count_is_written_to_task_record(sandbox, monkeypatch):
+    """Defect: settlement omits the boundary's Sources count or prefers provider stream telemetry."""
+    from lu_machinery.dispatcher import write_boundary
+    from tests.dispatcher import stub_provider
+
+    monkeypatch.setenv("LU_TASKS_DIR", str(sandbox.tasks))
+    monkeypatch.setattr(worker.providers, "load", lambda _agent: stub_provider)
+    monkeypatch.setattr(write_boundary, "verify", verify_write_boundary)
+    parse = stub_provider.parse
+    monkeypatch.setattr(stub_provider, "parse", lambda *args: replace(parse(*args), sources_mcp_call_count=99))
+    spec = TaskSpec("sources-count", "codex", "echo", None, "read-only", sandbox.repo,
+                    sandbox.repo / "sources-count.prompt", sandbox.tasks / "sources-count.result")
+    prompt = b"literal final response"
+    spec.prompt_file.write_bytes(prompt)
+    record = store.new_record(spec, {"key": "public", "github": str(sandbox.remote)}, "main",
+                              run_git(sandbox.repo, "rev-parse", "HEAD"), {"research_owned_path": []})
+    record["prompt_file"] = str(sandbox.tasks / "sources-count.prompt")
+    path = store.create(record, prompt)
+    (sandbox.tasks / "logs").mkdir()
+    write_boundary.receipt_file(path).write_text(json.dumps({
+        "schema": write_boundary.SCHEMA, "task_id": spec.task_id, "mode": "read-only",
+        "status": "ran", "canary": {"passed": True}, "import": {"status": "unchanged"},
+        "sources": {"completed": 2},
+    }))
+
+    worker.supervise(path, {}, 10)
+
+    settled = json.loads(path.read_text())
+    assert settled["status"] == "done", settled["error"]
+    assert settled["sources_mcp_call_count"] == 2
+    assert settled["write_boundary"]["sources"] == {"completed": 2}
+
+
 def test_deadline_settles_as_timeout(sandbox):
     task = sandbox.dispatch("blocked", "--hard-timeout", "0.2")
     record = sandbox.settle(task, expected=1)
@@ -1169,7 +1204,7 @@ def test_supervisor_crash_is_reconciled_without_claiming_success(sandbox):
 
 
 def _killed_review_supervisor(sandbox, tmp_path, model):
-    """Dispatch a held Codex read-only review on ``model``, SIGKILL its supervisor once gone; the provider pid."""
+    """Kill a read-only review's supervisor after its fixture provider signals that it started."""
     from lu_machinery.common import test_slots
 
     for name in (test_slots.HOLDER_ENV, test_slots.SESSION_ENV, "CI"):
@@ -1179,12 +1214,11 @@ def _killed_review_supervisor(sandbox, tmp_path, model):
     task = sandbox.dispatch(model, "--require-review-verdict", *sandbox.review_target(model))
     child = int(await_file(sandbox.tasks / f"{task[0]}.started"))
     if model == "governed":
-        assert await_file(sandbox.tasks / f"{task[0]}.joined") == "joined"
-    # The provider's start marker precedes the supervisor's record update.
+        assert await_file(sandbox.tasks / f"{task[0]}.joined") == "held"
     record = json.loads(await_file(
-        sandbox.tasks / f"{task[0]}.json", ready=lambda content: "review_test_slots" in json.loads(content)
+        sandbox.tasks / f"{task[0]}.json", ready=lambda content: "provider_pgid" in json.loads(content)
     ))
-    assert record["review_test_slots"]["outcome"] == "held"
+    assert "review_test_slots" not in record
     os.kill(record["pid"], signal.SIGKILL)
     deadline = time.monotonic() + 10
     while worker._identity(record["pid"]) == record["process_start"]:
@@ -1212,12 +1246,10 @@ def _provider_environment(pid, sandbox):
 
 
 def test_a_slot_holding_preload_starts_no_thread_pool_that_keeps_the_review_hold(tmp_path):
-    """Defect: the build-engine preload starts an OpenBLAS pool that keeps review flocks past SIGKILL.
+    """Defect: the native review preload imports the build engine and starts an OpenBLAS pool.
 
-    ``scripts.build.fresh.manifest`` reaches numpy. Its threads share the supervisor's file table, so once the
-    leader is a zombie ``_identity`` reports it gone while the flocks are still held. The preload a slot-holding
-    supervisor runs is ``load_post_start_code(False)``: a bound review attempt is the only run that passes True,
-    and that run does not take review slots.
+    ``scripts.build.fresh.manifest`` reaches NumPy. Its threads share the process's file table and can
+    delay release of locks after SIGKILL. Only the bound review path needs the build-engine imports.
     """
     from lu_machinery.common import test_slots
 
@@ -1238,7 +1270,7 @@ from lu_machinery.dispatcher.worker import load_post_start_code
 load_post_start_code(False)
 threads = len(list(Path("/proc/self/task").iterdir()))
 from lu_machinery.common import test_slots
-test_slots.acquire(2, kind="review", task_id="preload-threads")
+test_slots.acquire(2, kind="pytest", task_id="preload-threads")
 Path(sys.argv[3]).write_text(json.dumps({"threads": threads}))
 time.sleep(30)
 """
@@ -1272,7 +1304,7 @@ time.sleep(30)
 
 
 def test_a_killed_supervisors_review_hold_ends_with_it_and_its_provider_holds_no_pool_descriptor(sandbox, tmp_path):
-    """Defect class: a provider that outlives its supervisor keeps the review hold, so slots strand without bound."""
+    """Defect class: an idle review takes slots or inherits a pool descriptor or holder marker."""
     from lu_machinery.common import test_slots
 
     task, child = _killed_review_supervisor(sandbox, tmp_path, "blocked")
@@ -1283,7 +1315,7 @@ def test_a_killed_supervisors_review_hold_ends_with_it_and_its_provider_holds_no
         report = _pool_report(sandbox)
         assert report["slots_in_use"] + report["slots_draining"] == 0
         environment = _provider_environment(child, sandbox)
-        assert environment[test_slots.HOLDER_ENV]
+        assert test_slots.HOLDER_ENV not in environment
         assert test_slots.inherited_hold(environment) is None
         assert worker._identity(child) is not None
         assert sandbox.settle(task, expected=1)["status"] == "crashed"
@@ -1293,14 +1325,15 @@ def test_a_killed_supervisors_review_hold_ends_with_it_and_its_provider_holds_no
 
 
 def test_a_governed_turn_in_flight_keeps_its_slots_past_a_killed_supervisor_and_nothing_new_joins(sandbox, tmp_path):
-    """Defect class: a killed supervisor frees slots a running test still uses, or lets a new run join its hold."""
+    """Defect class: a killed supervisor frees an independent test run's slots while the test is still running."""
     from lu_machinery.common import test_slots
 
     task, child = _killed_review_supervisor(sandbox, tmp_path, "governed")
     try:
         governed = int(await_file(sandbox.tasks / f"{task[0]}.grandchild"))
         report = _pool_report(sandbox)
-        assert (report["slots_in_use"], report["slots_draining"]) == (0, worker.admission.REVIEW_TEST_SLOTS)
+        assert (report["slots_in_use"], report["slots_draining"]) == (2, 0)
+        assert [(holder["task_id"], holder["kind"]) for holder in report["holders"]] == [(task[0], "pytest")]
         assert test_slots.join_inherited(_provider_environment(child, sandbox), wait_s=0.3) is None
         (sandbox.tasks / f"{task[0]}.child-release").touch()
         deadline = time.monotonic() + 10

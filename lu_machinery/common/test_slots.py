@@ -21,13 +21,11 @@ A holder's descendants run inside its slots through :data:`HOLDER_ENV`. The mark
 counts only while it names a ticket in this pool's ``holders`` directory that this user owns and a live process
 locks, whose record carries the marker's count for the same dispatch task, and while every slot that record
 claims is locked and its slot file names that ticket and the marker's nonce, minted when the slots were issued.
-A sandbox that shows the pool's root-owned ancestors under an unmapped owner and mounts it read-only cannot prepare
-the pool, so a Codex read-only review takes ``review`` slots in its trusted dispatch worker before the sandbox
-starts (#11230, #10744). There, a process in a user namespace that maps only part of the id range, as a sandbox
-does, may not choose the pool (:data:`DIR_ENV`, :data:`SCRATCH_ROOT_ENV`) and may join only a ``review`` hold.
-Dispatched write workers use the ordinary host pool without a boundary or pool bind. The existing
-launcher-bound pool recognition (:func:`launcher_bound`) also accepts a trusted writable mount, and its
-xdist descendants join a hold taken in that same user namespace.
+A sandbox may not choose the pool (:data:`DIR_ENV`, :data:`SCRATCH_ROOT_ENV`). Native read-only
+reviews use the launcher-bound pool (:func:`launcher_bound`) at the default location and take
+slots only while tests run. Their xdist descendants join holds taken in the same user namespace.
+Dispatched write workers use the ordinary host pool. A sandbox with a read-only view of the pool
+can still join a ``review`` hold from a trusted launcher (#11230).
 
 A review's governed test runs take turns: one run holds the hold's session lock, and only that run's own
 descendants join its turn. They prove it through :data:`SESSION_ENV`, which names the turn's process, its start
@@ -219,23 +217,31 @@ def _unescape_mount_path(value: str) -> str:
 
 
 def launcher_bound(path: Path) -> bool:
-    """Whether ``path`` is, in this process's view, a writable mount exactly at that path (#557).
+    """Whether the trusted launcher mounted a usable pool exactly at this path.
 
-    A trusted launcher may bind the host's verified pool at the default location. A process in
-    the sandbox cannot create a mount (it has no capabilities and no new user namespace), so the kernel's mount table
-    tells the launcher's pool from a directory the sandbox made itself. A read-only view, as Codex's review sandbox
-    mounts it, is not one: there a run joins only its launcher's review hold.
+    The shared review boundary mounts the two ticket directories and the lock files writable inside a
+    read-only root. A legacy launcher can bind the writable pool itself (#557). The process cannot
+    create mounts, so the kernel distinguishes either view from a directory created by the reviewer.
     """
     try:
         lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return False
-    target, options = str(path), None
+    target = str(path)
+    mounts: dict[str, tuple[str, ...]] = {}
     for line in lines:
         fields = line.split(" ")
-        if len(fields) > 5 and _unescape_mount_path(fields[4]) == target:
-            options = fields[5].split(",")  # the last mount at a path is the one its name resolves to
-    return options is not None and "rw" in options and os.path.realpath(path) == target
+        if len(fields) > 5:
+            mount = _unescape_mount_path(fields[4])
+            if mount == target or mount.startswith(target + "/"):
+                mounts[mount] = tuple(fields[5].split(","))
+    if os.path.realpath(path) != target:
+        return False
+    options = mounts.get(target, ())
+    return "rw" in options or (
+        "ro" in options
+        and all("rw" in mounts.get(str(path / name), ()) for name in ("queue", "holders", "pool.lock"))
+    )
 
 
 def pool_dir(environ: Mapping[str, str] | None = None) -> Path:
@@ -420,6 +426,33 @@ def _open_pool(env: Mapping[str, str]) -> Path:
     except OSError as error:
         raise SlotError("pool_unavailable", f"the pool directory cannot be prepared ({type(error).__name__})") from None
     return path
+
+
+def prepare_launcher_pool(env: Mapping[str, str]) -> tuple[list[Path], dict[str, str]]:
+    """Prepare the host entries a launcher may bind and their governed execution settings."""
+    size = pool_size(env)
+    settings = {ENABLE_ENV: "on", COUNT_ENV: str(size), WAIT_ENV: str(wait_timeout(env))}
+    pool = _open_pool(env)
+    # Each slot needs one bwrap option and two absolute paths. Leave half the argv budget for
+    # the boundary's other mounts, environment, and provider invocation.
+    paths_bytes = sum(len(os.fsencode(path)) for path in (pool, _default_pool()))
+    mount_bytes = paths_bytes + 2 * len("/slot-999999.lock") + 32
+    if size * mount_bytes > os.sysconf("SC_ARG_MAX") // 2:
+        raise SlotError("invalid_configuration", "the pool has too many slots to project into the boundary")
+    locks = [pool / "pool.lock", *(_slot_path(pool, index) for index in range(size))]
+    try:
+        for path in locks:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                        or stat.S_IMODE(info.st_mode) != 0o600):
+                    raise SlotError("pool_unavailable", "a pool lock is not a private regular file")
+            finally:
+                os.close(fd)
+    except OSError as error:
+        raise SlotError("pool_unavailable", f"a pool lock cannot be prepared ({type(error).__name__})") from None
+    return [pool / "queue", pool / "holders", *locks], settings
 
 
 @contextlib.contextmanager
@@ -1229,8 +1262,9 @@ def _whole(value: object) -> int | None:
 
 
 def _number(value: object) -> float | None:
-    if isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value):
-        return float(value)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        with contextlib.suppress(OverflowError):
+            return float(value) if math.isfinite(value) else None
     return None
 
 
@@ -1306,7 +1340,8 @@ def status(environ: Mapping[str, str] | None = None) -> dict[str, object]:
         report["pool_exists"] = True
         now = time.time()
         records = [record for _, record in _scan(path / "holders", reap=False)]
-        claimed = {index for record in records if isinstance(record.get("slots"), list) for index in record["slots"]}
+        claimed = {index for record in records if isinstance(record.get("slots"), list)
+                   for value in record["slots"] if (index := _whole(value)) is not None}
         draining = sum(1 for index in range(size) if index not in claimed and _slot_locked(path, index))
         holders = [
             {

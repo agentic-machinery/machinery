@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.common import test_slots
 from lu_machinery.dispatcher import write_boundary
 from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.opsec.test_git_push_scan import push_sandbox  # noqa: F401
@@ -40,12 +41,16 @@ def primary(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
+    monkeypatch.delenv(test_slots.DIR_ENV, raising=False)
     # GitHub's published address ranges, which the launcher reads with the host login in production.
     monkeypatch.setattr(write_boundary, "github_networks", lambda: (ipaddress.ip_network(_GITHUB_RANGE),))
     # The test's own scripts and fixtures live below its temporary root, which may be a data root the view
     # empties (/var/tmp): keep that one root visible, every other data root stays emptied.
     monkeypatch.setattr(write_boundary, "_DATA_ROOTS",
                         tuple(root for root in write_boundary._DATA_ROOTS if not tmp_path.resolve().is_relative_to(root)))
+    # Without the /var/tmp tmpfs, bubblewrap needs an existing destination on the inherited read-only filesystem.
+    monkeypatch.setattr(test_slots, "DEFAULT_SCRATCH_ROOT", tmp_path / "slot-mounts")
+    test_slots._default_pool().mkdir(parents=True)
     return repo, worktree, tmp_path / "receipt.json"
 
 
@@ -56,6 +61,72 @@ def _run(primary, script: str, *extra: str) -> tuple[int, dict]:
         "--receipt", str(receipt), *extra, "--", "/bin/sh", "-c", script,
     ])
     return code, json.loads(receipt.read_text())
+
+
+def test_review_runs_named_pytest_with_a_real_shared_slot_and_task_local_interpreter(primary, tmp_path, monkeypatch, capfd):
+    """Defect: a shared-boundary review lacks the project interpreter or cannot acquire a real host slot."""
+    repo, worktree, _ = primary
+    pool = tmp_path / "host-pool"
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(repo))
+    monkeypatch.setenv(test_slots.DIR_ENV, str(pool))
+    monkeypatch.setenv(test_slots.COUNT_ENV, "1")
+    monkeypatch.setenv(test_slots.ENABLE_ENV, "on")
+    monkeypatch.setenv(test_slots.TASK_ENV, "wb-test")
+    # The nested pytest starts its own session, even when this fixture runs in an outer xdist worker.
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("PYTHONPATH", str(Path(write_boundary.__file__).parents[2]))
+    with test_slots.acquire(1, kind="pytest", task_id="fixture"):
+        inode = (pool / "slot-000.lock").stat()
+    (worktree / "conftest.py").write_text(f"""
+from pathlib import Path
+from lu_machinery.common import test_slots
+
+test_slots.DEFAULT_SCRATCH_ROOT = Path({str(test_slots.DEFAULT_SCRATCH_ROOT)!r})
+pytest_plugins = ["lu_machinery.ci.pytest_dispatch_cap"]
+""")
+    (worktree / "test_slot_probe.py").write_text(f"""
+from lu_machinery.common import test_slots
+
+def test_host_slot():
+    state = test_slots.status()
+    assert [(h["task_id"], h["kind"], h["slots"]) for h in state["holders"]] == [("wb-test", "pytest", 1)]
+    lock = (test_slots.pool_dir() / "slot-000.lock").stat()
+    assert (lock.st_dev, lock.st_ino) == ({inode.st_dev}, {inode.st_ino})
+""")
+    code, receipt = _run(primary, ".venv/bin/python -m pytest -p no:cacheprovider -q test_slot_probe.py")
+    output = capfd.readouterr()
+    assert code == 0, output.out + output.err
+    assert "1 passed" in output.out
+    assert receipt["test_slots"] == {"bound": True, "pool_size": 1}
+    assert test_slots.status()["slots_free"] == 1
+    assert not os.path.lexists(worktree / ".venv")
+
+
+@pytest.mark.parametrize(("projection", "reason"), [
+    ([], "sources_mcp_required"),
+    (["--sources-mcp", "cursor"], "sources_mcp_unavailable"),
+], ids=["missing-config", "relay-start"])
+def test_ukrainian_review_refuses_before_provider_on_missing_sources_or_failed_relay(
+    primary, tmp_path, monkeypatch, capfd, projection, reason,
+):
+    """Defect: a Ukrainian review starts its provider without a usable Sources relay."""
+    tasks = tmp_path / "task-records"
+    tasks.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    (tasks / "wb-test.json").write_text(json.dumps({
+        "task_id": "wb-test", "mode": "read-only", "status": "running",
+        "run_nonce": "1" * 32, "review_profile": "ukrainian",
+    }))
+
+    def refuse_relay(*_args, **_kwargs):
+        raise OSError("fixture relay unavailable")
+
+    if projection:
+        monkeypatch.setattr(write_boundary.agy_sandbox, "SourcesRelay", refuse_relay)
+    code, receipt = _run(primary, "printf provider-started", *projection)
+    assert (code, receipt["status"]) == (write_boundary.REFUSED, "refused")
+    assert receipt["reason"].startswith(f"{reason}:")
+    assert capfd.readouterr().out == ""
 
 
 def _digest(*paths: Path) -> dict:
@@ -316,23 +387,18 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
                       ' && grep -qF \'"/run/lu-write-boundary/sources-stdio.py", "/run/lu-write-boundary/sources.sock"]\''
                       ' "$CODEX_HOME/config.toml"')
         refreshed = '"$CODEX_HOME/auth.json"'  # a refresh through the link lands in the selected login
-    # An AGY, Cursor or OpenCode write worker, and a read-only Cursor run, reads one task-local MCP file naming only
-    # the Sources relay, never the host's own (planted here with a foreign server), and cannot rewrite it.
-    sources_mcp = {"agy": "$HOME/.gemini/config/mcp_config.json", "cursor": "$HOME/.cursor/mcp.json",
-                   "opencode": '"$OPENCODE_CONFIG"'}.get(route) if mode == "workspace-write" or route == "cursor" else None
-    if sources_mcp is not None:
+    if route == "cursor":
+        # Cursor gets one task-local MCP file and cannot rewrite it or read the host's foreign server.
+        sources_mcp = "$HOME/.cursor/mcp.json"
         for planted in (".gemini/config/mcp_config.json", ".cursor/mcp.json", ".config/opencode/opencode.json"):
             (home / planted).parent.mkdir(parents=True, exist_ok=True)
             (home / planted).write_text('{"mcpServers": {"foreign": {"url": "http://127.0.0.1:8766/mcp"}}}\n')
         extra += ["--sources-mcp", route]
-        home_check = ((' && test "$OPENCODE_CONFIG" = /run/lu-write-boundary/sources-mcp.json' if route == "opencode"
-                       else ' && test -z "$OPENCODE_CONFIG"')
-                      + f" && grep -qF '\"/run/lu-write-boundary/sources.sock\"' {sources_mcp}"
+        home_check = (f" && grep -qF '\"/run/lu-write-boundary/sources.sock\"' {sources_mcp}"
                       + f" && ! grep -q foreign {sources_mcp} && ! (echo planted >> {sources_mcp}) 2>/dev/null")
-        if mode == "read-only":  # with its permission profile, which Cursor rewrites through a file beside it
-            profile = "$HOME/.cursor/cli-config.json"
-            home_check += (f" && grep -qF 'Shell(git:push*)' {profile}"
-                           f" && cp {profile} {profile}.1.tmp && mv {profile}.1.tmp {profile}")
+        profile = "$HOME/.cursor/cli-config.json"
+        home_check += (f" && grep -qF 'Shell(git:push*)' {profile}"
+                       f" && cp {profile} {profile}.1.tmp && mv {profile}.1.tmp {profile}")
     probe, report = tmp_path / "probe.py", tmp_path / "cells.json"
     probe.write_text(_CREDENTIAL_PROBE)
     code = write_boundary.main([
@@ -363,8 +429,8 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
     if route == "codex":
         assert result["codex_home"] == {"config_sha256": hashlib.sha256(write_boundary.codex_home_config().encode())
                                         .hexdigest(), "auth": "linked", "auth_writable": True}
-    if sources_mcp is not None:
-        config = write_boundary.sources_mcp_config(route)
+    if route == "cursor":
+        config = write_boundary.cursor_sources_mcp_config()
         assert result["sources_mcp"] == {"provider": route, "config_sha256": hashlib.sha256(config.encode()).hexdigest()}
         assert [probe["outcome"] for probe in result["canary"]["probes"] if probe["op"] == "write_open"
                 and probe["path"].endswith(("/mcp_config.json", "/.cursor/mcp.json", "/sources-mcp.json"))] == ["EROFS"]
@@ -1080,7 +1146,7 @@ def test_savant_write_run_needs_its_bounds(primary, tmp_path):
         argv = full[:index] + full[index + (1 if drop.startswith("--no-") else 2):]
         with pytest.raises(SystemExit):
             _run(primary, "true", *argv)
-    for extra in (["--sources-mcp", "opencode"], ["--mode", "read-only"]):
+    for extra in (["--sources-mcp", "cursor"], ["--mode", "read-only"]):
         with pytest.raises(SystemExit):
             _run(primary, "true", *full, *extra)
     # Only the supervisor's fresh unnamed file takes the patch: a named file, or one already written to, refuses

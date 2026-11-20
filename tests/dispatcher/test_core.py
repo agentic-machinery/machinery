@@ -29,7 +29,7 @@ CURRENT_SOL = current_sol()
 
 
 
-# ---- ported from tests/test_delegate_review_test_slots.py and tests/test_delegate.py (C-2188 unit D) ----
+# ---- ported from tests/test_delegate.py (C-2188 unit D) ----
 
 
 def test_legacy_archive_is_read_only_and_nonce_checked(tmp_path, monkeypatch):
@@ -1040,63 +1040,41 @@ def _slot_pool(tmp_path, monkeypatch):
     return path
 
 
-def _review_slot_hold(**overrides):
-    from lu_machinery.dispatcher import admission
+def _review_pool_mounts(tmp_path):
+    from argparse import Namespace
+    from lu_machinery.dispatcher.write_boundary import _Boundary
 
-    arguments = {"agent": "codex", "mode": "read-only", "review_typed": True, "sealed_attempt": False,
-                 "task_id": "review-11230-worker-fixture"}
-    arguments.update(overrides)
-    return admission.hold_review_test_slots(**arguments)
+    boundary = _Boundary(Namespace(worktree=tmp_path, scratch=tmp_path, mode="read-only"), {})
+    mounts, settings = boundary._test_slots(tmp_path)
+    return mounts, settings, boundary.receipt
 
 
-def test_a_codex_read_only_review_holds_review_slots_for_its_task(tmp_path, monkeypatch) -> None:
+def test_a_review_mounts_only_the_pool_entries_without_holding_slots(tmp_path, monkeypatch) -> None:
     from lu_machinery.common import test_slots
-    from lu_machinery.dispatcher import admission
-
-    _slot_pool(tmp_path, monkeypatch)
-    hold, record = _review_slot_hold()
-    try:
-        assert hold is not None and record == {"outcome": "held", "slots": 2, "waited_s": record["waited_s"]}
-        holders = test_slots.status()["holders"]
-        assert [(entry["task_id"], entry["kind"], entry["slots"]) for entry in holders] == [
-            ("review-11230-worker-fixture", "review", 2)
-        ]
-        env = {**os.environ, **hold.environment(), test_slots.TASK_ENV: "review-11230-worker-fixture"}
-        assert test_slots.inherited_hold(env) == admission.REVIEW_TEST_SLOTS
-    finally:
-        if hold is not None:
-            hold.release()
+    pool = _slot_pool(tmp_path, monkeypatch)
+    mounts, settings, receipt = _review_pool_mounts(tmp_path)
+    target = test_slots._default_pool()
+    assert mounts == [
+        ("--ro-bind", tmp_path / "test-slots", target),
+        *(("--bind", pool / name, target / name)
+          for name in ("queue", "holders", "pool.lock", *(f"slot-{i:03d}.lock" for i in range(4)))),
+    ]
+    assert settings == {test_slots.ENABLE_ENV: "on", test_slots.COUNT_ENV: "4", test_slots.WAIT_ENV: "5.0"}
+    assert receipt["test_slots"] == {"bound": False, "reason": "canary_unproven"}
     assert test_slots.status()["slots_in_use"] == 0
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"agent": "claude"},
-        {"agent": "agy"},
-        {"mode": "workspace-write"},
-        {"review_typed": False},
-        {"sealed_attempt": True},
-    ],
-    ids=["claude", "agy", "workspace-write", "not-a-review", "sealed-attempt"],
-)
-def test_every_other_route_takes_its_own_slots_or_none(tmp_path, monkeypatch, overrides) -> None:
-    """No double counting: a seat that can prepare the pool, or runs no tests, holds nothing up front."""
-    pool = _slot_pool(tmp_path, monkeypatch)
-    assert _review_slot_hold(**overrides) == (None, None)
-    assert not pool.exists()
-
-
-def test_a_disabled_pool_holds_nothing(tmp_path, monkeypatch) -> None:
+def test_a_disabled_pool_is_not_mounted(tmp_path, monkeypatch) -> None:
     from lu_machinery.common import test_slots
 
     pool = _slot_pool(tmp_path, monkeypatch)
-    monkeypatch.setenv(test_slots.ENABLE_ENV, "off")
-    assert _review_slot_hold() == (None, {"outcome": "disabled"})
+    monkeypatch.delenv(test_slots.ENABLE_ENV)
+    monkeypatch.setenv("CI", "true")
+    assert _review_pool_mounts(tmp_path) == ([], {}, {"test_slots": {"bound": False, "reason": "disabled"}})
     assert not pool.exists()
 
 
-def test_a_refused_hold_is_recorded_and_the_review_runs_on(tmp_path, monkeypatch, capsys) -> None:
+def test_an_unusable_pool_is_recorded_without_a_mount(tmp_path, monkeypatch) -> None:
     from lu_machinery.common import test_slots
 
     _slot_pool(tmp_path, monkeypatch)
@@ -1105,8 +1083,7 @@ def test_a_refused_hold_is_recorded_and_the_review_runs_on(tmp_path, monkeypatch
     shared.chmod(0o777)  # another user could redirect a pool below it
     monkeypatch.setenv(test_slots.DIR_ENV, str(shared / "pool"))
 
-    assert _review_slot_hold() == (None, {"outcome": "refused", "reason": "pool_unavailable"})
-    assert "review test slots refused" in capsys.readouterr().err
+    assert _review_pool_mounts(tmp_path) == ([], {}, {"test_slots": {"bound": False, "reason": "pool_unavailable"}})
     assert not (shared / "pool").exists()
 
 

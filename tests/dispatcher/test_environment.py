@@ -67,17 +67,13 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
             for name in ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT",
                          "LEARN_UKRAINIAN_STATE_ROOT"):
                 assert f"{name}={child[name]}" not in argv
-            # An AGY, Cursor or OpenCode write worker gets its task-local Sources MCP file (Claude and Codex
-            # name the relay themselves).
+            # Workspace-write workers configure Sources outside the shared boundary.
             write_argv = write_boundary.launcher(replace(spec, mode=mode), Invocation(["/bin/sh"], None, child, None),
                                                  tmp_path / "task.json")
-            launch = write_argv[:write_argv.index("--")]
-            projected = launch[launch.index("--sources-mcp") + 1] if "--sources-mcp" in launch else None
-            assert projected == (agent if agent in ("agy", "cursor", "opencode") else None)
-            # A read-only launch projects none, but for Cursor, whose permission profile rides with it.
+            assert "--sources-mcp" not in write_argv[:write_argv.index("--")]
             read_only = argv[:argv.index("--")]
-            assert (read_only[read_only.index("--sources-mcp") + 1] if "--sources-mcp" in read_only else None) == (
-                "cursor" if agent == "cursor" else None)
+            projected = read_only[read_only.index("--sources-mcp") + 1] if "--sources-mcp" in read_only else None
+            assert projected == (agent if agent in ("claude", "codex", "cursor") else None)
             # Defect class: the launcher's host GitHub reads inherit a provider's private config root (the Savant
             # route's), so gh reads anonymously and the boundary refuses. They keep the dispatcher's login.
             monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
