@@ -990,12 +990,8 @@ RETRY_REASONS = frozenset({"dirty", *LIVENESS_REASONS, "borrowed_by_live_task",
 def _load_bound_review_code() -> None:
     """Import what a bound formal review attempt (``review_attempt.run``) imports on demand.
 
-    Only that kind of run needs the build engine's manifest, the evidence sources, the review prompt checks and the agent runner with
-    its ``ai_llm`` package. The manifest import reaches ``scripts.wiki.dense_rerank``, which imports numpy, and numpy starts an
-    OpenBLAS thread pool in this process. The pool shares the file table. A supervisor that then holds review slots keeps those
-    flocks in the same table; SIGKILL makes the leader a zombie, which ``_identity`` treats as gone, while the pool still holds
-    the flocks, so the hold stays live. A bound attempt does not take review slots (``hold_review_test_slots`` returns immediately
-    when ``review_attempt`` is set), so only that run loads this code. The runner imports ``ai_llm`` from ``scripts/``, which
+    Only that kind of run needs the build engine's manifest, the evidence sources, the review prompt checks and
+    the agent runner with its ``ai_llm`` package. The runner imports ``ai_llm`` from ``scripts/``, which
     ``review_attempt.run`` puts on ``sys.path`` just before it imports the runner; do the same, and leave ``sys.path`` as it was.
     """
     scripts_dir = str(machinery_path("agent_runtime").parent)
@@ -1763,7 +1759,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     child, status, returncode, error, usage, text = None, "crashed", None, None, None, None
     start_refusal = None
     draft_fd: int | None = None  # a Savant write run's unnamed patch file (``_keep_savant_patch``)
-    slots = None
     resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
     cancel_requested = interruptible = False
@@ -1915,18 +1910,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status, error = "failed", f"read_only_scratch_unavailable: {exc}"
                 start_refusal = StartRefusal.SETUP
                 return
-        # The slot queue can wait for an hour and discards its ticket on any exception, so cancel stops it in place.
-        interruptible = True
-        try:
-            checkpoint()  # after the region opens: a request from before it cannot wait out the queue
-            slots, slots_record = admission.hold_review_test_slots(
-                agent=spec.agent, mode=spec.mode, review_typed=admission.review_typed(record),
-                sealed_attempt=bool(record.get("review_attempt")), task_id=spec.task_id,
-            )
-        finally:
-            interruptible = False
-        if slots_record is not None:
-            record["review_test_slots"] = slots_record
         while True:
             correcting = pending_correction is not None
             if pending_conversation:
@@ -1982,8 +1965,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     stdout=out,
                     stderr=err,
                     cwd=spec.worktree,
-                    # The CLI's governed test runs join this hold through its marker (#11230).
-                    env={**invocation.env, **slots.environment()} if slots else invocation.env,
+                    env=invocation.env,
                     start_new_session=True,
                     pass_fds=() if draft_fd is None else (draft_fd,),
                 )
@@ -2051,6 +2033,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             # Only the receipt the launcher writes outside the sandbox proves the run was contained (#423).
             boundary, refusal = write_boundary.verify(path, spec.task_id, spec.mode)
             record["write_boundary"] = boundary
+            sources_calls = None
             if refusal:
                 status, error = "failed", refusal
                 if (returncode == write_boundary.REFUSED and boundary.get("status") == "refused"
@@ -2058,6 +2041,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         and refusal.startswith("write_boundary_refused:") and not (continuations or correction_launches)):
                     start_refusal = StartRefusal.BOUNDARY
                 return
+            evidence = boundary.get("sources")
+            count = evidence.get("completed") if isinstance(evidence, dict) else None
+            if type(count) is int and count >= 0:
+                sources_calls = count
         if spec.agent == "agy" and spec.mode == "read-only":
             # Only the boundary's receipt, written outside the sandbox, proves the run read-only and
             # supplies its Sources count (C-3027); without a verified one the run fails.
@@ -2206,10 +2193,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 if residue := agy_sandbox.discard(spec.task_id):
                     record["read_only_boundary_cleanup"] = residue
             _discard_read_only_scratch(record)
-            if slots is not None:
-                # The hold is the supervisor's: a killed supervisor ends it, and the governed runs in flight
-                # keep their slots shared until they exit (test_slots).
-                slots.release()
             if start_refusal is None and text is not None:
                 spec.final_file.write_text(text)
                 spec.final_file.chmod(0o600)

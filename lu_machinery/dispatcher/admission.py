@@ -1,7 +1,6 @@
-"""Launch protections the legacy launcher applied: Claude account, review test slots, systemd placement.
+"""Launch protections the legacy launcher applied: Claude account and systemd placement.
 
-These helpers retain the account, review-slot and placement contracts used by
-dispatch v2 (C-2188 unit D).
+These helpers retain the account and placement contracts used by dispatch v2 (C-2188 unit D).
 """
 
 import contextlib
@@ -11,14 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from lu_machinery.common import test_slots
 from lu_machinery.dispatcher import providers, store
 from lu_machinery.dispatcher.types import StartRefusal
 from lu_machinery.orchestration import dispatch_isolation
 from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS
-
-# Slots a Codex read-only review holds for its reviewer: the review bound of two test workers (cto-10744).
-REVIEW_TEST_SLOTS = 2
 
 
 @contextlib.contextmanager
@@ -200,32 +195,6 @@ def claude_launch(spec, invocation):
         raise ValueError(f"CLAUDE_ACCOUNT_REFUSED: {exc.code}") from None
     guarded = [sys.executable, "-I", "-c", adapter._LAUNCH_GUARD_CODE, verified]
     return Invocation([*guarded, "--", *argv], invocation.stdin, env, invocation.final_file)
-
-
-def hold_review_test_slots(
-    *, agent: str, mode: str, review_typed: bool, sealed_attempt: bool, task_id: str
-) -> tuple[test_slots.Hold | None, dict | None]:
-    """Take a Codex read-only review's test slots in the supervisor, before its sandbox starts (#11230, #10744).
-
-    Mechanical copy of ``delegate._hold_review_test_slots``. Codex's read-only sandbox cannot prepare
-    the pool, so the supervisor queues in the host pool and holds ``review`` slots until the provider
-    returns; the CLI's governed runs check the holder marker read-only. Other routes, and sealed
-    attempts whose inputs carry no pool, take their own slots or none. A refusal is recorded and the
-    review runs on; its governed runs are then refused, typed. Returns the hold (or ``None``) and the
-    record for the task's ``review_test_slots`` field. As in legacy, the hold ends with the supervisor
-    process, so a crash or kill releases it; governed runs in flight keep their slots through their own
-    shared locks until they exit.
-    """
-    if agent != "codex" or mode != "read-only" or not review_typed or sealed_attempt:
-        return None, None
-    try:
-        if not test_slots.enabled():
-            return None, {"outcome": "disabled"}
-        hold = test_slots.acquire(REVIEW_TEST_SLOTS, kind="review", task_id=task_id)
-    except test_slots.SlotError as error:
-        print(f"[dispatcher] WARNING: review test slots refused: {error}", file=sys.stderr)
-        return None, {"outcome": "refused", "reason": error.reason}
-    return hold, {"outcome": "held", "slots": hold.count, "waited_s": round(hold.waited, 1)}
 
 
 class LaunchRefused(ValueError):
