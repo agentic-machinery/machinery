@@ -486,6 +486,37 @@ def test_cursor_read_only_still_refuses_writes_and_publishing(tmp_path, command)
     assert "Write(*)" in permissions["deny"] and "Mcp(sources-relay:cache_entry)" in permissions["deny"]
 
 
+def test_cursor_read_only_allows_native_web_fetch_without_force(tmp_path):
+    """Defect class: Cursor rejects native WebFetch in headless read-only dispatches."""
+    argv, permissions, _ = _cursor_read_only_profile(tmp_path)
+    assert "--force" not in argv
+    assert set(permissions["allow"]) == {"Shell(*)", "Read(*)", "WebFetch(*)", "Mcp(sources-relay:verify_word)"}
+
+
+def test_workspace_write_provider_runs_the_configured_interpreter_from_its_worktree(tmp_path, monkeypatch):
+    """Defect class: the provider shell loses access to the configured interpreter in a worktree without .venv."""
+    from lu_machinery.dispatcher import environment
+
+    interpreter = tmp_path / "project environment" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    worktree = tmp_path / "write worktree"
+    worktree.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(interpreter))
+    monkeypatch.setattr(environment, "npm_shim_dir", lambda: None)
+    spec = TaskSpec("project-interpreter", "claude", "stub", None, "workspace-write", worktree,
+                    tmp_path / "prompt", tmp_path / "final")
+
+    result = subprocess.run(
+        ["/bin/sh", "-c", 'exec "$LEARN_UKRAINIAN_PYTHON" -c "from pathlib import Path; print(Path.cwd().name)"'],
+        cwd=worktree, env=environment.child_env(spec), capture_output=True, text=True, timeout=30, check=True,
+    )
+
+    assert result.stdout == "write worktree\n"
+    assert list(worktree.iterdir()) == []
+
+
 def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
     tmp_path, configured_roots, monkeypatch, caplog,  # noqa: F811
 ):
