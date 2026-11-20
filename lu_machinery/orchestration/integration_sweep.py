@@ -147,8 +147,6 @@ NEEDS_COVERAGE = "needs-coverage"
 RECORD_HEADINGS = ("### Cross-family review\n", "### Adversarial red-team review\n")
 # Every recorder opens the reviewer's reply with this line, right after the record's lines.
 REPLY_OPENER = "<details><summary>Reviewer's reply</summary>\n\n"
-# ...and closes it with this line, before the residual and repair lines and the trailer.
-REPLY_CLOSER = "\n\n</details>\n\n"
 # Since #11127 the publisher posts only the recorder's typed record, which never carries a
 # raw APPROVE trailer, so only a comment GitHub created before then can be such a legacy record.
 LEGACY_TRAILER_CUTOFF = datetime(2026, 10, 20, 6, 0, 20, tzinfo=UTC)
