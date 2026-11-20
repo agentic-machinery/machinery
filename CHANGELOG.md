@@ -9,6 +9,34 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.44"></a>
+## [0.1.44] - 2026-11-20
+
+### Changed
+
+- Refresh CodeQL alert 41 triage ([#943](https://github.com/learn-ukrainian/machinery/pull/943))
+- Restore census coverage with public prompt fixtures ([#953](https://github.com/learn-ukrainian/machinery/pull/953))
+- Share worktree and task inventory collectors ([#954](https://github.com/learn-ukrainian/machinery/pull/954))
+- Record intake review and successor limits ([#957](https://github.com/learn-ukrainian/machinery/pull/957))
+- Mint canaries from lane DB notes ([#956](https://github.com/learn-ukrainian/machinery/pull/956))
+- Upgrade mypy to 2.4.0 ([#970](https://github.com/learn-ukrainian/machinery/pull/970))
+
+### Fixed
+
+- Enforce tier-specific round limits ([#933](https://github.com/learn-ukrainian/machinery/pull/933))
+- Parse path components before checking host roots ([#934](https://github.com/learn-ukrainian/machinery/pull/934))
+- Renew a heartbeat without a second database connection ([#938](https://github.com/learn-ukrainian/machinery/pull/938))
+- Age split Monitor panels from the snapshot header ([#945](https://github.com/learn-ukrainian/machinery/pull/945))
+- Anchor repo-relative record paths during archive ([#959](https://github.com/learn-ukrainian/machinery/pull/959))
+- Preserve verdicts and report absent review evidence ([#958](https://github.com/learn-ukrainian/machinery/pull/958))
+- Verify ownership from published commits ([#963](https://github.com/learn-ukrainian/machinery/pull/963))
+- Skip a malformed status and anchor settle paths ([#964](https://github.com/learn-ukrainian/machinery/pull/964))
+- Record a cause for withheld Codex stderr ([#966](https://github.com/learn-ukrainian/machinery/pull/966))
+- Judge pace from the reset instant, not the display clock ([#967](https://github.com/learn-ukrainian/machinery/pull/967))
+- Retain read-only task outputs ([#968](https://github.com/learn-ukrainian/machinery/pull/968))
+- Qualify branch reviews with the recorder's rule at admission (#58) ([#969](https://github.com/learn-ukrainian/machinery/pull/969))
+- Preserve reviewer verdicts with P3 findings ([#971](https://github.com/learn-ukrainian/machinery/pull/971))
+
 <a id="v0.1.43"></a>
 ## [0.1.43] - 2026-11-19
 
@@ -1077,7 +1105,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.44...HEAD
+[0.1.44]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...v0.1.43
 [0.1.42]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...v0.1.42
 [0.1.41]: https://github.com/learn-ukrainian/machinery/compare/v0.1.40...v0.1.41
