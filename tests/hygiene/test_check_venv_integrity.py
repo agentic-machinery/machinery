@@ -194,11 +194,15 @@ def test_broken_launcher_is_alerted_and_recorded(tmp_path: Path, monkeypatch: py
     )
     assert ok is False
     assert "pytest" in message
+    assert "--require-hashes" in message
     assert "force-reinstall" in message
-    assert "pip install --force-reinstall" in message
-    # the printed repair command must name the OWNING PACKAGE, never invoke
-    # anything here — this probe must never mutate the venv itself.
-    assert f"{bin_dir / 'python'} -m pip install --force-reinstall pytest" in message
+    # the printed repair command must name the OWNING PACKAGE and install it
+    # from the lock with hashes. This probe must never mutate the venv itself.
+    assert (
+        f"{bin_dir / 'python'} -m pip install --require-hashes --only-binary=:all: "
+        "--force-reinstall --no-deps -r repair.txt"
+    ) in message
+    assert "includes pytest:" in message
 
     alerts = [e for e in _events(tmp_path / "state") if e["event"] == "venv_integrity_alert"]
     assert alerts
@@ -222,8 +226,8 @@ def test_py_test_and_pytest_dedupe_to_one_package(tmp_path: Path, monkeypatch: p
         repo, tasks_dir=tmp_path / "no-tasks", state_dir=tmp_path / "state", python_exe=bin_dir / "python"
     )
     assert ok is False
-    assert "py.test" not in message.split("force-reinstall", 1)[1]  # not suggested as an install target
-    assert message.count(" pytest") >= 1
+    listed = message.split("includes ", 1)[1].split(":", 1)[0].split()
+    assert listed == ["pytest"]
 
 
 # ---------------------------------------------------------------------------
