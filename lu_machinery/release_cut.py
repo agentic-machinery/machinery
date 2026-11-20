@@ -691,7 +691,8 @@ class Cut:
             raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
         lock = self.work / "runtime-requirements.txt"
         exported = self.run([uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
-                             "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test"],
+                             "--no-emit-project", "--no-default-groups", "--all-extras", "--no-extra", "test",
+                             "--no-python-downloads", "--python", self.host_python],
                             cwd=self.work / "src", env=self.scratch_env()).stdout
         lock.write_text(exported, encoding="utf-8")
         # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
@@ -763,7 +764,7 @@ class Cut:
         updated, url = adopt_manifest(manifest.read_text(encoding="utf-8"), release_base, self.version)
         manifest.write_text(updated, encoding="utf-8")
         self.run([uv, "lock", "--upgrade-package", "lu-machinery", "--exclude-newer-package", "lu-machinery=false",
-                  "--no-python-downloads"], cwd=product, env=self.scratch_env())
+                  "--no-python-downloads", "--python", self.host_python], cwd=product, env=self.scratch_env())
         selected = [package for package in _uv_packages(lock) if package["name"] == "lu-machinery"]
         wheel = self.work / "published" / url.rsplit("/", 1)[-1]
         expected_hash = f"sha256:{sha256(wheel)}"
@@ -1127,7 +1128,8 @@ class Cut:
             uv = shutil.which("uv")
             if uv is None:
                 raise CutError("uv is not on PATH; cannot refresh uv.lock for the next version")
-            self.run([uv, "lock", "--no-python-downloads"], cwd=clone, env=self.scratch_env())
+            self.run([uv, "lock", "--no-python-downloads", "--python", self.host_python], cwd=clone,
+                     env=self.scratch_env())
             version_files.append("uv.lock")
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *version_files)

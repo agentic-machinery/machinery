@@ -134,8 +134,10 @@ still includes FastAPI, Prometheus and their
 dependency floors because routing and verification commands call into the API
 package. The wheel job calls those entry points in the core environment.
 
-The cut runs pip and uv with a scratch home. The post-release version bump
-refreshes `uv.lock` against the registry from that same environment.
+The cut runs pip and uv with a scratch home. It passes the release runner's
+Python interpreter to uv and disables interpreter downloads. The
+post-release version bump refreshes `uv.lock` against the registry from that
+same environment.
 
 ## Cut a release
 

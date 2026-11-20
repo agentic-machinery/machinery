@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -368,7 +369,9 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
         "set -eu\n"
         '[ "$HOME" = "${PWD%/*}/home" ]\n'
         '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_EXCLUDE_NEWER+x}" ]\n'
-        '[ "$*" = "lock --no-python-downloads" ]\n'
+        '[ "$#" -eq 4 ]\n'
+        '[ "$1 $2 $3" = "lock --no-python-downloads --python" ]\n'
+        f'[ "$4" = {shlex.quote(sys.executable)} ]\n'
         "grep -Fqx 'version = \"0.1.23\"' pyproject.toml\n"
         "sed 's/^version = \"0.1.22\"$/version = \"0.1.23\"/' uv.lock > next.lock\n"
         "mv next.lock uv.lock\n",
@@ -382,7 +385,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     cut = Cut(
         work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
         product_remote=str(tmp_path / "product.git"), machinery_repo="learn-ukrainian/machinery",
-        product_repo="learn-ukrainian/learn-ukrainian", host_python=tmp_path / "python", primary=tmp_path,
+        product_repo="learn-ukrainian/learn-ukrainian", host_python=Path(sys.executable), primary=tmp_path,
         alert=False, x_agent="claude/claude-cto", version="0.1.22", previous="0.1.21", baseline="0.1.21",
         git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
     )
@@ -439,7 +442,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     def run_uv_adoption(argv, **kwargs):
         if argv[0] == str(uv):
             assert argv[1:] == ["lock", "--upgrade-package", "lu-machinery", "--exclude-newer-package",
-                                "lu-machinery=false", "--no-python-downloads"]
+                                "lu-machinery=false", "--no-python-downloads", "--python", Path(sys.executable)]
             assert kwargs["cwd"] == product
             assert kwargs["env"]["HOME"] == str(work / "home")
             assert {"GH_TOKEN", "ANTHROPIC_API_KEY", "UV_EXCLUDE_NEWER"}.isdisjoint(kwargs["env"])
