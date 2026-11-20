@@ -485,6 +485,8 @@ def test_control_format_characters_removed_from_stderr_excerpt(character, placem
     ("Failed to resolve host", "network"),
     ("Connection refused", "network"),
     ("Permission denied", "permission"),
+    ("\x1b[31mPermission denied\x1b[0m", "permission"),
+    ("\x9b31mPermission denied\x9b0m", "permission"),
     ("Operation not permitted", "permission"),
     ("Sandbox refused", "permission"),
     ("process killed by signal", "process_terminated"),

@@ -31,12 +31,14 @@ def _openai_structured_output_forbidden_keywords() -> frozenset[str]:
 # Failure codes (agent_runtime) for a provider that cannot take the run now: usage limits and no capacity.
 _OUT_OF_CAPACITY = frozenset({"rate_limited", "provider_overloaded"})
 _STDERR_EXCERPT = 500
+# A terminal style prefix can end immediately before the first diagnostic word.
+_STDERR_CAUSE_START = r"(?:\b|(?:\x1b\[|\x9b)[0-9;:]*m)"
 _STDERR_CAUSE_PATTERNS = {
-    "rate_limit": r"\b(?:hit your usage limit|rate limit exceeded|unexpected status 429)\b",
-    "auth": r"\b(?:not logged in|authentication failed|unexpected status 401)\b",
-    "network": r"\b(?:temporary failure in name resolution|failed to resolve host|connection refused)\b",
-    "permission": r"\b(?:permission denied|operation not permitted|sandbox refused)\b",
-    "process_terminated": r"\b(?:killed by signal\b|signal: (?:9 \(SIGKILL\)|15 \(SIGTERM\)))",
+    "rate_limit": r"hit your usage limit|rate limit exceeded|unexpected status 429",
+    "auth": r"not logged in|authentication failed|unexpected status 401",
+    "network": r"temporary failure in name resolution|failed to resolve host|connection refused",
+    "permission": r"permission denied|operation not permitted|sandbox refused",
+    "process_terminated": r"killed by signal|signal: 9 \(SIGKILL\)|signal: 15 \(SIGTERM\)",
 }
 
 
@@ -295,7 +297,7 @@ def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> 
             excerpt = "[stderr excerpt withheld: control or format characters]"
             causes = [
                 cause for cause, pattern in _STDERR_CAUSE_PATTERNS.items()
-                if re.search(pattern, sanitized, re.IGNORECASE)
+                if re.search(rf"{_STDERR_CAUSE_START}(?:{pattern})(?!\w)", sanitized, re.IGNORECASE)
             ]
             cause = causes[0] if len(causes) == 1 else "unknown"
             excerpt += f" [stderr_cause={cause}]"
