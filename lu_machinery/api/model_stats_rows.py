@@ -237,9 +237,8 @@ def model_catalog_reading() -> dict[str, Any] | None:
         return None
 
 
-def current_catalog_model_ids() -> frozenset[str] | None:
+def current_catalog_model_ids(catalog: Mapping[str, Any] | None) -> frozenset[str] | None:
     """Non-retired catalog IDs for display, or None when the catalog is unavailable."""
-    catalog = model_catalog_reading()
     if catalog is None:
         return None
     return frozenset(model_id for model_id, info in catalog["models"].items()

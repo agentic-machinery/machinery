@@ -2171,10 +2171,16 @@ def _weekly(**fields):
 
 
 def test_home_usage_fresh_reading_shows_left_pace_and_reset(monkeypatch):
+    from unittest.mock import Mock
+
     from lu_machinery.api import runtime_router
+    from lu_machinery.review.model_catalog import ModelCatalogError
 
     snapshot = {**_home_subs(), 'catalog_models': ['arbitrary-cache-label']}
     monkeypatch.setattr(runtime_router.subscriptions, 'subscriptions_snapshot', lambda: snapshot)
+    catalog = runtime_router.load_model_catalog()
+    monkeypatch.setattr(runtime_router, 'load_model_catalog', Mock(side_effect=[ModelCatalogError('unreadable'), catalog]))
+    assert json.loads(runtime_router.runtime_subscriptions().body)['catalog_models'] is None
     payload = json.loads(runtime_router.runtime_subscriptions().body)
     rendered = _render_home_usage(payload)
     assert {'gemini-4-neon', 'subq-savant-1.4'} <= set(payload['catalog_models'])

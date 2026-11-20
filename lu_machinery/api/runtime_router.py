@@ -35,6 +35,7 @@ from lu_machinery.fleet_comms import message_plane
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_module, open_readonly
 from lu_machinery.orchestration import codex_transport_health
+from lu_machinery.review.model_catalog import load_model_catalog
 
 from . import account_logins, panel_values, subscriptions
 from .model_stats_rows import current_catalog_model_ids
@@ -1722,7 +1723,10 @@ def _public_subscriptions(raw: object) -> dict[str, Any]:
             rows.append(row)
         providers.append({"provider": provider["provider"], "label": label, "accounts": rows})
     sources = panel_values.mapping(snapshot.get("sources"))
-    catalog_model_ids = current_catalog_model_ids()
+    try:
+        catalog_model_ids = current_catalog_model_ids(load_model_catalog())
+    except (OSError, ValueError):
+        catalog_model_ids = None
     return {**panel_values.scalars(snapshot, numbers=("stale_after_s",), times=("generated_at",)),
             "sources": {key: _subscription_section(sources.get(key)) for key in ("usage_cache", "plan_facts")},
             "catalog_models": sorted(catalog_model_ids) if catalog_model_ids is not None else None,

@@ -1495,7 +1495,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
     record_prs = _prs(selected, of_record=True) if record_prs is None else record_prs
     models = _models(fine)
     _stamp_allowance(models, selected)
-    catalog_model_ids = current_catalog_model_ids()
+    catalog_model_ids = current_catalog_model_ids(model_catalog_reading())
     used = {model for model, *_ in fine}
     return {
         "models": models, "authors": _authors(prs), "author_risks": _author_risks(record_prs, prs),
