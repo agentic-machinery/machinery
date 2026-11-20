@@ -310,8 +310,7 @@ def test_acp_claude_launcher_reaches_the_child_with_every_control(
     assert child["argv"] == [
         "--disallowedTools",
         ",".join(HEADLESS_BACKGROUND_TOOL_DENIES),
-        "--disallowedTools",
-        "Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,Task,Agent,Skill,EnterWorktree,ExitWorktree,DesignSync,RemoteTrigger,SendMessage,PushNotification,TaskStop",
+        "--tools=Read,Glob,Grep,ToolSearch",
         "--permission-mode=default",
         *_SDK_CHILD_ARGS,
     ]

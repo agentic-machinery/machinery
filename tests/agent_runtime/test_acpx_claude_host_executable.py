@@ -598,6 +598,8 @@ _SDK_ARGS = [
     "stream-json",
     # claude-agent-acp 0.101.0+ asks for Auto when settings name no defaultMode.
     "--permission-mode=auto",
+    # The SDK selects the Claude Code tool preset.
+    "--tools=default",
     "--disallowedTools",
     "AskUserQuestion",
 ]
@@ -651,15 +653,14 @@ def test_launcher_execs_the_pinned_binary_with_merged_denies_and_a_clean_env(tmp
     proc, dump = _run_launcher(tmp_path, host=str(fake), identity=acpx_module._claude_code_launch_identity(fake.stat()))
     assert proc.returncode == 0, proc.stderr
     record = json.loads(dump.read_text(encoding="utf-8"))
-    # The SDK's mode is replaced: Claude Code always starts in Manual.
+    # The SDK's mode and tool preset are replaced: Manual, read-only built-ins.
     assert record["argv"][1:] == [
         "--disallowedTools",
         "Monitor,ScheduleWakeup,CronCreate,Workflow",
-        # No tool that writes files or runs commands, in any mode.
-        "--disallowedTools",
-        "Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,Task,Agent,Skill,EnterWorktree,ExitWorktree,DesignSync,RemoteTrigger,SendMessage,PushNotification,TaskStop",
+        # Only read-only built-ins, in any mode.
+        "--tools=Read,Glob,Grep,ToolSearch",
         "--permission-mode=default",
-        *(arg for arg in _SDK_ARGS if arg != "--permission-mode=auto"),
+        *(arg for arg in _SDK_ARGS if arg not in {"--permission-mode=auto", "--tools=default"}),
     ]
     assert "LU_CLAUDE_ACP_HOST" not in record["env"]
     assert "LU_CLAUDE_ACP_HOST_IDENTITY" not in record["env"]
