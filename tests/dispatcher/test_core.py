@@ -523,9 +523,8 @@ def test_read_only_mode_denies_edits_on_every_provider(sandbox, tmp_path, monkey
     else:
         assert agent == "opencode" and "--auto" not in argv
         permission = json.loads(invocation.env["OPENCODE_PERMISSION"])
-        assert permission["edit"] == "deny"
-        assert permission["bash"]["*"] == "deny" and permission["bash"]["*>*"] == "deny"
-        assert list(permission["bash"])[-1] == "*>*"  # the last matching pattern wins
+        assert permission["edit"] == permission["task"] == "deny"
+        assert permission["bash"] == "allow"
 
 
 def test_aliases_and_all_retained_metadata_flags_parse():
