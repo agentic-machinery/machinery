@@ -230,7 +230,8 @@ MCP servers, connectors and loopback Sources URLs. Codex uses its model defaults
 finish startup or reach its existing timeout before the first model turn. The default one-second grace
 can omit the still-starting relay's tools from that turn. The read-only Codex argv enables only Sources
 readers and passes `--disable apps`. Cursor reads the relay definition from its task-local, read-only MCP
-file. The relay refuses tools that persist fetched entries.
+file. OpenCode defines a local Sources server with the same stdio command. The relay refuses
+tools that persist fetched entries.
 
 A Ukrainian review requires a Sources projection and relay before the provider starts.
 `sources_mcp_required` identifies missing setup and `sources_mcp_unavailable` identifies a relay
@@ -244,8 +245,6 @@ These apply to the read-only review dispatches the boundary still contains.
 
 - The Monitor API is a host loopback service and stays unreachable. `closeout_cli resolve-reviewer`
   inside falls back to its no-snapshot route, and the host dispatcher's own admission checks the pick.
-- Only native Claude and Codex name the Sources stdio command. Another provider whose `sources` server
-  points at the loopback address cannot reach it inside.
 - Decision A4 changes what a reviewer sees. It no longer reads the real provider configuration beyond the
   selected login's guard-bound state (no plugins, session history or other account), other tasks' records
   (stage a brief's inputs in `<task>.inputs`), private data roots such as `LU_SENSE_PROOF_DIR`, or driver
