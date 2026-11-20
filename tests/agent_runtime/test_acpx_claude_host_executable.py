@@ -422,6 +422,9 @@ def _ok_stream(session_id: str = _SESSION_ID) -> str:
     events = [
         {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}},
         {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": session_id}},
+        # The seat's ACPX sets Manual; the agent confirms it before the prompt.
+        {"jsonrpc": "2.0", "id": 5, "method": "session/set_config_option", "params": {"configId": "mode", "value": "default"}},
+        {"jsonrpc": "2.0", "id": 5, "result": {"configOptions": [{"id": "mode", "currentValue": "default"}]}},
         {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {}},
         {
             "jsonrpc": "2.0",

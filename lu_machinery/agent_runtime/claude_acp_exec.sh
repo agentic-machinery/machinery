@@ -38,7 +38,8 @@ stat=/usr/bin/gnustat
 # (option values that start with "-" are joined the same way), so that form is
 # replaced. The two-argument form, which the SDK never sends, is refused, as is
 # --dangerously-skip-permissions, which would override the mode.
-for arg do
+# The word list is expanded once, before the loop rebuilds "$@".
+for arg in "$@"; do
     shift
     case $arg in
         --permission-mode=*) ;;

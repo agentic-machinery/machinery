@@ -89,6 +89,16 @@ _SUCCESS_NDJSON = (
     '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}\n'
 )
 
+# The Claude seat's ACPX sets Manual and the agent confirms it before the prompt.
+_CLAUDE_MODE_SET_NDJSON = (
+    '{"jsonrpc":"2.0","id":5,"method":"session/set_config_option","params":{"sessionId":"sess-fixture-001",'
+    '"configId":"mode","value":"default"}}\n'
+    '{"jsonrpc":"2.0","id":5,"result":{"configOptions":[{"id":"mode","type":"select","currentValue":"default"}]}}\n'
+)
+_CLAUDE_SUCCESS_NDJSON = _SUCCESS_NDJSON.replace(
+    '{"jsonrpc":"2.0","id":2,"method":"session/prompt"', _CLAUDE_MODE_SET_NDJSON + '{"jsonrpc":"2.0","id":2,"method":"session/prompt"', 1
+)
+
 _CANCELLED_NDJSON = (
     '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,'
     '"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},'
@@ -2401,6 +2411,45 @@ def test_claude_session_starts_in_manual_mode_not_the_adapter_auto_default(tmp_p
     assert plan.metadata["session_mode"] == "default"
 
 
+_PROMPT_LINE = '{"jsonrpc":"2.0","id":2,"method":"session/prompt"'
+_MODE_UPDATE_ACCEPT_EDITS = (
+    '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-fixture-001",'
+    '"update":{"sessionUpdate":"current_mode_update","currentModeId":"acceptEdits"}}}\n'
+)
+_MODEL_SET_AFTER_MODE = (
+    '{"jsonrpc":"2.0","id":6,"method":"session/set_config_option","params":{"sessionId":"sess-fixture-001",'
+    '"configId":"model","value":"claude-sonnet-5-5"}}\n'
+    '{"jsonrpc":"2.0","id":6,"result":{"configOptions":[{"id":"mode","type":"select","currentValue":"acceptEdits"}]}}\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "reason"),
+    [
+        (_CLAUDE_SUCCESS_NDJSON, None),
+        (_SUCCESS_NDJSON, "prompt was sent before the agent confirmed"),
+        (_CLAUDE_SUCCESS_NDJSON.replace('"currentValue":"default"', '"currentValue":"auto"'), "did not confirm"),
+        (_CLAUDE_SUCCESS_NDJSON.replace('{"configOptions":[{"id":"mode","type":"select","currentValue":"default"}]}', "{}"), "did not confirm"),
+        (_CLAUDE_SUCCESS_NDJSON.replace(_PROMPT_LINE, _MODEL_SET_AFTER_MODE + _PROMPT_LINE, 1), "prompt was sent before"),
+        (
+            _CLAUDE_SUCCESS_NDJSON.replace('"text":"world."}}}}\n', '"text":"world."}}}}\n' + _MODE_UPDATE_ACCEPT_EDITS, 1),
+            "left mode",
+        ),
+    ],
+    ids=["confirmed", "never-set", "reports-auto", "omits-mode", "model-set-after-mode", "left-mode-mid-turn"],
+)
+def test_claude_parse_discards_a_reply_whose_manual_mode_the_agent_never_confirmed(stdout, reason):
+    """Defect class: ACPX sends the prompt whatever the mode set answered, so a
+    session the agent did not confirm in Manual (or that leaves it) must fail."""
+    parsed = AcpxClaudeShadowAdapter().parse_response(stdout=stdout, stderr="", returncode=0, output_file=None, plan=None)
+
+    if reason is None:
+        assert (parsed.ok, parsed.response) == (True, "Hello world.")
+    else:
+        assert (parsed.ok, parsed.response, parsed.failure_code) == (False, "", "acp_adapter_incompatible")
+        assert reason in (parsed.stderr_excerpt or "")
+
+
 def test_claude_sealed_review_turn_budget_rejects_intermediate_symlink_escape(
     tmp_path,
 ):
@@ -3410,7 +3459,7 @@ def test_r75_cleanup_never_changes_the_answer_status_or_attestation(
     plan = _claude_plan(launcher, host)
     if stream == "host_changed":
         host.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-    stdout = _TIMEOUT_NDJSON if stream == "failure" else _SUCCESS_NDJSON
+    stdout = _TIMEOUT_NDJSON if stream == "failure" else _CLAUDE_SUCCESS_NDJSON
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     acpx_module._drop_claude_acp_copy_lease(launcher.parents[1].name)
     clean = acpx_module._attest_claude_code_child(
@@ -3479,7 +3528,7 @@ def _run_chain(leased_copies, tmp_path, monkeypatch, *, grandchild="", hang=Fals
 
     state = tmp_path / "state"
     state.mkdir()
-    (state / "stream.ndjson").write_text(_SUCCESS_NDJSON, encoding="utf-8")
+    (state / "stream.ndjson").write_text(_CLAUDE_SUCCESS_NDJSON, encoding="utf-8")
     acpx = tmp_path / "fake-acpx"
     acpx.write_text(_CHAIN_ACPX, encoding="utf-8")
     acpx.chmod(0o755)
@@ -3688,7 +3737,7 @@ def test_r75_a_metadata_error_during_cleanup_keeps_the_answer(leased_copies, tmp
         return result
 
     monkeypatch.setattr(acpx_module.os, "fstat", failing_fstat)
-    parsed = _claude_parse(plan, _SUCCESS_NDJSON)
+    parsed = _claude_parse(plan, _CLAUDE_SUCCESS_NDJSON)
     monkeypatch.setattr(acpx_module.os, "fstat", real_fstat)
     assert (parsed.ok, parsed.response) == (True, "Hello world.")
     assert plan.metadata["claude_code_launcher_cleanup"] == "failed"
@@ -3706,7 +3755,7 @@ def test_r75_an_unexpected_cleanup_exception_keeps_the_answer(leased_copies, tmp
         raise RuntimeError("fixture")
 
     monkeypatch.setattr(acpx_module, "_remove_claude_acp_launcher_copy", broken)
-    parsed = _claude_parse(plan, _SUCCESS_NDJSON)
+    parsed = _claude_parse(plan, _CLAUDE_SUCCESS_NDJSON)
     assert (parsed.ok, parsed.response) == (True, "Hello world.")
     assert plan.metadata["claude_code_launcher_cleanup"] == "failed"
     AcpxClaudeShadowAdapter().cleanup_invocation(plan)

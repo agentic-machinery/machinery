@@ -2820,6 +2820,106 @@ def _attest_claude_code_child(parsed: ParseResult, *, plan: InvocationPlan | Non
     return parsed
 
 
+def _reported_mode(payload: Mapping[str, Any]) -> object:
+    """The ``currentValue`` of the ``mode`` config option in ``payload``, or None."""
+    options = payload.get("configOptions")
+    if not isinstance(options, list):
+        return None
+    for option in options:
+        if isinstance(option, dict) and option.get("id") == "mode":
+            return option.get("currentValue")
+    return None
+
+
+def _session_mode_refusal(stdout: str, expected: str) -> str | None:
+    """Why the ACP stream does not prove the session ran in ``expected``, or None.
+
+    ACPX 0.22.0 sends the prompt whatever its config sets answered, and the
+    adapter may change the child's mode during setup (an Auto fallback to
+    Accept edits). So the answer to the last configuration request before
+    ``session/prompt`` must be the ``mode`` set reporting ``expected``, and
+    nothing after it may report another mode. A message of an unexpected
+    shape refuses rather than being skipped.
+    """
+    unreadable = "the ACP stream is unreadable"
+    unconfirmed = f"the agent did not confirm session mode {expected!r}"
+    left = f"the session left mode {expected!r}"
+    pending: set[str | int | float] = set()
+    confirmed = False
+    for line in jsonl_lines(stdout):
+        if not line.strip():
+            continue
+        try:
+            event = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH)
+        except (json.JSONDecodeError, RecursionError):
+            return unreadable
+        if not isinstance(event, dict):
+            return unreadable
+        method = event.get("method")
+        event_id = event.get("id")
+        raw_params = event.get("params")
+        params: Mapping[str, Any] = raw_params if isinstance(raw_params, dict) else {}
+        if method is not None and not isinstance(method, str):
+            return unreadable
+        if method in {"session/set_config_option", "session/set_mode", "session/set_model"}:
+            # Any later setup request can change the mode again.
+            confirmed = False
+            pending.clear()
+            if method == "session/set_config_option" and params.get("configId") == "mode":
+                if params.get("value") != expected:
+                    return f"a session mode other than {expected!r} was requested"
+                if isinstance(event_id, bool) or not isinstance(event_id, (str, int, float)):
+                    return unreadable
+                pending.add(event_id)
+        elif method == "session/prompt":
+            if not confirmed:
+                return f"the prompt was sent before the agent confirmed session mode {expected!r}"
+        elif method == "session/update":
+            raw_update = params.get("update")
+            update: Mapping[str, Any] = raw_update if isinstance(raw_update, dict) else {}
+            kind = update.get("sessionUpdate")
+            if kind == "current_mode_update":
+                # This update exists to name the mode, so a missing one counts as another mode.
+                if confirmed and update.get("currentModeId") != expected:
+                    return left
+            elif kind == "config_option_update":
+                reported = _reported_mode(update)
+                if confirmed and reported is not None and reported != expected:
+                    return left
+        elif method is None and _is_jsonrpc_id(event_id):
+            result = event.get("result")
+            if event_id in pending:
+                pending.discard(event_id)
+                if not isinstance(result, dict) or _reported_mode(result) != expected:
+                    return unconfirmed
+                confirmed = True
+            elif confirmed and isinstance(result, dict):
+                reported = _reported_mode(result)
+                if reported is not None and reported != expected:
+                    return left
+    return None if confirmed else unconfirmed
+
+
+def _confirm_claude_session_mode(parsed: ParseResult, *, expected: str, stdout: str) -> ParseResult:
+    """Fail a successful ask whose stream does not prove the session ran in ``expected``.
+
+    ACPX has already delivered the prompt by then; this discards the reply and
+    names the failure. The launcher's start mode is the preventive control.
+    """
+    if not parsed.ok:
+        return parsed
+    reason = _session_mode_refusal(stdout, expected)
+    if reason is None:
+        return parsed
+    return replace(
+        parsed,
+        ok=False,
+        response="",
+        failure_code="acp_adapter_incompatible",
+        stderr_excerpt=f"AcpxClaudeShadowAdapter: {reason}; the reply is discarded",
+    )
+
+
 def _confinement_prefix_argv(
     binary: str,
     cwd: Path,
@@ -3957,8 +4057,9 @@ class AcpxClaudeShadowAdapter(_AcpxDiscussionAdapter):
     fixed_effort = "high"
     # Manual: every tool needs an ACP permission request, which --deny-all
     # refuses. Since 0.101.0 the adapter starts in Auto when settings name no
-    # defaultMode, and Auto approves tools without asking.
-    session_mode = "default"
+    # defaultMode, and Auto approves tools without asking. The launcher starts
+    # Claude Code in this mode and parse_response requires the agent to confirm it.
+    session_mode: str = "default"
     sealed_review_tool_names = _CLAUDE_SEALED_REVIEW_TOOL_NAMES
 
     def _max_turns(self, sealed_review_mcp_config: str | None) -> int:
@@ -4050,6 +4151,7 @@ class AcpxClaudeShadowAdapter(_AcpxDiscussionAdapter):
             plan=plan,
             stdout=kwargs.get("stdout") or "",
         )
+        parsed = _confirm_claude_session_mode(parsed, expected=self.session_mode, stdout=kwargs.get("stdout") or "")
         return _release_claude_acp_launcher_copy(parsed, plan=plan)
 
     def cleanup_invocation(self, plan: InvocationPlan) -> None:
