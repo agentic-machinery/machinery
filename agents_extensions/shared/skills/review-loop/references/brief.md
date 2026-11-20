@@ -123,9 +123,9 @@ Use one command per call so a denied command does not obscure the result of anot
 | Native Codex | Shell inside the whole-process read-only boundary, which provides the filesystem sandbox. |
 | Cursor (including Grok) | Shell and file reads inside the whole-process read-only boundary. Cursor denies file writes, selected Git and GitHub write commands, and Sources tools that persist data. |
 | Native AGY | Shell inside AGY's own bubblewrap boundary, with a read-only checkout and writable scratch. |
-| OpenCode (DeepSeek) | Check the deployed Bash policy in `lu_machinery/dispatcher/providers/opencode.py` before naming a probe. The Git-only profile admits `git diff`, `git log`, `git show`, and `git status` inside the read-only boundary and denies redirections, `--output`, and `--ext-diff`. |
+| OpenCode (DeepSeek direct or OpenRouter) | Bash and `.venv/bin/python` inside the whole-process read-only boundary. Sources reader tools use the boundary relay, and native `webfetch` uses the public HTTPS proxy. OpenCode denies edit and task tools. |
 
-For Claude, Codex, Cursor, and AGY, name the probes, scripts, or test files the reviewer needs
+For Claude, Codex, Cursor, AGY, and OpenCode, name the probes, scripts, or test files the reviewer needs
 and ask for their actual output. The boundary makes the project interpreter available at
 `.venv/bin/python`. When a test needs the shared pool, check the boundary receipt if pytest
 refuses to start. A targeted test command can use
