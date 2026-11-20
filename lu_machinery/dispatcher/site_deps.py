@@ -53,7 +53,9 @@ PASSED_ENV = frozenset({
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "NODE_OPTIONS",
 })
 NPM_CONFIG_PREFIX = "npm_config_"
-NPM_HOME_SETTINGS = frozenset({"npm_config_cache", "npm_config_userconfig", "npm_config_globalconfig"})
+NPM_HOME_SETTINGS = frozenset({
+    "npm_config_cache", "npm_config_userconfig", "npm_config_globalconfig", "npm_config_logs_dir",
+})
 # Native modules build with these when no prebuilt binary exists, so their identity is part of the key.
 BUILD_TOOLS = ("python3", "make", "cc", "c++")
 # Shim directories of any checkout, under the machinery package named by this file's location.
@@ -173,7 +175,8 @@ def install_key(site: Path, env: dict[str, str]) -> tuple[str, dict]:
         "runtime": _runtime(site, env),
         # Digests only: npm configuration can hold registry credentials, and facts are stored.
         "npm_config": hashlib.sha256(normalized_config.encode()).hexdigest(),
-        "env": {name: _digest(value) for name, value in env.items() if name not in {"HOME", "npm_config_globalconfig"}},
+        "env": {name: _digest(value) for name, value in env.items()
+                if name not in {"HOME", "npm_config_globalconfig", "npm_config_logs_dir"}},
         "toolchain": _toolchain(env),
         "inputs": {name: _sha256(site / name) for name in INSTALL_INPUTS if (site / name).is_file()},
         "local": _local_inputs(site),
@@ -279,7 +282,8 @@ def populate(repo: Path, site: Path, key: str, facts: dict, env: dict[str, str])
                 (staging / target).parent.mkdir(parents=True, exist_ok=True)
                 source = site / target
                 shutil.copytree(source, staging / target) if source.is_dir() else shutil.copy2(source, staging / target)
-        _run(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"], staging, env=env, timeout=INSTALL_TIMEOUT)
+        _run(["npm", "ci", "--prefer-offline", "--no-audit", "--no-fund", f"--cache={env['npm_config_cache']}"],
+             staging, env=env, timeout=INSTALL_TIMEOUT)
         tree = _ingest(store, staging / "node_modules")
         _write_manifest(store, key, facts, tree)
     finally:
@@ -355,8 +359,18 @@ def ensure(repo: Path, worktree: Path) -> dict:
     if (site / "node_modules").exists() or (site / "node_modules").is_symlink():
         return {"state": "present"}
     store = store_root(repo)
+    cache = Path(os.environ.get("NPM_CACHE", store.absolute() / "npm-cache"))
+    if not cache.is_absolute():
+        raise NotCacheable("NPM_CACHE must be an absolute release cache path")
     with tempfile.TemporaryDirectory(prefix="site-deps-home-") as home, _locked(store / "prune.lock", fcntl.LOCK_SH):
-        env = {**_install_env(), "HOME": home, "npm_config_globalconfig": str(Path(home) / "etc/npmrc")}
+        # Keep npm's diagnostic logs in the scratch home even when sharing cached tarballs.
+        env = {
+            **_install_env(),
+            "HOME": home,
+            "npm_config_globalconfig": str(Path(home) / "etc/npmrc"),
+            "npm_config_cache": str(cache),
+            "npm_config_logs_dir": str(Path(home) / ".npm/_logs"),
+        }
         key, facts = install_key(site, env)
         manifest = store / "trees" / f"{key}.json"
         if _altered(store, manifest) is not None:
