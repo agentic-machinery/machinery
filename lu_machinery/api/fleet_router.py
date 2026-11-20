@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
 import math
 import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
@@ -56,10 +57,8 @@ from .runtime_router import get_acp_conversation, list_acp_conversations, recent
 from .state_helpers import reports_failure, swr_route
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
-_pg_conninfo_to_dict: Callable[[str], dict[str, Any]] | None = None
 try:
     from psycopg import Error as PostgresError
-    from psycopg.conninfo import conninfo_to_dict as _pg_conninfo_to_dict
 except ModuleNotFoundError as exc:
     if exc.name != "psycopg":
         raise
@@ -425,11 +424,12 @@ def _safe_plane_status(
     ctx: MonitorContext | None = None,
     *,
     plane_root: Path | None = None,
+    telemetry_path: Path | None = None,
 ) -> dict[str, Any]:
     """Project the existing plane read model without paths or raw telemetry rows."""
     resolved_ctx = resolve_context(ctx)
     status = (
-        read_plane_status(root=plane_root, recent_limit=0)
+        read_plane_status(root=plane_root, telemetry_path=telemetry_path, recent_limit=0)
         if plane_root is not None
         else read_plane_status(repo_root=resolved_ctx.roots.state_root, recent_limit=0)
     )
@@ -492,14 +492,22 @@ BOARD_PR_LIST_TTL_S = 30.0
 
 
 
-def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
+def _count_by_state(
+    connection: Any,
+    table: str,
+    column: str,
+    *,
+    raise_on_error: bool = False,
+) -> dict[str, int]:
     if not _table_exists(connection, table):
         return {}
     try:
         rows = connection.execute(
             f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column} ORDER BY {column}"
         ).fetchall()
-    except sqlite3.Error:
+    except _DATABASE_ERRORS:
+        if raise_on_error:
+            raise
         return {}
     return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}
 
@@ -861,6 +869,18 @@ SELECT
 """
 
 
+@dataclass(frozen=True, slots=True)
+class _OverviewRoutingSnapshot:
+    plane_root: Path
+    authority: storage.Authority
+    telemetry_path: Path
+    db_identity: tuple[int, int] | None
+    expected_mode: str | None
+    mode_spec: tuple[Any, ...]
+    key: tuple[Any, ...]
+    cacheable: bool
+
+
 def _file_stat_key(path: Path) -> tuple[int, int, int, int, int] | None:
     try:
         st = path.stat()
@@ -869,47 +889,64 @@ def _file_stat_key(path: Path) -> tuple[int, int, int, int, int] | None:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def _pg_routing_digest() -> str:
-    raw_dsn = (os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or "").strip()
-    pg_env = tuple(sorted((key, value) for key, value in os.environ.items() if key.startswith("PG")))
-    if not raw_dsn and not pg_env:
-        return ""
-    payload = json.dumps({"dsn": raw_dsn, "pg_env": pg_env}, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+def _sqlite_db_identity(db_path: Path) -> tuple[int, int] | None:
+    try:
+        st = db_path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino)
 
 
-def _overview_mode_spec() -> tuple[Any, ...]:
+def _overview_mode_spec() -> tuple[tuple[Any, ...], str | None]:
     env = os.environ.get(message_plane.ENV_MODE)
     if env is not None and env.strip():
         value = env.strip().lower()
         if value in {"0", "false", "off", "disabled"}:
-            return ("env", "off")
+            return ("env", "off"), "off"
         if value in {"dual-write", "dualwrite"}:
-            return ("env", "dual_write")
-        return ("env", value)
+            return ("env", "dual_write"), "dual_write"
+        return ("env", value), value
     cfg_path = machinery_path("config/fleet_communications.yaml")
-    return ("config", str(cfg_path), _file_stat_key(cfg_path))
+    return ("config", str(cfg_path), _file_stat_key(cfg_path)), None
 
 
-def _overview_routing_key(
-    ctx: MonitorContext,
-    plane_root: Path,
-) -> tuple[tuple[Any, ...], storage.Authority]:
+def _capture_overview_routing(ctx: MonitorContext) -> _OverviewRoutingSnapshot:
+    plane_root = _plane_root(ctx)
     authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
-    pg_digest = _pg_routing_digest() if authority is storage.Authority.PG else ""
     telemetry_path = message_plane.default_parity_telemetry_path(plane_root)
+    telemetry_stat = _file_stat_key(telemetry_path)
+    mode_spec, expected_mode = _overview_mode_spec()
     allow_shadow = os.environ.get("FLEET_COMMS_ALLOW_LOCAL_SHADOW", "").strip() == "1"
+    db_identity = (
+        None
+        if authority is storage.Authority.PG
+        else _sqlite_db_identity(plane_root / "comms.sqlite3")
+    )
+    # PostgreSQL status/count readers resolve DSN from live environment without
+    # a caller-supplied connection target, so PG reads skip cache publication.
+    cacheable = authority is not storage.Authority.PG and db_identity is not None
     key = (
         repr(ctx.roots),
         str(plane_root),
         authority.value,
-        pg_digest,
-        _overview_mode_spec(),
+        db_identity,
+        mode_spec,
         str(telemetry_path),
-        _file_stat_key(telemetry_path),
+        telemetry_stat,
         allow_shadow,
     )
-    return key, authority
+    return _OverviewRoutingSnapshot(
+        plane_root=plane_root,
+        authority=authority,
+        telemetry_path=telemetry_path,
+        db_identity=db_identity,
+        expected_mode=expected_mode,
+        mode_spec=mode_spec,
+        key=key,
+        cacheable=cacheable,
+    )
 
 
 def _current_plane_mode() -> str:
@@ -937,46 +974,29 @@ def _overview_is_storable(result: dict[str, Any]) -> bool:
 
 
 def _overview_cache_get(key: tuple[Any, ...]) -> tuple[dict[str, Any], float] | None:
-    now = _overview_clock()
     with _overview_cache_lock:
         entry = _overview_cache.get(key)
         if entry is None:
             return None
-        age = now - entry[0]
-        if age >= OVERVIEW_CACHE_TTL_S:
+        started, stored_payload = entry
+        if (_overview_clock() - started) >= OVERVIEW_CACHE_TTL_S:
             return None
-        return copy.deepcopy(entry[1]), max(0.0, age)
-
-
-def _pg_connection_matches_dsn(connection: Any, raw_dsn: str) -> bool:
-    info = getattr(connection, "info", None)
-    if info is None or not raw_dsn:
-        return True
-    if _pg_conninfo_to_dict is None:
-        return False
-    try:
-        expected = _pg_conninfo_to_dict(raw_dsn)
-    except Exception:
-        return False
-    for field in ("host", "port", "dbname", "user"):
-        want = expected.get(field)
-        if want is None:
-            continue
-        actual = str(getattr(info, field, ""))
-        if field in {"host", "port"}:
-            allowed = {part.strip() for part in str(want).split(",")}
-            if actual not in allowed:
-                return False
-        elif actual != str(want):
-            return False
-    return True
+    # Deep-copy outside the mutex; stored_payload is immutable after insertion.
+    payload = copy.deepcopy(stored_payload)
+    age = _overview_clock() - started
+    if age >= OVERVIEW_CACHE_TTL_S:
+        return None
+    return payload, max(0.0, age)
 
 
 def _overview_cache_put(key: tuple[Any, ...], started: float, payload: dict[str, Any]) -> bool:
-    now = _overview_clock()
-    if (now - started) >= OVERVIEW_CACHE_TTL_S:
+    if (_overview_clock() - started) >= OVERVIEW_CACHE_TTL_S:
         return False
+    cloned = copy.deepcopy(payload)
     with _overview_cache_lock:
+        now = _overview_clock()
+        if (now - started) >= OVERVIEW_CACHE_TTL_S:
+            return False
         expired = [k for k, (ts, _) in _overview_cache.items() if (now - ts) >= OVERVIEW_CACHE_TTL_S]
         for k in expired:
             _overview_cache.pop(k, None)
@@ -986,7 +1006,7 @@ def _overview_cache_put(key: tuple[Any, ...], started: float, payload: dict[str,
         if key not in _overview_cache and len(_overview_cache) >= _OVERVIEW_CACHE_MAX_ENTRIES:
             oldest = min(_overview_cache, key=lambda item: _overview_cache[item][0])
             _overview_cache.pop(oldest, None)
-        _overview_cache[key] = (started, copy.deepcopy(payload))
+        _overview_cache[key] = (started, cloned)
     return True
 
 
@@ -1098,21 +1118,20 @@ def fleet_overview(
 ) -> dict[str, Any]:
     """Compact durable-plane counts for the consolidated fleet dashboard."""
     resolved_ctx = resolve_context(ctx)
-    plane_root = _plane_root(resolved_ctx)
-    routing_key, expected_authority = _overview_routing_key(resolved_ctx, plane_root)
-    expected_pg_dsn = (
-        (os.environ.get("LEARN_UKRAINIAN_CP_PG_DSN") or "").strip()
-        if expected_authority is storage.Authority.PG
-        else ""
-    )
-    cached = _overview_cache_get(routing_key)
-    if cached is not None:
-        payload, age = cached
-        response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S))
-        return payload
+    snapshot = _capture_overview_routing(resolved_ctx)
+    if snapshot.cacheable:
+        cached = _overview_cache_get(snapshot.key)
+        if cached is not None:
+            payload, age = cached
+            response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S))
+            return payload
 
     started = _overview_clock()
-    status = _safe_plane_status(resolved_ctx, plane_root=plane_root)
+    status = _safe_plane_status(
+        resolved_ctx,
+        plane_root=snapshot.plane_root,
+        telemetry_path=snapshot.telemetry_path,
+    )
     result: dict[str, Any] = {
         "read_only": True,
         "authority": status["authority"],
@@ -1130,33 +1149,51 @@ def fleet_overview(
         "availability": "db_missing",
     }
     conn_authority: storage.Authority | None = None
-    pg_conn_ok = True
+    complete = False
+    db_identity_opened: tuple[int, int] | None = None
     try:
-        result, conn_authority, pg_conn_ok = _populate_fleet_overview(
+        result, conn_authority, complete, db_identity_opened = _populate_fleet_overview(
             result,
             status,
             resolved_ctx,
-            plane_root=plane_root,
-            expected_pg_dsn=expected_pg_dsn,
+            plane_root=snapshot.plane_root,
         )
     except _OVERVIEW_READ_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
 
+    storable = complete and _overview_is_storable(result)
     stored = False
-    if _overview_is_storable(result) and conn_authority is expected_authority and pg_conn_ok:
+    if snapshot.cacheable and storable and conn_authority is snapshot.authority:
         status_authority = status.get("schema", {}).get("authority")
-        if status_authority == expected_authority.value and status.get("mode") == _current_plane_mode():
+        expected_mode = (
+            snapshot.expected_mode
+            if snapshot.expected_mode is not None
+            else _current_plane_mode()
+        )
+        if (
+            status_authority == snapshot.authority.value
+            and status.get("mode") == expected_mode
+            and db_identity_opened == snapshot.db_identity
+        ):
             try:
-                post_root = _plane_root(resolved_ctx)
-                post_key, _ = _overview_routing_key(resolved_ctx, post_root)
+                post_snapshot = _capture_overview_routing(resolved_ctx)
             except (PlaneRootAnchorError, storage.ControlPlaneError):
-                post_key = ()
-            if post_key == routing_key:
-                stored = _overview_cache_put(routing_key, started, result)
+                post_snapshot = None
+            if (
+                post_snapshot is not None
+                and post_snapshot.cacheable
+                and post_snapshot.key == snapshot.key
+            ):
+                stored = _overview_cache_put(snapshot.key, started, result)
 
     age = max(0.0, _overview_clock() - started)
-    response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S, unavailable=not stored))
+    unavailable = (
+        not storable
+        if snapshot.authority is storage.Authority.PG
+        else not stored
+    )
+    response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S, unavailable=unavailable))
     return result
 
 
@@ -1166,8 +1203,7 @@ def _populate_fleet_overview(
     ctx: MonitorContext,
     *,
     plane_root: Path | None = None,
-    expected_pg_dsn: str = "",
-) -> tuple[dict[str, Any], storage.Authority, bool]:
+) -> tuple[dict[str, Any], storage.Authority, bool, tuple[int, int] | None]:
     with _read_connection_with_authority(
         ctx,
         pg_supported=True,
@@ -1175,15 +1211,22 @@ def _populate_fleet_overview(
     ) as (connection, availability, authority):
         if connection is None:
             result["availability"] = availability
-            return result, authority, True
-        pg_conn_ok = (
-            _pg_connection_matches_dsn(connection, expected_pg_dsn)
-            if authority is storage.Authority.PG
-            else True
+            return result, authority, False, None
+        db_identity_opened = (
+            _sqlite_db_identity(plane_root / "comms.sqlite3")
+            if plane_root is not None and authority is not storage.Authority.PG
+            else None
         )
         if is_sqlite_connection(connection) and _populate_fleet_overview_sqlite(connection, result, status):
-            return result, authority, pg_conn_ok
-        legacy_request_states = _count_by_state(connection, "requests", "state")
+            return result, authority, True, db_identity_opened
+        complete = (
+            not is_sqlite_connection(connection)
+            and _table_exists(connection, "requests")
+            and _table_exists(connection, "comms_messages")
+        )
+        legacy_request_states = _count_by_state(
+            connection, "requests", "state", raise_on_error=True
+        )
         if status["mode"] == "authority":
             request_states = _count_by_state_where(
                 connection,
@@ -1213,9 +1256,15 @@ def _populate_fleet_overview(
             request_states=request_states,
             request_source=request_source,
             legacy_request_states=legacy_request_states,
-            message_kinds=_count_by_state(connection, "comms_messages", "kind"),
-            review_states=_count_by_state(connection, "formal_review_jobs", "state"),
-            authority_job_states=_count_by_state(connection, "authority_jobs", "state"),
+            message_kinds=_count_by_state(
+                connection, "comms_messages", "kind", raise_on_error=True
+            ),
+            review_states=_count_by_state(
+                connection, "formal_review_jobs", "state", raise_on_error=True
+            ),
+            authority_job_states=_count_by_state(
+                connection, "authority_jobs", "state", raise_on_error=True
+            ),
             dead_letters_total=dead_letters_total,
             acp_conversations_total=acp_conversations_total,
             authority_health=(
@@ -1224,7 +1273,7 @@ def _populate_fleet_overview(
                 else None
             ),
         )
-    return result, authority, pg_conn_ok
+    return result, authority, complete, db_identity_opened
 
 
 def _registered_endpoints(connection: SQLiteConnection | None) -> dict[str, dict[str, Any]]:
