@@ -540,7 +540,7 @@ def test_annotated_tag_uses_the_checkout_identity_when_the_host_has_none(tmp_pat
     assert list(refused_work.iterdir()) == []
 
 
-def _released_history(tmp_path, commits, releases):
+def _released_history(tmp_path, monkeypatch, commits, releases, *, machinery_uv="==0.13.9", product_uv="==0.13.9"):
     """A machinery remote whose first-parent history is ``commits`` ((title, version, tag)), and a dry-run Cut on it.
 
     GitHub is faked: ``releases`` maps a tag to its release's isPrerelease, and HEAD's CI Gate push run succeeded.
@@ -549,7 +549,10 @@ def _released_history(tmp_path, commits, releases):
     _init_repo(seed)
     (seed / "CHANGELOG.md").write_text(CHANGELOG, encoding="utf-8")
     for title, version, tag in commits:
-        (seed / "pyproject.toml").write_text(f'[project]\nname = "lu-machinery"\nversion = "{version}"\n', encoding="utf-8")
+        (seed / "pyproject.toml").write_text(
+            f'[project]\nname = "lu-machinery"\nversion = "{version}"\n\n[tool.uv]\nrequired-version = "{machinery_uv}"\n',
+            encoding="utf-8",
+        )
         package = {"name": "lu-machinery-acp", "version": version}
         (seed / "package.json").write_text(json.dumps(package, indent=2) + "\n", encoding="utf-8")
         lock = {**package, "packages": {"": {"version": version}}}
@@ -560,11 +563,30 @@ def _released_history(tmp_path, commits, releases):
             _git(seed, "tag", tag)
     remote = tmp_path / "machinery.git"
     subprocess.run(["git", "clone", "--quiet", "--bare", str(seed), str(remote)], check=True, capture_output=True)
+    product = tmp_path / "product seed"
+    _init_repo(product)
+    (product / "pyproject.toml").write_text(f'[tool.uv]\nrequired-version = "{product_uv}"\n', encoding="utf-8")
+    _git(product, "add", "pyproject.toml")
+    _git(product, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "Set required uv version")
+    bin_dir = tmp_path / "tool bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        '#!/bin/sh\n[ "$#" = 5 ] && [ "$1" = --offline ] && [ "$2" = --config-file ] '
+        '&& [ "$4" = cache ] && [ "$5" = dir ] || exit 2\n'
+        'case "$(cat "$3")" in\n'
+        '  \'required-version = "==0.13.9"\'|\'required-version = ">=0.13.8,<0.14"\') exit 0;;\n'
+        '  *) exit 2;;\n'
+        'esac\n',
+        encoding="utf-8",
+    )
+    uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(bin_dir), prepend=os.pathsep)
     head = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True,
                           text=True).stdout.strip()
     work = tmp_path / "work"
     work.mkdir()
-    cut = Cut(work=work, dry_run=True, machinery_remote=str(remote), product_remote=str(tmp_path / "product.git"),
+    cut = Cut(work=work, dry_run=True, machinery_remote=str(remote), product_remote=str(product),
               machinery_repo="learn-ukrainian/machinery", product_repo="learn-ukrainian/learn-ukrainian",
               host_python=tmp_path / "python", primary=tmp_path, alert=False, x_agent="claude/claude-cto",
               git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"))
@@ -600,9 +622,39 @@ def _released_history(tmp_path, commits, releases):
     return cut
 
 
-def test_a_withdrawn_last_tag_cuts_everything_merged_since_the_last_full_release(tmp_path):
+@pytest.mark.parametrize(("machinery_uv", "product_uv", "mismatched_side"), [
+    ("==0.13.9", ">=0.13.8,<0.14", None),
+    ("==0.13.8", "==0.13.9", "machinery"),
+    ("==0.13.9", "==0.13.8", "product"),
+])
+def test_cut_checks_both_uv_requirements_before_build(tmp_path, monkeypatch, machinery_uv, product_uv, mismatched_side):
+    """Defect class: an incompatible uv reaches build or tagging before the cut checks both projects."""
+    cut = _released_history(tmp_path, monkeypatch, [
+        ("seed versions", "0.1.21", "v0.1.21"),
+        ("fix(release): check uv in preflight", "0.1.22", None),
+    ], releases={"v0.1.21": False}, machinery_uv=machinery_uv, product_uv=product_uv)
+    if mismatched_side is None:
+        decision, _, _ = cut.preflight()
+        assert decision.action == "cut"
+        assert (cut.work / "product" / "pyproject.toml").is_file()
+    else:
+        cut.dry_run = mismatched_side == "product"
+
+        def unexpected_step(*_):
+            pytest.fail("preflight allowed build or publication with an incompatible uv")
+
+        monkeypatch.setattr(cut, "build", unexpected_step)
+        monkeypatch.setattr(cut, "publish", unexpected_step)
+        with pytest.raises(CutError, match=rf"uv preflight \({mismatched_side}\): uv on PATH could not satisfy") as exc:
+            release_cut.execute(cut)
+        assert isinstance(exc.value, release_cut.UvPreflightError)
+        assert exc.value.side == mismatched_side
+        assert cut.step == "preflight"
+
+
+def test_a_withdrawn_last_tag_cuts_everything_merged_since_the_last_full_release(tmp_path, monkeypatch):
     """Defect class: after a withdrawn pre-release the skip rule and notes start at its tag, so changes never ship."""
-    cut = _released_history(tmp_path, [
+    cut = _released_history(tmp_path, monkeypatch, [
         ("seed versions", "0.1.22", "v0.1.22"),
         ("chore(release): record 0.1.22 and start 0.1.23 (#630)", "0.1.23", None),
         ("fix(dispatcher): an unreadable stranger no longer voids the fallback settlement stop (#632)", "0.1.23", None),
@@ -621,9 +673,9 @@ def test_a_withdrawn_last_tag_cuts_everything_merged_since_the_last_full_release
     )
 
 
-def test_only_a_bump_since_a_full_release_still_skips(tmp_path):
+def test_only_a_bump_since_a_full_release_still_skips(tmp_path, monkeypatch):
     """Defect class: the withdrawn-release walk turns an unchanged window after a full release into an empty cut."""
-    cut = _released_history(tmp_path, [
+    cut = _released_history(tmp_path, monkeypatch, [
         ("seed versions", "0.1.21", "v0.1.21"),
         ("fix(review): count a shared branch's review rounds per pull request (#627)", "0.1.22", "v0.1.22"),
         ("chore(release): record 0.1.22 and start 0.1.23 (#630)", "0.1.23", None),

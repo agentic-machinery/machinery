@@ -59,7 +59,7 @@ Code: `lu_machinery/common/test_slots.py`. Status: `.venv/bin/python -m lu_machi
 | --- | --- |
 | Dispatch-worker pytest runs | Use `.venv/bin/python -m lu_machinery.common.test_slots run -- <command>`; dispatch v2 does not inject the nested-pytest plugin. When loaded explicitly, `ci.pytest_dispatch_cap` holds slots when `LEARN_UKRAINIAN_DISPATCH_TASK_ID` is set. This covers every documented command, such as `.venv/bin/python -m pytest -n 2 -q <files>`, the pre-commit pytest hooks and `lu_machinery/ci/components.py`. It skips `--collect-only` and `--help`. A nested run queues for nothing and starts at most the inherited count of workers. A wait timeout is a pytest usage error (exit 4) naming `test_slots_wait_timeout`. |
 | Any other test command | `.venv/bin/python -m lu_machinery.common.test_slots run -- <command>` waits for slots, rewrites a visible `-n`/`--numprocesses` (including `auto`) to the slots held, caps a hidden `-n auto` through `PYTEST_XDIST_AUTO_NUM_WORKERS`, and execs the command, so the command itself holds the slots until it exits. A repo pytest the command starts with a hidden explicit `-n` is capped by the plugin above. |
-| Codex read-only reviews | The dispatch worker holds 2 `review` slots before the CLI starts. See "Sandboxed reviews" below. |
+| Shared read-only review boundary | Governed test runs acquire slots from the launcher-bound host pool. See [Sandboxed reviews](#sandboxed-reviews). |
 | Dispatch admission | `dispatch.py dispatch` refuses a new write worker while more than `DISPATCH_MAX_TEST_SLOT_QUEUE` runs (default 4) wait for slots. The refusal uses the usual admission message and exit 3. |
 
 The plugin takes slots only for dispatch workers, and it caps workers for runs below a live holder.
@@ -71,40 +71,21 @@ task ids do not conflict; that is the existing descendant contract, not a second
 
 ## Sandboxed reviews
 
-Codex runs a read-only review's commands in a user-namespace sandbox that maps only the current user.
-There, root-owned ancestors of the pool, `/` included, show the kernel's overflow owner, and every path
-is mounted read-only. The governor therefore refuses to prepare the pool there with
-`test_slots_pool_unavailable` ("owned by another user"). That refusal is correct, because the sandbox
-cannot prove who owns those ancestors, and it stays in place (#11230, #10744).
+In the [shared read-only review boundary](write-worker-boundary.md), the launcher verifies the host
+pool before entering the user namespace. It mounts the pool's ticket directories and existing lock
+files at the sandbox's default pool location. The root is read-only and the lock files keep their
+host inodes, so governed tests and host tests use the same queue and locks.
 
-For a review-typed Codex dispatch in `read-only` mode, the dispatch worker takes the slots instead,
-outside the sandbox, with the full ownership walk:
+A review holds slots only while a governed test runs. Use the worktree's `.venv/bin/python` and name
+the test files. When the repository loads `ci.pytest_dispatch_cap`, pytest acquires a hold in the
+host pool. Its xdist workers join the hold in the same namespace and keep their locks until they exit.
+The shared pool relies on participants using the test governor to manage its tickets and claims.
 
-1. It queues in the host pool like any run and holds 2 `review` slots, the review bound of two test
-   workers. The task record shows the result as `review_test_slots`: `held` (with the slot count and
-   the wait), `refused` (with the reason) or `disabled`. A refused review still runs, and its governed
-   test runs are refused with a typed reason.
-2. The CLI receives the holder marker. Inside the sandbox, `test_slots run` and the dispatch pytest plugin
-   only read the marked ticket and the slot files and check their locks, so they need no write access to
-   the pool. A sandboxed process, one whose user namespace maps only part of the id range, cannot choose
-   the pool: `LU_TEST_SLOTS_DIR` or `LU_SCRATCH_ROOT` there is refused with
-   `test_slots_pool_override_refused`, and it may join only its launcher's `review` hold.
-3. The review's governed test runs take turns on the hold's session lock, a `.session` file beside its
-   ticket. Concurrent runs of one review therefore never add up past its 2 slots. The run that holds the
-   turn passes `LU_TEST_SLOTS_SESSION` to its own descendants, such as a pytest a test starts or the
-   command it execs. The value names the turn's process, its start time and the descriptor holding the
-   session lock. A descendant joins without waiting only when the kernel shows that process is itself or
-   an ancestor and holds the lock through that descriptor. A sibling that guesses the value or copies it
-   is refused with `test_slots_session_unverified`.
-4. Every run of a turn holds the hold's slot files and its `.turn` file shared until it ends. Slots
-   therefore stay taken while any reviewer test run is alive, even after the worker that issued the
-   hold has ended or was killed, and the next turn starts only when every run of the previous one has
-   ended. `status` reports such slots as `slots_draining`.
-5. The worker gives its own hold back when the runtime returns: on success, on failure, on a timeout and
-   on cancellation. New runs are refused from then on, because the marker's holder is gone.
-
-The slots stay reserved while the reviewer reads. The dispatch hard timeout bounds that time.
-Native read-only reviews keep their existing boundary and review-slot admission.
+The sandbox cannot select a different pool with `LU_TEST_SLOTS_DIR`. Its `LU_SCRATCH_ROOT` names
+private scratch and leaves pool selection to the verified mount. If the launcher cannot bind the pool,
+the review may proceed and governed tests receive a typed refusal. The task record's
+`write_boundary.test_slots` reports `bound: true` with `pool_size`, or `bound: false` with a
+`reason`. Use PR CI for test evidence when the boundary reports `bound: false`.
 
 ## Write workers
 

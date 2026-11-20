@@ -4,7 +4,6 @@ import json
 import re
 import signal
 from pathlib import Path
-from types import SimpleNamespace
 import pytest
 from lu_machinery.dispatcher import store, worker
 from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
@@ -223,9 +222,6 @@ def test_mid_run_record_damage_publishes_typed_terminal_failure(sandbox, monkeyp
 
     monkeypatch.setenv("LU_TASKS_DIR", str(sandbox.tasks))
     monkeypatch.setattr(worker.providers, "load", lambda _agent: stub_provider)
-    released = []
-    hold = SimpleNamespace(environment=lambda: {}, release=lambda: released.append(True))
-    monkeypatch.setattr(worker.admission, "hold_review_test_slots", lambda **_kwargs: (hold, None))
     spec = TaskSpec("damage-probe", "codex", "echo", None, "read-only", sandbox.repo,
                     sandbox.repo / "damage-probe.prompt", sandbox.tasks / "damage-probe.result")
     spec.prompt_file.write_bytes(b"literal final response")
@@ -285,7 +281,6 @@ def test_mid_run_record_damage_publishes_typed_terminal_failure(sandbox, monkeyp
         assert terminal["worktree_disposition_reason"] == "task_record_damaged"
         assert worker._identity(terminal["provider_pgid"]) is None
     assert damaged
-    assert released == [True]
     assert reaped == []
     assert signal.getsignal(signal.SIGTERM) is previous_term
     assert signal.getsignal(signal.SIGINT) is previous_int

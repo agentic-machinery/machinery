@@ -1,0 +1,62 @@
+# Dependabot — automated dependency updates
+# Docs: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates
+# No auto-merge anywhere: every Dependabot PR must pass CI Gate and review as usual.
+version: 2
+updates:
+  # uv is left out until dependabot-core bundles uv >= 0.13.9 (pyproject.toml required-version ==0.13.9).
+
+  # npm (machinery-owned package.json and package-lock.json)
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    # One grouped PR per ecosystem.
+    groups:
+      npm:
+        patterns:
+          - "*"
+    ignore:
+      # Auto mode can approve tools without an ACP permission request.
+      - dependency-name: "@agentclientprotocol/claude-agent-acp"
+        versions: [">=0.101.0 <=0.109.0"]
+      # debug reads the CommonJS .stderr export. The ESM releases put it under .default.
+      - dependency-name: "supports-color"
+        versions: [">=9.0.0 <=11.0.0"]
+
+  # GitHub Actions (.github/workflows/ and any root action.yml or action.yaml for directory: "/")
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    # One grouped PR per ecosystem.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    ignore:
+      # Actions whose commit SHAs are pinned in .github/workflows/pins.txt
+      # (and packaging/machinery-security/pins.txt) and must move together
+      # with those records.
+      - dependency-name: "actions/cache"
+      - dependency-name: "actions/cache/*"
+      - dependency-name: "actions/checkout"
+      - dependency-name: "actions/upload-artifact"
+      - dependency-name: "astral-sh/setup-uv"
+      - dependency-name: "github/codeql-action"
+      - dependency-name: "github/codeql-action/*"

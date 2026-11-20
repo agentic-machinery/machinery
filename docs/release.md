@@ -119,6 +119,21 @@ is seven days old. The first-party `lu-machinery = false` entry lets the
 release cut adopt a newly published machinery wheel in the product.
 See [uv's package cutoff settings](https://docs.astral.sh/uv/reference/settings/#exclude-newer-package).
 
+`.github/dependabot.yml` applies the same seven-day cooldown (`cooldown.default-days: 7`)
+to scheduled weekly grouped updates for `npm` and `github-actions` (`uv` is left out until
+`dependabot-core` bundles `uv >= 0.13.9`), and ignores the actions pinned in
+`.github/workflows/pins.txt` so coupled workflow pins always move together. No dependency PR
+auto-merges. For an urgent CVE fix that cannot wait for the cooldown or that affects a
+`pins.txt`-coupled tool or action, open a manual PR updating the affected manifest and
+lockfile, and land it through the usual exact-head review and green `CI Gate`:
+
+- Inside the seven-day `uv` cooldown window, add the dated `[tool.uv].exclude-newer-package`
+  override above.
+- For a `pins.txt`-coupled tool or action, bump `.github/workflows/pins.txt` and its matching
+  workflow, gate, and baseline pins together.
+- When a `pins.txt`-coupled `uv` tool needs an urgent fix inside the seven-day window, apply
+  both the dated `[tool.uv].exclude-newer-package` override and the coordinated pin bump.
+
 The release wheelhouse includes core and the `api`, `postgres`, and
 `pytest` extras. This export excludes the project, development groups, and
 the `test` extra:
@@ -200,15 +215,19 @@ order:
    and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when
    `$SHA` is that tag's commit, or when only post-release PRs merged since the
    last full release `v<full>` (see Changelog). It refuses when it cannot read
-   the release state of a tag it must check. Otherwise it refuses unless all
-   four of these hold:
+   the release state of a tag it must check. Otherwise preflight checks these
+   conditions.
+
    - `pyproject.toml`, `package.json` and both versions in
-     `package-lock.json` hold `$V`, the next patch version after `<previous>`;
-   - the tag `v$V` is absent;
-   - the `Unreleased` section of `CHANGELOG.md` at `$SHA` is empty;
-   - the newest `CI Gate` push run on `$SHA`
+     `package-lock.json` hold `$V`, the next patch version after `<previous>`.
+   - The tag `v$V` is absent.
+   - The `Unreleased` section of `CHANGELOG.md` at `$SHA` is empty.
+   - The newest `CI Gate` push run on `$SHA`
      (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
      `success`.
+   - The uv on `PATH` satisfies `[tool.uv] required-version` in the machinery
+     candidate and in the product `main` checkout used for adoption and test
+     collection. This check also applies to dry runs that proceed to a build.
 2. **Release notes**, generated as described under Changelog.
 3. **Build** once from `git archive "$SHA"`, outside any checkout, with the
    build pins of the `Installed wheel` job (the `build-requirements.txt`

@@ -5,7 +5,8 @@ private copy of the published view, and the launcher turns the edits into a patc
 exits (``_Boundary._draft``; docs/runbooks/savant.md). Native read-only providers run under
 bubblewrap, reusing agy_sandbox's canary, Sources relay and GitHub read relay. The worktree,
 Git metadata and public checkouts are read-only mounts. HOME and temporary runtime state are
-private; only declared outputs and the selected provider's refreshable login are writable.
+private. Declared outputs, the selected provider's refreshable login and the host test pool's
+ticket directories and lock files are writable.
 GitHub credentials are masked and direct GitHub egress is refused. The host broker admits
 named GitHub reads with launch-bound scope and one final Fleet delivery to the dispatcher.
 
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, test_slots
 from lu_machinery.common.repo_root import (
     machinery_path,
     main_checkout_root,
@@ -46,6 +47,7 @@ from lu_machinery.common.repo_root import (
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.dispatcher.agy_sandbox import REFUSED, Refused, _now, _remove, _write_private, _write_receipt
+from lu_machinery.review.language_lane import is_ukrainian_review
 
 _PACKAGE = Path(__file__).absolute().parents[1].name
 SCHEMA = 1
@@ -62,7 +64,6 @@ _PROJECTED = {
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # Private tmpfs inside: host sockets below these roots, including ones created after launch, are absent.
-# /var/tmp stays a read-only view so driver-provided inputs remain readable; its sockets are masked.
 _MASKED_ROOTS = (Path("/tmp"), Path("/run"), Path("/dev/shm"))
 # Loopback services a worker must not reach (Monitor API, Sources, SSH); the namespace has no loopback route.
 _LOOPBACK_PORTS = (22, 8765, 8766)
@@ -98,17 +99,21 @@ _MAX_HIDDEN_PROBES = 1000
 _MAX_PROBES_PER_DIRECTORY = 128
 
 
+_TEST_SLOT_SETTINGS = frozenset({
+    "CI", test_slots.SCRATCH_ROOT_ENV, test_slots.ENABLE_ENV, test_slots.COUNT_ENV, test_slots.WAIT_ENV,
+    test_slots.DIR_ENV,
+})
 # The dispatcher's own configuration the launcher needs on the host (roots, scratch, task store, Fleet plane,
 # interpreter, user bus). The provider's environment is minimal (``environment.child_env``), so the launcher gets
-# these as ``--host-env NAME=VALUE`` and applies them to itself only; none is passed to the provider. Paths and
-# addresses only: no credential is ever one of them.
+# these as ``--host-env NAME=VALUE`` and applies them to itself only. The provider gets separate, validated
+# test-slot settings. No credential is ever one of these values.
 _HOST_CONTEXT = frozenset({
     "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LEARN_UKRAINIAN_GITHUB_SLUG", "LEARN_UKRAINIAN_STATE_ROOT",
     "LEARN_UKRAINIAN_PYTHON", "LU_PRODUCT_ROOT", "LU_SCRATCH_ROOT", "LU_RUNTIME_TMP_BASE_ROOT", "LU_TASKS_DIR",
     "FLEET_COMMS_ROOT", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
     "XDG_CACHE_HOME", "XDG_DATA_HOME", "GH_CONFIG_DIR", "DELEGATE_MONITOR_API", "LU_DISPATCH_ISOLATION",
     "LU_OPSEC_NEEDLES_FILE",
-})
+}) | _TEST_SLOT_SETTINGS
 # A provider may point these at its own private, empty roots (the Savant route does). The launcher's host steps
 # (gh and the masks of its credential stores) always take the dispatcher's values, an empty value meaning unset;
 # the provider keeps its own.
@@ -145,12 +150,11 @@ _SOURCES_INSIDE = "/run/lu-write-boundary/sources.sock"
 _SOURCES_STDIO_INSIDE = "/run/lu-write-boundary/sources-stdio.py"
 # The task-local CODEX_HOME the launcher projects into the run's private scratch, beside its TMPDIR.
 _CODEX_HOME = "codex-home"
-# A write worker on these routes gets one task-local MCP file naming only the Sources relay (``sources_mcp_config``),
-# written in the read-only boundary directory. AGY reads only HOME's ``.gemini/config/mcp_config.json`` (the file
-# ``agy mcp add`` writes; ``adapters/agy.py``) and Cursor HOME's ``.cursor/mcp.json``, so the file is bound read-only
-# there; OpenCode reads the file ``OPENCODE_CONFIG`` names, which is the file's fixed path inside.
+# Cursor reads the relay definition from a read-only file below HOME. Claude receives it in argv,
+# and Codex reads it from its task-local CODEX_HOME.
 _SOURCES_MCP = "sources-mcp.json"
-_SOURCES_MCP_INSIDE = "/run/lu-write-boundary/sources-mcp.json"
+_CURSOR_MCP_HOME = ".cursor/mcp.json"
+_SOURCES_MCP_ROUTES = ("claude", "codex", "cursor")
 # A public Savant run's tools read only this read-only snapshot of the published start commit (designated
 # approval, Savant tool conditions C1-C4): regular files, none of whose path components names Git metadata, an
 # environment file, a key or credential store, or an instruction or config file OpenCode loads by itself.
@@ -181,7 +185,6 @@ MAX_DRAFT_PATHS = 256
 # The recursive tree listing, excluded and skipped entries included, is read up to this size (about 16 times what
 # MAX_SNAPSHOT_FILES records of ordinary paths need), so the launcher's memory before the caps apply is bounded too.
 MAX_TREE_LISTING_BYTES = 16 * 1024 * 1024
-_SOURCES_MCP_HOME = {"agy": ".gemini/config/mcp_config.json", "cursor": ".cursor/mcp.json", "opencode": None}
 # Cursor gives a workspace's own ``.cursor/mcp.json`` precedence over HOME's for a server of the same name, and the
 # product's names ``sources`` at a loopback URL the boundary refuses, so Cursor's relay entry has a name of its own.
 _CURSOR_SOURCES_SERVER = "sources-relay"
@@ -198,7 +201,7 @@ def sources_command() -> list[str]:
     """The MCP stdio argv that reaches the launcher's read-only Sources relay from inside the boundary.
 
     The launcher runs the provider with this interpreter and binds its proxy and the relay socket at these
-    fixed paths. Without a relay the socket is absent: the server fails to start and the run goes on.
+    fixed paths.
     """
     return [str(Path(sys.executable).resolve(strict=True)), "-I", _SOURCES_STDIO_INSIDE, _SOURCES_INSIDE]
 
@@ -222,22 +225,10 @@ def codex_home_config() -> str:
     ])
 
 
-def sources_mcp_config(agent: str) -> str:
-    """The task-local MCP file of an AGY, Cursor or OpenCode write worker: one stdio server, the Sources relay.
-
-    Each is in the shape that provider reads (AGY and Cursor ``mcpServers`` with ``command`` and ``args``; OpenCode
-    ``mcp`` with a ``local`` server whose ``command`` is the whole argv). HOME is empty inside, so no other MCP
-    server, credential or host configuration is a layer of the run.
-    """
+def cursor_sources_mcp_config() -> str:
+    """Cursor's task-local MCP file naming only the Sources relay."""
     command, *args = sources_command()
-    if agent == "agy":
-        config: dict = {"mcpServers": {"sources": {"command": command, "args": args}}}
-    elif agent == "cursor":
-        config = {"mcpServers": {_CURSOR_SOURCES_SERVER: {"type": "stdio", "command": command, "args": args}}}
-    elif agent == "opencode":
-        config = {"mcp": {"sources": {"type": "local", "command": [command, *args]}}}
-    else:
-        raise ValueError(f"write boundary: no Sources MCP projection for {agent!r}")
+    config = {"mcpServers": {_CURSOR_SOURCES_SERVER: {"type": "stdio", "command": command, "args": args}}}
     return json.dumps(config, indent=2) + "\n"
 
 
@@ -366,7 +357,7 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
     savant = spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER
-    if spec.agent in _SOURCES_MCP_HOME and not savant and (spec.mode == "workspace-write" or spec.agent == "cursor"):
+    if spec.mode == "read-only" and spec.agent in _SOURCES_MCP_ROUTES:
         argv += ["--sources-mcp", spec.agent]
     if spec.options.get("pr"):
         # The task record's PR, frozen here: a private repository's github-read is that PR and its checks (#565).
@@ -396,7 +387,8 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
             argv += ["--draft-patch-fd", str(draft_fd)]
             argv += [arg for path in owned for arg in ("--owned-path", path)]
     host = {name: os.environ.get(name, "") for name in _HOST_CONTEXT
-            if (os.environ.get(name) and name not in invocation.env) or (name in _HOST_ROOTS and name in invocation.env)}
+            if (os.environ.get(name) and name not in invocation.env)
+            or (name in (_HOST_ROOTS | _TEST_SLOT_SETTINGS) and name in invocation.env)}
     # The launcher starts with the provider's environment. Its own GitHub reads (the published address ranges, the
     # github-read relay) use the dispatcher's gh login, never gh under a provider's private config root, where it
     # reads anonymously and the client refuses it below the landing reserve. No GH_* variable reaches the provider.
@@ -417,7 +409,8 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
     if not isinstance(receipt, dict):
         return {"status": "missing"}, "write_boundary_unproven: the boundary receipt is not an object"
     summary = {key: receipt.get(key) for key in (
-        "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker")}
+        "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker",
+        "sources", "test_slots")}
     canary = receipt.get("canary")
     # Only the launcher's Boolean true proves containment; any other value, however truthy, does not.
     summary["canary_passed"] = isinstance(canary, dict) and canary.get("passed") is True
@@ -680,7 +673,7 @@ def _toolchain(home: Path, executable: str, env: dict[str, str], *, package: boo
     candidates += _package_roots(path_env, [executable, sources_command()[0]])
     candidates += [_interpreter_root(), Path(sys.prefix)]
     if package:
-        candidates.append(machinery_path("dispatcher/write_boundary.py").parents[2])
+        candidates += [machinery_path("dispatcher/write_boundary.py").parents[2], *agy_sandbox._venv_reads()]
     hidden_roots = [home, *_MASKED_ROOTS, *_DATA_ROOTS]
     # Never a whole emptied root or a parent of HOME (a PATH entry such as /opt or /home restores nothing).
     paths = sorted({path for candidate in candidates if (path := _resolved(candidate)) is not None
@@ -1468,6 +1461,7 @@ class _Boundary:
         self.relay: Any = None
         self.gh: Any = None
         self.created = False
+        self.created_interpreter = False
         self.created_outputs: list[Path] = []
         self.status_read: int | None = None
         # A write run's baseline: each path of its writable view and that file's Git mode, object id and SHA-256.
@@ -1578,12 +1572,18 @@ class _Boundary:
             elif not path.is_file():
                 raise Refused("a declared output is not a regular file")
             outputs.append(Path(os.path.realpath(path)))
-        final_delivery = None
-        if self.args.task_artifacts:
+        record = {}
+        if self.args.mode == "read-only":
             from lu_machinery.dispatcher import store as task_store
 
+            record = task_store.read(self.args.task_id, missing_ok=True) or {}
+        sources_required = is_ukrainian_review(record)
+        if sources_required and (self.args.sources_mcp is None or self.args.no_sources_relay
+                                 or (self.args.sources_mcp == "codex" and self.args.codex_auth is None)):
+            raise Refused("sources_mcp_required: Ukrainian review needs a Sources MCP projection and relay")
+        final_delivery = None
+        if self.args.task_artifacts:
             task_id = self.args.task_id
-            record = task_store.read(task_id, missing_ok=True) or {}
             nonce = record.get("run_nonce")
             if (record.get("task_id") != task_id or record.get("mode") != "read-only"
                     or record.get("status") not in ("spawning", "running")
@@ -1618,6 +1618,11 @@ class _Boundary:
         # A snapshot run sees no checkout, worktree or Git metadata at all: its tools read the snapshot only,
         # and the OS view, not just OpenCode's permission rules, keeps everything else out of reach.
         snapshot_only = self.args.snapshot_bytes is not None
+        if not snapshot_only:
+            try:
+                self.created_interpreter = agy_sandbox._link_interpreter(self.worktree)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise Refused("the project interpreter cannot be exposed in the worktree") from exc
         checkouts = [] if snapshot_only else [repository, *([product] if product is not None and product != repository
                                                             else [])]
         toolchain = _toolchain(home, command[0], self.args.provider_env, package=not snapshot_only)
@@ -1639,7 +1644,10 @@ class _Boundary:
             restores.append(Path(self.args.runtime))
         if self.args.codex_auth is not None:
             restores.append(self.base / _CODEX_HOME)
-        sources_mcp = self._sources_mcp(boundary, home)
+        slot_mounts, slot_env = self._test_slots(boundary) if not snapshot_only else ([], {})
+        if slot_mounts:
+            restores.append(test_slots._default_pool())
+        sources_mcp = self._cursor_sources_mcp(boundary, home)
         if sources_mcp is not None:
             restores.append(sources_mcp)
         cursor_config = self._cursor_permissions()
@@ -1661,6 +1669,16 @@ class _Boundary:
         probes += self._view_probes(home, data, masks, restores, private, credentials, own, nonce)
         for path in projected_reads:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
+        if not snapshot_only:
+            probes.append({"op": "stat", "path": str(self.worktree / ".venv/bin/python"), "expect_any": ["OK"]})
+        if slot_mounts:
+            pool_target = test_slots._default_pool()
+            probes.append({"op": "create", "path": str(pool_target / f".canary-{nonce}"), "expect_any": ["EROFS"]})
+            probes.extend({"op": "stat", "path": str(target), "expect_any": ["OK"]}
+                          for _flag, _source, target in slot_mounts)
+            probes.extend({"op": "rename", "path": str(pool_target / name), "expect_any": ["EBUSY", "EROFS"]}
+                          for name in ("queue", "holders", "pool.lock"))
+            probes.append({"op": "write_open", "path": str(pool_target / "pool.lock"), "expect_any": ["OK"]})
         self.receipt["canary"] = {"probes_planned": len(probes), "passed": False}
         self.receipt["view"] = {"data_roots": len(data), "toolchain": len(toolchain), "checkouts": len(checkouts),
                                 "private_masks": len(private), "own_records": len(own)}
@@ -1694,6 +1712,8 @@ class _Boundary:
         for path in outputs:
             argv += ["--bind", str(path), str(path)]
         argv += ["--bind", str(tmp), str(tmp), "--ro-bind", str(boundary), str(boundary)]
+        for flag, source, target in slot_mounts:
+            argv += [flag, str(source), str(target)]
         runtime = tmp
         if self.args.runtime is not None:
             from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
@@ -1710,8 +1730,8 @@ class _Boundary:
             # Codex writes its state there, but the trusted Sources definition stays read-only (as review F1).
             argv += ["--bind", str(codex_home), str(codex_home),
                      "--ro-bind", str(codex_home / "config.toml"), str(codex_home / "config.toml")]
-        if sources_mcp is not None and sources_mcp != boundary / _SOURCES_MCP:
-            # The provider reads it from HOME; it stays read-only there, as Codex's Sources definition.
+        if sources_mcp is not None:
+            # Cursor reads it from HOME; the definition stays read-only there.
             argv += ["--ro-bind", str(boundary / _SOURCES_MCP), str(sources_mcp)]
         # No GitHub credential is readable inside (PUBLISH-CRED-1113): the host login's known stores are empty.
         for path in _github_credential_paths(home):
@@ -1752,8 +1772,10 @@ class _Boundary:
                 readers, _writers = sources_tool_sets()
                 self.relay = agy_sandbox.SourcesRelay(boundary / "sources.sock", frozenset(readers), {
                     name: os.environ[name] for name in ("PATH", "HOME", "LANG", "TMPDIR") if name in os.environ})
-        except Exception as exc:  # Sources is optional; containment does not depend on it
+        except Exception as exc:
             self.receipt["sources"] = {"status": "unavailable", "reason": f"{type(exc).__name__}: {exc}"[:200]}
+            if sources_required:
+                raise Refused("sources_mcp_unavailable: the Ukrainian review's Sources relay could not start") from exc
         argv += ["--cap-drop", "ALL", "--chdir", SNAPSHOT_INSIDE if snapshot_only else str(self.worktree)]
 
         self.egress = AttemptEgress(boundary / "egress.sock", refused_domains=GITHUB_DOMAINS,
@@ -1786,8 +1808,11 @@ class _Boundary:
         env["PATH"] = str(boundary / "bin") + os.pathsep + env.get("PATH", os.defpath)
         if codex_home is not None:
             env["CODEX_HOME"] = str(codex_home)
-        if self.args.sources_mcp == "opencode":
-            env["OPENCODE_CONFIG"] = _SOURCES_MCP_INSIDE
+        if not snapshot_only:
+            for name in (test_slots.ENABLE_ENV, test_slots.COUNT_ENV, test_slots.WAIT_ENV, test_slots.DIR_ENV,
+                         test_slots.HOLDER_ENV, test_slots.SESSION_ENV):
+                env.pop(name, None)
+            env.update(slot_env)
         if (store := _pre_commit_store(home, self.args.provider_env)) is not None and (found := _resolved(store)) is not None and found.is_dir():
             # The store is restored at its resolved path (``_toolchain``); a link on pre-commit's lookup path, such
             # as HOME's .cache, is not in the view, so pre-commit is told the directory it resolves on the host.
@@ -1814,6 +1839,8 @@ class _Boundary:
             if not passed:
                 raise Refused("the write boundary canary failed: " + ", ".join(
                     f"{probe.get('op')} {probe.get('path')} gave {probe.get('outcome')}" for probe in failed[:5]))
+            if slot_mounts:
+                self.receipt["test_slots"] = {"bound": True, "pool_size": int(slot_env[test_slots.COUNT_ENV])}
             if status_read is not None:
                 init = self._sandbox_init(status_read, process.pid)
             os.write(go_write, b"1")
@@ -1976,30 +2003,47 @@ class _Boundary:
                                       "auth_writable": auth in credentials}
         return home
 
-    def _sources_mcp(self, boundary: Path, home: Path) -> Path | None:
-        """Write the provider's task-local Sources MCP file (``--sources-mcp``) and return where it reads it.
+    def _test_slots(self, boundary: Path) -> tuple[list[tuple[str, Path, Path]], dict[str, str]]:
+        """Project only the verified host pool entries needed by governed tests."""
+        try:
+            if not test_slots.enabled():
+                self.receipt["test_slots"] = {"bound": False, "reason": "disabled"}
+                return [], {}
+            entries, settings = test_slots.prepare_launcher_pool(os.environ)
+        except test_slots.SlotError as exc:
+            self.receipt["test_slots"] = {"bound": False, "reason": exc.reason}
+            return [], {}
+        target = test_slots._default_pool()
+        source = boundary / "test-slots"
+        source.mkdir(mode=0o700)
+        mounts = [("--ro-bind", source, target)]
+        # Keep the root read-only and the entries pinned. The sandbox cannot add slots or replace a
+        # lock inode while a host test holds it. The host pool root and any unrelated entries stay hidden.
+        for path in entries:
+            placeholder = source / path.name
+            if path.is_dir():
+                placeholder.mkdir(mode=0o700)
+            else:
+                _write_private(placeholder, b"", 0o600)
+            mounts.append(("--bind", path, target / path.name))
+        self.receipt["test_slots"] = {"bound": False, "reason": "canary_unproven"}
+        return mounts, settings
 
-        The file is in the boundary directory, read-only inside; AGY and Cursor read it at its bind below HOME,
-        OpenCode at its fixed path inside (``OPENCODE_CONFIG``).
-        """
-        agent = self.args.sources_mcp
-        if agent is None:
+    def _cursor_sources_mcp(self, boundary: Path, home: Path) -> Path | None:
+        """Stage Cursor's read-only Sources configuration and return its mount point."""
+        if self.args.sources_mcp != "cursor":
             return None
-        if self.args.mode != "workspace-write" and agent != "cursor":
-            raise Refused("--sources-mcp projects a write worker's MCP file only, or a read-only Cursor run's")
-        config = sources_mcp_config(agent).encode()
+        config = cursor_sources_mcp_config().encode()
         _write_private(boundary / _SOURCES_MCP, config, 0o600)
-        relative = _SOURCES_MCP_HOME[agent]
-        target = home / relative if relative is not None else boundary / _SOURCES_MCP
-        self.receipt["sources_mcp"] = {"provider": agent, "config_sha256": hashlib.sha256(config).hexdigest()}
-        return target
+        self.receipt["sources_mcp"] = {"provider": "cursor", "config_sha256": hashlib.sha256(config).hexdigest()}
+        return home / _CURSOR_MCP_HOME
 
     def _cursor_permissions(self) -> bytes | None:
         """A read-only Cursor run's permission profile, else None.
 
         Without the Sources partition no Sources tool is allowed, and Cursor refuses an MCP call no rule allows.
         """
-        if self.args.mode != "read-only" or self.args.sources_mcp != "cursor":
+        if self.args.sources_mcp != "cursor":
             return None
         from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
         from lu_machinery.dispatcher.providers.cursor import read_only_cli_config
@@ -2145,12 +2189,8 @@ class _Boundary:
             # The task-local Codex configuration holds the trusted Sources definition: it refuses a write.
             probes.append({"op": "write_open", "path": str(self.base / _CODEX_HOME / "config.toml"),
                            "expect_any": ["EROFS"]})
-        if (agent := self.args.sources_mcp) is not None:
-            # The task-local Sources MCP file the provider reads refuses a write too.
-            relative = _SOURCES_MCP_HOME[agent]
-            probes.append({"op": "write_open", "path": str(home / relative) if relative else _SOURCES_MCP_INSIDE,
-                           "expect_any": ["EROFS"]})
-        if self.args.mode == "read-only" and self.args.sources_mcp == "cursor":
+        if self.args.sources_mcp == "cursor":
+            probes.append({"op": "write_open", "path": str(home / _CURSOR_MCP_HOME), "expect_any": ["EROFS"]})
             # A read-only Cursor run's permission profile is present where Cursor reads it.
             probes.append({"op": "stat", "path": str(home / _CURSOR_CLI_CONFIG_HOME), "expect_any": ["OK"]})
         return probes
@@ -2385,6 +2425,9 @@ class _Boundary:
             with contextlib.suppress(OSError):
                 if path.stat().st_size == 0:
                     path.unlink()
+        if self.created_interpreter:
+            with contextlib.suppress(OSError):
+                (self.worktree / ".venv").unlink()
         if self.created:
             try:
                 _remove(self.base)
@@ -2484,9 +2527,8 @@ def main(argv: list[str]) -> int:
                         "projected as private copies")
     parser.add_argument("--codex-auth", help="The selected Codex account's auth.json, linked into a task-local "
                         "CODEX_HOME that holds only the Sources server")
-    parser.add_argument("--sources-mcp", choices=tuple(_SOURCES_MCP_HOME),
-                        help="Sources projection selector; read-only dispatches use cursor only, with AGY/OpenCode "
-                        "definitions retained (default: none)")
+    parser.add_argument("--sources-mcp", choices=_SOURCES_MCP_ROUTES,
+                        help="Sources projection used by the read-only provider (default: none)")
     parser.add_argument("--upload-ceiling", type=_positive_bytes,
                         help="At most this many bytes sent upstream by the whole run, e.g. 16777216 (default: none)")
     parser.add_argument("--no-github-relays", action="store_true",

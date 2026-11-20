@@ -1001,23 +1001,143 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert "samples.window.until === pageWindow.until" in html
     assert "unparsed_reasons" in html and "unparsed_samples" in html
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
+    assert all(token in html for token in ("pareto-class", "pareto-x", "trends-metric",
+                                           "Not enough data", "pool_pace", "/subscriptions",
+                                           "landed_ci"))
+    assert "quota-alerts" not in html and "Cached snapshot fallback:" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
     rank_tasks = rank_root / "tasks"
     rank_tasks.mkdir(parents=True)
     for index in range(10):
-        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3)
+        _record(rank_tasks, f"short-{index}", model="gpt-6.2-sol", duration_s=3, research_task_family="code")
         _review(rank_tasks, f"short-review-{index}", "correct", [], pr=100 + index,
                 review_author_model="gpt-6.2-sol")
-        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600)
+        _record(rank_tasks, f"long-{index}", model="gpt-6.1-sol", duration_s=3600, research_task_family="code")
         _review(rank_tasks, f"long-review-{index}", "correct" if index < 5 else "incorrect", [], pr=200 + index,
                 review_author_model="gpt-6.1-sol")
+    # Per-class Pareto frontier: a faster model with lower landed share stays on the frontier beside the higher-rate
+    # model, a dominated model does not, and a low-sample model never joins or dominates the frontier (#875).
+    for index in range(10):
+        _record(rank_tasks, f"fast-{index}", model="claude-sonnet-5-5", duration_s=600, research_task_family="code")
+        _record(rank_tasks, f"slow-{index}", model="claude-opus-5-5", duration_s=7200, research_task_family="code")
+    for index in range(4):
+        _record(rank_tasks, f"tiny-{index}", model="grok-4.7", duration_s=1, research_task_family="code")
+    for index in range(5):
+        _record(rank_tasks, f"doc-a-{index}", model="gpt-6.2-sol", duration_s=300, research_task_family="docs")
+        _record(rank_tasks, f"doc-b-{index}", model="grok-4.7", duration_s=300, research_task_family="docs")
     rows.backfill(rank_tasks, rank_root)
-    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(
-        task_ids={f"short-{index}" for index in range(10)} | {f"long-{index}" for index in range(10)}))
-    recommendation = ranked["windows"]["7d"]["charts"]["recommendation"]
+    landed_ids = (
+        {f"short-{index}" for index in range(10)}
+        | {f"long-{index}" for index in range(10)}
+        | {f"fast-{index}" for index in range(8)}
+        | {f"slow-{index}" for index in range(7)}
+        | {f"tiny-{index}" for index in range(4)}
+        | {f"doc-a-{index}" for index in range(5)}
+    )
+    ranked = stats.collect(rank_root, tmp_path, NOW, landing=stats.Landing(task_ids=landed_ids))
+    charts = ranked["windows"]["7d"]["charts"]
+    recommendation = charts["recommendation"]
     assert recommendation["model"] == "gpt-6.2-sol"
     assert recommendation["approvals"] == 10
+    pareto_by_model = {p["model"]: p for p in charts["pareto"]}
+    assert pareto_by_model["gpt-6.2-sol"]["hours_exact"] > 0
+    speed_by_model = {p["model"]: p for p in charts["speed_quality"]}
+    assert speed_by_model["gpt-6.2-sol"]["median_seconds"] == 3.0
+    assert speed_by_model["gpt-6.2-sol"]["timed_n"] == 15
+    assert speed_by_model["gpt-6.2-sol"]["low_sample"] is False
+    assert speed_by_model["gpt-6.2-sol"]["frontier"] is True
+    assert speed_by_model["gpt-6.1-sol"]["median_seconds"] == 3600.0
+    assert speed_by_model["gpt-6.1-sol"]["timed_n"] == 10
+    assert speed_by_model["gpt-6.1-sol"]["low_sample"] is False
+    assert speed_by_model["gpt-6.1-sol"]["frontier"] is False
+    durations_by_model = {d["model"]: d for d in charts["durations"]}
+    assert (durations_by_model["claude-sonnet-5-5"]["tasks"], durations_by_model["claude-sonnet-5-5"]["landed"],
+            durations_by_model["claude-sonnet-5-5"]["landed_rate"],
+            durations_by_model["claude-sonnet-5-5"]["landed_ci"]) == (10, 8, 0.8, stats._wilson(8, 10))
+    jobs_by_class = {j["class"]: {m["model"]: m for m in j["models"]} for j in charts["jobs"]}
+    # In code: gpt-6.2-sol is 100% @ 3s (hours=0.0, hours_exact>0, frontier=True); gpt-6.1-sol is 100% @ 3600s
+    # (dominated by gpt-6.2-sol); claude-sonnet-5-5 is 80% @ 750s (dominated); claude-opus-5-5 is 70% @ 10286s
+    # (dominated); grok-4.7 is 100% @ 1s but n=4 (low_sample, never frontier).
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["hours"] == 0.0
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["hours_exact"] > 0
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["frontier"] is True
+    assert jobs_by_class["code"]["gpt-6.1-sol"]["frontier"] is False
+    assert jobs_by_class["code"]["claude-sonnet-5-5"]["frontier"] is False
+    assert jobs_by_class["code"]["claude-opus-5-5"]["frontier"] is False
+    assert jobs_by_class["code"]["grok-4.7"]["frontier"] is False
+    # In docs: 10 total tasks, max n=5 per model, so no model reaches the frontier.
+    assert all(m["frontier"] is False for m in jobs_by_class["docs"].values())
+    # Two eligible non-dominated models in one class, plus: (1) unrounded sub-0.1s duration tie-breaking (F2),
+    # (2) PR-only author admitted to weekly approval trends without write tasks (F4), and (3) speed_quality point
+    # retained when wall_hours_observed is unavailable (>1% untimed writes, F5).
+    split_root = tmp_path / "split_frontier"
+    split_tasks = split_root / "tasks"
+    split_tasks.mkdir(parents=True)
+    for index in range(10):
+        _record(split_tasks, f"hi-{index}", model="claude-opus-5-5", duration_s=3600, research_task_family="infra")
+        _record(split_tasks, f"fast-{index}", model="grok-4.7", duration_s=600, research_task_family="infra")
+        _record(split_tasks, f"dom-{index}", model="gpt-6.1-sol", duration_s=7200, research_task_family="infra")
+        _record(split_tasks, f"tie-a-{index}", model="gpt-6.2-sol", duration_s=1.001, research_task_family="docs")
+        _record(split_tasks, f"tie-b-{index}", model="claude-sonnet-5-5", duration_s=1.002, research_task_family="docs")
+        _review(split_tasks, f"pr-only-{index}", "correct", [], pr=500 + index, review_author_model="claude-haiku-5-5")
+        _review(split_tasks, f"pr-zero-{index}", "correct", [], pr=800 + index, review_author_model="gpt-6-luna")
+    # Sub-cutoff counts on models qualifying in the other metric stay preserved, never zeroed out (F9).
+    for index in range(3):
+        _record(split_tasks, f"haiku-w-{index}", model="claude-haiku-5-5", duration_s=60, research_task_family="docs")
+        _review(split_tasks, f"opus-pr-{index}", "correct", [], pr=700 + index, review_author_model="claude-opus-5-5")
+    for index in range(20):
+        _record(split_tasks, f"spd-t-{index}", model="gemini-4-hydrogen", duration_s=120, research_task_family="code")
+    for index in range(2):
+        _record(split_tasks, f"spd-u-{index}", model="gemini-4-hydrogen", research_task_family="code")
+    for index in range(10):
+        _review(split_tasks, f"spd-r-{index}", "correct", [], pr=600 + index, review_author_model="gemini-4-hydrogen")
+        _record(split_tasks, f"zmed-w-{index}", model="gemini-4-neon",
+                duration_s=0 if index < 6 else 1, research_task_family="code")
+        _review(split_tasks, f"zmed-r-{index}", "correct", [], pr=900 + index, review_author_model="gemini-4-neon")
+    rows.backfill(split_tasks, split_root)
+    split_landed = (
+        {f"hi-{index}" for index in range(9)}
+        | {f"fast-{index}" for index in range(7)}
+        | {f"dom-{index}" for index in range(6)}
+        | {f"tie-a-{index}" for index in range(10)}
+        | {f"tie-b-{index}" for index in range(10)}
+        | {f"haiku-w-{index}" for index in range(2)}
+        | {f"spd-t-{index}" for index in range(10)}
+    )
+    split_charts = stats.collect(split_root, tmp_path, NOW,
+                                 landing=stats.Landing(task_ids=split_landed))["windows"]["7d"]["charts"]
+    split_jobs = {j["class"]: {m["model"]: m for m in j["models"]} for j in split_charts["jobs"]}
+    assert split_jobs["infra"]["claude-opus-5-5"]["frontier"] is True
+    assert split_jobs["infra"]["grok-4.7"]["frontier"] is True
+    assert split_jobs["infra"]["gpt-6.1-sol"]["frontier"] is False
+    # Unrounded durations: 10.01s vs 10.02s both round to 10.0s, but only the faster model sits on the docs frontier.
+    assert split_jobs["docs"]["gpt-6.2-sol"]["frontier"] is True
+    assert split_jobs["docs"]["claude-sonnet-5-5"]["frontier"] is False
+    assert split_jobs["docs"]["gpt-6.2-sol"]["hours_exact"] < split_jobs["docs"]["claude-sonnet-5-5"]["hours_exact"]
+    # Weekly trends admit a model qualifying in either metric, including zero-write authors (F4, F11), and keep
+    # sub-cutoff counts in the other metric (F9).
+    haiku_trends = [t for t in split_charts["trends"] if t["model"] == "claude-haiku-5-5"]
+    assert len(haiku_trends) == 1 and haiku_trends[0]["prs"] == 10 and haiku_trends[0]["first_approved"] == 10
+    assert haiku_trends[0]["tasks"] == 3 and haiku_trends[0]["landed"] == 2
+    luna_trends = [t for t in split_charts["trends"] if t["model"] == "gpt-6-luna"]
+    assert len(luna_trends) == 1 and luna_trends[0]["prs"] == 10 and luna_trends[0]["first_approved"] == 10
+    assert luna_trends[0]["tasks"] == 0 and luna_trends[0]["landed"] == 0
+    opus_trends = [t for t in split_charts["trends"] if t["model"] == "claude-opus-5-5"]
+    assert len(opus_trends) == 1 and opus_trends[0]["tasks"] == 10 and opus_trends[0]["prs"] == 3
+    assert opus_trends[0]["first_approved"] == 3
+    # Speed/quality keeps gemini-4-hydrogen (20 timed + 2 untimed writes -> no hours_observed, 10 PRs, F5)
+    # and keeps finite zero medians (6x 0s + 4x 1s writes -> median 0.0, 10 PRs, F17).
+    assert "gemini-4-hydrogen" not in {p["model"] for p in split_charts["pareto"]}
+    split_speed = {p["model"]: p for p in split_charts["speed_quality"]}
+    assert split_speed["gemini-4-hydrogen"]["median_seconds"] == 120.0
+    assert split_speed["gemini-4-hydrogen"]["timed_n"] == 20
+    assert split_speed["gemini-4-hydrogen"]["prs"] == 10
+    assert split_speed["gemini-4-hydrogen"]["frontier"] is False
+    assert split_speed["gemini-4-neon"]["median_seconds"] == 0.0
+    assert split_speed["gemini-4-neon"]["timed_n"] == 10
+    assert split_speed["gemini-4-neon"]["prs"] == 10
+    assert split_speed["gemini-4-neon"]["frontier"] is True
     # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
     fine = tmp_path / "fine"
     fine_tasks = fine / "tasks"
@@ -1119,7 +1239,18 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     assert author["after_blocked_first_round"]["blocked"] == 0
     neon_chart = window["charts"]["neon"]
     assert neon_chart["enough"] is False
-    assert {arm["effort"]: arm["review_results"] for arm in neon_chart["arms"]} == {"medium": 1, "high": 1}
+    arms = {arm["effort"]: arm for arm in neon_chart["arms"]}
+    assert {effort: arm["review_results"] for effort, arm in arms.items()} == {"medium": 1, "high": 1}
+    assert (arms["medium"]["review_tasks"], arms["medium"]["blocking_per_review"], arms["medium"]["p0_p2_per_review"],
+            arms["medium"]["findings_n"], arms["medium"]["review_median_seconds"],
+            arms["medium"]["review_p90_seconds"], arms["medium"]["review_timed_n"],
+            arms["medium"]["write_median_seconds"], arms["medium"]["write_timed_n"]) == (
+                2, 0.0, 0.0, 1, 90.0, 120.0, 2, None, 0)
+    assert (arms["high"]["review_tasks"], arms["high"]["blocking_per_review"], arms["high"]["p0_p2_per_review"],
+            arms["high"]["findings_n"], arms["high"]["review_median_seconds"],
+            arms["high"]["review_p90_seconds"], arms["high"]["review_timed_n"],
+            arms["high"]["write_median_seconds"], arms["high"]["write_timed_n"]) == (
+                1, None, None, 0, 180.0, 180.0, 1, None, 0)
 
 
 def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):

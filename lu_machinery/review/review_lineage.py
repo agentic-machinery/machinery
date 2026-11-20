@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.agent_runtime.model_pause import normalize_role
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.guardrails.delegate_ownership import TERMINAL_TASK_STATUSES
 from lu_machinery.opsec.prepublish import normalize_repository
@@ -79,7 +80,7 @@ class LineageRefused(recorder.RecordError):
 
 
 def _is_review_task(task: Mapping[str, Any]) -> bool:
-    """Whatever dispatch types as a review (``admission.review_typed``), plus legacy review markers.
+    """Use the explicit role and verdict requirement, with dispatch and legacy review flags as fallback.
 
     An advisory decision (``advisory_role``) is not a review; its consumer checks it.
     """
@@ -87,7 +88,12 @@ def _is_review_task(task: Mapping[str, Any]) -> bool:
         task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")
     ):
         return False
-    return review_typed(dict(task)) or bool(task.get("review_mode") or task.get("type") == "review")
+    raw_role = task.get("research_role")
+    role = normalize_role(raw_role) if isinstance(raw_role, str) else None
+    if role == "verification":
+        # PR targeting and review settings can also pin a behaviour probe.
+        return bool(task.get("require_review_verdict") or task.get("review_attempt"))
+    return role == "review" or review_typed(dict(task)) or bool(task.get("review_mode") or task.get("type") == "review")
 
 
 def _review_branches(task: Mapping[str, Any]) -> set[Any]:
